@@ -614,7 +614,7 @@ impl SearchService for SearchServiceImpl {
         };
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
-        let _ = metric_index.set(canonical_metric_index_label(index.schema()).to_owned());
+        let _ = metric_index.set(canonical_metric_index_label(&index.schema()).to_owned());
         let reader = index
             .reader()
             .await
@@ -639,7 +639,7 @@ impl SearchService for SearchServiceImpl {
             .reranker
             .as_ref()
             .map(|reranker| {
-                convert_reranker(reranker, reader.schema())
+                convert_reranker(reranker, searcher.schema())
                     .map_err(|e| Status::invalid_argument(format!("Invalid reranker: {}", e)))
             })
             .transpose()?;
@@ -661,7 +661,7 @@ impl SearchService for SearchServiceImpl {
                         .ok_or_else(|| Status::invalid_argument("Fusion sub-query is missing"))?;
                     let core = convert_query(
                         sub,
-                        reader.schema(),
+                        searcher.schema(),
                         Some(searcher.global_stats()),
                         Some(index.directory().root()),
                     )
@@ -737,7 +737,7 @@ impl SearchService for SearchServiceImpl {
             } else {
                 let core_query = convert_query(
                     &query,
-                    reader.schema(),
+                    searcher.schema(),
                     Some(searcher.global_stats()),
                     Some(index.directory().root()),
                 )
@@ -998,7 +998,7 @@ impl SearchService for SearchServiceImpl {
             .map_err(crate::error::hermes_error_to_status)?;
 
         // Convert schema to SDL string
-        let schema_str = schema_to_sdl(index.schema());
+        let schema_str = schema_to_sdl(&index.schema());
 
         // Collect memory stats from segment readers
         let mut total_term_dict_cache = 0u64;

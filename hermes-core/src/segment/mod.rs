@@ -44,8 +44,11 @@ pub use reader::{
 };
 pub use store::*;
 #[cfg(feature = "native")]
-pub use tracker::{SegmentSnapshot, SegmentTracker};
-pub use types::{FieldStats, SegmentFiles, SegmentId, SegmentMeta, TrainedVectorStructures};
+pub use tracker::{PublishedIndexGeneration, SegmentSnapshot, SegmentTracker};
+pub use types::{
+    FieldStats, ScannTrainedArtifactBytes, SegmentFiles, SegmentId, SegmentMeta,
+    TrainedVectorStructures,
+};
 pub use vector_data::{FlatVectorData, LazyFlatVectorData, dequantize_raw};
 
 /// Write adapter that tracks bytes written.

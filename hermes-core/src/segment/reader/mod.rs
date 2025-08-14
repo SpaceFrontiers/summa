@@ -1170,6 +1170,15 @@ fn validate_coarse_centroids(centroids: &CoarseCentroids, dim: usize) -> Result<
 pub struct DensePlanCache {
     pub(crate) tq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqQueryPlan>>>,
     pub(crate) ivf_tq: std::sync::Mutex<Option<std::sync::Arc<crate::structures::TqIvfQueryPlan>>>,
+    scann: std::sync::Mutex<Option<ScannPlanCacheEntry>>,
+}
+
+#[derive(Debug)]
+struct ScannPlanCacheEntry {
+    artifact_id: u64,
+    probes: usize,
+    query_bits: Vec<u32>,
+    plan: std::sync::Arc<crate::structures::vector::scann::FloatScannQuery>,
 }
 
 /// Search one segment's TQ payload, reusing the per-query plan across
@@ -1339,6 +1348,87 @@ fn search_ivf_tq_segment(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn search_scann_ah_segment(
+    index: &crate::segment::ann_disk::AnnDiskIndex,
+    artifact: &crate::segment::ScannTrainedArtifactBytes,
+    query: &[f32],
+    fetch_k: usize,
+    combiner: crate::query::MultiValueCombiner,
+    field: Field,
+    nprobe: usize,
+    plan_cache: Option<&std::sync::Mutex<Option<ScannPlanCacheEntry>>>,
+) -> Result<Vec<RawVectorCandidate>> {
+    index
+        .validate_scann_generation(
+            artifact.config(),
+            artifact.generation(),
+            artifact.artifact_id(),
+        )
+        .map_err(|error| {
+            Error::Corruption(format!(
+                "ScaNN generation mismatch for field {}: {error}",
+                field.0
+            ))
+        })?;
+    let probes = nprobe.clamp(1, artifact.config().num_leaves as usize);
+    let query_bits = query
+        .iter()
+        .map(|value| value.to_bits())
+        .collect::<Vec<_>>();
+    let build = || {
+        let mut normalized_query = query.to_vec();
+        crate::structures::vector::ivf::routing::normalize_cosine_in_place(&mut normalized_query);
+        artifact
+            .float_model()
+            .map_err(Error::Io)?
+            .prepare_query(&normalized_query, probes)
+            .map(std::sync::Arc::new)
+            .map_err(|error| Error::Query(format!("invalid ScaNN query: {error}")))
+    };
+    let plan = match plan_cache {
+        Some(cache) => {
+            let mut cached = cache
+                .lock()
+                .map_err(|_| Error::Internal("ScaNN plan cache is poisoned".into()))?;
+            match cached.as_ref() {
+                Some(entry)
+                    if entry.artifact_id == artifact.artifact_id()
+                        && entry.probes == probes
+                        && entry.query_bits == query_bits =>
+                {
+                    std::sync::Arc::clone(&entry.plan)
+                }
+                _ => {
+                    let plan = build()?;
+                    *cached = Some(ScannPlanCacheEntry {
+                        artifact_id: artifact.artifact_id(),
+                        probes,
+                        query_bits,
+                        plan: std::sync::Arc::clone(&plan),
+                    });
+                    plan
+                }
+            }
+        }
+        None => build()?,
+    };
+    index
+        .search_scann_ah_combined_documents(fetch_k, &plan, combiner)
+        .map(|documents| {
+            documents
+                .into_iter()
+                .map(|candidate| (candidate.doc_id, 0, 0.0))
+                .collect()
+        })
+        .map_err(|error| {
+            Error::Corruption(format!(
+                "invalid ScaNN AH payload for field {}: {error}",
+                field.0
+            ))
+        })
+}
+
 fn validate_ivf_tq_ann(
     index: &crate::segment::ann_disk::AnnDiskIndex,
     centroids: &CoarseCentroids,
@@ -1406,11 +1496,7 @@ fn binary_probe_clusters(
     cache: Option<&std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
 ) -> Result<std::sync::Arc<[u32]>> {
     let effective_nprobe = nprobe.clamp(1, quantizer.num_clusters as usize);
-    let request_fingerprint = crate::structures::vector::ivf::routing::binary_probe_fingerprint(
-        query,
-        effective_nprobe,
-        routing,
-    );
+    let request_fingerprint = quantizer.request_fingerprint(query, effective_nprobe, routing);
     if let Some(cache) = cache {
         let mut cached = cache
             .lock()
@@ -1430,6 +1516,49 @@ fn binary_probe_clusters(
     Ok(quantizer
         .probe(query, effective_nprobe, routing)
         .cluster_ids)
+}
+
+fn binary_scann_probe_clusters(
+    model: &crate::structures::vector::scann::QuantizedBinaryScannModelView<'_>,
+    query: &[u8],
+    nprobe: usize,
+    cache: Option<&std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
+) -> Result<std::sync::Arc<[u32]>> {
+    let probes = nprobe.clamp(1, model.num_leaves() as usize);
+    // Start with a bounded recall beam. The model widens intermediate levels
+    // when necessary so every requested terminal leaf remains reachable.
+    let routing_beam = probes.min(64);
+    let mut fingerprint = 0xcbf2_9ce4_8422_2325u64;
+    for byte in query.iter().copied().chain((probes as u64).to_le_bytes()) {
+        fingerprint ^= u64::from(byte);
+        fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if let Some(cache) = cache {
+        let mut cached = cache
+            .lock()
+            .map_err(|_| Error::Internal("binary ScaNN probe cache is poisoned".into()))?;
+        if let Some(plan) = cached.as_ref()
+            && plan.quantizer_version == model.fingerprint()
+            && plan.request_fingerprint == fingerprint
+            && plan.cluster_ids.len() == probes
+        {
+            return Ok(std::sync::Arc::clone(&plan.cluster_ids));
+        }
+        let mut scratch = crate::structures::vector::scann::BinaryScannSearchScratch::default();
+        let routed = model
+            .probe(query, probes, routing_beam, &mut scratch)
+            .map_err(|error| Error::Query(format!("binary ScaNN routing failed: {error}")))?;
+        let plan =
+            crate::structures::IvfProbePlan::new(model.fingerprint(), fingerprint, routed.leaf_ids);
+        let leaves = std::sync::Arc::clone(&plan.cluster_ids);
+        *cached = Some(plan);
+        return Ok(leaves);
+    }
+    let mut scratch = crate::structures::vector::scann::BinaryScannSearchScratch::default();
+    model
+        .probe(query, probes, routing_beam, &mut scratch)
+        .map(|plan| plan.leaf_ids.into())
+        .map_err(|error| Error::Query(format!("binary ScaNN routing failed: {error}")))
 }
 
 /// Async segment reader with lazy loading
@@ -1621,7 +1750,10 @@ impl SegmentReader {
         // here instead of surfacing as unexplained latency.
         for (&field_id, vector_index) in &reader.vector_indexes {
             match vector_index {
-                VectorIndex::BinaryIvf(index) | VectorIndex::IvfTq { index, .. } => {
+                VectorIndex::BinaryIvf(index)
+                | VectorIndex::IvfTq { index, .. }
+                | VectorIndex::ScannAh(index)
+                | VectorIndex::ScannBinary(index) => {
                     index.get().report_health(
                         reader.schema.index_label(),
                         field_id,
@@ -1642,9 +1774,10 @@ impl SegmentReader {
     /// Cheap (O(runs) over in-memory data); exposed for `hermes-tool diagnose`.
     pub fn ann_health(&self, field: Field) -> Option<crate::segment::ann_disk::AnnHealth> {
         match self.vector_indexes.get(&field.0)? {
-            VectorIndex::BinaryIvf(index) | VectorIndex::IvfTq { index, .. } => {
-                Some(index.get().health())
-            }
+            VectorIndex::BinaryIvf(index)
+            | VectorIndex::IvfTq { index, .. }
+            | VectorIndex::ScannAh(index)
+            | VectorIndex::ScannBinary(index) => Some(index.get().health()),
             VectorIndex::Tq { .. } => None,
         }
     }
@@ -2547,6 +2680,35 @@ impl SegmentReader {
                     // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
                     Vec::new()
                 }
+                VectorIndex::ScannAh(lazy) => {
+                    let artifact = self
+                        .trained_vectors
+                        .scann_artifacts
+                        .get(&field.0)
+                        .ok_or_else(|| {
+                            Error::Schema(format!(
+                                "ScaNN field {} has no loaded global artifact",
+                                field.0
+                            ))
+                        })?;
+                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
+                    search_scann_ah_segment(
+                        lazy.get(),
+                        artifact,
+                        query,
+                        fetch_k.min(flat.num_docs_with_vectors()),
+                        combiner,
+                        field,
+                        params.nprobe,
+                        plan_cache.map(|cache| &cache.scann),
+                    )?
+                }
+                VectorIndex::ScannBinary(_) => {
+                    return Err(Error::Corruption(format!(
+                        "binary ScaNN payload was attached to float field {}",
+                        field.0
+                    )));
+                }
             }
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force from lazy flat vectors (native-precision SIMD scoring).
@@ -2596,6 +2758,8 @@ impl SegmentReader {
                 Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
                 Some(VectorIndex::Tq { .. }) => "tq_flat",
                 Some(VectorIndex::IvfTq { .. }) => "ivf_tq",
+                Some(VectorIndex::ScannAh(_)) => "scann_ah",
+                Some(VectorIndex::ScannBinary(_)) => "scann_binary",
                 None => "flat",
             };
             crate::observe::dense_l1(
@@ -2687,6 +2851,80 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
         let t0 = crate::observe::Timer::start();
+        if let Some(VectorIndex::ScannBinary(lazy)) = self.vector_indexes.get(&field.0) {
+            let artifact = self
+                .trained_vectors
+                .scann_artifacts
+                .get(&field.0)
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "binary ScaNN field {} has no loaded global artifact",
+                        field.0
+                    ))
+                })?;
+            lazy.get()
+                .validate_scann_generation(
+                    artifact.config(),
+                    artifact.generation(),
+                    artifact.artifact_id(),
+                )
+                .map_err(|error| {
+                    Error::Corruption(format!(
+                        "binary ScaNN generation mismatch for field {}: {error}",
+                        field.0
+                    ))
+                })?;
+            let config = self
+                .schema
+                .get_field_entry(field)
+                .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "binary ScaNN field {} has no schema configuration",
+                        field.0
+                    ))
+                })?;
+            let model = artifact.binary_model().map_err(Error::Io)?;
+            let clusters = binary_scann_probe_clusters(&model, query, config.nprobe, probe_cache)?;
+            let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "binary ScaNN field {} is missing flat vectors",
+                    field.0
+                ))
+            })?;
+            let candidate_limit =
+                checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
+            let (documents, ordinal_scores) = lazy
+                .get()
+                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
+                .map_err(|error| {
+                    Error::Corruption(format!(
+                        "invalid binary ScaNN payload for field {}: {error}",
+                        field.0
+                    ))
+                })?;
+            let results = exact_score_binary_candidate_document_ids(
+                documents
+                    .into_iter()
+                    .map(|candidate| candidate.doc_id)
+                    .collect(),
+                &ordinal_scores,
+                flat,
+                query,
+                schema_dim,
+                combiner,
+                k,
+            )
+            .await?;
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                "binary_scann",
+                t0.secs(),
+                results.len(),
+            );
+            return Ok(results);
+        }
         if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0) {
             let ivf = lazy.get();
             let config = self
@@ -3229,6 +3467,35 @@ impl SegmentReader {
                     // Binary IVF serves Hamming queries only (BinaryDenseVectorQuery)
                     Vec::new()
                 }
+                VectorIndex::ScannAh(lazy) => {
+                    let artifact = self
+                        .trained_vectors
+                        .scann_artifacts
+                        .get(&field.0)
+                        .ok_or_else(|| {
+                            Error::Schema(format!(
+                                "ScaNN field {} has no loaded global artifact",
+                                field.0
+                            ))
+                        })?;
+                    let flat = lazy_flat.expect("ANN/flat pairing validated above");
+                    search_scann_ah_segment(
+                        lazy.get(),
+                        artifact,
+                        query,
+                        fetch_k.min(flat.num_docs_with_vectors()),
+                        combiner,
+                        field,
+                        params.nprobe,
+                        plan_cache.map(|cache| &cache.scann),
+                    )?
+                }
+                VectorIndex::ScannBinary(_) => {
+                    return Err(Error::Corruption(format!(
+                        "binary ScaNN payload was attached to float field {}",
+                        field.0
+                    )));
+                }
             }
         } else if let Some(lazy_flat) = lazy_flat {
             // Batched brute-force (sync mmap reads)
@@ -3298,6 +3565,79 @@ impl SegmentReader {
             return Ok(Vec::new());
         }
         let t0 = crate::observe::Timer::start();
+        if let Some(VectorIndex::ScannBinary(lazy)) = self.vector_indexes.get(&field.0) {
+            let artifact = self
+                .trained_vectors
+                .scann_artifacts
+                .get(&field.0)
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "binary ScaNN field {} has no loaded global artifact",
+                        field.0
+                    ))
+                })?;
+            lazy.get()
+                .validate_scann_generation(
+                    artifact.config(),
+                    artifact.generation(),
+                    artifact.artifact_id(),
+                )
+                .map_err(|error| {
+                    Error::Corruption(format!(
+                        "binary ScaNN generation mismatch for field {}: {error}",
+                        field.0
+                    ))
+                })?;
+            let config = self
+                .schema
+                .get_field_entry(field)
+                .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+                .ok_or_else(|| {
+                    Error::Schema(format!(
+                        "binary ScaNN field {} has no schema configuration",
+                        field.0
+                    ))
+                })?;
+            let model = artifact.binary_model().map_err(Error::Io)?;
+            let clusters = binary_scann_probe_clusters(&model, query, config.nprobe, probe_cache)?;
+            let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
+                Error::Corruption(format!(
+                    "binary ScaNN field {} is missing flat vectors",
+                    field.0
+                ))
+            })?;
+            let candidate_limit =
+                checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
+            let (documents, ordinal_scores) = lazy
+                .get()
+                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
+                .map_err(|error| {
+                    Error::Corruption(format!(
+                        "invalid binary ScaNN payload for field {}: {error}",
+                        field.0
+                    ))
+                })?;
+            let results = exact_score_binary_candidate_document_ids_sync(
+                documents
+                    .into_iter()
+                    .map(|candidate| candidate.doc_id)
+                    .collect(),
+                &ordinal_scores,
+                flat,
+                query,
+                schema_dim,
+                combiner,
+                k,
+            )?;
+            crate::observe::dense_l1(
+                self.schema.index_label(),
+                self.schema.get_field_name(field).unwrap_or("?"),
+                "binary_scann",
+                t0.secs(),
+                results.len(),
+            );
+            return Ok(results);
+        }
         if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0) {
             let ivf = lazy.get();
             let config = self

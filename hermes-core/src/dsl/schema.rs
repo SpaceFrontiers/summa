@@ -124,6 +124,10 @@ pub enum VectorIndexType {
     /// default trained float ANN format.
     #[default]
     IvfTq,
+    /// ScaNN: a shared, index-wide hierarchical partitioner with
+    /// asymmetric-hashing leaf codes. Immutable segments reference one
+    /// trained generation and can therefore be merged without retraining.
+    Scann,
 }
 
 /// Reject schemas that reference removed index types. Called on every schema
@@ -131,16 +135,132 @@ pub enum VectorIndexType {
 /// construction all fail loudly with the same actionable message.
 pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), String> {
     for (_, entry) in schema.fields() {
-        if let Some(config) = entry.dense_vector_config.as_ref()
-            && config.index_type == VectorIndexType::IvfPq
-        {
+        if let Some(config) = entry.dense_vector_config.as_ref() {
+            validate_target_vectors(
+                &entry.name,
+                config.target_vectors,
+                !matches!(
+                    config.index_type,
+                    VectorIndexType::Flat | VectorIndexType::Tq
+                ),
+            )?;
+            if config.index_type == VectorIndexType::IvfPq {
+                return Err(format!(
+                    "dense field '{}' uses index_type `ivf_pq`, which was removed; \
+                     recreate the index with `ivf_tq` (trained router, training-free \
+                     TurboQuant leaves) and reindex — see docs/turboquant-quantization.md",
+                    entry.name,
+                ));
+            }
+            if config.index_type == VectorIndexType::Scann && config.soar.is_some() {
+                return Err(format!(
+                    "dense field '{}' enables SOAR for ScaNN, but ScaNN SOAR secondary assignments are not implemented; set soar to null/off",
+                    entry.name,
+                ));
+            }
+            validate_persisted_scann_options(
+                &entry.name,
+                config.index_type == VectorIndexType::Scann,
+                config.num_clusters,
+                config.tree_levels,
+                config.nprobe,
+                config.ivf_routing,
+            )?;
+        }
+        if let Some(config) = entry.binary_dense_vector_config.as_ref() {
+            validate_target_vectors(
+                &entry.name,
+                config.target_vectors,
+                config.index_type != BinaryIndexType::Flat,
+            )?;
+            if config.soar.is_some() && config.index_type != BinaryIndexType::Scann {
+                return Err(format!(
+                    "binary dense field '{}' enables binary SOAR spilling, but it requires the ScaNN index",
+                    entry.name,
+                ));
+            }
+            if config.index_type == BinaryIndexType::Scann && !config.dim.is_multiple_of(8) {
+                return Err(format!(
+                    "binary dense field '{}' uses ScaNN with dimension {}; binary ScaNN dimensions must be a multiple of 8 bits",
+                    entry.name, config.dim,
+                ));
+            }
+            validate_persisted_scann_options(
+                &entry.name,
+                config.index_type == BinaryIndexType::Scann,
+                config.num_clusters,
+                config.tree_levels,
+                config.nprobe,
+                config.ivf_routing,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_target_vectors(
+    field_name: &str,
+    target_vectors: Option<u64>,
+    topology_is_automatic: bool,
+) -> Result<(), String> {
+    if target_vectors == Some(0) {
+        return Err(format!(
+            "field '{field_name}' has target_vectors 0; expected a positive steady-state vector count"
+        ));
+    }
+    if target_vectors.is_some() && !topology_is_automatic {
+        return Err(format!(
+            "field '{field_name}' sets target_vectors for a flat/training-free index; the hint is only valid for IVF or ScaNN automatic topology"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_persisted_scann_options(
+    field_name: &str,
+    is_scann: bool,
+    num_clusters: Option<usize>,
+    tree_levels: Option<u8>,
+    nprobe: usize,
+    routing: IvfRoutingMode,
+) -> Result<(), String> {
+    if !is_scann {
+        if tree_levels.is_some() {
             return Err(format!(
-                "dense field '{}' uses index_type `ivf_pq`, which was removed; \
-                 recreate the index with `ivf_tq` (trained router, training-free \
-                 TurboQuant leaves) and reindex — see docs/turboquant-quantization.md",
-                entry.name,
+                "field '{field_name}' sets tree_levels but does not use the ScaNN index"
             ));
         }
+        return Ok(());
+    }
+    if routing != IvfRoutingMode::Auto {
+        return Err(format!(
+            "field '{field_name}' sets routing {routing:?} for ScaNN, but ScaNN owns its hierarchical routing; remove the routing option"
+        ));
+    }
+
+    if let Some(levels) = tree_levels
+        && !(1..=3).contains(&levels)
+    {
+        return Err(format!(
+            "field '{field_name}' has ScaNN tree_levels {levels}; expected 1..=3"
+        ));
+    }
+    if let Some(leaves) = num_clusters {
+        if !(2..=30_000_000).contains(&leaves) {
+            return Err(format!(
+                "field '{field_name}' has ScaNN num_clusters {leaves}; expected 2..=30000000"
+            ));
+        }
+        if nprobe > leaves {
+            return Err(format!(
+                "field '{field_name}' has ScaNN nprobe {nprobe} greater than num_clusters {leaves}"
+            ));
+        }
+    }
+    if nprobe == 0 {
+        return Err(format!(
+            "field '{field_name}' has ScaNN nprobe 0; expected a positive probe count"
+        ));
     }
     Ok(())
 }
@@ -228,7 +348,8 @@ impl DenseVectorQuantization {
 /// - **Built (ANN)**: Fast approximate nearest neighbor search using trained structures.
 ///   Centroids and codebooks are trained from index-wide data and shared by
 ///   every segment; segment payloads contain only assignments and PQ codes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct DenseVectorConfig {
     /// Dimensionality of vectors
     pub dim: usize,
@@ -239,11 +360,20 @@ pub struct DenseVectorConfig {
     /// Storage quantization for vector elements (f32, f16, uint8)
     #[serde(default)]
     pub quantization: DenseVectorQuantization,
-    /// Number of IVF leaf clusters. If omitted, a billion-scale cost model and
-    /// the available training sample determine the value.
+    /// Number of IVF leaf clusters. If omitted, the selected index algorithm's
+    /// corpus-size cost model determines the value.
     /// If None, automatically determined based on dataset size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_clusters: Option<usize>,
+    /// Expected steady-state vector count used only for automatic topology
+    /// sizing. Training readiness still depends on the observed live corpus.
+    /// Explicit `num_clusters` takes precedence over this hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_vectors: Option<u64>,
+    /// Number of levels in the ScaNN routing tree. When omitted, training
+    /// derives the depth from corpus size. Only meaningful for ScaNN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_levels: Option<u8>,
     /// Coarse-codebook routing strategy. This setting is metric agnostic and
     /// is applied to every IVF-backed dense index.
     #[serde(default)]
@@ -274,6 +404,68 @@ pub struct DenseVectorConfig {
     pub soar: Option<crate::structures::SoarConfig>,
 }
 
+#[derive(Default)]
+enum PersistedSoar {
+    #[default]
+    Unspecified,
+    Specified(Option<crate::structures::SoarConfig>),
+}
+
+impl<'de> Deserialize<'de> for PersistedSoar {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<crate::structures::SoarConfig>::deserialize(deserializer).map(Self::Specified)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DenseVectorConfigWire {
+    dim: usize,
+    #[serde(default)]
+    index_type: VectorIndexType,
+    #[serde(default)]
+    quantization: DenseVectorQuantization,
+    #[serde(default)]
+    num_clusters: Option<usize>,
+    #[serde(default)]
+    target_vectors: Option<u64>,
+    #[serde(default)]
+    tree_levels: Option<u8>,
+    #[serde(default)]
+    ivf_routing: IvfRoutingMode,
+    #[serde(default = "default_nprobe")]
+    nprobe: usize,
+    #[serde(default = "default_unit_norm")]
+    unit_norm: bool,
+    #[serde(default)]
+    soar: PersistedSoar,
+}
+
+impl<'de> Deserialize<'de> for DenseVectorConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = DenseVectorConfigWire::deserialize(deserializer)?;
+        let soar = match wire.soar {
+            PersistedSoar::Specified(soar) => soar,
+            PersistedSoar::Unspecified if wire.index_type == VectorIndexType::IvfTq => {
+                default_soar()
+            }
+            PersistedSoar::Unspecified => None,
+        };
+        Ok(Self {
+            dim: wire.dim,
+            index_type: wire.index_type,
+            quantization: wire.quantization,
+            num_clusters: wire.num_clusters,
+            target_vectors: wire.target_vectors,
+            tree_levels: wire.tree_levels,
+            ivf_routing: wire.ivf_routing,
+            nprobe: wire.nprobe,
+            unit_norm: wire.unit_norm,
+            soar,
+        })
+    }
+}
+
 fn default_nprobe() -> usize {
     64
 }
@@ -293,6 +485,8 @@ impl DenseVectorConfig {
             index_type: VectorIndexType::IvfTq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: IvfRoutingMode::Auto,
             nprobe: 64,
             unit_norm: true,
@@ -307,6 +501,8 @@ impl DenseVectorConfig {
             index_type: VectorIndexType::Flat,
             quantization: DenseVectorQuantization::F32,
             num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: IvfRoutingMode::Auto,
             nprobe: 0,
             unit_norm: true,
@@ -321,6 +517,8 @@ impl DenseVectorConfig {
             index_type: VectorIndexType::Tq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: IvfRoutingMode::Flat,
             nprobe: 0,
             unit_norm: true,
@@ -335,6 +533,8 @@ impl DenseVectorConfig {
             index_type: VectorIndexType::IvfTq,
             quantization: DenseVectorQuantization::F32,
             num_clusters,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: IvfRoutingMode::Auto,
             nprobe,
             unit_norm: true,
@@ -360,6 +560,12 @@ impl DenseVectorConfig {
         self
     }
 
+    /// Hint the expected steady-state corpus size for automatic topology.
+    pub fn with_target_vectors(mut self, target_vectors: u64) -> Self {
+        self.target_vectors = Some(target_vectors);
+        self
+    }
+
     /// Set flat, two-level, or HNSW IVF centroid routing explicitly.
     pub fn with_ivf_routing(mut self, routing: IvfRoutingMode) -> Self {
         self.ivf_routing = routing;
@@ -382,6 +588,11 @@ impl DenseVectorConfig {
         self.index_type == VectorIndexType::IvfTq
     }
 
+    /// Whether the partitioner supports SOAR secondary assignments.
+    pub fn supports_soar(&self) -> bool {
+        self.index_type == VectorIndexType::IvfTq
+    }
+
     /// Check if this config is flat (brute-force)
     pub fn is_flat(&self) -> bool {
         self.index_type == VectorIndexType::Flat
@@ -390,6 +601,11 @@ impl DenseVectorConfig {
     /// Calculate optimal number of clusters for given vector count
     pub fn optimal_num_clusters(&self, num_vectors: usize) -> usize {
         self.num_clusters.unwrap_or_else(|| {
+            let num_vectors = self.target_vectors.map_or(num_vectors, |target| {
+                usize::try_from(target)
+                    .unwrap_or(usize::MAX)
+                    .max(num_vectors)
+            });
             // Balanced IVF cost model: practical values are commonly in the
             // 4-16×sqrt(N) range. Eight is a conservative midpoint; training
             // quality and artifact memory impose the final bounds.
@@ -405,6 +621,7 @@ impl DenseVectorConfig {
 /// Hamming distance for scoring. Segments accumulate exact packed codes and
 /// use the same global IVF router after `build_vector_index`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BinaryDenseVectorConfig {
     /// Number of bits (dimensions). Storage is ceil(dim/8) bytes per vector.
     pub dim: usize,
@@ -416,6 +633,15 @@ pub struct BinaryDenseVectorConfig {
     /// Number of IVF leaf clusters, selected from corpus and sample size by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_clusters: Option<usize>,
+    /// Expected steady-state vector count used only for automatic topology
+    /// sizing. Training readiness still depends on the observed live corpus.
+    /// Explicit `num_clusters` takes precedence over this hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_vectors: Option<u64>,
+    /// Number of levels in the ScaNN Hamming routing tree. When omitted,
+    /// training derives the depth from corpus size. Only meaningful for ScaNN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_levels: Option<u8>,
     /// Coarse-codebook routing strategy. Uses the same routing planner as
     /// floating-point IVF indexes.
     #[serde(default)]
@@ -423,6 +649,11 @@ pub struct BinaryDenseVectorConfig {
     /// Clusters to probe during search (default: 64)
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
+    /// Optional one-secondary selective spilling for binary ScaNN. The
+    /// alternate leaf is chosen by exact centroid Hamming distance. Unlike
+    /// float SOAR, packed bits have no continuous residual geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soar: Option<crate::structures::SoarConfig>,
 }
 
 /// ANN index type for binary dense vector fields
@@ -434,6 +665,17 @@ pub enum BinaryIndexType {
     /// IVF with a global k-majority Hamming quantizer
     #[default]
     Ivf,
+    /// Hierarchical Hamming partitioning with exact packed-code leaf scoring.
+    Scann,
+}
+
+/// Complete target ANN configuration for an atomic vector-index ALTER.
+/// Storage shape is deliberately included for validation but cannot change:
+/// ALTER rewrites ANN payloads from retained flat vectors, not stored vectors.
+#[derive(Debug, Clone)]
+pub enum VectorIndexAlter {
+    Dense(DenseVectorConfig),
+    Binary(BinaryDenseVectorConfig),
 }
 
 impl BinaryDenseVectorConfig {
@@ -446,8 +688,11 @@ impl BinaryDenseVectorConfig {
             dim,
             index_type: BinaryIndexType::Ivf,
             num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: IvfRoutingMode::Auto,
             nprobe: 64,
+            soar: None,
         }
     }
 
@@ -459,17 +704,43 @@ impl BinaryDenseVectorConfig {
         self
     }
 
+    /// Hint the expected steady-state corpus size for automatic topology.
+    pub fn with_target_vectors(mut self, target_vectors: u64) -> Self {
+        self.target_vectors = Some(target_vectors);
+        self
+    }
+
     /// Set flat, two-level, or HNSW IVF centroid routing explicitly.
     pub fn with_ivf_routing(mut self, routing: IvfRoutingMode) -> Self {
         self.ivf_routing = routing;
         self
     }
 
-    /// Optimal cluster count for a given vector count (sqrt(n), capped)
+    /// Enable selective secondary-leaf spilling for binary ScaNN.
+    pub fn with_soar(mut self, soar: crate::structures::SoarConfig) -> Self {
+        self.soar = Some(soar);
+        self
+    }
+
+    /// Disable binary ScaNN secondary-leaf spilling.
+    pub fn without_soar(mut self) -> Self {
+        self.soar = None;
+        self
+    }
+
+    /// Balanced binary IVF cluster count for a given vector count.
     pub fn optimal_num_clusters(&self, num_vectors: usize) -> usize {
         self.num_clusters.unwrap_or_else(|| {
-            let optimal = 8.0 * (num_vectors as f64).sqrt();
-            (optimal as usize).clamp(16, 1_048_576)
+            let num_vectors = self.target_vectors.map_or(num_vectors, |target| {
+                usize::try_from(target)
+                    .unwrap_or(usize::MAX)
+                    .max(num_vectors)
+            });
+            // The 15M-row packed-Hamming sweep found the balanced sqrt(N)
+            // geometry Pareto-optimal for practical recall/latency targets.
+            // Larger, search-quality geometries remain available explicitly.
+            let balanced = (num_vectors as f64).sqrt().ceil() as usize;
+            balanced.clamp(16, 1_048_576)
         })
     }
 
@@ -516,6 +787,64 @@ impl Schema {
 
     pub fn get_field_entry(&self, field: Field) -> Option<&FieldEntry> {
         self.fields.get(field.0 as usize)
+    }
+
+    /// Clone this schema with one vector field's ANN parameters replaced.
+    /// Field type, dimension, and storage quantization are immutable.
+    pub fn with_vector_index_alter(
+        &self,
+        field: Field,
+        alter: VectorIndexAlter,
+    ) -> Result<Self, String> {
+        let mut next = self.clone();
+        let entry = next
+            .fields
+            .get_mut(field.0 as usize)
+            .ok_or_else(|| format!("vector ALTER references unknown field {}", field.0))?;
+        match alter {
+            VectorIndexAlter::Dense(config) => {
+                let current = entry
+                    .dense_vector_config
+                    .as_ref()
+                    .ok_or_else(|| format!("field '{}' is not a dense vector field", entry.name))?;
+                if config.dim != current.dim || config.quantization != current.quantization {
+                    return Err(format!(
+                        "field '{}' ALTER cannot change dimension or storage quantization",
+                        entry.name
+                    ));
+                }
+                if matches!(
+                    config.index_type,
+                    VectorIndexType::Flat | VectorIndexType::Tq
+                ) {
+                    return Err(format!(
+                        "field '{}' ALTER target must be `ivf_tq` or `scann`",
+                        entry.name
+                    ));
+                }
+                entry.dense_vector_config = Some(config);
+            }
+            VectorIndexAlter::Binary(config) => {
+                let current = entry.binary_dense_vector_config.as_ref().ok_or_else(|| {
+                    format!("field '{}' is not a binary dense vector field", entry.name)
+                })?;
+                if config.dim != current.dim {
+                    return Err(format!(
+                        "field '{}' ALTER cannot change binary dimension",
+                        entry.name
+                    ));
+                }
+                if config.index_type == BinaryIndexType::Flat {
+                    return Err(format!(
+                        "field '{}' ALTER target must be `ivf` or `scann`",
+                        entry.name
+                    ));
+                }
+                entry.binary_dense_vector_config = Some(config);
+            }
+        }
+        reject_removed_vector_index_types(&next)?;
+        Ok(next)
     }
 
     pub fn get_field_name(&self, field: Field) -> Option<&str> {
@@ -1310,6 +1639,81 @@ mod tests {
     }
 
     #[test]
+    fn binary_ivf_uses_measured_balanced_fifteen_million_geometry() {
+        let config = BinaryDenseVectorConfig::new(2_560);
+        assert_eq!(config.optimal_num_clusters(15_000_000), 3_873);
+
+        let explicit = config.with_ivf(Some(8_192), 128);
+        assert_eq!(explicit.optimal_num_clusters(15_000_000), 8_192);
+    }
+
+    #[test]
+    fn target_vectors_sizes_automatic_topology_but_explicit_clusters_win() {
+        let hinted = BinaryDenseVectorConfig::new(2_560).with_target_vectors(1_000_000_000);
+        assert_eq!(hinted.optimal_num_clusters(1_000_000), 31_623);
+
+        let lower_hint = BinaryDenseVectorConfig::new(2_560).with_target_vectors(1_000_000);
+        assert_eq!(
+            lower_hint.optimal_num_clusters(15_000_000),
+            BinaryDenseVectorConfig::new(2_560).optimal_num_clusters(15_000_000),
+            "a steady-state hint is a lower bound and must not shrink live-corpus geometry"
+        );
+
+        let explicit = hinted.with_ivf(Some(8_192), 128);
+        assert_eq!(explicit.optimal_num_clusters(1_000_000), 8_192);
+
+        let float = DenseVectorConfig::ivf_tq(1_024, None, 64).with_target_vectors(1_000_000_000);
+        assert_eq!(float.optimal_num_clusters(1_000_000), 252_982);
+    }
+
+    #[test]
+    fn persisted_target_vectors_must_be_positive_and_topology_bearing() {
+        let mut zero = BinaryDenseVectorConfig::new(256);
+        zero.target_vectors = Some(0);
+        let mut builder = Schema::builder();
+        builder.add_binary_dense_vector_field_with_config("hash", true, false, zero);
+        let error = reject_removed_vector_index_types(&builder.build()).unwrap_err();
+        assert!(error.contains("positive steady-state"), "{error}");
+
+        let hinted = DenseVectorConfig::ivf_tq(128, None, 64).with_target_vectors(1_000_000_000);
+        let encoded = serde_json::to_value(&hinted).unwrap();
+        let decoded: DenseVectorConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.target_vectors, Some(1_000_000_000));
+
+        let binary = BinaryDenseVectorConfig::new(2_560).with_target_vectors(1_000_000_000);
+        let encoded = serde_json::to_value(&binary).unwrap();
+        let decoded: BinaryDenseVectorConfig = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.target_vectors, Some(1_000_000_000));
+
+        let old_dense: DenseVectorConfig = serde_json::from_value(serde_json::json!({
+            "dim": 128,
+            "index_type": "ivf_tq"
+        }))
+        .unwrap();
+        assert_eq!(old_dense.target_vectors, None);
+        let old_binary: BinaryDenseVectorConfig = serde_json::from_value(serde_json::json!({
+            "dim": 256,
+            "index_type": "ivf"
+        }))
+        .unwrap();
+        assert_eq!(old_binary.target_vectors, None);
+
+        let flat = DenseVectorConfig::flat(128).with_target_vectors(1_000_000);
+        let mut builder = Schema::builder();
+        builder.add_dense_vector_field_with_config("embedding", true, false, flat);
+        let error = reject_removed_vector_index_types(&builder.build()).unwrap_err();
+        assert!(error.contains("flat/training-free"), "{error}");
+
+        let mut binary_flat = BinaryDenseVectorConfig::new(256);
+        binary_flat.index_type = BinaryIndexType::Flat;
+        binary_flat.target_vectors = Some(1_000_000);
+        let mut builder = Schema::builder();
+        builder.add_binary_dense_vector_field_with_config("hash", true, false, binary_flat);
+        let error = reject_removed_vector_index_types(&builder.build()).unwrap_err();
+        assert!(error.contains("flat/training-free"), "{error}");
+    }
+
+    #[test]
     fn omitted_and_explicitly_disabled_soar_are_distinct_in_serde() {
         let omitted: DenseVectorConfig = serde_json::from_value(serde_json::json!({
             "dim": 8,
@@ -1339,6 +1743,96 @@ mod tests {
             round_trip.soar.is_none(),
             "explicit off must survive a schema round trip"
         );
+    }
+
+    #[test]
+    fn scann_config_serde_preserves_old_json_defaults_and_new_parameters() {
+        let old_dense: DenseVectorConfig = serde_json::from_value(serde_json::json!({
+            "dim": 768,
+            "index_type": "ivf_tq"
+        }))
+        .unwrap();
+        assert_eq!(old_dense.tree_levels, None);
+        let old_json = serde_json::to_value(&old_dense).unwrap();
+        assert!(old_json.get("tree_levels").is_none());
+
+        let scann: DenseVectorConfig = serde_json::from_value(serde_json::json!({
+            "dim": 1024,
+            "index_type": "scann",
+            "num_clusters": 10_000_000,
+            "tree_levels": 2,
+            "nprobe": 1024
+        }))
+        .unwrap();
+        assert_eq!(scann.index_type, VectorIndexType::Scann);
+        assert_eq!(scann.tree_levels, Some(2));
+        assert!(scann.soar.is_none());
+
+        let binary: BinaryDenseVectorConfig = serde_json::from_value(serde_json::json!({
+            "dim": 1024,
+            "index_type": "scann",
+            "tree_levels": 3
+        }))
+        .unwrap();
+        assert_eq!(binary.index_type, BinaryIndexType::Scann);
+        assert_eq!(binary.tree_levels, Some(3));
+    }
+
+    #[test]
+    fn persisted_scann_geometry_is_validated_on_schema_load() {
+        let mut invalid_levels = DenseVectorConfig::new(128);
+        invalid_levels.index_type = VectorIndexType::Scann;
+        invalid_levels.tree_levels = Some(4);
+        invalid_levels.soar = None;
+        let mut builder = Schema::builder();
+        builder.add_dense_vector_field_with_config("embedding", true, false, invalid_levels);
+        let error = reject_removed_vector_index_types(&builder.build())
+            .expect_err("invalid persisted ScaNN levels must fail at the schema gate");
+        assert!(error.contains("1..=3"), "{error}");
+
+        let mut wrong_algorithm = BinaryDenseVectorConfig::new(256);
+        wrong_algorithm.tree_levels = Some(2);
+        let mut builder = Schema::builder();
+        builder.add_binary_dense_vector_field_with_config("hash", true, false, wrong_algorithm);
+        let error = reject_removed_vector_index_types(&builder.build())
+            .expect_err("ScaNN-only persisted options must fail on IVF");
+        assert!(error.contains("does not use the ScaNN index"), "{error}");
+
+        let mut invalid_soar = DenseVectorConfig::flat(128);
+        invalid_soar.index_type = VectorIndexType::Scann;
+        invalid_soar.nprobe = 1;
+        invalid_soar.soar = Some(crate::structures::SoarConfig::default());
+        let mut builder = Schema::builder();
+        builder.add_dense_vector_field_with_config("embedding", true, false, invalid_soar);
+        let error = reject_removed_vector_index_types(&builder.build())
+            .expect_err("persisted ScaNN SOAR must fail until assignments exist");
+        assert!(error.contains("not implemented"), "{error}");
+
+        let mut one_leaf = DenseVectorConfig::flat(128);
+        one_leaf.index_type = VectorIndexType::Scann;
+        one_leaf.num_clusters = Some(1);
+        one_leaf.nprobe = 1;
+        let mut builder = Schema::builder();
+        builder.add_dense_vector_field_with_config("embedding", true, false, one_leaf);
+        let error = reject_removed_vector_index_types(&builder.build())
+            .expect_err("one-leaf ScaNN geometry must fail at schema load");
+        assert!(error.contains("2..=30000000"), "{error}");
+
+        let binary = BinaryDenseVectorConfig {
+            dim: 255,
+            index_type: BinaryIndexType::Scann,
+            num_clusters: Some(2),
+            target_vectors: None,
+            tree_levels: Some(1),
+            ivf_routing: IvfRoutingMode::Auto,
+            nprobe: 1,
+            soar: None,
+        };
+        let mut builder = Schema::builder();
+        builder.add_binary_dense_vector_field_with_config("hash", true, false, binary);
+        let error = reject_removed_vector_index_types(&builder.build())
+            .expect_err("binary ScaNN dimensions must be byte-aligned");
+        assert!(error.contains("multiple of 8"), "{error}");
     }
 
     #[test]

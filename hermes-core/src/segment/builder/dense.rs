@@ -128,6 +128,21 @@ fn build_dense_ann_blob(
             )
             .map(|bytes| (super::super::ann_build::IVF_TQ_TYPE, bytes))
         }
+        VectorIndexType::Scann => {
+            if config.soar.is_some() {
+                return Err(crate::Error::Schema(format!(
+                    "ScaNN field {field_id} enables SOAR, but ScaNN SOAR secondary assignments are not implemented; set soar: null before building"
+                )));
+            }
+            let Some(artifact) = trained.and_then(|trained| trained.scann_artifacts.get(&field_id))
+            else {
+                // Geometry-derived deferred training intentionally keeps new
+                // segments flat until the first global generation is ready.
+                return Ok(None);
+            };
+            super::super::ann_build::build_scann_ah(artifact, &builder.doc_ids, &builder.vectors)
+                .map(|bytes| (super::super::ann_build::SCANN_AH_TYPE, bytes))
+        }
         _ => return Ok(None),
     };
     let (index_type, bytes) = blob?;
@@ -407,6 +422,47 @@ pub(super) fn build_vectors_streaming(
                     quantizer.num_clusters,
                     crate::format_bytes(blob_len),
                 );
+            }
+            if let Some(cfg) = binary_config
+                && cfg.index_type == crate::dsl::BinaryIndexType::Scann
+                && let Some(artifact) =
+                    trained.and_then(|trained| trained.scann_artifacts.get(&field_id))
+            {
+                let doc_count = builder
+                    .doc_ids
+                    .iter()
+                    .map(|&(doc_id, _)| doc_id)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        crate::Error::Corruption("binary ScaNN doc count overflows".into())
+                    })?;
+                let mut payload_builder = crate::segment::ann_build::BinaryScannPayloadBuilder::new(
+                    artifact,
+                    cfg.soar.as_ref(),
+                );
+                payload_builder.add_batch(&builder.doc_ids, &builder.vectors)?;
+                let payload = payload_builder.finish(doc_count)?;
+                let blob_offset = current_offset;
+                let blob_len = crate::segment::ann_disk::write_built_scann(&payload, &mut *writer)
+                    .map_err(crate::Error::Io)?;
+                current_offset = current_offset.checked_add(blob_len).ok_or_else(|| {
+                    crate::Error::Internal("binary ScaNN output offset exceeds u64".into())
+                })?;
+                toc.push(DenseVectorTocEntry {
+                    field_id,
+                    index_type: super::super::ann_build::SCANN_BINARY_TYPE,
+                    offset: blob_offset,
+                    size: blob_len,
+                });
+                let pad = (8 - (current_offset % 8)) % 8;
+                if pad > 0 {
+                    writer.write_all(&[0u8; 8][..pad as usize])?;
+                    current_offset = current_offset.checked_add(pad).ok_or_else(|| {
+                        crate::Error::Internal("vector output padding exceeds u64".into())
+                    })?;
+                }
             }
         }
     }

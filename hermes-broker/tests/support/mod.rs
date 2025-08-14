@@ -255,6 +255,17 @@ impl IndexService for MockBackend {
         self.check_available()?;
         Ok(Response::new(RetrainVectorIndexResponse { success: true }))
     }
+
+    async fn alter_vector_index(
+        &self,
+        _request: Request<AlterVectorIndexRequest>,
+    ) -> Result<Response<AlterVectorIndexResponse>, Status> {
+        self.check_available()?;
+        Ok(Response::new(AlterVectorIndexResponse {
+            publication_generation: 1,
+            state: VectorIndexAlterState::Built.into(),
+        }))
+    }
 }
 
 /// The real hermes-broker binary running against test backends. Killed on drop.

@@ -69,6 +69,10 @@ pub(crate) enum AnnKind {
     TqFlat = 3,
     /// Trained IVF router with TurboQuant-coded centroid residuals.
     IvfTq = 4,
+    /// ScaNN float leaves encoded with 4-bit asymmetric hashes.
+    ScannAh = 5,
+    /// ScaNN binary leaves retaining exact packed vectors for Hamming scan.
+    ScannBinary = 6,
 }
 
 impl AnnKind {
@@ -81,6 +85,8 @@ impl AnnKind {
             2 => Ok(Self::BinaryIvf),
             3 => Ok(Self::TqFlat),
             4 => Ok(Self::IvfTq),
+            5 => Ok(Self::ScannAh),
+            6 => Ok(Self::ScannBinary),
             _ => Err(invalid_data(format!("unknown ANN kind {value}"))),
         }
     }
@@ -89,9 +95,14 @@ impl AnnKind {
 /// Codes-column byte length for one run. TQ packs vectors into 16-lane
 /// blocks (gammas + dimension-major nibbles), so its column is block-padded
 /// rather than `count * code_size`.
-fn expected_codes_column_len(kind: AnnKind, count: usize, code_size: usize) -> io::Result<usize> {
+fn expected_codes_column_len(
+    kind: AnnKind,
+    count: usize,
+    dim: usize,
+    code_size: usize,
+) -> io::Result<usize> {
     match kind {
-        AnnKind::BinaryIvf => count
+        AnnKind::BinaryIvf | AnnKind::ScannBinary => count
             .checked_mul(code_size)
             .ok_or_else(|| invalid_data("ANN code column size overflows usize")),
         // Single source of truth for the block-packed layouts lives in tq.rs.
@@ -103,6 +114,20 @@ fn expected_codes_column_len(kind: AnnKind, count: usize, code_size: usize) -> i
             count, code_size,
         )
         .ok_or_else(|| invalid_data("IVF-TQ code column size overflows usize")),
+        // For ScaNN AH, `code_size` stores dimensions-per-block. This is the
+        // one encoding parameter not derivable from the fixed ANN header;
+        // the actual byte length remains count-dependent because complete
+        // 32-row FastScan blocks interleave their nibbles.
+        AnnKind::ScannAh => crate::structures::vector::scann::ScannEncoding::AsymmetricHash {
+            dimensions_per_block: u16::try_from(code_size)
+                .map_err(|_| invalid_data("ScaNN AH block dimension exceeds u16"))?,
+            bits_per_code: 4,
+        }
+        .leaf_code_bytes(
+            u32::try_from(dim).map_err(|_| invalid_data("ScaNN dimension exceeds u32"))?,
+            count,
+        )
+        .map_err(|error| invalid_data(error.to_string())),
     }
 }
 
@@ -329,7 +354,7 @@ impl AnnDiskIndex {
             let ordinals_len = count
                 .checked_mul(std::mem::size_of::<u16>())
                 .ok_or_else(|| invalid_data("ANN ordinal column size overflows usize"))?;
-            let expected_codes_len = expected_codes_column_len(kind, count, code_size)?;
+            let expected_codes_len = expected_codes_column_len(kind, count, dim, code_size)?;
             let doc_ids_end = doc_ids_offset
                 .checked_add(doc_ids_len)
                 .ok_or_else(|| invalid_data("ANN doc-ID range overflows usize"))?;
@@ -495,6 +520,89 @@ impl AnnDiskIndex {
 
     pub(crate) fn header(&self) -> &AnnDiskHeader {
         &self.header
+    }
+
+    /// Refuse to pair a segment payload with any global ScaNN model other
+    /// than the exact generation that encoded it.
+    pub(crate) fn validate_scann_generation(
+        &self,
+        config: &crate::structures::vector::scann::ScannConfig,
+        generation: u64,
+        artifact_id: u64,
+    ) -> io::Result<()> {
+        use crate::structures::vector::scann::ScannEncoding;
+
+        let expected_kind = match config.encoding {
+            ScannEncoding::AsymmetricHash { .. } => AnnKind::ScannAh,
+            ScannEncoding::BinaryHamming => AnnKind::ScannBinary,
+        };
+        if self.header.kind != expected_kind
+            || self.header.routing != IvfRoutingMode::Flat
+            || self.header.dim != config.dimension as usize
+            || self.header.num_clusters != config.num_leaves
+            || self.header.quantizer_version != generation
+            || self.header.codebook_version != artifact_id
+        {
+            return Err(invalid_data(
+                "ScaNN ANN payload does not match the global trained generation",
+            ));
+        }
+        match config.encoding {
+            ScannEncoding::AsymmetricHash {
+                dimensions_per_block,
+                bits_per_code: 4,
+            } if self.header.code_size == usize::from(dimensions_per_block) => Ok(()),
+            ScannEncoding::BinaryHamming
+                if self.header.code_size == config.dimension as usize / 8 =>
+            {
+                Ok(())
+            }
+            _ => Err(invalid_data(
+                "ScaNN ANN payload encoding does not match the global trained artifact",
+            )),
+        }
+    }
+
+    /// Validate physical leaf postings against the logical flat-vector count.
+    /// Float ScaNN and primary-only binary ScaNN are exact. Binary spilling
+    /// may add at most one posting per logical vector, with target-fraction
+    /// policies retaining a stricter segment-local cap.
+    #[cfg(feature = "native")]
+    pub(crate) fn validate_scann_posting_count(
+        &self,
+        logical_vectors: usize,
+        soar: Option<&crate::structures::SoarConfig>,
+    ) -> io::Result<()> {
+        let spill_budget = match self.header.kind {
+            AnnKind::ScannAh => 0,
+            AnnKind::ScannBinary
+                if self.header.num_clusters > 1
+                    && soar.is_some_and(|config| config.num_secondary > 0) =>
+            {
+                match soar.and_then(crate::structures::SoarConfig::calibration_target) {
+                    Some(target_fraction) => {
+                        (logical_vectors as f64 * f64::from(target_fraction)).floor() as usize
+                    }
+                    None => logical_vectors,
+                }
+            }
+            AnnKind::ScannBinary => 0,
+            _ => {
+                return Err(invalid_data(
+                    "posting-count validation requires a ScaNN ANN payload",
+                ));
+            }
+        };
+        let maximum = logical_vectors
+            .checked_add(spill_budget)
+            .ok_or_else(|| invalid_data("ScaNN posting-count bound overflows usize"))?;
+        if self.header.vector_count < logical_vectors || self.header.vector_count > maximum {
+            return Err(invalid_data(format!(
+                "ScaNN ANN payload has {} physical postings for {logical_vectors} logical vectors; expected {logical_vectors}..={maximum}",
+                self.header.vector_count,
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
@@ -795,6 +903,75 @@ impl AnnDiskIndex {
             combiner,
             IVF_PARALLEL_SCAN_MIN_POSTINGS,
         )
+    }
+
+    /// Score float ScaNN AH codes in the routed leaves and retain approximate
+    /// document candidates for the shared exact-flat reranker.
+    pub(crate) fn search_scann_ah_combined_documents(
+        &self,
+        k: usize,
+        query: &crate::structures::vector::scann::FloatScannQuery,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> io::Result<Vec<AnnDocumentCandidate>> {
+        use crate::structures::vector::scann::{FAST_SCAN_LANES, FastScanQuery};
+
+        validate_combined_search(combiner)?;
+        if self.header.kind != AnnKind::ScannAh {
+            return Err(invalid_data(
+                "ScaNN AH query used with a different ANN payload",
+            ));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "native")]
+        self.prefetch_cluster_runs(query.routed_leaves());
+        let blocks = self.header.dim.div_ceil(self.header.code_size);
+        let packed_row_bytes = blocks.div_ceil(2);
+        let packed_block_bytes = blocks
+            .checked_mul(FAST_SCAN_LANES / 2)
+            .ok_or_else(|| invalid_data("ScaNN FastScan block size overflows"))?;
+        let fast_query = FastScanQuery::new(query.ah_query());
+        let bytes = self.raw.as_slice();
+        let mut ordinal_scores = Vec::new();
+        for &leaf in query.routed_leaves() {
+            let centroid_dot = query
+                .centroid_dot(leaf)
+                .ok_or_else(|| invalid_data("ScaNN routed leaf has no centroid score"))?;
+            for run in self.cluster_runs(leaf) {
+                let codes = &bytes[run.codes.clone()];
+                let full_blocks = run.count / FAST_SCAN_LANES;
+                for block_index in 0..full_blocks {
+                    let start = block_index * packed_block_bytes;
+                    let scores = fast_query
+                        .score_block(&codes[start..start + packed_block_bytes], centroid_dot)
+                        .map_err(|error| invalid_data(error.to_string()))?;
+                    for (lane, &score) in scores.iter().enumerate() {
+                        let row = block_index * FAST_SCAN_LANES + lane;
+                        ordinal_scores.push((
+                            run_doc_id(bytes, run, row)?,
+                            read_u16(bytes, run.ordinals.start + row * 2),
+                            score,
+                        ));
+                    }
+                }
+                let tail_start = full_blocks * packed_block_bytes;
+                for tail in 0..run.count % FAST_SCAN_LANES {
+                    let start = tail_start + tail * packed_row_bytes;
+                    let score = query
+                        .ah_query()
+                        .score_packed(&codes[start..start + packed_row_bytes], centroid_dot)
+                        .map_err(|error| invalid_data(error.to_string()))?;
+                    let row = full_blocks * FAST_SCAN_LANES + tail;
+                    ordinal_scores.push((
+                        run_doc_id(bytes, run, row)?,
+                        read_u16(bytes, run.ordinals.start + row * 2),
+                        score,
+                    ));
+                }
+            }
+        }
+        Ok(combine_scored_ordinals(ordinal_scores, k, combiner))
     }
 
     fn search_binary_combined_documents_with_tuning(
@@ -1165,11 +1342,10 @@ impl AnnDiskIndex {
         self.prefetch_cluster_runs(cluster_ids);
         let bytes = self.raw.as_slice();
 
-        // A probe plan returns each leaf once and every indexed vector belongs
-        // to exactly one leaf, so `(doc_id, ordinal)` keys are unique in the
-        // common single-value path.
+        // A probe plan returns each leaf once. IVF has one posting per vector;
+        // binary ScaNN may intentionally spill a vector into a second leaf.
         debug_assert!(
-            BY_DOCUMENT || {
+            BY_DOCUMENT || self.header.kind == AnnKind::ScannBinary || {
                 let mut seen = rustc_hash::FxHashSet::default();
                 cluster_ids
                     .iter()
@@ -1217,8 +1393,8 @@ impl AnnDiskIndex {
         }
 
         let mut scores = vec![0.0f32; BINARY_SCORE_BATCH.min(self.header.vector_count)];
-        if BY_DOCUMENT {
-            let mut collector = BoundedAnnCollector::<true, true>::new(k);
+        if BY_DOCUMENT || self.header.kind == AnnKind::ScannBinary {
+            let mut collector = BoundedAnnCollector::<BY_DOCUMENT, true>::new(k);
             score_binary_cluster_runs(
                 self,
                 bytes,
@@ -1618,6 +1794,121 @@ pub(crate) fn write_built_binary_ivf(
     )
 }
 
+/// Serialize ScaNN segment-local leaf runs into Hermes's merge-native ANN
+/// format. The global model is not embedded: its generation and content
+/// fingerprint occupy the header's compatibility slots, so an ordinary merge
+/// can reject mixed models before copying any corpus bytes.
+#[cfg(feature = "native")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn write_built_scann(
+    payload: &crate::structures::vector::scann::ScannSegmentPayload,
+    writer: &mut (impl Write + ?Sized),
+) -> io::Result<u64> {
+    use crate::structures::vector::scann::ScannEncoding;
+
+    let (kind, code_size) = match payload.encoding {
+        ScannEncoding::AsymmetricHash {
+            dimensions_per_block,
+            bits_per_code: 4,
+        } => (AnnKind::ScannAh, usize::from(dimensions_per_block)),
+        ScannEncoding::AsymmetricHash { .. } => {
+            return Err(invalid_data(
+                "ScaNN ANN disk format supports only 4-bit AH codes",
+            ));
+        }
+        ScannEncoding::BinaryHamming => (
+            AnnKind::ScannBinary,
+            usize::try_from(payload.dimension)
+                .map_err(|_| invalid_data("ScaNN dimension exceeds usize"))?
+                .div_ceil(8),
+        ),
+    };
+    let vector_count = payload.runs().iter().try_fold(0usize, |total, run| {
+        total
+            .checked_add(run.row_count as usize)
+            .ok_or_else(|| invalid_data("ScaNN vector count overflows usize"))
+    })?;
+    let header = AnnDiskHeader {
+        kind,
+        // ScaNN owns its multi-level routing geometry in the global artifact;
+        // Flat is the reserved sentinel in the shared ANN header.
+        routing: IvfRoutingMode::Flat,
+        dim: usize::try_from(payload.dimension)
+            .map_err(|_| invalid_data("ScaNN dimension exceeds usize"))?,
+        code_size,
+        num_clusters: payload.num_leaves,
+        quantizer_version: payload.generation,
+        codebook_version: payload.artifact_id,
+        vector_count,
+    };
+    validate_header(&header)?;
+    write_header(writer, &header)?;
+
+    let mut offset = ANN_HEADER_SIZE as u64;
+    let mut records = Vec::with_capacity(payload.runs().len());
+    let mut previous_leaf = None;
+    for run in payload.runs() {
+        let count = run.row_count as usize;
+        let expected_docs = count
+            .checked_mul(4)
+            .ok_or_else(|| invalid_data("ScaNN doc-ID column size overflows usize"))?;
+        let expected_ordinals = count
+            .checked_mul(2)
+            .ok_or_else(|| invalid_data("ScaNN ordinal column size overflows usize"))?;
+        if count == 0
+            || run.leaf_id >= header.num_clusters
+            || previous_leaf.is_some_and(|leaf| leaf > run.leaf_id)
+            || run.doc_ids_le.len() != expected_docs
+            || run.ordinals_le.len() != expected_ordinals
+            || run.codes.len()
+                != expected_codes_column_len(header.kind, count, header.dim, header.code_size)?
+        {
+            return Err(invalid_data("ScaNN ANN leaf run columns are inconsistent"));
+        }
+        previous_leaf = Some(run.leaf_id);
+        let max_doc_id = run
+            .doc_ids_le
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .max()
+            .unwrap_or(0);
+        if run
+            .doc_base
+            .checked_add(max_doc_id)
+            .is_none_or(|doc_id| doc_id >= payload.doc_count)
+        {
+            return Err(invalid_data(
+                "ScaNN ANN leaf run document ID is out of range",
+            ));
+        }
+
+        let doc_ids_offset = offset;
+        writer.write_all(&run.doc_ids_le)?;
+        offset = checked_advance(offset, run.doc_ids_le.len())?;
+        let ordinals_offset = offset;
+        writer.write_all(&run.ordinals_le)?;
+        offset = checked_advance(offset, run.ordinals_le.len())?;
+        let codes_offset = offset;
+        writer.write_all(&run.codes)?;
+        offset = checked_advance(offset, run.codes.len())?;
+        records.push(RunRecord {
+            cluster_id: run.leaf_id,
+            doc_base: run.doc_base,
+            count: run.row_count,
+            max_doc_id,
+            doc_ids_offset,
+            ordinals_offset,
+            codes_offset,
+            codes_len: u64::try_from(run.codes.len())
+                .map_err(|_| invalid_data("ScaNN code output size exceeds u64"))?,
+        });
+    }
+    if records.is_empty() {
+        return Err(invalid_data("cannot write an empty ScaNN ANN payload"));
+    }
+    finish_layout(writer, offset, &records)
+}
+
 /// Serialize a populated IVF-TQ build: one run per non-empty leaf, codes
 /// block-packed per run (scales + gammas + dimension-major nibbles).
 #[cfg(feature = "native")]
@@ -1796,7 +2087,8 @@ fn write_built_runs(
             || run.cluster_id >= header.num_clusters
             || previous_cluster.is_some_and(|cluster| cluster >= run.cluster_id)
             || run.ordinals.len() != count
-            || run.codes.len() != expected_codes_column_len(header.kind, count, header.code_size)?
+            || run.codes.len()
+                != expected_codes_column_len(header.kind, count, header.dim, header.code_size)?
         {
             return Err(invalid_data("ANN build run columns are inconsistent"));
         }
@@ -1916,7 +2208,7 @@ pub(crate) fn predicted_merge_fragmentation(sources: &[(&AnnDiskIndex, u32)]) ->
 #[cfg(feature = "native")]
 const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
 
-/// Cluster-major compacting merge for binary IVF payloads.
+/// Cluster-major compacting merge for exact-binary and ScaNN-AH payloads.
 ///
 /// The byte-copy merge keeps each source payload as one physical extent, so a
 /// logical cluster's postings scatter across up to `sources.len()` extents —
@@ -1929,14 +2221,15 @@ const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
 /// Cost: the same total payload bytes the byte-copy merge already streams,
 /// plus one `u32` add per posting — document IDs are rewritten absolute
 /// (`doc_base = 0`) because runs from different sources cannot share a single
-/// directory entry otherwise. Codes and ordinals are copied verbatim.
+/// directory entry otherwise. Ordinals and binary codes are copied verbatim.
+/// ScaNN AH codes are decoded one row at a time into a single 32-row scratch
+/// block and repacked, because FastScan block/tail boundaries are run-local.
 ///
-/// Binary only: binary code columns are exactly `count × code_size`, so
-/// concatenating runs is trivially valid. TQ payloads pack codes into
-/// fixed-lane blocks with per-run tail padding; concatenating those without
-/// re-packing would corrupt block boundaries, so TQ merges stay byte-copy.
+/// TQ payloads also pack codes into fixed-lane blocks, but their quantized
+/// representation is intentionally outside this ScaNN compactor; TQ merges
+/// stay byte-copy.
 ///
-/// Every binary merge whose prediction is fragmented takes this path.
+/// Every supported merge whose prediction is fragmented takes this path.
 /// Measured (interleaved best-of-3, pre-faulted buffers, aarch64): byte-copy
 /// 38.0 GiB/s vs compaction 32.4 GiB/s — ~17% more CPU on a stage that is a
 /// rounding error of merge wall-clock (a production dense stage is ~0.7s of
@@ -1951,9 +2244,12 @@ pub(crate) fn write_compacted_ann_cancellable(
     let Some((first, _)) = sources.first() else {
         return Err(invalid_data("cannot compact an empty ANN source list"));
     };
-    if first.header.kind != AnnKind::BinaryIvf {
+    if !matches!(
+        first.header.kind,
+        AnnKind::BinaryIvf | AnnKind::ScannBinary | AnnKind::ScannAh
+    ) {
         return Err(invalid_data(
-            "ANN run compaction is only defined for binary IVF payloads",
+            "ANN run compaction is only defined for exact binary and ScaNN AH payloads",
         ));
     }
     let mut header = first.header.clone();
@@ -2060,19 +2356,78 @@ pub(crate) fn write_compacted_ann_cancellable(
             }
         }
 
-        // Pass 3: codes, verbatim — the dominant bytes.
+        // Pass 3: codes. Exact binary rows concatenate directly. ScaNN AH
+        // blocks are run-relative, so repack a continuous output stream.
         let codes_offset = offset;
-        for (source_index, &(source, _)) in sources.iter().enumerate() {
-            let mut cursor = cursors[source_index];
-            while let Some(run) = source
-                .runs
-                .get(cursor)
-                .filter(|run| run.cluster_id == cluster_id)
-            {
-                copy_range(writer, &source.raw, run.codes.clone(), cancellation)?;
-                offset = checked_advance(offset, run.codes.len())?;
-                cursor += 1;
+        if header.kind == AnnKind::ScannAh {
+            let blocks = header.dim.div_ceil(code_size);
+            let lanes = crate::structures::vector::scann::FAST_SCAN_LANES;
+            let mut unpacked = Vec::with_capacity(lanes * blocks);
+            let mut packed = Vec::with_capacity(blocks * lanes / 2);
+            for (source_index, &(source, _)) in sources.iter().enumerate() {
+                let mut cursor = cursors[source_index];
+                while let Some(run) = source
+                    .runs
+                    .get(cursor)
+                    .filter(|run| run.cluster_id == cluster_id)
+                {
+                    let bytes = &source.raw.as_slice()[run.codes.clone()];
+                    for row in 0..run.count {
+                        unpack_scann_ah_row(bytes, run.count, blocks, row, &mut unpacked)?;
+                        if unpacked.len() == lanes * blocks {
+                            packed.clear();
+                            crate::structures::vector::scann::pack_fast_scan_block(
+                                &unpacked,
+                                blocks,
+                                &mut packed,
+                            )
+                            .map_err(|error| invalid_data(error.to_string()))?;
+                            writer.write_all(&packed)?;
+                            offset = checked_advance(offset, packed.len())?;
+                            unpacked.clear();
+                            if cancellation
+                                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                            {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "ANN compaction cancelled",
+                                ));
+                            }
+                        }
+                    }
+                    cursor += 1;
+                }
             }
+            // One compacted run has one row-major tail, not one tail per
+            // source run. Pack each remaining row's adjacent block nibbles.
+            if !unpacked.is_empty() {
+                packed.clear();
+                for row in unpacked.chunks_exact(blocks) {
+                    for pair in row.chunks(2) {
+                        packed.push(pair[0] | (pair.get(1).copied().unwrap_or(0) << 4));
+                    }
+                }
+                writer.write_all(&packed)?;
+                offset = checked_advance(offset, packed.len())?;
+            }
+        } else {
+            for (source_index, &(source, _)) in sources.iter().enumerate() {
+                let mut cursor = cursors[source_index];
+                while let Some(run) = source
+                    .runs
+                    .get(cursor)
+                    .filter(|run| run.cluster_id == cluster_id)
+                {
+                    copy_range(writer, &source.raw, run.codes.clone(), cancellation)?;
+                    offset = checked_advance(offset, run.codes.len())?;
+                    cursor += 1;
+                }
+            }
+        }
+        let expected_codes_len =
+            expected_codes_column_len(header.kind, count, header.dim, header.code_size)?;
+        if offset - codes_offset != expected_codes_len as u64 {
+            return Err(invalid_data("compacted ANN code column length mismatch"));
         }
 
         // Consume this cluster's runs from every cursor.
@@ -2096,8 +2451,9 @@ pub(crate) fn write_compacted_ann_cancellable(
             ordinals_offset,
             codes_offset,
             codes_len: u64::try_from(expected_codes_column_len(
-                AnnKind::BinaryIvf,
+                header.kind,
                 count,
+                header.dim,
                 code_size,
             )?)
             .map_err(|_| invalid_data("compacted ANN code length exceeds u64"))?,
@@ -2108,6 +2464,45 @@ pub(crate) fn write_compacted_ann_cancellable(
         return Err(invalid_data("cannot compact an ANN payload with no runs"));
     }
     finish_layout(writer, offset, &records)
+}
+
+/// Append one ScaNN-AH row as unpacked 4-bit block codes. Complete 32-row
+/// groups are block-major; each run's final partial group is row-major.
+#[cfg(feature = "native")]
+fn unpack_scann_ah_row(
+    codes: &[u8],
+    count: usize,
+    blocks: usize,
+    row: usize,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    let lanes = crate::structures::vector::scann::FAST_SCAN_LANES;
+    let full_rows = count / lanes * lanes;
+    let full_block_bytes = blocks
+        .checked_mul(lanes / 2)
+        .ok_or_else(|| invalid_data("ScaNN AH block size overflows usize"))?;
+    let tail_row_bytes = blocks.div_ceil(2);
+    for block in 0..blocks {
+        let (byte_offset, high) = if row < full_rows {
+            let lane = row % lanes;
+            (
+                (row / lanes) * full_block_bytes + block * (lanes / 2) + lane / 2,
+                !lane.is_multiple_of(2),
+            )
+        } else {
+            (
+                (full_rows / lanes) * full_block_bytes
+                    + (row - full_rows) * tail_row_bytes
+                    + block / 2,
+                !block.is_multiple_of(2),
+            )
+        };
+        let byte = *codes
+            .get(byte_offset)
+            .ok_or_else(|| invalid_data("ScaNN AH row exceeds its code column"))?;
+        output.push(if high { byte >> 4 } else { byte & 0x0f });
+    }
+    Ok(())
 }
 
 /// [`run_doc_id`] against an explicit base, for rewriting IDs absolute.
@@ -2171,7 +2566,12 @@ fn write_merged_ann_impl(
             || run.cluster_id >= header.num_clusters
             || run.ordinals.len() != run.doc_ids.len()
             || run.codes.len()
-                != expected_codes_column_len(header.kind, run.doc_ids.len(), header.code_size)?
+                != expected_codes_column_len(
+                    header.kind,
+                    run.doc_ids.len(),
+                    header.dim,
+                    header.code_size,
+                )?
         {
             return Err(invalid_data("extra ANN merge run columns are inconsistent"));
         }
@@ -2493,6 +2893,11 @@ fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
             && (header.codebook_version != 0
                 || !header.dim.is_multiple_of(8)
                 || header.code_size != header.dim.div_ceil(8)))
+        || (header.kind == AnnKind::ScannBinary
+            && (header.codebook_version == 0
+                || header.routing != IvfRoutingMode::Flat
+                || !header.dim.is_multiple_of(8)
+                || header.code_size != header.dim / 8))
         || (header.kind == AnnKind::TqFlat
             && (header.codebook_version != 0
                 || header.num_clusters != 1
@@ -2505,6 +2910,17 @@ fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
             && (header.codebook_version == 0
                 || header.code_size * 2
                     != crate::structures::vector::quantization::tq_padded_dim(header.dim)))
+        || (header.kind == AnnKind::ScannAh
+            && (header.codebook_version == 0
+                || header.routing != IvfRoutingMode::Flat
+                || u16::try_from(header.code_size).is_err()
+                || u32::try_from(header.dim).is_err()
+                || crate::structures::vector::scann::ScannEncoding::AsymmetricHash {
+                    dimensions_per_block: header.code_size as u16,
+                    bits_per_code: 4,
+                }
+                .row_code_bytes(u32::try_from(header.dim).unwrap_or(0))
+                .is_err()))
     {
         return Err(invalid_data("ANN header contains invalid metadata"));
     }
@@ -2694,6 +3110,90 @@ mod tests {
         let mut docs: Vec<u32> = all.iter().map(|&(doc, _, _)| doc).collect();
         docs.sort_unstable();
         assert_eq!(docs, (0..=12).collect::<Vec<u32>>());
+    }
+
+    #[test]
+    fn compacted_scann_ah_repacks_blocks_across_run_boundaries() {
+        use crate::structures::vector::scann::{FAST_SCAN_LANES, pack_fast_scan_block};
+
+        const DIM: usize = 8;
+        const DIMS_PER_BLOCK: usize = 2;
+        const BLOCKS: usize = DIM / DIMS_PER_BLOCK;
+
+        let make_rows = |start: usize, count: usize| -> Vec<u8> {
+            (0..count)
+                .flat_map(|row| {
+                    (0..BLOCKS).map(move |block| ((start + row * 3 + block * 5) & 0x0f) as u8)
+                })
+                .collect()
+        };
+        let encode = |rows: &[u8]| -> Vec<u8> {
+            let count = rows.len() / BLOCKS;
+            let full_rows = count / FAST_SCAN_LANES * FAST_SCAN_LANES;
+            let mut codes = Vec::new();
+            for group in rows[..full_rows * BLOCKS].chunks_exact(FAST_SCAN_LANES * BLOCKS) {
+                pack_fast_scan_block(group, BLOCKS, &mut codes).unwrap();
+            }
+            for row in rows[full_rows * BLOCKS..].chunks_exact(BLOCKS) {
+                for pair in row.chunks(2) {
+                    codes.push(pair[0] | (pair.get(1).copied().unwrap_or(0) << 4));
+                }
+            }
+            codes
+        };
+        let make_source = |rows: &[u8]| {
+            let count = rows.len() / BLOCKS;
+            let docs: Vec<u32> = (0..count as u32).collect();
+            let ordinals = vec![0u16; count];
+            let codes = encode(rows);
+            let run = BuildRun {
+                cluster_id: 0,
+                doc_ids: &docs,
+                ordinals: &ordinals,
+                codes: &codes,
+            };
+            let header = AnnDiskHeader {
+                kind: AnnKind::ScannAh,
+                routing: IvfRoutingMode::Flat,
+                dim: DIM,
+                code_size: DIMS_PER_BLOCK,
+                num_clusters: 1,
+                quantizer_version: 41,
+                codebook_version: 73,
+                vector_count: count,
+            };
+            let mut bytes = Vec::new();
+            write_built_runs(header, &[run], &mut bytes).unwrap();
+            AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, count as u32).unwrap()
+        };
+
+        // The first source has a complete FastScan group plus a tail; the
+        // second tail completes a new cross-source group plus an output tail.
+        let left_rows = make_rows(1, 35);
+        let right_rows = make_rows(9, 30);
+        let left = make_source(&left_rows);
+        let right = make_source(&right_rows);
+        let mut bytes = Vec::new();
+        write_compacted_ann_cancellable(&[(&left, 0), (&right, 35)], &mut bytes, None).unwrap();
+        let compacted = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, 65).unwrap();
+
+        assert_eq!(compacted.runs.len(), 1);
+        assert!((compacted.health().fragmentation() - 1.0).abs() < 1e-9);
+        let run = &compacted.runs[0];
+        let codes = &compacted.raw.as_slice()[run.codes.clone()];
+        let mut decoded = Vec::new();
+        for row in 0..run.count {
+            unpack_scann_ah_row(codes, run.count, BLOCKS, row, &mut decoded).unwrap();
+        }
+        let mut expected = left_rows;
+        expected.extend_from_slice(&right_rows);
+        assert_eq!(decoded, expected);
+        for row in 0..65 {
+            assert_eq!(
+                run_doc_id(compacted.raw.as_slice(), run, row).unwrap(),
+                row as u32
+            );
+        }
     }
 
     /// Compaction is undefined for block-packed TQ codes and must refuse.
@@ -3562,5 +4062,254 @@ mod tests {
         .unwrap();
         bytes[directory + 12..directory + 16].copy_from_slice(&10u32.to_le_bytes());
         assert!(AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 1).is_err());
+    }
+
+    fn scann_binary_artifact(
+        generation: u64,
+    ) -> crate::structures::vector::scann::ScannTrainedArtifact {
+        use crate::structures::vector::scann::{
+            ScannConfig, ScannEncoding, ScannRoutingLevel, ScannTrainedArtifact,
+        };
+        ScannTrainedArtifact::new(
+            generation,
+            100_000,
+            ScannConfig {
+                dimension: 16,
+                tree_levels: 1,
+                num_leaves: 2,
+                encoding: ScannEncoding::BinaryHamming,
+            },
+            vec![ScannRoutingLevel {
+                centroid_count: 2,
+                centroid_codes: vec![0, 0, 0xff, 0xff],
+                minimums: Vec::new(),
+                steps: Vec::new(),
+                child_offsets: Vec::new(),
+            }],
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scann_binary_ann_round_trip_validates_exact_global_generation() {
+        use crate::structures::vector::scann::{
+            ScannEncoding, ScannLeafRun, ScannSegmentPayload, ScannTrainedArtifactView,
+        };
+
+        let artifact = scann_binary_artifact(41);
+        let primary = ScannLeafRun::from_rows(
+            0,
+            0,
+            &[0, 1],
+            &[0, 2],
+            vec![0x12, 0x34, 0xab, 0xcd],
+            ScannEncoding::BinaryHamming,
+            16,
+        )
+        .unwrap();
+        let secondary = ScannLeafRun::from_rows(
+            1,
+            0,
+            &[0],
+            &[0],
+            vec![0x12, 0x34],
+            ScannEncoding::BinaryHamming,
+            16,
+        )
+        .unwrap();
+        let payload = ScannSegmentPayload::new(&artifact, 2, vec![primary, secondary]).unwrap();
+        let mut bytes = Vec::new();
+        write_built_scann(&payload, &mut bytes).unwrap();
+
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannBinary, 2).unwrap();
+        assert_eq!(disk.header.quantizer_version, artifact.generation);
+        assert_eq!(disk.header.codebook_version, artifact.artifact_id);
+        assert_eq!(disk.header.vector_count, 3);
+        let artifact_bytes = artifact.to_bytes().unwrap();
+        let view = ScannTrainedArtifactView::parse(&artifact_bytes).unwrap();
+        disk.validate_scann_generation(&view.config, view.generation, view.artifact_id)
+            .unwrap();
+        let selective = crate::structures::SoarConfig::new().target_spill_fraction(0.5);
+        disk.validate_scann_posting_count(2, Some(&selective))
+            .unwrap();
+        assert!(
+            disk.validate_scann_posting_count(2, None)
+                .unwrap_err()
+                .to_string()
+                .contains("physical postings")
+        );
+        let too_small_budget = crate::structures::SoarConfig::new().target_spill_fraction(0.49);
+        assert!(
+            disk.validate_scann_posting_count(2, Some(&too_small_budget))
+                .is_err()
+        );
+
+        let serial = disk
+            .search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], usize::MAX)
+            .unwrap();
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                disk.search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], 1)
+            })
+            .unwrap();
+        assert_eq!(parallel, serial);
+        assert_eq!(serial.len(), 2, "secondary posting duplicated a result");
+        assert_eq!(serial[0], (0, 0, 1.0));
+
+        let other = scann_binary_artifact(42);
+        let other_bytes = other.to_bytes().unwrap();
+        let other_view = ScannTrainedArtifactView::parse(&other_bytes).unwrap();
+        let error = disk
+            .validate_scann_generation(
+                &other_view.config,
+                other_view.generation,
+                other_view.artifact_id,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("global trained generation"));
+    }
+
+    #[test]
+    fn scann_ah_ann_round_trip_preserves_fastscan_tail_geometry() {
+        use crate::structures::vector::scann::{
+            ScannAhCodebook, ScannConfig, ScannEncoding, ScannLeafRun, ScannRoutingLevel,
+            ScannSegmentPayload, ScannTrainedArtifact, ScannTrainedArtifactView,
+        };
+
+        let encoding = ScannEncoding::AsymmetricHash {
+            dimensions_per_block: 2,
+            bits_per_code: 4,
+        };
+        let artifact = ScannTrainedArtifact::new(
+            51,
+            100_000,
+            ScannConfig {
+                dimension: 8,
+                tree_levels: 1,
+                num_leaves: 2,
+                encoding,
+            },
+            vec![ScannRoutingLevel {
+                centroid_count: 2,
+                centroid_codes: vec![0; 16],
+                minimums: vec![0.0; 8],
+                steps: vec![1.0; 8],
+                child_offsets: Vec::new(),
+            }],
+            Some(ScannAhCodebook {
+                dimensions_per_block: 2,
+                centers_per_block: 16,
+                centers: vec![0.0; 4 * 16 * 2],
+            }),
+        )
+        .unwrap();
+        let docs: Vec<u32> = (0..33).collect();
+        let ordinals = vec![0u16; docs.len()];
+        let codes = vec![0x5a; encoding.leaf_code_bytes(8, docs.len()).unwrap()];
+        let run = ScannLeafRun::from_rows(0, 0, &docs, &ordinals, codes, encoding, 8).unwrap();
+        let payload = ScannSegmentPayload::new(&artifact, 33, vec![run]).unwrap();
+        let mut bytes = Vec::new();
+        write_built_scann(&payload, &mut bytes).unwrap();
+
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, 33).unwrap();
+        assert_eq!(
+            disk.runs[0].codes.len(),
+            encoding.leaf_code_bytes(8, 33).unwrap()
+        );
+        let artifact_bytes = artifact.to_bytes().unwrap();
+        let view = ScannTrainedArtifactView::parse(&artifact_bytes).unwrap();
+        disk.validate_scann_generation(&view.config, view.generation, view.artifact_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn scann_binary_merge_copies_codes_and_rebases_without_retraining() {
+        use crate::structures::vector::scann::{ScannEncoding, ScannLeafRun, ScannSegmentPayload};
+
+        let artifact = scann_binary_artifact(61);
+        let make = |codes: Vec<u8>| {
+            let secondary_code = codes[..2].to_vec();
+            let primary = ScannLeafRun::from_rows(
+                0,
+                0,
+                &[0, 1],
+                &[0, 0],
+                codes,
+                ScannEncoding::BinaryHamming,
+                16,
+            )
+            .unwrap();
+            let secondary = ScannLeafRun::from_rows(
+                1,
+                0,
+                &[0],
+                &[0],
+                secondary_code,
+                ScannEncoding::BinaryHamming,
+                16,
+            )
+            .unwrap();
+            let payload = ScannSegmentPayload::new(&artifact, 2, vec![primary, secondary]).unwrap();
+            let mut bytes = Vec::new();
+            write_built_scann(&payload, &mut bytes).unwrap();
+            AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannBinary, 2).unwrap()
+        };
+        let left = make(vec![1, 2, 3, 4]);
+        let right = make(vec![5, 6, 7, 8]);
+        let left_codes = left.raw.as_slice()[left.runs[0].codes.clone()].to_vec();
+        let right_codes = right.raw.as_slice()[right.runs[0].codes.clone()].to_vec();
+
+        let mut merged_bytes = Vec::new();
+        write_merged_ann(&[(&left, 0), (&right, 2)], &mut merged_bytes).unwrap();
+        let merged =
+            AnnDiskIndex::open(OwnedBytes::new(merged_bytes), AnnKind::ScannBinary, 4).unwrap();
+        assert_eq!(merged.header.vector_count, 6);
+        merged
+            .validate_scann_posting_count(
+                4,
+                Some(&crate::structures::SoarConfig::new().target_spill_fraction(0.5)),
+            )
+            .unwrap();
+        assert_eq!(merged.runs[0].doc_base, 0);
+        assert_eq!(merged.runs[1].doc_base, 2);
+        assert_eq!(
+            &merged.raw.as_slice()[merged.runs[0].codes.clone()],
+            left_codes
+        );
+        assert_eq!(
+            &merged.raw.as_slice()[merged.runs[1].codes.clone()],
+            right_codes
+        );
+        assert_eq!(
+            merged
+                .search_binary_clusters::<false>(&[0, 0], 4, &[0, 1])
+                .unwrap()
+                .len(),
+            4,
+            "merge exposed primary and secondary postings as separate results",
+        );
+
+        let other_artifact = scann_binary_artifact(62);
+        let other_run = ScannLeafRun::from_rows(
+            0,
+            0,
+            &[0],
+            &[0],
+            vec![9, 10],
+            ScannEncoding::BinaryHamming,
+            16,
+        )
+        .unwrap();
+        let other_payload = ScannSegmentPayload::new(&other_artifact, 1, vec![other_run]).unwrap();
+        let mut other_bytes = Vec::new();
+        write_built_scann(&other_payload, &mut other_bytes).unwrap();
+        let other =
+            AnnDiskIndex::open(OwnedBytes::new(other_bytes), AnnKind::ScannBinary, 1).unwrap();
+        let error = write_merged_ann(&[(&left, 0), (&other, 2)], &mut Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("incompatible generations"));
     }
 }

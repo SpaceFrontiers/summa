@@ -794,7 +794,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let builder_config = default_builder_config(&index.config);
         Self::new_with_parts(
             Arc::clone(&index.directory),
-            Arc::clone(&index.schema),
+            index.schema_arc(),
             index.config.clone(),
             builder_config,
             Arc::clone(&index.segment_manager),
@@ -953,8 +953,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     }
 
     /// Get the schema
-    pub fn schema(&self) -> &Schema {
-        &self.schema
+    pub fn schema(&self) -> Arc<Schema> {
+        self.segment_manager.published_generation().schema.clone()
     }
 
     /// Set tokenizer for a field.
@@ -1279,7 +1279,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     // Initialize builder if needed
                     if builder.is_none() {
                         match SegmentBuilder::new(
-                            Arc::clone(&state.schema),
+                            state.segment_manager.published_generation().schema.clone(),
                             state.builder_config.clone(),
                         ) {
                             Ok(mut b) => {

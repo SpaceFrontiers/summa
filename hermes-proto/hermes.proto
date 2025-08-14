@@ -42,6 +42,9 @@ service IndexService {
 
   // Retrain global vector codebooks and atomically rebuild every ANN segment
   rpc RetrainVectorIndex(RetrainVectorIndexRequest) returns (RetrainVectorIndexResponse);
+
+  // Atomically replace one vector field's IVF/ScaNN algorithm or parameters
+  rpc AlterVectorIndex(AlterVectorIndexRequest) returns (AlterVectorIndexResponse);
 }
 
 // Query types
@@ -437,6 +440,26 @@ message RetrainVectorIndexRequest {
 
 message RetrainVectorIndexResponse {
   bool success = 1;
+}
+
+message AlterVectorIndexRequest {
+  string index_name = 1;
+  string field_name = 2;
+  // SDL field type/options, for example:
+  // dense_vector<768, f16> [indexed<scann, tree_levels: 2, nprobe: 1024>]
+  string field_schema = 3;
+}
+
+enum VectorIndexAlterState {
+  VECTOR_INDEX_ALTER_STATE_UNSPECIFIED = 0;
+  VECTOR_INDEX_ALTER_STATE_BUILT = 1;
+  VECTOR_INDEX_ALTER_STATE_DEFERRED_FLAT = 2;
+  VECTOR_INDEX_ALTER_STATE_PARAMETERS_ONLY = 3;
+}
+
+message AlterVectorIndexResponse {
+  uint64 publication_generation = 1;
+  VectorIndexAlterState state = 2;
 }
 
 // Reorder request/response

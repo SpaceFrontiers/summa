@@ -398,6 +398,8 @@ async fn diagnose_segment(
             Some(VectorIndex::BinaryIvf(_)) => "binary_ivf",
             Some(VectorIndex::Tq { .. }) => "tq",
             Some(VectorIndex::IvfTq { .. }) => "ivf_tq",
+            Some(VectorIndex::ScannAh(_)) => "scann_ah",
+            Some(VectorIndex::ScannBinary(_)) => "scann_binary",
             None => "flat",
         };
         let ann = segment.ann_health(Field(field_id));

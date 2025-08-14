@@ -373,7 +373,7 @@ async fn test_multivalue_field_indexing_and_search() {
     assert_eq!(all_uris[1].as_text(), Some("two"));
 
     // Verify to_json returns array for multi-value field
-    let json = doc.to_json(index.schema());
+    let json = doc.to_json(&index.schema());
     let uris_json = json.get("uris").unwrap();
     assert!(uris_json.is_array(), "Multi-value field should be an array");
     let uris_arr = uris_json.as_array().unwrap();

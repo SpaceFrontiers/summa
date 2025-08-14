@@ -725,6 +725,7 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     VectorIndexType::IvfPq => "ivf_pq",
                     VectorIndexType::Tq => "tq",
                     VectorIndexType::IvfTq => "ivf_tq",
+                    VectorIndexType::Scann => "scann",
                 };
                 idx_params.push(idx_name.to_string());
                 // TQ scans every code: IVF knobs do not apply and re-parsing
@@ -732,6 +733,9 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                 if cfg.index_type != VectorIndexType::Tq {
                     if let Some(nc) = cfg.num_clusters {
                         idx_params.push(format!("num_clusters: {}", nc));
+                    }
+                    if let Some(tree_levels) = cfg.tree_levels {
+                        idx_params.push(format!("tree_levels: {tree_levels}"));
                     }
                     if cfg.nprobe != 64 {
                         idx_params.push(format!("nprobe: {}", cfg.nprobe));
@@ -763,11 +767,15 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     match cfg.index_type {
                         BinaryIndexType::Flat => "flat",
                         BinaryIndexType::Ivf => "ivf",
+                        BinaryIndexType::Scann => "scann",
                     }
                     .to_string(),
                 );
                 if let Some(num_clusters) = cfg.num_clusters {
                     idx_params.push(format!("num_clusters: {num_clusters}"));
+                }
+                if let Some(tree_levels) = cfg.tree_levels {
+                    idx_params.push(format!("tree_levels: {tree_levels}"));
                 }
                 if cfg.nprobe != 64 {
                     idx_params.push(format!("nprobe: {}", cfg.nprobe));
@@ -1419,6 +1427,8 @@ mod tests {
                 field tags: text<raw_ci> [indexed, stored<multi>, fast]
                 field sparse_emb: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
                 field dense_emb: dense_vector<1024, f16> [indexed<ivf_pq, routing: hnsw, num_clusters: 256>, stored<multi>]
+                field scann_emb: dense_vector<768, f16> [indexed<scann, num_clusters: 4096, tree_levels: 2, nprobe: 128>]
+                field binary_scann: binary_dense_vector<512> [indexed<scann, num_clusters: 2048, tree_levels: 2, nprobe: 96>]
                 field meta: json [stored<multi>]
             }
         "#;
@@ -1502,6 +1512,25 @@ mod tests {
                     "dense num_clusters mismatch for {}",
                     orig.name
                 );
+                assert_eq!(
+                    a.tree_levels, b.tree_levels,
+                    "dense tree_levels mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    a.nprobe, b.nprobe,
+                    "dense nprobe mismatch for {}",
+                    orig.name
+                );
+            }
+            if let (Some(a), Some(b)) = (
+                &orig.binary_dense_vector_config,
+                &reparsed.binary_dense_vector_config,
+            ) {
+                assert_eq!(a.index_type, b.index_type);
+                assert_eq!(a.num_clusters, b.num_clusters);
+                assert_eq!(a.tree_levels, b.tree_levels);
+                assert_eq!(a.nprobe, b.nprobe);
             }
         }
     }

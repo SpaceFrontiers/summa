@@ -19,11 +19,12 @@ use crate::context::{BrokerContext, code_label};
 use crate::metrics as m;
 use crate::proto::hermes::index_service_server::IndexService;
 use crate::proto::hermes::{
-    BatchIndexDocumentsRequest, BatchIndexDocumentsResponse, CommitRequest, CommitResponse,
-    CreateIndexRequest, CreateIndexResponse, DeleteIndexRequest, DeleteIndexResponse,
-    ForceMergeRequest, ForceMergeResponse, IndexDocumentRequest, IndexDocumentsResponse,
-    ListIndexesRequest, ListIndexesResponse, NamedDocument, ReorderRequest, ReorderResponse,
-    RetrainVectorIndexRequest, RetrainVectorIndexResponse,
+    AlterVectorIndexRequest, AlterVectorIndexResponse, BatchIndexDocumentsRequest,
+    BatchIndexDocumentsResponse, CommitRequest, CommitResponse, CreateIndexRequest,
+    CreateIndexResponse, DeleteIndexRequest, DeleteIndexResponse, ForceMergeRequest,
+    ForceMergeResponse, IndexDocumentRequest, IndexDocumentsResponse, ListIndexesRequest,
+    ListIndexesResponse, NamedDocument, ReorderRequest, ReorderResponse, RetrainVectorIndexRequest,
+    RetrainVectorIndexResponse,
 };
 
 /// Streaming IndexDocuments is buffered per index and forwarded as
@@ -330,5 +331,12 @@ impl IndexService for BrokerIndexService {
         request: Request<RetrainVectorIndexRequest>,
     ) -> Result<Response<RetrainVectorIndexResponse>, Status> {
         forward_write!(self, request, retrain_vector_index, "retrain_vector_index")
+    }
+
+    async fn alter_vector_index(
+        &self,
+        request: Request<AlterVectorIndexRequest>,
+    ) -> Result<Response<AlterVectorIndexResponse>, Status> {
+        forward_write!(self, request, alter_vector_index, "alter_vector_index")
     }
 }

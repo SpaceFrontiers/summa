@@ -317,6 +317,54 @@ impl SegmentMerger {
                     AnnWriteMode::Copy => {
                         self.copy_ann_runs(field, entry, segments, &doc_offs, trained, &mut writer)?
                     }
+                    AnnWriteMode::Rebuild
+                        if entry.field_type == FieldType::DenseVector
+                            && config.is_some_and(|config| {
+                                config.index_type == VectorIndexType::Scann
+                            }) =>
+                    {
+                        if let Some(payload) = self
+                            .rebuild_scann_ah(field, config, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_scann(&payload, &mut writer)
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::SCANN_AH_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    AnnWriteMode::Rebuild
+                        if entry.field_type == FieldType::BinaryDenseVector
+                            && entry.binary_dense_vector_config.as_ref().is_some_and(
+                                |config| config.index_type == crate::dsl::BinaryIndexType::Scann,
+                            ) =>
+                    {
+                        if let Some(payload) = self
+                            .rebuild_binary_scann(field, entry, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_scann(&payload, &mut writer)
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::SCANN_BINARY_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
                     AnnWriteMode::Rebuild if entry.field_type == FieldType::BinaryDenseVector => {
                         if let Some(index) = self
                             .rebuild_binary_ivf(field, entry, segments, &doc_offs, trained)
@@ -462,6 +510,19 @@ impl SegmentMerger {
         {
             return self.copy_ivf_tq_runs(field, config, segments, doc_offs, Some(trained), writer);
         }
+        if (entry.field_type == FieldType::DenseVector
+            && entry
+                .dense_vector_config
+                .as_ref()
+                .is_some_and(|config| config.index_type == VectorIndexType::Scann))
+            || (entry.field_type == FieldType::BinaryDenseVector
+                && entry
+                    .binary_dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == crate::dsl::BinaryIndexType::Scann))
+        {
+            return self.copy_scann_runs(field, entry, segments, doc_offs, trained, writer);
+        }
 
         let mut sources = Vec::new();
         let index_type = match entry.field_type {
@@ -593,6 +654,117 @@ impl SegmentMerger {
                 crate::format_bytes(data_size),
             );
         }
+        Ok(Some((index_type, data_offset, data_size)))
+    }
+
+    /// Copy ScaNN leaf extents without decoding, assigning, or retraining.
+    /// Every source must point at the exact global model stored in this
+    /// segment-generation snapshot; the ANN header checks both monotonically
+    /// assigned generation and content fingerprint.
+    fn copy_scann_runs(
+        &self,
+        field: crate::dsl::Field,
+        entry: &crate::dsl::FieldEntry,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: &TrainedVectorStructures,
+        writer: &mut OffsetWriter,
+    ) -> Result<Option<(u8, u64, u64)>> {
+        let artifact = trained.scann_artifacts.get(&field.0).ok_or_else(|| {
+            crate::Error::Corruption(format!(
+                "ScaNN field {} has segment payloads but no loaded global artifact",
+                field.0
+            ))
+        })?;
+        let binary = entry.field_type == FieldType::BinaryDenseVector;
+        let index_type = if binary {
+            crate::segment::ann_build::SCANN_BINARY_TYPE
+        } else {
+            crate::segment::ann_build::SCANN_AH_TYPE
+        };
+        let mut sources = Vec::new();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            let disk = match (binary, segment.vector_indexes().get(&field.0)) {
+                (false, Some(crate::segment::VectorIndex::ScannAh(index)))
+                | (true, Some(crate::segment::VectorIndex::ScannBinary(index))) => index.get(),
+                (_, Some(_)) => {
+                    return Err(crate::Error::Corruption(format!(
+                        "ordinary merge source {:032x} field {} has the wrong ANN payload type for ScaNN",
+                        segment.meta().id,
+                        field.0,
+                    )));
+                }
+                (_, None) => {
+                    return Err(crate::Error::Corruption(format!(
+                        "ordinary merge source {:032x} field {} is missing its ScaNN payload; run a vector-generation rebuild",
+                        segment.meta().id,
+                        field.0,
+                    )));
+                }
+            };
+            disk.validate_scann_generation(
+                artifact.config(),
+                artifact.generation(),
+                artifact.artifact_id(),
+            )
+            .map_err(|error| {
+                crate::Error::Corruption(format!(
+                    "ordinary merge source {:032x} field {} uses an incompatible ScaNN generation: {error}",
+                    segment.meta().id,
+                    field.0,
+                ))
+            })?;
+            let soar = entry
+                .binary_dense_vector_config
+                .as_ref()
+                .and_then(|config| config.soar.as_ref());
+            disk.validate_scann_posting_count(flat.num_vectors, soar)
+                .map_err(|error| {
+                    crate::Error::Corruption(format!(
+                        "ordinary merge source {:032x} field {} has an invalid ScaNN posting count: {error}",
+                        segment.meta().id,
+                        field.0,
+                    ))
+                })?;
+            sources.push((disk, doc_offs[segment_index]));
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+
+        let data_offset = writer.offset();
+        let result = super::block_in_place_if_multithread(|| {
+            // Compact every fragmented ScaNN generation leaf-wise. Binary
+            // rows copy verbatim; AH rows are streamed through the FastScan
+            // packer so 32-row blocks remain valid across source boundaries.
+            // Neither path reassigns vectors or retrains the global model.
+            if crate::segment::ann_disk::predicted_merge_fragmentation(&sources) > 1.0 + 1e-9 {
+                crate::segment::ann_disk::write_compacted_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            } else {
+                crate::segment::ann_disk::write_merged_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            }
+        });
+        self.ensure_not_cancelled()?;
+        result.map_err(crate::Error::Io)?;
+        let data_size = writer.offset() - data_offset;
+        log::debug!(
+            "[merge_vectors] index={} field {}: copied {} compatible ScaNN leaf source(s), {} bytes",
+            self.schema.index_label(),
+            field.0,
+            sources.len(),
+            data_size,
+        );
         Ok(Some((index_type, data_offset, data_size)))
     }
 
@@ -957,6 +1129,60 @@ impl SegmentMerger {
         Ok(Some((index, centroids.num_clusters)))
     }
 
+    /// Re-encode flat vectors against a newly trained global ScaNN model.
+    /// This path is used only by vector-generation staging; ordinary commits
+    /// and merges copy compatible leaf runs and never retrain/re-encode them.
+    async fn rebuild_scann_ah(
+        &self,
+        field: crate::dsl::Field,
+        config: Option<&crate::dsl::DenseVectorConfig>,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+    ) -> Result<Option<crate::structures::vector::scann::ScannSegmentPayload>> {
+        let Some(config) = config.filter(|config| config.index_type == VectorIndexType::Scann)
+        else {
+            return Ok(None);
+        };
+        if config.soar.is_some() {
+            return Err(crate::Error::Schema(format!(
+                "ScaNN field {} enables SOAR, but ScaNN SOAR secondary assignments are not implemented; set soar: null before building",
+                field.0
+            )));
+        }
+        let Some(artifact) = trained.and_then(|trained| trained.scann_artifacts.get(&field.0))
+        else {
+            return Ok(None);
+        };
+        let mut builder = crate::segment::ann_build::ScannAhSegmentBuilder::new(artifact);
+        let mut total_fed = 0usize;
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let fed = feed_segment(
+                segment,
+                field,
+                doc_offs[segment_index],
+                |labels, vectors| builder.add_batch(labels, vectors),
+                self.cancellation.as_deref(),
+            )
+            .await?;
+            total_fed = total_fed.checked_add(fed).ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "ScaNN rebuild vector count overflows for field {}",
+                    field.0
+                ))
+            })?;
+        }
+        if total_fed == 0 {
+            return Ok(None);
+        }
+        let doc_count = segments.iter().try_fold(0u32, |total, segment| {
+            total.checked_add(segment.meta().num_docs).ok_or_else(|| {
+                crate::Error::Corruption("ScaNN rebuilt segment document count overflows".into())
+            })
+        })?;
+        Ok(Some(builder.finish(doc_count)?))
+    }
+
     /// Rebuild the binary IVF index for a vector-generation rewrite.
     ///
     /// Streams packed codes from source flat storage and assigns every vector
@@ -1046,6 +1272,75 @@ impl SegmentMerger {
             crate::format_bytes(index.estimated_memory_bytes() as u64),
         );
         Ok(Some(index))
+    }
+
+    async fn rebuild_binary_scann(
+        &self,
+        field: crate::dsl::Field,
+        entry: &crate::dsl::FieldEntry,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+    ) -> Result<Option<crate::structures::vector::scann::ScannSegmentPayload>> {
+        let Some(config) = entry
+            .binary_dense_vector_config
+            .as_ref()
+            .filter(|config| config.index_type == crate::dsl::BinaryIndexType::Scann)
+        else {
+            return Ok(None);
+        };
+        let Some(artifact) = trained.and_then(|trained| trained.scann_artifacts.get(&field.0))
+        else {
+            return Ok(None);
+        };
+        if artifact.config().dimension as usize != config.dim {
+            return Err(crate::Error::Corruption(format!(
+                "binary ScaNN artifact dimension mismatch for field {}",
+                field.0
+            )));
+        }
+        const CODE_BATCH: usize = 65_536;
+        let mut builder = crate::segment::ann_build::BinaryScannPayloadBuilder::new(
+            artifact,
+            config.soar.as_ref(),
+        );
+        let mut labels = Vec::with_capacity(CODE_BATCH);
+        let mut count = 0usize;
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            for batch_start in (0..flat.num_vectors).step_by(CODE_BATCH) {
+                let batch_count = CODE_BATCH.min(flat.num_vectors - batch_start);
+                let codes = flat
+                    .read_vectors_batch(batch_start, batch_count)
+                    .await
+                    .map_err(crate::Error::Io)?;
+                labels.clear();
+                for row in 0..batch_count {
+                    let (doc_id, ordinal) = flat.get_doc_id(batch_start + row);
+                    labels.push((
+                        doc_id.checked_add(doc_offs[segment_index]).ok_or_else(|| {
+                            crate::Error::Corruption("binary ScaNN doc ID overflows".into())
+                        })?,
+                        ordinal,
+                    ));
+                }
+                builder.add_batch(&labels, codes.as_slice())?;
+                count = count.checked_add(batch_count).ok_or_else(|| {
+                    crate::Error::Corruption("binary ScaNN vector count overflows".into())
+                })?;
+            }
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        let doc_count = segments.iter().try_fold(0u32, |total, segment| {
+            total.checked_add(segment.meta().num_docs).ok_or_else(|| {
+                crate::Error::Corruption("binary ScaNN document count overflows".into())
+            })
+        })?;
+        Ok(Some(builder.finish(doc_count)?))
     }
 }
 

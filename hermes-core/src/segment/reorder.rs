@@ -1049,14 +1049,16 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
 /// fast fields. Backends without links use the bounded streaming fallback.
 pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
     dir: &D,
-    schema: &Arc<Schema>,
+    schemas: (&Arc<Schema>, &Arc<Schema>),
     source_id: SegmentId,
     output_id: SegmentId,
     term_cache_blocks: usize,
     trained: &TrainedVectorStructures,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
 ) -> Result<(String, u32)> {
-    let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
+    let (source_schema, target_schema) = schemas;
+    let reader =
+        SegmentReader::open(dir, source_id, Arc::clone(source_schema), term_cache_blocks).await?;
     let num_docs = reader.num_docs();
     let src_files = SegmentFiles::new(source_id.0);
     let dst_files = SegmentFiles::new(output_id.0);
@@ -1067,7 +1069,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
     let rewrite_started = std::time::Instant::now();
     log::info!(
         "[dense_vector_rewrite] started: index={} segment {} → {} ({} docs)",
-        schema.index_label(),
+        target_schema.index_label(),
         source_id.to_hex(),
         output_id.to_hex(),
         num_docs,
@@ -1093,10 +1095,10 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
             !reader.sparse_indexes().is_empty() || !reader.bmp_indexes().is_empty(),
         ),
     ] {
-        clone_segment_file(dir, schema.index_label(), src, dst, required, None).await?;
+        clone_segment_file(dir, target_schema.index_label(), src, dst, required, None).await?;
     }
 
-    let merger = SegmentMerger::new(Arc::clone(schema)).with_background_pool(rayon_pool);
+    let merger = SegmentMerger::new(Arc::clone(target_schema)).with_background_pool(rayon_pool);
     let vector_bytes = merger
         .merge_dense_vectors(
             dir,
@@ -1124,7 +1126,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
 
     log::info!(
         "[dense_vector_rewrite] completed: index={} segment {} → {} ({} docs, {} vector payload) in {:.1}s",
-        schema.index_label(),
+        target_schema.index_label(),
         source_id.to_hex(),
         output_id.to_hex(),
         num_docs,

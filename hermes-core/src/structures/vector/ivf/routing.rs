@@ -36,7 +36,14 @@ pub const HIERARCHICAL_TRAINING_THRESHOLD: usize = 4_096;
 /// Extra leaf coverage requested from the parent level. A beam of four times
 /// the minimum parent count avoids the recall cliff of greedy one-parent
 /// hierarchical routing while keeping parent/leaf scoring sublinear.
-const PARENT_BEAM_OVERSAMPLE: usize = 4;
+pub const DEFAULT_PARENT_BEAM_OVERSAMPLE: usize = 4;
+/// Upper bound for caller-selected two-level routing oversampling.
+///
+/// The beam controls leaf-centroid work, so accepting an unbounded runtime
+/// value would turn a supposedly hierarchical probe into an accidental full
+/// scan. Sixteen still leaves room for recall-oriented binary profiles while
+/// keeping the ordinary small-nprobe path sublinear.
+pub const MAX_PARENT_BEAM_OVERSAMPLE: usize = 16;
 /// Construction assignments become permanent, so inspect multiple populated
 /// parent cells even when the query-time leaf budget fits under one parent.
 const MIN_BUILD_PARENT_BEAM: usize = 4;
@@ -1093,8 +1100,25 @@ pub(crate) fn cosine_probe_fingerprint(query: &[f32], nprobe: usize, mode: IvfRo
     )
 }
 
-pub fn binary_probe_fingerprint(query: &[u8], nprobe: usize, mode: IvfRoutingMode) -> u64 {
-    fingerprint_words(mode, nprobe, query.iter().map(|&value| value as u64))
+/// Binary probe fingerprint including the runtime two-level beam policy.
+/// Flat/HNSW plans ignore the beam because it cannot change their result.
+pub fn binary_probe_fingerprint_with_parent_beam(
+    query: &[u8],
+    nprobe: usize,
+    mode: IvfRoutingMode,
+    parent_beam_oversample: usize,
+) -> u64 {
+    let beam = match mode {
+        IvfRoutingMode::TwoLevel => {
+            parent_beam_oversample.clamp(1, MAX_PARENT_BEAM_OVERSAMPLE) as u64
+        }
+        IvfRoutingMode::Auto | IvfRoutingMode::Flat | IvfRoutingMode::Hnsw => 0,
+    };
+    fingerprint_words(
+        mode,
+        nprobe,
+        std::iter::once(beam).chain(query.iter().map(|&value| value as u64)),
+    )
 }
 
 /// Resolve `Auto` for float centroids.
@@ -1129,12 +1153,31 @@ fn resolve_auto_routing(
 
 /// Number of parent cells to put in the routing beam.
 pub fn parent_probe_count(nprobe: usize, num_leaves: usize, num_parents: usize) -> usize {
+    parent_probe_count_with_oversample(
+        nprobe,
+        num_leaves,
+        num_parents,
+        DEFAULT_PARENT_BEAM_OVERSAMPLE,
+    )
+}
+
+/// Number of parent cells for an explicit, bounded coverage multiplier.
+///
+/// Callers may tune recall without changing the persisted routing topology.
+/// The effective multiplier is always in `1..=MAX_PARENT_BEAM_OVERSAMPLE`.
+pub fn parent_probe_count_with_oversample(
+    nprobe: usize,
+    num_leaves: usize,
+    num_parents: usize,
+    oversample: usize,
+) -> usize {
     if num_parents == 0 || num_leaves == 0 {
         return 0;
     }
     let leaves_per_parent = num_leaves.div_ceil(num_parents).max(1);
+    let oversample = oversample.clamp(1, MAX_PARENT_BEAM_OVERSAMPLE);
     nprobe
-        .saturating_mul(PARENT_BEAM_OVERSAMPLE)
+        .saturating_mul(oversample)
         .div_ceil(leaves_per_parent)
         .clamp(1, num_parents)
 }
@@ -1148,6 +1191,21 @@ pub fn select_parent_beam<const HIGHER_IS_BETTER: bool>(
     topology: &IvfRoutingTopology,
     requested_leaves: usize,
 ) -> Vec<u32> {
+    select_parent_beam_with_oversample::<HIGHER_IS_BETTER>(
+        scores,
+        topology,
+        requested_leaves,
+        DEFAULT_PARENT_BEAM_OVERSAMPLE,
+    )
+}
+
+/// Select a parent beam using an explicit bounded coverage multiplier.
+pub fn select_parent_beam_with_oversample<const HIGHER_IS_BETTER: bool>(
+    scores: &[f32],
+    topology: &IvfRoutingTopology,
+    requested_leaves: usize,
+    oversample: usize,
+) -> Vec<u32> {
     let parent_count = scores.len().min(topology.parent_count());
     let leaf_count = topology.leaf_ids.len();
     let requested_leaves = requested_leaves.min(leaf_count);
@@ -1155,8 +1213,12 @@ pub fn select_parent_beam<const HIGHER_IS_BETTER: bool>(
         return Vec::new();
     }
 
-    let initial_take =
-        parent_probe_count(requested_leaves, leaf_count, parent_count).min(parent_count);
+    let initial_take = if oversample == DEFAULT_PARENT_BEAM_OVERSAMPLE {
+        parent_probe_count(requested_leaves, leaf_count, parent_count)
+    } else {
+        parent_probe_count_with_oversample(requested_leaves, leaf_count, parent_count, oversample)
+    }
+    .min(parent_count);
     let scores = &scores[..parent_count];
     let initial = select_best::<HIGHER_IS_BETTER>(scores, initial_take);
     let initial_coverage: usize = initial
@@ -1191,6 +1253,25 @@ pub fn select_parent_beam_for_build<const HIGHER_IS_BETTER: bool>(
     topology: &IvfRoutingTopology,
     requested_leaves: usize,
 ) -> Vec<u32> {
+    select_parent_beam_for_build_with_oversample::<HIGHER_IS_BETTER>(
+        scores,
+        topology,
+        requested_leaves,
+        DEFAULT_PARENT_BEAM_OVERSAMPLE,
+        MIN_BUILD_PARENT_BEAM,
+    )
+}
+
+/// Construction-time variant with caller-selected query oversampling and
+/// minimum populated-parent coverage. Both values are bounded by the topology;
+/// oversampling is additionally clamped to the public hard limit.
+pub fn select_parent_beam_for_build_with_oversample<const HIGHER_IS_BETTER: bool>(
+    scores: &[f32],
+    topology: &IvfRoutingTopology,
+    requested_leaves: usize,
+    oversample: usize,
+    minimum_parents: usize,
+) -> Vec<u32> {
     if requested_leaves == 0 {
         return Vec::new();
     }
@@ -1199,7 +1280,12 @@ pub fn select_parent_beam_for_build<const HIGHER_IS_BETTER: bool>(
         return Vec::new();
     }
 
-    let query_parents = select_parent_beam::<HIGHER_IS_BETTER>(scores, topology, requested_leaves);
+    let query_parents = select_parent_beam_with_oversample::<HIGHER_IS_BETTER>(
+        scores,
+        topology,
+        requested_leaves,
+        oversample,
+    );
     let query_populated = query_parents
         .iter()
         .filter(|&&parent| !topology.children(parent as usize).is_empty())
@@ -1209,7 +1295,7 @@ pub fn select_parent_beam_for_build<const HIGHER_IS_BETTER: bool>(
     let mut ranked = select_best::<HIGHER_IS_BETTER>(scores, parent_count);
     ranked.retain(|&parent| !topology.children(parent as usize).is_empty());
     let take = query_populated
-        .max(MIN_BUILD_PARENT_BEAM.min(ranked.len()))
+        .max(minimum_parents.max(1).min(ranked.len()))
         .min(ranked.len());
     ranked.truncate(take);
     ranked
@@ -1333,6 +1419,37 @@ mod tests {
         assert_eq!(parent_probe_count(32, 65_536, 256), 1);
         assert_eq!(parent_probe_count(256, 65_536, 256), 4);
         assert_eq!(parent_probe_count(65_536, 65_536, 256), 256);
+    }
+
+    #[test]
+    fn configurable_parent_beam_increases_coverage_with_bounded_work() {
+        let children: Vec<Vec<u32>> = (0..64)
+            .map(|parent| {
+                let first = parent * 64;
+                (first..first + 64).map(|leaf| leaf as u32).collect()
+            })
+            .collect();
+        let topology = IvfRoutingTopology::from_children(&children);
+        let scores: Vec<f32> = (0..64).map(|score| score as f32).collect();
+
+        let baseline = select_parent_beam_with_oversample::<false>(&scores, &topology, 32, 4);
+        let recall_oriented =
+            select_parent_beam_with_oversample::<false>(&scores, &topology, 32, 8);
+        assert_eq!(baseline.len(), 2);
+        assert_eq!(recall_oriented.len(), 4);
+
+        let covered = recall_oriented
+            .iter()
+            .map(|&parent| topology.children(parent as usize).len())
+            .sum::<usize>();
+        assert_eq!(covered, 32 * 8);
+        assert!(covered < topology.leaf_ids.len());
+
+        // A hostile runtime knob cannot force work beyond the hard policy cap.
+        assert_eq!(
+            parent_probe_count_with_oversample(32, 4_096, 64, usize::MAX),
+            8
+        );
     }
 
     #[test]

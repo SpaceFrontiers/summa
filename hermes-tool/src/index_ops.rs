@@ -328,9 +328,9 @@ pub async fn show_info(index_path: PathBuf) -> Result<()> {
         println!("Sparse vectors:");
         let mut fields: Vec<_> = sparse_vectors.keys().copied().collect();
         fields.sort_unstable();
+        let schema = index.schema();
         for field_id in fields {
-            let name = index
-                .schema()
+            let name = schema
                 .get_field_name(hermes_core::dsl::Field(field_id))
                 .unwrap_or("unknown");
             let vectors = sparse_vectors[&field_id];

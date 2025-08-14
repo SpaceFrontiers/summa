@@ -102,6 +102,51 @@ export function multiValueCombinerToJSON(object: MultiValueCombiner): string {
   }
 }
 
+export enum VectorIndexAlterState {
+  VECTOR_INDEX_ALTER_STATE_UNSPECIFIED = 0,
+  VECTOR_INDEX_ALTER_STATE_BUILT = 1,
+  VECTOR_INDEX_ALTER_STATE_DEFERRED_FLAT = 2,
+  VECTOR_INDEX_ALTER_STATE_PARAMETERS_ONLY = 3,
+  UNRECOGNIZED = -1,
+}
+
+export function vectorIndexAlterStateFromJSON(object: any): VectorIndexAlterState {
+  switch (object) {
+    case 0:
+    case "VECTOR_INDEX_ALTER_STATE_UNSPECIFIED":
+      return VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_UNSPECIFIED;
+    case 1:
+    case "VECTOR_INDEX_ALTER_STATE_BUILT":
+      return VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_BUILT;
+    case 2:
+    case "VECTOR_INDEX_ALTER_STATE_DEFERRED_FLAT":
+      return VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_DEFERRED_FLAT;
+    case 3:
+    case "VECTOR_INDEX_ALTER_STATE_PARAMETERS_ONLY":
+      return VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_PARAMETERS_ONLY;
+    case -1:
+    case "UNRECOGNIZED":
+    default:
+      return VectorIndexAlterState.UNRECOGNIZED;
+  }
+}
+
+export function vectorIndexAlterStateToJSON(object: VectorIndexAlterState): string {
+  switch (object) {
+    case VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_UNSPECIFIED:
+      return "VECTOR_INDEX_ALTER_STATE_UNSPECIFIED";
+    case VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_BUILT:
+      return "VECTOR_INDEX_ALTER_STATE_BUILT";
+    case VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_DEFERRED_FLAT:
+      return "VECTOR_INDEX_ALTER_STATE_DEFERRED_FLAT";
+    case VectorIndexAlterState.VECTOR_INDEX_ALTER_STATE_PARAMETERS_ONLY:
+      return "VECTOR_INDEX_ALTER_STATE_PARAMETERS_ONLY";
+    case VectorIndexAlterState.UNRECOGNIZED:
+    default:
+      return "UNRECOGNIZED";
+  }
+}
+
 /** Query types */
 export interface Query {
   term?: TermQuery | undefined;
@@ -566,6 +611,21 @@ export interface RetrainVectorIndexRequest {
 
 export interface RetrainVectorIndexResponse {
   success: boolean;
+}
+
+export interface AlterVectorIndexRequest {
+  indexName: string;
+  fieldName: string;
+  /**
+   * SDL field type/options, for example:
+   * dense_vector<768, f16> [indexed<scann, tree_levels: 2, nprobe: 1024>]
+   */
+  fieldSchema: string;
+}
+
+export interface AlterVectorIndexResponse {
+  publicationGeneration: number;
+  state: VectorIndexAlterState;
 }
 
 /** Reorder request/response */
@@ -6239,6 +6299,190 @@ export const RetrainVectorIndexResponse: MessageFns<RetrainVectorIndexResponse> 
   },
 };
 
+function createBaseAlterVectorIndexRequest(): AlterVectorIndexRequest {
+  return { indexName: "", fieldName: "", fieldSchema: "" };
+}
+
+export const AlterVectorIndexRequest: MessageFns<AlterVectorIndexRequest> = {
+  encode(message: AlterVectorIndexRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.indexName !== "") {
+      writer.uint32(10).string(message.indexName);
+    }
+    if (message.fieldName !== "") {
+      writer.uint32(18).string(message.fieldName);
+    }
+    if (message.fieldSchema !== "") {
+      writer.uint32(26).string(message.fieldSchema);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AlterVectorIndexRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseAlterVectorIndexRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.indexName = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.fieldName = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.fieldSchema = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): AlterVectorIndexRequest {
+    return {
+      indexName: isSet(object.indexName)
+        ? globalThis.String(object.indexName)
+        : isSet(object.index_name)
+        ? globalThis.String(object.index_name)
+        : "",
+      fieldName: isSet(object.fieldName)
+        ? globalThis.String(object.fieldName)
+        : isSet(object.field_name)
+        ? globalThis.String(object.field_name)
+        : "",
+      fieldSchema: isSet(object.fieldSchema)
+        ? globalThis.String(object.fieldSchema)
+        : isSet(object.field_schema)
+        ? globalThis.String(object.field_schema)
+        : "",
+    };
+  },
+
+  toJSON(message: AlterVectorIndexRequest): unknown {
+    const obj: any = {};
+    if (message.indexName !== "") {
+      obj.indexName = message.indexName;
+    }
+    if (message.fieldName !== "") {
+      obj.fieldName = message.fieldName;
+    }
+    if (message.fieldSchema !== "") {
+      obj.fieldSchema = message.fieldSchema;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<AlterVectorIndexRequest>): AlterVectorIndexRequest {
+    return AlterVectorIndexRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<AlterVectorIndexRequest>): AlterVectorIndexRequest {
+    const message = createBaseAlterVectorIndexRequest();
+    message.indexName = object.indexName ?? "";
+    message.fieldName = object.fieldName ?? "";
+    message.fieldSchema = object.fieldSchema ?? "";
+    return message;
+  },
+};
+
+function createBaseAlterVectorIndexResponse(): AlterVectorIndexResponse {
+  return { publicationGeneration: 0, state: 0 };
+}
+
+export const AlterVectorIndexResponse: MessageFns<AlterVectorIndexResponse> = {
+  encode(message: AlterVectorIndexResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.publicationGeneration !== 0) {
+      writer.uint32(8).uint64(message.publicationGeneration);
+    }
+    if (message.state !== 0) {
+      writer.uint32(16).int32(message.state);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): AlterVectorIndexResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseAlterVectorIndexResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.publicationGeneration = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.state = reader.int32() as any;
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): AlterVectorIndexResponse {
+    return {
+      publicationGeneration: isSet(object.publicationGeneration)
+        ? globalThis.Number(object.publicationGeneration)
+        : isSet(object.publication_generation)
+        ? globalThis.Number(object.publication_generation)
+        : 0,
+      state: isSet(object.state) ? vectorIndexAlterStateFromJSON(object.state) : 0,
+    };
+  },
+
+  toJSON(message: AlterVectorIndexResponse): unknown {
+    const obj: any = {};
+    if (message.publicationGeneration !== 0) {
+      obj.publicationGeneration = Math.round(message.publicationGeneration);
+    }
+    if (message.state !== 0) {
+      obj.state = vectorIndexAlterStateToJSON(message.state);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<AlterVectorIndexResponse>): AlterVectorIndexResponse {
+    return AlterVectorIndexResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<AlterVectorIndexResponse>): AlterVectorIndexResponse {
+    const message = createBaseAlterVectorIndexResponse();
+    message.publicationGeneration = object.publicationGeneration ?? 0;
+    message.state = object.state ?? 0;
+    return message;
+  },
+};
+
 function createBaseReorderRequest(): ReorderRequest {
   return { indexName: "" };
 }
@@ -6503,6 +6747,15 @@ export const IndexServiceDefinition = {
       requestType: RetrainVectorIndexRequest,
       requestStream: false,
       responseType: RetrainVectorIndexResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Atomically replace one vector field's IVF/ScaNN algorithm or parameters */
+    alterVectorIndex: {
+      name: "AlterVectorIndex",
+      requestType: AlterVectorIndexRequest,
+      requestStream: false,
+      responseType: AlterVectorIndexResponse,
       responseStream: false,
       options: {},
     },

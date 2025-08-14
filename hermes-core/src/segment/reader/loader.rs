@@ -174,6 +174,20 @@ fn validate_ann_schema(schema: &Schema, field_id: u32, index_type: u8) -> Result
                     .as_ref()
                     .is_some_and(|config| config.index_type == VectorIndexType::IvfTq)
         }
+        ann_build::SCANN_AH_TYPE => {
+            field.field_type == FieldType::DenseVector
+                && field
+                    .dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == VectorIndexType::Scann)
+        }
+        ann_build::SCANN_BINARY_TYPE => {
+            field.field_type == FieldType::BinaryDenseVector
+                && field
+                    .binary_dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == BinaryIndexType::Scann)
+        }
         _ => false,
     };
 
@@ -220,6 +234,8 @@ fn is_ann_vector_type(index_type: u8) -> bool {
             | ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
             | ann_build::IVF_TQ_TYPE
+            | ann_build::SCANN_AH_TYPE
+            | ann_build::SCANN_BINARY_TYPE
     )
 }
 
@@ -396,7 +412,9 @@ async fn load_vectors_file_impl<D: Directory>(
             ann_build::LEGACY_IVF_PQ_TYPE
             | ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
-            | ann_build::IVF_TQ_TYPE => ann_toc_fields.insert(entry.field_id),
+            | ann_build::IVF_TQ_TYPE
+            | ann_build::SCANN_AH_TYPE
+            | ann_build::SCANN_BINARY_TYPE => ann_toc_fields.insert(entry.field_id),
             _ => continue,
         };
         if !inserted {
@@ -497,7 +515,9 @@ async fn load_vectors_file_impl<D: Directory>(
             ann_build::LEGACY_IVF_PQ_TYPE
             | ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
-            | ann_build::IVF_TQ_TYPE => {
+            | ann_build::IVF_TQ_TYPE
+            | ann_build::SCANN_AH_TYPE
+            | ann_build::SCANN_BINARY_TYPE => {
                 validate_ann_schema(schema, field_id, index_type)?;
                 if !load_ann {
                     continue;
@@ -515,6 +535,30 @@ async fn load_vectors_file_impl<D: Directory>(
                         .map_err(|error| {
                             crate::Error::Corruption(format!(
                                 "invalid binary IVF payload for field {field_id}: {error}"
+                            ))
+                        })?,
+                    )),
+                    ann_build::SCANN_AH_TYPE => VectorIndex::ScannAh(Arc::new(
+                        super::types::MmapAnnIndex::open(
+                            data,
+                            crate::segment::ann_disk::AnnKind::ScannAh,
+                            total_docs,
+                        )
+                        .map_err(|error| {
+                            crate::Error::Corruption(format!(
+                                "invalid ScaNN AH payload for field {field_id}: {error}"
+                            ))
+                        })?,
+                    )),
+                    ann_build::SCANN_BINARY_TYPE => VectorIndex::ScannBinary(Arc::new(
+                        super::types::MmapAnnIndex::open(
+                            data,
+                            crate::segment::ann_disk::AnnKind::ScannBinary,
+                            total_docs,
+                        )
+                        .map_err(|error| {
+                            crate::Error::Corruption(format!(
+                                "invalid binary ScaNN payload for field {field_id}: {error}"
                             ))
                         })?,
                     )),
@@ -603,7 +647,6 @@ async fn load_vectors_file_impl<D: Directory>(
             }
         }
     }
-
     Ok(VectorsFileData {
         indexes,
         flat_vectors,

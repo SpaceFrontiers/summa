@@ -35,6 +35,8 @@ mod writer;
 pub use primary_key::PrimaryKeyIndex;
 #[cfg(feature = "native")]
 pub use reader::IndexReader;
+#[cfg(feature = "native")]
+pub use vector_builder::{AlterVectorIndexOutcome, AlterVectorIndexState};
 #[cfg(all(feature = "wasm", not(feature = "native")))]
 pub use wasm_writer::IndexWriter as WasmIndexWriter;
 #[cfg(feature = "native")]
@@ -579,7 +581,6 @@ fn segment_manager_from_config<D: crate::directories::DirectoryWriter + 'static>
 #[cfg(feature = "native")]
 pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
     directory: Arc<D>,
-    schema: Arc<Schema>,
     config: IndexConfig,
     /// Cache and CPU policy used by every searcher reload.
     search_resources: searcher::SearcherResources,
@@ -628,7 +629,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
         Ok(Self {
             directory,
-            schema,
             config,
             search_resources,
             segment_manager,
@@ -659,7 +659,6 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
         Ok(Self {
             directory,
-            schema,
             config,
             search_resources,
             segment_manager,
@@ -668,13 +667,13 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     }
 
     /// Get the schema
-    pub fn schema(&self) -> &Schema {
-        &self.schema
+    pub fn schema(&self) -> Arc<Schema> {
+        self.schema_arc()
     }
 
-    /// Get the schema as an Arc reference (avoids clone when Arc is needed)
-    pub fn schema_arc(&self) -> &Arc<Schema> {
-        &self.schema
+    /// Clone the schema handle from the currently published generation.
+    pub fn schema_arc(&self) -> Arc<Schema> {
+        self.segment_manager.published_generation().schema.clone()
     }
 
     /// Get a reference to the underlying directory
@@ -695,7 +694,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         self.cached_reader
             .get_or_try_init(|| async {
                 IndexReader::from_segment_manager_with_resources(
-                    Arc::clone(&self.schema),
+                    self.schema_arc(),
                     Arc::clone(&self.segment_manager),
                     self.config.reload_interval_ms,
                     self.search_resources.clone(),
@@ -726,10 +725,11 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
     /// Get default fields for search
     pub fn default_fields(&self) -> Vec<crate::Field> {
-        if !self.schema.default_fields().is_empty() {
-            self.schema.default_fields().to_vec()
+        let schema = self.schema_arc();
+        if !schema.default_fields().is_empty() {
+            schema.default_fields().to_vec()
         } else {
-            self.schema
+            schema
                 .fields()
                 .filter(|(_, entry)| {
                     entry.indexed && entry.field_type == crate::dsl::FieldType::Text
@@ -748,20 +748,21 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     pub fn query_parser(&self) -> crate::dsl::QueryLanguageParser {
         let default_fields = self.default_fields();
         let tokenizers = self.tokenizers();
+        let schema = self.schema_arc();
 
-        let query_routers = self.schema.query_routers();
+        let query_routers = schema.query_routers();
         if !query_routers.is_empty()
             && let Ok(router) = crate::dsl::QueryFieldRouter::from_rules(query_routers)
         {
             return crate::dsl::QueryLanguageParser::with_router(
-                Arc::clone(&self.schema),
+                Arc::clone(&schema),
                 default_fields,
                 tokenizers,
                 router,
             );
         }
 
-        crate::dsl::QueryLanguageParser::new(Arc::clone(&self.schema), default_fields, tokenizers)
+        crate::dsl::QueryLanguageParser::new(schema, default_fields, tokenizers)
     }
 
     /// Parse and search using a query string

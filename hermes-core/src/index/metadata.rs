@@ -121,6 +121,14 @@ pub struct FieldVectorMeta {
     /// error instead of dropping the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codebook_file: Option<String>,
+    /// ScaNN global model generation encoded into every segment payload.
+    /// Absent for legacy IVF/TQ fields and older metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_generation: Option<u64>,
+    /// Content fingerprint of the exact ScaNN model encoded into every
+    /// segment payload. This prevents same-generation accidental mixing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<u64>,
 }
 
 /// Unified index metadata - single source of truth for index state
@@ -128,6 +136,11 @@ pub struct FieldVectorMeta {
 pub struct IndexMetadata {
     /// Version for compatibility
     pub version: u32,
+    /// Monotonic publication identity for schema/vector generations. Segment
+    /// commits are already detected by their IDs; this also makes query-only
+    /// ALTERs (for example `nprobe`) visible to cached readers.
+    #[serde(default)]
+    pub publication_generation: u64,
     /// Index schema
     pub schema: Schema,
     /// Segment metadata: segment_id -> info (doc count, etc.)
@@ -152,6 +165,7 @@ impl IndexMetadata {
     pub fn new(schema: Schema) -> Self {
         Self {
             version: INDEX_META_FORMAT_VERSION,
+            publication_generation: 0,
             schema,
             segment_metas: HashMap::new(),
             vector_fields: HashMap::new(),
@@ -250,6 +264,8 @@ impl IndexMetadata {
                 state: VectorIndexState::Flat,
                 centroids_file: None,
                 codebook_file: None,
+                artifact_generation: None,
+                artifact_id: None,
             });
     }
 
@@ -269,8 +285,53 @@ impl IndexMetadata {
             };
             field.centroids_file = Some(centroids_file);
             field.codebook_file = codebook_file;
+            field.artifact_generation = None;
+            field.artifact_id = None;
             self.refresh_total_vectors();
         }
+    }
+
+    /// Mark a ScaNN field built against one immutable global model. Reuses
+    /// `centroids_file` as the trained-artifact path for wire compatibility;
+    /// the explicit generation/fingerprint fields make its semantics loud.
+    pub fn mark_scann_field_built(
+        &mut self,
+        field_id: u32,
+        vector_count: usize,
+        num_leaves: usize,
+        artifact_file: String,
+        artifact_generation: u64,
+        artifact_id: u64,
+    ) -> Result<()> {
+        if artifact_generation == 0 || artifact_id == 0 {
+            return Err(Error::Corruption(format!(
+                "ScaNN field {field_id} cannot publish a zero generation or artifact fingerprint"
+            )));
+        }
+        let field = self.vector_fields.get_mut(&field_id).ok_or_else(|| {
+            Error::Corruption(format!(
+                "ScaNN field {field_id} must be initialized before it is marked built"
+            ))
+        })?;
+        if !matches!(
+            field.index_type,
+            VectorFieldIndexType::Float(VectorIndexType::Scann)
+                | VectorFieldIndexType::Binary(BinaryIndexType::Scann)
+        ) {
+            return Err(Error::Corruption(format!(
+                "field {field_id} is not configured as ScaNN"
+            )));
+        }
+        field.state = VectorIndexState::Built {
+            vector_count,
+            num_clusters: num_leaves,
+        };
+        field.centroids_file = Some(artifact_file);
+        field.codebook_file = None;
+        field.artifact_generation = Some(artifact_generation);
+        field.artifact_id = Some(artifact_id);
+        self.refresh_total_vectors();
+        Ok(())
     }
 
     /// Refresh the cached aggregate from the authoritative per-field states.
@@ -417,6 +478,7 @@ impl IndexMetadata {
 
         let mut centroids = rustc_hash::FxHashMap::default();
         let mut binary_quantizers = rustc_hash::FxHashMap::default();
+        let mut scann_artifacts = rustc_hash::FxHashMap::default();
 
         let mut built_fields: Vec<_> = vector_fields
             .iter()
@@ -580,6 +642,106 @@ impl IndexMetadata {
                         })?;
                     binary_quantizers.insert(*field_id, Arc::new(quantizer));
                 }
+                VectorFieldIndexType::Float(VectorIndexType::Scann)
+                | VectorFieldIndexType::Binary(BinaryIndexType::Scann) => {
+                    if field_meta.codebook_file.is_some() {
+                        return Err(Error::Corruption(format!(
+                            "trained ScaNN field {field_id} unexpectedly references a separate codebook file"
+                        )));
+                    }
+                    let expected_generation = field_meta.artifact_generation.ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "trained ScaNN field {field_id} has no artifact generation"
+                        ))
+                    })?;
+                    let expected_artifact_id = field_meta.artifact_id.ok_or_else(|| {
+                        Error::Corruption(format!(
+                            "trained ScaNN field {field_id} has no artifact fingerprint"
+                        ))
+                    })?;
+                    validate_trained_artifact_path(
+                        field_id.to_owned(),
+                        "ScaNN artifact",
+                        centroids_file,
+                    )?;
+                    let path = Path::new(centroids_file);
+                    let slice = dir.open_read(path).await.map_err(|error| {
+                        Error::Corruption(format!(
+                            "failed to open trained ScaNN artifact '{centroids_file}' for field {field_id}: {error}"
+                        ))
+                    })?;
+                    let raw = slice.read_bytes().await.map_err(|error| {
+                        Error::Corruption(format!(
+                            "failed to map trained ScaNN artifact '{centroids_file}' for field {field_id}: {error}"
+                        ))
+                    })?;
+                    let artifact =
+                        crate::segment::ScannTrainedArtifactBytes::open(raw).map_err(|error| {
+                            Error::Corruption(format!(
+                                "invalid trained ScaNN artifact for field {field_id}: {error}"
+                            ))
+                        })?;
+                    if artifact.generation() != expected_generation
+                        || artifact.artifact_id() != expected_artifact_id
+                        || artifact.config().num_leaves as usize != expected_clusters
+                    {
+                        return Err(Error::Corruption(format!(
+                            "trained ScaNN artifact for field {field_id} does not match metadata"
+                        )));
+                    }
+                    let entry = schema
+                        .get_field_entry(crate::dsl::Field(*field_id))
+                        .ok_or_else(|| {
+                            Error::Corruption(format!(
+                                "trained vector metadata references missing field {field_id}"
+                            ))
+                        })?;
+                    let schema_matches = match field_meta.index_type {
+                        VectorFieldIndexType::Float(VectorIndexType::Scann) => entry
+                            .dense_vector_config
+                            .as_ref()
+                            .filter(|_| entry.field_type == crate::dsl::FieldType::DenseVector)
+                            .is_some_and(|config| {
+                                config.index_type == VectorIndexType::Scann
+                                    && config.dim == artifact.config().dimension as usize
+                                    && scann_explicit_geometry_matches(
+                                        config.num_clusters,
+                                        config.tree_levels,
+                                        artifact.config().num_leaves as usize,
+                                        artifact.config().tree_levels,
+                                    )
+                                    && matches!(
+                                        artifact.config().encoding,
+                                        crate::structures::vector::scann::ScannEncoding::AsymmetricHash { .. }
+                                    )
+                            }),
+                        VectorFieldIndexType::Binary(BinaryIndexType::Scann) => entry
+                            .binary_dense_vector_config
+                            .as_ref()
+                            .filter(|_| {
+                                entry.field_type == crate::dsl::FieldType::BinaryDenseVector
+                            })
+                            .is_some_and(|config| {
+                                config.index_type == BinaryIndexType::Scann
+                                    && config.dim == artifact.config().dimension as usize
+                                    && scann_explicit_geometry_matches(
+                                        config.num_clusters,
+                                        config.tree_levels,
+                                        artifact.config().num_leaves as usize,
+                                        artifact.config().tree_levels,
+                                    )
+                                    && artifact.config().encoding
+                                        == crate::structures::vector::scann::ScannEncoding::BinaryHamming
+                            }),
+                        _ => false,
+                    };
+                    if !schema_matches {
+                        return Err(Error::Corruption(format!(
+                            "trained ScaNN artifact for field {field_id} does not match schema geometry/encoding"
+                        )));
+                    }
+                    scann_artifacts.insert(*field_id, Arc::new(artifact));
+                }
                 unsupported => {
                     return Err(Error::Corruption(format!(
                         "field {field_id} is Built for {unsupported:?}, which has no global IVF artifacts"
@@ -588,7 +750,7 @@ impl IndexMetadata {
             }
         }
 
-        if centroids.is_empty() && binary_quantizers.is_empty() {
+        if centroids.is_empty() && binary_quantizers.is_empty() && scann_artifacts.is_empty() {
             Ok(None)
         } else {
             let trained = crate::segment::TrainedVectorStructures {
@@ -596,6 +758,7 @@ impl IndexMetadata {
                 _ann_pins: Default::default(),
                 centroids,
                 binary_quantizers,
+                scann_artifacts,
             };
             #[cfg(feature = "native")]
             let trained = {
@@ -606,6 +769,19 @@ impl IndexMetadata {
             Ok(Some(trained))
         }
     }
+}
+
+/// Omitted ScaNN geometry is autopilot: the trained artifact's resolved
+/// values are authoritative and are also pinned by `VectorIndexState::Built`.
+/// Explicit schema values remain strict compatibility requirements.
+fn scann_explicit_geometry_matches(
+    configured_leaves: Option<usize>,
+    configured_levels: Option<u8>,
+    resolved_leaves: usize,
+    resolved_levels: u8,
+) -> bool {
+    configured_leaves.is_none_or(|leaves| leaves == resolved_leaves)
+        && configured_levels.is_none_or(|levels| levels == resolved_levels)
 }
 
 fn validate_trained_artifact_path(field_id: u32, kind: &str, filename: &str) -> Result<()> {
@@ -1117,6 +1293,73 @@ mod tests {
             field.centroids_file.as_deref(),
             Some("field_0_centroids.bin")
         );
+    }
+
+    #[test]
+    fn scann_metadata_persists_generation_and_fingerprint_and_defaults_old_json() {
+        let mut meta = IndexMetadata::new(test_schema());
+        meta.init_field(3, VectorIndexType::Scann);
+        meta.mark_scann_field_built(
+            3,
+            100_000,
+            1_000,
+            "field_3_scann_17.bin".to_string(),
+            17,
+            0xdecafbad,
+        )
+        .unwrap();
+
+        let bytes = meta.serialize_to_bytes().unwrap();
+        let decoded: IndexMetadata = serde_json::from_slice(&bytes).unwrap();
+        let field = decoded.get_field_meta(3).unwrap();
+        assert_eq!(field.artifact_generation, Some(17));
+        assert_eq!(field.artifact_id, Some(0xdecafbad));
+
+        let mut legacy_json = serde_json::to_value(&decoded).unwrap();
+        legacy_json["vector_fields"]["3"]
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_generation");
+        legacy_json["vector_fields"]["3"]
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_id");
+        let legacy: IndexMetadata = serde_json::from_value(legacy_json).unwrap();
+        let legacy_field = legacy.get_field_meta(3).unwrap();
+        assert_eq!(legacy_field.artifact_generation, None);
+        assert_eq!(legacy_field.artifact_id, None);
+    }
+
+    #[test]
+    fn scann_metadata_refuses_zero_or_non_scann_generation() {
+        let mut meta = IndexMetadata::new(test_schema());
+        meta.init_field(0, VectorIndexType::Scann);
+        assert!(
+            meta.mark_scann_field_built(0, 100_000, 1_000, "artifact.bin".into(), 0, 1)
+                .is_err()
+        );
+        meta.init_field(1, VectorIndexType::IvfTq);
+        assert!(
+            meta.mark_scann_field_built(1, 100_000, 1_000, "artifact.bin".into(), 1, 2)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn scann_autopilot_accepts_resolved_billion_scale_three_level_geometry() {
+        assert!(scann_explicit_geometry_matches(None, None, 10_000_000, 3));
+        assert!(!scann_explicit_geometry_matches(
+            Some(1_000_000),
+            None,
+            10_000_000,
+            3
+        ));
+        assert!(!scann_explicit_geometry_matches(
+            None,
+            Some(1),
+            10_000_000,
+            3
+        ));
     }
 
     #[test]

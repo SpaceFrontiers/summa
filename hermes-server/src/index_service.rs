@@ -109,7 +109,7 @@ impl IndexService for IndexServiceImpl {
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
-        let schema = index.schema().clone();
+        let schema = index.schema();
 
         // Move CPU-bound proto conversion off the async runtime
         let proto_docs = req.documents;
@@ -255,7 +255,7 @@ impl IndexService for IndexServiceImpl {
             if needs_switch {
                 let index = self.registry.get_or_open_index(&req.index_name).await?;
                 let writer = self.registry.get_writer(&req.index_name).await?;
-                current_schema = Some(Arc::clone(index.schema_arc()));
+                current_schema = Some(index.schema_arc());
                 current_writer = Some(writer);
                 current_index_name = Some(req.index_name.clone());
             }
@@ -481,5 +481,80 @@ impl IndexService for IndexServiceImpl {
         info!("Retrained vector index: {}", req.index_name);
 
         Ok(Response::new(RetrainVectorIndexResponse { success: true }))
+    }
+
+    async fn alter_vector_index(
+        &self,
+        request: Request<AlterVectorIndexRequest>,
+    ) -> Result<Response<AlterVectorIndexResponse>, Status> {
+        let req = request.into_inner();
+        if req.field_name.is_empty() || req.field_schema.is_empty() {
+            return Err(Status::invalid_argument(
+                "field_name and field_schema are required",
+            ));
+        }
+
+        let index = self.registry.get_or_open_index(&req.index_name).await?;
+        let schema = index.schema();
+        let field = schema
+            .get_field(&req.field_name)
+            .ok_or_else(|| Status::invalid_argument("unknown vector field"))?;
+        let field_name = schema
+            .get_field_name(field)
+            .ok_or_else(|| Status::internal("schema field has no name"))?;
+        let fragment = format!(
+            "index AlterVectorIndex {{ field {field_name}: {} }}",
+            req.field_schema
+        );
+        let replacement = parse_schema(&fragment)
+            .map_err(|error| Status::invalid_argument(format!("Invalid field_schema: {error}")))?;
+        let replacement_field = replacement
+            .get_field(field_name)
+            .and_then(|field| replacement.get_field_entry(field))
+            .ok_or_else(|| {
+                Status::invalid_argument("field_schema did not define the target field")
+            })?;
+        let alter = match replacement_field.field_type {
+            hermes_core::dsl::FieldType::DenseVector => replacement_field
+                .dense_vector_config
+                .clone()
+                .map(hermes_core::dsl::VectorIndexAlter::Dense),
+            hermes_core::dsl::FieldType::BinaryDenseVector => replacement_field
+                .binary_dense_vector_config
+                .clone()
+                .map(hermes_core::dsl::VectorIndexAlter::Binary),
+            _ => None,
+        }
+        .ok_or_else(|| Status::invalid_argument("field_schema must define a vector index"))?;
+
+        let writer = self.registry.get_writer(&req.index_name).await?;
+        let outcome = writer
+            .write()
+            .await
+            .alter_vector_index(field, alter)
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+
+        index
+            .reader()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?
+            .reload()
+            .await
+            .map_err(crate::error::hermes_error_to_status)?;
+
+        let state = match outcome.state {
+            hermes_core::index::AlterVectorIndexState::Built => VectorIndexAlterState::Built,
+            hermes_core::index::AlterVectorIndexState::DeferredFlat => {
+                VectorIndexAlterState::DeferredFlat
+            }
+            hermes_core::index::AlterVectorIndexState::ParametersOnly => {
+                VectorIndexAlterState::ParametersOnly
+            }
+        };
+        Ok(Response::new(AlterVectorIndexResponse {
+            publication_generation: outcome.publication_generation,
+            state: state.into(),
+        }))
     }
 }

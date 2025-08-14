@@ -12,6 +12,126 @@ use std::sync::Arc;
 
 use crate::dsl::Field;
 
+/// Mmap/Arc-backed bytes for one validated global ScaNN generation. The full
+/// artifact is fingerprinted exactly once at open; query/merge compatibility
+/// reads the cached identity/config instead of rehashing the centroid plane.
+#[derive(Debug, Clone)]
+pub struct ScannTrainedArtifactBytes {
+    raw: crate::directories::OwnedBytes,
+    generation: u64,
+    artifact_id: u64,
+    config: crate::structures::vector::scann::ScannConfig,
+    /// Small executable metadata; centroid planes remain in `raw` and are
+    /// decoded coordinate-by-coordinate while routing.
+    float_model: Option<Arc<crate::structures::vector::scann::QuantizedFloatScannModel>>,
+    binary_model: Option<Arc<crate::structures::vector::scann::QuantizedBinaryScannModel>>,
+}
+
+impl ScannTrainedArtifactBytes {
+    pub fn open(raw: crate::directories::OwnedBytes) -> std::io::Result<Self> {
+        let (generation, artifact_id, config, float_model, binary_model) = {
+            let view =
+                crate::structures::vector::scann::ScannTrainedArtifactView::parse(raw.as_slice())
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let (float_model, binary_model) = match view.config.encoding {
+                crate::structures::vector::scann::ScannEncoding::AsymmetricHash { .. } => (
+                    Some(Arc::new(
+                        crate::structures::vector::scann::QuantizedFloatScannModel::from_artifact_view(
+                            &view,
+                        )
+                        .map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?,
+                    )),
+                    None,
+                ),
+                crate::structures::vector::scann::ScannEncoding::BinaryHamming => (
+                    None,
+                    Some(Arc::new(
+                        crate::structures::vector::scann::QuantizedBinaryScannModel::from_artifact_view(
+                            &view,
+                        )
+                        .map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?,
+                    )),
+                ),
+            };
+            (
+                view.generation,
+                view.artifact_id,
+                view.config.clone(),
+                float_model,
+                binary_model,
+            )
+        };
+        let artifact = Self {
+            raw,
+            generation,
+            artifact_id,
+            config,
+            float_model,
+            binary_model,
+        };
+        Ok(artifact)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn artifact_id(&self) -> u64 {
+        self.artifact_id
+    }
+
+    pub fn config(&self) -> &crate::structures::vector::scann::ScannConfig {
+        &self.config
+    }
+
+    pub fn estimated_memory_bytes(&self) -> usize {
+        self.raw
+            .len()
+            .saturating_add(
+                self.float_model
+                    .as_deref()
+                    .map_or(0, |model| model.estimated_memory_bytes()),
+            )
+            .saturating_add(
+                self.binary_model
+                    .as_deref()
+                    .map_or(0, |model| model.estimated_memory_bytes()),
+            )
+    }
+
+    pub(crate) fn float_model(
+        &self,
+    ) -> std::io::Result<crate::structures::vector::scann::QuantizedFloatScannModelView<'_>> {
+        let model = self.float_model.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "binary ScaNN artifact cannot be used as a float model",
+            )
+        })?;
+        model
+            .view(self.raw.as_slice())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) fn binary_model(
+        &self,
+    ) -> std::io::Result<crate::structures::vector::scann::QuantizedBinaryScannModelView<'_>> {
+        let model = self.binary_model.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "float ScaNN artifact cannot be used as a binary model",
+            )
+        })?;
+        model
+            .view(self.raw.as_slice())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+
 /// Trained vector index structures for rebuilding segments with ANN indexes
 ///
 /// Defined here (not in merger) so it's available on all platforms including WASM.
@@ -25,6 +145,8 @@ pub struct TrainedVectorStructures {
     pub centroids: FxHashMap<u32, Arc<crate::structures::CoarseCentroids>>,
     /// Global Hamming coarse quantizers per binary dense field.
     pub binary_quantizers: FxHashMap<u32, Arc<crate::structures::BinaryCoarseQuantizer>>,
+    /// Global ScaNN models, mmap-backed and shared by every segment snapshot.
+    pub scann_artifacts: FxHashMap<u32, Arc<ScannTrainedArtifactBytes>>,
 }
 
 impl TrainedVectorStructures {

@@ -268,7 +268,7 @@ field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4�
 
 ### Index Types and Routing
 
-Float fields have two ANN formats, both built on the TurboQuant codec
+Float fields have three ANN formats. Two are built on the TurboQuant codec
 (`docs/turboquant-quantization.md`). `ivf_tq` (the default) combines the
 corpus-trained coarse centroid router with training-free TQ leaf codes of
 each normalized vector's centroid residual — only centroids are trained,
@@ -280,7 +280,10 @@ exhaustively with SIMD lookup tables and exact-reranked. Ordinary segment
 merges copy both formats' immutable run columns byte-for-byte and rewrite
 only their compact document-base directory. `flat` remains available for
 exact brute-force search and as the accumulation format before an `ivf_tq`
-build.
+build. `scann` uses an index-wide hierarchical partitioner and shared
+asymmetric-hashing codebook. Every immutable segment references the same
+trained generation, so commits only route/encode new vectors and merges copy
+compatible leaf runs without retraining.
 
 Only the cosine-normalized IVF-TQ generation is supported. Older unmarked
 trained generations and ANN payloads are rejected while opening the index;
@@ -294,6 +297,7 @@ recreated with `ivf_tq` and reindexed.
 field e: dense_vector<768, f16> [indexed]                                      # global IVF-TQ
 field e: dense_vector<768, f16> [indexed<ivf_tq, routing: hnsw, nprobe: 64>]
 field e: dense_vector<768, f16> [indexed<tq>]                                  # training-free TQ
+field e: dense_vector<768, f16> [indexed<scann, num_clusters: 10000000, tree_levels: 2, nprobe: 1024>]
 field e: dense_vector<768, f16> [indexed<flat>]                                # exact full scan
 field e: dense_vector<768> [stored]                                            # stored, not indexed
 ```
@@ -302,14 +306,40 @@ field e: dense_vector<768> [stored]                                            #
 code) and warns when they are set; `rerank_factor` applies unchanged.
 `ivf_tq` accepts all IVF knobs.
 
-When `num_clusters` is omitted, training chooses a corpus-sized leaf count
-using an 8×sqrt(N) target bounded by sample quality and artifact memory. Routing
-can be `auto`, `flat`, `two_level`, or `hnsw`; `auto` uses flat centroid scoring
-below 4,096 leaves and HNSW above it. HNSW is a global coarse-quantizer index,
-so its work is done once per query rather than once per segment. The default
-`nprobe` is 64. Candidate collection keeps distinct documents, is bounded to
-3×k per segment, and exact reranking streams every value of those candidate
-documents through fixed-size buffers.
+For `scann`, `num_clusters` is the terminal leaf count and `tree_levels` is
+the routing-tree depth. Both may be omitted for corpus-size autopilot. Explicit
+depths must be in `1..=3`, explicit leaf counts must not exceed 30 million, and
+`nprobe` must not exceed an explicit leaf count. Training readiness is derived
+by the runtime from the requested geometry and available sample; it is not a
+schema knob. `tree_levels` is an error on other index types rather than an
+ignored setting.
+
+At approximately one billion vectors, a high-selectivity explicit geometry is:
+
+```
+field e: dense_vector<1024, f16> [
+  indexed<scann, num_clusters: 10000000, tree_levels: 3,
+          nprobe: 1024>
+]
+```
+
+An explicit ten-million-leaf tree requires at least 80 million sampled rows
+(the internal eight-rows-per-leaf floor), so its operational training memory
+and sample limits must be raised accordingly. The desired quality sample is
+200 rows per leaf when the corpus and limits permit it.
+
+When `num_clusters` is omitted, autopilot follows AlloyDB's recall-oriented
+balanced geometry: `ceil(sqrt(rows))` below 100 million rows,
+`ceil(rows^(2/3))` through one billion, and
+`min(30,000,000, ceil(rows^(3/4)))` above one billion. A one-billion-row field
+selects 1,000,000 leaves in two centroid levels. Builder sample/memory ceilings
+never silently change that shared topology: the build fails or remains
+untrained until it can retain the hardcoded eight-samples-per-leaf minimum.
+Crossing 100 million rows requires 1,723,552 samples; crossing one billion
+requires 44,987,312. `tree_levels` can still pin a depth from one through three.
+The default `nprobe` is 64; intermediate routing keeps a 64-parent recall floor
+and widens it when necessary to keep the full requested probe count reachable.
+Exact reranking streams candidate values through fixed-size buffers.
 
 ### SOAR (higher recall for IVF indexes)
 
@@ -339,18 +369,31 @@ index documents {
 }
 ```
 
-### Binary Vector IVF
+### Binary Vector IVF and ScaNN
 
 Binary dense vector fields use the same global IVF router and HNSW topology as
 float fields, with metric-specific k-majority centroids and exact packed-code
 leaf scanning. The only approximation is which clusters get probed; there is
 no lossy PQ stage or rerank for exact Hamming codes. Use `flat` explicitly for
-brute-force SIMD Hamming scan:
+brute-force SIMD Hamming scan. Binary `scann` uses hierarchical Hamming
+partitioning and exact XOR-popcount leaf scoring; it does not expand packed
+bits to floats or apply a float AH codec. It accepts the same `num_clusters`,
+`tree_levels`, and `nprobe` parameters as float ScaNN. Float-only options such
+as `soar` are rejected:
 
 ```
 field hash: binary_dense_vector<512> [indexed<ivf, routing: hnsw, nprobe: 64>]
+field hash: binary_dense_vector<1024> [indexed<scann, num_clusters: 10000000, tree_levels: 2, nprobe: 1024>]
 field hash: binary_dense_vector<512> [indexed<flat>]
 ```
+
+An existing IVF or ScaNN field can be changed atomically through the
+`AlterVectorIndex` gRPC method. Pass the index name, field name, and the field's
+replacement SDL type/options, for example
+`dense_vector<768, f16> [indexed<scann, tree_levels: 2, nprobe: 1024>]`.
+The response reports whether the ANN generation was built immediately, kept
+flat until the geometry has enough training vectors, or only changed search
+parameters.
 
 ## Sparse Vectors
 

@@ -268,6 +268,8 @@ enum SoarDirective {
 struct IndexConfig {
     index_type: Option<super::schema::VectorIndexType>,
     num_clusters: Option<usize>,
+    target_vectors: Option<u64>,
+    tree_levels: Option<u8>,
     nprobe: Option<usize>,
     ivf_routing: Option<super::schema::IvfRoutingMode>,
     soar: SoarDirective,
@@ -309,7 +311,7 @@ struct ParsedAttributes {
 }
 
 /// Parse attributes from pest pair
-fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> ParsedAttributes {
+fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> Result<ParsedAttributes> {
     let mut attrs = ParsedAttributes {
         indexed: false,
         stored: false,
@@ -327,7 +329,7 @@ fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> ParsedAttributes {
                 match inner.as_rule() {
                     Rule::indexed_with_config => {
                         attrs.indexed = true;
-                        attrs.index_config = Some(parse_index_config(inner));
+                        attrs.index_config = Some(parse_index_config(inner)?);
                         found_config = true;
                         break;
                     }
@@ -353,11 +355,11 @@ fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> ParsedAttributes {
         }
     }
 
-    attrs
+    Ok(attrs)
 }
 
 /// Parse index configuration from indexed<...> attribute
-fn parse_index_config(pair: pest::iterators::Pair<Rule>) -> IndexConfig {
+fn parse_index_config(pair: pest::iterators::Pair<Rule>) -> Result<IndexConfig> {
     let mut config = IndexConfig::default();
 
     // indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
@@ -369,18 +371,21 @@ fn parse_index_config(pair: pest::iterators::Pair<Rule>) -> IndexConfig {
             for param in inner.into_inner() {
                 if param.as_rule() == Rule::index_config_param {
                     for p in param.into_inner() {
-                        parse_single_index_config_param(&mut config, p);
+                        parse_single_index_config_param(&mut config, p)?;
                     }
                 }
             }
         }
     }
 
-    config
+    Ok(config)
 }
 
 /// Parse a single index config parameter
-fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators::Pair<Rule>) {
+fn parse_single_index_config_param(
+    config: &mut IndexConfig,
+    p: pest::iterators::Pair<Rule>,
+) -> Result<()> {
     use super::schema::VectorIndexType;
 
     match p.as_rule() {
@@ -392,6 +397,10 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
             "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
             "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
             "ivf_tq" => config.index_type = Some(VectorIndexType::IvfTq),
+            "scann" => {
+                config.index_type = Some(VectorIndexType::Scann);
+                config.binary_index_type = Some(super::schema::BinaryIndexType::Scann);
+            }
             "tq" => config.index_type = Some(VectorIndexType::Tq),
             _ => {}
         },
@@ -406,6 +415,10 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
                     "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
                     "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
                     "ivf_tq" => config.index_type = Some(VectorIndexType::IvfTq),
+                    "scann" => {
+                        config.index_type = Some(VectorIndexType::Scann);
+                        config.binary_index_type = Some(super::schema::BinaryIndexType::Scann);
+                    }
                     "tq" => config.index_type = Some(VectorIndexType::Tq),
                     _ => {}
                 }
@@ -414,22 +427,43 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
         Rule::num_clusters_kwarg => {
             // num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }
             if let Some(n) = p.into_inner().next() {
-                config.num_clusters = Some(n.as_str().parse().unwrap_or_else(|_| {
-                    log::warn!(
-                        "Invalid num_clusters value '{}', using default 256",
+                config.num_clusters = Some(n.as_str().parse().map_err(|_| {
+                    Error::Schema(format!(
+                        "num_clusters '{}' does not fit on this platform",
                         n.as_str()
-                    );
-                    256
-                }));
+                    ))
+                })?);
+            }
+        }
+        Rule::target_vectors_kwarg => {
+            if let Some(value) = p.into_inner().next() {
+                config.target_vectors = Some(value.as_str().parse().map_err(|_| {
+                    Error::Schema(format!(
+                        "target_vectors '{}' does not fit in an unsigned 64-bit integer",
+                        value.as_str()
+                    ))
+                })?);
             }
         }
         Rule::nprobe_kwarg => {
             // nprobe_kwarg = { "nprobe" ~ ":" ~ nprobe_spec }
             if let Some(n) = p.into_inner().next() {
-                config.nprobe = Some(n.as_str().parse().unwrap_or_else(|_| {
-                    log::warn!("Invalid nprobe value '{}', using default 64", n.as_str());
-                    64
-                }));
+                config.nprobe = Some(n.as_str().parse().map_err(|_| {
+                    Error::Schema(format!(
+                        "nprobe '{}' does not fit on this platform",
+                        n.as_str()
+                    ))
+                })?);
+            }
+        }
+        Rule::tree_levels_kwarg => {
+            if let Some(value) = p.into_inner().next() {
+                config.tree_levels = Some(value.as_str().parse().map_err(|_| {
+                    Error::Schema(format!(
+                        "tree_levels '{}' does not fit in an unsigned 8-bit integer",
+                        value.as_str()
+                    ))
+                })?);
             }
         }
         Rule::routing_kwarg => {
@@ -586,6 +620,8 @@ fn parse_single_index_config_param(config: &mut IndexConfig, p: pest::iterators:
         }
         _ => {}
     }
+
+    Ok(())
 }
 
 /// Parse query configuration block: query<tokenizer: "...", weighting: idf>
@@ -745,7 +781,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 binary_dense_vector_config = Some(BinaryDenseVectorConfig::new(dim));
             }
             Rule::attributes => {
-                let attrs = parse_attributes(item);
+                let attrs = parse_attributes(item)?;
                 indexed = attrs.indexed;
                 stored = attrs.stored;
                 multi = attrs.multi;
@@ -786,13 +822,16 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     if let Some(idx_cfg) = index_config {
         positions = idx_cfg.positions;
         if let Some(ref mut bv_config) = binary_dense_vector_config {
-            apply_index_config_to_binary_dense_vector(bv_config, idx_cfg);
+            apply_index_config_to_binary_dense_vector(bv_config, idx_cfg)?;
         } else if let Some(ref mut dv_config) = dense_vector_config {
-            apply_index_config_to_dense_vector(dv_config, idx_cfg);
+            apply_index_config_to_dense_vector(dv_config, idx_cfg)?;
         } else if field_type == FieldType::SparseVector {
+            reject_scann_options_for_non_dense_vector(&idx_cfg, "sparse vector")?;
             // For sparse vectors, create default config if not present and apply index params
             let sv_config = sparse_vector_config.get_or_insert(SparseVectorConfig::default());
             apply_index_config_to_sparse_vector(sv_config, idx_cfg);
+        } else {
+            reject_scann_options_for_non_dense_vector(&idx_cfg, "non-vector field")?;
         }
     }
 
@@ -813,16 +852,69 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     })
 }
 
+fn reject_scann_options_for_non_dense_vector(config: &IndexConfig, field_kind: &str) -> Result<()> {
+    if config.index_type == Some(super::schema::VectorIndexType::Scann)
+        || config.binary_index_type == Some(super::schema::BinaryIndexType::Scann)
+        || config.tree_levels.is_some()
+        || config.target_vectors.is_some()
+    {
+        return Err(Error::Schema(format!(
+            "vector index options require a dense or binary dense vector field, not a {field_kind}"
+        )));
+    }
+    Ok(())
+}
+
 /// Apply index configuration from indexed<...> to BinaryDenseVectorConfig
 fn apply_index_config_to_binary_dense_vector(
     config: &mut BinaryDenseVectorConfig,
     idx_cfg: IndexConfig,
-) {
+) -> Result<()> {
+    if idx_cfg.target_vectors == Some(0) {
+        return Err(Error::Schema(
+            "target_vectors must be greater than zero".to_string(),
+        ));
+    }
+    if idx_cfg.index_type.is_some() && idx_cfg.binary_index_type.is_none() {
+        return Err(Error::Schema(
+            "binary dense vectors support only 'flat', 'ivf', or 'scann' index types".to_string(),
+        ));
+    }
     if let Some(index_type) = idx_cfg.binary_index_type {
         config.index_type = index_type;
     }
+    if idx_cfg.target_vectors.is_some() && config.index_type == super::schema::BinaryIndexType::Flat
+    {
+        return Err(Error::Schema(
+            "'target_vectors' is only valid for binary IVF or ScaNN automatic topology".to_string(),
+        ));
+    }
+    validate_scann_index_options(
+        "binary dense vector",
+        config.index_type == super::schema::BinaryIndexType::Scann,
+        &idx_cfg,
+    )?;
+    match &idx_cfg.soar {
+        SoarDirective::Unspecified | SoarDirective::Disabled => config.soar = None,
+        SoarDirective::Enabled(soar)
+            if config.index_type == super::schema::BinaryIndexType::Scann =>
+        {
+            config.soar = Some(soar.clone());
+        }
+        SoarDirective::Enabled(_) => {
+            return Err(Error::Schema(
+                "'soar' on a binary dense vector requires the ScaNN index".to_string(),
+            ));
+        }
+    }
     if idx_cfg.num_clusters.is_some() {
         config.num_clusters = idx_cfg.num_clusters;
+    }
+    if idx_cfg.target_vectors.is_some() {
+        config.target_vectors = idx_cfg.target_vectors;
+    }
+    if idx_cfg.tree_levels.is_some() {
+        config.tree_levels = idx_cfg.tree_levels;
     }
     if let Some(nprobe) = idx_cfg.nprobe {
         config.nprobe = nprobe;
@@ -830,13 +922,47 @@ fn apply_index_config_to_binary_dense_vector(
     if let Some(routing) = idx_cfg.ivf_routing {
         config.ivf_routing = routing;
     }
+    Ok(())
 }
 
 /// Apply index configuration from indexed<...> to DenseVectorConfig
-fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: IndexConfig) {
+fn apply_index_config_to_dense_vector(
+    config: &mut DenseVectorConfig,
+    idx_cfg: IndexConfig,
+) -> Result<()> {
+    if idx_cfg.target_vectors == Some(0) {
+        return Err(Error::Schema(
+            "target_vectors must be greater than zero".to_string(),
+        ));
+    }
+    if idx_cfg.binary_index_type.is_some() && idx_cfg.index_type.is_none() {
+        return Err(Error::Schema(
+            "float dense vectors do not support the binary-only 'ivf' index type; use 'ivf_tq' or 'scann'"
+                .to_string(),
+        ));
+    }
     // Apply index type if specified
     if let Some(index_type) = idx_cfg.index_type {
         config.index_type = index_type;
+    }
+    if idx_cfg.target_vectors.is_some()
+        && matches!(
+            config.index_type,
+            super::schema::VectorIndexType::Flat | super::schema::VectorIndexType::Tq
+        )
+    {
+        return Err(Error::Schema(
+            "'target_vectors' is only valid for IVF-TQ or ScaNN automatic topology".to_string(),
+        ));
+    }
+
+    validate_scann_index_options(
+        "dense vector",
+        config.index_type == super::schema::VectorIndexType::Scann,
+        &idx_cfg,
+    )?;
+    if idx_cfg.target_vectors.is_some() {
+        config.target_vectors = idx_cfg.target_vectors;
     }
 
     // TQ scans every code (no probing, no clusters, no routing); accepting
@@ -859,12 +985,16 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
         config.num_clusters = None;
         config.nprobe = 0;
         config.ivf_routing = super::schema::IvfRoutingMode::Flat;
-        return apply_soar_to_dense_vector(config, idx_cfg);
+        apply_soar_to_dense_vector(config, idx_cfg)?;
+        return Ok(());
     }
 
     // Apply num_clusters for IVF-based indexes
     if idx_cfg.num_clusters.is_some() {
         config.num_clusters = idx_cfg.num_clusters;
+    }
+    if idx_cfg.tree_levels.is_some() {
+        config.tree_levels = idx_cfg.tree_levels;
     }
 
     // Apply nprobe if specified
@@ -875,33 +1005,88 @@ fn apply_index_config_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: I
         config.ivf_routing = routing;
     }
 
-    apply_soar_to_dense_vector(config, idx_cfg);
+    apply_soar_to_dense_vector(config, idx_cfg)?;
+    Ok(())
+}
+
+const MAX_SCANN_TREE_LEVELS: u8 = 3;
+const MAX_SCANN_LEAVES: usize = 30_000_000;
+
+fn validate_scann_index_options(
+    field_kind: &str,
+    is_scann: bool,
+    config: &IndexConfig,
+) -> Result<()> {
+    if !is_scann {
+        if config.tree_levels.is_some() {
+            return Err(Error::Schema(format!(
+                "'tree_levels' is only valid for a ScaNN {field_kind} index"
+            )));
+        }
+        return Ok(());
+    }
+
+    if config.ivf_routing.is_some() {
+        return Err(Error::Schema(format!(
+            "'routing' is not configurable for ScaNN {field_kind} indexes; ScaNN owns its hierarchical routing"
+        )));
+    }
+
+    if let Some(tree_levels) = config.tree_levels
+        && !(1..=MAX_SCANN_TREE_LEVELS).contains(&tree_levels)
+    {
+        return Err(Error::Schema(format!(
+            "ScaNN tree_levels must be in 1..={MAX_SCANN_TREE_LEVELS}, got {tree_levels}"
+        )));
+    }
+    if let Some(num_clusters) = config.num_clusters {
+        if num_clusters < 2 {
+            return Err(Error::Schema(
+                "ScaNN num_clusters (terminal leaf count) must be at least 2".to_string(),
+            ));
+        }
+        if num_clusters > MAX_SCANN_LEAVES {
+            return Err(Error::Schema(format!(
+                "ScaNN num_clusters cannot exceed {MAX_SCANN_LEAVES}, got {num_clusters}"
+            )));
+        }
+        let nprobe = config.nprobe.unwrap_or(64);
+        if nprobe > num_clusters {
+            return Err(Error::Schema(format!(
+                "ScaNN nprobe ({nprobe}) cannot exceed explicit num_clusters ({num_clusters})"
+            )));
+        }
+    }
+    if config.nprobe == Some(0) {
+        return Err(Error::Schema("ScaNN nprobe must be positive".to_string()));
+    }
+    Ok(())
 }
 
 /// Apply SOAR spilling if specified (IVF-based indexes only)
-fn apply_soar_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: IndexConfig) {
+fn apply_soar_to_dense_vector(config: &mut DenseVectorConfig, idx_cfg: IndexConfig) -> Result<()> {
     match idx_cfg.soar {
         SoarDirective::Unspecified => {
             config.soar = config
-                .uses_ivf()
+                .supports_soar()
                 .then(crate::structures::SoarConfig::default);
         }
         SoarDirective::Disabled => {
             config.soar = None;
         }
         SoarDirective::Enabled(soar) => {
-            if config.uses_ivf() {
+            if config.supports_soar() {
                 config.soar = Some(soar);
             } else {
                 config.soar = None;
-                log::warn!(
-                    "'soar' requires the IVF-TQ index; \
-                     ignoring for index type {:?}",
+                return Err(Error::Schema(format!(
+                    "'soar' requires the IVF-TQ index and is not implemented for {:?}",
                     config.index_type
-                );
+                )));
             }
         }
     }
+    Ok(())
 }
 
 /// Parse sparse_vector_config - only index_size (positional)
@@ -1846,6 +2031,149 @@ mod tests {
     }
 
     #[test]
+    fn scann_float_and_binary_parse_billion_scale_settings() {
+        let indexes = parse_sdl(
+            r#"
+            index billion_vectors {
+                field embedding: dense_vector<1024, f16> [indexed<scann, num_clusters: 10000000, tree_levels: 2, nprobe: 1024>]
+                field hash: binary_dense_vector<1024> [indexed<scann, num_clusters: 10000000, tree_levels: 3, nprobe: 2048>]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let dense = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
+        assert_eq!(
+            dense.index_type,
+            super::super::schema::VectorIndexType::Scann
+        );
+        assert_eq!(dense.num_clusters, Some(10_000_000));
+        assert_eq!(dense.tree_levels, Some(2));
+        assert_eq!(dense.nprobe, 1024);
+
+        let binary = indexes[0].fields[1]
+            .binary_dense_vector_config
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            binary.index_type,
+            super::super::schema::BinaryIndexType::Scann
+        );
+        assert_eq!(binary.num_clusters, Some(10_000_000));
+        assert_eq!(binary.tree_levels, Some(3));
+        assert_eq!(binary.nprobe, 2048);
+    }
+
+    #[test]
+    fn target_vectors_parses_for_float_and_binary_indexes() {
+        let indexes = parse_sdl(
+            r#"
+            index streaming_vectors {
+                field embedding: dense_vector<1024, f16> [indexed<scann, num_clusters: 1000000, target_vectors: 1000000000>]
+                field hash: binary_dense_vector<2560> [indexed<ivf, target_vectors: 1000000000>]
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            indexes[0].fields[0]
+                .dense_vector_config
+                .as_ref()
+                .unwrap()
+                .target_vectors,
+            Some(1_000_000_000)
+        );
+        assert_eq!(
+            indexes[0].fields[0]
+                .dense_vector_config
+                .as_ref()
+                .unwrap()
+                .num_clusters,
+            Some(1_000_000),
+            "target_vectors may be persisted alongside an explicit, overriding topology"
+        );
+        assert_eq!(
+            indexes[0].fields[1]
+                .binary_dense_vector_config
+                .as_ref()
+                .unwrap()
+                .target_vectors,
+            Some(1_000_000_000)
+        );
+
+        let error = parse_sdl(
+            "index invalid { field hash: binary_dense_vector<256> [indexed<ivf, target_vectors: 0>] }",
+        )
+        .expect_err("zero target must fail");
+        assert!(error.to_string().contains("greater than zero"), "{error}");
+
+        let error = parse_sdl(
+            "index invalid { field embedding: dense_vector<256> [indexed<tq, target_vectors: 1000000>] }",
+        )
+        .expect_err("training-free topology hint must fail");
+        assert!(error.to_string().contains("automatic topology"), "{error}");
+
+        for sdl in [
+            "index invalid { field embedding: dense_vector<256> [indexed<flat, target_vectors: 1000000>] }",
+            "index invalid { field hash: binary_dense_vector<256> [indexed<flat, target_vectors: 1000000>] }",
+        ] {
+            let error = parse_sdl(sdl).expect_err("flat topology hint must fail");
+            assert!(error.to_string().contains("automatic topology"), "{error}");
+        }
+
+        let error = parse_sdl(
+            "index invalid { field hash: binary_dense_vector<256> [indexed<ivf, target_vectors: 18446744073709551616>] }",
+        )
+        .expect_err("u64 overflow must fail");
+        assert!(error.to_string().contains("unsigned 64-bit"), "{error}");
+    }
+
+    #[test]
+    fn scann_rejects_invalid_geometry_and_algorithm_specific_options() {
+        for (fragment, expected) in [
+            ("scann, tree_levels: 0", "tree_levels"),
+            ("scann, tree_levels: 4", "tree_levels"),
+            ("scann, num_clusters: 30000001", "num_clusters"),
+            ("scann, num_clusters: 1", "at least 2"),
+            ("scann, routing: flat", "not configurable for ScaNN"),
+            (
+                "scann, num_clusters: 32, nprobe: 33",
+                "cannot exceed explicit num_clusters",
+            ),
+            ("ivf_tq, tree_levels: 2", "only valid for a ScaNN"),
+        ] {
+            let sdl = format!(
+                "index invalid {{ field embedding: dense_vector<128> [indexed<{fragment}>] }}"
+            );
+            let error = parse_sdl(&sdl).expect_err(fragment);
+            assert!(error.to_string().contains(expected), "{fragment}: {error}");
+        }
+    }
+
+    #[test]
+    fn binary_scann_accepts_selective_spilling_but_binary_ivf_rejects_it() {
+        let indexes = parse_sdl(
+            "index valid { field hash: binary_dense_vector<256> [indexed<scann, soar: selective>] }",
+        )
+        .unwrap();
+        let soar = indexes[0].fields[0]
+            .binary_dense_vector_config
+            .as_ref()
+            .unwrap()
+            .soar
+            .as_ref()
+            .expect("binary ScaNN should retain explicit spilling");
+        assert_eq!(soar.calibration_target(), Some(0.30));
+
+        let error = parse_sdl(
+            "index invalid { field hash: binary_dense_vector<256> [indexed<ivf, soar: selective>] }",
+        )
+        .expect_err("binary IVF spilling must fail loudly");
+        assert!(error.to_string().contains("requires the ScaNN"), "{error}");
+    }
+
+    #[test]
     fn test_dense_vector_with_soar() {
         // Omission resolves to the selective one-secondary default.
         let sdl = r#"
@@ -1906,6 +2234,7 @@ mod tests {
             index documents {
                 field tq: dense_vector<768> [indexed<tq>]
                 field flat: dense_vector<768> [indexed<flat>]
+                field scann: dense_vector<768> [indexed<scann>]
             }
         "#;
         let indexes = parse_sdl(sdl).unwrap();
@@ -1921,6 +2250,16 @@ mod tests {
                 field.name,
             );
         }
+    }
+
+    #[test]
+    fn float_scann_rejects_explicit_soar_until_secondary_assignments_exist() {
+        let error = parse_sdl(
+            "index invalid { field embedding: dense_vector<256> [indexed<scann, soar: selective>] }",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not implemented"));
+        assert!(error.to_string().contains("Scann") || error.to_string().contains("ScaNN"));
     }
 
     #[test]

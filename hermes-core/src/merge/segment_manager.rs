@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use arc_swap::ArcSwapOption;
+use arc_swap::ArcSwap;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -54,7 +54,8 @@ use crate::directories::DirectoryWriter;
 use crate::error::{Error, Result};
 use crate::index::{IndexMetadata, ReorderConcurrencyGate, ReorderPriority, SegmentMetaInfo};
 use crate::segment::{
-    SegmentFiles, SegmentId, SegmentMeta, SegmentSnapshot, SegmentTracker, TrainedVectorStructures,
+    PublishedIndexGeneration, SegmentFiles, SegmentId, SegmentMeta, SegmentSnapshot,
+    SegmentTracker, TrainedVectorStructures,
 };
 #[cfg(feature = "native")]
 use crate::segment::{SegmentMerger, SegmentReader};
@@ -849,7 +850,7 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// Trained vector structures — lock-free reads via ArcSwap.
     /// Wrapped in `Arc` so cancellation-safe metadata transactions can publish
     /// the matching in-memory generation after their durable commit point.
-    trained: Arc<ArcSwapOption<TrainedVectorStructures>>,
+    published_generation: Arc<ArcSwap<PublishedIndexGeneration>>,
 
     /// Raised while index-level trained artifacts and their metadata are being
     /// replaced. Search readers keep using the last valid generation, while
@@ -991,6 +992,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             })
         };
 
+        let initial_generation = Arc::new(PublishedIndexGeneration {
+            publication_id: metadata.publication_generation,
+            schema: Arc::clone(&schema),
+            trained_vectors: None,
+        });
         Self {
             state: Arc::new(AsyncMutex::new(ManagerState {
                 metadata,
@@ -1006,7 +1012,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             #[cfg(test)]
             force_merge_conflict_retries: std::sync::atomic::AtomicU64::new(0),
             lifecycle_handles,
-            trained: Arc::new(ArcSwapOption::new(None)),
+            published_generation: Arc::new(ArcSwap::new(initial_generation)),
             vector_artifact_update: Arc::new(AtomicBool::new(false)),
             tracker,
             delete_fn,
@@ -1393,7 +1399,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     /// Get trained vector structures (lock-free via ArcSwap)
     pub fn trained(&self) -> Option<Arc<TrainedVectorStructures>> {
-        self.trained.load_full()
+        self.published_generation.load().trained_vectors.clone()
+    }
+
+    /// Current schema/vector publication. Cloning the Arc gives an operation a
+    /// stable configuration even if an ALTER publishes concurrently.
+    pub(crate) fn published_generation(&self) -> Arc<PublishedIndexGeneration> {
+        self.published_generation.load_full()
+    }
+
+    pub(crate) fn publication_id(&self) -> u64 {
+        self.published_generation.load().publication_id
     }
 
     /// Capture trained structures for a segment producer.
@@ -1406,7 +1422,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         if self.vector_artifact_update.load(Ordering::Acquire) {
             return None;
         }
-        let trained = self.trained.load_full();
+        let trained = self.published_generation.load().trained_vectors.clone();
         if self.vector_artifact_update.load(Ordering::Acquire) {
             None
         } else {
@@ -1464,14 +1480,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Copies metadata under lock, releases lock, then does disk I/O.
     pub(crate) async fn try_load_and_publish_trained(&self) -> Result<()> {
         // Copy vector_fields under lock (cheap clone of HashMap<u32, FieldMeta>)
-        let vector_fields = {
+        let (vector_fields, schema, publication_id) = {
             let st = self.state.lock().await;
-            st.metadata.vector_fields.clone()
+            (
+                st.metadata.vector_fields.clone(),
+                Arc::new(st.metadata.schema.clone()),
+                st.metadata.publication_generation,
+            )
         };
         // Disk I/O happens WITHOUT holding the state lock
         let trained = IndexMetadata::try_load_trained_from_fields(
             &vector_fields,
-            self.schema.as_ref(),
+            schema.as_ref(),
             self.directory.as_ref(),
         )
         .await?
@@ -1479,7 +1499,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // Publish exactly the validated snapshot, including None. Retaining a
         // previous map when metadata has no Built fields would let new segments
         // depend on artifacts no longer referenced durably.
-        self.trained.store(trained);
+        self.published_generation
+            .store(Arc::new(PublishedIndexGeneration {
+                publication_id,
+                schema,
+                trained_vectors: trained,
+            }));
         Ok(())
     }
 
@@ -1494,6 +1519,25 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         artifact_update: &VectorArtifactUpdateGuard,
         vector_fields: HashMap<u32, crate::index::FieldVectorMeta>,
         next_trained: Arc<TrainedVectorStructures>,
+        staged: Vec<StagedVectorSegment>,
+    ) -> Result<()> {
+        let schema = self.published_generation().schema.clone();
+        self.publish_vector_generation_with_schema(
+            artifact_update,
+            schema,
+            vector_fields,
+            Some(next_trained),
+            staged,
+        )
+        .await
+    }
+
+    pub(crate) async fn publish_vector_generation_with_schema(
+        self: &Arc<Self>,
+        artifact_update: &VectorArtifactUpdateGuard,
+        schema: Arc<crate::dsl::Schema>,
+        vector_fields: HashMap<u32, crate::index::FieldVectorMeta>,
+        next_trained: Option<Arc<TrainedVectorStructures>>,
         mut staged: Vec<StagedVectorSegment>,
     ) -> Result<()> {
         if !self.vector_artifact_update.load(Ordering::Acquire) {
@@ -1509,6 +1553,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let mut st = Arc::clone(&self.state).lock_owned().await;
         let mut next = st.metadata.clone();
+        next.schema = (*schema).clone();
         next.vector_fields = vector_fields;
         next.refresh_total_vectors();
 
@@ -1534,7 +1579,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
 
         let directory = Arc::clone(&self.directory);
-        let trained = Arc::clone(&self.trained);
+        let published_generation = Arc::clone(&self.published_generation);
         let tracker = Arc::clone(&self.tracker);
         let replacement_refresh = self.replacement_refresh.read().clone();
         // Keep the producer gate raised if the requesting future is cancelled
@@ -1542,6 +1587,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // clone drops only after durable metadata and ArcSwap state agree.
         let artifact_update = artifact_update.clone();
         let index_label = self.schema.index_label().to_owned();
+        next.publication_generation =
+            next.publication_generation.checked_add(1).ok_or_else(|| {
+                Error::Corruption("vector publication generation exhausted u64".into())
+            })?;
+        let next_schema = schema;
+        let next_publication_id = next.publication_generation;
         self.run_lifecycle_transaction(async move {
             let _artifact_update = artifact_update;
             next.save(directory.as_ref()).await?;
@@ -1550,7 +1601,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 tracker.register(&replacement.output_id.to_hex());
             }
             st.metadata = next;
-            trained.store(Some(next_trained));
+            published_generation.store(Arc::new(PublishedIndexGeneration {
+                publication_id: next_publication_id,
+                schema: next_schema,
+                trained_vectors: next_trained,
+            }));
 
             // Outputs are now durably live. Disarm unwind cleanup before
             // retiring the old generation and releasing operation ownership.
@@ -1578,6 +1633,28 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             refresh_replacement_topology(replacement_refresh, &index_label).await;
             Ok(())
         })
+        .await
+    }
+
+    /// Publish query-only vector parameters without rebuilding segments or
+    /// artifacts. The publication ID still advances so cached readers reload
+    /// even though the segment ID set is unchanged.
+    pub(crate) async fn publish_vector_schema_only(
+        self: &Arc<Self>,
+        artifact_update: &VectorArtifactUpdateGuard,
+        schema: Arc<crate::dsl::Schema>,
+    ) -> Result<()> {
+        let vector_fields = self
+            .read_metadata(|metadata| metadata.vector_fields.clone())
+            .await;
+        let trained = self.published_generation().trained_vectors.clone();
+        self.publish_vector_generation_with_schema(
+            artifact_update,
+            schema,
+            vector_fields,
+            trained,
+            Vec::new(),
+        )
         .await
     }
 
@@ -1610,16 +1687,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Acquire a snapshot of current segments for reading.
     /// The snapshot holds references — segments won't be deleted while snapshot exists.
     pub async fn acquire_snapshot(&self) -> SegmentSnapshot {
-        let (acquired, trained) = {
+        let (acquired, generation) = {
             let st = self.state.lock().await;
             let segment_ids = st.metadata.segment_ids();
-            (self.tracker.acquire(&segment_ids), self.trained.load_full())
+            (
+                self.tracker.acquire(&segment_ids),
+                self.published_generation.load_full(),
+            )
         };
 
         SegmentSnapshot::with_generation(
             Arc::clone(&self.tracker),
             acquired,
-            trained,
+            generation,
             Arc::clone(&self.delete_fn),
         )
     }
@@ -1958,6 +2038,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         priority: ReorderPriority,
     ) -> MergeTaskResult<(String, u32, bool)> {
         let mut output_cleanup = self.output_cleanup_guard(output_id);
+        let generation = self.published_generation();
         let trained = self.trained_for_segment_build();
         let granularity = if reorder_bmp {
             self.merge_granularity(ids).await
@@ -1966,7 +2047,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         };
         let result = Self::do_merge(
             self.directory.as_ref(),
-            &self.schema,
+            &generation.schema,
             ids,
             output_id,
             self.term_cache_blocks,
@@ -2057,7 +2138,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let output_reader = SegmentReader::open(
             self.directory.as_ref(),
             output_id,
-            Arc::clone(&self.schema),
+            self.published_generation().schema.clone(),
             self.term_cache_blocks,
         )
         .await
@@ -2844,6 +2925,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     fn segment_needs_vector_rewrite(
         &self,
+        schema: &crate::dsl::Schema,
         reader: &SegmentReader,
         field_ids: &[u32],
         trained: &TrainedVectorStructures,
@@ -2869,7 +2951,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 return Ok(true);
             }
             let field = crate::dsl::Field(field_id);
-            let entry = self.schema.get_field_entry(field).ok_or_else(|| {
+            let entry = schema.get_field_entry(field).ok_or_else(|| {
                 Error::Corruption(format!(
                     "segment {:032x} references unknown vector field {field_id}",
                     reader.meta().id,
@@ -2914,15 +2996,60 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                                     )
                                 && header.routing == config.ivf_routing
                         }
+                        (None, None) => true,
+                        _ => false,
+                    }
+                }
+                crate::dsl::FieldType::DenseVector
+                    if entry.dense_vector_config.as_ref().is_some_and(|config| {
+                        config.index_type == crate::dsl::VectorIndexType::Scann
+                    }) =>
+                {
+                    match (ann, trained.scann_artifacts.get(&field_id)) {
+                        (Some(crate::segment::VectorIndex::ScannAh(index)), Some(artifact)) => {
+                            index
+                                .get()
+                                .validate_scann_generation(
+                                    artifact.config(),
+                                    artifact.generation(),
+                                    artifact.artifact_id(),
+                                )
+                                .is_ok()
+                        }
+                        (None, None) => true,
                         _ => false,
                     }
                 }
                 // Only ivf_tq dense fields are trainable; other dense
                 // index types never reach a vector-generation rewrite.
                 crate::dsl::FieldType::DenseVector => false,
-                crate::dsl::FieldType::BinaryDenseVector => {
-                    matches!(ann, Some(crate::segment::VectorIndex::BinaryIvf(_)))
+                crate::dsl::FieldType::BinaryDenseVector
+                    if entry
+                        .binary_dense_vector_config
+                        .as_ref()
+                        .is_some_and(|config| {
+                            config.index_type == crate::dsl::BinaryIndexType::Scann
+                        }) =>
+                {
+                    match (ann, trained.scann_artifacts.get(&field_id)) {
+                        (Some(crate::segment::VectorIndex::ScannBinary(index)), Some(artifact)) => {
+                            index
+                                .get()
+                                .validate_scann_generation(
+                                    artifact.config(),
+                                    artifact.generation(),
+                                    artifact.artifact_id(),
+                                )
+                                .is_ok()
+                        }
+                        (None, None) => true,
+                        _ => false,
+                    }
                 }
+                crate::dsl::FieldType::BinaryDenseVector => matches!(
+                    (ann, trained.binary_quantizers.get(&field_id)),
+                    (Some(crate::segment::VectorIndex::BinaryIvf(_)), Some(_)) | (None, None)
+                ),
                 _ => false,
             };
             if !current {
@@ -2962,6 +3089,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     async fn build_vector_replacement(
         self: &Arc<Self>,
+        schemas: (&Arc<crate::dsl::Schema>, &Arc<crate::dsl::Schema>),
         segment_id: &str,
         source_id: SegmentId,
         output_id: SegmentId,
@@ -2971,7 +3099,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let mut cleanup = self.output_cleanup_guard(output_id);
         match crate::segment::reorder::rewrite_vector_segment(
             self.directory.as_ref(),
-            &self.schema,
+            schemas,
             source_id,
             output_id,
             self.term_cache_blocks,
@@ -3007,12 +3135,34 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         trained: Arc<TrainedVectorStructures>,
         rewrite_existing: bool,
     ) -> Result<Vec<StagedVectorSegment>> {
+        let schema = self.published_generation().schema.clone();
+        self.stage_vector_generation_with_schema(
+            _artifact_update,
+            segment_ids,
+            field_ids,
+            trained,
+            rewrite_existing,
+            schema,
+        )
+        .await
+    }
+
+    pub(crate) async fn stage_vector_generation_with_schema(
+        self: &Arc<Self>,
+        _artifact_update: &VectorArtifactUpdateGuard,
+        segment_ids: &[String],
+        field_ids: &[u32],
+        trained: Arc<TrainedVectorStructures>,
+        rewrite_existing: bool,
+        schema: Arc<crate::dsl::Schema>,
+    ) -> Result<Vec<StagedVectorSegment>> {
         if !self.vector_artifact_update.load(Ordering::Acquire) {
             return Err(Error::Internal(
                 "cannot stage a vector generation without an exclusive update lease".into(),
             ));
         }
 
+        let source_schema = self.published_generation().schema.clone();
         let mut staged = Vec::new();
         for segment_id in segment_ids {
             if self.quarantined_segments.lock().contains(segment_id) {
@@ -3053,11 +3203,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let reader = SegmentReader::open(
                 self.directory.as_ref(),
                 source_id,
-                Arc::clone(&self.schema),
+                Arc::clone(&source_schema),
                 self.term_cache_blocks,
             )
             .await?;
             if !self.segment_needs_vector_rewrite(
+                schema.as_ref(),
                 &reader,
                 field_ids,
                 trained.as_ref(),
@@ -3069,6 +3220,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             let (new_id, doc_count, cleanup) = self
                 .build_vector_replacement(
+                    (&source_schema, &schema),
                     segment_id,
                     source_id,
                     output_id,
@@ -3080,11 +3232,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let output_reader = SegmentReader::open(
                 self.directory.as_ref(),
                 output_id,
-                Arc::clone(&self.schema),
+                Arc::clone(&schema),
                 self.term_cache_blocks,
             )
             .await?;
             if self.segment_needs_vector_rewrite(
+                schema.as_ref(),
                 &output_reader,
                 field_ids,
                 trained.as_ref(),
@@ -3145,21 +3298,29 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let Some(trained) = self.trained_for_segment_build() else {
             return Ok(VectorSegmentRewriteOutcome::Deferred);
         };
+        let schema = self.published_generation().schema.clone();
 
         let reader = SegmentReader::open(
             self.directory.as_ref(),
             source_id,
-            Arc::clone(&self.schema),
+            Arc::clone(&schema),
             self.term_cache_blocks,
         )
         .await?;
-        if !self.segment_needs_vector_rewrite(&reader, field_ids, trained.as_ref(), false)? {
+        if !self.segment_needs_vector_rewrite(
+            schema.as_ref(),
+            &reader,
+            field_ids,
+            trained.as_ref(),
+            false,
+        )? {
             return Ok(VectorSegmentRewriteOutcome::AlreadyCurrent);
         }
         drop(reader);
 
         let (new_id, doc_count, mut output_cleanup) = self
             .build_vector_replacement(
+                (&schema, &schema),
                 segment_id,
                 source_id,
                 output_id,
@@ -3514,7 +3675,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // be on disk (deferred deletion under a searcher snapshot) — reordering
         // them would re-insert a duplicate copy of docs the merge output holds.
         let all_ids = vec![seg_id.to_string(), output_hex];
-        let (_guard, source_docs) = {
+        let (_guard, source_docs, schema) = {
             let st = self.state.lock().await;
             // Force merge raises this barrier under the same state lock, so
             // this second check closes the race with the cheap early check
@@ -3537,8 +3698,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 return Ok(false);
             };
 
+            let schema = self.published_generation().schema.clone();
             match self.active_operations.try_register(all_ids) {
-                Some(guard) => (guard, source_meta.num_docs),
+                Some(guard) => (guard, source_meta.num_docs, schema),
                 None if !self.active_operations.is_accepting() => {
                     return Err(Error::IndexClosed);
                 }
@@ -3570,7 +3732,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let reorder_result = crate::segment::reorder::reorder_segment(
             self.directory.as_ref(),
-            &self.schema,
+            &schema,
             source_id,
             output_id,
             self.term_cache_blocks,
@@ -4134,13 +4296,18 @@ mod tests {
     #[tokio::test]
     async fn artifact_update_gate_preserves_search_generation_but_forces_flat_producers() {
         let manager = lifecycle_test_manager();
+        let current = manager.published_generation();
         manager
-            .trained
-            .store(Some(Arc::new(TrainedVectorStructures {
-                centroids: rustc_hash::FxHashMap::default(),
-                binary_quantizers: rustc_hash::FxHashMap::default(),
-                ..Default::default()
-            })));
+            .published_generation
+            .store(Arc::new(PublishedIndexGeneration {
+                publication_id: current.publication_id,
+                schema: current.schema.clone(),
+                trained_vectors: Some(Arc::new(TrainedVectorStructures {
+                    centroids: rustc_hash::FxHashMap::default(),
+                    binary_quantizers: rustc_hash::FxHashMap::default(),
+                    ..Default::default()
+                })),
+            }));
 
         let guard = manager.begin_vector_artifact_update().await.unwrap();
         assert!(

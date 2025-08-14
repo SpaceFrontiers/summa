@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  Field {:?}: {:?}", field, value);
         }
 
-        let json = doc.to_json(index.schema());
+        let json = doc.to_json(&index.schema());
         println!("Doc as JSON: {}", serde_json::to_string_pretty(&json)?);
     } else {
         println!("Doc 0 not found");

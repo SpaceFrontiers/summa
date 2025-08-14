@@ -27,6 +27,7 @@ pub mod ivf;
 mod kmeans;
 pub(crate) mod progress;
 pub mod quantization;
+pub mod scann;
 
 #[cfg(feature = "native")]
 pub(crate) use kmeans::estimated_euclidean_kmeans_distance_multiplier;

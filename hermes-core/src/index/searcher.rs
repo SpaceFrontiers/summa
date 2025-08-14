@@ -522,6 +522,10 @@ impl<D: Directory + 'static> Searcher<D> {
         &self.schema
     }
 
+    pub fn schema_arc(&self) -> Arc<Schema> {
+        Arc::clone(&self.schema)
+    }
+
     /// Get segment readers
     pub fn segment_readers(&self) -> &[Arc<SegmentReader>] {
         &self.segments

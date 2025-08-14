@@ -186,7 +186,7 @@ where
             }
         };
 
-        let doc = match Document::from_json(&json, schema) {
+        let doc = match Document::from_json(&json, &schema) {
             Some(d) => d,
             None => {
                 stats.errors += 1;
@@ -214,7 +214,7 @@ where
     D: Directory + DirectoryWriter,
 {
     let schema = writer.schema();
-    let doc = Document::from_json(json, schema)
+    let doc = Document::from_json(json, &schema)
         .ok_or_else(|| Error::Document("Failed to parse JSON document".to_string()))?;
     writer.add_document(doc)?;
     Ok(())

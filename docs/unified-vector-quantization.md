@@ -42,11 +42,14 @@ retaining their optimal metric kernels.
 
 ## Billion-scale defaults
 
-Automatic training targets 8×sqrt(N) leaves, capped by the available training
-sample and a 512 MiB coarse-artifact budget. Training samples at most two
-million vectors or 6 GiB. Large codebooks use hierarchical k-means for
-tractable training and a compact HNSW graph (`M=32`, `efConstruction=200`);
-query routing uses `efSearch=max(128, 4*nprobe)`, with `nprobe=64` by default.
+Automatic float IVF training targets 8×sqrt(N) leaves. Binary IVF uses the
+measured balanced sqrt(N) geometry. ScaNN uses sqrt(N) below 100M rows,
+N^(2/3) through 1B, and min(30M, N^(3/4)) above 1B, matching AlloyDB's
+balanced depth-specific guidance within Hermes's format limit. ScaNN never
+changes the selected shared topology to fit a transient sampling ceiling. Large
+codebooks use hierarchical k-means for tractable training and a compact HNSW
+graph (`M=32`, `efConstruction=200`); query routing uses
+`efSearch=max(128, 4*nprobe)`, with `nprobe=64` by default.
 
 Float residual PQ uses shared distance tables built once per query. Segment PQ
 payloads use struct-of-arrays columns with `code_size + 6` bytes per assignment

@@ -1,0 +1,24 @@
+ScaNN-derived asymmetric hashing
+=================================
+
+The anisotropic asymmetric-hashing objective and 32-lane lookup-table layout
+in this directory are adapted from Google ScaNN 1.4.2 at commit
+634a79fb5b4b23237a81eac028d27b5d34a5dba4, in particular:
+
+  scann/hashes/internal/asymmetric_hashing_impl.cc
+
+Copyright 2020 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. The full license text is in
+the adjacent `LICENSE-APACHE-2.0` file and is also available at:
+
+  https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+The hierarchical artifact layout and Hermes streaming-index integration are
+Hermes-specific implementations.

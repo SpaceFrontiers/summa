@@ -3,6 +3,65 @@ use crate::dsl::{Document, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
 
 #[tokio::test]
+async fn test_scann_training_defers_below_geometry_floor_and_keeps_flat_search() {
+    use crate::dsl::{DenseVectorConfig, DenseVectorQuantization, VectorIndexType};
+
+    let mut schema_builder = SchemaBuilder::default();
+    let embedding = schema_builder.add_dense_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        DenseVectorConfig {
+            dim: 4,
+            index_type: VectorIndexType::Scann,
+            quantization: DenseVectorQuantization::F32,
+            // The selected geometry itself raises readiness above the 100k
+            // corpus floor. A tiny corpus must stay flat, not fail sampling.
+            num_clusters: Some(200_000),
+            target_vectors: None,
+            tree_levels: Some(2),
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
+            nprobe: 1,
+            unit_norm: true,
+            soar: None,
+        },
+    );
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for row in 0..32 {
+        let mut document = Document::new();
+        document.add_dense_vector(embedding, vec![1.0, row as f32, 0.5, -0.25]);
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    assert!(writer.segment_manager.trained().is_none());
+
+    let index = Index::open(dir, config).await.unwrap();
+    let segment = index.segment_readers().await.unwrap().pop().unwrap();
+    assert!(segment.get_vector_index(embedding).is_none());
+    let results = segment
+        .search_dense_vector(
+            embedding,
+            &[1.0, 0.0, 0.5, -0.25],
+            3,
+            1,
+            1.0,
+            crate::query::MultiValueCombiner::Max,
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 3);
+}
+
+#[tokio::test]
 async fn test_vector_index_threshold_switch() {
     use crate::dsl::{DenseVectorConfig, DenseVectorQuantization, VectorIndexType};
 
@@ -18,6 +77,8 @@ async fn test_vector_index_threshold_switch() {
             index_type: VectorIndexType::IvfTq,
             quantization: DenseVectorQuantization::F32,
             num_clusters: Some(4), // Small for test
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 2,
             unit_norm: false,
@@ -429,6 +490,8 @@ async fn test_needle_dense_vector_flat() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
             unit_norm: false,
@@ -790,6 +853,8 @@ async fn test_needle_combined_all_modalities() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
             unit_norm: false,
@@ -947,6 +1012,8 @@ async fn search_fused_hybrid_union_impl() {
             index_type: VectorIndexType::Flat,
             quantization: crate::dsl::DenseVectorQuantization::F32,
             num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
             ivf_routing: crate::dsl::IvfRoutingMode::Auto,
             nprobe: 0,
             unit_norm: false,

@@ -23,9 +23,10 @@ use crate::structures::simd::{HammingKernel, scores_from_hamming};
 use crate::structures::simd::{batch_hamming_scores, hamming_distance};
 use crate::structures::vector::ivf::routing::{
     HIERARCHICAL_TRAINING_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
-    PairDistance, QueryDistance, allocate_child_clusters, binary_probe_fingerprint,
-    effective_binary_routing_mode, routing_parent_count, select_best, select_best_candidates,
-    select_parent_beam, select_parent_beam_for_build,
+    PairDistance, QueryDistance, allocate_child_clusters,
+    binary_probe_fingerprint_with_parent_beam, effective_binary_routing_mode, routing_parent_count,
+    select_best, select_best_candidates, select_parent_beam_for_build_with_oversample,
+    select_parent_beam_with_oversample,
 };
 use crate::structures::vector::progress::PhaseProgress;
 
@@ -143,6 +144,28 @@ const MAX_BINARY_IVF_CLUSTERS: usize = 1_048_576;
 #[cfg(test)]
 const BINARY_IVF_SCORE_BATCH: usize = 8_192;
 const BUILD_ASSIGNMENT_CANDIDATES: usize = 128;
+/// Two-level binary routing can spend more leaf-centroid work than float IVF:
+/// packed centroids are narrow and exact Hamming scans vectorize well. Widen
+/// only once the direct-training crossover is reached, then again for truly
+/// large codebooks where a fixed four-times beam becomes nearly greedy.
+pub const BINARY_PARENT_BEAM_OVERSAMPLE_MEDIUM: usize = 8;
+pub const BINARY_PARENT_BEAM_OVERSAMPLE_LARGE: usize = 12;
+
+/// Default runtime parent coverage for a binary codebook. Callers that expose
+/// an expert knob can override this through `probe_with_parent_beam` without
+/// changing the serialized quantizer format.
+pub fn adaptive_binary_parent_beam_oversample(num_clusters: usize) -> usize {
+    match num_clusters {
+        65_536.. => BINARY_PARENT_BEAM_OVERSAMPLE_LARGE,
+        HIERARCHICAL_TRAINING_THRESHOLD.. => BINARY_PARENT_BEAM_OVERSAMPLE_MEDIUM,
+        _ => crate::structures::vector::ivf::routing::DEFAULT_PARENT_BEAM_OVERSAMPLE,
+    }
+}
+
+#[inline]
+fn uses_hierarchical_binary_training(num_clusters: usize) -> bool {
+    num_clusters >= HIERARCHICAL_TRAINING_THRESHOLD
+}
 
 /// A code with no set bits carries no information: its Hamming distance to any
 /// query is a constant `popcount(query)`, so it scores mid-range against
@@ -231,7 +254,7 @@ impl BinaryCoarseQuantizer {
                     (leaves, Some(router))
                 }
                 IvfRoutingMode::Hnsw => {
-                    let leaves = if config.num_clusters >= HIERARCHICAL_TRAINING_THRESHOLD {
+                    let leaves = if uses_hierarchical_binary_training(config.num_clusters) {
                         train_k_majority_hierarchical(&config, codes, num_vectors, index_label).0
                     } else {
                         train_k_majority(&config, codes, num_vectors, index_label)
@@ -249,10 +272,18 @@ impl BinaryCoarseQuantizer {
                     );
                     (leaves, Some(BinaryCentroidRouter::Hnsw(graph)))
                 }
-                IvfRoutingMode::Flat | IvfRoutingMode::Auto => (
-                    train_k_majority(&config, codes, num_vectors, index_label),
-                    None,
-                ),
+                IvfRoutingMode::Flat | IvfRoutingMode::Auto => {
+                    // Routing and training have different crossover points.
+                    // Packed centroids remain cheap enough for exact flat
+                    // probing well past 4K leaves, while direct k-majority
+                    // seeding is already O(N*K) and impractical there.
+                    let leaves = if uses_hierarchical_binary_training(config.num_clusters) {
+                        train_k_majority_hierarchical(&config, codes, num_vectors, index_label).0
+                    } else {
+                        train_k_majority(&config, codes, num_vectors, index_label)
+                    };
+                    (leaves, None)
+                }
             };
         let version = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -359,15 +390,57 @@ impl BinaryCoarseQuantizer {
     }
 
     pub fn probe(&self, query: &[u8], k: usize, mode: IvfRoutingMode) -> IvfProbePlan {
+        self.probe_with_parent_beam(
+            query,
+            k,
+            mode,
+            adaptive_binary_parent_beam_oversample(self.num_clusters as usize),
+        )
+    }
+
+    /// Cache key for the default probe policy. This must stay paired with
+    /// [`Self::probe`]: automatic routing and adaptive parent beams are both
+    /// resolved here before hashing.
+    pub fn request_fingerprint(&self, query: &[u8], k: usize, mode: IvfRoutingMode) -> u64 {
         let take = k.clamp(1, self.num_clusters as usize);
-        let cluster_ids = match effective_binary_routing_mode(mode, self.num_clusters as usize) {
+        let effective_mode = effective_binary_routing_mode(mode, self.num_clusters as usize);
+        binary_probe_fingerprint_with_parent_beam(
+            query,
+            take,
+            effective_mode,
+            adaptive_binary_parent_beam_oversample(self.num_clusters as usize),
+        )
+    }
+
+    /// Probe with an explicit two-level parent coverage multiplier.
+    ///
+    /// The routing layer clamps the multiplier to its hard work bound. Flat
+    /// and HNSW modes ignore it, so a runtime integration can pass one policy
+    /// uniformly without changing artifacts or exact leaf scoring.
+    pub fn probe_with_parent_beam(
+        &self,
+        query: &[u8],
+        k: usize,
+        mode: IvfRoutingMode,
+        parent_beam_oversample: usize,
+    ) -> IvfProbePlan {
+        let take = k.clamp(1, self.num_clusters as usize);
+        let effective_mode = effective_binary_routing_mode(mode, self.num_clusters as usize);
+        let cluster_ids = match effective_mode {
             IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_k_nearest(query, take),
-            IvfRoutingMode::TwoLevel => self.find_k_nearest_two_level(query, take),
+            IvfRoutingMode::TwoLevel => {
+                self.find_k_nearest_two_level(query, take, parent_beam_oversample)
+            }
             IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(query, take),
         };
         IvfProbePlan::new(
             self.version,
-            binary_probe_fingerprint(query, take, mode),
+            binary_probe_fingerprint_with_parent_beam(
+                query,
+                take,
+                effective_mode,
+                parent_beam_oversample,
+            ),
             cluster_ids,
         )
     }
@@ -377,12 +450,15 @@ impl BinaryCoarseQuantizer {
     /// Segment construction routes every vector through here, so this path must
     /// stay allocation-free.
     pub fn assign(&self, code: &[u8], mode: IvfRoutingMode) -> u32 {
+        let parent_beam_oversample =
+            adaptive_binary_parent_beam_oversample(self.num_clusters as usize);
         match effective_binary_routing_mode(mode, self.num_clusters as usize) {
             IvfRoutingMode::Hnsw => self.find_nearest_hnsw_for_build(code).unwrap_or(0),
             IvfRoutingMode::TwoLevel => self
                 .find_k_nearest_two_level_for_build(
                     code,
                     BUILD_ASSIGNMENT_CANDIDATES.min(self.num_clusters as usize),
+                    parent_beam_oversample,
                 )
                 .first()
                 .copied()
@@ -439,18 +515,29 @@ impl BinaryCoarseQuantizer {
         })
     }
 
-    fn find_k_nearest_two_level(&self, query: &[u8], k: usize) -> Vec<u32> {
-        self.find_k_nearest_two_level_impl::<false>(query, k)
+    fn find_k_nearest_two_level(
+        &self,
+        query: &[u8],
+        k: usize,
+        parent_beam_oversample: usize,
+    ) -> Vec<u32> {
+        self.find_k_nearest_two_level_impl::<false>(query, k, parent_beam_oversample)
     }
 
-    fn find_k_nearest_two_level_for_build(&self, query: &[u8], k: usize) -> Vec<u32> {
-        self.find_k_nearest_two_level_impl::<true>(query, k)
+    fn find_k_nearest_two_level_for_build(
+        &self,
+        query: &[u8],
+        k: usize,
+        parent_beam_oversample: usize,
+    ) -> Vec<u32> {
+        self.find_k_nearest_two_level_impl::<true>(query, k, parent_beam_oversample)
     }
 
     fn find_k_nearest_two_level_impl<const FOR_BUILD: bool>(
         &self,
         query: &[u8],
         k: usize,
+        parent_beam_oversample: usize,
     ) -> Vec<u32> {
         let Some(BinaryCentroidRouter::TwoLevel {
             parent_centroids,
@@ -474,9 +561,20 @@ impl BinaryCoarseQuantizer {
             &mut parent_scores,
         );
         let parents = if FOR_BUILD {
-            select_parent_beam_for_build::<true>(&parent_scores, topology, k)
+            select_parent_beam_for_build_with_oversample::<true>(
+                &parent_scores,
+                topology,
+                k,
+                parent_beam_oversample,
+                parent_beam_oversample.min(BINARY_PARENT_BEAM_OVERSAMPLE_MEDIUM),
+            )
         } else {
-            select_parent_beam::<true>(&parent_scores, topology, k)
+            select_parent_beam_with_oversample::<true>(
+                &parent_scores,
+                topology,
+                k,
+                parent_beam_oversample,
+            )
         };
         let candidate_count = parents
             .iter()
@@ -564,6 +662,12 @@ fn default_max_train_samples() -> usize {
     100_000
 }
 
+fn default_hierarchical_parent_restarts() -> usize {
+    2
+}
+
+const MAX_HIERARCHICAL_PARENT_RESTARTS: usize = 4;
+
 /// Configuration for a binary IVF index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BinaryIvfConfig {
@@ -579,6 +683,11 @@ pub struct BinaryIvfConfig {
     /// all vectors). Bounds merge-time training cost on huge segments.
     #[serde(default = "default_max_train_samples")]
     pub max_train_samples: usize,
+    /// Deterministic parent-codebook candidates evaluated by exact Hamming
+    /// loss before hierarchical child training. This strengthens large IVF
+    /// training without multiplying the much larger child-codebook work.
+    #[serde(default = "default_hierarchical_parent_restarts")]
+    pub hierarchical_parent_restarts: usize,
     /// RNG seed for centroid initialization (deterministic builds)
     pub seed: u64,
 }
@@ -591,6 +700,7 @@ impl BinaryIvfConfig {
             routing: IvfRoutingMode::Auto,
             train_iters: 10,
             max_train_samples: default_max_train_samples(),
+            hierarchical_parent_restarts: default_hierarchical_parent_restarts(),
             seed: 42,
         }
     }
@@ -619,6 +729,12 @@ impl BinaryIvfConfig {
         self.num_clusters
             .checked_mul(self.dim_bits)
             .ok_or_else(|| "binary IVF training scratch size overflow".to_string())?;
+        if !(1..=MAX_HIERARCHICAL_PARENT_RESTARTS).contains(&self.hierarchical_parent_restarts) {
+            return Err(format!(
+                "binary IVF hierarchical parent restarts must be in 1..={MAX_HIERARCHICAL_PARENT_RESTARTS}, got {}",
+                self.hierarchical_parent_restarts
+            ));
+        }
         Ok(())
     }
 }
@@ -974,6 +1090,43 @@ fn train_k_majority(
     index_label: &str,
 ) -> Vec<u8> {
     train_k_majority_reporting(config, codes, n, index_label, true)
+}
+
+/// Train one flat packed-bit k-majority codebook for another global routing
+/// implementation.
+///
+/// ScaNN's binary tree deliberately reuses the same deterministic trainer as
+/// binary IVF. Keeping this narrow adapter here prevents a second Hamming
+/// clustering implementation (and, critically, any conversion through
+/// floating-point vectors).
+pub(crate) fn train_binary_k_majority_codebook(
+    config: &BinaryIvfConfig,
+    codes: &[u8],
+    num_vectors: usize,
+    index_label: &str,
+) -> io::Result<Vec<u8>> {
+    config
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let expected = num_vectors.checked_mul(config.byte_len()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "binary k-majority training size overflow",
+        )
+    })?;
+    if num_vectors == 0 || config.num_clusters > num_vectors || codes.len() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "binary k-majority needs a contiguous matrix with at least one vector per centroid",
+        ));
+    }
+    Ok(train_k_majority_reporting(
+        config,
+        codes,
+        num_vectors,
+        index_label,
+        false,
+    ))
 }
 
 /// As [`train_k_majority`], with progress reporting suppressed for the hundreds
@@ -1353,6 +1506,56 @@ fn update_binary_centroid(
     }
 }
 
+/// Exact total Hamming assignment loss for deterministic parent-model
+/// selection. Summation is integer and therefore independent of rayon task
+/// ordering.
+fn binary_codebook_loss(codes: &[u8], centroids: &[u8], byte_len: usize) -> u64 {
+    debug_assert!(byte_len > 0 && codes.len().is_multiple_of(byte_len));
+    let clusters = centroids.len() / byte_len;
+    #[cfg(feature = "native")]
+    {
+        use rayon::prelude::*;
+        codes
+            .par_chunks_exact(byte_len)
+            .map_init(
+                || vec![0u32; clusters],
+                |distances, code| {
+                    u64::from(
+                        nearest_binary_centroid_with_distance(
+                            HammingKernel::resolve(),
+                            code,
+                            centroids,
+                            byte_len,
+                            distances,
+                        )
+                        .1,
+                    )
+                },
+            )
+            .sum()
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        let kernel = HammingKernel::resolve();
+        let mut distances = vec![0u32; clusters];
+        codes
+            .chunks_exact(byte_len)
+            .map(|code| {
+                u64::from(
+                    nearest_binary_centroid_with_distance(
+                        kernel,
+                        code,
+                        centroids,
+                        byte_len,
+                        &mut distances,
+                    )
+                    .1,
+                )
+            })
+            .sum()
+    }
+}
+
 /// Hierarchical k-majority training keeps large global codebooks tractable:
 /// train sqrt(K) parent cells, partition the sample once, then train each
 /// child codebook independently. Complexity is O(N·sqrt(K)) rather than
@@ -1368,7 +1571,33 @@ fn train_k_majority_hierarchical(
     let mut parent_config = config.clone();
     parent_config.num_clusters = parent_count;
     parent_config.max_train_samples = config.max_train_samples.min(n);
-    let parents = train_k_majority(&parent_config, codes, n, index_label);
+    let mut selected_parent: Option<(u64, Vec<u8>, usize)> = None;
+    for restart in 0..config.hierarchical_parent_restarts {
+        parent_config.seed = if restart == 0 {
+            config.seed
+        } else {
+            config
+                .seed
+                .wrapping_add((restart as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        };
+        let candidate = train_k_majority(&parent_config, codes, n, index_label);
+        let loss = binary_codebook_loss(codes, &candidate, byte_len);
+        let replace = match selected_parent.as_ref() {
+            None => true,
+            Some((best_loss, best_centroids, _)) => {
+                loss < *best_loss || (loss == *best_loss && candidate < *best_centroids)
+            }
+        };
+        if replace {
+            selected_parent = Some((loss, candidate, restart));
+        }
+    }
+    let (parent_loss, parents, selected_restart) =
+        selected_parent.expect("validated binary IVF has at least one parent restart");
+    log::info!(
+        "[binary_ivf] index={index_label}: selected hierarchical parent restart {selected_restart}/{} with exact Hamming loss {parent_loss}",
+        config.hierarchical_parent_restarts,
+    );
 
     let mut assignments = vec![0u32; n];
     let mut group_sizes = vec![0usize; parent_count];
@@ -1565,6 +1794,119 @@ mod tests {
             }
         }
         codes
+    }
+
+    #[test]
+    fn binary_parent_beam_adapts_at_large_codebook_boundaries() {
+        assert_eq!(adaptive_binary_parent_beam_oversample(4_095), 4);
+        assert_eq!(
+            adaptive_binary_parent_beam_oversample(4_096),
+            BINARY_PARENT_BEAM_OVERSAMPLE_MEDIUM
+        );
+        assert_eq!(
+            adaptive_binary_parent_beam_oversample(65_536),
+            BINARY_PARENT_BEAM_OVERSAMPLE_LARGE
+        );
+        assert!(!uses_hierarchical_binary_training(4_095));
+        assert!(uses_hierarchical_binary_training(4_096));
+    }
+
+    #[test]
+    fn wider_binary_parent_beam_recovers_a_cross_parent_nearest_leaf() {
+        let (dim_bits, byte_len, parent_count, leaves_per_parent) = (64, 8, 64, 64);
+        let leaves = parent_count * leaves_per_parent;
+        let mut parent_centroids = vec![0u8; parent_count * byte_len];
+        for parent in 0..parent_count {
+            for bit in 0..parent.min(dim_bits) {
+                parent_centroids[parent * byte_len + bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        let children: Vec<Vec<u32>> = (0..parent_count)
+            .map(|parent| {
+                let first = parent * leaves_per_parent;
+                (first..first + leaves_per_parent)
+                    .map(|leaf| leaf as u32)
+                    .collect()
+            })
+            .collect();
+        let target = 3 * leaves_per_parent;
+        let mut centroids = vec![0xff; leaves * byte_len];
+        centroids[target * byte_len..(target + 1) * byte_len].fill(0);
+        let quantizer = BinaryCoarseQuantizer {
+            dim_bits,
+            num_clusters: leaves as u32,
+            centroids,
+            version: 1,
+            routing_index: Some(BinaryCentroidRouter::TwoLevel {
+                parent_centroids,
+                topology: IvfRoutingTopology::from_children(&children),
+            }),
+        };
+        quantizer.validate().unwrap();
+
+        let query = [0u8; 8];
+        let narrow = quantizer.probe_with_parent_beam(&query, 32, IvfRoutingMode::TwoLevel, 4);
+        let wide = quantizer.probe_with_parent_beam(&query, 32, IvfRoutingMode::TwoLevel, 8);
+        assert!(!narrow.cluster_ids.contains(&(target as u32)));
+        assert_eq!(wide.cluster_ids.first(), Some(&(target as u32)));
+        assert_eq!(wide.cluster_ids.len(), 32);
+        assert_ne!(narrow.request_fingerprint, wide.request_fingerprint);
+
+        let default_plan = quantizer.probe(&query, 32, IvfRoutingMode::Auto);
+        assert_eq!(
+            default_plan.request_fingerprint,
+            quantizer.request_fingerprint(&query, 32, IvfRoutingMode::Auto),
+            "reader-side cache lookup must use the resolved adaptive policy"
+        );
+    }
+
+    #[test]
+    fn deterministic_parent_restarts_cannot_worsen_exact_hamming_loss() {
+        let dim_bits = 64;
+        let byte_len = dim_bits / 8;
+        let codes = clustered_binary_codes(byte_len, 32, 16, 5, 0x55aa_0102);
+        let points = codes.len() / byte_len;
+        let train = |restarts| {
+            let mut config = BinaryIvfConfig::new(dim_bits, 64);
+            config.routing = IvfRoutingMode::TwoLevel;
+            config.train_iters = 2;
+            config.max_train_samples = points;
+            config.hierarchical_parent_restarts = restarts;
+            BinaryCoarseQuantizer::train(config, &codes, points, "test").unwrap()
+        };
+        let single = train(1);
+        let multi = train(3);
+        let parent_loss = |quantizer: &BinaryCoarseQuantizer| {
+            let Some(BinaryCentroidRouter::TwoLevel {
+                parent_centroids, ..
+            }) = quantizer.routing_index.as_ref()
+            else {
+                panic!("two-level parent router expected");
+            };
+            binary_codebook_loss(&codes, parent_centroids, byte_len)
+        };
+        assert!(parent_loss(&multi) <= parent_loss(&single));
+
+        let repeated = train(3);
+        assert_eq!(multi.centroids, repeated.centroids);
+        let (
+            Some(BinaryCentroidRouter::TwoLevel {
+                parent_centroids: multi_parents,
+                topology: multi_topology,
+            }),
+            Some(BinaryCentroidRouter::TwoLevel {
+                parent_centroids: repeated_parents,
+                topology: repeated_topology,
+            }),
+        ) = (
+            multi.routing_index.as_ref(),
+            repeated.routing_index.as_ref(),
+        )
+        else {
+            panic!("two-level parent routers expected");
+        };
+        assert_eq!(multi_parents, repeated_parents);
+        assert_eq!(multi_topology, repeated_topology);
     }
 
     /// The construction beam is a *floor* paid by every assigned vector, so its

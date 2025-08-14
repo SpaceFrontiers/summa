@@ -29,6 +29,10 @@ pub enum VectorIndex {
         index: Arc<MmapAnnIndex>,
         codec: Arc<crate::structures::TqCodec>,
     },
+    /// ScaNN float asymmetric-hash leaves. Routing/codebook data is global.
+    ScannAh(Arc<MmapAnnIndex>),
+    /// ScaNN exact packed-binary Hamming leaves. Routing data is global.
+    ScannBinary(Arc<MmapAnnIndex>),
 }
 
 /// Thin public wrapper around the shared mmap ANN representation. Its internals
@@ -76,6 +80,9 @@ impl VectorIndex {
             VectorIndex::Tq { index, codec } | VectorIndex::IvfTq { index, codec } => {
                 index.estimated_heap_bytes() + codec.estimated_memory_bytes()
             }
+            VectorIndex::ScannAh(index) | VectorIndex::ScannBinary(index) => {
+                index.estimated_heap_bytes()
+            }
         }
     }
 
@@ -87,7 +94,11 @@ impl VectorIndex {
         report: &mut crate::segment::pin::PinReport,
     ) {
         let index = match self {
-            Self::BinaryIvf(index) | Self::Tq { index, .. } | Self::IvfTq { index, .. } => index,
+            Self::BinaryIvf(index)
+            | Self::Tq { index, .. }
+            | Self::IvfTq { index, .. }
+            | Self::ScannAh(index)
+            | Self::ScannBinary(index) => index,
         };
         if let Some(index) = Arc::get_mut(index) {
             index.pin_lookup_directory(mode, remaining, report);

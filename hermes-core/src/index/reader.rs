@@ -24,6 +24,7 @@ use super::searcher::SearcherResources;
 struct SearcherState<D: DirectoryWriter + 'static> {
     searcher: Arc<Searcher<D>>,
     segment_ids: Vec<String>,
+    publication_id: u64,
 }
 
 /// Cancellation-safe ownership of the reload flag. Async reload checks may be
@@ -92,7 +93,8 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         // Get initial segment IDs
         let initial_segment_ids = segment_manager.get_segment_ids().await;
 
-        let reader = Self::create_reader(&schema, &segment_manager, resources.clone()).await?;
+        let (reader, publication_id) =
+            Self::create_reader(&schema, &segment_manager, resources.clone()).await?;
 
         Ok(Self {
             schema,
@@ -100,6 +102,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             state: ArcSwap::from_pointee(SearcherState {
                 searcher: Arc::new(reader),
                 segment_ids: initial_segment_ids,
+                publication_id,
             }),
             resources,
             last_reload_check: RwLock::new(std::time::Instant::now()),
@@ -115,23 +118,30 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         schema: &Arc<Schema>,
         segment_manager: &Arc<crate::merge::SegmentManager<D>>,
         resources: SearcherResources,
-    ) -> Result<Searcher<D>> {
+    ) -> Result<(Searcher<D>, u64)> {
         let snapshot = segment_manager.acquire_snapshot().await;
-
-        // The snapshot carries the exact trained-artifact generation paired
-        // with its segment IDs. This remains correct across atomic retrains.
-        let trained = snapshot
-            .trained_vectors()
+        let generation = snapshot.published_generation();
+        let snapshot_schema = generation
+            .as_ref()
+            .map(|generation| Arc::clone(&generation.schema))
+            .unwrap_or_else(|| Arc::clone(schema));
+        let trained = generation
+            .as_ref()
+            .and_then(|generation| generation.trained_vectors.clone())
             .unwrap_or_else(|| Arc::new(crate::segment::TrainedVectorStructures::default()));
+        let publication_id = generation
+            .as_ref()
+            .map_or(0, |generation| generation.publication_id);
 
-        Searcher::from_snapshot(
+        let searcher = Searcher::from_snapshot(
             segment_manager.directory(),
-            Arc::clone(schema),
+            snapshot_schema,
             snapshot,
             trained,
             resources,
         )
-        .await
+        .await?;
+        Ok((searcher, publication_id))
     }
 
     /// Set reload check interval
@@ -176,12 +186,13 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         let new_segment_ids = self.segment_manager.get_segment_ids().await;
 
         // Check if segments actually changed (wait-free read)
-        let segments_changed = {
+        let publication_id = self.segment_manager.publication_id();
+        let generation_changed = {
             let state = self.state.load();
-            state.segment_ids != new_segment_ids
+            state.segment_ids != new_segment_ids || state.publication_id != publication_id
         };
 
-        if segments_changed {
+        if generation_changed {
             let old_count = self.state.load().segment_ids.len();
             let new_count = new_segment_ids.len();
             log::info!(
@@ -219,12 +230,13 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         let new_segment_ids = self.segment_manager.get_segment_ids().await;
 
         // Fast path: skip reload if segments haven't changed
-        let segments_changed = {
+        let publication_id = self.segment_manager.publication_id();
+        let generation_changed = {
             let state = self.state.load();
-            state.segment_ids != new_segment_ids
+            state.segment_ids != new_segment_ids || state.publication_id != publication_id
         };
 
-        if segments_changed {
+        if generation_changed {
             self.reload_with_segments(new_segment_ids).await
         } else {
             log::debug!(
@@ -245,15 +257,22 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             self.state.load().searcher.segment_readers().to_vec();
 
         let snapshot = self.segment_manager.acquire_snapshot().await;
-
-        // Use the trained-artifact generation captured with this snapshot.
-        let trained = snapshot
-            .trained_vectors()
+        let generation = snapshot.published_generation();
+        let schema = generation
+            .as_ref()
+            .map(|generation| Arc::clone(&generation.schema))
+            .unwrap_or_else(|| Arc::clone(&self.schema));
+        let trained = generation
+            .as_ref()
+            .and_then(|generation| generation.trained_vectors.clone())
             .unwrap_or_else(|| Arc::new(crate::segment::TrainedVectorStructures::default()));
+        let publication_id = generation
+            .as_ref()
+            .map_or(0, |generation| generation.publication_id);
 
         let new_reader = Searcher::from_snapshot_reuse(
             self.segment_manager.directory(),
-            Arc::clone(&self.schema),
+            schema,
             snapshot,
             trained,
             self.resources.clone(),
@@ -265,14 +284,20 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         self.state.store(Arc::new(SearcherState {
             searcher: Arc::new(new_reader),
             segment_ids: new_segment_ids,
+            publication_id,
         }));
 
         Ok(())
     }
 
     /// Get schema
-    pub fn schema(&self) -> &Schema {
-        &self.schema
+    pub fn schema(&self) -> Arc<Schema> {
+        self.schema_arc()
+    }
+
+    /// Schema of the currently published search generation.
+    pub fn schema_arc(&self) -> Arc<Schema> {
+        self.state.load().searcher.schema_arc()
     }
 }
 
@@ -289,5 +314,91 @@ mod tests {
         });
         assert!(result.is_err());
         assert!(!reloading.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn schema_publication_is_atomic_for_old_and_new_searchers() {
+        use crate::directories::RamDirectory;
+        use crate::dsl::{DenseVectorConfig, SchemaBuilder, VectorIndexAlter, VectorIndexType};
+
+        let mut builder = SchemaBuilder::default();
+        let field = builder.add_dense_vector_field_with_config(
+            "embedding",
+            true,
+            true,
+            DenseVectorConfig::ivf_tq(4, Some(2), 1),
+        );
+        let directory = RamDirectory::new();
+        let index = crate::Index::create(
+            directory.clone(),
+            builder.build(),
+            crate::IndexConfig::default(),
+        )
+        .await
+        .unwrap();
+        let reader = index.reader().await.unwrap();
+        let old_searcher = reader.searcher().await.unwrap();
+
+        let mut target = DenseVectorConfig::ivf_tq(4, Some(2), 1);
+        target.index_type = VectorIndexType::Scann;
+        target.tree_levels = Some(1);
+        target.soar = None;
+        let next_schema = Arc::new(
+            index
+                .schema_arc()
+                .with_vector_index_alter(field, VectorIndexAlter::Dense(target))
+                .unwrap(),
+        );
+        let update = index
+            .segment_manager()
+            .begin_vector_artifact_update()
+            .await
+            .unwrap();
+        index
+            .segment_manager()
+            .publish_vector_schema_only(&update, next_schema)
+            .await
+            .unwrap();
+        drop(update);
+
+        assert_eq!(
+            old_searcher
+                .schema()
+                .get_field_entry(field)
+                .unwrap()
+                .dense_vector_config
+                .as_ref()
+                .unwrap()
+                .index_type,
+            VectorIndexType::IvfTq
+        );
+        reader.reload().await.unwrap();
+        let new_searcher = reader.searcher().await.unwrap();
+        assert_eq!(
+            new_searcher
+                .schema()
+                .get_field_entry(field)
+                .unwrap()
+                .dense_vector_config
+                .as_ref()
+                .unwrap()
+                .index_type,
+            VectorIndexType::Scann
+        );
+
+        let reopened = crate::Index::open(directory, crate::IndexConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .schema_arc()
+                .get_field_entry(field)
+                .unwrap()
+                .dense_vector_config
+                .as_ref()
+                .unwrap()
+                .index_type,
+            VectorIndexType::Scann
+        );
     }
 }

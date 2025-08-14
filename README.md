@@ -161,6 +161,12 @@ finalizer carries metadata publication, primary-key refresh, and worker resume
 to completion even if the client disconnects. A pre-publication storage error
 keeps that generation paused and retryable instead of mixing it with new input.
 
+Vector indexes can be switched atomically between IVF and ScaNN with the
+`AlterVectorIndex` gRPC method. The request identifies the field and supplies
+its replacement SDL type/options; the response reports `BUILT`,
+`DEFERRED_FLAT` (the hardcoded geometry-derived training floor has not been
+reached), or `PARAMETERS_ONLY`. See [the schema reference](docs/schema.md).
+
 Python client:
 
 ```python
