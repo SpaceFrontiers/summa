@@ -129,6 +129,10 @@ const NEW_POS_TERM_OVERHEAD: usize =
 const MAX_POSITION_ELEMENT_ORDINAL: u32 = (1 << 12) - 1;
 const MAX_TOKEN_POSITION: u32 = (1 << 20) - 1;
 
+/// Vector ordinals are zero-based `u16`s, so all 65,536 ordinal values are
+/// available to one vector field in one document.
+pub(crate) const MAX_VECTOR_VALUES_PER_FIELD: usize = u16::MAX as usize + 1;
+
 /// Default BMP vocabulary size when `dims` is unset in the sparse vector
 /// config (SPLADE unigram vocabulary). Must match the build-time defaults in
 /// `builder/sparse.rs` and `merger/sparse.rs`.
@@ -162,6 +166,44 @@ fn field_value_type_name(value: &FieldValue) -> &'static str {
         FieldValue::Json(_) => "json",
         FieldValue::BinaryDenseVector(_) => "binary_dense_vector",
     }
+}
+
+/// Reject vector lists that cannot be represented by the ordinal wire format.
+///
+/// This validation is intentionally pure and runs before a document enters a
+/// native worker queue or mutates an inline/WASM segment builder. Otherwise a
+/// single oversized document is discovered only after sibling documents have
+/// been indexed, forcing the entire commit generation to be discarded.
+pub(crate) fn validate_vector_value_counts(doc: &Document, schema: &Schema) -> Result<()> {
+    let mut vector_values_per_field: FxHashMap<u32, usize> = FxHashMap::default();
+
+    for (field, value) in doc.field_values() {
+        let Some(entry) = schema.get_field_entry(*field) else {
+            continue;
+        };
+
+        let consumes_vector_ordinal = match (&entry.field_type, value) {
+            (FieldType::DenseVector, FieldValue::DenseVector(_))
+            | (FieldType::BinaryDenseVector, FieldValue::BinaryDenseVector(_)) => {
+                entry.indexed || entry.stored
+            }
+            (FieldType::SparseVector, FieldValue::SparseVector(_)) => entry.indexed || entry.fast,
+            _ => false,
+        };
+        if !consumes_vector_ordinal {
+            continue;
+        }
+
+        let count = vector_values_per_field.entry(field.0).or_insert(0);
+        *count += 1;
+        if *count > MAX_VECTOR_VALUES_PER_FIELD {
+            return Err(crate::Error::Document(format!(
+                "field '{}' (id {}) has more than {} vector values in one document",
+                entry.name, field.0, MAX_VECTOR_VALUES_PER_FIELD
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Segment builder with optimized memory usage
@@ -559,6 +601,8 @@ impl SegmentBuilder {
     ///   from the grid and silently filtered from queries — permanently
     ///   unsearchable.
     fn validate_document_against_schema(&self, doc: &Document) -> Result<()> {
+        validate_vector_value_counts(doc, &self.schema)?;
+
         for (field, value) in doc.field_values() {
             let Some(entry) = self.schema.get_field_entry(*field) else {
                 continue;

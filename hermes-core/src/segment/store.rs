@@ -34,7 +34,9 @@ use crate::directories::FileHandle;
 use crate::dsl::{Document, Schema};
 
 const STORE_MAGIC: u32 = 0x53544F52; // "STOR"
-const STORE_VERSION: u32 = 2; // Version 2 supports dictionaries
+/// Version 3 widens each document's stored field-value count from u16 to u32.
+const STORE_VERSION: u32 = 3;
+
 /// Block size for document store (16KB).
 /// Smaller blocks reduce read amplification for single-doc fetches at the
 /// cost of slightly worse compression ratio. Zstd dictionary training
@@ -47,7 +49,7 @@ pub const DEFAULT_DICT_SIZE: usize = 4 * 1024;
 /// Hard safety bounds for individual on-disk store objects. Writers normally
 /// emit ~16 KiB blocks and 4 KiB dictionaries; these generous limits preserve
 /// unusually large stored documents while bounding corrupt compressed frames.
-const MAX_STORE_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+const MAX_STORE_BLOCK_BYTES: usize = 256 * 1024 * 1024;
 const MAX_STORE_DICTIONARY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Default compression level for document store
@@ -87,7 +89,7 @@ fn write_store_index_and_footer(
 }
 
 /// Binary document format:
-///   num_fields: u16
+///   num_fields: u32
 ///   per field: field_id: u16, type_tag: u8, value data
 ///     0=Text:         len:u32 + utf8
 ///     1=U64:          u64 LE
@@ -132,10 +134,9 @@ pub fn serialize_document_into(
         .filter(|(field, value)| is_stored(field, value))
         .count();
 
-    buf.write_u16::<LittleEndian>(
-        u16::try_from(stored_count)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many stored fields"))?,
-    )?;
+    buf.write_u32::<LittleEndian>(u32::try_from(stored_count).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "too many stored field-values")
+    })?)?;
 
     for (field, value) in doc.field_values().iter().filter(|(f, v)| is_stored(f, v)) {
         buf.write_u16::<LittleEndian>(u16::try_from(field.0).map_err(|_| {
@@ -1378,7 +1379,7 @@ fn deserialize_document_inner(
     use crate::dsl::Field;
 
     let mut reader = data;
-    let num_fields = reader.read_u16::<LittleEndian>()? as usize;
+    let num_fields = reader.read_u32::<LittleEndian>()? as usize;
     let mut doc = Document::new();
 
     for _ in 0..num_fields {
@@ -1890,12 +1891,17 @@ mod tests {
     }
 
     #[test]
+    fn document_store_block_limit_is_256_mib() {
+        assert_eq!(MAX_STORE_BLOCK_BYTES, 256 * 1024 * 1024);
+    }
+
+    #[test]
     fn document_deserializer_rejects_length_prefixed_slice_overrun() {
         let schema = Schema::builder().build();
-        let truncated_text = [1, 0, 0, 0, 0, 5, 0, 0, 0, b'x'];
+        let truncated_text = [1, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, b'x'];
         assert!(deserialize_document(&truncated_text, &schema).is_err());
 
-        let truncated_sparse = [1, 0, 0, 0, 5, 2, 0, 0, 0, 1, 0, 0, 0];
+        let truncated_sparse = [1, 0, 0, 0, 0, 0, 5, 2, 0, 0, 0, 1, 0, 0, 0];
         assert!(deserialize_document(&truncated_sparse, &schema).is_err());
     }
 

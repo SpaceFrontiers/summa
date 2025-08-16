@@ -12,6 +12,9 @@
 //! 4. A commit cancelled mid-flush (client disconnect drops the future)
 //!    leaves a detached waiter on the flush condvar; the retried commit must
 //!    still observe the flush completion instead of stalling to its deadline.
+//! 5. The v3 document store must encode more than 65,535 stored field-values,
+//!    while the independent u16 vector-ordinal limit is rejected before a
+//!    document enters an indexing generation.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -366,6 +369,92 @@ async fn test_retried_prepare_commit_survives_cancelled_commit_waiter() {
             .expect("retried prepare_commit must succeed");
     assert!(prepared.commit().await.unwrap());
     opener.await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 5. stored-value counts and vector-ordinal limits are independent
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_store_v3_accepts_more_than_u16_stored_field_values() {
+    const VECTOR_COUNT: usize = u16::MAX as usize + 1;
+
+    let mut schema_builder = Schema::builder();
+    // Stored-only vectors do not consume vector ordinals. They isolate the
+    // document-store count from the separate indexed-vector limit.
+    let vectors = schema_builder.add_sparse_vector_field("vectors", false, true);
+    let title = schema_builder.add_text_field("title", true, true);
+    let directory = RamDirectory::new();
+    let mut writer = IndexWriter::create(
+        directory.clone(),
+        schema_builder.build(),
+        IndexConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    // 65,536 sparse values plus the title crosses the old u16 stored-value
+    // ceiling while remaining a valid document in store v3.
+    let mut document = Document::new();
+    document.add_text(title, "large document");
+    for _ in 0..VECTOR_COUNT {
+        document.add_sparse_vector(vectors, Vec::new());
+    }
+    writer.add_document(document).unwrap();
+    assert!(
+        writer.commit().await.unwrap(),
+        "the u32 stored-value count must commit"
+    );
+
+    drop(writer);
+    let index = Index::open(directory, IndexConfig::default())
+        .await
+        .unwrap();
+    let segment_id = index.segment_readers().await.unwrap()[0].meta().id;
+    let stored = index
+        .get_document(&hermes_core::query::DocAddress::new(segment_id, 0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.get_all(vectors).count(), VECTOR_COUNT);
+    assert_eq!(
+        stored.get_first(title).and_then(|value| value.as_text()),
+        Some("large document")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_too_many_vector_values_is_rejected_before_queueing() {
+    let mut schema_builder = Schema::builder();
+    let vectors = schema_builder.add_sparse_vector_field("vectors", true, false);
+    let title = schema_builder.add_text_field("title", true, true);
+    let mut writer = IndexWriter::create(
+        RamDirectory::new(),
+        schema_builder.build(),
+        IndexConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    let mut oversized = Document::new();
+    for _ in 0..=(u16::MAX as usize + 1) {
+        oversized.add_sparse_vector(vectors, Vec::new());
+    }
+    let error = writer
+        .add_document(oversized)
+        .expect_err("ordinal overflow must be rejected before queueing");
+    assert!(
+        error.to_string().contains("more than 65536 vector values"),
+        "error must state the vector-value limit: {error}"
+    );
+
+    writer
+        .add_document(title_doc(title, "valid after rejection"))
+        .unwrap();
+    assert!(
+        writer.commit().await.unwrap(),
+        "a rejected document must not poison the commit generation"
+    );
 }
 
 // ---------------------------------------------------------------------------

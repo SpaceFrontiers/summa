@@ -44,7 +44,9 @@ use rustc_hash::FxHashMap;
 use crate::directories::DirectoryWriter;
 use crate::dsl::{Document, Field, Schema};
 use crate::error::{Error, Result};
-use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
+use crate::segment::{
+    SegmentBuilder, SegmentBuilderConfig, SegmentId, validate_vector_value_counts,
+};
 use crate::tokenizer::BoxedTokenizer;
 
 use super::IndexConfig;
@@ -1195,6 +1197,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         if sender.is_closed() {
             return Err(Error::CommitInProgress);
         }
+        // Reject unencodable documents before they enter a worker queue. A
+        // worker discovers these limits only after mutating a segment builder,
+        // which invalidates every sibling document in the commit generation.
+        validate_vector_value_counts(&doc, &self.schema)?;
         let primary_key_index = self.primary_key_index.read();
         if let Some(ref pk_index) = *primary_key_index {
             pk_index.check_and_insert(&doc)?;

@@ -21,7 +21,9 @@ use crate::directories::DirectoryWriter;
 use crate::dsl::{Document, Field, FieldType, FieldValue, Schema};
 use crate::error::Result;
 use crate::index::IndexMetadata;
-use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
+use crate::segment::{
+    SegmentBuilder, SegmentBuilderConfig, SegmentId, validate_vector_value_counts,
+};
 use crate::tokenizer::BoxedTokenizer;
 
 use super::IndexConfig;
@@ -204,17 +206,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// native-only spill paths do not exist here); all of them are pure
     /// functions of (document, schema).
     fn validate_document(&self, doc: &Document) -> Result<()> {
-        let mut vector_values_per_field: FxHashMap<u32, u32> = FxHashMap::default();
-        let mut stored_count: usize = 0;
+        validate_vector_value_counts(doc, &self.schema)?;
+        let mut stored_count = 0usize;
 
         for (field, value) in doc.field_values() {
             let Some(entry) = self.schema.get_field_entry(*field) else {
                 continue;
             };
 
-            // Mirrors `write_document_to_store` / `serialize_document_into`
-            // limits: stored field ids and the stored-field count are u16 on
-            // the wire.
+            // Stored field IDs remain u16 on disk; only the number of stored
+            // field-values was widened to u32 in store v3.
             let stored_in_store = entry.stored
                 && !matches!(
                     value,
@@ -230,25 +231,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 }
             }
 
-            // Mirrors `SegmentBuilder::next_vector_ordinal`: vector ordinals
-            // are u16, so at most u16::MAX + 1 values per field per document.
-            let mut count_vector_value = |field_id: u32| -> Result<()> {
-                let count = vector_values_per_field.entry(field_id).or_insert(0);
-                *count += 1;
-                if *count > u16::MAX as u32 + 1 {
-                    return Err(crate::Error::Document(format!(
-                        "field {field_id} has more than {} vector values in one document",
-                        u16::MAX as usize + 1
-                    )));
-                }
-                Ok(())
-            };
-
             match (&entry.field_type, value) {
                 (FieldType::DenseVector, FieldValue::DenseVector(vec))
                     if entry.indexed || entry.stored =>
                 {
-                    count_vector_value(field.0)?;
                     let expected_dim = entry
                         .dense_vector_config
                         .as_ref()
@@ -272,7 +258,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 (FieldType::BinaryDenseVector, FieldValue::BinaryDenseVector(bytes))
                     if entry.indexed || entry.stored =>
                 {
-                    count_vector_value(field.0)?;
                     let dim_bits = entry
                         .binary_dense_vector_config
                         .as_ref()
@@ -300,7 +285,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 (FieldType::SparseVector, FieldValue::SparseVector(entries))
                     if entry.indexed || entry.fast =>
                 {
-                    count_vector_value(field.0)?;
                     if let Some((index, (_, weight))) = entries
                         .iter()
                         .enumerate()
@@ -315,10 +299,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             }
         }
 
-        if stored_count > u16::MAX as usize {
-            return Err(crate::Error::Document(
-                "too many stored fields in one document (max 65535)".to_string(),
-            ));
+        if u32::try_from(stored_count).is_err() {
+            return Err(crate::Error::Document(format!(
+                "too many stored field-values in one document (max {})",
+                u32::MAX
+            )));
         }
 
         Ok(())

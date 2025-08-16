@@ -165,7 +165,7 @@ pub(super) fn build_store_streaming_from_buffer(
     writer.write_u64::<LittleEndian>(0)?; // dict_offset
     writer.write_u32::<LittleEndian>(next_doc_id)?;
     writer.write_u32::<LittleEndian>(0)?; // has_dict = false
-    writer.write_u32::<LittleEndian>(2)?; // STORE_VERSION
+    writer.write_u32::<LittleEndian>(3)?; // STORE_VERSION
     writer.write_u32::<LittleEndian>(0x53544F52)?; // STORE_MAGIC
 
     if next_doc_id != expected_docs {
