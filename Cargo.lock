@@ -1256,9 +1256,9 @@ checksum = "18f12cc9948ed9604230cdddc7c86e270f9401ccbe3c2e98a4378c5e7632212f"
 
 [[package]]
 name = "const_panic"
-version = "0.2.16"
+version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e684de8c3d7be678f6cc5a68820a2e4e2f69ded7dc55d878687ebfe167f4d95"
+checksum = "9603f79528ece8163c496f8932121cb36cfe46259e9c907bb3d8205139d7caa3"
 dependencies = [
  "typewit",
 ]
@@ -3083,9 +3083,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3217,7 +3217,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-broker"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3246,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3291,7 +3291,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "anyhow",
  "axum",
@@ -3325,7 +3325,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "anyhow",
  "pest",
@@ -3337,7 +3337,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "anyhow",
  "clap",
@@ -3370,7 +3370,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3389,7 +3389,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3412,7 +3412,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3441,7 +3441,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.103"
+version = "1.8.104"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -5759,9 +5759,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.16"
+version = "0.11.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f4bfc015262b9df63c8845072ce59068853ff5872180c2ce2f13038b970e560"
+checksum = "04759210543be93709136e28212294a659ef5001836ff4eab4d663e4529bba83"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -9093,9 +9093,9 @@ dependencies = [
 
 [[package]]
 name = "zerovec-derive"
-version = "0.11.4"
+version = "0.11.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47402523226a02bfe5230160dc3ccc089aa6f6f19e7fcbb4e6f824bbb1b4aa62"
+checksum = "9f212a141d820099d57ffafb9569be9617a6f27d3dc881fbee8fb56642f917a9"
 dependencies = [
  "proc-macro2",
  "quote",
