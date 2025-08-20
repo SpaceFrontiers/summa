@@ -19,13 +19,6 @@ use tonic::transport::{Channel, Endpoint};
 use crate::proto::hermes::index_service_client::IndexServiceClient;
 use crate::proto::hermes::search_service_client::SearchServiceClient;
 
-/// Backends encode search/index responses up to 64 MiB (hermes-server
-/// SEARCH_MAX_ENCODE / INDEX_MAX_ENCODE).
-const BACKEND_MAX_DECODE: usize = 256 * 1024 * 1024;
-/// Backends accept index requests up to 256 MiB (INDEX_MAX_DECODE); the
-/// broker forwards whatever it accepted at its own edge.
-const BACKEND_MAX_ENCODE: usize = 256 * 1024 * 1024;
-
 /// Shaved off a propagated client deadline to cover broker overhead, so the
 /// backend gives up slightly before the client does and the client sees the
 /// backend's status rather than a broker-side race.
@@ -44,13 +37,26 @@ pub struct BackendChannels {
 pub struct ClientPool {
     channels: Mutex<HashMap<String, BackendChannels>>,
     backend_max_searches: usize,
+    /// Decoded-message cap on broker→backend channels (--backend-max-decode-mb);
+    /// must cover the backends' search/index encode caps.
+    backend_max_decode: usize,
+    /// Encoded-message cap on broker→backend channels (--backend-max-encode-mb);
+    /// must cover whatever the broker accepted at its own edge
+    /// (--index-max-decode-mb).
+    backend_max_encode: usize,
 }
 
 impl ClientPool {
-    pub fn new(backend_max_searches: usize) -> Self {
+    pub fn new(
+        backend_max_searches: usize,
+        backend_max_decode: usize,
+        backend_max_encode: usize,
+    ) -> Self {
         Self {
             channels: Mutex::new(HashMap::new()),
             backend_max_searches,
+            backend_max_decode,
+            backend_max_encode,
         }
     }
 
@@ -71,14 +77,14 @@ impl ClientPool {
                 .send_compressed(CompressionEncoding::Zstd)
                 .accept_compressed(CompressionEncoding::Zstd)
                 .accept_compressed(CompressionEncoding::Gzip)
-                .max_decoding_message_size(BACKEND_MAX_DECODE)
-                .max_encoding_message_size(BACKEND_MAX_ENCODE),
+                .max_decoding_message_size(self.backend_max_decode)
+                .max_encoding_message_size(self.backend_max_encode),
             index: IndexServiceClient::new(channel)
                 .send_compressed(CompressionEncoding::Zstd)
                 .accept_compressed(CompressionEncoding::Zstd)
                 .accept_compressed(CompressionEncoding::Gzip)
-                .max_decoding_message_size(BACKEND_MAX_DECODE)
-                .max_encoding_message_size(BACKEND_MAX_ENCODE),
+                .max_decoding_message_size(self.backend_max_decode)
+                .max_encoding_message_size(self.backend_max_encode),
             search_permits: Arc::new(Semaphore::new(self.backend_max_searches)),
         };
         self.channels

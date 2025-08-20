@@ -80,8 +80,14 @@ Contract guarantees clients rely on:
   is `RESOURCE_EXHAUSTED` with the server's exact message, so client backoff
   logic cannot tell broker and backend apart. Only genuine unavailability
   surfaces as `UNAVAILABLE` (it trips client circuit breakers).
-- Transport limits and tuning mirror hermes-server exactly (search 4 MiB
-  decode / 64 MiB encode, index 256 MiB decode / 64 MiB encode, gzip+zstd).
+- Transport limits and tuning mirror hermes-server by default (search
+  4 MiB decode / 256 MiB encode, index 256 MiB decode / 64 MiB encode,
+  gzip+zstd). All six message caps are startup flags
+  (`--search-max-decode-mb`, `--search-max-encode-mb`,
+  `--index-max-decode-mb`, `--index-max-encode-mb`, plus
+  `--backend-max-decode-mb` / `--backend-max-encode-mb` for the
+  broker→backend channels); inconsistent combinations warn loudly at
+  startup.
 
 Pass-through responses are proto-equal, not always byte-equal: protobuf map
 fields (`SearchHit.fields`) may re-serialize entries in a different order.

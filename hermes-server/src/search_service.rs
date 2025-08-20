@@ -14,50 +14,136 @@ use crate::proto::search_service_server::SearchService;
 use crate::proto::*;
 use crate::registry::IndexRegistry;
 
-const DEFAULT_SEARCH_LIMIT: usize = 10;
-const MAX_SEARCH_LIMIT: usize = 10_000;
-const MAX_SEARCH_WINDOW: usize = 50_000;
-const MAX_CANDIDATE_LIMIT: usize = 50_000;
 const MAX_FUSION_SUB_QUERIES: usize = hermes_core::query::MAX_FUSION_SUB_QUERIES;
 const MAX_FUSION_CANDIDATE_SLOTS: usize = hermes_core::query::MAX_FUSION_CANDIDATE_SLOTS;
 
-// The transport's 4 MiB decode limit bounds wire bytes, not decoded object
-// count or downstream expansion. Empty protobuf messages and strings are only
-// a few bytes on the wire, so keep independent structural budgets here.
-const MAX_QUERY_DEPTH: usize = 32;
-const MAX_QUERY_NODES: usize = 256;
-const MAX_QUERY_CLAUSES: usize = 512;
-const MAX_BOOLEAN_CLAUSES: usize = 128;
-const MAX_QUERY_TEXT_BYTES: usize = 64 * 1024;
-const MAX_FIELD_NAME_BYTES: usize = 255;
-const MAX_INDEX_NAME_BYTES: usize = 255;
-const MAX_DENSE_QUERY_DIMS: usize = 65_536;
-const MAX_SPARSE_QUERY_DIMS: usize = 4_096;
-const MAX_BINARY_QUERY_BYTES: usize = 256 * 1024;
-const MAX_TOTAL_QUERY_VECTOR_BYTES: usize = 1024 * 1024;
-const MAX_FIELDS_TO_LOAD: usize = 64;
-const MAX_FIELDS_TO_LOAD_NAME_BYTES: usize = 16 * 1024;
-
-// Leave headroom below tonic's 256 MiB response limit for compression and
-// framing, and also cap estimated retained heap while the response is built.
-// 2026-08-22: raised 48 → 192 MiB — chunk-level binary reranking over a
-// book-heavy RAG pool legitimately hydrates >48 MiB (a few dozen books ×
-// thousands of 320-byte chunk vectors). Downstream caps that must stay
-// above this: hermes-server SEARCH_MAX_ENCODE (256 MiB), hermes-broker
-// BACKEND_MAX_DECODE / SEARCH_MAX_ENCODE (256 MiB), and the consumers'
-// hermes-client decode cap (200 MiB).
-const MAX_SEARCH_RESPONSE_BYTES: usize = 192 * 1024 * 1024;
 const UNKNOWN_INDEX_LABEL: &str = "unknown";
 
-#[derive(Default)]
-struct QueryShapeBudget {
+/// Structural anti-DoS budgets for one decoded request, set once at startup
+/// from the hermes-server CLI (flags of the same names). The transport's
+/// decode limit (`--search-max-decode-mb`) bounds wire bytes, not decoded
+/// object count or downstream expansion — empty protobuf messages and strings
+/// are only a few bytes on the wire — so these are independent budgets.
+/// `Default` preserves the historical hard-coded values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryShapeLimits {
+    /// Maximum query tree nesting depth.
+    pub max_query_depth: usize,
+    /// Maximum query tree nodes per request.
+    pub max_query_nodes: usize,
+    /// Maximum aggregate clauses across the query tree.
+    pub max_query_clauses: usize,
+    /// Maximum clauses in a single BooleanQuery.
+    pub max_boolean_clauses: usize,
+    /// Maximum aggregate query text bytes (terms, match text, field names).
+    pub max_query_text_bytes: usize,
+    /// Maximum bytes in one field name.
+    pub max_field_name_bytes: usize,
+    /// Maximum bytes in the index name.
+    pub max_index_name_bytes: usize,
+    /// Maximum elements in one dense query/reranker vector.
+    pub max_dense_query_dims: usize,
+    /// Maximum entries in one sparse query vector.
+    pub max_sparse_query_dims: usize,
+    /// Maximum bytes in one binary query/reranker vector.
+    pub max_binary_query_bytes: usize,
+    /// Maximum aggregate query vector bytes per request.
+    pub max_total_query_vector_bytes: usize,
+    /// Maximum names in SearchRequest.fields_to_load.
+    pub max_fields_to_load: usize,
+    /// Maximum aggregate bytes across fields_to_load names.
+    pub max_fields_to_load_name_bytes: usize,
+    /// Maximum tokens a Term/Match query may expand to after tokenization.
+    pub max_text_query_tokens: usize,
+    /// Maximum dimensions a SparseVectorQuery text may tokenize into.
+    pub max_sparse_token_dimensions: usize,
+}
+
+impl Default for QueryShapeLimits {
+    fn default() -> Self {
+        Self {
+            max_query_depth: 32,
+            max_query_nodes: 256,
+            max_query_clauses: 512,
+            max_boolean_clauses: 128,
+            max_query_text_bytes: 64 * 1024,
+            max_field_name_bytes: 255,
+            max_index_name_bytes: 255,
+            max_dense_query_dims: 65_536,
+            max_sparse_query_dims: 4_096,
+            max_binary_query_bytes: 256 * 1024,
+            max_total_query_vector_bytes: 1024 * 1024,
+            max_fields_to_load: 64,
+            max_fields_to_load_name_bytes: 16 * 1024,
+            max_text_query_tokens: 256,
+            max_sparse_token_dimensions: 4_096,
+        }
+    }
+}
+
+/// Request-facing result and hydration limits, set once at startup from the
+/// hermes-server CLI (`--default-search-limit`, `--max-search-limit`,
+/// `--max-search-window`, `--max-candidate-limit`,
+/// `--max-search-response-mb`). `Default` preserves the historical
+/// hard-coded values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchLimits {
+    /// Results returned when `SearchRequest.limit` is 0.
+    pub default_search_limit: usize,
+    /// Upper bound on `SearchRequest.limit`.
+    pub max_search_limit: usize,
+    /// Upper bound on `SearchRequest.offset + limit`.
+    pub max_search_window: usize,
+    /// Upper bound on the first-stage candidate pool
+    /// (`SearchRequest.candidate_limit`).
+    pub max_candidate_limit: usize,
+    /// Structural anti-DoS budgets for the decoded query tree.
+    pub shape: QueryShapeLimits,
+    /// Hydration budget for one search response: caps both estimated retained
+    /// heap while the response is built and its encoded size. Must leave
+    /// headroom below the transport's encode limit (`--search-max-encode-mb`)
+    /// for compression and framing — startup validation enforces the ordering.
+    /// 2026-08-22: raised 48 → 192 MiB — chunk-level binary reranking over a
+    /// book-heavy RAG pool legitimately hydrates >48 MiB (a few dozen books ×
+    /// thousands of 320-byte chunk vectors). Downstream caps that must stay
+    /// above this: hermes-server `--search-max-encode-mb` (256 MiB),
+    /// hermes-broker `--backend-max-decode-mb` / `--search-max-encode-mb`
+    /// (256 MiB), and the consumers' hermes-client decode cap (200 MiB).
+    pub max_search_response_bytes: usize,
+}
+
+impl Default for SearchLimits {
+    fn default() -> Self {
+        Self {
+            default_search_limit: 10,
+            max_search_limit: 10_000,
+            max_search_window: 50_000,
+            max_candidate_limit: 50_000,
+            shape: QueryShapeLimits::default(),
+            max_search_response_bytes: 192 * 1024 * 1024,
+        }
+    }
+}
+
+struct QueryShapeBudget<'a> {
+    shape: &'a QueryShapeLimits,
     nodes: usize,
     clauses: usize,
     text_bytes: usize,
     vector_bytes: usize,
 }
 
-impl QueryShapeBudget {
+impl<'a> QueryShapeBudget<'a> {
+    fn new(shape: &'a QueryShapeLimits) -> Self {
+        Self {
+            shape,
+            nodes: 0,
+            clauses: 0,
+            text_bytes: 0,
+            vector_bytes: 0,
+        }
+    }
+
     fn add_limited(
         current: &mut usize,
         amount: usize,
@@ -77,27 +163,34 @@ impl QueryShapeBudget {
     }
 
     fn add_node(&mut self, depth: usize) -> Result<(), Status> {
-        if depth > MAX_QUERY_DEPTH {
+        if depth > self.shape.max_query_depth {
             return Err(Status::invalid_argument(format!(
-                "Query nesting depth must not exceed {MAX_QUERY_DEPTH}"
+                "Query nesting depth must not exceed {}",
+                self.shape.max_query_depth
             )));
         }
-        Self::add_limited(&mut self.nodes, 1, MAX_QUERY_NODES, "Query node count")
+        Self::add_limited(
+            &mut self.nodes,
+            1,
+            self.shape.max_query_nodes,
+            "Query node count",
+        )
     }
 
     fn add_clauses(&mut self, clauses: usize) -> Result<(), Status> {
         Self::add_limited(
             &mut self.clauses,
             clauses,
-            MAX_QUERY_CLAUSES,
+            self.shape.max_query_clauses,
             "Query clause count",
         )
     }
 
     fn add_field_name(&mut self, name: &str, description: &str) -> Result<(), Status> {
-        if name.len() > MAX_FIELD_NAME_BYTES {
+        if name.len() > self.shape.max_field_name_bytes {
             return Err(Status::invalid_argument(format!(
-                "{description} must not exceed {MAX_FIELD_NAME_BYTES} bytes"
+                "{description} must not exceed {} bytes",
+                self.shape.max_field_name_bytes
             )));
         }
         self.add_text(name.len())
@@ -107,7 +200,7 @@ impl QueryShapeBudget {
         Self::add_limited(
             &mut self.text_bytes,
             bytes,
-            MAX_QUERY_TEXT_BYTES,
+            self.shape.max_query_text_bytes,
             "Aggregate query text bytes",
         )
     }
@@ -130,7 +223,7 @@ impl QueryShapeBudget {
         Self::add_limited(
             &mut self.vector_bytes,
             bytes,
-            MAX_TOTAL_QUERY_VECTOR_BYTES,
+            self.shape.max_total_query_vector_bytes,
             "Aggregate query vector bytes",
         )
     }
@@ -138,37 +231,45 @@ impl QueryShapeBudget {
 
 /// Validate decoded request structure before acquiring scarce search capacity
 /// or recursively converting the protobuf query tree.
-fn validate_search_request_shape(req: &SearchRequest, root: &Query) -> Result<(), Status> {
-    if req.index_name.is_empty() || req.index_name.len() > MAX_INDEX_NAME_BYTES {
+fn validate_search_request_shape(
+    req: &SearchRequest,
+    root: &Query,
+    shape: &QueryShapeLimits,
+) -> Result<(), Status> {
+    if req.index_name.is_empty() || req.index_name.len() > shape.max_index_name_bytes {
         return Err(Status::invalid_argument(format!(
-            "SearchRequest.index_name must contain 1..={MAX_INDEX_NAME_BYTES} bytes"
+            "SearchRequest.index_name must contain 1..={} bytes",
+            shape.max_index_name_bytes
         )));
     }
-    if req.fields_to_load.len() > MAX_FIELDS_TO_LOAD {
+    if req.fields_to_load.len() > shape.max_fields_to_load {
         return Err(Status::invalid_argument(format!(
-            "SearchRequest.fields_to_load supports at most {MAX_FIELDS_TO_LOAD} names (got {})",
+            "SearchRequest.fields_to_load supports at most {} names (got {})",
+            shape.max_fields_to_load,
             req.fields_to_load.len()
         )));
     }
     let mut selected_name_bytes = 0usize;
     for (index, name) in req.fields_to_load.iter().enumerate() {
-        if name.len() > MAX_FIELD_NAME_BYTES {
+        if name.len() > shape.max_field_name_bytes {
             return Err(Status::invalid_argument(format!(
-                "SearchRequest.fields_to_load[{index}] must not exceed {MAX_FIELD_NAME_BYTES} bytes"
+                "SearchRequest.fields_to_load[{index}] must not exceed {} bytes",
+                shape.max_field_name_bytes
             )));
         }
         selected_name_bytes = selected_name_bytes
             .checked_add(name.len())
             .ok_or_else(|| Status::invalid_argument("Field selection byte count overflows"))?;
     }
-    if selected_name_bytes > MAX_FIELDS_TO_LOAD_NAME_BYTES {
+    if selected_name_bytes > shape.max_fields_to_load_name_bytes {
         return Err(Status::invalid_argument(format!(
             "SearchRequest.fields_to_load names must total at most \
-             {MAX_FIELDS_TO_LOAD_NAME_BYTES} bytes (got {selected_name_bytes})"
+             {} bytes (got {selected_name_bytes})",
+            shape.max_fields_to_load_name_bytes
         )));
     }
 
-    let mut budget = QueryShapeBudget::default();
+    let mut budget = QueryShapeBudget::new(shape);
     let mut stack = vec![(root, 1usize)];
     while let Some((query, depth)) = stack.pop() {
         budget.add_node(depth)?;
@@ -188,10 +289,11 @@ fn validate_search_request_shape(req: &SearchRequest, root: &Query) -> Result<()
                     .checked_add(boolean.should.len())
                     .and_then(|count| count.checked_add(boolean.must_not.len()))
                     .ok_or_else(|| Status::invalid_argument("Boolean clause count overflows"))?;
-                if clauses > MAX_BOOLEAN_CLAUSES {
+                if clauses > shape.max_boolean_clauses {
                     return Err(Status::invalid_argument(format!(
-                        "Each BooleanQuery supports at most {MAX_BOOLEAN_CLAUSES} clauses \
-                         (got {clauses})"
+                        "Each BooleanQuery supports at most {} clauses \
+                         (got {clauses})",
+                        shape.max_boolean_clauses
                     )));
                 }
                 budget.add_clauses(clauses)?;
@@ -219,13 +321,13 @@ fn validate_search_request_shape(req: &SearchRequest, root: &Query) -> Result<()
                     "SparseVectorQuery.indices",
                     sparse.indices.len(),
                     std::mem::size_of::<u32>(),
-                    MAX_SPARSE_QUERY_DIMS,
+                    shape.max_sparse_query_dims,
                 )?;
                 budget.add_vector(
                     "SparseVectorQuery.values",
                     sparse.values.len(),
                     std::mem::size_of::<f32>(),
-                    MAX_SPARSE_QUERY_DIMS,
+                    shape.max_sparse_query_dims,
                 )?;
             }
             query::Query::DenseVector(dense) => {
@@ -234,7 +336,7 @@ fn validate_search_request_shape(req: &SearchRequest, root: &Query) -> Result<()
                     "DenseVectorQuery.vector",
                     dense.vector.len(),
                     std::mem::size_of::<f32>(),
-                    MAX_DENSE_QUERY_DIMS,
+                    shape.max_dense_query_dims,
                 )?;
             }
             query::Query::Match(match_query) => {
@@ -254,7 +356,7 @@ fn validate_search_request_shape(req: &SearchRequest, root: &Query) -> Result<()
                     "BinaryDenseVectorQuery.vector",
                     binary.vector.len(),
                     1,
-                    MAX_BINARY_QUERY_BYTES,
+                    shape.max_binary_query_bytes,
                 )?;
             }
             query::Query::Fusion(fusion) => {
@@ -288,13 +390,13 @@ fn validate_search_request_shape(req: &SearchRequest, root: &Query) -> Result<()
             "Reranker.vector",
             reranker.vector.len(),
             std::mem::size_of::<f32>(),
-            MAX_DENSE_QUERY_DIMS,
+            shape.max_dense_query_dims,
         )?;
         budget.add_vector(
             "Reranker.binary_vector",
             reranker.binary_vector.len(),
             1,
-            MAX_BINARY_QUERY_BYTES,
+            shape.max_binary_query_bytes,
         )?;
     }
 
@@ -340,10 +442,6 @@ struct SearchResponseBudget {
 }
 
 impl SearchResponseBudget {
-    fn new() -> Self {
-        Self::with_maximum(MAX_SEARCH_RESPONSE_BYTES)
-    }
-
     fn with_maximum(maximum: usize) -> Self {
         Self {
             retained_bytes: 0,
@@ -489,30 +587,34 @@ fn try_acquire_search_permit(permits: &Arc<Semaphore>) -> Result<OwnedSemaphoreP
 
 /// Validate all request-controlled result and candidate depths before opening
 /// an index, constructing queries, or allocating candidate lists.
-fn validate_search_budget(req: &SearchRequest) -> Result<SearchBudget, Status> {
+fn validate_search_budget(
+    req: &SearchRequest,
+    limits: &SearchLimits,
+) -> Result<SearchBudget, Status> {
     let query = req
         .query
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("Query is required"))?;
-    validate_search_request_shape(req, query)?;
+    validate_search_request_shape(req, query, &limits.shape)?;
     let final_limit = bounded_limit(
         "SearchRequest.limit",
         req.limit,
-        DEFAULT_SEARCH_LIMIT,
-        MAX_SEARCH_LIMIT,
+        limits.default_search_limit,
+        limits.max_search_limit,
     )?;
     let offset = req.offset as usize;
     let search_limit = offset
         .checked_add(final_limit)
         .ok_or_else(|| Status::invalid_argument("Search result window is too large"))?;
-    if search_limit > MAX_SEARCH_WINDOW {
+    if search_limit > limits.max_search_window {
         return Err(Status::invalid_argument(format!(
-            "SearchRequest.offset + limit must not exceed {MAX_SEARCH_WINDOW} \
-             (got {offset} + {final_limit} = {search_limit})"
+            "SearchRequest.offset + limit must not exceed {} \
+             (got {offset} + {final_limit} = {search_limit})",
+            limits.max_search_window
         )));
     }
     let max_candidate_limit =
-        hermes_core::query::max_candidate_limit(search_limit).min(MAX_CANDIDATE_LIMIT);
+        hermes_core::query::max_candidate_limit(search_limit).min(limits.max_candidate_limit);
     let candidate_limit = bounded_limit(
         "SearchRequest.candidate_limit",
         req.candidate_limit,
@@ -577,10 +679,15 @@ fn validate_search_budget(req: &SearchRequest) -> Result<SearchBudget, Status> {
 pub struct SearchServiceImpl {
     pub registry: Arc<IndexRegistry>,
     search_permits: Arc<Semaphore>,
+    limits: SearchLimits,
 }
 
 impl SearchServiceImpl {
-    pub fn new(registry: Arc<IndexRegistry>, max_concurrent_searches: usize) -> Self {
+    pub fn new(
+        registry: Arc<IndexRegistry>,
+        max_concurrent_searches: usize,
+        limits: SearchLimits,
+    ) -> Self {
         assert!(
             max_concurrent_searches > 0,
             "max_concurrent_searches must be greater than zero"
@@ -588,6 +695,7 @@ impl SearchServiceImpl {
         Self {
             registry,
             search_permits: Arc::new(Semaphore::new(max_concurrent_searches)),
+            limits,
         }
     }
 }
@@ -602,7 +710,7 @@ impl SearchService for SearchServiceImpl {
         let metric_index = std::sync::OnceLock::new();
         let t = std::time::Instant::now();
         let result = async {
-        let budget = validate_search_budget(&req)?;
+        let budget = validate_search_budget(&req, &self.limits)?;
 
         // Bound expensive pipelines across all HTTP/2 connections without an
         // unbounded waiter queue retaining decoded requests under overload.
@@ -670,6 +778,7 @@ impl SearchService for SearchServiceImpl {
                         searcher.schema(),
                         Some(searcher.global_stats()),
                         Some(index.directory().root()),
+                        &self.limits.shape,
                     )
                     .map_err(|e| {
                         Status::invalid_argument(format!("Invalid fusion sub-query: {}", e))
@@ -746,6 +855,7 @@ impl SearchService for SearchServiceImpl {
                     searcher.schema(),
                     Some(searcher.global_stats()),
                     Some(index.directory().root()),
+                    &self.limits.shape,
                 )
                 .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
 
@@ -828,7 +938,8 @@ impl SearchService for SearchServiceImpl {
             }
         }
 
-        let mut response_budget = SearchResponseBudget::new();
+        let mut response_budget =
+            SearchResponseBudget::with_maximum(self.limits.max_search_response_bytes);
         let mut hits = Vec::with_capacity(results.len());
         for result in results {
             // Convert ordinal scores before hydration so their retained memory
@@ -1149,14 +1260,104 @@ mod tests {
         }
     }
 
+    fn limits() -> SearchLimits {
+        SearchLimits::default()
+    }
+
     #[test]
     fn search_budget_applies_defaults() {
-        let budget = validate_search_budget(&ordinary_request()).unwrap();
+        let budget = validate_search_budget(&ordinary_request(), &limits()).unwrap();
 
-        assert_eq!(budget.final_limit, DEFAULT_SEARCH_LIMIT);
+        assert_eq!(budget.final_limit, limits().default_search_limit);
         assert_eq!(budget.offset, 0);
-        assert_eq!(budget.search_limit, DEFAULT_SEARCH_LIMIT);
-        assert_eq!(budget.candidate_limit, DEFAULT_SEARCH_LIMIT);
+        assert_eq!(budget.search_limit, limits().default_search_limit);
+        assert_eq!(budget.candidate_limit, limits().default_search_limit);
+    }
+
+    #[test]
+    fn search_budget_honors_configured_limits() {
+        let tight = SearchLimits {
+            default_search_limit: 5,
+            max_search_limit: 20,
+            max_search_window: 30,
+            max_candidate_limit: 30,
+            ..SearchLimits::default()
+        };
+
+        let budget = validate_search_budget(&ordinary_request(), &tight).unwrap();
+        assert_eq!(budget.final_limit, 5);
+
+        let mut over_limit = ordinary_request();
+        over_limit.limit = 21;
+        assert_eq!(
+            validate_search_budget(&over_limit, &tight)
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+
+        let mut over_window = ordinary_request();
+        over_window.limit = 20;
+        over_window.offset = 11;
+        assert_eq!(
+            validate_search_budget(&over_window, &tight)
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+
+        let mut over_candidates = ordinary_request();
+        over_candidates.candidate_limit = 31;
+        assert_eq!(
+            validate_search_budget(&over_candidates, &tight)
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn query_shape_honors_configured_limits() {
+        let tight = SearchLimits {
+            shape: QueryShapeLimits {
+                max_query_depth: 2,
+                max_fields_to_load: 1,
+                ..QueryShapeLimits::default()
+            },
+            ..SearchLimits::default()
+        };
+
+        // Depth 3 (two boolean wrappers around the leaf) exceeds the
+        // configured depth of 2 but is fine under the defaults.
+        let mut nested = all_query();
+        for _ in 0..2 {
+            nested = Query {
+                query: Some(query::Query::Boolean(BooleanQuery {
+                    must: vec![nested],
+                    ..Default::default()
+                })),
+            };
+        }
+        let mut deep_req = ordinary_request();
+        deep_req.query = Some(nested);
+        assert_eq!(
+            validate_search_budget(&deep_req, &tight)
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        assert!(validate_search_budget(&deep_req, &limits()).is_ok());
+
+        // Two selected fields exceed the configured cap of 1.
+        let mut wide_req = ordinary_request();
+        wide_req.fields_to_load = vec!["a".to_owned(), "b".to_owned()];
+        assert_eq!(
+            validate_search_budget(&wide_req, &tight)
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        assert!(validate_search_budget(&wide_req, &limits()).is_ok());
     }
 
     #[test]
@@ -1164,13 +1365,13 @@ mod tests {
         let mut req = ordinary_request();
         req.index_name.clear();
         assert_eq!(
-            validate_search_budget(&req).unwrap_err().code(),
+            validate_search_budget(&req, &limits()).unwrap_err().code(),
             Code::InvalidArgument
         );
 
-        req.index_name = "x".repeat(MAX_INDEX_NAME_BYTES + 1);
+        req.index_name = "x".repeat(limits().shape.max_index_name_bytes + 1);
         assert_eq!(
-            validate_search_budget(&req).unwrap_err().code(),
+            validate_search_budget(&req, &limits()).unwrap_err().code(),
             Code::InvalidArgument
         );
     }
@@ -1178,9 +1379,9 @@ mod tests {
     #[test]
     fn search_budget_rejects_excessive_final_limit() {
         let mut req = ordinary_request();
-        req.limit = (MAX_SEARCH_LIMIT + 1) as u32;
+        req.limit = (limits().max_search_limit + 1) as u32;
 
-        let err = validate_search_budget(&req).unwrap_err();
+        let err = validate_search_budget(&req, &limits()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
@@ -1189,17 +1390,17 @@ mod tests {
         let mut req = ordinary_request();
         req.limit = 100;
         req.offset = 400;
-        let budget = validate_search_budget(&req).unwrap();
+        let budget = validate_search_budget(&req, &limits()).unwrap();
         assert_eq!(budget.final_limit, 100);
         assert_eq!(budget.offset, 400);
         assert_eq!(budget.search_limit, 500);
 
-        req.limit = DEFAULT_SEARCH_LIMIT as u32;
-        req.offset = (MAX_SEARCH_WINDOW - DEFAULT_SEARCH_LIMIT) as u32;
-        assert!(validate_search_budget(&req).is_ok());
+        req.limit = limits().default_search_limit as u32;
+        req.offset = (limits().max_search_window - limits().default_search_limit) as u32;
+        assert!(validate_search_budget(&req, &limits()).is_ok());
 
         req.offset += 1;
-        let err = validate_search_budget(&req).unwrap_err();
+        let err = validate_search_budget(&req, &limits()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
@@ -1208,32 +1409,32 @@ mod tests {
         let mut ordinary_default = ordinary_request();
         ordinary_default.limit = 300;
         assert_eq!(
-            validate_search_budget(&ordinary_default)
+            validate_search_budget(&ordinary_default, &limits())
                 .unwrap()
                 .candidate_limit,
             300
         );
 
         let mut default_req = ordinary_request();
-        default_req.limit = MAX_SEARCH_LIMIT as u32;
+        default_req.limit = limits().max_search_limit as u32;
         assert_eq!(
-            validate_search_budget(&default_req)
+            validate_search_budget(&default_req, &limits())
                 .unwrap()
                 .candidate_limit,
-            MAX_SEARCH_LIMIT
+            limits().max_search_limit
         );
 
         let mut excessive_req = ordinary_request();
         excessive_req.limit = 100;
         excessive_req.candidate_limit = 201;
-        let err = validate_search_budget(&excessive_req).unwrap_err();
+        let err = validate_search_budget(&excessive_req, &limits()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
 
         let mut impossible_page = ordinary_request();
         impossible_page.limit = 10;
         impossible_page.offset = 1_000;
         impossible_page.candidate_limit = 100;
-        let err = validate_search_budget(&impossible_page).unwrap_err();
+        let err = validate_search_budget(&impossible_page, &limits()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
@@ -1242,7 +1443,7 @@ mod tests {
         let mut request = ordinary_request();
         request.limit = 100;
         request.candidate_limit = 100;
-        let budget = validate_search_budget(&request).unwrap();
+        let budget = validate_search_budget(&request, &limits()).unwrap();
         assert_eq!(budget.search_limit, 100);
         assert_eq!(budget.candidate_limit, 100);
     }
@@ -1264,7 +1465,7 @@ mod tests {
         let mut req = fusion_request(2, 201);
         req.limit = 100;
 
-        let err = validate_search_budget(&req).unwrap_err();
+        let err = validate_search_budget(&req, &limits()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
@@ -1274,7 +1475,7 @@ mod tests {
         req.limit = 100;
         req.reranker = Some(Reranker::default());
 
-        let budget = validate_search_budget(&req).unwrap();
+        let budget = validate_search_budget(&req, &limits()).unwrap();
         assert_eq!(budget.candidate_limit, 100);
     }
 
@@ -1282,23 +1483,26 @@ mod tests {
     fn fusion_budget_rejects_too_many_sub_queries_before_conversion() {
         let req = fusion_request(MAX_FUSION_SUB_QUERIES + 1, 50);
 
-        let err = validate_search_budget(&req).unwrap_err();
+        let err = validate_search_budget(&req, &limits()).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[test]
     fn fusion_budget_rejects_excessive_fetch_and_aggregate_work() {
-        let excessive_fetch = fusion_request(2, (MAX_CANDIDATE_LIMIT + 1) as u32);
+        let excessive_fetch = fusion_request(2, (limits().max_candidate_limit + 1) as u32);
         assert_eq!(
-            validate_search_budget(&excessive_fetch).unwrap_err().code(),
+            validate_search_budget(&excessive_fetch, &limits())
+                .unwrap_err()
+                .code(),
             Code::InvalidArgument
         );
 
-        let mut excessive_aggregate = fusion_request(5, MAX_CANDIDATE_LIMIT as u32);
-        excessive_aggregate.limit = MAX_SEARCH_LIMIT as u32;
-        excessive_aggregate.offset = (MAX_SEARCH_WINDOW - MAX_SEARCH_LIMIT) as u32;
+        let mut excessive_aggregate = fusion_request(5, limits().max_candidate_limit as u32);
+        excessive_aggregate.limit = limits().max_search_limit as u32;
+        excessive_aggregate.offset =
+            (limits().max_search_window - limits().max_search_limit) as u32;
         assert_eq!(
-            validate_search_budget(&excessive_aggregate)
+            validate_search_budget(&excessive_aggregate, &limits())
                 .unwrap_err()
                 .code(),
             Code::InvalidArgument
@@ -1308,11 +1512,11 @@ mod tests {
     #[test]
     fn fusion_default_candidate_pool_is_checked_and_capped() {
         let mut req = fusion_request(2, 0);
-        req.limit = MAX_SEARCH_LIMIT as u32;
+        req.limit = limits().max_search_limit as u32;
         req.reranker = Some(Reranker::default());
 
-        let budget = validate_search_budget(&req).unwrap();
-        assert_eq!(budget.candidate_limit, MAX_SEARCH_LIMIT);
+        let budget = validate_search_budget(&req, &limits()).unwrap();
+        assert_eq!(budget.candidate_limit, limits().max_search_limit);
     }
 
     #[test]
@@ -1326,7 +1530,7 @@ mod tests {
             };
             fusion.rrf_k = rrf_k;
             assert_eq!(
-                validate_search_budget(&req).unwrap_err().code(),
+                validate_search_budget(&req, &limits()).unwrap_err().code(),
                 Code::InvalidArgument
             );
         }
@@ -1340,7 +1544,7 @@ mod tests {
             };
             fusion.queries[0].weight = weight;
             assert_eq!(
-                validate_search_budget(&req).unwrap_err().code(),
+                validate_search_budget(&req, &limits()).unwrap_err().code(),
                 Code::InvalidArgument
             );
         }
@@ -1349,21 +1553,25 @@ mod tests {
     #[test]
     fn request_shape_rejects_field_and_boolean_amplification() {
         let mut too_many_fields = ordinary_request();
-        too_many_fields.fields_to_load = vec![String::new(); MAX_FIELDS_TO_LOAD + 1];
+        too_many_fields.fields_to_load = vec![String::new(); limits().shape.max_fields_to_load + 1];
         assert_eq!(
-            validate_search_budget(&too_many_fields).unwrap_err().code(),
+            validate_search_budget(&too_many_fields, &limits())
+                .unwrap_err()
+                .code(),
             Code::InvalidArgument
         );
 
         let mut too_many_clauses = ordinary_request();
         too_many_clauses.query = Some(Query {
             query: Some(query::Query::Boolean(BooleanQuery {
-                must: (0..=MAX_BOOLEAN_CLAUSES).map(|_| all_query()).collect(),
+                must: (0..=limits().shape.max_boolean_clauses)
+                    .map(|_| all_query())
+                    .collect(),
                 ..Default::default()
             })),
         });
         assert_eq!(
-            validate_search_budget(&too_many_clauses)
+            validate_search_budget(&too_many_clauses, &limits())
                 .unwrap_err()
                 .code(),
             Code::InvalidArgument
@@ -1373,7 +1581,7 @@ mod tests {
     #[test]
     fn request_shape_rejects_depth_node_text_and_vector_expansion() {
         let mut nested = all_query();
-        for _ in 0..MAX_QUERY_DEPTH {
+        for _ in 0..limits().shape.max_query_depth {
             nested = Query {
                 query: Some(query::Query::Boost(Box::new(BoostQuery {
                     query: Some(Box::new(nested)),
@@ -1384,13 +1592,15 @@ mod tests {
         let mut excessive_depth = ordinary_request();
         excessive_depth.query = Some(nested);
         assert_eq!(
-            validate_search_budget(&excessive_depth).unwrap_err().code(),
+            validate_search_budget(&excessive_depth, &limits())
+                .unwrap_err()
+                .code(),
             Code::InvalidArgument
         );
 
         // 1 root + 128 Boolean children + 128 leaves exceeds the node budget,
         // while each Boolean and the aggregate clause count remain legal.
-        let branches = (0..MAX_BOOLEAN_CLAUSES)
+        let branches = (0..limits().shape.max_boolean_clauses)
             .map(|_| Query {
                 query: Some(query::Query::Boolean(BooleanQuery {
                     must: vec![all_query()],
@@ -1406,7 +1616,9 @@ mod tests {
             })),
         });
         assert_eq!(
-            validate_search_budget(&excessive_nodes).unwrap_err().code(),
+            validate_search_budget(&excessive_nodes, &limits())
+                .unwrap_err()
+                .code(),
             Code::InvalidArgument
         );
 
@@ -1414,11 +1626,13 @@ mod tests {
         excessive_text.query = Some(Query {
             query: Some(query::Query::Match(MatchQuery {
                 field: "body".to_owned(),
-                text: "x".repeat(MAX_QUERY_TEXT_BYTES + 1),
+                text: "x".repeat(limits().shape.max_query_text_bytes + 1),
             })),
         });
         assert_eq!(
-            validate_search_budget(&excessive_text).unwrap_err().code(),
+            validate_search_budget(&excessive_text, &limits())
+                .unwrap_err()
+                .code(),
             Code::InvalidArgument
         );
 
@@ -1426,12 +1640,12 @@ mod tests {
         excessive_vector.query = Some(Query {
             query: Some(query::Query::DenseVector(DenseVectorQuery {
                 field: "embedding".to_owned(),
-                vector: vec![0.0; MAX_DENSE_QUERY_DIMS + 1],
+                vector: vec![0.0; limits().shape.max_dense_query_dims + 1],
                 ..Default::default()
             })),
         });
         assert_eq!(
-            validate_search_budget(&excessive_vector)
+            validate_search_budget(&excessive_vector, &limits())
                 .unwrap_err()
                 .code(),
             Code::InvalidArgument

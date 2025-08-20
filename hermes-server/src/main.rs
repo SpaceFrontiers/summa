@@ -196,6 +196,244 @@ struct Args {
     /// Set to "off" to disable the exporter.
     #[arg(long, default_value = "0.0.0.0:9184")]
     metrics_addr: String,
+
+    /// Maximum decoded (received) gRPC message size in MiB for SearchService
+    /// requests. Queries are small; raise only for very large query vectors.
+    #[arg(long, default_value = "4")]
+    search_max_decode_mb: usize,
+
+    /// Maximum encoded (sent) gRPC message size in MiB for SearchService
+    /// responses. Must be at least --max-search-response-mb plus framing
+    /// headroom; a hermes-broker in front must mirror it in
+    /// --backend-max-decode-mb.
+    #[arg(long, default_value = "256")]
+    search_max_encode_mb: usize,
+
+    /// Maximum decoded (received) gRPC message size in MiB for IndexService
+    /// requests (bounds one indexing batch).
+    #[arg(long, default_value = "256")]
+    index_max_decode_mb: usize,
+
+    /// Maximum encoded (sent) gRPC message size in MiB for IndexService
+    /// responses.
+    #[arg(long, default_value = "64")]
+    index_max_encode_mb: usize,
+
+    /// Hydration budget in MiB for one search response: caps estimated
+    /// retained heap while the response is built and its encoded size.
+    /// Must not exceed --search-max-encode-mb; downstream broker/client
+    /// decode caps must stay above it.
+    #[arg(long, default_value = "192")]
+    max_search_response_mb: usize,
+
+    /// Results returned when SearchRequest.limit is 0
+    #[arg(long, default_value = "10")]
+    default_search_limit: usize,
+
+    /// Upper bound on SearchRequest.limit
+    #[arg(long, default_value = "10000")]
+    max_search_limit: usize,
+
+    /// Upper bound on SearchRequest.offset + limit (pagination window)
+    #[arg(long, default_value = "50000")]
+    max_search_window: usize,
+
+    /// Upper bound on the first-stage candidate pool
+    /// (SearchRequest.candidate_limit)
+    #[arg(long, default_value = "50000")]
+    max_candidate_limit: usize,
+
+    // Structural anti-DoS budgets for one decoded request. The transport's
+    // decode limit bounds wire bytes, not decoded object count or downstream
+    // expansion, so these are independent budgets.
+    /// Maximum query tree nesting depth
+    #[arg(long, default_value = "32")]
+    max_query_depth: usize,
+
+    /// Maximum query tree nodes per request
+    #[arg(long, default_value = "256")]
+    max_query_nodes: usize,
+
+    /// Maximum aggregate clauses across the query tree
+    #[arg(long, default_value = "512")]
+    max_query_clauses: usize,
+
+    /// Maximum clauses in a single BooleanQuery
+    #[arg(long, default_value = "128")]
+    max_boolean_clauses: usize,
+
+    /// Maximum aggregate query text bytes (terms, match text, field names)
+    #[arg(long, default_value = "65536")]
+    max_query_text_bytes: usize,
+
+    /// Maximum bytes in one field name
+    #[arg(long, default_value = "255")]
+    max_field_name_bytes: usize,
+
+    /// Maximum bytes in the index name
+    #[arg(long, default_value = "255")]
+    max_index_name_bytes: usize,
+
+    /// Maximum elements in one dense query/reranker vector
+    #[arg(long, default_value = "65536")]
+    max_dense_query_dims: usize,
+
+    /// Maximum entries in one sparse query vector
+    #[arg(long, default_value = "4096")]
+    max_sparse_query_dims: usize,
+
+    /// Maximum bytes in one binary query/reranker vector
+    #[arg(long, default_value = "262144")]
+    max_binary_query_bytes: usize,
+
+    /// Maximum aggregate query vector bytes per request
+    #[arg(long, default_value = "1048576")]
+    max_total_query_vector_bytes: usize,
+
+    /// Maximum names in SearchRequest.fields_to_load
+    #[arg(long, default_value = "64")]
+    max_fields_to_load: usize,
+
+    /// Maximum aggregate bytes across fields_to_load names
+    #[arg(long, default_value = "16384")]
+    max_fields_to_load_name_bytes: usize,
+
+    /// Maximum tokens a Term/Match query may expand to after tokenization
+    #[arg(long, default_value = "256")]
+    max_text_query_tokens: usize,
+
+    /// Maximum dimensions a SparseVectorQuery text may tokenize into
+    #[arg(long, default_value = "4096")]
+    max_sparse_token_dimensions: usize,
+}
+
+/// gRPC transport envelope and request-facing search limits resolved from CLI
+/// flags, cross-validated so an inconsistent configuration fails at startup
+/// instead of rejecting every oversized response at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServiceLimits {
+    search_max_decode_bytes: usize,
+    search_max_encode_bytes: usize,
+    index_max_decode_bytes: usize,
+    index_max_encode_bytes: usize,
+    search: search_service::SearchLimits,
+}
+
+fn nonzero_mb_to_bytes(flag: &str, mb: usize) -> Result<usize> {
+    if mb == 0 {
+        return Err(anyhow::anyhow!("{flag} must be greater than zero"));
+    }
+    mb.checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("{flag} is too large"))
+}
+
+fn nonzero(flag: &str, value: usize) -> Result<usize> {
+    if value == 0 {
+        return Err(anyhow::anyhow!("{flag} must be greater than zero"));
+    }
+    Ok(value)
+}
+
+fn resolve_query_shape_limits(args: &Args) -> Result<search_service::QueryShapeLimits> {
+    let shape = search_service::QueryShapeLimits {
+        max_query_depth: nonzero("--max-query-depth", args.max_query_depth)?,
+        max_query_nodes: nonzero("--max-query-nodes", args.max_query_nodes)?,
+        max_query_clauses: nonzero("--max-query-clauses", args.max_query_clauses)?,
+        max_boolean_clauses: nonzero("--max-boolean-clauses", args.max_boolean_clauses)?,
+        max_query_text_bytes: nonzero("--max-query-text-bytes", args.max_query_text_bytes)?,
+        max_field_name_bytes: nonzero("--max-field-name-bytes", args.max_field_name_bytes)?,
+        max_index_name_bytes: nonzero("--max-index-name-bytes", args.max_index_name_bytes)?,
+        max_dense_query_dims: nonzero("--max-dense-query-dims", args.max_dense_query_dims)?,
+        max_sparse_query_dims: nonzero("--max-sparse-query-dims", args.max_sparse_query_dims)?,
+        max_binary_query_bytes: nonzero("--max-binary-query-bytes", args.max_binary_query_bytes)?,
+        max_total_query_vector_bytes: nonzero(
+            "--max-total-query-vector-bytes",
+            args.max_total_query_vector_bytes,
+        )?,
+        max_fields_to_load: nonzero("--max-fields-to-load", args.max_fields_to_load)?,
+        max_fields_to_load_name_bytes: nonzero(
+            "--max-fields-to-load-name-bytes",
+            args.max_fields_to_load_name_bytes,
+        )?,
+        max_text_query_tokens: nonzero("--max-text-query-tokens", args.max_text_query_tokens)?,
+        max_sparse_token_dimensions: nonzero(
+            "--max-sparse-token-dimensions",
+            args.max_sparse_token_dimensions,
+        )?,
+    };
+    if shape.max_boolean_clauses > shape.max_query_clauses {
+        return Err(anyhow::anyhow!(
+            "--max-boolean-clauses ({}) must not exceed --max-query-clauses ({}): a single \
+             BooleanQuery could never reach its own cap",
+            shape.max_boolean_clauses,
+            shape.max_query_clauses,
+        ));
+    }
+    Ok(shape)
+}
+
+fn resolve_service_limits(args: &Args) -> Result<ServiceLimits> {
+    let search_max_decode_bytes =
+        nonzero_mb_to_bytes("--search-max-decode-mb", args.search_max_decode_mb)?;
+    let search_max_encode_bytes =
+        nonzero_mb_to_bytes("--search-max-encode-mb", args.search_max_encode_mb)?;
+    let index_max_decode_bytes =
+        nonzero_mb_to_bytes("--index-max-decode-mb", args.index_max_decode_mb)?;
+    let index_max_encode_bytes =
+        nonzero_mb_to_bytes("--index-max-encode-mb", args.index_max_encode_mb)?;
+    let max_search_response_bytes =
+        nonzero_mb_to_bytes("--max-search-response-mb", args.max_search_response_mb)?;
+
+    if search_max_encode_bytes < max_search_response_bytes {
+        return Err(anyhow::anyhow!(
+            "--search-max-encode-mb ({}) must be at least --max-search-response-mb ({}) \
+             or every response near the hydration budget fails to encode",
+            args.search_max_encode_mb,
+            args.max_search_response_mb,
+        ));
+    }
+    if args.default_search_limit == 0 {
+        return Err(anyhow::anyhow!(
+            "--default-search-limit must be greater than zero"
+        ));
+    }
+    if args.default_search_limit > args.max_search_limit {
+        return Err(anyhow::anyhow!(
+            "--default-search-limit ({}) must not exceed --max-search-limit ({})",
+            args.default_search_limit,
+            args.max_search_limit,
+        ));
+    }
+    if args.max_search_window < args.max_search_limit {
+        return Err(anyhow::anyhow!(
+            "--max-search-window ({}) must be at least --max-search-limit ({})",
+            args.max_search_window,
+            args.max_search_limit,
+        ));
+    }
+    if args.max_candidate_limit < args.max_search_window {
+        return Err(anyhow::anyhow!(
+            "--max-candidate-limit ({}) must be at least --max-search-window ({}) \
+             so every allowed page can fill its candidate pool",
+            args.max_candidate_limit,
+            args.max_search_window,
+        ));
+    }
+
+    Ok(ServiceLimits {
+        search_max_decode_bytes,
+        search_max_encode_bytes,
+        index_max_decode_bytes,
+        index_max_encode_bytes,
+        search: search_service::SearchLimits {
+            default_search_limit: args.default_search_limit,
+            max_search_limit: args.max_search_limit,
+            max_search_window: args.max_search_window,
+            max_candidate_limit: args.max_candidate_limit,
+            shape: resolve_query_shape_limits(args)?,
+            max_search_response_bytes,
+        },
+    })
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -304,6 +542,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     }
 
     let addr: SocketAddr = args.addr.parse()?;
+
+    let service_limits = resolve_service_limits(&args)?;
 
     let num_indexing_threads = args
         .indexing_threads
@@ -440,8 +680,11 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         registry.doctor_all_indexes().await;
     }
 
-    let search_service =
-        search_service::SearchServiceImpl::new(Arc::clone(&registry), max_concurrent_searches);
+    let search_service = search_service::SearchServiceImpl::new(
+        Arc::clone(&registry),
+        max_concurrent_searches,
+        service_limits.search,
+    );
 
     let index_service = index_service::IndexServiceImpl {
         registry: Arc::clone(&registry),
@@ -510,11 +753,34 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         );
     }
 
-    // Separate message size limits for search vs index services
-    const SEARCH_MAX_DECODE: usize = 4 * 1024 * 1024; // 4 MB (queries are small)
-    const SEARCH_MAX_ENCODE: usize = 256 * 1024 * 1024; // 256 MB (192 MiB hydration budget + framing headroom)
-    const INDEX_MAX_DECODE: usize = 256 * 1024 * 1024; // 256 MB (batch indexing)
-    const INDEX_MAX_ENCODE: usize = 64 * 1024 * 1024; // 64 MB (responses are medium)
+    info!(
+        "gRPC message caps: search {}/{} MiB decode/encode, index {}/{} MiB decode/encode",
+        args.search_max_decode_mb,
+        args.search_max_encode_mb,
+        args.index_max_decode_mb,
+        args.index_max_encode_mb,
+    );
+    info!(
+        "Search limits: default {}, max {}, window {}, candidates {}, response budget {} MiB",
+        args.default_search_limit,
+        args.max_search_limit,
+        args.max_search_window,
+        args.max_candidate_limit,
+        args.max_search_response_mb,
+    );
+    info!(
+        "Query shape budgets: depth {}, nodes {}, clauses {} (boolean {}), text {} B, \
+         vectors {} B total, fields_to_load {}, token expansion {} (sparse {})",
+        args.max_query_depth,
+        args.max_query_nodes,
+        args.max_query_clauses,
+        args.max_boolean_clauses,
+        args.max_query_text_bytes,
+        args.max_total_query_vector_bytes,
+        args.max_fields_to_load,
+        args.max_text_query_tokens,
+        args.max_sparse_token_dimensions,
+    );
 
     let signal_registry = Arc::clone(&registry);
     let signal_shutdown = shutdown_tx.clone();
@@ -532,16 +798,16 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .concurrency_limit_per_connection(128)
         .add_service(
             SearchServiceServer::new(search_service)
-                .max_decoding_message_size(SEARCH_MAX_DECODE)
-                .max_encoding_message_size(SEARCH_MAX_ENCODE)
+                .max_decoding_message_size(service_limits.search_max_decode_bytes)
+                .max_encoding_message_size(service_limits.search_max_encode_bytes)
                 .accept_compressed(CompressionEncoding::Gzip)
                 .accept_compressed(CompressionEncoding::Zstd)
                 .send_compressed(CompressionEncoding::Zstd),
         )
         .add_service(
             IndexServiceServer::new(index_service)
-                .max_decoding_message_size(INDEX_MAX_DECODE)
-                .max_encoding_message_size(INDEX_MAX_ENCODE)
+                .max_decoding_message_size(service_limits.index_max_decode_bytes)
+                .max_encoding_message_size(service_limits.index_max_encode_bytes)
                 .accept_compressed(CompressionEncoding::Gzip)
                 .accept_compressed(CompressionEncoding::Zstd)
                 .send_compressed(CompressionEncoding::Zstd),
@@ -632,5 +898,112 @@ mod tests {
     fn zero_merge_bp_budget_is_unbudgeted() {
         assert_eq!(merge_bp_time_budget(0), None);
         assert_eq!(merge_bp_time_budget(600), Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn service_limit_defaults_match_historical_constants() {
+        let args = Args::try_parse_from(["hermes-server"]).unwrap();
+        let limits = resolve_service_limits(&args).unwrap();
+        assert_eq!(limits.search_max_decode_bytes, 4 * 1024 * 1024);
+        assert_eq!(limits.search_max_encode_bytes, 256 * 1024 * 1024);
+        assert_eq!(limits.index_max_decode_bytes, 256 * 1024 * 1024);
+        assert_eq!(limits.index_max_encode_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.search, search_service::SearchLimits::default());
+    }
+
+    #[test]
+    fn service_limit_flags_override_defaults() {
+        let args = Args::try_parse_from([
+            "hermes-server",
+            "--search-max-encode-mb",
+            "512",
+            "--max-search-response-mb",
+            "384",
+            "--max-search-limit",
+            "20000",
+            "--max-search-window",
+            "80000",
+            "--max-candidate-limit",
+            "80000",
+        ])
+        .unwrap();
+        let limits = resolve_service_limits(&args).unwrap();
+        assert_eq!(limits.search_max_encode_bytes, 512 * 1024 * 1024);
+        assert_eq!(limits.search.max_search_response_bytes, 384 * 1024 * 1024);
+        assert_eq!(limits.search.max_search_limit, 20_000);
+        assert_eq!(limits.search.max_search_window, 80_000);
+        assert_eq!(limits.search.max_candidate_limit, 80_000);
+    }
+
+    #[test]
+    fn query_shape_flags_override_defaults_and_reject_inconsistency() {
+        let args = Args::try_parse_from([
+            "hermes-server",
+            "--max-query-depth",
+            "8",
+            "--max-text-query-tokens",
+            "64",
+            "--max-sparse-token-dimensions",
+            "1024",
+        ])
+        .unwrap();
+        let shape = resolve_service_limits(&args).unwrap().search.shape;
+        assert_eq!(shape.max_query_depth, 8);
+        assert_eq!(shape.max_text_query_tokens, 64);
+        assert_eq!(shape.max_sparse_token_dimensions, 1024);
+
+        // Zero budgets are refused.
+        let zero = Args::try_parse_from(["hermes-server", "--max-query-nodes", "0"]).unwrap();
+        assert!(resolve_service_limits(&zero).is_err());
+
+        // A per-boolean cap above the aggregate clause budget is unreachable.
+        let unreachable = Args::try_parse_from([
+            "hermes-server",
+            "--max-boolean-clauses",
+            "1024",
+            "--max-query-clauses",
+            "512",
+        ])
+        .unwrap();
+        assert!(resolve_service_limits(&unreachable).is_err());
+    }
+
+    #[test]
+    fn inconsistent_service_limits_fail_at_startup() {
+        // Zero message caps are refused.
+        let zero = Args::try_parse_from(["hermes-server", "--search-max-decode-mb", "0"]).unwrap();
+        assert!(resolve_service_limits(&zero).is_err());
+
+        // Hydration budget above the transport encode cap is refused.
+        let over_encode = Args::try_parse_from([
+            "hermes-server",
+            "--search-max-encode-mb",
+            "128",
+            "--max-search-response-mb",
+            "192",
+        ])
+        .unwrap();
+        assert!(resolve_service_limits(&over_encode).is_err());
+
+        // Default limit above the maximum is refused.
+        let bad_default = Args::try_parse_from([
+            "hermes-server",
+            "--default-search-limit",
+            "100",
+            "--max-search-limit",
+            "50",
+        ])
+        .unwrap();
+        assert!(resolve_service_limits(&bad_default).is_err());
+
+        // Window below the maximum limit is refused.
+        let bad_window =
+            Args::try_parse_from(["hermes-server", "--max-search-window", "5000"]).unwrap();
+        assert!(resolve_service_limits(&bad_window).is_err());
+
+        // Candidate cap below the window is refused.
+        let bad_candidates =
+            Args::try_parse_from(["hermes-server", "--max-candidate-limit", "10000"]).unwrap();
+        assert!(resolve_service_limits(&bad_candidates).is_err());
     }
 }

@@ -19,9 +19,7 @@ static TOKENIZER_REGISTRY: LazyLock<TokenizerRegistry> = LazyLock::new(Tokenizer
 use crate::proto;
 use crate::proto::field_value::Value;
 use crate::proto::query::Query as ProtoQueryType;
-
-const MAX_TEXT_QUERY_TOKENS: usize = 256;
-const MAX_SPARSE_TOKEN_DIMENSIONS: usize = 4_096;
+use crate::search_service::QueryShapeLimits;
 
 fn validate_token_expansion(kind: &str, count: usize, maximum: usize) -> Result<(), String> {
     if count > maximum {
@@ -61,6 +59,7 @@ pub fn convert_query(
     schema: &Schema,
     global_stats: Option<&LazyGlobalStats>,
     idf_cache_dir: Option<&std::path::Path>,
+    shape: &QueryShapeLimits,
 ) -> Result<Box<dyn Query>, String> {
     match &query.query {
         Some(ProtoQueryType::Term(term_query)) => {
@@ -89,7 +88,7 @@ pub fn convert_query(
                 .into_iter()
                 .map(|t| t.text)
                 .collect();
-            validate_token_expansion("TermQuery", tokens.len(), MAX_TEXT_QUERY_TOKENS)?;
+            validate_token_expansion("TermQuery", tokens.len(), shape.max_text_query_tokens)?;
             if tokens.is_empty() {
                 return Err(format!("No tokens in term '{}'", term_query.term));
             }
@@ -131,7 +130,7 @@ pub fn convert_query(
                 .into_iter()
                 .map(|t| t.text)
                 .collect();
-            validate_token_expansion("MatchQuery", tokens.len(), MAX_TEXT_QUERY_TOKENS)?;
+            validate_token_expansion("MatchQuery", tokens.len(), shape.max_text_query_tokens)?;
 
             if tokens.is_empty() {
                 return Err(format!(
@@ -153,7 +152,7 @@ pub fn convert_query(
             Ok(Box::new(query))
         }
         Some(ProtoQueryType::Boolean(bool_query)) => {
-            convert_boolean_query(bool_query, schema, global_stats, idf_cache_dir)
+            convert_boolean_query(bool_query, schema, global_stats, idf_cache_dir, shape)
         }
         Some(ProtoQueryType::Boost(boost_query)) => {
             if !boost_query.boost.is_finite() {
@@ -163,7 +162,7 @@ pub fn convert_query(
                 .query
                 .as_ref()
                 .ok_or_else(|| "Boost query requires inner query".to_string())?;
-            let inner_query = convert_query(inner, schema, global_stats, idf_cache_dir)?;
+            let inner_query = convert_query(inner, schema, global_stats, idf_cache_dir, shape)?;
             Ok(Box::new(BoostQuery {
                 inner: inner_query.into(),
                 boost: boost_query.boost,
@@ -249,7 +248,7 @@ pub fn convert_query(
                 validate_token_expansion(
                     "SparseVectorQuery.text",
                     token_counts.len(),
-                    MAX_SPARSE_TOKEN_DIMENSIONS,
+                    shape.max_sparse_token_dimensions,
                 )?;
 
                 // Convert (token_id, count) to (token_id, weight)
@@ -551,18 +550,19 @@ fn convert_boolean_query(
     schema: &Schema,
     global_stats: Option<&LazyGlobalStats>,
     idf_cache_dir: Option<&std::path::Path>,
+    shape: &QueryShapeLimits,
 ) -> Result<Box<dyn Query>, String> {
     let mut bq = BooleanQuery::new();
     for q in &bool_query.must {
-        let inner = convert_query(q, schema, global_stats, idf_cache_dir)?;
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
         bq.must.push(inner.into());
     }
     for q in &bool_query.should {
-        let inner = convert_query(q, schema, global_stats, idf_cache_dir)?;
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
         bq.should.push(inner.into());
     }
     for q in &bool_query.must_not {
-        let inner = convert_query(q, schema, global_stats, idf_cache_dir)?;
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
         bq.must_not.push(inner.into());
     }
     Ok(Box::new(bq))
@@ -1197,6 +1197,10 @@ pub fn convert_proto_to_document(
 mod tests {
     use super::*;
 
+    fn shape() -> QueryShapeLimits {
+        QueryShapeLimits::default()
+    }
+
     #[test]
     fn token_expansion_is_bounded_before_query_construction() {
         assert!(validate_token_expansion("test", 256, 256).is_ok());
@@ -1253,18 +1257,26 @@ mod tests {
     #[test]
     fn bmp_query_dimension_pruning_is_explicit_not_a_server_fallback() {
         let schema = bmp_sparse_test_schema();
-        let default_query = convert_query(&sparse_proto_query(0.0), &schema, None, None).unwrap();
+        let default_query =
+            convert_query(&sparse_proto_query(0.0), &schema, None, None, &shape()).unwrap();
         assert!(!default_query.to_string().contains("orig="));
 
-        let pruned_query = convert_query(&sparse_proto_query(0.33), &schema, None, None).unwrap();
+        let pruned_query =
+            convert_query(&sparse_proto_query(0.33), &schema, None, None, &shape()).unwrap();
         assert!(pruned_query.to_string().contains("orig=6"));
     }
 
     #[test]
     fn dense_query_uses_schema_nprobe_when_request_omits_it() {
         let schema = dense_test_schema(17);
-        let query =
-            convert_query(&dense_proto_query(vec![1.0, 2.0, 3.0]), &schema, None, None).unwrap();
+        let query = convert_query(
+            &dense_proto_query(vec![1.0, 2.0, 3.0]),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
 
         assert!(query.to_string().contains("nprobe=17"));
     }
@@ -1272,8 +1284,14 @@ mod tests {
     #[test]
     fn server_conversion_uses_the_shared_candidate_budget() {
         let schema = dense_test_schema(17);
-        let query =
-            convert_query(&dense_proto_query(vec![1.0, 2.0, 3.0]), &schema, None, None).unwrap();
+        let query = convert_query(
+            &dense_proto_query(vec![1.0, 2.0, 3.0]),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
 
         assert!(query.to_string().contains("rerank=1"));
     }
@@ -1290,7 +1308,7 @@ mod tests {
             vec![1.0, f32::NEG_INFINITY, 3.0],
         ] {
             assert!(
-                convert_query(&dense_proto_query(vector), &schema, None, None).is_err(),
+                convert_query(&dense_proto_query(vector), &schema, None, None, &shape()).is_err(),
                 "invalid vector should be rejected"
             );
         }
@@ -1304,14 +1322,14 @@ mod tests {
             unreachable!()
         };
         query.field = "title".to_string();
-        assert!(convert_query(&wrong_field, &schema, None, None).is_err());
+        assert!(convert_query(&wrong_field, &schema, None, None, &shape()).is_err());
 
         let mut proto = dense_proto_query(vec![1.0, 2.0, 3.0]);
         let Some(ProtoQueryType::DenseVector(query)) = proto.query.as_mut() else {
             unreachable!()
         };
         query.nprobe = MAX_DENSE_NPROBE as u32 + 1;
-        assert!(convert_query(&proto, &schema, None, None).is_err());
+        assert!(convert_query(&proto, &schema, None, None, &shape()).is_err());
     }
 
     #[test]
@@ -1330,8 +1348,8 @@ mod tests {
             })),
         };
 
-        assert!(convert_query(&match_all_prefix, &schema, None, None).is_err());
-        assert!(convert_query(&explicit_empty_prefix, &schema, None, None).is_err());
+        assert!(convert_query(&match_all_prefix, &schema, None, None, &shape()).is_err());
+        assert!(convert_query(&explicit_empty_prefix, &schema, None, None, &shape()).is_err());
     }
 
     #[test]
@@ -1347,9 +1365,9 @@ mod tests {
             )),
         };
 
-        assert!(convert_query(&query("binary", vec![0, 1]), &schema, None, None).is_ok());
-        assert!(convert_query(&query("binary", vec![0]), &schema, None, None).is_err());
-        assert!(convert_query(&query("title", vec![0, 1]), &schema, None, None).is_err());
+        assert!(convert_query(&query("binary", vec![0, 1]), &schema, None, None, &shape()).is_ok());
+        assert!(convert_query(&query("binary", vec![0]), &schema, None, None, &shape()).is_err());
+        assert!(convert_query(&query("title", vec![0, 1]), &schema, None, None, &shape()).is_err());
 
         let bad_document = [proto::FieldEntry {
             name: "binary".to_string(),
@@ -1372,27 +1390,53 @@ mod tests {
             })),
         };
 
-        assert!(convert_query(&query("sparse", vec![1], vec![1.0]), &schema, None, None).is_ok());
         assert!(
-            convert_query(&query("sparse", vec![1, 2], vec![1.0]), &schema, None, None).is_err()
+            convert_query(
+                &query("sparse", vec![1], vec![1.0]),
+                &schema,
+                None,
+                None,
+                &shape()
+            )
+            .is_ok()
+        );
+        assert!(
+            convert_query(
+                &query("sparse", vec![1, 2], vec![1.0]),
+                &schema,
+                None,
+                None,
+                &shape()
+            )
+            .is_err()
         );
         assert!(
             convert_query(
                 &query("sparse", vec![1], vec![f32::NAN]),
                 &schema,
                 None,
-                None
+                None,
+                &shape()
             )
             .is_err()
         );
-        assert!(convert_query(&query("title", vec![1], vec![1.0]), &schema, None, None).is_err());
+        assert!(
+            convert_query(
+                &query("title", vec![1], vec![1.0]),
+                &schema,
+                None,
+                None,
+                &shape()
+            )
+            .is_err()
+        );
 
         let mut invalid_factor = query("sparse", vec![1], vec![1.0]);
         let Some(ProtoQueryType::SparseVector(query)) = invalid_factor.query.as_mut() else {
             unreachable!()
         };
         query.heap_factor = f32::INFINITY;
-        assert!(convert_query(&invalid_factor, &schema, None, None).is_err());
+        assert!(convert_query(&invalid_factor, &schema, None, None, &shape()).is_err());
     }
 
     #[test]

@@ -129,6 +129,100 @@ struct Args {
     /// Maximum number of tokio worker threads (default: min(cpus, 16))
     #[arg(long)]
     worker_threads: Option<usize>,
+
+    /// Maximum decoded (received) gRPC message size in MiB for client-facing
+    /// SearchService requests. Mirror the hermes-server flag of the same name
+    /// so the broker stays transparent to clients.
+    #[arg(long, default_value = "4")]
+    search_max_decode_mb: usize,
+
+    /// Maximum encoded (sent) gRPC message size in MiB for client-facing
+    /// SearchService responses; must cover the backends'
+    /// --max-search-response-mb hydration budget.
+    #[arg(long, default_value = "256")]
+    search_max_encode_mb: usize,
+
+    /// Maximum decoded (received) gRPC message size in MiB for client-facing
+    /// IndexService requests (bounds one indexing batch).
+    #[arg(long, default_value = "256")]
+    index_max_decode_mb: usize,
+
+    /// Maximum encoded (sent) gRPC message size in MiB for client-facing
+    /// IndexService responses.
+    #[arg(long, default_value = "64")]
+    index_max_encode_mb: usize,
+
+    /// Maximum decoded message size in MiB on broker→backend channels; must
+    /// cover the backends' --search-max-encode-mb / --index-max-encode-mb.
+    #[arg(long, default_value = "256")]
+    backend_max_decode_mb: usize,
+
+    /// Maximum encoded message size in MiB on broker→backend channels; must
+    /// cover forwarded index batches (>= --index-max-decode-mb).
+    #[arg(long, default_value = "256")]
+    backend_max_encode_mb: usize,
+}
+
+/// gRPC message caps resolved from CLI flags. Inconsistent combinations that
+/// would strand traffic inside the broker are refused or warned about at
+/// startup, never discovered per-request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MessageCaps {
+    search_max_decode: usize,
+    search_max_encode: usize,
+    index_max_decode: usize,
+    index_max_encode: usize,
+    backend_max_decode: usize,
+    backend_max_encode: usize,
+}
+
+fn nonzero_mb_to_bytes(flag: &str, mb: usize) -> Result<usize> {
+    if mb == 0 {
+        return Err(anyhow::anyhow!("{flag} must be greater than zero"));
+    }
+    mb.checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("{flag} is too large"))
+}
+
+fn resolve_message_caps(args: &Args) -> Result<MessageCaps> {
+    let caps = MessageCaps {
+        search_max_decode: nonzero_mb_to_bytes(
+            "--search-max-decode-mb",
+            args.search_max_decode_mb,
+        )?,
+        search_max_encode: nonzero_mb_to_bytes(
+            "--search-max-encode-mb",
+            args.search_max_encode_mb,
+        )?,
+        index_max_decode: nonzero_mb_to_bytes("--index-max-decode-mb", args.index_max_decode_mb)?,
+        index_max_encode: nonzero_mb_to_bytes("--index-max-encode-mb", args.index_max_encode_mb)?,
+        backend_max_decode: nonzero_mb_to_bytes(
+            "--backend-max-decode-mb",
+            args.backend_max_decode_mb,
+        )?,
+        backend_max_encode: nonzero_mb_to_bytes(
+            "--backend-max-encode-mb",
+            args.backend_max_encode_mb,
+        )?,
+    };
+    // Warnings, not errors: a fleet may intentionally run asymmetric caps
+    // (e.g. while rolling out a raise), but a silent mismatch strands
+    // responses inside the broker with a confusing per-request error.
+    if caps.search_max_encode < caps.backend_max_decode {
+        warn!(
+            "--search-max-encode-mb ({}) is below --backend-max-decode-mb ({}): backend \
+             search responses in between will fail to re-encode at the broker edge",
+            args.search_max_encode_mb, args.backend_max_decode_mb,
+        );
+    }
+    if caps.backend_max_encode < caps.index_max_decode {
+        warn!(
+            "--backend-max-encode-mb ({}) is below --index-max-decode-mb ({}): index \
+             batches in between are accepted from clients but cannot be forwarded",
+            args.backend_max_encode_mb, args.index_max_decode_mb,
+        );
+    }
+    Ok(caps)
 }
 
 fn main() -> Result<()> {
@@ -180,6 +274,7 @@ async fn async_main(args: Args) -> Result<()> {
     }
 
     let addr: SocketAddr = args.addr.parse()?;
+    let message_caps = resolve_message_caps(&args)?;
     if args.backend_max_searches == 0 {
         return Err(anyhow::anyhow!(
             "--backend-max-searches must be greater than zero"
@@ -273,7 +368,11 @@ async fn async_main(args: Args) -> Result<()> {
         }
     };
 
-    let pool = Arc::new(ClientPool::new(args.backend_max_searches));
+    let pool = Arc::new(ClientPool::new(
+        args.backend_max_searches,
+        message_caps.backend_max_decode,
+        message_caps.backend_max_encode,
+    ));
     let snapshot = Arc::new(ArcSwap::from_pointee(TopologySnapshot::default()));
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -339,12 +438,18 @@ async fn async_main(args: Args) -> Result<()> {
         None => info!("Broker-global search admission: per-backend caps only"),
     }
 
-    // Same limits and transport tuning as hermes-server so the broker is
-    // transparent to clients written against the server's envelope.
-    const SEARCH_MAX_DECODE: usize = 4 * 1024 * 1024; // 4 MB (queries are small)
-    const SEARCH_MAX_ENCODE: usize = 256 * 1024 * 1024; // 256 MB (must cover the backends' 192 MiB hydration budget)
-    const INDEX_MAX_DECODE: usize = 256 * 1024 * 1024; // 256 MB (batch indexing)
-    const INDEX_MAX_ENCODE: usize = 64 * 1024 * 1024; // 64 MB (responses are medium)
+    // Defaults mirror hermes-server so the broker is transparent to clients
+    // written against the server's envelope.
+    info!(
+        "gRPC message caps: search {}/{} MiB decode/encode, index {}/{} MiB decode/encode, \
+         backend channels {}/{} MiB decode/encode",
+        args.search_max_decode_mb,
+        args.search_max_encode_mb,
+        args.index_max_decode_mb,
+        args.index_max_encode_mb,
+        args.backend_max_decode_mb,
+        args.backend_max_encode_mb,
+    );
 
     let signal_flag = Arc::clone(&shutting_down);
     let signal_shutdown = shutdown_tx.clone();
@@ -363,16 +468,16 @@ async fn async_main(args: Args) -> Result<()> {
         .add_service(reflection_service)
         .add_service(
             SearchServiceServer::new(search_service)
-                .max_decoding_message_size(SEARCH_MAX_DECODE)
-                .max_encoding_message_size(SEARCH_MAX_ENCODE)
+                .max_decoding_message_size(message_caps.search_max_decode)
+                .max_encoding_message_size(message_caps.search_max_encode)
                 .accept_compressed(CompressionEncoding::Gzip)
                 .accept_compressed(CompressionEncoding::Zstd)
                 .send_compressed(CompressionEncoding::Zstd),
         )
         .add_service(
             IndexServiceServer::new(index_service)
-                .max_decoding_message_size(INDEX_MAX_DECODE)
-                .max_encoding_message_size(INDEX_MAX_ENCODE)
+                .max_decoding_message_size(message_caps.index_max_decode)
+                .max_encoding_message_size(message_caps.index_max_encode)
                 .accept_compressed(CompressionEncoding::Gzip)
                 .accept_compressed(CompressionEncoding::Zstd)
                 .send_compressed(CompressionEncoding::Zstd),
@@ -457,6 +562,38 @@ mod tests {
         assert_eq!(args.backend_max_searches, 16);
         assert_eq!(args.max_concurrent_searches, None);
         assert_eq!(args.placement_default, PlacementDefault::Single);
+
+        // Message caps default to the historical hard-coded envelope.
+        let caps = resolve_message_caps(&args).unwrap();
+        assert_eq!(
+            caps,
+            MessageCaps {
+                search_max_decode: 4 * 1024 * 1024,
+                search_max_encode: 256 * 1024 * 1024,
+                index_max_decode: 256 * 1024 * 1024,
+                index_max_encode: 64 * 1024 * 1024,
+                backend_max_decode: 256 * 1024 * 1024,
+                backend_max_encode: 256 * 1024 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn message_cap_flags_override_and_reject_zero() {
+        let args = Args::try_parse_from([
+            "hermes-broker",
+            "--search-max-encode-mb",
+            "512",
+            "--backend-max-decode-mb",
+            "512",
+        ])
+        .unwrap();
+        let caps = resolve_message_caps(&args).unwrap();
+        assert_eq!(caps.search_max_encode, 512 * 1024 * 1024);
+        assert_eq!(caps.backend_max_decode, 512 * 1024 * 1024);
+
+        let zero = Args::try_parse_from(["hermes-broker", "--index-max-decode-mb", "0"]).unwrap();
+        assert!(resolve_message_caps(&zero).is_err());
     }
 
     #[test]
