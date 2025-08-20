@@ -342,7 +342,7 @@ async fn async_main(args: Args) -> Result<()> {
     // Same limits and transport tuning as hermes-server so the broker is
     // transparent to clients written against the server's envelope.
     const SEARCH_MAX_DECODE: usize = 4 * 1024 * 1024; // 4 MB (queries are small)
-    const SEARCH_MAX_ENCODE: usize = 64 * 1024 * 1024; // 64 MB (large result sets)
+    const SEARCH_MAX_ENCODE: usize = 256 * 1024 * 1024; // 256 MB (must cover the backends' 192 MiB hydration budget)
     const INDEX_MAX_DECODE: usize = 256 * 1024 * 1024; // 256 MB (batch indexing)
     const INDEX_MAX_ENCODE: usize = 64 * 1024 * 1024; // 64 MB (responses are medium)
 

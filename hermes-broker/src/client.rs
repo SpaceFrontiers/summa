@@ -21,7 +21,7 @@ use crate::proto::hermes::search_service_client::SearchServiceClient;
 
 /// Backends encode search/index responses up to 64 MiB (hermes-server
 /// SEARCH_MAX_ENCODE / INDEX_MAX_ENCODE).
-const BACKEND_MAX_DECODE: usize = 64 * 1024 * 1024;
+const BACKEND_MAX_DECODE: usize = 256 * 1024 * 1024;
 /// Backends accept index requests up to 256 MiB (INDEX_MAX_DECODE); the
 /// broker forwards whatever it accepted at its own edge.
 const BACKEND_MAX_ENCODE: usize = 256 * 1024 * 1024;

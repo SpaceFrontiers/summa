@@ -512,7 +512,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
 
     // Separate message size limits for search vs index services
     const SEARCH_MAX_DECODE: usize = 4 * 1024 * 1024; // 4 MB (queries are small)
-    const SEARCH_MAX_ENCODE: usize = 64 * 1024 * 1024; // 64 MB (large result sets)
+    const SEARCH_MAX_ENCODE: usize = 256 * 1024 * 1024; // 256 MB (192 MiB hydration budget + framing headroom)
     const INDEX_MAX_DECODE: usize = 256 * 1024 * 1024; // 256 MB (batch indexing)
     const INDEX_MAX_ENCODE: usize = 64 * 1024 * 1024; // 64 MB (responses are medium)
 

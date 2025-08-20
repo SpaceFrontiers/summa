@@ -38,9 +38,15 @@ const MAX_TOTAL_QUERY_VECTOR_BYTES: usize = 1024 * 1024;
 const MAX_FIELDS_TO_LOAD: usize = 64;
 const MAX_FIELDS_TO_LOAD_NAME_BYTES: usize = 16 * 1024;
 
-// Leave headroom below tonic's 64 MiB response limit for compression and
+// Leave headroom below tonic's 256 MiB response limit for compression and
 // framing, and also cap estimated retained heap while the response is built.
-const MAX_SEARCH_RESPONSE_BYTES: usize = 48 * 1024 * 1024;
+// 2026-08-22: raised 48 → 192 MiB — chunk-level binary reranking over a
+// book-heavy RAG pool legitimately hydrates >48 MiB (a few dozen books ×
+// thousands of 320-byte chunk vectors). Downstream caps that must stay
+// above this: hermes-server SEARCH_MAX_ENCODE (256 MiB), hermes-broker
+// BACKEND_MAX_DECODE / SEARCH_MAX_ENCODE (256 MiB), and the consumers'
+// hermes-client decode cap (200 MiB).
+const MAX_SEARCH_RESPONSE_BYTES: usize = 192 * 1024 * 1024;
 const UNKNOWN_INDEX_LABEL: &str = "unknown";
 
 #[derive(Default)]
