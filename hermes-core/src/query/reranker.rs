@@ -18,9 +18,13 @@ use super::{MultiValueCombiner, ScoredPosition, SearchResult, compare_search_res
 
 /// Maximum stored vectors expanded from the document candidate set by one L2
 /// rerank request. Candidate documents are bounded separately by the server;
-/// this closes the multi-value/ordinal multiplier.
-const MAX_L2_RERANK_VECTORS: usize = 500_000;
-const MAX_L2_RERANK_VECTOR_BYTES: usize = 512 * 1024 * 1024;
+/// this closes the multi-value/ordinal multiplier. 2026-08-22: raised
+/// 500k → 2M (and bytes 512 MiB → 1 GiB): a few hundred book-length
+/// documents in one RAG rerank pool legitimately expand past 500k chunk
+/// vectors. Expansion is streamed in MAX_RERANK_RAW_BATCH_BYTES batches, so
+/// this bounds total scoring work, not resident memory.
+const MAX_L2_RERANK_VECTORS: usize = 2_000_000;
+const MAX_L2_RERANK_VECTOR_BYTES: usize = 1024 * 1024 * 1024;
 const RERANK_SCORE_BATCH: usize = 4_096;
 const MAX_RERANK_RAW_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CONCURRENT_RERANK_SEGMENTS: usize = 8;
