@@ -258,19 +258,28 @@ impl LspSegmentPlan {
     }
 }
 
-/// Robust zero-shot γ schedule reported for LSP/0.
+/// γ schedule for LSP/0 superblock selection.
 ///
-/// The paper evaluates 250 for k=10, 500 for k=100, and 1000 for k=1000.
-/// Beyond the evaluated range we avoid inventing a sublinear cap: γ grows
-/// with the requested depth and is never smaller than 2000.
+/// The paper's zero-shot values (250 for k=10, 500 for k=100, 1000 for
+/// k=1000) are too aggressive for a large, topically dense corpus: superblock
+/// upper bounds are sums of per-block dimension maxima, so a query whose
+/// terms are common in the corpus inflates hundreds of blocks above the true
+/// best document's *actual* score, pushing its block out of the top-γ
+/// projection entirely. Measured on the 69M-doc production index
+/// (2026-08-23): an exact-title query's true top-1 document (actual score
+/// 24.3 vs 21.5 for the approximate head) was dropped at γ=500 and only
+/// recovered at γ≥1000; a broad topical query needed γ≥2000. Selection cost
+/// is nearly flat in γ up to ~5000 (< 50ms end-to-end delta), so the
+/// schedule buys reliability with margin. It also removes the paper
+/// schedule's rank instability across result windows (the γ step at depth
+/// 101 made shallow and deep requests disagree on the head).
 pub(crate) const fn recommended_lsp_gamma(retrieval_depth: usize) -> usize {
     match retrieval_depth {
-        0..=10 => 250,
-        11..=100 => 500,
-        101..=1000 => 1000,
+        0..=100 => 3000,
+        101..=1000 => 4000,
         _ => {
-            if retrieval_depth < 2000 {
-                2000
+            if retrieval_depth < 4000 {
+                4000
             } else {
                 retrieval_depth
             }
@@ -1753,14 +1762,17 @@ mod tests {
     }
 
     #[test]
-    fn lsp_zero_shot_gamma_schedule_is_depth_aware() {
-        assert_eq!(recommended_lsp_gamma(0), 250);
-        assert_eq!(recommended_lsp_gamma(10), 250);
-        assert_eq!(recommended_lsp_gamma(11), 500);
-        assert_eq!(recommended_lsp_gamma(100), 500);
-        assert_eq!(recommended_lsp_gamma(101), 1000);
-        assert_eq!(recommended_lsp_gamma(1000), 1000);
-        assert_eq!(recommended_lsp_gamma(1001), 2000);
+    fn lsp_gamma_schedule_is_depth_aware_with_reliability_floors() {
+        // Floors chosen from the 2026-08-23 production incident: γ=500
+        // dropped an exact-title query's true top-1 document; γ=2000 was the
+        // measured fix for broad topical queries; floors carry 1.5-2x margin
+        // and selection cost is ~flat in γ up to ~5000.
+        assert_eq!(recommended_lsp_gamma(0), 3000);
+        assert_eq!(recommended_lsp_gamma(10), 3000);
+        assert_eq!(recommended_lsp_gamma(100), 3000);
+        assert_eq!(recommended_lsp_gamma(101), 4000);
+        assert_eq!(recommended_lsp_gamma(1000), 4000);
+        assert_eq!(recommended_lsp_gamma(1001), 4000);
         assert_eq!(recommended_lsp_gamma(4800), 4800);
     }
 
