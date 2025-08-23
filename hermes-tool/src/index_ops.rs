@@ -345,7 +345,9 @@ pub async fn search_batch(
     let mut done = 0usize;
     for chunk in queries.chunks(concurrency) {
         let mut handles = Vec::with_capacity(chunk.len());
-        for (line_no, query_str) in chunk.iter().cloned() {
+        for (line_no, query_str) in chunk {
+            let line_no = *line_no;
+            let query_str = query_str.clone();
             let index = Arc::clone(&index);
             let schema = Arc::clone(&schema);
             handles.push(tokio::spawn(async move {
