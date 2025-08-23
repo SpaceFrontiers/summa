@@ -292,6 +292,54 @@ pub async fn search_index(
     Ok(())
 }
 
+/// Run many queries against an index opened once, emitting one JSON line per
+/// query: `{"line": <1-based input line>, "total_hits": N, "hits": [{"score",
+/// "doc"}]}`. Output is flushed per query so a driving process can stream.
+pub async fn search_batch(index_path: PathBuf, queries_path: PathBuf, limit: usize) -> Result<()> {
+    use std::io::Write;
+
+    let dir = FsDirectory::new(&index_path);
+    let config = IndexConfig::default();
+    let index = hermes_core::Index::open(dir, config).await?;
+    let schema = index.schema().clone();
+
+    let file = File::open(&queries_path)
+        .with_context(|| format!("Failed to open queries file: {:?}", queries_path))?;
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut queries = 0usize;
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        let query_str = line.trim();
+        if query_str.is_empty() {
+            continue;
+        }
+        let response = index
+            .query_offset(query_str, limit, 0)
+            .await
+            .with_context(|| format!("Search failed for query on line {}", line_no + 1))?;
+        let mut hits = Vec::with_capacity(response.hits.len());
+        for hit in &response.hits {
+            let doc = match index.get_document(&hit.address).await? {
+                Some(doc) => doc.to_json(&schema),
+                None => serde_json::Value::Null,
+            };
+            hits.push(serde_json::json!({"score": hit.score, "doc": doc}));
+        }
+        let row = serde_json::json!({
+            "line": line_no + 1,
+            "total_hits": response.total_hits,
+            "hits": hits,
+        });
+        serde_json::to_writer(&mut out, &row)?;
+        out.write_all(b"\n")?;
+        out.flush()?;
+        queries += 1;
+    }
+    info!("Ran {} queries from {:?}", queries, queries_path);
+    Ok(())
+}
+
 pub async fn show_info(index_path: PathBuf) -> Result<()> {
     let dir = FsDirectory::new(&index_path);
     let config = IndexConfig::default();

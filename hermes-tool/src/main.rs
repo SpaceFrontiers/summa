@@ -280,14 +280,24 @@ enum Commands {
         index: PathBuf,
 
         /// Query string (e.g. "rust", "title:rust", "rust AND search")
-        #[arg(short, long)]
-        query: String,
+        #[arg(
+            short,
+            long,
+            required_unless_present = "queries_file",
+            conflicts_with = "queries_file"
+        )]
+        query: Option<String>,
+
+        /// File with one query per line; the index is opened once and one
+        /// JSON result line is emitted per query
+        #[arg(long)]
+        queries_file: Option<PathBuf>,
 
         /// Number of results to return
         #[arg(short, long, default_value = "10")]
         limit: usize,
 
-        /// Offset for pagination
+        /// Offset for pagination (single --query only)
         #[arg(short, long, default_value = "0")]
         offset: usize,
     },
@@ -509,10 +519,17 @@ async fn main() -> Result<()> {
         Commands::Search {
             index,
             query,
+            queries_file,
             limit,
             offset,
         } => {
-            index_ops::search_index(index, &query, limit, offset).await?;
+            if let Some(queries_file) = queries_file {
+                anyhow::ensure!(offset == 0, "--offset is not supported with --queries-file");
+                index_ops::search_batch(index, queries_file, limit).await?;
+            } else {
+                let query = query.expect("clap enforces --query when --queries-file is absent");
+                index_ops::search_index(index, &query, limit, offset).await?;
+            }
         }
         Commands::Warmup { index, cache_size } => {
             index_ops::warmup_cache(index, cache_size).await?;
