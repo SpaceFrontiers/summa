@@ -293,6 +293,14 @@ enum Commands {
         #[arg(long)]
         queries_file: Option<PathBuf>,
 
+        /// Concurrent queries for --queries-file (default: CPU count)
+        #[arg(short = 'j', long)]
+        concurrency: Option<usize>,
+
+        /// Search pool threads (default: CPU count / 4)
+        #[arg(short = 't', long)]
+        search_threads: Option<usize>,
+
         /// Number of results to return
         #[arg(short, long, default_value = "10")]
         limit: usize,
@@ -441,6 +449,9 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("hermes_tool=info".parse()?),
         )
+        // Logs go to stderr so machine-readable stdout (e.g. search
+        // --queries-file JSONL) stays clean.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -520,15 +531,27 @@ async fn main() -> Result<()> {
             index,
             query,
             queries_file,
+            concurrency,
+            search_threads,
             limit,
             offset,
         } => {
             if let Some(queries_file) = queries_file {
                 anyhow::ensure!(offset == 0, "--offset is not supported with --queries-file");
-                index_ops::search_batch(index, queries_file, limit).await?;
+                let concurrency = concurrency.unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(8)
+                });
+                index_ops::search_batch(index, queries_file, limit, concurrency, search_threads)
+                    .await?;
             } else {
+                anyhow::ensure!(
+                    concurrency.is_none(),
+                    "--concurrency requires --queries-file"
+                );
                 let query = query.expect("clap enforces --query when --queries-file is absent");
-                index_ops::search_index(index, &query, limit, offset).await?;
+                index_ops::search_index(index, &query, limit, offset, search_threads).await?;
             }
         }
         Commands::Warmup { index, cache_size } => {
