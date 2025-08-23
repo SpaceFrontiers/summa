@@ -158,7 +158,7 @@ wheels = [
 
 [[package]]
 name = "hermes-client-python"
-version = "1.8.109"
+version = "1.8.110"
 source = { editable = "." }
 dependencies = [
     { name = "grpcio" },
