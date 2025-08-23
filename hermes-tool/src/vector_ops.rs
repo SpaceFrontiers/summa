@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tracing::info;
 
-use hermes_core::{FsDirectory, IndexConfig};
+use hermes_core::{IndexConfig, MmapDirectory};
 
 /// Train coarse centroids from a JSONL file containing vectors
 pub fn train_centroids(
@@ -114,7 +114,7 @@ pub async fn retrain_centroids(
 
     info!("Opening index at {:?}", index_path);
 
-    let dir = FsDirectory::new(index_path.clone());
+    let dir = MmapDirectory::new(index_path.clone());
     let config = IndexConfig::default();
 
     let index = hermes_core::Index::open(dir, config)
