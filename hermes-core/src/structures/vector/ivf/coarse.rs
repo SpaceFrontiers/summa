@@ -816,13 +816,7 @@ impl CoarseCentroids {
 
 #[inline]
 fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(&a, &b)| {
-            let delta = a - b;
-            delta * delta
-        })
-        .sum()
+    crate::structures::simd::squared_l2_f32(left, right)
 }
 
 #[inline]
@@ -859,8 +853,9 @@ fn soar_secondary_loss(
         .iter()
         .zip(secondary_centroid)
         .zip(primary_residual)
-        .map(|((&value, &centroid), &primary)| primary * (value - centroid))
-        .sum::<f32>();
+        .fold(0.0f32, |acc, ((&value, &centroid), &primary)| {
+            acc.algebraic_add(primary.algebraic_mul(value - centroid))
+        });
 
     // A zero primary residual already has no correlated score error. Define
     // its projection penalty as zero rather than producing 0/0.

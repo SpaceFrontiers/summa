@@ -4,16 +4,15 @@
 //! - **Unpacking**: Convert packed 8/16/32-bit values to u32 arrays
 //! - **Delta decoding**: Prefix sum for converting deltas to absolute values
 //! - **Add one**: Increment all values in an array (for TF decoding)
+//! - **Float reductions**: dot product, squared L2, squared norm
 //!
 //! Supports:
 //! - **NEON** on aarch64 (Apple Silicon, ARM servers)
 //! - **SSE/SSE4.1** on x86_64 (Intel/AMD)
-//! - **Scalar fallback** for other architectures
-
+//! - **Scalar fallback** for other architectures (algebraic float ops, see below)
 // ============================================================================
 // NEON intrinsics for aarch64 (Apple Silicon, ARM servers)
 // ============================================================================
-
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod neon {
@@ -228,7 +227,6 @@ mod neon {
             let bytes = vreinterpret_u8_u32(vdup_n_u32(raw));
             let u16s = vmovl_u8(bytes); // 8×u8 → 8×u16 (only low 4 matter)
             let d = vmovl_u16(vget_low_u16(u16s)); // 4×u16 → 4×u32
-
             // Add 1 (since we store gap-1)
             let gaps = vaddq_u32(d, ones);
 
@@ -399,7 +397,6 @@ mod neon {
 // ============================================================================
 // SSE intrinsics for x86_64 (Intel/AMD)
 // ============================================================================
-
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod sse {
@@ -694,7 +691,6 @@ mod sse {
 // ============================================================================
 // AVX2 intrinsics for x86_64 (Intel/AMD with 256-bit registers)
 // ============================================================================
-
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod avx2 {
@@ -1069,7 +1065,6 @@ mod avx2 {
 // ============================================================================
 // Scalar fallback implementations
 // ============================================================================
-
 #[allow(dead_code)]
 mod scalar {
     /// Scalar unpack for 8-bit values
@@ -1126,7 +1121,6 @@ mod scalar {
 // ============================================================================
 // Public dispatch functions that select SIMD or scalar at runtime
 // ============================================================================
-
 /// Unpack 8-bit packed values to u32 with SIMD acceleration
 #[inline]
 pub fn unpack_8bit(input: &[u8], output: &mut [u32], count: usize) {
@@ -1315,7 +1309,6 @@ pub fn bits_needed(val: u32) -> u8 {
 //   1-8    -> 8  (u8)
 //   9-16   -> 16 (u16)
 //   17-32  -> 32 (u32)
-
 /// Rounded bit width type for SIMD-friendly encoding
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -1473,7 +1466,6 @@ pub fn unpack_rounded_delta_decode(
 // ============================================================================
 // Fused operations for better cache utilization
 // ============================================================================
-
 /// Fused unpack 8-bit + delta decode in a single pass
 ///
 /// This avoids writing the intermediate unpacked values to memory,
@@ -1646,7 +1638,6 @@ pub fn unpack_delta_decode(
 // ============================================================================
 // Sparse Vector SIMD Functions
 // ============================================================================
-
 /// Dequantize UInt8 weights to f32 with SIMD acceleration
 ///
 /// Computes `output[i] = input[i] as f32 * scale + min_val`.
@@ -1777,6 +1768,52 @@ unsafe fn dequantize_uint8_sse(
     }
 }
 
+/// Dot product of two equal-length f32 slices, reassociated for vectorization.
+#[inline]
+fn dot_product_f32_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).fold(0.0f32, |acc, (&x, &y)| {
+        acc.algebraic_add(x.algebraic_mul(y))
+    })
+}
+
+/// Fused dot(a, b) and dot(b, b) over equal-length f32 slices in one pass.
+#[inline]
+fn fused_dot_norm_scalar(a: &[f32], b: &[f32]) -> (f32, f32) {
+    a.iter()
+        .zip(b)
+        .fold((0.0f32, 0.0f32), |(dot, norm), (&x, &y)| {
+            (
+                dot.algebraic_add(x.algebraic_mul(y)),
+                norm.algebraic_add(y.algebraic_mul(y)),
+            )
+        })
+}
+
+/// Squared L2 distance `||a - b||^2` between two equal-length f32 slices.
+///
+/// The element-wise subtraction stays strict IEEE; only the summation is
+/// reassociated. Iterates over `min(a.len(), b.len())` elements.
+#[inline]
+pub fn squared_l2_f32(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).fold(0.0f32, |acc, (&x, &y)| {
+        let delta = x - y;
+        acc.algebraic_add(delta.algebraic_mul(delta))
+    })
+}
+
+/// Squared L2 norm `||v||^2` of an f32 slice.
+#[inline]
+pub fn norm_squared_f32(v: &[f32]) -> f32 {
+    v.iter()
+        .fold(0.0f32, |acc, &x| acc.algebraic_add(x.algebraic_mul(x)))
+}
+
+/// L2 norm `||v||` of an f32 slice.
+#[inline]
+pub fn norm_f32(v: &[f32]) -> f32 {
+    norm_squared_f32(v).sqrt()
+}
+
 /// Compute dot product of two f32 arrays with SIMD acceleration
 #[inline]
 pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
@@ -1807,11 +1844,7 @@ pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
     }
 
     // Scalar fallback
-    let mut sum = 0.0f32;
-    for i in 0..count {
-        sum += a[i] * b[i];
-    }
-    sum
+    dot_product_f32_scalar(&a[..count], &b[..count])
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2057,7 +2090,6 @@ unsafe fn fused_dot_norm_avx512(a: &[f32], b: &[f32], count: usize) -> (f32, f32
 // ============================================================================
 // Batched Cosine Similarity for Dense Vector Search
 // ============================================================================
-
 /// Fused dot-product + self-norm in a single pass (SIMD accelerated).
 ///
 /// Returns (dot(a, b), dot(b, b)) — i.e. the dot product of a·b and ||b||².
@@ -2085,13 +2117,7 @@ fn fused_dot_norm(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
     }
 
     // Scalar fallback
-    let mut dot = 0.0f32;
-    let mut norm_b = 0.0f32;
-    for i in 0..count {
-        dot += a[i] * b[i];
-        norm_b += b[i] * b[i];
-    }
-    (dot, norm_b)
+    fused_dot_norm_scalar(&a[..count], &b[..count])
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2316,7 +2342,6 @@ pub fn batch_cosine_scores(query: &[f32], vectors: &[f32], dim: usize, scores: &
 // ============================================================================
 // f16 (IEEE 754 half-precision) conversion
 // ============================================================================
-
 /// Convert f32 to f16 (IEEE 754 half-precision), stored as u16
 #[inline]
 pub fn f32_to_f16(value: f32) -> u16 {
@@ -2417,7 +2442,6 @@ pub fn u8_to_f32(byte: u8) -> f32 {
 // ============================================================================
 // Batch conversion (used during builder write)
 // ============================================================================
-
 /// Batch convert f32 slice to f16 (stored as u16)
 pub fn batch_f32_to_f16(src: &[f32], dst: &mut [u16]) {
     debug_assert_eq!(src.len(), dst.len());
@@ -2437,7 +2461,6 @@ pub fn batch_f32_to_u8(src: &[f32], dst: &mut [u8]) {
 // ============================================================================
 // NEON-accelerated fused dot+norm for quantized vectors
 // ============================================================================
-
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod neon_quant {
@@ -2664,54 +2687,46 @@ mod neon_quant {
 // ============================================================================
 // Scalar fallback for fused dot+norm on quantized vectors
 // ============================================================================
-
 #[allow(dead_code)]
 fn fused_dot_norm_f16_scalar(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
-    let mut dot = 0.0f32;
-    let mut norm = 0.0f32;
-    for i in 0..dim {
+    (0..dim).fold((0.0f32, 0.0f32), |(dot, norm), i| {
         let v = f16_to_f32(vec_f16[i]);
         let q = f16_to_f32(query_f16[i]);
-        dot += q * v;
-        norm += v * v;
-    }
-    (dot, norm)
+        (
+            dot.algebraic_add(q.algebraic_mul(v)),
+            norm.algebraic_add(v.algebraic_mul(v)),
+        )
+    })
 }
 
 #[allow(dead_code)]
 fn fused_dot_norm_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
-    let mut dot = 0.0f32;
-    let mut norm = 0.0f32;
-    for i in 0..dim {
+    (0..dim).fold((0.0f32, 0.0f32), |(dot, norm), i| {
         let v = u8_to_f32(vec_u8[i]);
-        dot += query[i] * v;
-        norm += v * v;
-    }
-    (dot, norm)
+        (
+            dot.algebraic_add(query[i].algebraic_mul(v)),
+            norm.algebraic_add(v.algebraic_mul(v)),
+        )
+    })
 }
 
 #[allow(dead_code)]
 fn dot_product_f16_scalar(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
-    let mut dot = 0.0f32;
-    for i in 0..dim {
-        dot += f16_to_f32(query_f16[i]) * f16_to_f32(vec_f16[i]);
-    }
-    dot
+    (0..dim).fold(0.0f32, |dot, i| {
+        dot.algebraic_add(f16_to_f32(query_f16[i]).algebraic_mul(f16_to_f32(vec_f16[i])))
+    })
 }
 
 #[allow(dead_code)]
 fn dot_product_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
-    let mut dot = 0.0f32;
-    for i in 0..dim {
-        dot += query[i] * u8_to_f32(vec_u8[i]);
-    }
-    dot
+    (0..dim).fold(0.0f32, |dot, i| {
+        dot.algebraic_add(query[i].algebraic_mul(u8_to_f32(vec_u8[i])))
+    })
 }
 
 // ============================================================================
 // x86_64 SSE4.1 quantized fused dot+norm
 // ============================================================================
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2", enable = "sse4.1")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -2821,7 +2836,6 @@ unsafe fn fused_dot_norm_u8_sse(query: &[f32], vec_u8: &[u8], dim: usize) -> (f3
 // ============================================================================
 // x86_64 F16C + AVX + FMA accelerated f16 scoring
 // ============================================================================
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx", enable = "f16c", enable = "fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -2964,7 +2978,6 @@ unsafe fn dot_product_u8_sse(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
 // ============================================================================
 // Platform dispatch
 // ============================================================================
-
 #[inline]
 fn fused_dot_norm_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
     #[cfg(target_arch = "aarch64")]
@@ -3005,7 +3018,6 @@ fn fused_dot_norm_u8(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
 }
 
 // ── Dot-product-only dispatch (for unit_norm vectors) ─────────────────────
-
 #[inline]
 fn dot_product_f16_quant(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
     #[cfg(target_arch = "aarch64")]
@@ -3045,7 +3057,6 @@ fn dot_product_u8_quant(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
 // ============================================================================
 // Public batch cosine scoring for quantized vectors
 // ============================================================================
-
 /// Batch cosine similarity: f32 query vs N contiguous f16 vectors.
 ///
 /// `vectors_raw` is raw bytes: N vectors × dim × 2 bytes (f16 stored as u16).
@@ -3149,7 +3160,6 @@ pub fn batch_cosine_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, sco
 // ============================================================================
 // Batch dot-product scoring for unit-norm vectors
 // ============================================================================
-
 /// Batch dot-product scoring: f32 query vs N contiguous f32 unit-norm vectors.
 ///
 /// For pre-normalized vectors (||v|| = 1), cosine = dot(q, v) / ||q||.
@@ -3269,7 +3279,6 @@ pub fn batch_dot_scores_u8(query: &[f32], vectors_raw: &[u8], dim: usize, scores
 // ============================================================================
 // Precomputed-norm batch scoring (avoids redundant query norm + f16 conversion)
 // ============================================================================
-
 /// Batch cosine: f32 query vs N f32 vectors, with precomputed `inv_norm_q`.
 #[inline]
 pub fn batch_cosine_scores_precomp(
@@ -3499,7 +3508,6 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // ============================================================================
 // Hamming distance for binary dense vectors
 // ============================================================================
-
 /// AVX-512 Hamming distance using `VPOPCNTDQ`.
 ///
 /// Processes 64 bytes per iteration with a single hardware popcount per lane
@@ -4126,7 +4134,6 @@ mod tests {
     // ========================================================================
     // Sparse Vector SIMD Tests
     // ========================================================================
-
     #[test]
     fn test_dequantize_uint8() {
         let input: Vec<u8> = vec![0, 128, 255, 64, 192];
@@ -4309,7 +4316,6 @@ mod tests {
     // ================================================================
     // f16 conversion tests
     // ================================================================
-
     #[test]
     fn test_f16_roundtrip_normal() {
         for &v in &[0.0f32, 1.0, -1.0, 0.5, -0.5, 0.333, 65504.0] {
@@ -4348,14 +4354,12 @@ mod tests {
     // ================================================================
     // u8 conversion tests
     // ================================================================
-
     #[test]
     fn test_u8_roundtrip() {
         // Boundary values
         assert_eq!(f32_to_u8_saturating(-1.0), 0);
         assert_eq!(f32_to_u8_saturating(1.0), 255);
         assert_eq!(f32_to_u8_saturating(0.0), 127); // ~127.5 truncated
-
         // Saturation
         assert_eq!(f32_to_u8_saturating(-2.0), 0);
         assert_eq!(f32_to_u8_saturating(2.0), 255);
@@ -4371,7 +4375,6 @@ mod tests {
     // ================================================================
     // Batch scoring tests for quantized vectors
     // ================================================================
-
     #[test]
     fn test_batch_cosine_scores_f16() {
         let query = vec![0.6f32, 0.8, 0.0, 0.0];
@@ -4445,7 +4448,6 @@ mod tests {
     // ================================================================
     // Hamming distance tests
     // ================================================================
-
     #[test]
     fn test_hamming_distance_identical() {
         let a = vec![0xAA; 64];
@@ -4492,7 +4494,6 @@ mod tests {
         let a = vec![0xFF; 17];
         let b = vec![0x00; 17];
         assert_eq!(hamming_distance(&a, &b), 136); // 17 * 8
-
         // 33 bytes: tests 32-byte chunk + 1 remainder for AVX2
         let a = vec![0xFF; 33];
         let b = vec![0x00; 33];
@@ -4522,7 +4523,6 @@ mod tests {
     // ================================================================
     // Batch Hamming scoring tests
     // ================================================================
-
     #[test]
     fn test_batch_hamming_scores_identical() {
         let query = vec![0xAA; 16];
@@ -4673,7 +4673,6 @@ mod tests {
 // ============================================================================
 // SIMD-accelerated linear scan for sorted u32 slices (within-block seek)
 // ============================================================================
-
 /// Find index of first element >= `target` in a sorted `u32` slice.
 ///
 /// Equivalent to `slice.partition_point(|&d| d < target)` but uses SIMD to
@@ -4919,5 +4918,117 @@ mod find_first_ge_tests {
         assert_eq!(find_first_ge_u32(&data, u32::MAX - 10), 0);
         assert_eq!(find_first_ge_u32(&data, u32::MAX - 7), 1);
         assert_eq!(find_first_ge_u32(&data, u32::MAX), 3);
+    }
+}
+
+/// Regression coverage for the algebraic (reassociation-permitting) float
+/// reductions. Pins them against a strict f64 reference and against the
+/// hand-written SIMD kernels they must stay interchangeable with.
+#[cfg(test)]
+mod algebraic_reduction_tests {
+    use super::*;
+
+    fn algebraic_test_vector(dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / (1u64 << 30) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// Dimensions that straddle every SIMD chunk width used in this module
+    /// (4/8/16 lanes) plus their tails, and realistic embedding widths.
+    const ALGEBRAIC_TEST_DIMS: [usize; 12] = [0, 1, 3, 4, 7, 8, 15, 16, 17, 64, 384, 768];
+
+    #[test]
+    fn test_algebraic_squared_l2_matches_f64_reference() {
+        for dim in ALGEBRAIC_TEST_DIMS {
+            let a = algebraic_test_vector(dim, 0x51ed_0001);
+            let b = algebraic_test_vector(dim, 0x51ed_0002);
+            let reference: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| {
+                    let delta = f64::from(x) - f64::from(y);
+                    delta * delta
+                })
+                .sum();
+            let actual = squared_l2_f32(&a, &b);
+            let tolerance = (reference * 1e-5).max(1e-6);
+            assert!(
+                (f64::from(actual) - reference).abs() <= tolerance,
+                "dim {dim}: squared_l2_f32 {actual} drifted from f64 reference {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_algebraic_squared_l2_uses_shorter_length() {
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [1.0f32, 4.0];
+        assert_eq!(squared_l2_f32(&a, &b), 4.0);
+        assert_eq!(squared_l2_f32(&b, &a), 4.0);
+    }
+
+    #[test]
+    fn test_algebraic_norm_squared_matches_f64_reference() {
+        for dim in ALGEBRAIC_TEST_DIMS {
+            let v = algebraic_test_vector(dim, 0x51ed_0003);
+            let reference: f64 = v.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+            let actual = norm_squared_f32(&v);
+            let tolerance = (reference * 1e-5).max(1e-6);
+            assert!(
+                (f64::from(actual) - reference).abs() <= tolerance,
+                "dim {dim}: norm_squared_f32 {actual} drifted from f64 reference {reference}"
+            );
+            assert!(
+                (f64::from(norm_f32(&v)) - reference.sqrt()).abs() <= tolerance.sqrt().max(1e-5)
+            );
+        }
+    }
+
+    #[test]
+    fn test_algebraic_dot_scalar_matches_simd_dispatch() {
+        for dim in ALGEBRAIC_TEST_DIMS {
+            let a = algebraic_test_vector(dim, 0x51ed_0004);
+            let b = algebraic_test_vector(dim, 0x51ed_0005);
+            let dispatched = dot_product_f32(&a, &b, dim);
+            let scalar = dot_product_f32_scalar(&a, &b);
+            let tolerance = (dispatched.abs() * 1e-5).max(1e-5);
+            assert!(
+                (dispatched - scalar).abs() <= tolerance,
+                "dim {dim}: scalar dot {scalar} disagrees with dispatched {dispatched}"
+            );
+
+            let (fused_dot, fused_norm) = fused_dot_norm(&a, &b, dim);
+            let (scalar_dot, scalar_norm) = fused_dot_norm_scalar(&a, &b);
+            assert!((fused_dot - scalar_dot).abs() <= tolerance);
+            assert!((fused_norm - scalar_norm).abs() <= (fused_norm.abs() * 1e-5).max(1e-5));
+        }
+    }
+
+    /// Rust's algebraic operations differ from `-ffast-math`: they permit
+    /// reassociation but never assume finite inputs. NaN and infinity must
+    /// still propagate, otherwise a degenerate stored vector would silently
+    /// score as a finite number instead of being rejected downstream.
+    #[test]
+    fn test_algebraic_reductions_propagate_non_finite() {
+        let finite = vec![1.0f32; 8];
+
+        let mut with_nan = finite.clone();
+        with_nan[5] = f32::NAN;
+        assert!(norm_squared_f32(&with_nan).is_nan());
+        assert!(squared_l2_f32(&with_nan, &finite).is_nan());
+        assert!(dot_product_f32_scalar(&with_nan, &finite).is_nan());
+
+        let mut with_inf = finite.clone();
+        with_inf[2] = f32::INFINITY;
+        assert!(norm_squared_f32(&with_inf).is_infinite());
+        assert!(squared_l2_f32(&with_inf, &finite).is_infinite());
+        assert!(dot_product_f32_scalar(&with_inf, &finite).is_infinite());
     }
 }

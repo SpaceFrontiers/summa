@@ -689,25 +689,17 @@ fn evaluate_float_build_quality(
             (exact_cluster_id, routed_cluster_id)
         };
         router_hits += usize::from(routed_cluster_id == exact_cluster_id);
-        let exact_distance = vector
-            .iter()
-            .zip(centroids.get_centroid(exact_cluster_id))
-            .map(|(&value, &center)| {
-                let delta = value - center;
-                delta * delta
-            })
-            .sum::<f32>();
+        let exact_distance = crate::structures::simd::squared_l2_f32(
+            vector,
+            centroids.get_centroid(exact_cluster_id),
+        );
         let routed_distance = if routed_cluster_id == exact_cluster_id {
             exact_distance
         } else {
-            vector
-                .iter()
-                .zip(centroids.get_centroid(routed_cluster_id))
-                .map(|(&value, &center)| {
-                    let delta = value - center;
-                    delta * delta
-                })
-                .sum::<f32>()
+            crate::structures::simd::squared_l2_f32(
+                vector,
+                centroids.get_centroid(routed_cluster_id),
+            )
         };
         exact_distortion_sum += f64::from(exact_distance);
         routed_distortion_sum += f64::from(routed_distance);

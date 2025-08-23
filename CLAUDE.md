@@ -34,6 +34,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   defaults. SIMD kernels always ship with a scalar fallback and dispatch safely.
 - **Substantial features get a short design doc** under `docs/` before
   implementation (format changes, new index structures, protocol additions).
+- **Float reductions on the vector path use algebraic ops** (Rust 1.98
+  `f32::algebraic_add`/`algebraic_mul`) so LLVM can reassociate and vectorize
+  them — see `docs/algebraic-float-reductions.md` for the measured numbers and
+  the reproducibility contract. Never use them where a float is compared
+  bit-exactly, hashed, or written into a content-addressed artifact; in
+  particular `hermes-train` stays strict IEEE.
 
 ## Project Overview
 
@@ -183,7 +189,7 @@ Full SDL reference: `docs/schema.md`
 
 ## Development Requirements
 
-- Rust 1.97+ (see `rust-toolchain.toml`)
+- Rust 1.98+ (see `rust-toolchain.toml`)
 - Python 3.12+ (for Python bindings)
 - Node.js 20+ (for WASM and web)
 - pnpm 10+ (for TypeScript and web packages)

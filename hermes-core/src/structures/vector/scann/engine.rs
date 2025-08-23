@@ -1489,13 +1489,7 @@ fn intermediate_routing_beam(probes: usize) -> usize {
 
 #[inline]
 fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(&a, &b)| {
-            let difference = a - b;
-            difference * difference
-        })
-        .sum()
+    crate::structures::simd::squared_l2_f32(left, right)
 }
 
 #[cfg(test)]
