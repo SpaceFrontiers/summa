@@ -442,12 +442,12 @@ impl AhQuery {
         {
             return Err(ScannFormatError::new("invalid unpacked ScaNN AH codes"));
         }
-        Ok(centroid_dot
-            + codes
-                .iter()
-                .enumerate()
-                .map(|(block, &code)| self.values[block * CENTERS_PER_BLOCK + code as usize])
-                .sum::<f32>())
+        Ok(codes
+            .iter()
+            .enumerate()
+            .fold(centroid_dot, |score, (block, &code)| {
+                score.algebraic_add(self.values[block * CENTERS_PER_BLOCK + code as usize])
+            }))
     }
 
     pub fn score_packed(&self, codes: &[u8], centroid_dot: f32) -> ScannResult<f32> {
@@ -457,7 +457,7 @@ impl AhQuery {
         let mut score = centroid_dot;
         for block in 0..self.blocks() {
             let code = (codes[block / 2] >> ((block % 2) * 4)) & 0x0f;
-            score += self.values[block * CENTERS_PER_BLOCK + code as usize];
+            score = score.algebraic_add(self.values[block * CENTERS_PER_BLOCK + code as usize]);
         }
         Ok(score)
     }
@@ -547,13 +547,7 @@ fn train_subspace(
 
 #[inline]
 fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(&a, &b)| {
-            let difference = a - b;
-            difference * difference
-        })
-        .sum()
+    crate::structures::simd::squared_l2_f32(left, right)
 }
 
 #[inline]

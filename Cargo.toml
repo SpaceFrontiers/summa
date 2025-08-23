@@ -16,7 +16,7 @@ resolver = "2"
 [workspace.package]
 version = "1.8.110"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/SpaceFrontiers/hermes"
 homepage = "https://github.com/SpaceFrontiers/hermes"

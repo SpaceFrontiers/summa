@@ -73,13 +73,7 @@ pub(crate) fn estimated_euclidean_kmeans_distance_multiplier(
 
 #[inline]
 fn squared_l2(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(&a, &b)| {
-            let delta = a - b;
-            delta * delta
-        })
-        .sum()
+    crate::structures::simd::squared_l2_f32(left, right)
 }
 
 #[inline]

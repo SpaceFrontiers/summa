@@ -1,4 +1,4 @@
-FROM rust:1.97.1
+FROM rust:1.98.0
 
 # System deps
 RUN apt-get update && apt-get install -y \

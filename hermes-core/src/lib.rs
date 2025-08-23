@@ -1,3 +1,10 @@
+// clippy 1.98 added `chunks_exact_to_as_chunks`, which fires on ~40 call sites
+// here. Migrating them is a real (if mechanical) improvement — a const-generic
+// chunk width lets LLVM drop the per-chunk length check — but most of the sites
+// are inside BMP / ScaNN / fast-field wire-format parsers, and rewriting those
+// belongs in its own reviewed change rather than riding along with a toolchain
+// bump. Tracked as follow-up; see docs/algebraic-float-reductions.md.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 #![deny(
     rustdoc::bare_urls,
     rustdoc::broken_intra_doc_links,
