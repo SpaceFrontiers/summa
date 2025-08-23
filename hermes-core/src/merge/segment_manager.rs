@@ -2534,11 +2534,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Force merge segments into compact, size-balanced groups, respecting
-    /// `max_segment_docs` from the merge policy.
+    /// Force merge all segments into one (packing up to the u32 document
+    /// format limit per output).
     ///
-    /// If the policy defines a max segment size, segments are merged in batches
-    /// that stay within that limit. Otherwise, all segments are merged into one.
+    /// An explicit force merge is a full compaction: unlike background
+    /// merges, it deliberately ignores the policy's `max_segment_docs` cap
+    /// (which exists to bound background BP/merge cost, not to keep an index
+    /// permanently split). Only the u32 doc-id format limit can force more
+    /// than one output, and that outcome is logged loudly.
     ///
     /// Each batch is registered in `active_operations` via an RAII guard to prevent
     /// `maybe_merge` from spawning a conflicting background merge.
@@ -2575,7 +2578,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // wait for a release; those passes run for minutes, so poll slowly.
         const FORCE_MERGE_HELD_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
-        let (_force_merge_activity, max_segment_docs) = {
+        let (_force_merge_activity, policy_segment_docs) = {
             let st = self.state.lock().await;
             // `maybe_merge` registers and publishes every task handle under
             // this same state lock. Raising the barrier here therefore makes
@@ -2661,13 +2664,31 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .into_iter()
                 .filter(|(id, _)| !active_ids.contains(id))
                 .collect();
-            // Every segment format and doc map uses u32 document IDs. A policy
-            // with no explicit cap therefore means "up to the format limit",
-            // not an unrepresentable u64-sized output.
-            let max_docs = max_segment_docs
-                .map(u64::from)
-                .unwrap_or(u64::from(u32::MAX));
-            let next_group = plan_force_merge_groups(free_segments, max_docs)
+            // Every segment format and doc map uses u32 document IDs.
+            // An explicit force merge packs up to that format limit: the
+            // policy's `max_segment_docs` bounds *background* merge cost and
+            // must not silently leave a forced compaction above one segment
+            // (observed in prod: an 8.8M-doc index stuck at 2 segments under
+            // a 5M-doc policy cap).
+            let max_docs = u64::from(u32::MAX);
+            let planned_groups = plan_force_merge_groups(free_segments, max_docs);
+            if let Some(cap) = policy_segment_docs {
+                for group in planned_groups
+                    .iter()
+                    .filter(|group| group.segments.len() >= 2)
+                    .filter(|group| group.total_docs > u64::from(cap))
+                {
+                    log::warn!(
+                        "[force_merge] index={} output of {} docs intentionally exceeds the \
+                         background merge policy cap of {} docs (force merge compacts to the \
+                         u32 format limit)",
+                        self.schema.index_label(),
+                        group.total_docs,
+                        cap,
+                    );
+                }
+            }
+            let next_group = planned_groups
                 .into_iter()
                 .find(|group| group.segments.len() >= 2);
 
@@ -2683,7 +2704,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         continue;
                     }
                     // Every remaining free segment is either already at the
-                    // size cap or cannot be paired without exceeding it.
+                    // u32 format limit or cannot be paired without exceeding
+                    // it. More than one leftover segment is an exceptional,
+                    // loudly-reported outcome — never a silent policy effect.
+                    let remaining = {
+                        let st = self.state.lock().await;
+                        st.metadata.segment_metas.len()
+                    };
+                    if remaining > 1 {
+                        log::warn!(
+                            "[force_merge] index={} finished with {} segments: combined \
+                             document count exceeds the u32 segment format limit, so a \
+                             single output is impossible",
+                            self.schema.index_label(),
+                            remaining,
+                        );
+                    }
                     // A reorder that was already running when foreground
                     // admission began may have published after the preceding
                     // callback. Reconcile external readers one final time so

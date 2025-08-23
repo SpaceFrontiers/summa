@@ -214,6 +214,7 @@ fn bmp_threshold<'a>(
     options: &'a super::ScorerOptions,
     combiner: MultiValueCombiner,
     single_valued: bool,
+    heap_covers_limit: bool,
 ) -> super::bmp::BmpThreshold<'a> {
     if !single_valued && combiner != MultiValueCombiner::Max {
         return super::bmp::BmpThreshold::default();
@@ -221,7 +222,12 @@ fn bmp_threshold<'a>(
     super::bmp::BmpThreshold {
         initial: options.initial_threshold,
         shared: options.shared_threshold.as_ref(),
-        publish: single_valued,
+        // A full heap's k-th score is a valid cross-segment floor only when
+        // the heap is as deep as the requested result window. A segment with
+        // fewer documents than `limit` fills its (clamped) heap early; its
+        // k-th score says nothing about the global top-`limit` set and used
+        // to erase every lower-scoring segment's results.
+        publish: single_valued && heap_covers_limit,
     }
 }
 
@@ -333,7 +339,19 @@ fn build_sparse_bmp_results_inner(
         .lsp_gamma
         .unwrap_or_else(|| super::bmp::recommended_lsp_gamma(executor_limit));
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
-    let threshold = bmp_threshold(options, info.combiner, bmp.is_single_valued());
+    // The per-segment `limit` may already be clamped to the segment's doc
+    // count, so validate the heap depth against the *query* window carried by
+    // the shared floor, not against `limit`.
+    let heap_covers_floor = options
+        .shared_threshold
+        .as_ref()
+        .is_none_or(|shared| shared.covers(executor_limit));
+    let threshold = bmp_threshold(
+        options,
+        info.combiner,
+        bmp.is_single_valued(),
+        heap_covers_floor,
+    );
     let results = if let Some(predicate) = predicate {
         super::bmp::execute_bmp_filtered_with_threshold(
             bmp,
@@ -683,18 +701,38 @@ mod tests {
             lsp_plan: None,
         };
 
-        let single_sum = bmp_threshold(&options, MultiValueCombiner::Sum, true);
+        let single_sum = bmp_threshold(&options, MultiValueCombiner::Sum, true, true);
         assert_eq!(single_sum.initial, 5.0);
         assert!(single_sum.shared.is_some());
         assert!(single_sum.publish);
 
-        let multi_max = bmp_threshold(&options, MultiValueCombiner::Max, false);
+        let multi_max = bmp_threshold(&options, MultiValueCombiner::Max, false, true);
         assert!(multi_max.shared.is_some());
         assert!(!multi_max.publish);
 
-        let multi_sum = bmp_threshold(&options, MultiValueCombiner::Sum, false);
+        let multi_sum = bmp_threshold(&options, MultiValueCombiner::Sum, false, true);
         assert_eq!(multi_sum.initial, 0.0);
         assert!(multi_sum.shared.is_none());
         assert!(!multi_sum.publish);
+    }
+
+    /// A segment with fewer real docs than the requested window clamps its
+    /// heap below `limit`; its full-heap threshold must then stay private.
+    #[test]
+    fn bmp_threshold_from_a_clamped_heap_is_never_published() {
+        let shared = super::super::SharedThreshold::new();
+        let options = super::super::ScorerOptions {
+            collect_positions: false,
+            initial_threshold: 0.0,
+            shared_threshold: Some(shared),
+            lsp_plan: None,
+        };
+
+        let clamped = bmp_threshold(&options, MultiValueCombiner::Sum, true, false);
+        assert!(clamped.shared.is_some(), "reading a valid floor stays safe");
+        assert!(
+            !clamped.publish,
+            "a heap shallower than the result window must not publish a floor"
+        );
     }
 }
