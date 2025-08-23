@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use tracing::info;
 
-use hermes_core::{Document, FsDirectory, IndexConfig, IndexWriter, parse_schema};
+use hermes_core::{Document, IndexConfig, IndexWriter, MmapDirectory, parse_schema};
 
 use crate::release_memory_to_os;
 
@@ -24,7 +24,7 @@ pub async fn create_index(index_path: PathBuf, schema_path: PathBuf) -> Result<(
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("Failed to create index directory: {:?}", index_path))?;
 
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
 
     let _writer = IndexWriter::create(dir, schema, config).await?;
@@ -41,7 +41,7 @@ pub async fn init_index_from_sdl(index_path: PathBuf, sdl: String) -> Result<()>
     std::fs::create_dir_all(&index_path)
         .with_context(|| format!("Failed to create index directory: {:?}", index_path))?;
 
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
 
     let _writer = IndexWriter::create(dir, schema.clone(), config).await?;
@@ -53,7 +53,7 @@ pub async fn init_index_from_sdl(index_path: PathBuf, sdl: String) -> Result<()>
 }
 
 async fn index_from_reader<R: BufRead>(
-    writer: &mut IndexWriter<FsDirectory>,
+    writer: &mut IndexWriter<MmapDirectory>,
     reader: R,
     progress_interval: usize,
 ) -> Result<usize> {
@@ -159,7 +159,7 @@ pub async fn index_documents(
 ) -> Result<()> {
     let optimization_mode = optimization;
 
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let default_config = IndexConfig::default();
     let config = IndexConfig {
         max_indexing_memory_bytes: max_indexing_memory_mb * 1024 * 1024,
@@ -213,7 +213,7 @@ pub async fn index_documents(
 }
 
 pub async fn commit_index(index_path: PathBuf) -> Result<()> {
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
     let mut writer = IndexWriter::open(dir, config).await?;
 
@@ -224,7 +224,7 @@ pub async fn commit_index(index_path: PathBuf) -> Result<()> {
 }
 
 pub async fn merge_index(index_path: PathBuf) -> Result<()> {
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
     let mut writer = IndexWriter::open(dir, config).await?;
 
@@ -236,7 +236,7 @@ pub async fn merge_index(index_path: PathBuf) -> Result<()> {
 }
 
 pub async fn reorder_index(index_path: PathBuf) -> Result<()> {
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
     let mut writer = IndexWriter::open(dir, config).await?;
 
@@ -254,7 +254,7 @@ pub async fn search_index(
     offset: usize,
     search_threads: Option<usize>,
 ) -> Result<()> {
-    let dir = hermes_core::MmapDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let mut config = IndexConfig::default();
     if let Some(threads) = search_threads {
         config.num_threads = threads;
@@ -312,9 +312,7 @@ pub async fn search_batch(
     use std::sync::Arc;
 
     anyhow::ensure!(concurrency > 0, "--concurrency must be at least 1");
-    // Mmap (inline) handles: the BMP reader needs synchronous range reads,
-    // which lazy FsDirectory handles refuse; this matches hermes-server.
-    let dir = hermes_core::MmapDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let mut config = IndexConfig::default();
     if let Some(threads) = search_threads {
         config.num_threads = threads;
@@ -383,7 +381,7 @@ pub async fn search_batch(
 }
 
 pub async fn show_info(index_path: PathBuf) -> Result<()> {
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
     let index = hermes_core::Index::open(dir, config).await?;
 
@@ -449,7 +447,7 @@ pub async fn heatmap_bmp_grid(
 ) -> Result<()> {
     use hermes_core::{FieldType, Index};
 
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
     let index = Index::open(dir, config).await?;
     let schema = index.schema().clone();
@@ -659,7 +657,7 @@ pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> 
         hermes_core::format_bytes(cache_size as u64)
     );
 
-    let dir = FsDirectory::new(&index_path);
+    let dir = MmapDirectory::new(&index_path);
     let caching_dir = SliceCachingDirectory::new(dir.clone(), cache_size);
     let config = IndexConfig::default();
 
@@ -748,9 +746,10 @@ mod tests {
         .await
         .unwrap();
 
-        let index = hermes_core::Index::open(FsDirectory::new(&index_path), IndexConfig::default())
-            .await
-            .unwrap();
+        let index =
+            hermes_core::Index::open(MmapDirectory::new(&index_path), IndexConfig::default())
+                .await
+                .unwrap();
         assert_eq!(
             index.num_docs().await.unwrap(),
             2,
@@ -773,9 +772,10 @@ mod tests {
         .await
         .unwrap();
 
-        let index = hermes_core::Index::open(FsDirectory::new(&index_path), IndexConfig::default())
-            .await
-            .unwrap();
+        let index =
+            hermes_core::Index::open(MmapDirectory::new(&index_path), IndexConfig::default())
+                .await
+                .unwrap();
         assert_eq!(
             index.num_docs().await.unwrap(),
             2,
