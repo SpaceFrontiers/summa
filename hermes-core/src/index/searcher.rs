@@ -929,8 +929,10 @@ impl<D: Directory + 'static> Searcher<D> {
         use futures::StreamExt;
         use futures::TryStreamExt;
         // Cross-segment top-k floor (see search_internal_sync). Concurrent
-        // segments share it via an atomic; ordering is best-effort.
-        let shared = crate::query::SharedThreshold::new();
+        // segments share it via an atomic; ordering is best-effort. The floor
+        // carries the query window so executors with clamped heaps (segments
+        // smaller than the window) can never publish an invalid floor.
+        let shared = crate::query::SharedThreshold::for_limit(fetch_limit);
         let lsp_plans = self.prepare_global_lsp(query, fetch_limit, false)?;
         let mut total_seen: u32 = 0;
         let mut merged = Vec::new();
@@ -1060,7 +1062,7 @@ impl<D: Directory + 'static> Searcher<D> {
         use rayon::prelude::*;
 
         let lsp_plans = self.prepare_global_lsp(query, fetch_limit, true)?;
-        let shared = crate::query::SharedThreshold::new();
+        let shared = crate::query::SharedThreshold::for_limit(fetch_limit);
         let run_segment = |segment_index: &usize| {
             let segment = &self.segments[*segment_index];
             let lsp_plan = lsp_plans[*segment_index].clone();

@@ -863,9 +863,21 @@ pub async fn load_sparse_file<D: Directory>(
             }
             payload_ranges.push((blob_offset, blob_end, field_id, dim_id));
 
+            // `BmpIndex::parse` slices the blob with zero-copy synchronous
+            // reads (mmap/RAM). Lazy directories (tokio-fs `FsDirectory`,
+            // HTTP) only support async range reads, so materialize the blob
+            // once here; parsing it through the sync path used to fail every
+            // BMP segment open — and with it every `hermes-tool merge` — with
+            // "Synchronous read not available on lazy file handle".
+            let (parse_handle, parse_offset) = if handle.is_sync() {
+                (handle.clone(), blob_offset)
+            } else {
+                let blob_bytes = handle.read_bytes_range(blob_offset..blob_end).await?;
+                (crate::directories::FileHandle::from_bytes(blob_bytes), 0u64)
+            };
             match BmpIndex::parse(
-                handle.clone(),
-                blob_offset,
+                parse_handle,
+                parse_offset,
                 blob_len,
                 total_docs,
                 total_vectors,

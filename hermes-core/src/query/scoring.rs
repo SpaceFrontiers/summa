@@ -292,20 +292,59 @@ impl ScoreCollector {
 /// any other segment with `v` can never drop a document that belongs in the
 /// final top-k. Completion order is arbitrary, so the floor is best-effort — it
 /// only changes how aggressively later segments prune, never correctness.
-#[derive(Clone, Debug, Default)]
-pub struct SharedThreshold(std::sync::Arc<std::sync::atomic::AtomicU32>);
+///
+/// The floor carries the query's result-window depth `k` (`for_limit`).
+/// Publishing from a heap shallower than `k` is invalid — a segment with
+/// fewer documents than the window fills its clamped heap early, and its
+/// heap threshold says nothing about the query-global k-th score. Executors
+/// must check `SharedThreshold::covers` before raising the floor with a
+/// full-heap threshold.
+#[derive(Clone, Debug)]
+pub struct SharedThreshold {
+    floor: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Result-window depth the floor is valid for. `usize::MAX` means the
+    /// depth is unknown; reading stays safe, publishing is disabled.
+    k: usize,
+}
+
+impl Default for SharedThreshold {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SharedThreshold {
-    /// A fresh floor of 0.0 (no pruning seed).
+    /// A fresh floor of 0.0 (no pruning seed) with an unknown window depth.
+    /// Executors can read and manually raise it, but never publish their own
+    /// full-heap thresholds into it.
     pub fn new() -> Self {
-        // 0.0_f32.to_bits() == 0, matching AtomicU32::default().
-        Self(std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)))
+        Self::with_depth(usize::MAX)
+    }
+
+    /// A fresh floor valid for a query fetching `limit` results.
+    pub fn for_limit(limit: usize) -> Self {
+        Self::with_depth(limit)
+    }
+
+    fn with_depth(k: usize) -> Self {
+        Self {
+            // 0.0_f32.to_bits() == 0, matching AtomicU32::default().
+            floor: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            k,
+        }
+    }
+
+    /// True when a full heap of `heap_depth` distinct documents backs a valid
+    /// query-global floor for this threshold's result window.
+    #[inline]
+    pub(crate) fn covers(&self, heap_depth: usize) -> bool {
+        heap_depth >= self.k
     }
 
     /// Current floor.
     #[inline]
     pub fn get(&self) -> f32 {
-        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+        f32::from_bits(self.floor.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Raise the floor to `score` if it is strictly higher. Monotonic; a lower
@@ -320,9 +359,12 @@ impl SharedThreshold {
         }
         use std::sync::atomic::Ordering::Relaxed;
         let bits = score.to_bits();
-        let mut cur = self.0.load(Relaxed);
+        let mut cur = self.floor.load(Relaxed);
         while f32::from_bits(cur) < score {
-            match self.0.compare_exchange_weak(cur, bits, Relaxed, Relaxed) {
+            match self
+                .floor
+                .compare_exchange_weak(cur, bits, Relaxed, Relaxed)
+            {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }

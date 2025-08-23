@@ -252,9 +252,13 @@ pub async fn search_index(
     query_str: &str,
     limit: usize,
     offset: usize,
+    search_threads: Option<usize>,
 ) -> Result<()> {
-    let dir = FsDirectory::new(&index_path);
-    let config = IndexConfig::default();
+    let dir = hermes_core::MmapDirectory::new(&index_path);
+    let mut config = IndexConfig::default();
+    if let Some(threads) = search_threads {
+        config.num_threads = threads;
+    }
     let index = hermes_core::Index::open(dir, config).await?;
     let schema = index.schema().clone();
 
@@ -289,6 +293,92 @@ pub async fn search_index(
         response.total_hits
     );
 
+    Ok(())
+}
+
+/// Run many queries against an index opened once, emitting one JSON line per
+/// query in input order: `{"line": <1-based input line>, "total_hits": N,
+/// "hits": [{"score", "doc"}]}`. Queries execute `concurrency` at a time;
+/// output is flushed per chunk so a driving process can stream. Logs stay on
+/// stderr — stdout carries only result JSONL.
+pub async fn search_batch(
+    index_path: PathBuf,
+    queries_path: PathBuf,
+    limit: usize,
+    concurrency: usize,
+    search_threads: Option<usize>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    anyhow::ensure!(concurrency > 0, "--concurrency must be at least 1");
+    // Mmap (inline) handles: the BMP reader needs synchronous range reads,
+    // which lazy FsDirectory handles refuse; this matches hermes-server.
+    let dir = hermes_core::MmapDirectory::new(&index_path);
+    let mut config = IndexConfig::default();
+    if let Some(threads) = search_threads {
+        config.num_threads = threads;
+    }
+    let index = Arc::new(hermes_core::Index::open(dir, config).await?);
+    let schema = Arc::new(index.schema().clone());
+
+    let file = File::open(&queries_path)
+        .with_context(|| format!("Failed to open queries file: {:?}", queries_path))?;
+    let queries: Vec<(usize, String)> = BufReader::new(file)
+        .lines()
+        .enumerate()
+        .filter_map(|(line_no, line)| match line {
+            Ok(line) => {
+                let query = line.trim();
+                if query.is_empty() {
+                    None
+                } else {
+                    Some(Ok((line_no + 1, query.to_string())))
+                }
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<std::result::Result<_, _>>()?;
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut done = 0usize;
+    for chunk in queries.chunks(concurrency) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for (line_no, query_str) in chunk {
+            let line_no = *line_no;
+            let query_str = query_str.clone();
+            let index = Arc::clone(&index);
+            let schema = Arc::clone(&schema);
+            handles.push(tokio::spawn(async move {
+                let response = index
+                    .query_offset(&query_str, limit, 0)
+                    .await
+                    .with_context(|| format!("Search failed for query on line {}", line_no))?;
+                let mut hits = Vec::with_capacity(response.hits.len());
+                for hit in &response.hits {
+                    let doc = match index.get_document(&hit.address).await? {
+                        Some(doc) => doc.to_json(&schema),
+                        None => serde_json::Value::Null,
+                    };
+                    hits.push(serde_json::json!({"score": hit.score, "doc": doc}));
+                }
+                anyhow::Ok(serde_json::json!({
+                    "line": line_no,
+                    "total_hits": response.total_hits,
+                    "hits": hits,
+                }))
+            }));
+        }
+        for handle in handles {
+            let row = handle.await??;
+            serde_json::to_writer(&mut out, &row)?;
+            out.write_all(b"\n")?;
+        }
+        out.flush()?;
+        done += chunk.len();
+    }
+    info!("Ran {} queries from {:?}", done, queries_path);
     Ok(())
 }
 

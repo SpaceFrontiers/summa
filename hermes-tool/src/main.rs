@@ -280,14 +280,32 @@ enum Commands {
         index: PathBuf,
 
         /// Query string (e.g. "rust", "title:rust", "rust AND search")
-        #[arg(short, long)]
-        query: String,
+        #[arg(
+            short,
+            long,
+            required_unless_present = "queries_file",
+            conflicts_with = "queries_file"
+        )]
+        query: Option<String>,
+
+        /// File with one query per line; the index is opened once and one
+        /// JSON result line is emitted per query
+        #[arg(long)]
+        queries_file: Option<PathBuf>,
+
+        /// Concurrent queries for --queries-file (default: CPU count)
+        #[arg(short = 'j', long)]
+        concurrency: Option<usize>,
+
+        /// Search pool threads (default: CPU count / 4)
+        #[arg(short = 't', long)]
+        search_threads: Option<usize>,
 
         /// Number of results to return
         #[arg(short, long, default_value = "10")]
         limit: usize,
 
-        /// Offset for pagination
+        /// Offset for pagination (single --query only)
         #[arg(short, long, default_value = "0")]
         offset: usize,
     },
@@ -431,6 +449,9 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("hermes_tool=info".parse()?),
         )
+        // Logs go to stderr so machine-readable stdout (e.g. search
+        // --queries-file JSONL) stays clean.
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -509,10 +530,29 @@ async fn main() -> Result<()> {
         Commands::Search {
             index,
             query,
+            queries_file,
+            concurrency,
+            search_threads,
             limit,
             offset,
         } => {
-            index_ops::search_index(index, &query, limit, offset).await?;
+            if let Some(queries_file) = queries_file {
+                anyhow::ensure!(offset == 0, "--offset is not supported with --queries-file");
+                let concurrency = concurrency.unwrap_or_else(|| {
+                    std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(8)
+                });
+                index_ops::search_batch(index, queries_file, limit, concurrency, search_threads)
+                    .await?;
+            } else {
+                anyhow::ensure!(
+                    concurrency.is_none(),
+                    "--concurrency requires --queries-file"
+                );
+                let query = query.expect("clap enforces --query when --queries-file is absent");
+                index_ops::search_index(index, &query, limit, offset, search_threads).await?;
+            }
         }
         Commands::Warmup { index, cache_size } => {
             index_ops::warmup_cache(index, cache_size).await?;

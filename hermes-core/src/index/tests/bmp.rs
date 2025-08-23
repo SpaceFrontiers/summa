@@ -3339,3 +3339,401 @@ async fn test_failed_reorder_leaves_no_orphan_files() {
         "orphan files must be gone"
     );
 }
+
+// ============================================================================
+// Regression tests: multi-segment BMP search dropped whole segments' results,
+// force merge did not converge to one segment, and BMP without configured
+// dims silently returned empty results (2026-08 CLI repro).
+// ============================================================================
+/// Helper: BMP config matching the CLI repro schema
+/// (`dims: 131072, max_weight: 5.0, bmp_block_size: 256`).
+fn repro_bmp_config() -> SparseVectorConfig {
+    SparseVectorConfig {
+        format: SparseFormat::Bmp,
+        weight_quantization: WeightQuantization::UInt8,
+        bmp_block_size: 256,
+        dims: Some(131_072),
+        max_weight: Some(5.0),
+        ..SparseVectorConfig::default()
+    }
+}
+
+fn repro_schema() -> (crate::dsl::Schema, crate::dsl::Field, crate::dsl::Field) {
+    let mut sb = SchemaBuilder::default();
+    let doc_id = sb.add_text_field("doc_id", true, true);
+    let emb = sb.add_sparse_vector_field_with_config("emb", true, true, repro_bmp_config());
+    (sb.build(), doc_id, emb)
+}
+
+async fn results_by_label(
+    searcher: &crate::index::Searcher<RamDirectory>,
+    doc_id: crate::dsl::Field,
+    results: &[crate::query::SearchResult],
+) -> Vec<(String, f32)> {
+    let mut labeled = Vec::with_capacity(results.len());
+    for result in results {
+        let doc = searcher
+            .doc(result.segment_id, result.doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        labeled.push((
+            doc.get_first(doc_id)
+                .unwrap()
+                .as_text()
+                .unwrap()
+                .to_string(),
+            result.score,
+        ));
+    }
+    labeled
+}
+
+/// A segment smaller than the query limit must never publish its own k-th
+/// score as a cross-segment floor: that floor is not the global k-th score
+/// and erased every lower-scoring segment's results (whole segments' hits
+/// vanished from multi-segment BMP searches).
+#[tokio::test]
+async fn test_bmp_multi_segment_search_returns_all_matching_docs() {
+    let (schema, doc_id, emb) = repro_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..IndexConfig::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    // Segment 1 (largest — deterministic pilot): the two top-scoring docs.
+    for (label, weight) in [("a1", 2.0f32), ("a2", 1.5f32)] {
+        let mut doc = Document::new();
+        doc.add_text(doc_id, label);
+        doc.add_sparse_vector(emb, vec![(5, weight), (9000, weight)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    // Segment 2: one doc scoring below segment 1's k-th heap entry.
+    let mut doc_b = Document::new();
+    doc_b.add_text(doc_id, "b");
+    doc_b.add_sparse_vector(emb, vec![(5, 1.0)]);
+    writer.add_document(doc_b).unwrap();
+    writer.commit().await.unwrap();
+
+    // Segment 3: one doc scoring below both.
+    let mut doc_c = Document::new();
+    doc_c.add_text(doc_id, "c");
+    doc_c.add_sparse_vector(emb, vec![(9000, 0.5)]);
+    writer.add_document(doc_c).unwrap();
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 3);
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let query = SparseVectorQuery::new(emb, vec![(5, 1.0), (9000, 1.0)]).with_lsp_gamma(0);
+    let results = searcher.search(&query, 10).await.unwrap();
+    let labeled = results_by_label(&searcher, doc_id, &results).await;
+    assert_eq!(
+        labeled
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a1", "a2", "b", "c"],
+        "multi-segment BMP search must return matches from every segment, got {labeled:?}",
+    );
+    for ((_, score), expected) in labeled.iter().zip([4.0f32, 3.0, 1.0, 0.5]) {
+        assert!(
+            (score - expected).abs() < 0.05,
+            "score {score} diverged from expected {expected}: {labeled:?}",
+        );
+    }
+}
+
+/// The exact CLI repro: docs a/b/c in three one-doc segments. Every matching
+/// document must come back regardless of segment execution order.
+#[tokio::test]
+async fn test_bmp_multi_segment_search_one_doc_segments_cli_repro() {
+    let (schema, doc_id, emb) = repro_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..IndexConfig::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    for (label, entries) in [
+        ("a", vec![(5u32, 1.5f32), (9000, 2.0), (130_000, 0.5)]),
+        ("b", vec![(5, 0.5), (77, 3.0)]),
+        ("c", vec![(9000, 2.5), (130_000, 1.0)]),
+    ] {
+        let mut doc = Document::new();
+        doc.add_text(doc_id, label);
+        doc.add_sparse_vector(emb, entries);
+        writer.add_document(doc).unwrap();
+        writer.commit().await.unwrap();
+    }
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 3);
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let query = SparseVectorQuery::new(emb, vec![(5, 1.0), (9000, 1.0)]).with_lsp_gamma(0);
+    // Run repeatedly: the failure mode depended on segment completion order.
+    for round in 0..20 {
+        let results = searcher.search(&query, 5).await.unwrap();
+        let labeled = results_by_label(&searcher, doc_id, &results).await;
+        assert_eq!(
+            labeled
+                .iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c", "b"],
+            "round {round}: BMP dropped a segment's results: {labeled:?}",
+        );
+        for ((_, score), expected) in labeled.iter().zip([3.51f32, 2.51, 0.51]) {
+            assert!(
+                (score - expected).abs() < 0.05,
+                "round {round}: score {score} diverged from expected {expected}",
+            );
+        }
+    }
+}
+
+/// Force merge must converge to a single segment (sources fit the format
+/// limit) and post-merge search must return the exact same documents.
+#[tokio::test]
+async fn test_bmp_force_merge_collapses_to_single_segment_and_search_is_correct() {
+    let (schema, doc_id, emb) = repro_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..IndexConfig::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    for (label, entries) in [
+        ("a", vec![(5u32, 1.5f32), (9000, 2.0), (130_000, 0.5)]),
+        ("b", vec![(5, 0.5), (77, 3.0)]),
+        ("c", vec![(9000, 2.5), (130_000, 1.0)]),
+    ] {
+        let mut doc = Document::new();
+        doc.add_text(doc_id, label);
+        doc.add_sparse_vector(emb, entries);
+        writer.add_document(doc).unwrap();
+        writer.commit().await.unwrap();
+    }
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 3);
+    drop(index);
+
+    writer.force_merge().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(
+        index.segment_readers().await.unwrap().len(),
+        1,
+        "force merge must end at exactly one segment",
+    );
+    assert_eq!(index.num_docs().await.unwrap(), 3);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let query = SparseVectorQuery::new(emb, vec![(5, 1.0), (9000, 1.0)]).with_lsp_gamma(0);
+    let results = searcher.search(&query, 5).await.unwrap();
+    let labeled = results_by_label(&searcher, doc_id, &results).await;
+    assert_eq!(
+        labeled
+            .iter()
+            .map(|(label, _)| label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c", "b"],
+        "post-merge BMP search must return every matching doc: {labeled:?}",
+    );
+    for ((_, score), expected) in labeled.iter().zip([3.51f32, 2.51, 0.51]) {
+        assert!(
+            (score - expected).abs() < 0.05,
+            "post-merge score {score} diverged from expected {expected}",
+        );
+    }
+}
+
+/// Force merge must not stop above one segment because the background merge
+/// policy caps segment size: an explicit force merge packs up to the u32
+/// format limit (or fails loudly), never silently leaving extra segments.
+#[tokio::test]
+async fn test_bmp_force_merge_ignores_policy_segment_cap() {
+    let (schema, _doc_id, emb) = repro_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        // Policy cap of 2 docs per segment would split 3 one-doc sources
+        // into 2 outputs if force merge honored it.
+        merge_policy: Box::new(crate::merge::TieredMergePolicy {
+            max_segment_docs: 2,
+            max_merged_docs: 2,
+            ..crate::merge::TieredMergePolicy::default()
+        }),
+        ..IndexConfig::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for weight in [1.0f32, 2.0, 3.0] {
+        let mut doc = Document::new();
+        doc.add_sparse_vector(emb, vec![(5, weight)]);
+        writer.add_document(doc).unwrap();
+        writer.commit().await.unwrap();
+    }
+    writer.force_merge().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(
+        index.segment_readers().await.unwrap().len(),
+        1,
+        "explicit force merge must converge to one segment despite the policy cap",
+    );
+}
+
+/// BMP without configured `dims`/`max_weight` must either work end-to-end or
+/// refuse loudly at commit time — never commit successfully and then return
+/// zero hits for every query.
+#[tokio::test]
+async fn test_bmp_without_dims_config_works_or_fails_loud() {
+    let mut sb = SchemaBuilder::default();
+    let doc_id = sb.add_text_field("doc_id", true, true);
+    let emb = sb.add_sparse_vector_field_with_config(
+        "emb",
+        true,
+        true,
+        SparseVectorConfig {
+            format: SparseFormat::Bmp,
+            weight_quantization: WeightQuantization::UInt8,
+            bmp_block_size: 256,
+            // No dims / max_weight configured.
+            ..SparseVectorConfig::default()
+        },
+    );
+    let schema = sb.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    for (label, entries) in [
+        ("a", vec![(5u32, 1.5f32), (9000, 2.0), (130_000, 0.5)]),
+        ("b", vec![(5, 0.5), (77, 3.0)]),
+        ("c", vec![(9000, 2.5), (130_000, 1.0)]),
+    ] {
+        let mut doc = Document::new();
+        doc.add_text(doc_id, label);
+        doc.add_sparse_vector(emb, entries);
+        writer.add_document(doc).unwrap();
+    }
+
+    let committed = writer.commit().await;
+    match committed {
+        Err(error) => {
+            // Loud refusal is acceptable; silence is not.
+            let message = format!("{error}");
+            assert!(
+                message.contains("dims"),
+                "load-time refusal must explain the dims capability mismatch: {message}",
+            );
+        }
+        Ok(_) => {
+            let index = Index::open(dir, config).await.unwrap();
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            let query = SparseVectorQuery::new(emb, vec![(5, 1.0), (9000, 1.0)]).with_lsp_gamma(0);
+            let results = searcher.search(&query, 5).await.unwrap();
+            assert_eq!(
+                results.len(),
+                3,
+                "commit succeeded, so search must return every matching doc",
+            );
+        }
+    }
+}
+
+/// BMP segments must open through directories that only provide lazy (async)
+/// file handles. `FsDirectory` — used by `hermes-tool merge`/`commit` — is
+/// such a directory: every BMP segment open (and therefore every force merge)
+/// used to fail with "Synchronous read not available on lazy file handle".
+#[tokio::test]
+async fn test_bmp_force_merge_works_on_lazy_fs_directory() {
+    let (schema, doc_id, emb) = repro_schema();
+    let temp = tempfile::TempDir::new().unwrap();
+    let dir = crate::directories::FsDirectory::new(temp.path());
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..IndexConfig::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    for (label, entries) in [
+        ("a", vec![(5u32, 1.5f32), (9000, 2.0), (130_000, 0.5)]),
+        ("b", vec![(5, 0.5), (77, 3.0)]),
+        ("c", vec![(9000, 2.5), (130_000, 1.0)]),
+    ] {
+        let mut doc = Document::new();
+        doc.add_text(doc_id, label);
+        doc.add_sparse_vector(emb, entries);
+        writer.add_document(doc).unwrap();
+        writer.commit().await.unwrap();
+    }
+
+    // Opening and searching BMP segments must work on a lazy directory.
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    assert_eq!(index.segment_readers().await.unwrap().len(), 3);
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let query = SparseVectorQuery::new(emb, vec![(5, 1.0), (9000, 1.0)]).with_lsp_gamma(0);
+    let results = searcher.search(&query, 5).await.unwrap();
+    assert_eq!(results.len(), 3, "pre-merge lazy-directory search");
+    drop(index);
+
+    writer.force_merge().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(
+        index.segment_readers().await.unwrap().len(),
+        1,
+        "force merge on a lazy directory must end at one segment",
+    );
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let results = searcher.search(&query, 5).await.unwrap();
+    let mut labels = Vec::new();
+    for result in &results {
+        let doc = searcher
+            .doc(result.segment_id, result.doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        labels.push(
+            doc.get_first(doc_id)
+                .unwrap()
+                .as_text()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    assert_eq!(
+        labels,
+        vec!["a", "c", "b"],
+        "post-merge lazy-directory search"
+    );
+}
