@@ -281,6 +281,12 @@ fn validate_search_request_shape(
             query::Query::Term(term) => {
                 budget.add_field_name(&term.field, "TermQuery.field")?;
                 budget.add_text(term.term.len())?;
+                budget.add_text(term.tokenizer_hint.len())?;
+            }
+            query::Query::Phrase(phrase) => {
+                budget.add_field_name(&phrase.field, "PhraseQuery.field")?;
+                budget.add_text(phrase.text.len())?;
+                budget.add_text(phrase.tokenizer_hint.len())?;
             }
             query::Query::Boolean(boolean) => {
                 let clauses = boolean
@@ -342,6 +348,7 @@ fn validate_search_request_shape(
             query::Query::Match(match_query) => {
                 budget.add_field_name(&match_query.field, "MatchQuery.field")?;
                 budget.add_text(match_query.text.len())?;
+                budget.add_text(match_query.tokenizer_hint.len())?;
             }
             query::Query::Range(range) => {
                 budget.add_field_name(&range.field, "RangeQuery.field")?;
@@ -1627,10 +1634,42 @@ mod tests {
             query: Some(query::Query::Match(MatchQuery {
                 field: "body".to_owned(),
                 text: "x".repeat(limits().shape.max_query_text_bytes + 1),
+                tokenizer_hint: String::new(),
             })),
         });
         assert_eq!(
             validate_search_budget(&excessive_text, &limits())
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+
+        let mut excessive_phrase = ordinary_request();
+        excessive_phrase.query = Some(Query {
+            query: Some(query::Query::Phrase(crate::proto::PhraseQuery {
+                field: "body".to_owned(),
+                text: "x".repeat(limits().shape.max_query_text_bytes + 1),
+                slop: 0,
+                tokenizer_hint: String::new(),
+            })),
+        });
+        assert_eq!(
+            validate_search_budget(&excessive_phrase, &limits())
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+
+        let mut oversized_hint = ordinary_request();
+        oversized_hint.query = Some(Query {
+            query: Some(query::Query::Match(MatchQuery {
+                field: "body".to_owned(),
+                text: "x".to_owned(),
+                tokenizer_hint: "en,".repeat(limits().shape.max_query_text_bytes),
+            })),
+        });
+        assert_eq!(
+            validate_search_budget(&oversized_hint, &limits())
                 .unwrap_err()
                 .code(),
             Code::InvalidArgument

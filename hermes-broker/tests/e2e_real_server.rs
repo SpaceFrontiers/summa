@@ -240,6 +240,7 @@ async fn broker_routes_real_hermes_servers() {
                 query: Some(query::Query::Term(TermQuery {
                     field: "id".to_string(),
                     term: "doc-1".to_string(),
+                    tokenizer_hint: String::new(),
                 })),
             }),
             limit: 10,
@@ -278,6 +279,7 @@ async fn broker_routes_real_hermes_servers() {
                 query: Some(query::Query::Term(TermQuery {
                     field: "id".to_string(),
                     term: "doc-1".to_string(),
+                    tokenizer_hint: String::new(),
                 })),
             }),
             limit: 10,

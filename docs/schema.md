@@ -131,41 +131,69 @@ Text fields can specify a tokenizer using angle brackets after the type:
 ```
 field title: text<en_stem> [indexed, stored]    # English stemmer
 field body: text<german> [indexed]              # German stemmer
-field name: text<default> [indexed, stored]     # Default (lowercase)
-field raw: text [indexed, stored]               # Default tokenizer
+field name: text<simple> [indexed, stored]      # Lowercase, punctuation stripped
+field raw: text [indexed, stored]               # Default tokenizer (simple)
 ```
+
+Unknown tokenizer names are rejected when the schema is parsed.
+
+### Dynamic per-document stemming
+
+A single field can hold documents in many languages and stem each one with
+its own Snowball algorithm. The stemmer is selected per document from the
+values of another text field, and per query from the `tokenizer_hint`
+argument of `TermQuery`, `MatchQuery` and `PhraseQuery`:
+
+```
+field languages: text<raw_ci> [fast]
+field content: text<stem(by: languages, default: simple)> [indexed<token_position>]
+```
+
+- `by` names a text field of the same index; all of its values in a document
+  form the hint (`"ru,en"`).
+- `default` is the language used when a document (or query) carries no
+  recognised hint; `simple` means no stemming.
+- Each token is stemmed with the first hinted language whose script matches
+  the token (Snowball stemmers are script-local), so Cyrillic and Latin text
+  in one document both stem correctly; same-script languages use the first
+  listed one.
+- `indexed<token_position>` enables phrase queries on the field.
+
+See `docs/dynamic-tokenizer-and-phrase.md` for the design.
 
 ### Available Tokenizers
 
-| Name      | Aliases      | Description                                            |
-| --------- | ------------ | ------------------------------------------------------ |
-| `default` | `lowercase`  | Lowercase tokenizer (splits on whitespace, lowercases) |
-| `simple`  | `raw`        | Simple whitespace tokenizer (no lowercasing)           |
-| `en_stem` | `english`    | English Snowball stemmer                               |
-| `de_stem` | `german`     | German Snowball stemmer                                |
-| `fr_stem` | `french`     | French Snowball stemmer                                |
-| `es_stem` | `spanish`    | Spanish Snowball stemmer                               |
-| `it_stem` | `italian`    | Italian Snowball stemmer                               |
-| `pt_stem` | `portuguese` | Portuguese Snowball stemmer                            |
-| `ru_stem` | `russian`    | Russian Snowball stemmer                               |
-| `ar_stem` | `arabic`     | Arabic Snowball stemmer                                |
-| `da_stem` | `danish`     | Danish Snowball stemmer                                |
-| `nl_stem` | `dutch`      | Dutch Snowball stemmer                                 |
-| `fi_stem` | `finnish`    | Finnish Snowball stemmer                               |
-| `el_stem` | `greek`      | Greek Snowball stemmer                                 |
-| `hu_stem` | `hungarian`  | Hungarian Snowball stemmer                             |
-| `no_stem` | `norwegian`  | Norwegian Snowball stemmer                             |
-| `ro_stem` | `romanian`   | Romanian Snowball stemmer                              |
-| `sv_stem` | `swedish`    | Swedish Snowball stemmer                               |
-| `ta_stem` | `tamil`      | Tamil Snowball stemmer                                 |
-| `tr_stem` | `turkish`    | Turkish Snowball stemmer                               |
+| Name                      | Aliases      | Description                                        |
+| ------------------------- | ------------ | -------------------------------------------------- |
+| `simple`                  | `default`    | Whitespace split, punctuation stripped, lowercased |
+| `raw`                     |              | Whole value as one token, unchanged                |
+| `raw_ci`                  |              | Whole value as one token, lowercased               |
+| `stem(by: F, default: L)` |              | Dynamic stemmer hinted by field `F` (see above)    |
+| `en_stem`                 | `english`    | English Snowball stemmer                           |
+| `de_stem`                 | `german`     | German Snowball stemmer                            |
+| `fr_stem`                 | `french`     | French Snowball stemmer                            |
+| `es_stem`                 | `spanish`    | Spanish Snowball stemmer                           |
+| `it_stem`                 | `italian`    | Italian Snowball stemmer                           |
+| `pt_stem`                 | `portuguese` | Portuguese Snowball stemmer                        |
+| `ru_stem`                 | `russian`    | Russian Snowball stemmer                           |
+| `ar_stem`                 | `arabic`     | Arabic Snowball stemmer                            |
+| `da_stem`                 | `danish`     | Danish Snowball stemmer                            |
+| `nl_stem`                 | `dutch`      | Dutch Snowball stemmer                             |
+| `fi_stem`                 | `finnish`    | Finnish Snowball stemmer                           |
+| `el_stem`                 | `greek`      | Greek Snowball stemmer                             |
+| `hu_stem`                 | `hungarian`  | Hungarian Snowball stemmer                         |
+| `no_stem`                 | `norwegian`  | Norwegian Snowball stemmer                         |
+| `ro_stem`                 | `romanian`   | Romanian Snowball stemmer                          |
+| `sv_stem`                 | `swedish`    | Swedish Snowball stemmer                           |
+| `ta_stem`                 | `tamil`      | Tamil Snowball stemmer                             |
+| `tr_stem`                 | `turkish`    | Turkish Snowball stemmer                           |
 
 ### Custom Tokenizers
 
 You can register custom tokenizers programmatically:
 
 ```rust
-use hermes_core::{TokenizerRegistry, LowercaseTokenizer};
+use hermes_core::TokenizerRegistry;
 
 let registry = TokenizerRegistry::new();
 registry.register("my_tokenizer", MyCustomTokenizer::new());
@@ -223,22 +251,26 @@ file = { SOI ~ index_def+ ~ EOI }
 
 index_def = { "index" ~ identifier ~ "{" ~ field_def* ~ "}" }
 
-field_def = { "field" ~ identifier ~ ":" ~ field_type ~ tokenizer_spec? ~ attributes? }
+field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (sparse_vector_config | dense_vector_config | binary_dense_vector_config | tokenizer_spec)? ~ attributes? }
 
 field_type = {
     "text" | "string" | "str" |
     "u64" | "uint" | "unsigned" |
     "i64" | "int" | "integer" |
     "f64" | "float" | "double" |
+    "binary_dense_vector" | "binary_vector" |
     "bytes" | "binary" | "blob" |
     "json" |
-    "dense_vector" | "sparse_vector"
+    "sparse_vector" |
+    "dense_vector" | "vector"
 }
 
-tokenizer_spec = { "<" ~ identifier ~ ">" }
+tokenizer_spec = { "<" ~ identifier ~ tokenizer_params? ~ ">" }
+tokenizer_params = { "(" ~ tokenizer_param ~ ("," ~ tokenizer_param)* ~ ")" }
+tokenizer_param = { identifier ~ ":" ~ identifier }
 
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" }
+attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "reorder" }
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 

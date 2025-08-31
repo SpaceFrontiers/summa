@@ -77,6 +77,17 @@ pub struct FieldEntry {
     pub reorder: bool,
 }
 
+impl FieldEntry {
+    /// Parsed tokenizer spec of a text field (`None` for non-text fields,
+    /// fields without a tokenizer, or unparsable names).
+    pub fn tokenizer_spec(&self) -> Option<crate::tokenizer::TokenizerSpec> {
+        if self.field_type != FieldType::Text {
+            return None;
+        }
+        crate::tokenizer::TokenizerSpec::parse(self.tokenizer.as_deref()?).ok()
+    }
+}
+
 /// Position tracking mode for text fields
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -787,6 +798,13 @@ impl Schema {
 
     pub fn get_field_entry(&self, field: Field) -> Option<&FieldEntry> {
         self.fields.get(field.0 as usize)
+    }
+
+    /// Field whose values hint the dynamic tokenizer of `field`
+    /// (`text<stem(by: <hint field>, ...)>`), if any.
+    pub fn tokenizer_hint_field(&self, field: Field) -> Option<Field> {
+        let spec = self.get_field_entry(field)?.tokenizer_spec()?;
+        self.get_field(spec.hint_field()?)
     }
 
     /// Clone this schema with one vector field's ANN parameters replaced.

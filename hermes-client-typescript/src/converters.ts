@@ -35,10 +35,32 @@ function combinerToProto(combiner?: Combiner): MultiValueCombiner {
 
 export function buildQuery(q: Query): PbQuery {
   if ("term" in q) {
-    return { term: { field: q.term.field, term: q.term.term } };
+    return {
+      term: {
+        field: q.term.field,
+        term: q.term.term,
+        tokenizerHint: q.term.tokenizerHint ?? "",
+      },
+    };
   }
   if ("match" in q) {
-    return { match: { field: q.match.field, text: q.match.text } };
+    return {
+      match: {
+        field: q.match.field,
+        text: q.match.text,
+        tokenizerHint: q.match.tokenizerHint ?? "",
+      },
+    };
+  }
+  if ("phrase" in q) {
+    return {
+      phrase: {
+        field: q.phrase.field,
+        text: q.phrase.text,
+        slop: q.phrase.slop ?? 0,
+        tokenizerHint: q.phrase.tokenizerHint ?? "",
+      },
+    };
   }
   if ("boolean" in q) {
     return {
@@ -144,6 +166,7 @@ export function buildQuery(q: Query): PbQuery {
   const validKeys = [
     "term",
     "match",
+    "phrase",
     "boolean",
     "sparseVector",
     "denseVector",

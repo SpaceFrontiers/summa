@@ -13,7 +13,9 @@ use std::sync::Arc;
 
 use super::query_field_router::{QueryFieldRouter, RoutingMode};
 use super::schema::{Field, Schema};
-use crate::query::{BooleanQuery, DEFAULT_DENSE_RERANK_FACTOR, PrefixQuery, Query, TermQuery};
+use crate::query::{
+    BooleanQuery, DEFAULT_DENSE_RERANK_FACTOR, PhraseQuery, PrefixQuery, Query, TermQuery,
+};
 use crate::tokenizer::{BoxedTokenizer, TokenizerRegistry};
 
 #[derive(Parser)]
@@ -607,11 +609,11 @@ impl QueryLanguageParser {
             return Ok(Box::new(TermQuery::text(field_id, &tokens[0])));
         }
 
-        // Create AND query for all tokens (simplified phrase matching)
-        let mut bool_query = BooleanQuery::new();
-        for token in &tokens {
-            bool_query = bool_query.must(TermQuery::text(field_id, token));
-        }
+        // Positional phrase query; on a field without positions it degrades to
+        // an AND of the terms inside PhraseQuery itself.
+        let phrase_terms = |tokens: &[String]| -> Vec<Vec<u8>> {
+            tokens.iter().map(|t| t.clone().into_bytes()).collect()
+        };
 
         // If no field specified and multiple default fields, wrap in OR
         if field.is_none() && self.default_fields.len() > 1 {
@@ -623,17 +625,15 @@ impl QueryLanguageParser {
                     .into_iter()
                     .map(|t| t.text.to_lowercase())
                     .collect();
-
-                let mut field_query = BooleanQuery::new();
-                for token in &tokens {
-                    field_query = field_query.must(TermQuery::text(f, token));
+                if tokens.is_empty() {
+                    continue;
                 }
-                outer = outer.should(field_query);
+                outer = outer.should(PhraseQuery::new(f, phrase_terms(&tokens)));
             }
             return Ok(Box::new(outer));
         }
 
-        Ok(Box::new(bool_query))
+        Ok(Box::new(PhraseQuery::new(field_id, phrase_terms(&tokens))))
     }
 
     fn get_tokenizer(&self, field: Field) -> BoxedTokenizer {

@@ -33,7 +33,7 @@
 //! ```
 
 use hermes_core::query::{
-    BooleanQuery, DenseVectorQuery, PrefixQuery, Query, SparseVectorQuery, TermQuery,
+    BooleanQuery, DenseVectorQuery, PhraseQuery, PrefixQuery, Query, SparseVectorQuery, TermQuery,
 };
 use hermes_core::tokenizer::TokenizerRegistry;
 use hermes_core::{Directory, Schema, Searcher};
@@ -49,6 +49,8 @@ pub(crate) struct JsQuery {
     #[serde(default, rename = "match")]
     match_: Option<JsMatchQuery>,
     #[serde(default)]
+    phrase: Option<JsPhraseQuery>,
+    #[serde(default)]
     boolean: Option<JsBooleanQuery>,
     #[serde(default)]
     prefix: Option<JsPrefixQuery>,
@@ -61,15 +63,32 @@ pub(crate) struct JsQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct JsTermQuery {
     field: String,
     value: String,
+    #[serde(default)]
+    tokenizer_hint: Option<String>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct JsMatchQuery {
     field: String,
     text: String,
+    #[serde(default)]
+    tokenizer_hint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JsPhraseQuery {
+    field: String,
+    text: String,
+    #[serde(default)]
+    slop: u32,
+    #[serde(default)]
+    tokenizer_hint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -271,15 +290,16 @@ pub(crate) async fn execute_structured_search<D: Directory>(
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
 }
 
-/// Tokenize text using the field's configured tokenizer and build a query.
-/// Term queries use MUST (AND), match queries use SHOULD (OR).
-fn tokenize_and_build(
+/// Resolve a text field and tokenize `text` with its configured tokenizer,
+/// passing the optional hint through (dynamic stemmers read it as a language
+/// list; static tokenizers ignore it).
+fn field_tokens(
     field_name: &str,
     text: &str,
-    must: bool,
+    tokenizer_hint: Option<&str>,
     schema: &Schema,
     tokenizers: &TokenizerRegistry,
-) -> Result<Box<dyn Query>, JsValue> {
+) -> Result<(hermes_core::Field, Vec<String>), JsValue> {
     let field = schema
         .get_field(field_name)
         .ok_or_else(|| JsValue::from_str(&format!("Unknown field: '{}'", field_name)))?;
@@ -290,10 +310,29 @@ fn tokenize_and_build(
     let tok = tokenizers
         .get(tokenizer_name)
         .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
-    let tokens: Vec<String> = tok.tokenize(text).into_iter().map(|t| t.text).collect();
+    let hint = tokenizer_hint.map(str::trim).filter(|h| !h.is_empty());
+    let tokens: Vec<String> = tok
+        .tokenize_hinted(text, hint)
+        .into_iter()
+        .map(|t| t.text)
+        .collect();
     if tokens.is_empty() {
         return Err(JsValue::from_str("No tokens in query"));
     }
+    Ok((field, tokens))
+}
+
+/// Tokenize text using the field's configured tokenizer and build a query.
+/// Term queries use MUST (AND), match queries use SHOULD (OR).
+fn tokenize_and_build(
+    field_name: &str,
+    text: &str,
+    tokenizer_hint: Option<&str>,
+    must: bool,
+    schema: &Schema,
+    tokenizers: &TokenizerRegistry,
+) -> Result<Box<dyn Query>, JsValue> {
+    let (field, tokens) = field_tokens(field_name, text, tokenizer_hint, schema, tokenizers)?;
     if tokens.len() == 1 {
         return Ok(Box::new(TermQuery::text(field, &tokens[0])));
     }
@@ -315,11 +354,37 @@ pub(crate) fn convert_query(
     tokenizers: &TokenizerRegistry,
 ) -> Result<Box<dyn Query>, JsValue> {
     if let Some(ref tq) = js.term {
-        return tokenize_and_build(&tq.field, &tq.value, true, schema, tokenizers);
+        return tokenize_and_build(
+            &tq.field,
+            &tq.value,
+            tq.tokenizer_hint.as_deref(),
+            true,
+            schema,
+            tokenizers,
+        );
     }
 
     if let Some(ref mq) = js.match_ {
-        return tokenize_and_build(&mq.field, &mq.text, false, schema, tokenizers);
+        return tokenize_and_build(
+            &mq.field,
+            &mq.text,
+            mq.tokenizer_hint.as_deref(),
+            false,
+            schema,
+            tokenizers,
+        );
+    }
+
+    if let Some(ref pq) = js.phrase {
+        let (field, tokens) = field_tokens(
+            &pq.field,
+            &pq.text,
+            pq.tokenizer_hint.as_deref(),
+            schema,
+            tokenizers,
+        )?;
+        let terms = tokens.into_iter().map(String::into_bytes).collect();
+        return Ok(Box::new(PhraseQuery::new(field, terms).with_slop(pq.slop)));
     }
 
     if let Some(ref bq) = js.boolean {

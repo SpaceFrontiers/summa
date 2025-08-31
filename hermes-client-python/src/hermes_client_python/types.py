@@ -5,7 +5,7 @@ Query is a dict with exactly one key matching the proto Query oneof variant.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Required, TypedDict
 
 # =============================================================================
 # Multi-value score combiner (mirrors proto MultiValueCombiner)
@@ -18,14 +18,25 @@ Combiner = Literal["log_sum_exp", "max", "avg", "sum", "weighted_top_k"]
 # =============================================================================
 
 
-class TermQuery(TypedDict):
-    field: str
-    term: str
+class TermQuery(TypedDict, total=False):
+    field: Required[str]
+    term: Required[str]
+    tokenizer_hint: str
 
 
-class MatchQuery(TypedDict):
-    field: str
-    text: str
+class MatchQuery(TypedDict, total=False):
+    field: Required[str]
+    text: Required[str]
+    # Passed to the field's tokenizer; a dynamic stemmer reads it as a
+    # comma-separated language list ("ru,en"). Static tokenizers ignore it.
+    tokenizer_hint: str
+
+
+class PhraseQuery(TypedDict, total=False):
+    field: Required[str]
+    text: Required[str]
+    slop: int
+    tokenizer_hint: str
 
 
 class BooleanQuery(TypedDict, total=False):

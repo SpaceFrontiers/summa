@@ -753,10 +753,17 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     for item in inner {
         match item.as_rule() {
             Rule::tokenizer_spec => {
-                // Extract tokenizer name from <name>
-                if let Some(tok_name) = item.into_inner().next() {
-                    tokenizer = Some(tok_name.as_str().to_string());
-                }
+                // `<name>` or `<stem(by: field, default: simple)>`: store the
+                // canonical spec string (validated against the index in
+                // `parse_index_def`).
+                let raw = item.as_str().trim();
+                let raw = raw
+                    .strip_prefix('<')
+                    .and_then(|s| s.strip_suffix('>'))
+                    .unwrap_or(raw);
+                let spec = crate::tokenizer::TokenizerSpec::parse(raw)
+                    .map_err(|e| Error::Schema(format!("Field '{name}': {e}")))?;
+                tokenizer = Some(spec.to_string());
             }
             Rule::sparse_vector_config => {
                 // Parse named parameters: <index_size: u16, quantization: uint8, weight_threshold: 0.1>
@@ -1417,6 +1424,8 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
         }
     }
 
+    validate_tokenizer_specs(&name, &fields)?;
+
     // Validate primary key constraints
     let primary_fields: Vec<&FieldDef> = fields.iter().filter(|f| f.primary).collect();
     if primary_fields.len() > 1 {
@@ -1448,6 +1457,49 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
         query_routers,
         reorder_on_merge,
     })
+}
+
+/// Fail loudly on tokenizer specs that would otherwise degrade silently:
+/// unknown tokenizer names (the builder would fall back to plain lowercasing)
+/// and dynamic stemmers whose hint field does not exist or is not text.
+fn validate_tokenizer_specs(index_name: &str, fields: &[FieldDef]) -> Result<()> {
+    use crate::tokenizer::{TokenizerRegistry, TokenizerSpec};
+    let mut registry: Option<TokenizerRegistry> = None;
+    for field in fields {
+        let Some(raw) = field.tokenizer.as_deref() else {
+            continue;
+        };
+        let spec = TokenizerSpec::parse(raw).map_err(|e| {
+            Error::Schema(format!("Index '{index_name}', field '{}': {e}", field.name))
+        })?;
+        match spec {
+            TokenizerSpec::Named(tokenizer) => {
+                let registry = registry.get_or_insert_with(TokenizerRegistry::new);
+                if !registry.contains(&tokenizer) {
+                    return Err(Error::Schema(format!(
+                        "Index '{index_name}', field '{}': unknown tokenizer '{tokenizer}'",
+                        field.name
+                    )));
+                }
+            }
+            TokenizerSpec::DynamicStem { by, .. } => match fields.iter().find(|f| f.name == by) {
+                None => {
+                    return Err(Error::Schema(format!(
+                        "Index '{index_name}', field '{}': tokenizer hint field '{by}' does not exist",
+                        field.name
+                    )));
+                }
+                Some(hint) if hint.field_type != FieldType::Text => {
+                    return Err(Error::Schema(format!(
+                        "Index '{index_name}', field '{}': tokenizer hint field '{by}' must be a text field, got {:?}",
+                        field.name, hint.field_type
+                    )));
+                }
+                Some(_) => {}
+            },
+        }
+    }
+    Ok(())
 }
 
 /// Parse SDL from a string
@@ -1650,6 +1702,99 @@ mod tests {
 
         assert_eq!(index.fields[2].name, "author");
         assert_eq!(index.fields[2].tokenizer, None); // No tokenizer specified
+    }
+
+    #[test]
+    fn test_dynamic_tokenizer_spec() {
+        let sdl = r#"
+            index documents {
+                field languages: text<raw_ci> [fast]
+                field content: text<stem(by: languages, default: simple)> [indexed<token_position>]
+                field title: text<stem(by:languages,default:english)> [indexed]
+                field embedding: dense_vector<768> [indexed]
+                field hash: binary_dense_vector<64> [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let index = &indexes[0];
+        assert_eq!(
+            index.fields[1].tokenizer,
+            Some("stem(by: languages, default: simple)".to_string())
+        );
+        assert_eq!(
+            index.fields[1].positions,
+            Some(super::super::schema::PositionMode::TokenPosition)
+        );
+        // Canonical rendering normalises spacing and language names.
+        assert_eq!(
+            index.fields[2].tokenizer,
+            Some("stem(by: languages, default: en)".to_string())
+        );
+        // Vector `<N>` configs are unaffected by the extended tokenizer grammar.
+        assert_eq!(
+            index.fields[3].dense_vector_config.as_ref().unwrap().dim,
+            768
+        );
+        assert_eq!(
+            index.fields[4]
+                .binary_dense_vector_config
+                .as_ref()
+                .unwrap()
+                .dim,
+            64
+        );
+
+        let schema = index.to_schema();
+        let content = schema.get_field("content").unwrap();
+        let languages = schema.get_field("languages").unwrap();
+        assert_eq!(schema.tokenizer_hint_field(content), Some(languages));
+        assert_eq!(schema.tokenizer_hint_field(languages), None);
+        let entry = schema.get_field_entry(content).unwrap();
+        assert_eq!(
+            entry.tokenizer_spec().unwrap().hint_field(),
+            Some("languages")
+        );
+    }
+
+    #[test]
+    fn test_tokenizer_specs_fail_loud() {
+        let missing_hint_field = r#"
+            index documents {
+                field content: text<stem(by: languages, default: simple)> [indexed]
+            }
+        "#;
+        let err = parse_sdl(missing_hint_field).unwrap_err().to_string();
+        assert!(
+            err.contains("hint field 'languages' does not exist"),
+            "{err}"
+        );
+
+        let numeric_hint_field = r#"
+            index documents {
+                field languages: u64 [fast]
+                field content: text<stem(by: languages)> [indexed]
+            }
+        "#;
+        let err = parse_sdl(numeric_hint_field).unwrap_err().to_string();
+        assert!(err.contains("must be a text field"), "{err}");
+
+        let unknown_default = r#"
+            index documents {
+                field languages: text [fast]
+                field content: text<stem(by: languages, default: klingon)> [indexed]
+            }
+        "#;
+        let err = parse_sdl(unknown_default).unwrap_err().to_string();
+        assert!(err.contains("unknown default language 'klingon'"), "{err}");
+
+        let unknown_tokenizer = r#"
+            index documents {
+                field content: text<klingon_stem> [indexed]
+            }
+        "#;
+        let err = parse_sdl(unknown_tokenizer).unwrap_err().to_string();
+        assert!(err.contains("unknown tokenizer 'klingon_stem'"), "{err}");
     }
 
     #[test]

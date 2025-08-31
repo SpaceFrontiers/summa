@@ -61,6 +61,7 @@ message Query {
     PrefixQuery prefix = 9;
     BinaryDenseVectorQuery binary_dense_vector = 10;
     FusionQuery fusion = 11;  // Top-level only (cannot be nested)
+    PhraseQuery phrase = 12;
   }
 }
 
@@ -143,6 +144,8 @@ message BinaryDenseVectorQuery {
 message TermQuery {
   string field = 1;
   string term = 2;
+  // Optional hint for the field's tokenizer (see MatchQuery.tokenizer_hint)
+  string tokenizer_hint = 3;
 }
 
 message BooleanQuery {
@@ -175,6 +178,25 @@ message RangeQuery {
 message MatchQuery {
   string field = 1;
   string text = 2;
+  // Optional hint passed to the field's tokenizer. Static tokenizers ignore
+  // it; a dynamic stemmer (`text<stem(by: languages, default: simple)>`)
+  // reads it as a comma-separated list of language codes ("ru,en") and stems
+  // each query token with the first listed language of the token's script.
+  // Empty = the tokenizer's default.
+  string tokenizer_hint = 3;
+}
+
+// Phrase query - text is tokenized server-side with the field's tokenizer
+// (so stemming matches indexing) and the terms must occur consecutively
+// (slop 0) or within `slop` positions of each other. Requires the field to be
+// indexed with token positions (`indexed<token_position>` or
+// `indexed<positions>`); without positions the engine degrades to a MUST of
+// the terms. Scored with BM25 like MatchQuery.
+message PhraseQuery {
+  string field = 1;
+  string text = 2;
+  uint32 slop = 3;
+  string tokenizer_hint = 4;  // See MatchQuery.tokenizer_hint
 }
 
 // Prefix query - matches all documents containing any term starting with prefix

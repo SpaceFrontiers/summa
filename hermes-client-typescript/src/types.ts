@@ -73,11 +73,24 @@ export type Combiner = "log_sum_exp" | "max" | "avg" | "sum" | "weighted_top_k";
 export interface TermQuery {
   field: string;
   term: string;
+  /** Passed to the field's tokenizer; a dynamic stemmer reads a language list ("ru,en"). */
+  tokenizerHint?: string;
 }
 
 export interface MatchQuery {
   field: string;
   text: string;
+  /** Passed to the field's tokenizer; a dynamic stemmer reads a language list ("ru,en"). */
+  tokenizerHint?: string;
+}
+
+/** Consecutive-terms query on a field indexed with token positions. */
+export interface PhraseQuery {
+  field: string;
+  text: string;
+  /** Max positions between terms; 0 = exact phrase. */
+  slop?: number;
+  tokenizerHint?: string;
 }
 
 export interface BooleanQuery {
@@ -192,6 +205,7 @@ export interface FusionQuery {
 export type Query =
   | { term: TermQuery }
   | { match: MatchQuery }
+  | { phrase: PhraseQuery }
   | { boolean: BooleanQuery }
   | { sparseVector: SparseVectorQuery }
   | { denseVector: DenseVectorQuery }

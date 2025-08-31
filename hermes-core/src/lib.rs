@@ -72,15 +72,16 @@ pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 
 // Re-exports from query
 pub use query::{
-    BinaryDenseVectorQuery, Bm25Params, BooleanQuery, BoostQuery, MaxScoreExecutor, PrefixQuery,
-    Query, ScoredDoc, Scorer, SearchHit, SearchResponse, SearchResult, TermQuery, TopKCollector,
+    BinaryDenseVectorQuery, Bm25Params, BooleanQuery, BoostQuery, MaxScoreExecutor, PhraseQuery,
+    PrefixQuery, Query, ScoredDoc, Scorer, SearchHit, SearchResponse, SearchResult, TermQuery,
+    TopKCollector,
 };
 
 // Re-exports from tokenizer
 pub use tokenizer::{
-    BoxedTokenizer, Language, LanguageAwareTokenizer, MultiLanguageStemmer, RawCiTokenizer,
-    RawTokenizer, SimpleTokenizer, StemmerTokenizer, Token, Tokenizer, TokenizerRegistry,
-    parse_language,
+    BoxedTokenizer, DynamicStemmer, Language, LanguageAwareTokenizer, MultiLanguageStemmer,
+    RawCiTokenizer, RawTokenizer, Script, SimpleTokenizer, StemmerTokenizer, Token, Tokenizer,
+    TokenizerRegistry, TokenizerSpec, language_code, parse_language, parse_language_opt,
 };
 
 // Re-exports from other modules

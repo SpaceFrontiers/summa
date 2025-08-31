@@ -554,3 +554,183 @@ async fn test_cross_segment_threshold_topk_matches_exhaustive() {
         }
     }
 }
+
+/// One `text<stem(by: languages, default: simple)>` field holds documents of
+/// several languages: each document is stemmed with the language(s) listed in
+/// its own `languages` values, and queries are stemmed by the hint they carry.
+#[tokio::test]
+async fn dynamic_stemmer_indexes_per_document_language() {
+    use crate::query::{BooleanQuery, TermQuery};
+    use crate::tokenizer::{DynamicStemmer, Tokenizer};
+
+    let mut schema_builder = SchemaBuilder::default();
+    let languages =
+        schema_builder.add_text_field_with_tokenizer("languages", false, true, "raw_ci");
+    let content = schema_builder.add_text_field_with_tokenizer(
+        "content",
+        true,
+        true,
+        "stem(by: languages, default: simple)",
+    );
+    let schema = schema_builder.build();
+    assert_eq!(schema.tokenizer_hint_field(content), Some(languages));
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    // Doc 0: English
+    let mut doc = Document::new();
+    doc.add_text(languages, "en");
+    doc.add_text(content, "running foxes");
+    writer.add_document(doc).unwrap();
+    // Doc 1: Russian
+    let mut doc = Document::new();
+    doc.add_text(languages, "ru");
+    doc.add_text(content, "бегущие собаки");
+    writer.add_document(doc).unwrap();
+    // Doc 2: Russian body with an English abstract, tagged with both languages
+    let mut doc = Document::new();
+    doc.add_text(languages, "ru");
+    doc.add_text(languages, "en");
+    doc.add_text(content, "бегущие собаки running foxes");
+    writer.add_document(doc).unwrap();
+    // Doc 3: untagged → simple tokenizer, exact forms only
+    let mut doc = Document::new();
+    doc.add_text(content, "running foxes");
+    writer.add_document(doc).unwrap();
+
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+
+    // Emulate the server: stem the query with the field's tokenizer + hint.
+    let stemmer = DynamicStemmer::new(None);
+    let query_for = |text: &str, hint: Option<&str>| {
+        let mut bq = BooleanQuery::new();
+        for token in Tokenizer::tokenize_hinted(&stemmer, text, hint) {
+            bq = bq.should(TermQuery::text(content, &token.text));
+        }
+        bq
+    };
+    let hits = |response: crate::query::SearchResponse| {
+        let mut ids: Vec<u32> = response.hits.iter().map(|h| h.address.doc_id).collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    // English inflection with an English hint: the English doc and the
+    // bilingual doc (its Latin tokens were stemmed with en), never the
+    // untagged doc (indexed as the exact form "foxes").
+    let response = index
+        .search(&query_for("fox", Some("en")), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits(response), vec![0, 2]);
+
+    // Russian inflection with a Russian hint: both Russian-tagged docs.
+    let response = index
+        .search(&query_for("собака", Some("ru")), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits(response), vec![1, 2]);
+
+    // No hint: exact tokens only, which is what the untagged doc indexed.
+    let response = index.search(&query_for("foxes", None), 10).await.unwrap();
+    assert_eq!(hits(response), vec![3]);
+
+    // A Russian hint does not stem Latin tokens, so "foxes" stays exact and
+    // still reaches the untagged document.
+    let response = index
+        .search(&query_for("foxes", Some("ru")), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits(response), vec![3]);
+}
+
+/// Wire-level phrase semantics: consecutive stemmed terms on a field with
+/// token positions; slop widens the window; a field without positions
+/// degrades to a MUST of the terms.
+#[tokio::test]
+async fn phrase_query_matches_consecutive_stemmed_terms() {
+    use crate::dsl::PositionMode;
+    use crate::query::PhraseQuery;
+    use crate::tokenizer::{DynamicStemmer, Tokenizer};
+
+    let mut schema_builder = SchemaBuilder::default();
+    let languages =
+        schema_builder.add_text_field_with_tokenizer("languages", false, true, "raw_ci");
+    let content = schema_builder.add_text_field_with_tokenizer(
+        "content",
+        true,
+        true,
+        "stem(by: languages, default: simple)",
+    );
+    schema_builder.set_positions(content, PositionMode::TokenPosition);
+    let flat = schema_builder.add_text_field_with_tokenizer("flat", true, false, "en_stem");
+    let schema = schema_builder.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+
+    for text in [
+        "the quick brown fox",
+        "the brown quick fox",
+        "quick and brown foxes",
+    ] {
+        let mut doc = Document::new();
+        doc.add_text(languages, "en");
+        doc.add_text(content, text);
+        doc.add_text(flat, text);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+
+    let stemmer = DynamicStemmer::new(None);
+    let phrase = |field, text: &str, slop| {
+        let terms = Tokenizer::tokenize_hinted(&stemmer, text, Some("en"))
+            .into_iter()
+            .map(|t| t.text.into_bytes())
+            .collect();
+        PhraseQuery::new(field, terms).with_slop(slop)
+    };
+    let hits = |response: crate::query::SearchResponse| {
+        let mut ids: Vec<u32> = response.hits.iter().map(|h| h.address.doc_id).collect();
+        ids.sort_unstable();
+        ids
+    };
+
+    // Exact phrase: only the document with the terms in order and adjacent.
+    let response = index
+        .search(&phrase(content, "quick brown", 0), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits(response), vec![0]);
+
+    // Stemmed phrase: "quick brown foxes" → quick brown fox matches doc 0.
+    let response = index
+        .search(&phrase(content, "Quick Brown Foxes", 0), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits(response), vec![0]);
+
+    // Slop 1 allows one intervening token ("quick and brown") but keeps the
+    // term order, so "brown quick" still does not match.
+    let response = index
+        .search(&phrase(content, "quick brown", 1), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits(response), vec![0, 2]);
+
+    // Without positions the phrase degrades to an AND of the terms.
+    let response = index
+        .search(&phrase(flat, "quick brown", 0), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits(response), vec![0, 1, 2]);
+}

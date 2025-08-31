@@ -9,8 +9,8 @@ use hermes_core::query::{
 use hermes_core::structures::QueryWeighting;
 use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
 use hermes_core::{
-    BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, PrefixQuery, Query, Schema,
-    TermQuery, TokenizerRegistry,
+    BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, PhraseQuery, PrefixQuery,
+    Query, Schema, TermQuery, TokenizerRegistry,
 };
 use log::{debug, warn};
 
@@ -28,6 +28,45 @@ fn validate_token_expansion(kind: &str, count: usize, maximum: usize) -> Result<
         ));
     }
     Ok(())
+}
+
+/// Resolve a text field and tokenize query text with the field's configured
+/// tokenizer, so stemmers (static or hinted dynamic ones) match the indexing
+/// path. An empty `tokenizer_hint` means "no hint".
+fn field_tokens(
+    kind: &str,
+    schema: &Schema,
+    field_name: &str,
+    text: &str,
+    tokenizer_hint: &str,
+    shape: &QueryShapeLimits,
+) -> Result<(hermes_core::Field, Vec<String>), String> {
+    let field = schema
+        .get_field(field_name)
+        .ok_or_else(|| format!("Field '{field_name}' not found"))?;
+    let entry = schema.get_field_entry(field);
+    if let Some(e) = entry
+        && e.field_type != hermes_core::FieldType::Text
+    {
+        return Err(format!(
+            "{kind} requires a text field, but '{field_name}' is {:?}. Use RangeQuery for numeric fields.",
+            e.field_type
+        ));
+    }
+    let tokenizer_name = entry
+        .and_then(|e| e.tokenizer.as_deref())
+        .unwrap_or("simple");
+    let tokenizer = TOKENIZER_REGISTRY
+        .get(tokenizer_name)
+        .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
+    let hint = Some(tokenizer_hint.trim()).filter(|hint| !hint.is_empty());
+    let tokens: Vec<String> = tokenizer
+        .tokenize_hinted(text, hint)
+        .into_iter()
+        .map(|t| t.text)
+        .collect();
+    validate_token_expansion(kind, tokens.len(), shape.max_text_query_tokens)?;
+    Ok((field, tokens))
 }
 
 /// Convert proto combiner enum to core MultiValueCombiner
@@ -63,32 +102,14 @@ pub fn convert_query(
 ) -> Result<Box<dyn Query>, String> {
     match &query.query {
         Some(ProtoQueryType::Term(term_query)) => {
-            let field = schema
-                .get_field(&term_query.field)
-                .ok_or_else(|| format!("Field '{}' not found", term_query.field))?;
-            let entry = schema.get_field_entry(field);
-            if let Some(e) = entry
-                && e.field_type != hermes_core::FieldType::Text
-            {
-                return Err(format!(
-                    "TermQuery requires a text field, but '{}' is {:?}. Use RangeQuery for numeric fields.",
-                    term_query.field, e.field_type
-                ));
-            }
-            // Tokenize the term using the field's configured tokenizer so that
-            // stemmers (e.g. ru_stem) are applied, matching the indexing path.
-            let tokenizer_name = entry
-                .and_then(|e| e.tokenizer.as_deref())
-                .unwrap_or("simple");
-            let tokenizer = TOKENIZER_REGISTRY
-                .get(tokenizer_name)
-                .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
-            let tokens: Vec<String> = tokenizer
-                .tokenize(&term_query.term)
-                .into_iter()
-                .map(|t| t.text)
-                .collect();
-            validate_token_expansion("TermQuery", tokens.len(), shape.max_text_query_tokens)?;
+            let (field, tokens) = field_tokens(
+                "TermQuery",
+                schema,
+                &term_query.field,
+                &term_query.term,
+                &term_query.tokenizer_hint,
+                shape,
+            )?;
             if tokens.is_empty() {
                 return Err(format!("No tokens in term '{}'", term_query.term));
             }
@@ -103,34 +124,25 @@ pub fn convert_query(
             }
         }
         Some(ProtoQueryType::Match(match_query)) => {
-            let field = schema
-                .get_field(&match_query.field)
-                .ok_or_else(|| format!("Field '{}' not found", match_query.field))?;
-
             // Trailing `*` → PrefixQuery (no tokenization, raw lowercased prefix)
             if let Some(prefix) = match_query.text.strip_suffix('*') {
+                let field = schema
+                    .get_field(&match_query.field)
+                    .ok_or_else(|| format!("Field '{}' not found", match_query.field))?;
                 if prefix.is_empty() {
                     return Err("Prefix query must not be empty".to_string());
                 }
                 return Ok(Box::new(PrefixQuery::text(field, prefix)));
             }
 
-            // Get the field's configured tokenizer (or default)
-            let tokenizer_name = schema
-                .get_field_entry(field)
-                .and_then(|entry| entry.tokenizer.as_deref())
-                .unwrap_or("simple");
-
-            let tokenizer = TOKENIZER_REGISTRY
-                .get(tokenizer_name)
-                .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
-
-            let tokens: Vec<String> = tokenizer
-                .tokenize(&match_query.text)
-                .into_iter()
-                .map(|t| t.text)
-                .collect();
-            validate_token_expansion("MatchQuery", tokens.len(), shape.max_text_query_tokens)?;
+            let (field, tokens) = field_tokens(
+                "MatchQuery",
+                schema,
+                &match_query.field,
+                &match_query.text,
+                &match_query.tokenizer_hint,
+                shape,
+            )?;
 
             if tokens.is_empty() {
                 return Err(format!(
@@ -150,6 +162,28 @@ pub fn convert_query(
                 query = query.should(TermQuery::text(field, &token));
             }
             Ok(Box::new(query))
+        }
+        Some(ProtoQueryType::Phrase(phrase_query)) => {
+            let (field, tokens) = field_tokens(
+                "PhraseQuery",
+                schema,
+                &phrase_query.field,
+                &phrase_query.text,
+                &phrase_query.tokenizer_hint,
+                shape,
+            )?;
+            if tokens.is_empty() {
+                return Err(format!(
+                    "No tokens in phrase query text '{}'",
+                    phrase_query.text
+                ));
+            }
+            // PhraseQuery itself collapses one term to a TermQuery and, on a
+            // field without positions, degrades to a MUST of the terms.
+            let terms = tokens.into_iter().map(String::into_bytes).collect();
+            Ok(Box::new(
+                PhraseQuery::new(field, terms).with_slop(phrase_query.slop),
+            ))
         }
         Some(ProtoQueryType::Boolean(bool_query)) => {
             convert_boolean_query(bool_query, schema, global_stats, idf_cache_dir, shape)
@@ -1207,6 +1241,170 @@ mod tests {
         assert!(validate_token_expansion("test", 257, 256).is_err());
     }
 
+    fn stemmed_text_schema() -> Schema {
+        let mut builder = hermes_core::SchemaBuilder::default();
+        builder.add_text_field_with_tokenizer("body", true, false, "en_stem");
+        builder.add_text_field_with_tokenizer("languages", false, false, "raw_ci");
+        builder.add_text_field_with_tokenizer(
+            "content",
+            true,
+            false,
+            "stem(by: languages, default: simple)",
+        );
+        builder.add_u64_field("views", true, false);
+        builder.build()
+    }
+
+    fn phrase_proto(field: &str, text: &str, slop: u32, hint: &str) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::Phrase(proto::PhraseQuery {
+                field: field.to_string(),
+                text: text.to_string(),
+                slop,
+                tokenizer_hint: hint.to_string(),
+            })),
+        }
+    }
+
+    fn match_proto(field: &str, text: &str, hint: &str) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: field.to_string(),
+                text: text.to_string(),
+                tokenizer_hint: hint.to_string(),
+            })),
+        }
+    }
+
+    #[test]
+    fn phrase_query_tokenizes_with_the_field_stemmer() {
+        let schema = stemmed_text_schema();
+        let query = convert_query(
+            &phrase_proto("body", "Running Foxes", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(rendered.contains("Phrase("), "{rendered}");
+        assert!(rendered.contains("\"run fox\""), "{rendered}");
+        assert!(!rendered.contains('~'), "{rendered}");
+
+        let slop = convert_query(
+            &phrase_proto("body", "Running Foxes", 2, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        assert!(slop.to_string().contains("~2"), "{slop}");
+    }
+
+    #[test]
+    fn phrase_and_match_queries_honour_the_tokenizer_hint() {
+        let schema = stemmed_text_schema();
+        let hinted = convert_query(
+            &phrase_proto("content", "бегущие foxes", 0, "ru,en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(hinted.contains("\"бегущ fox\""), "{hinted}");
+
+        // No hint → the spec default (simple): cleaned but unstemmed terms.
+        let unhinted = convert_query(
+            &phrase_proto("content", "бегущие foxes", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(unhinted.contains("\"бегущие foxes\""), "{unhinted}");
+
+        // MatchQuery: a single stemmed token collapses to a TermQuery.
+        let matched = convert_query(
+            &match_proto("content", "Foxes", "en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(matched.contains("fox"), "{matched}");
+        assert!(!matched.contains("foxes"), "{matched}");
+
+        // Static tokenizers ignore the hint.
+        let static_hint = convert_query(
+            &match_proto("body", "Foxes", "ru"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(static_hint.contains("fox"), "{static_hint}");
+    }
+
+    #[test]
+    fn phrase_query_rejects_bad_fields_and_empty_text() {
+        let schema = stemmed_text_schema();
+        let unknown = convert_query(
+            &phrase_proto("missing", "quick fox", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .err()
+        .unwrap();
+        assert!(unknown.contains("not found"), "{unknown}");
+
+        let numeric = convert_query(
+            &phrase_proto("views", "quick fox", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .err()
+        .unwrap();
+        assert!(numeric.contains("requires a text field"), "{numeric}");
+
+        let empty = convert_query(
+            &phrase_proto("body", " ... ", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .err()
+        .unwrap();
+        assert!(empty.contains("No tokens"), "{empty}");
+
+        let mut tight = shape();
+        tight.max_text_query_tokens = 2;
+        let too_many = convert_query(
+            &phrase_proto("body", "one two three", 0, ""),
+            &schema,
+            None,
+            None,
+            &tight,
+        )
+        .err()
+        .unwrap();
+        assert!(too_many.contains("expands to 3 tokens"), "{too_many}");
+    }
+
     fn dense_test_schema(nprobe: usize) -> Schema {
         let mut builder = hermes_core::SchemaBuilder::default();
         let mut config = hermes_core::dsl::DenseVectorConfig::new(3);
@@ -1339,6 +1537,7 @@ mod tests {
             query: Some(ProtoQueryType::Match(proto::MatchQuery {
                 field: "title".to_string(),
                 text: "*".to_string(),
+                tokenizer_hint: String::new(),
             })),
         };
         let explicit_empty_prefix = proto::Query {
@@ -1469,6 +1668,8 @@ mod tests {
                 field price: f64 [indexed, fast]
                 field count: u64 [indexed, stored, fast]
                 field tags: text<raw_ci> [indexed, stored<multi>, fast]
+                field languages: text<raw_ci> [fast]
+                field content: text<stem(by: languages, default: simple)> [indexed<token_position>]
                 field sparse_emb: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
                 field dense_emb: dense_vector<1024, f16> [indexed<ivf_pq, routing: hnsw, num_clusters: 256>, stored<multi>]
                 field scann_emb: dense_vector<768, f16> [indexed<scann, num_clusters: 4096, tree_levels: 2, nprobe: 128>]

@@ -21,6 +21,10 @@ pub struct SegmentBuilderStats {
     pub estimated_memory_bytes: usize,
     /// Memory breakdown by component
     pub memory_breakdown: MemoryBreakdown,
+    /// Documents indexed into a dynamically tokenized field
+    /// (`text<stem(by: ...)>`) without any value in the hint field, so the
+    /// tokenizer's default applied.
+    pub unhinted_dynamic_docs: u64,
 }
 
 /// Detailed memory breakdown by component

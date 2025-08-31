@@ -163,6 +163,7 @@ export interface Query {
     | undefined;
   /** Top-level only (cannot be nested) */
   fusion?: FusionQuery | undefined;
+  phrase?: PhraseQuery | undefined;
 }
 
 /** Weighted sub-query for hybrid fusion */
@@ -258,6 +259,8 @@ export interface BinaryDenseVectorQuery {
 export interface TermQuery {
   field: string;
   term: string;
+  /** Optional hint for the field's tokenizer (see MatchQuery.tokenizer_hint) */
+  tokenizerHint: string;
 }
 
 export interface BooleanQuery {
@@ -295,6 +298,30 @@ export interface RangeQuery {
 export interface MatchQuery {
   field: string;
   text: string;
+  /**
+   * Optional hint passed to the field's tokenizer. Static tokenizers ignore
+   * it; a dynamic stemmer (`text<stem(by: languages, default: simple)>`)
+   * reads it as a comma-separated list of language codes ("ru,en") and stems
+   * each query token with the first listed language of the token's script.
+   * Empty = the tokenizer's default.
+   */
+  tokenizerHint: string;
+}
+
+/**
+ * Phrase query - text is tokenized server-side with the field's tokenizer
+ * (so stemming matches indexing) and the terms must occur consecutively
+ * (slop 0) or within `slop` positions of each other. Requires the field to be
+ * indexed with token positions (`indexed<token_position>` or
+ * `indexed<positions>`); without positions the engine degrades to a MUST of
+ * the terms. Scored with BM25 like MatchQuery.
+ */
+export interface PhraseQuery {
+  field: string;
+  text: string;
+  slop: number;
+  /** See MatchQuery.tokenizer_hint */
+  tokenizerHint: string;
 }
 
 /**
@@ -651,6 +678,7 @@ function createBaseQuery(): Query {
     prefix: undefined,
     binaryDenseVector: undefined,
     fusion: undefined,
+    phrase: undefined,
   };
 }
 
@@ -688,6 +716,9 @@ export const Query: MessageFns<Query> = {
     }
     if (message.fusion !== undefined) {
       FusionQuery.encode(message.fusion, writer.uint32(90).fork()).join();
+    }
+    if (message.phrase !== undefined) {
+      PhraseQuery.encode(message.phrase, writer.uint32(98).fork()).join();
     }
     return writer;
   },
@@ -787,6 +818,14 @@ export const Query: MessageFns<Query> = {
           message.fusion = FusionQuery.decode(reader, reader.uint32());
           continue;
         }
+        case 12: {
+          if (tag !== 98) {
+            break;
+          }
+
+          message.phrase = PhraseQuery.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -821,6 +860,7 @@ export const Query: MessageFns<Query> = {
         ? BinaryDenseVectorQuery.fromJSON(object.binary_dense_vector)
         : undefined,
       fusion: isSet(object.fusion) ? FusionQuery.fromJSON(object.fusion) : undefined,
+      phrase: isSet(object.phrase) ? PhraseQuery.fromJSON(object.phrase) : undefined,
     };
   },
 
@@ -859,6 +899,9 @@ export const Query: MessageFns<Query> = {
     if (message.fusion !== undefined) {
       obj.fusion = FusionQuery.toJSON(message.fusion);
     }
+    if (message.phrase !== undefined) {
+      obj.phrase = PhraseQuery.toJSON(message.phrase);
+    }
     return obj;
   },
 
@@ -895,6 +938,9 @@ export const Query: MessageFns<Query> = {
       : undefined;
     message.fusion = (object.fusion !== undefined && object.fusion !== null)
       ? FusionQuery.fromPartial(object.fusion)
+      : undefined;
+    message.phrase = (object.phrase !== undefined && object.phrase !== null)
+      ? PhraseQuery.fromPartial(object.phrase)
       : undefined;
     return message;
   },
@@ -1748,7 +1794,7 @@ export const BinaryDenseVectorQuery: MessageFns<BinaryDenseVectorQuery> = {
 };
 
 function createBaseTermQuery(): TermQuery {
-  return { field: "", term: "" };
+  return { field: "", term: "", tokenizerHint: "" };
 }
 
 export const TermQuery: MessageFns<TermQuery> = {
@@ -1758,6 +1804,9 @@ export const TermQuery: MessageFns<TermQuery> = {
     }
     if (message.term !== "") {
       writer.uint32(18).string(message.term);
+    }
+    if (message.tokenizerHint !== "") {
+      writer.uint32(26).string(message.tokenizerHint);
     }
     return writer;
   },
@@ -1785,6 +1834,14 @@ export const TermQuery: MessageFns<TermQuery> = {
           message.term = reader.string();
           continue;
         }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.tokenizerHint = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1798,6 +1855,11 @@ export const TermQuery: MessageFns<TermQuery> = {
     return {
       field: isSet(object.field) ? globalThis.String(object.field) : "",
       term: isSet(object.term) ? globalThis.String(object.term) : "",
+      tokenizerHint: isSet(object.tokenizerHint)
+        ? globalThis.String(object.tokenizerHint)
+        : isSet(object.tokenizer_hint)
+        ? globalThis.String(object.tokenizer_hint)
+        : "",
     };
   },
 
@@ -1809,6 +1871,9 @@ export const TermQuery: MessageFns<TermQuery> = {
     if (message.term !== "") {
       obj.term = message.term;
     }
+    if (message.tokenizerHint !== "") {
+      obj.tokenizerHint = message.tokenizerHint;
+    }
     return obj;
   },
 
@@ -1819,6 +1884,7 @@ export const TermQuery: MessageFns<TermQuery> = {
     const message = createBaseTermQuery();
     message.field = object.field ?? "";
     message.term = object.term ?? "";
+    message.tokenizerHint = object.tokenizerHint ?? "";
     return message;
   },
 };
@@ -2227,7 +2293,7 @@ export const RangeQuery: MessageFns<RangeQuery> = {
 };
 
 function createBaseMatchQuery(): MatchQuery {
-  return { field: "", text: "" };
+  return { field: "", text: "", tokenizerHint: "" };
 }
 
 export const MatchQuery: MessageFns<MatchQuery> = {
@@ -2237,6 +2303,9 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     }
     if (message.text !== "") {
       writer.uint32(18).string(message.text);
+    }
+    if (message.tokenizerHint !== "") {
+      writer.uint32(26).string(message.tokenizerHint);
     }
     return writer;
   },
@@ -2264,6 +2333,14 @@ export const MatchQuery: MessageFns<MatchQuery> = {
           message.text = reader.string();
           continue;
         }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.tokenizerHint = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2277,6 +2354,11 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     return {
       field: isSet(object.field) ? globalThis.String(object.field) : "",
       text: isSet(object.text) ? globalThis.String(object.text) : "",
+      tokenizerHint: isSet(object.tokenizerHint)
+        ? globalThis.String(object.tokenizerHint)
+        : isSet(object.tokenizer_hint)
+        ? globalThis.String(object.tokenizer_hint)
+        : "",
     };
   },
 
@@ -2288,6 +2370,9 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     if (message.text !== "") {
       obj.text = message.text;
     }
+    if (message.tokenizerHint !== "") {
+      obj.tokenizerHint = message.tokenizerHint;
+    }
     return obj;
   },
 
@@ -2298,6 +2383,119 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     const message = createBaseMatchQuery();
     message.field = object.field ?? "";
     message.text = object.text ?? "";
+    message.tokenizerHint = object.tokenizerHint ?? "";
+    return message;
+  },
+};
+
+function createBasePhraseQuery(): PhraseQuery {
+  return { field: "", text: "", slop: 0, tokenizerHint: "" };
+}
+
+export const PhraseQuery: MessageFns<PhraseQuery> = {
+  encode(message: PhraseQuery, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.field !== "") {
+      writer.uint32(10).string(message.field);
+    }
+    if (message.text !== "") {
+      writer.uint32(18).string(message.text);
+    }
+    if (message.slop !== 0) {
+      writer.uint32(24).uint32(message.slop);
+    }
+    if (message.tokenizerHint !== "") {
+      writer.uint32(34).string(message.tokenizerHint);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): PhraseQuery {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBasePhraseQuery();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.field = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.text = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.slop = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.tokenizerHint = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): PhraseQuery {
+    return {
+      field: isSet(object.field) ? globalThis.String(object.field) : "",
+      text: isSet(object.text) ? globalThis.String(object.text) : "",
+      slop: isSet(object.slop) ? globalThis.Number(object.slop) : 0,
+      tokenizerHint: isSet(object.tokenizerHint)
+        ? globalThis.String(object.tokenizerHint)
+        : isSet(object.tokenizer_hint)
+        ? globalThis.String(object.tokenizer_hint)
+        : "",
+    };
+  },
+
+  toJSON(message: PhraseQuery): unknown {
+    const obj: any = {};
+    if (message.field !== "") {
+      obj.field = message.field;
+    }
+    if (message.text !== "") {
+      obj.text = message.text;
+    }
+    if (message.slop !== 0) {
+      obj.slop = Math.round(message.slop);
+    }
+    if (message.tokenizerHint !== "") {
+      obj.tokenizerHint = message.tokenizerHint;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<PhraseQuery>): PhraseQuery {
+    return PhraseQuery.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<PhraseQuery>): PhraseQuery {
+    const message = createBasePhraseQuery();
+    message.field = object.field ?? "";
+    message.text = object.text ?? "";
+    message.slop = object.slop ?? 0;
+    message.tokenizerHint = object.tokenizerHint ?? "";
     return message;
   },
 };

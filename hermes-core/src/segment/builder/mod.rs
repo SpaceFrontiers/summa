@@ -216,6 +216,14 @@ pub struct SegmentBuilder {
     schema: Arc<Schema>,
     config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
+    /// Text field → sibling field whose values hint its dynamic tokenizer
+    /// (`text<stem(by: languages, ...)>`).
+    tokenizer_hint_fields: FxHashMap<Field, Field>,
+    /// Reusable buffer holding the comma-joined hint of the current document.
+    tokenizer_hint_buffer: String,
+    /// Documents indexed into a hinted field without any hint value present
+    /// (fell back to the tokenizer's default). Reported in builder stats.
+    unhinted_dynamic_docs: u64,
 
     /// String interner for terms - O(1) lookup and deduplication
     term_interner: Rodeo,
@@ -333,6 +341,7 @@ impl SegmentBuilder {
         let mut field_to_slot = FxHashMap::default();
         let mut position_enabled_fields = FxHashMap::default();
         let mut tokenizers = FxHashMap::default();
+        let mut tokenizer_hint_fields = FxHashMap::default();
         for (field, entry) in schema.fields() {
             if entry.indexed && matches!(entry.field_type, FieldType::Text) {
                 field_to_slot.insert(field.0, num_indexed_fields);
@@ -344,6 +353,9 @@ impl SegmentBuilder {
                     && let Some(tokenizer) = registry.get(tok_name)
                 {
                     tokenizers.insert(field, tokenizer);
+                }
+                if let Some(hint_field) = schema.tokenizer_hint_field(field) {
+                    tokenizer_hint_fields.insert(field, hint_field);
                 }
             }
         }
@@ -383,6 +395,9 @@ impl SegmentBuilder {
         Ok(Self {
             schema,
             tokenizers,
+            tokenizer_hint_fields,
+            tokenizer_hint_buffer: String::new(),
+            unhinted_dynamic_docs: 0,
             term_interner: Rodeo::new(),
             inverted_index: HashMap::with_capacity(config.posting_map_capacity),
             #[cfg(feature = "native")]
@@ -424,6 +439,46 @@ impl SegmentBuilder {
 
     pub fn set_tokenizer(&mut self, field: Field, tokenizer: BoxedTokenizer) {
         self.tokenizers.insert(field, tokenizer);
+    }
+
+    /// Documents that hit a dynamically tokenized field without a hint value.
+    pub fn unhinted_dynamic_docs(&self) -> u64 {
+        self.unhinted_dynamic_docs
+    }
+
+    /// Resolve the tokenizer hint for `field` from the document's hint field.
+    ///
+    /// Returns `true` when `field` is dynamically tokenized; the hint text
+    /// (all values of the hint field, trimmed, lowercased, comma-joined) is
+    /// left in `tokenizer_hint_buffer`, empty when the document carries none.
+    fn resolve_tokenizer_hint(
+        &mut self,
+        field: Field,
+        doc: &Document,
+        element_ordinal: u32,
+    ) -> bool {
+        let Some(&hint_field) = self.tokenizer_hint_fields.get(&field) else {
+            return false;
+        };
+        self.tokenizer_hint_buffer.clear();
+        for value in doc.get_all(hint_field) {
+            if let FieldValue::Text(hint) = value {
+                let hint = hint.trim();
+                if hint.is_empty() {
+                    continue;
+                }
+                if !self.tokenizer_hint_buffer.is_empty() {
+                    self.tokenizer_hint_buffer.push(',');
+                }
+                for c in hint.chars().flat_map(char::to_lowercase) {
+                    self.tokenizer_hint_buffer.push(c);
+                }
+            }
+        }
+        if self.tokenizer_hint_buffer.is_empty() && element_ordinal == 0 {
+            self.unhinted_dynamic_docs += 1;
+        }
+        true
     }
 
     /// Get the current element ordinal for a field and increment it.
@@ -583,6 +638,7 @@ impl SegmentBuilder {
             doc_field_lengths_size: self.doc_field_lengths.len(),
             estimated_memory_bytes,
             memory_breakdown,
+            unhinted_dynamic_docs: self.unhinted_dynamic_docs,
         }
     }
 
@@ -702,8 +758,9 @@ impl SegmentBuilder {
                 (FieldType::Text, FieldValue::Text(text)) => {
                     if entry.indexed {
                         let element_ordinal = self.next_element_ordinal(field.0);
+                        let hinted = self.resolve_tokenizer_hint(*field, &doc, element_ordinal);
                         let token_count =
-                            self.index_text_field(*field, doc_id, text, element_ordinal)?;
+                            self.index_text_field(*field, doc_id, text, element_ordinal, hinted)?;
 
                         let stats = self.field_stats.entry(field.0).or_default();
                         stats.total_tokens += token_count as u64;
@@ -789,6 +846,7 @@ impl SegmentBuilder {
         doc_id: DocId,
         text: &str,
         element_ordinal: u32,
+        hinted: bool,
     ) -> Result<u32> {
         use crate::dsl::PositionMode;
 
@@ -828,7 +886,15 @@ impl SegmentBuilder {
         // Tokenize: use custom tokenizer if set, else inline zero-alloc path.
         // The owned Vec<Token> is computed first so the immutable borrow of
         // self.tokenizers ends before we mutate other fields.
-        let custom_tokens = self.tokenizers.get(&field).map(|t| t.tokenize(text));
+        let custom_tokens = self.tokenizers.get(&field).map(|t| {
+            if hinted {
+                let hint = (!self.tokenizer_hint_buffer.is_empty())
+                    .then_some(self.tokenizer_hint_buffer.as_str());
+                t.tokenize_hinted(text, hint)
+            } else {
+                t.tokenize(text)
+            }
+        });
 
         if let Some(tokens) = custom_tokens {
             // Custom tokenizer path

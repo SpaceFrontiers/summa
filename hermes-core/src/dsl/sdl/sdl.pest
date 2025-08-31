@@ -114,8 +114,11 @@ quant_type_spec = { "f32" | "f16" | "uint8" | "u8" }
 //   field hash: binary_vector<1024> [indexed, stored]
 binary_dense_vector_config = { "<" ~ dimension_spec ~ ">" }
 
-// Tokenizer specification: <tokenizer_name>
-tokenizer_spec = { "<" ~ identifier ~ ">" }
+// Tokenizer specification: <tokenizer_name> or a parameterized dynamic spec
+//   field content: text<stem(by: languages, default: simple)> [indexed<token_position>]
+tokenizer_spec = { "<" ~ identifier ~ tokenizer_params? ~ ">" }
+tokenizer_params = { "(" ~ tokenizer_param ~ ("," ~ tokenizer_param)* ~ ")" }
+tokenizer_param = { identifier ~ ":" ~ identifier }
 
 // Attributes like [indexed, stored]
 // indexed can have optional index config: indexed<positions> or indexed<ivf_tq, nprobe: 64>

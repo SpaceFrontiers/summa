@@ -65,11 +65,16 @@ impl PhraseQuery {
         }
     }
 
-    /// Create from text (splits on whitespace and lowercases)
+    /// Create from text using the simple tokenizer (whitespace split,
+    /// punctuation stripped, lowercased). Fields with a stemming tokenizer
+    /// should tokenize the phrase themselves and call [`PhraseQuery::new`] so
+    /// the query terms match the indexed stems.
     pub fn text(field: Field, phrase: &str) -> Self {
-        let terms: Vec<Vec<u8>> = phrase
-            .split_whitespace()
-            .map(|w| w.to_lowercase().into_bytes())
+        use crate::tokenizer::Tokenizer;
+        let terms: Vec<Vec<u8>> = crate::tokenizer::SimpleTokenizer
+            .tokenize(phrase)
+            .into_iter()
+            .map(|token| token.text.into_bytes())
             .collect();
         Self {
             field,

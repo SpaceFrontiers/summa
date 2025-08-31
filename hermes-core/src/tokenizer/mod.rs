@@ -51,6 +51,17 @@ impl Token {
 pub trait Tokenizer: Send + Sync + Clone + 'static {
     /// Tokenize the input text into a vector of tokens
     fn tokenize(&self, text: &str) -> Vec<Token>;
+
+    /// Tokenize with an optional caller-supplied hint.
+    ///
+    /// Static tokenizers ignore the hint. Dynamic tokenizers (see
+    /// [`DynamicStemmer`]) interpret it — e.g. as a comma-separated list of
+    /// language codes taken from a sibling document field at index time and
+    /// from `tokenizer_hint` on the query at search time.
+    fn tokenize_hinted(&self, text: &str, hint: Option<&str>) -> Vec<Token> {
+        let _ = hint;
+        self.tokenize(text)
+    }
 }
 
 /// Simple tokenizer — splits on whitespace, strips non-alphanumeric, and lowercases.
@@ -446,6 +457,13 @@ where
         // Default to English when no hint is provided
         self.stemmer.tokenize_with_language(text, Language::English)
     }
+
+    fn tokenize_hinted(&self, text: &str, hint: Option<&str>) -> Vec<Token> {
+        match hint {
+            Some(hint) => self.tokenize_with_hint(text, hint),
+            None => Tokenizer::tokenize(self, text),
+        }
+    }
 }
 
 /// Parse a language string into a Language enum
@@ -475,17 +493,330 @@ pub fn parse_language(s: &str) -> Language {
     }
 }
 
+/// Parse a language string into a Language, returning `None` for unknown values.
+///
+/// Accepts ISO 639-1 codes and English language names, case-insensitively.
+/// Unlike [`parse_language`], unknown input is not silently mapped to English.
+pub fn parse_language_opt(s: &str) -> Option<Language> {
+    Some(match s.trim().to_lowercase().as_str() {
+        "ar" | "arabic" => Language::Arabic,
+        "da" | "danish" => Language::Danish,
+        "nl" | "dutch" => Language::Dutch,
+        "en" | "english" => Language::English,
+        "fi" | "finnish" => Language::Finnish,
+        "fr" | "french" => Language::French,
+        "de" | "german" => Language::German,
+        "el" | "greek" => Language::Greek,
+        "hu" | "hungarian" => Language::Hungarian,
+        "it" | "italian" => Language::Italian,
+        "no" | "norwegian" => Language::Norwegian,
+        "pt" | "portuguese" => Language::Portuguese,
+        "ro" | "romanian" => Language::Romanian,
+        "ru" | "russian" => Language::Russian,
+        "es" | "spanish" => Language::Spanish,
+        "sv" | "swedish" => Language::Swedish,
+        "ta" | "tamil" => Language::Tamil,
+        "tr" | "turkish" => Language::Turkish,
+        _ => return None,
+    })
+}
+
+/// Writing system of a token, used to route it to a stemmer of the same script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Script {
+    Latin,
+    Cyrillic,
+    Greek,
+    Arabic,
+    Tamil,
+    /// Any other script (CJK, Hebrew, digits-only tokens, ...)
+    Other,
+}
+
+impl Script {
+    /// Script of the first alphabetic character of `token`; `Other` when none.
+    pub fn of_token(token: &str) -> Script {
+        let Some(c) = token.chars().find(|c| c.is_alphabetic()) else {
+            return Script::Other;
+        };
+        Script::of_char(c)
+    }
+
+    fn of_char(c: char) -> Script {
+        match c as u32 {
+            // Basic Latin, Latin-1 Supplement, Latin Extended-A/B, Latin Extended Additional
+            0x0041..=0x024F | 0x1E00..=0x1EFF => Script::Latin,
+            0x0370..=0x03FF | 0x1F00..=0x1FFF => Script::Greek,
+            0x0400..=0x052F => Script::Cyrillic,
+            0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF => Script::Arabic,
+            0x0B80..=0x0BFF => Script::Tamil,
+            _ => Script::Other,
+        }
+    }
+}
+
+impl Language {
+    /// Script the Snowball algorithm of this language operates on.
+    pub fn script(self) -> Script {
+        match self {
+            Language::Russian => Script::Cyrillic,
+            Language::Greek => Script::Greek,
+            Language::Arabic => Script::Arabic,
+            Language::Tamil => Script::Tamil,
+            _ => Script::Latin,
+        }
+    }
+}
+
+thread_local! {
+    static STEMMER_CACHE: std::cell::RefCell<HashMap<Language, rust_stemmers::Stemmer>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Stem `word` with the cached Snowball stemmer for `language`.
+fn stem_cached(language: Language, word: &str) -> String {
+    STEMMER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let stemmer = cache
+            .entry(language)
+            .or_insert_with(|| rust_stemmers::Stemmer::create(language.to_algorithm()));
+        stemmer.stem(word).into_owned()
+    })
+}
+
+/// Stemmer whose language is selected per call from the tokenizer hint.
+///
+/// The hint is a comma-separated list of language codes or names (`"ru,en"`).
+/// Each token is stemmed with the first hinted language whose script matches
+/// the token's script; tokens of a script no hinted language covers are kept
+/// as cleaned (lowercased, punctuation stripped) text. Without a hint the
+/// `default` language applies, or plain cleaning when it is `None`.
+///
+/// Because Snowball stemmers are script-local, one field can hold mixed
+/// Cyrillic/Latin documents and still stem each part correctly.
+///
+/// Declared in SDL as `text<stem(by: <field>, default: <language|simple>)>`;
+/// see [`TokenizerSpec`].
+#[derive(Debug, Clone, Default)]
+pub struct DynamicStemmer {
+    default: Option<Language>,
+}
+
+impl DynamicStemmer {
+    /// Create a dynamic stemmer; `default` applies when no hint is present.
+    pub fn new(default: Option<Language>) -> Self {
+        Self { default }
+    }
+
+    /// Default language used when no hint is given.
+    pub fn default_language(&self) -> Option<Language> {
+        self.default
+    }
+
+    /// Parse a hint into the ordered list of recognised languages.
+    pub fn parse_hint(hint: &str) -> Vec<Language> {
+        let mut languages = Vec::new();
+        for part in hint.split(',') {
+            if let Some(language) = parse_language_opt(part)
+                && !languages.contains(&language)
+            {
+                languages.push(language);
+            }
+        }
+        languages
+    }
+
+    fn tokenize_with_languages(&self, text: &str, languages: &[Language]) -> Vec<Token> {
+        match languages {
+            [] => tokenize_and_clean(text, |s| s),
+            [single] if single.script() == Script::Latin => {
+                let language = *single;
+                tokenize_and_clean(text, |s| {
+                    if Script::of_token(&s) == Script::Latin {
+                        stem_cached(language, &s)
+                    } else {
+                        s
+                    }
+                })
+            }
+            many => tokenize_and_clean(text, |s| {
+                let script = Script::of_token(&s);
+                match many.iter().find(|language| language.script() == script) {
+                    Some(language) => stem_cached(*language, &s),
+                    None => s,
+                }
+            }),
+        }
+    }
+}
+
+impl Tokenizer for DynamicStemmer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        match self.default {
+            Some(language) => self.tokenize_with_languages(text, &[language]),
+            None => tokenize_and_clean(text, |s| s),
+        }
+    }
+
+    fn tokenize_hinted(&self, text: &str, hint: Option<&str>) -> Vec<Token> {
+        match hint.map(str::trim).filter(|hint| !hint.is_empty()) {
+            Some(hint) => {
+                let languages = Self::parse_hint(hint);
+                if languages.is_empty() {
+                    // Hinted but nothing recognised: fall back to the default.
+                    Tokenizer::tokenize(self, text)
+                } else {
+                    self.tokenize_with_languages(text, &languages)
+                }
+            }
+            None => Tokenizer::tokenize(self, text),
+        }
+    }
+}
+
+/// Parsed form of a tokenizer name in the schema.
+///
+/// Plain names refer to a registered tokenizer (`simple`, `en_stem`, ...).
+/// `stem(by: <field>, default: <language|simple>)` declares a
+/// [`DynamicStemmer`] whose per-document hint is read from `<field>` in the
+/// same document. The canonical string form is stored in
+/// `FieldEntry::tokenizer`, so index metadata needs no new field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenizerSpec {
+    /// A registered tokenizer name.
+    Named(String),
+    /// Dynamic stemmer hinted by another field of the document.
+    DynamicStem {
+        /// Field whose text values supply the language hint.
+        by: String,
+        /// Language applied when the hint field is absent; `None` = simple.
+        default: Option<Language>,
+    },
+}
+
+impl TokenizerSpec {
+    /// Parse a tokenizer name or `stem(...)` spec.
+    pub fn parse(spec: &str) -> Result<TokenizerSpec, String> {
+        let spec = spec.trim();
+        let Some(rest) = spec.strip_prefix("stem(") else {
+            if spec.is_empty() || spec.contains(['(', ')', ':', ',']) {
+                return Err(format!("invalid tokenizer spec '{spec}'"));
+            }
+            return Ok(TokenizerSpec::Named(spec.to_string()));
+        };
+        let Some(params) = rest.strip_suffix(')') else {
+            return Err(format!("tokenizer spec '{spec}' is missing ')'"));
+        };
+        let mut by = None;
+        let mut default = None;
+        for param in params.split(',') {
+            let param = param.trim();
+            if param.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = param.split_once(':') else {
+                return Err(format!(
+                    "tokenizer spec '{spec}': parameter '{param}' must be 'key: value'"
+                ));
+            };
+            let (key, value) = (key.trim(), value.trim());
+            match key {
+                "by" if !value.is_empty() => by = Some(value.to_string()),
+                "by" => return Err(format!("tokenizer spec '{spec}': 'by' needs a field name")),
+                "default" => {
+                    default = match value {
+                        "simple" | "none" => None,
+                        other => Some(parse_language_opt(other).ok_or_else(|| {
+                            format!("tokenizer spec '{spec}': unknown default language '{other}'")
+                        })?),
+                    };
+                }
+                other => {
+                    return Err(format!(
+                        "tokenizer spec '{spec}': unknown parameter '{other}'"
+                    ));
+                }
+            }
+        }
+        let by = by.ok_or_else(|| format!("tokenizer spec '{spec}' requires 'by: <field>'"))?;
+        Ok(TokenizerSpec::DynamicStem { by, default })
+    }
+
+    /// Field whose values hint the tokenizer, for dynamic specs.
+    pub fn hint_field(&self) -> Option<&str> {
+        match self {
+            TokenizerSpec::Named(_) => None,
+            TokenizerSpec::DynamicStem { by, .. } => Some(by),
+        }
+    }
+
+    /// Build the tokenizer described by a dynamic spec.
+    pub fn dynamic_tokenizer(&self) -> Option<BoxedTokenizer> {
+        match self {
+            TokenizerSpec::Named(_) => None,
+            TokenizerSpec::DynamicStem { default, .. } => {
+                Some(Box::new(DynamicStemmer::new(*default)))
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TokenizerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenizerSpec::Named(name) => f.write_str(name),
+            TokenizerSpec::DynamicStem { by, default } => {
+                let default = match default {
+                    None => "simple".to_string(),
+                    Some(language) => language_code(*language).to_string(),
+                };
+                write!(f, "stem(by: {by}, default: {default})")
+            }
+        }
+    }
+}
+
+/// ISO 639-1 code of a stemmer language.
+pub fn language_code(language: Language) -> &'static str {
+    match language {
+        Language::Arabic => "ar",
+        Language::Danish => "da",
+        Language::Dutch => "nl",
+        Language::English => "en",
+        Language::Finnish => "fi",
+        Language::French => "fr",
+        Language::German => "de",
+        Language::Greek => "el",
+        Language::Hungarian => "hu",
+        Language::Italian => "it",
+        Language::Norwegian => "no",
+        Language::Portuguese => "pt",
+        Language::Romanian => "ro",
+        Language::Russian => "ru",
+        Language::Spanish => "es",
+        Language::Swedish => "sv",
+        Language::Tamil => "ta",
+        Language::Turkish => "tr",
+    }
+}
+
 /// Boxed tokenizer for dynamic dispatch
 pub type BoxedTokenizer = Box<dyn TokenizerClone>;
 
 pub trait TokenizerClone: Send + Sync {
     fn tokenize(&self, text: &str) -> Vec<Token>;
+    /// Hinted tokenization; see [`Tokenizer::tokenize_hinted`].
+    fn tokenize_hinted(&self, text: &str, hint: Option<&str>) -> Vec<Token>;
     fn clone_box(&self) -> BoxedTokenizer;
 }
 
 impl<T: Tokenizer> TokenizerClone for T {
     fn tokenize(&self, text: &str) -> Vec<Token> {
         Tokenizer::tokenize(self, text)
+    }
+
+    fn tokenize_hinted(&self, text: &str, hint: Option<&str>) -> Vec<Token> {
+        Tokenizer::tokenize_hinted(self, text, hint)
     }
 
     fn clone_box(&self) -> BoxedTokenizer {
@@ -520,8 +851,9 @@ impl TokenizerRegistry {
 
     /// Register default tokenizers
     fn register_defaults(&self) {
-        // Basic tokenizers
+        // Basic tokenizers ("default" is the documented alias of "simple")
         self.register("simple", SimpleTokenizer);
+        self.register("default", SimpleTokenizer);
         self.register("raw", RawTokenizer);
         self.register("raw_ci", RawCiTokenizer);
 
@@ -616,8 +948,16 @@ impl TokenizerRegistry {
         tokenizers.insert(name.to_string(), Box::new(tokenizer));
     }
 
-    /// Get a tokenizer by name
+    /// Get a tokenizer by name or by a `stem(by: ..., default: ...)` spec.
+    ///
+    /// Dynamic specs are not stored in the registry: a fresh
+    /// [`DynamicStemmer`] is built from the spec on every call.
     pub fn get(&self, name: &str) -> Option<BoxedTokenizer> {
+        if name.starts_with("stem(") {
+            return TokenizerSpec::parse(name)
+                .ok()
+                .and_then(|spec| spec.dynamic_tokenizer());
+        }
         let tokenizers = self.tokenizers.read();
         tokenizers.get(name).cloned()
     }
@@ -964,5 +1304,170 @@ mod tests {
         let texts: Vec<&str> = tokens.iter().map(|t| t.text.as_str()).collect();
         assert!(texts.contains(&"eleph")); // stemmed
         assert!(texts.contains(&"galaxi")); // stemmed
+    }
+
+    fn hinted<T: Tokenizer>(tokenizer: &T, text: &str, hint: Option<&str>) -> Vec<Token> {
+        Tokenizer::tokenize_hinted(tokenizer, text, hint)
+    }
+
+    fn texts(tokens: &[Token]) -> Vec<&str> {
+        tokens.iter().map(|t| t.text.as_str()).collect()
+    }
+
+    #[test]
+    fn dynamic_stemmer_selects_language_from_hint() {
+        let stemmer = DynamicStemmer::new(None);
+        assert_eq!(
+            texts(&hinted(&stemmer, "Running Foxes", Some("en"))),
+            vec!["run", "fox"]
+        );
+        assert_eq!(
+            texts(&hinted(&stemmer, "бегущие собаки", Some("ru"))),
+            vec!["бегущ", "собак"]
+        );
+        // Unknown hint and no hint both fall back to the default (simple).
+        assert_eq!(
+            texts(&hinted(&stemmer, "Running Foxes", Some("xx"))),
+            vec!["running", "foxes"]
+        );
+        assert_eq!(
+            texts(&hinted(&stemmer, "Running Foxes", None)),
+            vec!["running", "foxes"]
+        );
+        assert_eq!(
+            texts(&Tokenizer::tokenize(&stemmer, "Running, Foxes!")),
+            vec!["running", "foxes"]
+        );
+        // A default language applies when no hint is given.
+        let english = DynamicStemmer::new(Some(Language::English));
+        assert_eq!(
+            texts(&hinted(&english, "Running Foxes", None)),
+            vec!["run", "fox"]
+        );
+    }
+
+    #[test]
+    fn dynamic_stemmer_routes_tokens_by_script() {
+        let stemmer = DynamicStemmer::new(None);
+        // Mixed-script text: each token goes to the hinted language of its script.
+        assert_eq!(
+            texts(&hinted(&stemmer, "бегущие foxes", Some("ru,en"))),
+            vec!["бегущ", "fox"]
+        );
+        assert_eq!(
+            texts(&hinted(&stemmer, "бегущие foxes", Some("en, ru"))),
+            vec!["бегущ", "fox"]
+        );
+        // A single hinted language never touches tokens of another script.
+        assert_eq!(
+            texts(&hinted(&stemmer, "бегущие foxes", Some("ru"))),
+            vec!["бегущ", "foxes"]
+        );
+        assert_eq!(
+            texts(&hinted(&stemmer, "бегущие foxes", Some("en"))),
+            vec!["бегущие", "fox"]
+        );
+        // Same-script languages: the first listed one wins.
+        assert_eq!(
+            texts(&hinted(&stemmer, "running", Some("de,en"))),
+            vec!["running"]
+        );
+        assert_eq!(
+            texts(&hinted(&stemmer, "running", Some("en,de"))),
+            vec!["run"]
+        );
+        // Positions stay sequential across scripts.
+        let tokens = hinted(&stemmer, "бегущие foxes run", Some("ru,en"));
+        assert_eq!(
+            tokens.iter().map(|t| t.position).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn script_detection_covers_supported_stemmer_scripts() {
+        assert_eq!(Script::of_token("hello"), Script::Latin);
+        assert_eq!(Script::of_token("straße"), Script::Latin);
+        assert_eq!(Script::of_token("собака"), Script::Cyrillic);
+        assert_eq!(Script::of_token("γεια"), Script::Greek);
+        assert_eq!(Script::of_token("مرحبا"), Script::Arabic);
+        assert_eq!(Script::of_token("தமிழ்"), Script::Tamil);
+        assert_eq!(Script::of_token("日本語"), Script::Other);
+        assert_eq!(Script::of_token("2024"), Script::Other);
+        assert_eq!(Language::Russian.script(), Script::Cyrillic);
+        assert_eq!(Language::Turkish.script(), Script::Latin);
+    }
+
+    #[test]
+    fn tokenizer_spec_parses_and_renders_canonically() {
+        assert_eq!(
+            TokenizerSpec::parse("en_stem").unwrap(),
+            TokenizerSpec::Named("en_stem".to_string())
+        );
+        let spec = TokenizerSpec::parse("stem(by:languages,default:simple)").unwrap();
+        assert_eq!(
+            spec,
+            TokenizerSpec::DynamicStem {
+                by: "languages".to_string(),
+                default: None
+            }
+        );
+        assert_eq!(spec.to_string(), "stem(by: languages, default: simple)");
+        assert_eq!(spec.hint_field(), Some("languages"));
+
+        let spec = TokenizerSpec::parse("stem(by: lang, default: english)").unwrap();
+        assert_eq!(spec.to_string(), "stem(by: lang, default: en)");
+        assert_eq!(
+            TokenizerSpec::parse("stem(by: lang)").unwrap(),
+            TokenizerSpec::DynamicStem {
+                by: "lang".to_string(),
+                default: None
+            }
+        );
+
+        assert!(TokenizerSpec::parse("stem(default: en)").is_err());
+        assert!(TokenizerSpec::parse("stem(by: lang, default: klingon)").is_err());
+        assert!(TokenizerSpec::parse("stem(by: lang").is_err());
+        assert!(TokenizerSpec::parse("stem(by: lang, color: red)").is_err());
+        assert!(TokenizerSpec::parse("en_stem(foo)").is_err());
+        assert!(TokenizerSpec::parse("").is_err());
+    }
+
+    #[test]
+    fn registry_builds_dynamic_stemmer_from_spec() {
+        let registry = TokenizerRegistry::new();
+        let tokenizer = registry
+            .get("stem(by: languages, default: simple)")
+            .expect("dynamic spec resolves without registration");
+        assert_eq!(
+            texts(&tokenizer.tokenize_hinted("Running Foxes", Some("en"))),
+            vec!["run", "fox"]
+        );
+        assert_eq!(
+            texts(&tokenizer.tokenize("Running Foxes")),
+            vec!["running", "foxes"]
+        );
+        assert!(
+            registry
+                .get("stem(by: languages, default: klingon)")
+                .is_none()
+        );
+        // Static tokenizers accept and ignore hints.
+        let simple = registry.get("en_stem").unwrap();
+        assert_eq!(
+            texts(&simple.tokenize_hinted("Running Foxes", Some("ru"))),
+            vec!["run", "fox"]
+        );
+    }
+
+    #[test]
+    fn parse_language_opt_rejects_unknown_codes() {
+        assert_eq!(parse_language_opt(" RU "), Some(Language::Russian));
+        assert_eq!(parse_language_opt("german"), Some(Language::German));
+        assert_eq!(parse_language_opt("xx"), None);
+        assert_eq!(parse_language_opt(""), None);
+        for language in [Language::English, Language::Russian, Language::Tamil] {
+            assert_eq!(parse_language_opt(language_code(language)), Some(language));
+        }
     }
 }

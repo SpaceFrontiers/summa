@@ -738,16 +738,39 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
     """Recursively convert a Query dict to protobuf Query.
 
     The dict must have exactly one key matching the proto Query oneof:
-    "term", "match", "boolean", "sparse_vector", "dense_vector",
+    "term", "match", "phrase", "boolean", "sparse_vector", "dense_vector",
     "binary_dense_vector", "boost", "range", "prefix", "all", or "fusion".
     """
     if "term" in q:
         t = q["term"]
-        return pb.Query(term=pb.TermQuery(field=t["field"], term=t["term"]))
+        return pb.Query(
+            term=pb.TermQuery(
+                field=t["field"],
+                term=t["term"],
+                tokenizer_hint=t.get("tokenizer_hint", ""),
+            )
+        )
 
     if "match" in q:
         m = q["match"]
-        return pb.Query(match=pb.MatchQuery(field=m["field"], text=m["text"]))
+        return pb.Query(
+            match=pb.MatchQuery(
+                field=m["field"],
+                text=m["text"],
+                tokenizer_hint=m.get("tokenizer_hint", ""),
+            )
+        )
+
+    if "phrase" in q:
+        p = q["phrase"]
+        return pb.Query(
+            phrase=pb.PhraseQuery(
+                field=p["field"],
+                text=p["text"],
+                slop=p.get("slop", 0),
+                tokenizer_hint=p.get("tokenizer_hint", ""),
+            )
+        )
 
     if "boolean" in q:
         b = q["boolean"]
