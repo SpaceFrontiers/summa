@@ -79,9 +79,10 @@ pub use query::{
 
 // Re-exports from tokenizer
 pub use tokenizer::{
-    BoxedTokenizer, DynamicStemmer, Language, LanguageAwareTokenizer, MultiLanguageStemmer,
-    RawCiTokenizer, RawTokenizer, Script, SimpleTokenizer, StemmerTokenizer, Token, Tokenizer,
-    TokenizerRegistry, TokenizerSpec, language_code, parse_language, parse_language_opt,
+    BoxedTokenizer, Language, LanguageAwareTokenizer, LexOptions, LexTokenizer,
+    MultiLanguageStemmer, RawCiTokenizer, RawTokenizer, Script, SimpleTokenizer, StemmerTokenizer,
+    Token, Tokenizer, TokenizerRegistry, TokenizerSpec, language_code, parse_language,
+    parse_language_opt,
 };
 
 // Re-exports from other modules

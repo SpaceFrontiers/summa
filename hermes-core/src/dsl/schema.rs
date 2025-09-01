@@ -811,7 +811,7 @@ impl Schema {
     }
 
     /// Field whose values hint the dynamic tokenizer of `field`
-    /// (`text<stem(by: <hint field>, ...)>`), if any.
+    /// (`text<lex(by: <hint field>, ...)>`), if any.
     pub fn tokenizer_hint_field(&self, field: Field) -> Option<Field> {
         let spec = self.get_field_entry(field)?.tokenizer_spec()?;
         self.get_field(spec.hint_field()?)

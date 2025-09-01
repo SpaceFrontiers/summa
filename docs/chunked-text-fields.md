@@ -30,7 +30,7 @@ length are all computed over chunks; results are folded back to documents with
 per-ordinal scores exactly like sparse vectors.
 
 ```
-field content: text<stem(by: languages, default: simple)> [indexed<chunked, token_position>]
+field content: text<lex(by: languages, default: en)> [indexed<chunked, token_position>]
 ```
 
 ### Virtual ids

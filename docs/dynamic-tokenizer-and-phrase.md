@@ -22,10 +22,10 @@ body), `DynamicStemmer` interprets it.
 
 ```
 field languages: text<raw_ci> [fast]
-field content: text<stem(by: languages, default: simple, stop_words: true)> [indexed<token_position>]
+field content: text<lex(by: languages, default: en, stop_words: true)> [indexed<token_position>]
 ```
 
-`stem(by: <field>, default: <language|simple>, stop_words: <bool>, segmenter: <simple|unicode>)`
+`lex(by: <field>, default: <language|none>, stop_words: <bool>, segmenter: <icu|unicode|simple>, stem: <light|snowball|none>, variants: <bool>, fold: <bool>, max_token_length: <n>, han: <as_written|simplified>, cjk: <icu|dictionary>)`
 is a parameterized tokenizer spec. Its canonical string form is stored in the
 existing `FieldEntry.tokenizer`, so `metadata.json` has no new field and old
 indexes load unchanged; `stop_words` is omitted from the canonical form when
@@ -141,7 +141,7 @@ with `"ru,en"` to ~54 MiB/s. The stemmer itself (~120 ns per word) is the
 cost; the tokenizer around it now fetches the thread-local stemmers once per
 call instead of once per token and keeps a token's allocation when stemming
 leaves it unchanged (+8% over the first implementation). Query-time
-resolution of a `stem(...)` spec is cached per spec string in
+resolution of a `lex(...)` spec is cached per spec string in
 `TokenizerRegistry` (~1 µs per query for a five-word query).
 
 ## Not in scope

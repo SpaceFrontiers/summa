@@ -794,7 +794,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     for item in inner {
         match item.as_rule() {
             Rule::tokenizer_spec => {
-                // `<name>` or `<stem(by: field, default: simple)>`: store the
+                // `<name>` or `<lex(by: field, ...)>`: store the
                 // canonical spec string (validated against the index in
                 // `parse_index_def`).
                 let raw = item.as_str().trim();
@@ -1560,8 +1560,10 @@ fn validate_tokenizer_specs(index_name: &str, fields: &[FieldDef]) -> Result<()>
                     )));
                 }
             }
-            TokenizerSpec::DynamicStem { by: None, .. } => {}
-            TokenizerSpec::DynamicStem { by: Some(by), .. } => {
+            TokenizerSpec::Lex(options) => {
+                let Some(by) = options.by.as_deref() else {
+                    continue;
+                };
                 match fields.iter().find(|f| f.name == by) {
                     None => {
                         return Err(Error::Schema(format!(
@@ -1748,7 +1750,7 @@ mod tests {
         let sdl = r#"
             index documents {
                 field languages: text<raw_ci> [fast]
-                field content: text<stem(by: languages, default: simple)> [indexed<chunked, token_position>]
+                field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed<chunked, token_position>]
                 field notes: text<simple> [indexed<chunked>, stored]
             }
         "#;
@@ -1841,8 +1843,8 @@ mod tests {
         let sdl = r#"
             index documents {
                 field languages: text<raw_ci> [fast]
-                field content: text<stem(by: languages, default: simple)> [indexed<token_position>]
-                field title: text<stem(by:languages,default:english)> [indexed]
+                field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed<token_position>]
+                field title: text<lex(by:languages,default:english)> [indexed]
                 field embedding: dense_vector<768> [indexed]
                 field hash: binary_dense_vector<64> [indexed]
             }
@@ -1852,7 +1854,10 @@ mod tests {
         let index = &indexes[0];
         assert_eq!(
             index.fields[1].tokenizer,
-            Some("stem(by: languages, default: simple)".to_string())
+            Some(
+                "lex(by: languages, segmenter: simple, stem: snowball, variants: false)"
+                    .to_string()
+            )
         );
         assert_eq!(
             index.fields[1].positions,
@@ -1861,7 +1866,7 @@ mod tests {
         // Canonical rendering normalises spacing and language names.
         assert_eq!(
             index.fields[2].tokenizer,
-            Some("stem(by: languages, default: en)".to_string())
+            Some("lex(by: languages, default: en)".to_string())
         );
         // Vector `<N>` configs are unaffected by the extended tokenizer grammar.
         assert_eq!(
@@ -1893,7 +1898,7 @@ mod tests {
     fn test_tokenizer_specs_fail_loud() {
         let missing_hint_field = r#"
             index documents {
-                field content: text<stem(by: languages, default: simple)> [indexed]
+                field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed]
             }
         "#;
         let err = parse_sdl(missing_hint_field).unwrap_err().to_string();
@@ -1905,7 +1910,7 @@ mod tests {
         let numeric_hint_field = r#"
             index documents {
                 field languages: u64 [fast]
-                field content: text<stem(by: languages)> [indexed]
+                field content: text<lex(by: languages)> [indexed]
             }
         "#;
         let err = parse_sdl(numeric_hint_field).unwrap_err().to_string();
@@ -1914,7 +1919,7 @@ mod tests {
         let unknown_default = r#"
             index documents {
                 field languages: text [fast]
-                field content: text<stem(by: languages, default: klingon)> [indexed]
+                field content: text<lex(by: languages, default: klingon)> [indexed]
             }
         "#;
         let err = parse_sdl(unknown_default).unwrap_err().to_string();

@@ -26,7 +26,7 @@ fn chunked_schema() -> Fields {
         "content",
         true,
         false,
-        "stem(by: languages, default: simple)",
+        "lex(by: languages, segmenter: simple, stem: snowball, variants: false)",
     );
     sb.set_chunked(content, true);
     sb.set_positions(content, PositionMode::TokenPosition);
@@ -454,7 +454,7 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
         "content",
         true,
         false,
-        "stem(by: languages, default: simple)",
+        "lex(by: languages, segmenter: simple, stem: snowball, variants: false)",
     );
     sb.set_chunked(content, true);
     sb.set_positions(content, PositionMode::TokenPosition);

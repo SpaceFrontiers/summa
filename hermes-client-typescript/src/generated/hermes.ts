@@ -300,7 +300,7 @@ export interface MatchQuery {
   text: string;
   /**
    * Optional hint passed to the field's tokenizer. Static tokenizers ignore
-   * it; a dynamic stemmer (`text<stem(by: languages, default: simple)>`)
+   * it; a `lex(by: languages, ...)` tokenizer
    * reads it as a comma-separated list of language codes ("ru,en") and stems
    * each query token with the first listed language of the token's script.
    * Empty = the tokenizer's default.
@@ -569,6 +569,33 @@ export interface GetIndexInfoResponse {
     | undefined;
   /** Per-field vector statistics */
   vectorStats: VectorFieldStats[];
+  /**
+   * Per text field: how it is tokenized, so clients pick query forms
+   * without parsing the schema SDL.
+   */
+  textFields: TextFieldInfo[];
+}
+
+/** Tokenization facts of one text field. */
+export interface TextFieldInfo {
+  field: string;
+  /** The field uses a `lex(...)` tokenizer. */
+  lexical: boolean;
+  /**
+   * A `lex(by: <field>)` tokenizer: the query's `tokenizer_hint` selects
+   * the stemmer (empty when the field has no hint field).
+   */
+  hintField: string;
+  /**
+   * `lex(variants: true)`: the written word is indexed next to its stem and
+   * folded forms, so one clause per field suffices (phrases match the
+   * written form, match queries the stem).
+   */
+  variants: boolean;
+  /** Token positions are indexed, so phrase queries verify adjacency. */
+  positions: boolean;
+  /** `indexed<chunked>`: every value is its own BM25 unit with an ordinal. */
+  chunked: boolean;
 }
 
 /** Per-field vector statistics (dense or sparse) */
@@ -5010,7 +5037,15 @@ export const GetIndexInfoRequest: MessageFns<GetIndexInfoRequest> = {
 };
 
 function createBaseGetIndexInfoResponse(): GetIndexInfoResponse {
-  return { indexName: "", numDocs: 0, numSegments: 0, schema: "", memoryStats: undefined, vectorStats: [] };
+  return {
+    indexName: "",
+    numDocs: 0,
+    numSegments: 0,
+    schema: "",
+    memoryStats: undefined,
+    vectorStats: [],
+    textFields: [],
+  };
 }
 
 export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
@@ -5032,6 +5067,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     }
     for (const v of message.vectorStats) {
       VectorFieldStats.encode(v!, writer.uint32(50).fork()).join();
+    }
+    for (const v of message.textFields) {
+      TextFieldInfo.encode(v!, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -5091,6 +5129,14 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
           message.vectorStats.push(VectorFieldStats.decode(reader, reader.uint32()));
           continue;
         }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.textFields.push(TextFieldInfo.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5128,6 +5174,11 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
         : globalThis.Array.isArray(object?.vector_stats)
         ? object.vector_stats.map((e: any) => VectorFieldStats.fromJSON(e))
         : [],
+      textFields: globalThis.Array.isArray(object?.textFields)
+        ? object.textFields.map((e: any) => TextFieldInfo.fromJSON(e))
+        : globalThis.Array.isArray(object?.text_fields)
+        ? object.text_fields.map((e: any) => TextFieldInfo.fromJSON(e))
+        : [],
     };
   },
 
@@ -5151,6 +5202,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     if (message.vectorStats?.length) {
       obj.vectorStats = message.vectorStats.map((e) => VectorFieldStats.toJSON(e));
     }
+    if (message.textFields?.length) {
+      obj.textFields = message.textFields.map((e) => TextFieldInfo.toJSON(e));
+    }
     return obj;
   },
 
@@ -5167,6 +5221,151 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
       ? MemoryStats.fromPartial(object.memoryStats)
       : undefined;
     message.vectorStats = object.vectorStats?.map((e) => VectorFieldStats.fromPartial(e)) || [];
+    message.textFields = object.textFields?.map((e) => TextFieldInfo.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseTextFieldInfo(): TextFieldInfo {
+  return { field: "", lexical: false, hintField: "", variants: false, positions: false, chunked: false };
+}
+
+export const TextFieldInfo: MessageFns<TextFieldInfo> = {
+  encode(message: TextFieldInfo, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.field !== "") {
+      writer.uint32(10).string(message.field);
+    }
+    if (message.lexical !== false) {
+      writer.uint32(16).bool(message.lexical);
+    }
+    if (message.hintField !== "") {
+      writer.uint32(26).string(message.hintField);
+    }
+    if (message.variants !== false) {
+      writer.uint32(32).bool(message.variants);
+    }
+    if (message.positions !== false) {
+      writer.uint32(40).bool(message.positions);
+    }
+    if (message.chunked !== false) {
+      writer.uint32(48).bool(message.chunked);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TextFieldInfo {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTextFieldInfo();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.field = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.lexical = reader.bool();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.hintField = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.variants = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.positions = reader.bool();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.chunked = reader.bool();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TextFieldInfo {
+    return {
+      field: isSet(object.field) ? globalThis.String(object.field) : "",
+      lexical: isSet(object.lexical) ? globalThis.Boolean(object.lexical) : false,
+      hintField: isSet(object.hintField)
+        ? globalThis.String(object.hintField)
+        : isSet(object.hint_field)
+        ? globalThis.String(object.hint_field)
+        : "",
+      variants: isSet(object.variants) ? globalThis.Boolean(object.variants) : false,
+      positions: isSet(object.positions) ? globalThis.Boolean(object.positions) : false,
+      chunked: isSet(object.chunked) ? globalThis.Boolean(object.chunked) : false,
+    };
+  },
+
+  toJSON(message: TextFieldInfo): unknown {
+    const obj: any = {};
+    if (message.field !== "") {
+      obj.field = message.field;
+    }
+    if (message.lexical !== false) {
+      obj.lexical = message.lexical;
+    }
+    if (message.hintField !== "") {
+      obj.hintField = message.hintField;
+    }
+    if (message.variants !== false) {
+      obj.variants = message.variants;
+    }
+    if (message.positions !== false) {
+      obj.positions = message.positions;
+    }
+    if (message.chunked !== false) {
+      obj.chunked = message.chunked;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TextFieldInfo>): TextFieldInfo {
+    return TextFieldInfo.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TextFieldInfo>): TextFieldInfo {
+    const message = createBaseTextFieldInfo();
+    message.field = object.field ?? "";
+    message.lexical = object.lexical ?? false;
+    message.hintField = object.hintField ?? "";
+    message.variants = object.variants ?? false;
+    message.positions = object.positions ?? false;
+    message.chunked = object.chunked ?? false;
     return message;
   },
 };

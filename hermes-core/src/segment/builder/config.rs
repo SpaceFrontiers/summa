@@ -22,7 +22,7 @@ pub struct SegmentBuilderStats {
     /// Memory breakdown by component
     pub memory_breakdown: MemoryBreakdown,
     /// Documents indexed into a dynamically tokenized field
-    /// (`text<stem(by: ...)>`) without any value in the hint field, so the
+    /// (`text<lex(by: ...)>`) without any value in the hint field, so the
     /// tokenizer's default applied.
     pub unhinted_dynamic_docs: u64,
 }

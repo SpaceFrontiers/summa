@@ -186,7 +186,7 @@ message MatchQuery {
   string field = 1;
   string text = 2;
   // Optional hint passed to the field's tokenizer. Static tokenizers ignore
-  // it; a dynamic stemmer (`text<stem(by: languages, default: simple)>`)
+  // it; a `lex(by: languages, ...)` tokenizer
   // reads it as a comma-separated list of language codes ("ru,en") and stems
   // each query token with the first listed language of the token's script.
   // Empty = the tokenizer's default.
@@ -394,6 +394,27 @@ message GetIndexInfoResponse {
   MemoryStats memory_stats = 5;
   // Per-field vector statistics
   repeated VectorFieldStats vector_stats = 6;
+  // Per text field: how it is tokenized, so clients pick query forms
+  // without parsing the schema SDL.
+  repeated TextFieldInfo text_fields = 7;
+}
+
+// Tokenization facts of one text field.
+message TextFieldInfo {
+  string field = 1;
+  // The field uses a `lex(...)` tokenizer.
+  bool lexical = 2;
+  // A `lex(by: <field>)` tokenizer: the query's `tokenizer_hint` selects
+  // the stemmer (empty when the field has no hint field).
+  string hint_field = 3;
+  // `lex(variants: true)`: the written word is indexed next to its stem and
+  // folded forms, so one clause per field suffices (phrases match the
+  // written form, match queries the stem).
+  bool variants = 4;
+  // Token positions are indexed, so phrase queries verify adjacency.
+  bool positions = 5;
+  // `indexed<chunked>`: every value is its own BM25 unit with an ordinal.
+  bool chunked = 6;
 }
 
 // Per-field vector statistics (dense or sparse)

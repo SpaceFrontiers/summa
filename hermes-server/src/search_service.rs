@@ -1280,6 +1280,7 @@ impl SearchService for SearchServiceImpl {
         }
         vector_stats.sort_by(|a, b| a.field_name.cmp(&b.field_name));
 
+        let text_fields = text_field_infos(&index.schema());
         Ok(Response::new(GetIndexInfoResponse {
             index_name: req.index_name,
             num_docs: searcher.num_docs(),
@@ -1287,8 +1288,32 @@ impl SearchService for SearchServiceImpl {
             schema: schema_str,
             memory_stats: Some(memory_stats),
             vector_stats,
+            text_fields,
         }))
     }
+}
+
+/// Tokenization facts of every text field, for clients that pick query
+/// forms without parsing the schema SDL.
+pub fn text_field_infos(schema: &hermes_core::Schema) -> Vec<TextFieldInfo> {
+    schema
+        .fields()
+        .filter(|(_, entry)| entry.field_type == hermes_core::FieldType::Text)
+        .map(|(_, entry)| {
+            let spec = entry.tokenizer_spec();
+            let lex = spec.as_ref().and_then(|spec| spec.lex());
+            TextFieldInfo {
+                field: entry.name.clone(),
+                lexical: lex.is_some(),
+                hint_field: lex
+                    .and_then(|options| options.by.clone())
+                    .unwrap_or_default(),
+                variants: lex.is_some_and(|options| options.variants),
+                positions: entry.positions.is_some(),
+                chunked: entry.chunked,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

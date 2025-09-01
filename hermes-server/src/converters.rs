@@ -7,7 +7,7 @@ use hermes_core::query::{
     MultiValueCombiner, RerankerConfig, SparseVectorQuery,
 };
 use hermes_core::structures::QueryWeighting;
-use hermes_core::tokenizer::{idf_weights_cache, tokenizer_cache};
+use hermes_core::tokenizer::{Purpose, idf_weights_cache, tokenizer_cache};
 use hermes_core::{
     BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, PhraseQuery, PrefixQuery,
     Query, Schema, TermQuery, TokenizerRegistry,
@@ -38,9 +38,17 @@ fn field_tokens(
     text: &str,
     tokenizer_hint: &str,
     shape: &QueryShapeLimits,
+    purpose: Purpose,
 ) -> Result<(hermes_core::Field, Vec<String>), String> {
-    let (field, tokens) =
-        field_token_stream(kind, schema, field_name, text, tokenizer_hint, shape)?;
+    let (field, tokens) = field_token_stream(
+        kind,
+        schema,
+        field_name,
+        text,
+        tokenizer_hint,
+        shape,
+        purpose,
+    )?;
     Ok((field, tokens.into_iter().map(|t| t.text).collect()))
 }
 
@@ -55,6 +63,7 @@ fn field_token_stream(
     text: &str,
     tokenizer_hint: &str,
     shape: &QueryShapeLimits,
+    purpose: Purpose,
 ) -> Result<(hermes_core::Field, Vec<hermes_core::tokenizer::Token>), String> {
     let field = schema
         .get_field(field_name)
@@ -75,7 +84,7 @@ fn field_token_stream(
         .get(tokenizer_name)
         .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
     let hint = Some(tokenizer_hint.trim()).filter(|hint| !hint.is_empty());
-    let tokens = tokenizer.tokenize_hinted(text, hint);
+    let tokens = tokenizer.tokenize_with(text, hint, purpose);
     validate_token_expansion(kind, tokens.len(), shape.max_text_query_tokens)?;
     Ok((field, tokens))
 }
@@ -101,6 +110,7 @@ fn is_unverifiable_phrase(
                 &phrase.text,
                 &phrase.tokenizer_hint,
                 shape,
+                Purpose::Exact,
             )?;
             Ok(tokens.is_empty())
         }
@@ -163,6 +173,7 @@ pub fn convert_query(
                 &term_query.term,
                 &term_query.tokenizer_hint,
                 shape,
+                Purpose::Exact,
             )?;
             if tokens.is_empty() {
                 return Err(format!("No tokens in term '{}'", term_query.term));
@@ -205,6 +216,7 @@ pub fn convert_query(
                 &match_query.text,
                 &match_query.tokenizer_hint,
                 shape,
+                Purpose::Match,
             )?;
 
             if tokens.is_empty() {
@@ -268,6 +280,7 @@ pub fn convert_query(
                 &phrase_query.text,
                 &phrase_query.tokenizer_hint,
                 shape,
+                Purpose::Exact,
             )?;
             if tokens.is_empty() {
                 return Err(format!(
@@ -1502,13 +1515,13 @@ mod tests {
             "content",
             true,
             false,
-            "stem(by: languages, default: simple)",
+            "lex(by: languages, segmenter: simple, stem: snowball, variants: false)",
         );
         builder.add_text_field_with_tokenizer(
             "stopped",
             true,
             false,
-            "stem(by: languages, default: simple, stop_words: true)",
+            "lex(by: languages, stop_words: true, segmenter: simple, stem: snowball, variants: false)",
         );
         builder.add_u64_field("views", true, false);
         builder.build()
@@ -2085,7 +2098,7 @@ mod tests {
         let input = r#"
             index documents {
                 field languages: text<raw_ci> [fast]
-                field content: text<stem(by: languages, default: simple)> [indexed<chunked, token_position>]
+                field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed<chunked, token_position>]
             }
         "#;
         let schema = hermes_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
@@ -2129,7 +2142,7 @@ mod tests {
                 field count: u64 [indexed, stored, fast]
                 field tags: text<raw_ci> [indexed, stored<multi>, fast]
                 field languages: text<raw_ci> [fast]
-                field content: text<stem(by: languages, default: simple)> [indexed<token_position>]
+                field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed<token_position>]
                 field sparse_emb: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
                 field dense_emb: dense_vector<1024, f16> [indexed<ivf_pq, routing: hnsw, num_clusters: 256>, stored<multi>]
                 field scann_emb: dense_vector<768, f16> [indexed<scann, num_clusters: 4096, tree_levels: 2, nprobe: 128>]

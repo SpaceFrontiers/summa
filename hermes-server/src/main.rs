@@ -671,6 +671,14 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         ..Default::default()
     };
 
+    if hermes_core::tokenizer::cjk_dictionaries_available() {
+        let started = std::time::Instant::now();
+        hermes_core::tokenizer::warm_up_cjk_dictionaries();
+        log::info!(
+            "Japanese and Korean dictionaries loaded in {:?}",
+            started.elapsed()
+        );
+    }
     let registry = Arc::new(registry::IndexRegistry::new(args.data_dir.clone(), config));
 
     // Clean up index directories from incomplete deletes (e.g. server crashed mid-delete)

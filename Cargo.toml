@@ -62,6 +62,8 @@ rust-stemmers = "1.2"
 stop-words = { version = "0.10", features = ["nltk"] }
 unicode-segmentation = "1.12"
 unicode-normalization = "0.1"
+icu_segmenter = { version = "2.3", features = ["compiled_data", "auto"] }
+lindera = { version = "6", features = ["embed-unidic", "embed-ko-dic"] }
 
 # Collections and utilities
 rustc-hash = "2.1"

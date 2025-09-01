@@ -217,7 +217,7 @@ pub struct SegmentBuilder {
     config: SegmentBuilderConfig,
     tokenizers: FxHashMap<Field, BoxedTokenizer>,
     /// Text field → sibling field whose values hint its dynamic tokenizer
-    /// (`text<stem(by: languages, ...)>`).
+    /// (`text<lex(by: languages, ...)>`).
     tokenizer_hint_fields: FxHashMap<Field, Field>,
     /// Reusable buffer holding the comma-joined hint of the current document.
     tokenizer_hint_buffer: String,
@@ -936,7 +936,7 @@ impl SegmentBuilder {
             if hinted {
                 let hint = (!self.tokenizer_hint_buffer.is_empty())
                     .then_some(self.tokenizer_hint_buffer.as_str());
-                t.tokenize_hinted(text, hint)
+                t.tokenize_with(text, hint, crate::tokenizer::Purpose::Index)
             } else {
                 t.tokenize(text)
             }
@@ -968,7 +968,9 @@ impl SegmentBuilder {
                         .push(encoded_pos);
                 }
             }
-            token_position = tokens.len() as u32;
+            // Variants share a position with their original and are not
+            // tokens of the document for length normalisation.
+            token_position = tokens.iter().filter(|t| !t.variant).count() as u32;
         } else {
             // Inline zero-allocation path: split_whitespace + lowercase + strip non-alphanumeric
             for word in text.split_whitespace() {

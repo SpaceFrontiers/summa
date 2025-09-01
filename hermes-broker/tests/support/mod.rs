@@ -156,6 +156,7 @@ impl SearchService for MockBackend {
             schema: "index mock {}".to_string(),
             memory_stats: None,
             vector_stats: vec![],
+            text_fields: vec![],
         }))
     }
 }
