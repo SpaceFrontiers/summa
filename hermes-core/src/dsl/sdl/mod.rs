@@ -1560,21 +1560,24 @@ fn validate_tokenizer_specs(index_name: &str, fields: &[FieldDef]) -> Result<()>
                     )));
                 }
             }
-            TokenizerSpec::DynamicStem { by, .. } => match fields.iter().find(|f| f.name == by) {
-                None => {
-                    return Err(Error::Schema(format!(
-                        "Index '{index_name}', field '{}': tokenizer hint field '{by}' does not exist",
-                        field.name
-                    )));
+            TokenizerSpec::DynamicStem { by: None, .. } => {}
+            TokenizerSpec::DynamicStem { by: Some(by), .. } => {
+                match fields.iter().find(|f| f.name == by) {
+                    None => {
+                        return Err(Error::Schema(format!(
+                            "Index '{index_name}', field '{}': tokenizer hint field '{by}' does not exist",
+                            field.name
+                        )));
+                    }
+                    Some(hint) if hint.field_type != FieldType::Text => {
+                        return Err(Error::Schema(format!(
+                            "Index '{index_name}', field '{}': tokenizer hint field '{by}' must be a text field, got {:?}",
+                            field.name, hint.field_type
+                        )));
+                    }
+                    Some(_) => {}
                 }
-                Some(hint) if hint.field_type != FieldType::Text => {
-                    return Err(Error::Schema(format!(
-                        "Index '{index_name}', field '{}': tokenizer hint field '{by}' must be a text field, got {:?}",
-                        field.name, hint.field_type
-                    )));
-                }
-                Some(_) => {}
-            },
+            }
         }
     }
     Ok(())

@@ -781,6 +781,9 @@ pub struct DynamicStemmer {
     default: Option<Language>,
     stop_words: bool,
     segmenter: Segmenter,
+    /// A spec without `by` has no per-document language and treats query
+    /// hints the same way: every text goes through `default`.
+    ignore_hints: bool,
 }
 
 impl DynamicStemmer {
@@ -793,7 +796,21 @@ impl DynamicStemmer {
             default,
             stop_words: false,
             segmenter: Segmenter::Simple,
+            ignore_hints: false,
         }
+    }
+
+    /// Ignore language hints (index-time field values and query hints
+    /// alike): the tokenizer always applies `default`. This is the
+    /// `stem(...)` spec without `by`.
+    pub fn with_ignored_hints(mut self, ignore: bool) -> Self {
+        self.ignore_hints = ignore;
+        self
+    }
+
+    /// Whether hints are ignored (see [`DynamicStemmer::with_ignored_hints`]).
+    pub fn ignores_hints(&self) -> bool {
+        self.ignore_hints
     }
 
     /// Choose the word segmentation (see [`Segmenter`]).
@@ -881,6 +898,9 @@ impl Tokenizer for DynamicStemmer {
     }
 
     fn tokenize_hinted(&self, text: &str, hint: Option<&str>) -> Vec<Token> {
+        if self.ignore_hints {
+            return Tokenizer::tokenize(self, text);
+        }
         match hint.map(str::trim).filter(|hint| !hint.is_empty()) {
             Some(hint) => {
                 let languages = Self::parse_hint(hint);
@@ -901,17 +921,22 @@ impl Tokenizer for DynamicStemmer {
 /// Plain names refer to a registered tokenizer (`simple`, `en_stem`, ...).
 /// `stem(by: <field>, default: <language|simple>, stop_words: <bool>)`
 /// declares a [`DynamicStemmer`] whose per-document hint is read from
-/// `<field>` in the same document. The canonical string form is stored in
+/// `<field>` in the same document. Without `by` the same options apply to
+/// every document and query (no language routing; `default: simple` is
+/// then plain unicode tokenization with stop words and no stemming). The canonical string form is stored in
 /// `FieldEntry::tokenizer`, so index metadata needs no new field; specs
 /// without `stop_words` render exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenizerSpec {
     /// A registered tokenizer name.
     Named(String),
-    /// Dynamic stemmer hinted by another field of the document.
+    /// Dynamic stemmer hinted by another field of the document, or, without
+    /// `by`, a fixed tokenizer with the same options (stop words, unicode
+    /// segmentation) that ignores hints.
     DynamicStem {
-        /// Field whose text values supply the language hint.
-        by: String,
+        /// Field whose text values supply the language hint; `None` = no
+        /// per-document language, hints are ignored, `default` always applies.
+        by: Option<String>,
         /// Language applied when the hint field is absent; `None` = simple.
         default: Option<Language>,
         /// Drop the routed language's stop words (positions keep their gaps).
@@ -989,7 +1014,6 @@ impl TokenizerSpec {
                 }
             }
         }
-        let by = by.ok_or_else(|| format!("tokenizer spec '{spec}' requires 'by: <field>'"))?;
         Ok(TokenizerSpec::DynamicStem {
             by,
             default,
@@ -1002,7 +1026,7 @@ impl TokenizerSpec {
     pub fn hint_field(&self) -> Option<&str> {
         match self {
             TokenizerSpec::Named(_) => None,
-            TokenizerSpec::DynamicStem { by, .. } => Some(by),
+            TokenizerSpec::DynamicStem { by, .. } => by.as_deref(),
         }
     }
 
@@ -1011,14 +1035,15 @@ impl TokenizerSpec {
         match self {
             TokenizerSpec::Named(_) => None,
             TokenizerSpec::DynamicStem {
+                by,
                 default,
                 stop_words,
                 segmenter,
-                ..
             } => Some(Box::new(
                 DynamicStemmer::new(*default)
                     .with_stop_words(*stop_words)
-                    .with_segmenter(*segmenter),
+                    .with_segmenter(*segmenter)
+                    .with_ignored_hints(by.is_none()),
             )),
         }
     }
@@ -1038,7 +1063,10 @@ impl std::fmt::Display for TokenizerSpec {
                     None => "simple".to_string(),
                     Some(language) => language_code(*language).to_string(),
                 };
-                write!(f, "stem(by: {by}, default: {default}")?;
+                match by {
+                    Some(by) => write!(f, "stem(by: {by}, default: {default}")?,
+                    None => write!(f, "stem(default: {default}")?,
+                }
                 if *stop_words {
                     write!(f, ", stop_words: true")?;
                 }
@@ -1824,7 +1852,7 @@ mod tests {
         assert_eq!(
             spec,
             TokenizerSpec::DynamicStem {
-                by: "languages".to_string(),
+                by: Some("languages".to_string()),
                 default: None,
                 stop_words: false,
                 segmenter: Segmenter::Simple,
@@ -1838,7 +1866,7 @@ mod tests {
         assert_eq!(
             TokenizerSpec::parse("stem(by: lang)").unwrap(),
             TokenizerSpec::DynamicStem {
-                by: "lang".to_string(),
+                by: Some("lang".to_string()),
                 default: None,
                 stop_words: false,
                 segmenter: Segmenter::Simple,
@@ -1850,7 +1878,7 @@ mod tests {
         assert_eq!(
             spec,
             TokenizerSpec::DynamicStem {
-                by: "languages".to_string(),
+                by: Some("languages".to_string()),
                 default: None,
                 stop_words: true,
                 segmenter: Segmenter::Simple,
@@ -1874,7 +1902,7 @@ mod tests {
         assert_eq!(
             spec,
             TokenizerSpec::DynamicStem {
-                by: "languages".to_string(),
+                by: Some("languages".to_string()),
                 default: None,
                 stop_words: true,
                 segmenter: Segmenter::Unicode,
@@ -1886,7 +1914,13 @@ mod tests {
         );
         assert!(TokenizerSpec::parse("stem(by: lang, segmenter: icu)").is_err());
 
-        assert!(TokenizerSpec::parse("stem(default: en)").is_err());
+        // `by` is optional: a spec without it is a fixed tokenizer.
+        assert_eq!(
+            TokenizerSpec::parse("stem(default: en)")
+                .unwrap()
+                .hint_field(),
+            None
+        );
         assert!(TokenizerSpec::parse("stem(by: lang, default: klingon)").is_err());
         assert!(TokenizerSpec::parse("stem(by: lang").is_err());
         assert!(TokenizerSpec::parse("stem(by: lang, color: red)").is_err());
@@ -1925,6 +1959,43 @@ mod tests {
             texts(&simple.tokenize_hinted("Running Foxes", Some("ru"))),
             vec!["run", "fox"]
         );
+    }
+
+    #[test]
+    fn spec_without_by_is_a_fixed_tokenizer_that_ignores_hints() {
+        let spec =
+            TokenizerSpec::parse("stem(default: simple, stop_words: true, segmenter: unicode)")
+                .unwrap();
+        assert_eq!(spec.hint_field(), None);
+        assert_eq!(
+            spec.to_string(),
+            "stem(default: simple, stop_words: true, segmenter: unicode)"
+        );
+        assert_eq!(TokenizerSpec::parse(&spec.to_string()).unwrap(), spec);
+        let tokenizer = spec.dynamic_tokenizer().unwrap();
+        let plain: Vec<String> = tokenizer
+            .tokenize("The running cells")
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        // No language: nothing is stemmed and no stop list applies.
+        assert_eq!(plain, vec!["the", "running", "cells"]);
+        let hinted: Vec<String> = tokenizer
+            .tokenize_hinted("The running cells", Some("en"))
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(hinted, plain, "hints are ignored without `by`");
+
+        // A fixed default language stems every document and query alike.
+        let english = TokenizerSpec::parse("stem(default: en, stop_words: true)").unwrap();
+        let tokenizer = english.dynamic_tokenizer().unwrap();
+        let stemmed: Vec<String> = tokenizer
+            .tokenize_hinted("The running cells", Some("ru"))
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert_eq!(stemmed, vec!["run", "cell"]);
     }
 
     #[test]
