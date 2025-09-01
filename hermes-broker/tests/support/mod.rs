@@ -48,6 +48,8 @@ pub struct MockState {
     pub searches: Vec<String>,
     /// Recorded full Search requests (offset/limit/text_stats as received).
     pub search_requests: Vec<SearchRequest>,
+    /// Recorded statistics queries, which must not contain FusionQuery.
+    pub text_stats_requests: Vec<GetTextStatsRequest>,
     /// Schema SDL returned by GetIndexInfo (a `primary` field makes the
     /// index partitionable).
     pub schema: String,
@@ -146,7 +148,10 @@ impl SearchService for MockBackend {
         request: Request<GetTextStatsRequest>,
     ) -> Result<Response<GetTextStatsResponse>, Status> {
         self.check_available()?;
-        let _ = request.into_inner();
+        self.state
+            .lock()
+            .text_stats_requests
+            .push(request.into_inner());
         Ok(Response::new(GetTextStatsResponse {
             stats: Some(TextStats {
                 total_docs: 42,

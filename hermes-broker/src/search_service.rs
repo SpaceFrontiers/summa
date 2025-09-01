@@ -131,8 +131,7 @@ impl BrokerSearchService {
         }
         // Shared BM25 statistics: every partition scores with the sum.
         if req.text_stats.is_none()
-            && let Some(query) = req.query.clone()
-            && partition::has_text_terms(&query)
+            && let Some(query) = req.query.as_ref().and_then(partition::text_stats_query)
         {
             let stats = forward_read!(
                 self,

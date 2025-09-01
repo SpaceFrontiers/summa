@@ -297,3 +297,88 @@ async fn broker_routes_real_hermes_servers() {
         .into_inner();
     assert_eq!(empty.hits.len(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the hermes-server binary; see module docs"]
+async fn partitioned_fusion_collects_text_stats_from_real_servers() {
+    let server_a = spawn_server();
+    let server_b = spawn_server();
+    wait_server_ready(&server_a.addr).await;
+    wait_server_ready(&server_b.addr).await;
+
+    let broker = spawn_broker(
+        &[
+            format!("id=a,addr={},shard=0", server_a.addr),
+            format!("id=b,addr={},shard=1", server_b.addr),
+        ],
+        &["--placement", "docs*=0,1"],
+    );
+    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+
+    let index_name = "docs_fusion_e2e";
+    let schema = SCHEMA.replace("index e2e", &format!("index {index_name}"));
+    let mut index = broker_index_client(&broker).await;
+    index
+        .create_index(CreateIndexRequest {
+            index_name: index_name.to_string(),
+            schema,
+        })
+        .await
+        .unwrap();
+    wait_for_indexes(&broker, &[index_name], Duration::from_secs(10)).await;
+    index
+        .batch_index_documents(BatchIndexDocumentsRequest {
+            index_name: index_name.to_string(),
+            documents: vec![
+                doc("doc-1", "quantum field theory"),
+                doc("doc-2", "another quantum document"),
+            ],
+        })
+        .await
+        .unwrap();
+    index
+        .commit(CommitRequest {
+            index_name: index_name.to_string(),
+        })
+        .await
+        .unwrap();
+
+    let match_query = |text: &str| Query {
+        query: Some(query::Query::Match(MatchQuery {
+            field: "title".to_string(),
+            text: text.to_string(),
+            ..Default::default()
+        })),
+    };
+    let response = broker_search_client(&broker)
+        .await
+        .search(SearchRequest {
+            index_name: index_name.to_string(),
+            query: Some(Query {
+                query: Some(query::Query::Fusion(FusionQuery {
+                    queries: vec![
+                        WeightedQuery {
+                            query: Some(match_query("quantum")),
+                            weight: 1.0,
+                        },
+                        WeightedQuery {
+                            query: Some(match_query("document")),
+                            weight: 1.0,
+                        },
+                    ],
+                    rrf_k: 60.0,
+                    ..Default::default()
+                })),
+            }),
+            limit: 10,
+            fields_to_load: vec!["id".to_string(), "title".to_string()],
+            ..Default::default()
+        })
+        .await
+        .expect("partitioned fusion with BM25 terms should collect shared stats")
+        .into_inner();
+    // Fusion total_hits sums the contributing ranked-list counts; hits are
+    // de-duplicated by document address in the fused result.
+    assert_eq!(response.total_hits, 3);
+    assert_eq!(response.hits.len(), 2);
+}

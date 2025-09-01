@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use tonic::Status;
 
 use crate::proto::hermes::{
-    BatchIndexDocumentsResponse, DocumentError, FieldValue, GetIndexInfoResponse,
+    BatchIndexDocumentsResponse, BooleanQuery, DocumentError, FieldValue, GetIndexInfoResponse,
     IndexingBufferStats, MemoryStats, NamedDocument, Query, SearchHit, SearchResponse,
     SearchTimings, SegmentReaderStats, TermDocFreq, TextFieldStats, TextStats, VectorFieldStats,
     field_value, query,
@@ -117,25 +117,57 @@ pub fn route_documents(
     RoutedBatch { groups, unroutable }
 }
 
-/// Whether a query scores any text term (BM25), i.e. needs corpus-wide
-/// statistics shared across partitions.
-pub fn has_text_terms(query: &Query) -> bool {
-    match &query.query {
-        Some(query::Query::Term(_))
-        | Some(query::Query::Match(_))
-        | Some(query::Query::Phrase(_)) => true,
-        Some(query::Query::Boolean(b)) => b
-            .must
-            .iter()
-            .chain(&b.should)
-            .chain(&b.must_not)
-            .any(has_text_terms),
-        Some(query::Query::Boost(b)) => b.query.as_deref().is_some_and(has_text_terms),
-        Some(query::Query::Fusion(f)) => f
-            .queries
-            .iter()
-            .any(|w| w.query.as_ref().is_some_and(has_text_terms)),
-        _ => false,
+/// Collect text-bearing leaves into a query `GetTextStats` can convert.
+///
+/// Fusion is a searcher-level operation and `hermes-server` deliberately
+/// rejects it in the ordinary query converter used by `GetTextStats`. A
+/// partitioned hybrid search still needs corpus-wide BM25 statistics, so the
+/// broker sends only its term/match/phrase leaves for statistics while the
+/// original fusion remains unchanged for the actual search.
+pub fn text_stats_query(query: &Query) -> Option<Query> {
+    fn collect(query: &Query, leaves: &mut Vec<Query>) {
+        match &query.query {
+            Some(query::Query::Term(_))
+            | Some(query::Query::Match(_))
+            | Some(query::Query::Phrase(_)) => leaves.push(query.clone()),
+            Some(query::Query::Boolean(boolean)) => {
+                for clause in boolean
+                    .must
+                    .iter()
+                    .chain(&boolean.should)
+                    .chain(&boolean.must_not)
+                {
+                    collect(clause, leaves);
+                }
+            }
+            Some(query::Query::Boost(boost)) => {
+                if let Some(inner) = boost.query.as_deref() {
+                    collect(inner, leaves);
+                }
+            }
+            Some(query::Query::Fusion(fusion)) => {
+                for weighted in &fusion.queries {
+                    if let Some(inner) = weighted.query.as_ref() {
+                        collect(inner, leaves);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut leaves = Vec::new();
+    collect(query, &mut leaves);
+    match leaves.len() {
+        0 => None,
+        1 => leaves.pop(),
+        _ => Some(Query {
+            query: Some(query::Query::Boolean(BooleanQuery {
+                must: vec![],
+                should: leaves,
+                must_not: vec![],
+            })),
+        }),
     }
 }
 
@@ -355,7 +387,10 @@ pub fn partition_failure(index_name: &str, shard: &str, status: Status) -> Statu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::hermes::{DocAddress, FieldEntry};
+    use crate::proto::hermes::{
+        DocAddress, FieldEntry, FusionQuery, MatchQuery, PhraseQuery, SparseVectorQuery,
+        WeightedQuery,
+    };
 
     fn doc(id: &str) -> NamedDocument {
         NamedDocument {
@@ -394,6 +429,63 @@ mod tests {
             primary_key_field("index x {\n field a: text<raw> [indexed]\n}"),
             None
         );
+    }
+
+    #[test]
+    fn fusion_stats_query_keeps_only_text_leaves() {
+        let text_query = |kind| Query { query: Some(kind) };
+        let query = Query {
+            query: Some(query::Query::Fusion(FusionQuery {
+                queries: vec![
+                    WeightedQuery {
+                        query: Some(text_query(query::Query::SparseVector(SparseVectorQuery {
+                            field: "sparse_vectors".to_string(),
+                            ..Default::default()
+                        }))),
+                        weight: 1.0,
+                    },
+                    WeightedQuery {
+                        query: Some(Query {
+                            query: Some(query::Query::Boolean(BooleanQuery {
+                                must: vec![text_query(query::Query::Match(MatchQuery {
+                                    field: "content".to_string(),
+                                    text: "quantum".to_string(),
+                                    ..Default::default()
+                                }))],
+                                should: vec![text_query(query::Query::Phrase(PhraseQuery {
+                                    field: "content".to_string(),
+                                    text: "quantum field".to_string(),
+                                    ..Default::default()
+                                }))],
+                                must_not: vec![],
+                            })),
+                        }),
+                        weight: 0.8,
+                    },
+                ],
+                ..Default::default()
+            })),
+        };
+
+        let stats = text_stats_query(&query).expect("fusion has text leaves");
+        let Some(query::Query::Boolean(boolean)) = stats.query else {
+            panic!("multiple text leaves should become a boolean query");
+        };
+        assert_eq!(boolean.should.len(), 2);
+        assert!(matches!(
+            boolean.should[0].query,
+            Some(query::Query::Match(_))
+        ));
+        assert!(matches!(
+            boolean.should[1].query,
+            Some(query::Query::Phrase(_))
+        ));
+
+        let vector_only = text_query(query::Query::SparseVector(SparseVectorQuery {
+            field: "sparse_vectors".to_string(),
+            ..Default::default()
+        }));
+        assert!(text_stats_query(&vector_only).is_none());
     }
 
     #[test]

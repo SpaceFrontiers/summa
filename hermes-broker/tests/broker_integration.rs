@@ -617,6 +617,62 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
         let state = mock.state.lock();
         assert_eq!(state.search_requests.len(), 2);
         assert!(state.search_requests[1].text_stats.is_none());
+        assert_eq!(state.text_stats_requests.len(), 1);
+    }
+
+    // Hybrid retrieval is a top-level fusion. GetTextStats cannot execute a
+    // FusionQuery, so the broker must send only the BM25 leaf for statistics
+    // while preserving the fusion in the actual Search request.
+    let mut hybrid = simple_search_request("documents");
+    hybrid.query = Some(Query {
+        query: Some(query::Query::Fusion(FusionQuery {
+            queries: vec![
+                WeightedQuery {
+                    query: Some(Query {
+                        query: Some(query::Query::SparseVector(SparseVectorQuery {
+                            field: "sparse_vectors".to_string(),
+                            ..Default::default()
+                        })),
+                    }),
+                    weight: 1.0,
+                },
+                WeightedQuery {
+                    query: Some(Query {
+                        query: Some(query::Query::Match(MatchQuery {
+                            field: "content".to_string(),
+                            text: "quantum".to_string(),
+                            ..Default::default()
+                        })),
+                    }),
+                    weight: 1.0,
+                },
+            ],
+            ..Default::default()
+        })),
+    });
+    broker_search_client(&broker)
+        .await
+        .search(hybrid)
+        .await
+        .unwrap();
+    for mock in &mocks {
+        let state = mock.state.lock();
+        assert_eq!(state.search_requests.len(), 3);
+        assert!(matches!(
+            state.search_requests[2]
+                .query
+                .as_ref()
+                .and_then(|query| query.query.as_ref()),
+            Some(query::Query::Fusion(_))
+        ));
+        assert_eq!(state.text_stats_requests.len(), 2);
+        assert!(matches!(
+            state.text_stats_requests[1]
+                .query
+                .as_ref()
+                .and_then(|query| query.query.as_ref()),
+            Some(query::Query::Match(_))
+        ));
     }
 }
 
