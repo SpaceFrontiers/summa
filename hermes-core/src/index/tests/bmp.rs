@@ -3134,6 +3134,142 @@ async fn test_bmp_block_posting_overflow_256() {
     assert_eq!(fwd.total_postings(), 300 * 256);
 }
 
+/// Regression: a block whose payload no longer parses, a sparse posting whose
+/// slot lies outside the block, and a document-map entry pointing outside the
+/// segment were all skipped silently by the executor — and the unparseable
+/// block was still counted as scored. Every drop must be counted so it can be
+/// alerted on, and the surviving data must still score exactly.
+#[tokio::test]
+async fn test_bmp_corrupt_block_posting_and_docmap_entry_are_counted_not_silently_dropped() {
+    use crate::directories::{FileHandle, OwnedBytes};
+    use crate::segment::BmpIndex;
+    use crate::segment::bmp_adaptive::{AdaptiveBlock, AdaptivePostings};
+    use crate::segment::format::BMP_BLOB_FOOTER_SIZE;
+
+    const DOCS: u32 = 320;
+    const BLOCK: usize = 64;
+    let sparse_config = SparseVectorConfig {
+        format: SparseFormat::Bmp,
+        weight_quantization: WeightQuantization::UInt8,
+        bmp_block_size: BLOCK as u32,
+        dims: Some(2_000),
+        ..SparseVectorConfig::default()
+    };
+    // No `reorder` attribute: virtual ids keep insertion order, so block b
+    // holds exactly docs 64b..64b+63.
+    let mut sb = SchemaBuilder::default();
+    let sparse = sb.add_sparse_vector_field_with_config("sparse", true, true, sparse_config);
+    let schema = sb.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for d in 0..DOCS {
+        // Dims 100..105 are in every doc (dense rows); dim 500 is in one of
+        // every four docs, so each block stores it as 16 sparse postings.
+        let mut entries: Vec<(u32, f32)> = (100..105)
+            .map(|t| (t, 1.0 + (d % 5) as f32 * 0.1))
+            .collect();
+        if d % 4 == 0 {
+            entries.push((500, 2.0));
+        }
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, entries);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    drop(writer);
+
+    let index = Index::open(dir, config).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    let reader = &readers[0];
+    let bmp = reader.bmp_indexes().get(&sparse.0).unwrap();
+    assert_eq!(bmp.num_blocks, 5);
+    assert_eq!(bmp.bmp_block_size, BLOCK as u32);
+    assert_eq!(bmp.num_virtual_docs, DOCS);
+    let mut blob = bmp.read_raw_blob().unwrap().to_vec();
+    let data_len = blob.len() - BMP_BLOB_FOOTER_SIZE;
+
+    let query: Vec<(u32, f32)> = (100..105).map(|t| (t, 1.0)).chain([(500, 1.0)]).collect();
+    let run = |bytes: Vec<u8>| {
+        let len = bytes.len() as u64;
+        let parsed = BmpIndex::parse(
+            FileHandle::from_bytes(OwnedBytes::new(bytes)),
+            0,
+            len,
+            reader.num_docs(),
+            bmp.total_vectors,
+        )
+        .unwrap();
+        crate::query::bmp::execute_bmp_with_threshold_stats(
+            &parsed,
+            "corrupt",
+            "sparse",
+            &query,
+            &query,
+            DOCS as usize,
+            1.0,
+            0,
+            None,
+            crate::query::bmp::BmpThreshold::default(),
+        )
+        .unwrap()
+    };
+
+    // Control: the pristine blob scores every block and resolves every doc.
+    let (clean, clean_stats) = run(blob.clone());
+    assert_eq!(clean.len(), DOCS as usize);
+    assert_eq!(clean_stats.blocks_scored, 5);
+    assert!(
+        !clean_stats.has_integrity_faults(),
+        "pristine segment reported faults: {clean_stats:?}"
+    );
+
+    // (1) Block 2: zero `num_terms`, so the payload no longer parses.
+    let (b2_start, _) = bmp.block_data_range(2);
+    blob[b2_start as usize..b2_start as usize + 4].fill(0);
+
+    // (2) Block 3: point the first sparse posting of dim 500 at slot 255,
+    // outside the 64-slot block.
+    let (b3_start, b3_end) = bmp.block_data_range(3);
+    let posting_offset = {
+        let block_bytes = &blob[b3_start as usize..b3_end as usize];
+        let block = AdaptiveBlock::parse(block_bytes, BLOCK).unwrap();
+        let term = block.find_dimension(500).expect("dim 500 in block 3");
+        let AdaptivePostings::Sparse(postings) = block.postings(term).unwrap() else {
+            panic!("dim 500 must be stored as sparse postings");
+        };
+        b3_start as usize + (postings.as_ptr() as usize - block_bytes.as_ptr() as usize)
+    };
+    blob[posting_offset] = 255;
+
+    // (3) Virtual doc 5 (block 0): document-map id beyond the segment.
+    let dm_ids_start = data_len - bmp.num_virtual_docs as usize * 6;
+    blob[dm_ids_start + 5 * 4..dm_ids_start + 6 * 4].copy_from_slice(&(DOCS + 1000).to_le_bytes());
+
+    let (results, stats) = run(blob);
+    assert_eq!(stats.corrupt_blocks, 1, "{stats:?}");
+    assert_eq!(
+        stats.blocks_scored, 4,
+        "an unparseable block must not count as scored: {stats:?}"
+    );
+    assert_eq!(stats.dropped_postings, 1, "{stats:?}");
+    assert_eq!(stats.invalid_docmap_entries, 1, "{stats:?}");
+    assert_eq!(stats.corrupt_terms, 0, "{stats:?}");
+    assert!(stats.has_integrity_faults());
+    // The 64 docs of block 2 and virtual doc 5 are gone; everything else
+    // still scores, and no phantom document appears.
+    assert_eq!(results.len(), DOCS as usize - 64 - 1);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.doc_id != 5 && !(128..192).contains(&r.doc_id) && r.doc_id < DOCS),
+        "corrupted entries leaked into the results"
+    );
+}
+
 /// Regression: the optimizer's reorder candidates are scanned long before the
 /// pass runs (hours behind under load). If a merge consumes the candidate in
 /// the meantime, the reorder must SKIP it — operation ownership only covers

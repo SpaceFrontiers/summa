@@ -106,6 +106,14 @@ pub(crate) enum FloatCentroidRouter {
     Hnsw(HnswRoutingGraph),
 }
 
+thread_local! {
+    /// Flat probing scores every leaf centroid; at production cluster counts
+    /// that buffer is hundreds of KiB per query, so it is retained per thread
+    /// (mirrors `binary_ivf::CENTROID_SCORE_SCRATCH`).
+    static CENTROID_SCORE_SCRATCH: std::cell::RefCell<Vec<(u32, f32)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct FlatClusterMemberships {
     offsets: Vec<usize>,
     members: Vec<usize>,
@@ -230,6 +238,53 @@ impl CoarseCentroids {
         }
         trained.soar_config = soar_config;
         trained
+    }
+
+    /// Build a codebook around an existing leaf-centroid matrix without
+    /// running k-means.
+    ///
+    /// Benchmarks and tests use this to route over synthetic centroids of a
+    /// chosen size; production codebooks come from [`Self::train`]. Only
+    /// `Flat`/`Auto` (no router) and `Hnsw` (graph over the given leaves) are
+    /// supported: a two-level router needs trained parent cells.
+    pub fn from_leaf_centroids(
+        dim: usize,
+        centroids: Vec<f32>,
+        routing: IvfRoutingMode,
+        seed: u64,
+        index_label: &str,
+    ) -> Self {
+        assert!(dim > 0, "centroid dimension must be positive");
+        assert!(
+            !centroids.is_empty() && centroids.len().is_multiple_of(dim),
+            "centroid matrix length {} is not a non-empty multiple of dim {dim}",
+            centroids.len()
+        );
+        let num_clusters = centroids.len() / dim;
+        let routing_index = match effective_routing_mode(routing, num_clusters) {
+            IvfRoutingMode::Flat | IvfRoutingMode::Auto => None,
+            IvfRoutingMode::Hnsw => Some(FloatCentroidRouter::Hnsw(HnswRoutingGraph::build(
+                num_clusters,
+                |left, right| {
+                    let left = left as usize * dim;
+                    let right = right as usize * dim;
+                    squared_l2(&centroids[left..left + dim], &centroids[right..right + dim])
+                },
+                seed,
+                index_label,
+            ))),
+            IvfRoutingMode::TwoLevel => panic!(
+                "two-level routing needs trained parent centroids; use CoarseCentroids::train"
+            ),
+        };
+        Self {
+            num_clusters: num_clusters as u32,
+            dim,
+            centroids,
+            version: seed,
+            soar_config: None,
+            routing_index,
+        }
     }
 
     fn calibrate_selective_spill_threshold(
@@ -382,18 +437,11 @@ impl CoarseCentroids {
 
     /// Find nearest centroid index for a vector (static helper)
     fn find_nearest_idx_static(vector: &[f32], centroids: &[f32], dim: usize) -> usize {
-        let num_clusters = centroids.len() / dim;
         let mut best_idx = 0;
         let mut best_dist = f32::MAX;
 
-        for c in 0..num_clusters {
-            let offset = c * dim;
-            let dist: f32 = vector
-                .iter()
-                .zip(&centroids[offset..offset + dim])
-                .map(|(&a, &b)| (a - b) * (a - b))
-                .sum();
-
+        for (c, centroid) in centroids.chunks_exact(dim).enumerate() {
+            let dist = squared_l2(vector, centroid);
             if dist < best_dist {
                 best_dist = dist;
                 best_idx = c;
@@ -410,25 +458,36 @@ impl CoarseCentroids {
 
     /// Find k nearest clusters for a query vector
     pub fn find_k_nearest(&self, vector: &[f32], k: usize) -> Vec<u32> {
-        let mut distances: Vec<(u32, f32)> = (0..self.num_clusters)
-            .map(|c| {
-                let offset = c as usize * self.dim;
-                let dist: f32 = vector
-                    .iter()
-                    .zip(&self.centroids[offset..offset + self.dim])
-                    .map(|(&a, &b)| (a - b) * (a - b))
-                    .sum();
-                (c, dist)
-            })
-            .collect();
+        self.flat_k_nearest_with_distances(vector, k, |distances| {
+            distances.iter().map(|&(c, _)| c).collect()
+        })
+    }
 
-        // Partial sort: O(n + k log k) instead of O(n log n)
-        if distances.len() > k {
-            distances.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
-            distances.truncate(k);
-        }
-        distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-        distances.into_iter().map(|(c, _)| c).collect()
+    /// Exact flat pass over every leaf centroid, retaining the `k` nearest in
+    /// ascending distance order. The O(num_clusters) score buffer lives in
+    /// thread-local scratch: at production codebook sizes it is hundreds of
+    /// KiB per query and this runs once per query per routed field.
+    fn flat_k_nearest_with_distances<T>(
+        &self,
+        vector: &[f32],
+        k: usize,
+        finish: impl FnOnce(&[(u32, f32)]) -> T,
+    ) -> T {
+        CENTROID_SCORE_SCRATCH.with(|scratch| {
+            let mut distances = scratch.borrow_mut();
+            distances.clear();
+            distances.extend(
+                (0..self.num_clusters).map(|c| (c, squared_l2(vector, self.get_centroid(c)))),
+            );
+
+            // Partial sort: O(n + k log k) instead of O(n log n)
+            if distances.len() > k {
+                distances.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
+                distances.truncate(k);
+            }
+            distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+            finish(&distances)
+        })
     }
 
     /// Build a versioned probe plan using flat or two-level routing.
@@ -544,25 +603,7 @@ impl CoarseCentroids {
 
     /// Find k nearest clusters with their distances
     pub fn find_k_nearest_with_distances(&self, vector: &[f32], k: usize) -> Vec<(u32, f32)> {
-        let mut distances: Vec<(u32, f32)> = (0..self.num_clusters)
-            .map(|c| {
-                let offset = c as usize * self.dim;
-                let dist: f32 = vector
-                    .iter()
-                    .zip(&self.centroids[offset..offset + self.dim])
-                    .map(|(&a, &b)| (a - b) * (a - b))
-                    .sum();
-                (c, dist)
-            })
-            .collect();
-
-        // Partial sort: O(n + k log k) instead of O(n log n)
-        if distances.len() > k {
-            distances.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
-            distances.truncate(k);
-        }
-        distances.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-        distances
+        self.flat_k_nearest_with_distances(vector, k, <[(u32, f32)]>::to_vec)
     }
 
     /// Assign vector with SOAR (if configured) or standard assignment
@@ -645,7 +686,7 @@ impl CoarseCentroids {
             .map(|(v, c)| v - c)
             .collect();
 
-        let residual_norm_sq: f32 = residual.iter().map(|x| x * x).sum();
+        let residual_norm_sq = crate::structures::simd::norm_squared_f32(&residual);
 
         // 3. Check if we should spill (selective spilling)
         if config.selective && residual_norm_sq < config.spill_threshold * config.spill_threshold {

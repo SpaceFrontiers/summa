@@ -422,3 +422,204 @@ mod imp {
 }
 
 pub(crate) use imp::*;
+
+// ---- search plumbing (added by plumbing perf pass) ----
+
+#[cfg(all(feature = "metrics", feature = "native"))]
+mod plumbing {
+    use std::sync::Arc;
+
+    /// Slice cache hits, flushed in batches from an in-process counter (the
+    /// hit path itself is one atomic increment, no label allocation).
+    pub fn slice_cache_hits(index: &Arc<str>, hits: u64, last_bytes: usize) {
+        metrics::counter!("hermes_slice_cache_hits_total", "index" => Arc::clone(index))
+            .increment(hits);
+        metrics::histogram!("hermes_slice_cache_hit_bytes", "index" => Arc::clone(index))
+            .record(last_bytes as f64);
+    }
+
+    /// One slice cache miss (the range went to the inner directory).
+    pub fn slice_cache_miss(index: &Arc<str>, bytes: usize) {
+        metrics::counter!("hermes_slice_cache_misses_total", "index" => Arc::clone(index))
+            .increment(1);
+        metrics::histogram!("hermes_slice_cache_miss_bytes", "index" => Arc::clone(index))
+            .record(bytes as f64);
+    }
+
+    /// One eviction pass of the slice cache finished.
+    pub fn slice_cache_evicted(index: &Arc<str>, slices: u64, bytes: usize) {
+        metrics::counter!("hermes_slice_cache_evicted_slices_total", "index" => Arc::clone(index))
+            .increment(slices);
+        metrics::counter!("hermes_slice_cache_evicted_bytes_total", "index" => Arc::clone(index))
+            .increment(bytes as u64);
+    }
+
+    /// L2 rerank candidates dropped because their segment is gone or has no
+    /// stored vectors for the field.
+    pub fn rerank_candidates_skipped(index: &str, kind: &'static str, count: u64) {
+        let index: metrics::SharedString = Arc::<str>::from(index).into();
+        metrics::counter!("hermes_rerank_candidates_skipped_total", "index" => index, "kind" => kind)
+            .increment(count);
+    }
+}
+
+#[cfg(not(all(feature = "metrics", feature = "native")))]
+mod plumbing {
+    #[inline(always)]
+    pub fn slice_cache_hits(_: &std::sync::Arc<str>, _: u64, _: usize) {}
+    #[inline(always)]
+    pub fn slice_cache_miss(_: &std::sync::Arc<str>, _: usize) {}
+    #[inline(always)]
+    pub fn slice_cache_evicted(_: &std::sync::Arc<str>, _: u64, _: usize) {}
+    // Caller is the native-only L2 reranker — dead on wasm.
+    #[inline(always)]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub fn rerank_candidates_skipped(_: &str, _: &'static str, _: u64) {}
+}
+
+pub(crate) use plumbing::*;
+
+// ---- dense ANN (added by dense perf pass) ----
+
+/// Per-query diagnostics from one segment's dense ANN scan. Every field is a
+/// fallback or a regime decision that used to be invisible: pruned blocks
+/// only reached `log::debug!`, non-finite scores were dropped silently, the
+/// serial-vs-Rayon choice left no trace, and combined-document scans
+/// materialize every probed posting without saying how many.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DenseAnnScanStats {
+    /// Blocks (or rows) whose scores were computed.
+    pub scored_blocks: usize,
+    /// Blocks skipped by the scale upper bound.
+    pub pruned_blocks: usize,
+    /// Postings in the probed leaves (what a combined-document scan buffers).
+    pub posting_count: usize,
+    /// Candidates dropped because their score was NaN/±inf.
+    pub non_finite_dropped: usize,
+    /// Whether the scan fanned out across Rayon workers.
+    pub parallel: bool,
+}
+
+impl DenseAnnScanStats {
+    /// Metric label for the serial-vs-Rayon decision.
+    #[cfg_attr(not(all(feature = "metrics", feature = "native")), allow(dead_code))]
+    #[inline]
+    pub(crate) fn regime(&self) -> &'static str {
+        if self.parallel { "parallel" } else { "serial" }
+    }
+}
+
+#[cfg(all(feature = "metrics", feature = "native"))]
+mod dense_ann_imp {
+    use super::DenseAnnScanStats;
+    use std::sync::Arc;
+
+    /// One dense ANN segment scan finished (IVF-TQ, TQ flat, binary IVF).
+    pub fn dense_ann_scan(index: &str, field: &str, kind: &'static str, stats: DenseAnnScanStats) {
+        let index: metrics::SharedString = Arc::<str>::from(index).into();
+        let field: metrics::SharedString = Arc::<str>::from(field).into();
+        let regime = stats.regime();
+        metrics::counter!("hermes_dense_ann_scans_total", "index" => index.clone(), "field" => field.clone(), "kind" => kind, "regime" => regime)
+            .increment(1);
+        metrics::histogram!("hermes_dense_ann_blocks_scored", "index" => index.clone(), "field" => field.clone(), "kind" => kind)
+            .record(stats.scored_blocks as f64);
+        metrics::histogram!("hermes_dense_ann_blocks_pruned", "index" => index.clone(), "field" => field.clone(), "kind" => kind)
+            .record(stats.pruned_blocks as f64);
+        metrics::histogram!("hermes_dense_ann_postings_probed", "index" => index.clone(), "field" => field.clone(), "kind" => kind)
+            .record(stats.posting_count as f64);
+        metrics::counter!("hermes_dense_ann_non_finite_dropped_total", "index" => index, "field" => field, "kind" => kind)
+            .increment(stats.non_finite_dropped as u64);
+    }
+}
+
+#[cfg(not(all(feature = "metrics", feature = "native")))]
+mod dense_ann_imp {
+    use super::DenseAnnScanStats;
+
+    #[inline(always)]
+    pub fn dense_ann_scan(_: &str, _: &str, _: &'static str, _: DenseAnnScanStats) {}
+}
+
+pub(crate) use dense_ann_imp::dense_ann_scan;
+
+/// Rate-limited warning for dropped non-finite dense scores: a degenerate
+/// stored vector (NaN/inf payload) must be visible in logs without one line
+/// per query. Logs the 1st, 2nd, 4th, 8th, ... occurrence per process.
+pub(crate) fn warn_non_finite_dense_scores(
+    index: &str,
+    field: &str,
+    kind: &'static str,
+    dropped: usize,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static OCCURRENCES: AtomicU64 = AtomicU64::new(0);
+    if dropped == 0 {
+        return;
+    }
+    let occurrence = OCCURRENCES.fetch_add(1, Ordering::Relaxed) + 1;
+    if occurrence.is_power_of_two() {
+        log::warn!(
+            "[dense_ann] index={index} field={field} kind={kind}: dropped {dropped} candidates \
+             with non-finite scores (occurrence #{occurrence}; a stored vector is likely \
+             NaN/inf — see hermes_dense_ann_non_finite_dropped_total)"
+        );
+    }
+}
+
+// ---- integrity and degenerate-input counters (merge pass) ----
+
+#[cfg(all(feature = "metrics", feature = "native"))]
+mod integrity_imp {
+    use std::sync::Arc;
+
+    /// One BMP query hit at least one integrity fault; per-kind counts come
+    /// from `BmpExecutionStats`.
+    pub fn bmp_integrity_faults(
+        index: &str,
+        field: &str,
+        corrupt_blocks: u64,
+        corrupt_terms: u64,
+        dropped_postings: u64,
+        invalid_docmap_entries: u64,
+    ) {
+        let index: metrics::SharedString = Arc::<str>::from(index).into();
+        let field: metrics::SharedString = Arc::<str>::from(field).into();
+        metrics::counter!("hermes_bmp_integrity_fault_queries_total", "index" => index.clone(), "field" => field.clone())
+            .increment(1);
+        metrics::counter!("hermes_bmp_corrupt_blocks_total", "index" => index.clone(), "field" => field.clone())
+            .increment(corrupt_blocks);
+        metrics::counter!("hermes_bmp_corrupt_terms_total", "index" => index.clone(), "field" => field.clone())
+            .increment(corrupt_terms);
+        metrics::counter!("hermes_bmp_dropped_postings_total", "index" => index.clone(), "field" => field.clone())
+            .increment(dropped_postings);
+        metrics::counter!("hermes_bmp_invalid_docmap_entries_total", "index" => index, "field" => field)
+            .increment(invalid_docmap_entries);
+    }
+
+    /// Non-finite leaf scores dropped before combining multi-valued ANN
+    /// candidates (no index/field in scope at that layer).
+    pub fn ann_non_finite_scores_dropped(dropped: u64) {
+        metrics::counter!("hermes_ann_non_finite_scores_dropped_total").increment(dropped);
+    }
+
+    /// A FastScan lookup table collapsed to a constant (all-zero AH query):
+    /// every leaf row scores as its centroid dot.
+    pub fn scann_degenerate_fast_scan_query() {
+        metrics::counter!("hermes_scann_fast_scan_degenerate_queries_total").increment(1);
+    }
+}
+
+#[cfg(not(all(feature = "metrics", feature = "native")))]
+mod integrity_imp {
+    #[inline(always)]
+    pub fn bmp_integrity_faults(_: &str, _: &str, _: u64, _: u64, _: u64, _: u64) {}
+    // Callers live in the native-only ANN reader and ScaNN engine.
+    #[inline(always)]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub fn ann_non_finite_scores_dropped(_: u64) {}
+    #[inline(always)]
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub fn scann_degenerate_fast_scan_query() {}
+}
+
+pub(crate) use integrity_imp::*;

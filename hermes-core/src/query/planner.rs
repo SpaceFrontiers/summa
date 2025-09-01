@@ -10,8 +10,8 @@ use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
 use super::{
-    DocPredicate, EmptyScorer, GlobalStats, MatchedPositions, MaxScoreExecutor, MultiValueCombiner,
-    Query, ScoredDoc, ScoredPosition, Scorer, SparseTermQueryInfo, TermQueryInfo,
+    DocPredicate, EmptyScorer, GlobalStats, MaxScoreExecutor, MultiValueCombiner, Query, ScoredDoc,
+    Scorer, SparseTermQueryInfo, TermQueryInfo,
 };
 
 // ── IDF ──────────────────────────────────────────────────────────────────
@@ -133,7 +133,7 @@ pub(super) fn text_maxscore_allowed(
 ///
 /// Posting ids are virtual chunk ids; every hit is resolved through the
 /// segment's chunk map, grouped by document with `Max`, and served by a
-/// `VectorTopKResultScorer` so `matched_positions` carries `(ordinal, chunk
+/// `VectorResultScorer` so `matched_positions` carries `(ordinal, chunk
 /// score)` pairs — the same shape sparse vectors produce. Cross-segment
 /// threshold seeding is deliberately not applied: the k-th chunk score of a
 /// full heap is not a document-level floor after `Max` folding.
@@ -175,7 +175,7 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
         MultiValueCombiner::Max,
         limit,
     );
-    Ok(Box::new(VectorTopKResultScorer::new(combined, field.0)) as Box<dyn Scorer + 'a>)
+    Ok(Box::new(super::vector::VectorResultScorer::new(combined, field.0)) as Box<dyn Scorer + 'a>)
 }
 
 // ── Per-field grouping ───────────────────────────────────────────────────
@@ -474,7 +474,7 @@ pub(crate) fn combine_sparse_results<'a>(
         combiner,
         limit,
     );
-    Box::new(VectorTopKResultScorer::new(combined, field.0))
+    Box::new(super::vector::VectorResultScorer::new(combined, field.0))
 }
 
 /// Extract all sparse term infos from SHOULD clauses, flattening SparseVectorQuery.
@@ -691,72 +691,8 @@ impl Scorer for TopKResultScorer {
     }
 }
 
-/// Scorer that iterates over pre-computed vector results with ordinal information.
-/// Used by sparse MaxScore path to preserve per-ordinal scores for matched_positions().
-pub(crate) struct VectorTopKResultScorer {
-    results: Vec<crate::segment::VectorSearchResult>,
-    position: usize,
-    field_id: u32,
-}
-
-impl VectorTopKResultScorer {
-    pub(crate) fn new(mut results: Vec<crate::segment::VectorSearchResult>, field_id: u32) -> Self {
-        results.sort_unstable_by_key(|r| r.doc_id);
-        Self {
-            results,
-            position: 0,
-            field_id,
-        }
-    }
-}
-
-impl super::docset::DocSet for VectorTopKResultScorer {
-    fn doc(&self) -> DocId {
-        if self.position < self.results.len() {
-            self.results[self.position].doc_id
-        } else {
-            TERMINATED
-        }
-    }
-
-    fn advance(&mut self) -> DocId {
-        self.position += 1;
-        self.doc()
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        let remaining = &self.results[self.position..];
-        self.position += remaining.partition_point(|r| r.doc_id < target);
-        self.doc()
-    }
-
-    fn size_hint(&self) -> u32 {
-        (self.results.len() - self.position) as u32
-    }
-}
-
-impl Scorer for VectorTopKResultScorer {
-    fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
-        }
-    }
-
-    fn matched_positions(&self) -> Option<MatchedPositions> {
-        if self.position >= self.results.len() {
-            return None;
-        }
-        let result = &self.results[self.position];
-        let scored_positions: Vec<ScoredPosition> = result
-            .ordinals
-            .iter()
-            .map(|&(ordinal, score)| ScoredPosition::new(ordinal, score))
-            .collect();
-        Some(vec![(self.field_id, scored_positions)])
-    }
-}
+// Sparse executors share `crate::query::vector::VectorResultScorer` with the
+// dense queries (see `combine_sparse_results`).
 
 #[cfg(test)]
 mod tests {

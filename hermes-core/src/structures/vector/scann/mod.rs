@@ -14,6 +14,7 @@ mod engine;
 mod fast_scan;
 mod geometry;
 mod payload;
+mod quantized_dot;
 
 pub use ah::{
     AhCodebook, AhEncodeScratch, AhQuery, CENTERS_PER_BLOCK, DEFAULT_ANISOTROPIC_THRESHOLD,
@@ -38,7 +39,10 @@ pub use engine::{
     QuantizedFloatScannModel, QuantizedFloatScannModelView, RoutedLeaf, RoutingScratch,
     RoutingTraining, RoutingTrainingStats, train_routing_tree,
 };
-pub use fast_scan::{FAST_SCAN_LANES, FastScanQuery, pack_fast_scan_block};
+pub use fast_scan::{
+    FAST_SCAN_LANES, FAST_SCAN_LAYOUT_VERSION, FastScanKernel, FastScanQuery, pack_fast_scan_block,
+    packed_block_bytes, packed_code_position, padded_blocks,
+};
 pub use geometry::{
     QUALITY_OPTIMIZED_POINTS_PER_LEAF, ScannGeometry, derive_geometry, derive_geometry_with_levels,
     derive_geometry_with_levels_and_sample_limit, desired_training_sample, geometry_for_leaves,
@@ -47,6 +51,18 @@ pub use geometry::{
 pub use payload::{SCANN_SEGMENT_PAYLOAD_VERSION, ScannLeafRun, ScannSegmentPayload};
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Count one occurrence of a degraded condition and emit `log::warn!` for the
+/// 1st, 10th, 100th, ... occurrence so a hot path can stay observable without
+/// flooding the log. Returns the running total.
+pub(crate) fn warn_rate_limited(counter: &AtomicU64, message: impl FnOnce(u64) -> String) -> u64 {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if 10u64.pow(count.ilog10()) == count {
+        log::warn!("{}", message(count));
+    }
+    count
+}
 
 /// Retain the existing recall-oriented parent beam, then widen it only when
 /// that prefix cannot expose the requested number of children. Ranked nodes

@@ -747,12 +747,41 @@ pub struct VectorSearchResult {
     /// Combined score (after applying combiner: Sum/Max/Avg)
     pub score: f32,
     /// Individual ordinal contributions: (ordinal, score)
-    /// For single-value fields, this will have one entry with ordinal 0
-    pub ordinals: Vec<(u32, f32)>,
+    /// For single-value fields, this will have one entry with ordinal 0.
+    ///
+    /// Stored inline for the single-value case, so a top-k of single-vector
+    /// documents allocates nothing per result; multi-valued documents spill
+    /// to the heap like a `Vec`.
+    pub ordinals: VectorOrdinals,
 }
+
+/// Per-ordinal `(ordinal, score)` contributions of one vector search result.
+/// One entry lives inline; more spill to the heap.
+pub type VectorOrdinals = smallvec::SmallVec<[(u32, f32); 1]>;
 
 impl VectorSearchResult {
     pub fn new(doc_id: DocId, score: f32, ordinals: Vec<(u32, f32)>) -> Self {
+        Self {
+            doc_id,
+            score,
+            ordinals: VectorOrdinals::from_vec(ordinals),
+        }
+    }
+
+    /// Result of a single-valued document (ordinal 0 carries the whole
+    /// score). Allocation-free.
+    #[inline]
+    pub fn single(doc_id: DocId, score: f32) -> Self {
+        Self {
+            doc_id,
+            score,
+            ordinals: VectorOrdinals::from_buf([(0, score)]),
+        }
+    }
+
+    /// Result with pre-built ordinal contributions.
+    #[inline]
+    pub fn with_ordinals(doc_id: DocId, score: f32, ordinals: VectorOrdinals) -> Self {
         Self {
             doc_id,
             score,

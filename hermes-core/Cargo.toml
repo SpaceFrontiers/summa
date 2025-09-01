@@ -23,6 +23,7 @@ byteorder = { workspace = true }
 zstd = { workspace = true }
 rustc-hash = { workspace = true }
 parking_lot = { workspace = true }
+smallvec = "1.15"
 arc-swap = "1"
 async-channel = { workspace = true, optional = true }
 num_cpus = { workspace = true, optional = true }

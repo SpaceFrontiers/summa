@@ -135,9 +135,7 @@ fn build_chunked_phrase_scorer<'a>(
     }
     let combined =
         crate::segment::combine_ordinal_results(raw, super::MultiValueCombiner::Max, limit.max(1));
-    Ok(Box::new(super::planner::VectorTopKResultScorer::new(
-        combined, field.0,
-    )) as Box<dyn Scorer + 'a>)
+    Ok(Box::new(super::vector::VectorResultScorer::new(combined, field.0)) as Box<dyn Scorer + 'a>)
 }
 
 /// Build a PhraseScorer from already-fetched term data.

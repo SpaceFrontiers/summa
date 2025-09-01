@@ -173,6 +173,73 @@ fn reserve_rerank_vectors(
         })
 }
 
+/// Coalesce a chunk's flat indexes (ascending) into `(buffer_start,
+/// flat_start, count)` runs of adjacent vectors. Multi-valued documents store
+/// their values consecutively, so a chunk usually needs far fewer range
+/// reads than vectors. A repeated index (duplicate candidate) starts a new
+/// run rather than being rejected, so results are unchanged.
+fn plan_flat_read_runs(
+    flat_indexes: impl Iterator<Item = usize>,
+    runs: &mut Vec<(usize, usize, usize)>,
+) {
+    runs.clear();
+    for (buffer_index, flat_index) in flat_indexes.enumerate() {
+        if let Some(run) = runs.last_mut()
+            && run.1.checked_add(run.2) == Some(flat_index)
+        {
+            run.2 += 1;
+            continue;
+        }
+        runs.push((buffer_index, flat_index, 1));
+    }
+}
+
+/// Read the planned runs into `raw`, one range read per run.
+async fn read_flat_vector_runs(
+    lazy_flat: &crate::segment::LazyFlatVectorData,
+    runs: &[(usize, usize, usize)],
+    raw: &mut [u8],
+) -> crate::error::Result<()> {
+    let vbs = lazy_flat.vector_byte_size();
+    for &(buffer_start, flat_start, count) in runs {
+        let bytes = lazy_flat
+            .read_vectors_batch(flat_start, count)
+            .await
+            .map_err(crate::error::Error::Io)?;
+        let start = buffer_start
+            .checked_mul(vbs)
+            .ok_or_else(|| crate::Error::Query("rerank buffer offset overflow".into()))?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| crate::Error::Query("rerank buffer range overflow".into()))?;
+        raw.get_mut(start..end)
+            .ok_or_else(|| crate::Error::Corruption("rerank buffer is too short".into()))?
+            .copy_from_slice(bytes.as_slice());
+    }
+    Ok(())
+}
+
+/// Candidates that could not be reranked (segment gone or no stored vectors
+/// for the field) are dropped from the result; say so loudly.
+fn report_skipped_candidates<D: crate::directories::Directory + 'static>(
+    searcher: &crate::index::Searcher<D>,
+    kind: &'static str,
+    field_id: u32,
+    skipped: u32,
+    total: usize,
+) {
+    if skipped == 0 {
+        return;
+    }
+    let index_label = searcher.schema().index_label();
+    crate::observe::rerank_candidates_skipped(index_label, kind, u64::from(skipped));
+    log::warn!(
+        "[{kind}_vector_rerank] index={index_label} field {field_id}: {skipped} of {total} \
+         candidates skipped (segment missing or no stored vectors for the field) and dropped \
+         from the reranked result"
+    );
+}
+
 #[inline]
 fn rerank_batch_len(vector_byte_size: usize) -> usize {
     RERANK_SCORE_BATCH.min((MAX_RERANK_RAW_BATCH_BYTES / vector_byte_size.max(1)).max(1))
@@ -508,6 +575,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                     crate::Error::Query("dense reranker buffer size overflow".into())
                 })?;
                 let mut raw_buf = vec![0u8; max_raw_len];
+                let mut runs: Vec<(usize, usize, usize)> = Vec::new();
 
                 // Reconstruct PrecompQuery from captured components
                 let pq = PrecompQuery {
@@ -620,15 +688,11 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                             crate::Error::Query("dense reranker buffer size overflow".into())
                         })?;
                         let raw = &mut raw_buf[..raw_len];
-                        for (buf_idx, &(_, flat_idx, _)) in chunk.iter().enumerate() {
-                            lazy_flat
-                                .read_vector_raw_into(
-                                    flat_idx,
-                                    &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
-                                )
-                                .await
-                                .map_err(crate::error::Error::Io)?;
-                        }
+                        plan_flat_read_runs(
+                            chunk.iter().map(|&(_, flat_idx, _)| flat_idx),
+                            &mut runs,
+                        );
+                        read_flat_vector_runs(lazy_flat, &runs, raw).await?;
                         searcher.install_search_cpu(|| {
                             score_batch_precomp(
                                 &pq,
@@ -666,15 +730,11 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
                             crate::Error::Query("dense reranker buffer size overflow".into())
                         })?;
                         let raw = &mut raw_buf[..raw_len];
-                        for (buf_idx, &(_, flat_idx, _)) in chunk.iter().enumerate() {
-                            lazy_flat
-                                .read_vector_raw_into(
-                                    flat_idx,
-                                    &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
-                                )
-                                .await
-                                .map_err(crate::error::Error::Io)?;
-                        }
+                        plan_flat_read_runs(
+                            chunk.iter().map(|&(_, flat_idx, _)| flat_idx),
+                            &mut runs,
+                        );
+                        read_flat_vector_runs(lazy_flat, &runs, raw).await?;
                         searcher.install_search_cpu(|| {
                             score_batch_precomp(
                                 &pq,
@@ -707,6 +767,7 @@ pub async fn rerank<D: crate::directories::Directory + 'static>(
     }
 
     let read_score_elapsed = t0.elapsed();
+    report_skipped_candidates(searcher, "dense", field_id, skipped, candidates.len());
 
     if total_vectors == 0 {
         log::debug!(
@@ -800,13 +861,16 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
 
     // Group candidates by segment
     let mut segment_groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    let mut skipped = 0u32;
     for (ci, cand) in candidates.iter().enumerate() {
         if let Some(&seg_idx) = seg_by_id.get(&cand.segment_id) {
             let reader = &segments[seg_idx];
             if reader.flat_vectors().contains_key(&field_id) {
                 segment_groups.entry(seg_idx).or_default().push(ci);
+                continue;
             }
         }
+        skipped += 1;
     }
 
     // Bounded concurrent per-segment scoring (same pattern as dense reranker).
@@ -822,9 +886,10 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
             let byte_budget = Arc::clone(&byte_budget);
             async move {
                 let mut scores: Vec<(usize, u32, f32)> = Vec::new();
+                let mut seg_skipped = 0u32;
 
                 let Some(lazy_flat) = segments[seg_idx].flat_vectors().get(&field_id) else {
-                    return Ok::<_, crate::error::Error>(scores);
+                    return Ok::<_, crate::error::Error>((scores, cand_indices.len() as u32));
                 };
                 if lazy_flat.quantization != crate::dsl::DenseVectorQuantization::Binary
                     || !lazy_flat.dim.is_multiple_of(8)
@@ -845,13 +910,17 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
                 for &ci in &cand_indices {
                     let doc_id = candidates[ci].doc_id;
                     let (start, count) = lazy_flat.flat_indexes_for_doc_range(doc_id);
+                    if count == 0 {
+                        seg_skipped += 1;
+                        continue;
+                    }
                     reserve_rerank_vectors(&vector_budget, &byte_budget, count, vbs)?;
                     for j in 0..count {
                         resolved.push((ci, start + j));
                     }
                 }
                 if resolved.is_empty() {
-                    return Ok(scores);
+                    return Ok((scores, seg_skipped));
                 }
 
                 resolved.sort_unstable_by_key(|&(_, flat_idx)| flat_idx);
@@ -863,6 +932,7 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
                     crate::Error::Query("binary reranker buffer size overflow".into())
                 })?;
                 let mut raw_buf = vec![0u8; max_raw_len];
+                let mut runs: Vec<(usize, usize, usize)> = Vec::new();
                 let mut scores_buf = vec![0f32; max_batch];
                 scores.reserve(n);
 
@@ -871,15 +941,8 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
                         crate::Error::Query("binary reranker buffer size overflow".into())
                     })?;
                     let raw = &mut raw_buf[..raw_len];
-                    for (buf_idx, &(_, flat_idx)) in chunk.iter().enumerate() {
-                        lazy_flat
-                            .read_vector_raw_into(
-                                flat_idx,
-                                &mut raw[buf_idx * vbs..(buf_idx + 1) * vbs],
-                            )
-                            .await
-                            .map_err(crate::error::Error::Io)?;
-                    }
+                    plan_flat_read_runs(chunk.iter().map(|&(_, flat_idx)| flat_idx), &mut runs);
+                    read_flat_vector_runs(lazy_flat, &runs, raw).await?;
                     searcher.install_search_cpu(|| {
                         crate::structures::simd::batch_hamming_scores(
                             query,
@@ -896,7 +959,7 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
                     }
                 }
 
-                Ok(scores)
+                Ok((scores, seg_skipped))
             }
         },
     ))
@@ -905,7 +968,8 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
 
     // Combine ordinal scores per candidate and apply combiner
     let mut cand_ordinal_scores: FxHashMap<usize, Vec<(u32, f32)>> = FxHashMap::default();
-    while let Some(scores) = segment_futs.try_next().await? {
+    while let Some((scores, seg_skipped)) = segment_futs.try_next().await? {
+        skipped = skipped.saturating_add(seg_skipped);
         for (ci, ordinal, score) in scores {
             cand_ordinal_scores
                 .entry(ci)
@@ -913,6 +977,7 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
                 .push((ordinal, score));
         }
     }
+    report_skipped_candidates(searcher, "binary", field_id, skipped, candidates.len());
 
     let total_vectors = cand_ordinal_scores.len();
     let mut scored: Vec<SearchResult> = Vec::with_capacity(total_vectors);
@@ -956,6 +1021,22 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
 mod tests {
     use super::*;
     use crate::dsl::{Document, Field};
+
+    /// Adjacent flat indexes (multi-valued documents, consecutive candidates)
+    /// coalesce into one range read; gaps and repeated indexes start new
+    /// runs so every buffer slot is still filled exactly once.
+    #[test]
+    fn flat_read_runs_coalesce_adjacent_indexes_and_tolerate_duplicates() {
+        let mut runs = Vec::new();
+        plan_flat_read_runs([3usize, 4, 5, 9, 10, 20, 20, 21].into_iter(), &mut runs);
+        assert_eq!(runs, vec![(0, 3, 3), (3, 9, 2), (5, 20, 1), (6, 20, 2)]);
+
+        plan_flat_read_runs(std::iter::empty(), &mut runs);
+        assert!(runs.is_empty());
+
+        plan_flat_read_runs([usize::MAX].into_iter(), &mut runs);
+        assert_eq!(runs, vec![(0, usize::MAX, 1)]);
+    }
 
     fn make_config(vector: Vec<f32>, combiner: MultiValueCombiner) -> RerankerConfig {
         RerankerConfig {

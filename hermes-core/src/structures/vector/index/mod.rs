@@ -60,6 +60,9 @@ pub(crate) struct BoundedAnnCollector<const BY_DOCUMENT: bool, const HIGHER_IS_B
     k: usize,
     heap: std::collections::BinaryHeap<RankedEntry>,
     best: rustc_hash::FxHashMap<u64, RankedEntry>,
+    /// Candidates rejected because their score was NaN/±inf. Surfaced to the
+    /// caller so a degenerate scan never drops values silently.
+    non_finite: usize,
 }
 
 /// Heap-only top-k collector for streams whose `(doc_id, ordinal)` keys are
@@ -71,6 +74,8 @@ pub(crate) struct BoundedAnnCollector<const BY_DOCUMENT: bool, const HIGHER_IS_B
 pub(crate) struct BoundedUniqueAnnCollector<const HIGHER_IS_BETTER: bool> {
     k: usize,
     heap: std::collections::BinaryHeap<RankedEntry>,
+    /// Candidates rejected because their score was NaN/±inf.
+    non_finite: usize,
 }
 
 impl<const HIGHER_IS_BETTER: bool> BoundedUniqueAnnCollector<HIGHER_IS_BETTER> {
@@ -78,6 +83,33 @@ impl<const HIGHER_IS_BETTER: bool> BoundedUniqueAnnCollector<HIGHER_IS_BETTER> {
         Self {
             k,
             heap: std::collections::BinaryHeap::with_capacity(k.min(8_192)),
+            non_finite: 0,
+        }
+    }
+
+    /// Number of non-finite scores this collector refused.
+    #[inline]
+    pub(crate) fn non_finite_dropped(&self) -> usize {
+        self.non_finite
+    }
+
+    /// The k-th best value once `k` entries are held, else `None`. Keys are
+    /// unique, so the root is never stale and the bound is exact.
+    #[inline]
+    pub(crate) fn pruning_threshold(&self) -> Option<f32> {
+        if self.heap.len() < self.k {
+            return None;
+        }
+        self.heap.peek().map(|entry| Self::value(entry.rank))
+    }
+
+    /// Merge a worker-local collector; the union of unique-key streams is
+    /// still unique-keyed, so no deduplication is needed.
+    #[cfg(any(feature = "native", test))]
+    pub(crate) fn merge_from(&mut self, other: Self) {
+        self.non_finite += other.non_finite;
+        for entry in other.heap {
+            self.insert(entry.doc_id, entry.ordinal, Self::value(entry.rank));
         }
     }
 
@@ -93,7 +125,11 @@ impl<const HIGHER_IS_BETTER: bool> BoundedUniqueAnnCollector<HIGHER_IS_BETTER> {
 
     #[inline]
     pub(crate) fn insert(&mut self, doc_id: u32, ordinal: u16, value: f32) {
-        if self.k == 0 || !value.is_finite() {
+        if self.k == 0 {
+            return;
+        }
+        if !value.is_finite() {
+            self.non_finite += 1;
             return;
         }
         let candidate = RankedEntry {
@@ -103,9 +139,11 @@ impl<const HIGHER_IS_BETTER: bool> BoundedUniqueAnnCollector<HIGHER_IS_BETTER> {
         };
         if self.heap.len() < self.k {
             self.heap.push(candidate);
-        } else if self.heap.peek().is_some_and(|worst| candidate < *worst) {
-            self.heap.pop();
-            self.heap.push(candidate);
+        } else if let Some(mut worst) = self.heap.peek_mut()
+            && candidate < *worst
+        {
+            // Root replacement: one sift-down instead of pop + push.
+            *worst = candidate;
         }
     }
 
@@ -137,7 +175,14 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
             k,
             heap: std::collections::BinaryHeap::with_capacity(k.min(8_192)),
             best: rustc_hash::FxHashMap::with_capacity_and_hasher(k.min(8_192), Default::default()),
+            non_finite: 0,
         }
+    }
+
+    /// Number of non-finite scores this collector refused.
+    #[inline]
+    pub(crate) fn non_finite_dropped(&self) -> usize {
+        self.non_finite
     }
 
     #[inline]
@@ -179,7 +224,11 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
 
     #[inline]
     pub(crate) fn insert(&mut self, doc_id: u32, ordinal: u16, value: f32) {
-        if self.k == 0 || !value.is_finite() {
+        if self.k == 0 {
+            return;
+        }
+        if !value.is_finite() {
+            self.non_finite += 1;
             return;
         }
         let candidate = RankedEntry {
@@ -207,14 +256,20 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
 
         if self.best.len() >= self.k {
             self.discard_stale_top();
-            let Some(worst) = self.heap.peek().copied() else {
+            let Some(mut worst) = self.heap.peek_mut() else {
                 return;
             };
-            if candidate >= worst {
+            if candidate >= *worst {
                 return;
             }
-            self.heap.pop();
-            self.best.remove(&Self::key(worst.doc_id, worst.ordinal));
+            // Root replacement: one sift-down instead of pop + push. The
+            // evicted root is live (stale entries were discarded above).
+            let evicted = std::mem::replace(&mut *worst, candidate);
+            drop(worst);
+            self.best
+                .remove(&Self::key(evicted.doc_id, evicted.ordinal));
+            self.best.insert(key, candidate);
+            return;
         }
         self.best.insert(key, candidate);
         self.heap.push(candidate);
@@ -237,6 +292,7 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
     /// top-k state while keeping temporary memory bounded by the workers.
     #[cfg(any(feature = "native", test))]
     pub(crate) fn merge_from(&mut self, other: Self) {
+        self.non_finite += other.non_finite;
         for entry in other.best.into_values() {
             self.insert(entry.doc_id, entry.ordinal, Self::value(entry.rank));
         }
@@ -297,7 +353,44 @@ mod tests {
         collector.insert(1, 0, f32::NAN);
         collector.insert(2, 0, f32::INFINITY);
         collector.insert(3, 0, 1.0);
+        assert_eq!(collector.non_finite_dropped(), 2);
         assert_eq!(collector.into_sorted_results(), vec![(3, 0, 1.0)]);
+
+        let mut unique = BoundedUniqueAnnCollector::<true>::new(2);
+        unique.insert(1, 0, f32::NEG_INFINITY);
+        unique.insert(2, 0, 0.5);
+        assert_eq!(unique.non_finite_dropped(), 1);
+        assert_eq!(unique.pruning_threshold(), None, "one live entry < k");
+        unique.insert(3, 0, 0.75);
+        assert_eq!(unique.pruning_threshold(), Some(0.5));
+        unique.insert(4, 0, 0.9);
+        assert_eq!(unique.pruning_threshold(), Some(0.75));
+        assert_eq!(
+            unique.into_sorted_results(),
+            vec![(4, 0, 0.9), (3, 0, 0.75)]
+        );
+    }
+
+    #[test]
+    fn collectors_count_non_finite_drops_across_merges() {
+        let mut left = BoundedDocumentScoreCollector::new(2);
+        left.insert(1, 0, f32::NAN);
+        let mut right = BoundedDocumentScoreCollector::new(2);
+        right.insert(2, 0, f32::INFINITY);
+        right.insert(3, 0, 0.5);
+        left.merge_from(right);
+        assert_eq!(left.non_finite_dropped(), 2);
+        assert_eq!(left.into_sorted_results(), vec![(3, 0, 0.5)]);
+
+        let mut left = BoundedUniqueAnnCollector::<true>::new(2);
+        left.insert(1, 0, 0.1);
+        let mut right = BoundedUniqueAnnCollector::<true>::new(2);
+        right.insert(2, 0, f32::NAN);
+        right.insert(3, 0, 0.9);
+        right.insert(4, 0, 0.8);
+        left.merge_from(right);
+        assert_eq!(left.non_finite_dropped(), 1);
+        assert_eq!(left.into_sorted_results(), vec![(3, 0, 0.9), (4, 0, 0.8)]);
     }
 
     #[test]

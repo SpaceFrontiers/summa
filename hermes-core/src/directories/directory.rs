@@ -971,6 +971,36 @@ pub struct FsDirectory {
     label: IndexLabel,
 }
 
+/// Positional exact read that does not move the shared file cursor, so one
+/// `File` can serve concurrent range reads.
+#[cfg(all(feature = "native", unix))]
+fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buffer, offset)
+}
+
+#[cfg(all(feature = "native", windows))]
+fn read_exact_at(file: &std::fs::File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        match file.seek_read(buffer, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(read) => {
+                buffer = &mut buffer[read..];
+                offset += read as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "native")]
 impl FsDirectory {
     pub fn new(root: impl AsRef<Path>) -> Self {
@@ -1040,23 +1070,30 @@ impl Directory for FsDirectory {
     }
 
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
+        // Open once and keep the descriptor in the handle. Each range read is
+        // then a single positional read on one blocking thread instead of
+        // open + seek + read (three `spawn_blocking` hops) per range.
         let full_path = self.resolve(path);
-        let metadata = tokio::fs::metadata(&full_path).await?;
-        let file_size = metadata.len();
+        let (file, file_size) = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&full_path)?;
+            let file_size = file.metadata()?.len();
+            Ok::<_, io::Error>((file, file_size))
+        })
+        .await
+        .map_err(io::Error::other)??;
+        let file = Arc::new(file);
 
         let read_fn: RangeReadFn = Arc::new(move |range: Range<u64>| {
-            let full_path = full_path.clone();
+            let file = Arc::clone(&file);
             Box::pin(async move {
-                use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-                let mut file = tokio::fs::File::open(&full_path).await?;
-                file.seek(std::io::SeekFrom::Start(range.start)).await?;
-
-                let len = (range.end - range.start) as usize;
-                let mut buffer = vec![0u8; len];
-                file.read_exact(&mut buffer).await?;
-
-                Ok(OwnedBytes::new(buffer))
+                tokio::task::spawn_blocking(move || {
+                    let len = (range.end - range.start) as usize;
+                    let mut buffer = vec![0u8; len];
+                    read_exact_at(&file, &mut buffer, range.start)?;
+                    Ok(OwnedBytes::new(buffer))
+                })
+                .await
+                .map_err(io::Error::other)?
             })
         });
 

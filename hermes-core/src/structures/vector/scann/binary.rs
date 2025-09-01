@@ -403,67 +403,25 @@ impl BinaryScannModel {
                 "binary ScaNN nprobe and beam width must be positive",
             ));
         }
-        let kernel = HammingKernel::resolve();
-        scratch.frontier.clear();
-        scratch.frontier.push(0);
-
-        for (level_index, level) in self.levels.iter().enumerate() {
-            scratch.candidates.clear();
-            for &parent in &scratch.frontier {
-                let parent = parent as usize;
-                let start = level.parent_offsets[parent] as usize;
-                let end = level.parent_offsets[parent + 1] as usize;
-                let rows = end - start;
-                scratch.distances.clear();
-                scratch.distances.resize(rows, 0);
-                kernel.distances(
-                    query,
-                    &level.centroids[start * self.byte_len()..end * self.byte_len()],
-                    self.byte_len(),
-                    &mut scratch.distances,
-                );
-                scratch
-                    .candidates
-                    .extend(
-                        scratch
-                            .distances
-                            .iter()
-                            .enumerate()
-                            .map(|(local, &distance)| RouteCandidate {
-                                node: (start + local) as u32,
-                                distance,
-                            }),
-                    );
-            }
-            scratch.candidates.sort_unstable();
-            let width = if level_index + 1 == self.levels.len() {
-                nprobe.min(self.num_leaves as usize)
-            } else {
-                super::routing_prefix_for_child_coverage(
-                    &scratch.candidates,
-                    &self.levels[level_index + 1].parent_offsets,
-                    beam_width,
-                    nprobe,
-                    |candidate| candidate.node as usize,
-                )
+        let mut views = [BinaryLevelView::EMPTY; MAX_SCANN_TREE_LEVELS as usize];
+        for (view, level) in views.iter_mut().zip(&self.levels) {
+            *view = BinaryLevelView {
+                centroids: &level.centroids,
+                parent_offsets: &level.parent_offsets,
             };
-            scratch.frontier.clear();
-            scratch.frontier.extend(
-                scratch
-                    .candidates
-                    .iter()
-                    .take(width)
-                    .map(|candidate| candidate.node),
-            );
-            if scratch.frontier.is_empty() {
-                return Err(ScannFormatError::new(
-                    "binary ScaNN routing reached an empty branch",
-                ));
-            }
         }
+        let leaf_ids = probe_binary_tree(
+            &views[..self.levels.len()],
+            self.byte_len(),
+            self.num_leaves as usize,
+            query,
+            nprobe,
+            beam_width,
+            scratch,
+        )?;
         Ok(BinaryScannProbePlan {
             model_fingerprint: self.fingerprint,
-            leaf_ids: scratch.frontier.clone(),
+            leaf_ids,
         })
     }
 
@@ -725,67 +683,25 @@ impl QuantizedBinaryScannModelView<'_> {
                 "binary ScaNN nprobe and beam width must be positive",
             ));
         }
-        let kernel = HammingKernel::resolve();
-        scratch.frontier.clear();
-        scratch.frontier.push(0);
-        for (level_index, level) in self.model.levels.iter().enumerate() {
-            scratch.candidates.clear();
-            let centroids = &self.artifact_bytes[level.centroid_codes.clone()];
-            for &parent in &scratch.frontier {
-                let parent = parent as usize;
-                let start = level.parent_offsets[parent] as usize;
-                let end = level.parent_offsets[parent + 1] as usize;
-                let rows = end - start;
-                scratch.distances.clear();
-                scratch.distances.resize(rows, 0);
-                kernel.distances(
-                    query,
-                    &centroids[start * self.model.byte_len()..end * self.model.byte_len()],
-                    self.model.byte_len(),
-                    &mut scratch.distances,
-                );
-                scratch
-                    .candidates
-                    .extend(
-                        scratch
-                            .distances
-                            .iter()
-                            .enumerate()
-                            .map(|(local, &distance)| RouteCandidate {
-                                node: (start + local) as u32,
-                                distance,
-                            }),
-                    );
-            }
-            scratch.candidates.sort_unstable();
-            let width = if level_index + 1 == self.model.levels.len() {
-                nprobe.min(self.model.num_leaves as usize)
-            } else {
-                super::routing_prefix_for_child_coverage(
-                    &scratch.candidates,
-                    &self.model.levels[level_index + 1].parent_offsets,
-                    beam_width,
-                    nprobe,
-                    |candidate| candidate.node as usize,
-                )
+        let mut views = [BinaryLevelView::EMPTY; MAX_SCANN_TREE_LEVELS as usize];
+        for (view, level) in views.iter_mut().zip(&self.model.levels) {
+            *view = BinaryLevelView {
+                centroids: &self.artifact_bytes[level.centroid_codes.clone()],
+                parent_offsets: &level.parent_offsets,
             };
-            scratch.frontier.clear();
-            scratch.frontier.extend(
-                scratch
-                    .candidates
-                    .iter()
-                    .take(width)
-                    .map(|candidate| candidate.node),
-            );
-            if scratch.frontier.is_empty() {
-                return Err(ScannFormatError::new(
-                    "binary ScaNN routing reached an empty branch",
-                ));
-            }
         }
+        let leaf_ids = probe_binary_tree(
+            &views[..self.model.levels.len()],
+            self.model.byte_len(),
+            self.model.num_leaves as usize,
+            query,
+            nprobe,
+            beam_width,
+            scratch,
+        )?;
         Ok(BinaryScannProbePlan {
             model_fingerprint: self.model.fingerprint,
-            leaf_ids: scratch.frontier.clone(),
+            leaf_ids,
         })
     }
 
@@ -840,6 +756,142 @@ impl QuantizedBinaryScannModelView<'_> {
 pub struct BinaryScannProbePlan {
     pub model_fingerprint: u64,
     pub leaf_ids: Vec<u32>,
+}
+
+/// One routing level as borrowed slices, so the owned and mmap-backed models
+/// share a single beam-search implementation.
+#[derive(Clone, Copy)]
+struct BinaryLevelView<'a> {
+    centroids: &'a [u8],
+    parent_offsets: &'a [u32],
+}
+
+impl BinaryLevelView<'_> {
+    const EMPTY: Self = Self {
+        centroids: &[],
+        parent_offsets: &[],
+    };
+}
+
+/// Hierarchical Hamming beam search over `levels`, returning the selected
+/// terminal leaves in ascending `(distance, node)` order.
+///
+/// Each level keeps only the frontier it needs: a `select_nth_unstable`
+/// partition followed by sorting the kept prefix, instead of a full sort of
+/// every scored child. Intermediate levels start from `beam_width` ranked
+/// nodes and double the ranked prefix only while their children cannot yet
+/// cover `nprobe` leaves, which is the same widening rule the full sort fed
+/// into `routing_prefix_for_child_coverage`.
+fn probe_binary_tree(
+    levels: &[BinaryLevelView<'_>],
+    byte_len: usize,
+    num_leaves: usize,
+    query: &[u8],
+    nprobe: usize,
+    beam_width: usize,
+    scratch: &mut BinaryScannSearchScratch,
+) -> ScannResult<Vec<u32>> {
+    let kernel = HammingKernel::resolve();
+    scratch.frontier.clear();
+    scratch.frontier.push(0);
+    let mut leaf_ids = Vec::new();
+    for (level_index, level) in levels.iter().enumerate() {
+        scratch.candidates.clear();
+        for &parent in &scratch.frontier {
+            let parent = parent as usize;
+            let start = level.parent_offsets[parent] as usize;
+            let end = level.parent_offsets[parent + 1] as usize;
+            let rows = end - start;
+            scratch.distances.clear();
+            scratch.distances.resize(rows, 0);
+            kernel.distances(
+                query,
+                &level.centroids[start * byte_len..end * byte_len],
+                byte_len,
+                &mut scratch.distances,
+            );
+            scratch
+                .candidates
+                .extend(
+                    scratch
+                        .distances
+                        .iter()
+                        .enumerate()
+                        .map(|(local, &distance)| RouteCandidate {
+                            node: (start + local) as u32,
+                            distance,
+                        }),
+                );
+        }
+        let is_leaf_level = level_index + 1 == levels.len();
+        let width = if is_leaf_level {
+            let width = nprobe.min(num_leaves).min(scratch.candidates.len());
+            rank_best_candidates(&mut scratch.candidates, width);
+            width
+        } else {
+            let child_offsets = levels[level_index + 1].parent_offsets;
+            select_intermediate_frontier(&mut scratch.candidates, child_offsets, beam_width, nprobe)
+        };
+        if width == 0 {
+            return Err(ScannFormatError::new(
+                "binary ScaNN routing reached an empty branch",
+            ));
+        }
+        let selected = scratch.candidates[..width]
+            .iter()
+            .map(|candidate| candidate.node);
+        if is_leaf_level {
+            leaf_ids.reserve_exact(width);
+            leaf_ids.extend(selected);
+        } else {
+            scratch.frontier.clear();
+            scratch.frontier.extend(selected);
+        }
+    }
+    Ok(leaf_ids)
+}
+
+/// Move the `width` best candidates to the front, sorted; the rejected tail
+/// stays unsorted.
+fn rank_best_candidates(candidates: &mut [RouteCandidate], width: usize) {
+    if width < candidates.len() {
+        candidates.select_nth_unstable(width);
+    }
+    candidates[..width].sort_unstable();
+}
+
+/// Rank an intermediate level lazily: start with the recall beam and double
+/// the ranked prefix until its children can cover `nprobe` leaves (or every
+/// candidate is ranked). Returns the frontier width within the ranked prefix.
+fn select_intermediate_frontier(
+    candidates: &mut [RouteCandidate],
+    child_offsets: &[u32],
+    beam_width: usize,
+    nprobe: usize,
+) -> usize {
+    let total = candidates.len();
+    if total == 0 {
+        return 0;
+    }
+    let mut ranked = beam_width.clamp(1, total);
+    loop {
+        rank_best_candidates(candidates, ranked);
+        let width = super::routing_prefix_for_child_coverage(
+            &candidates[..ranked],
+            child_offsets,
+            beam_width,
+            nprobe,
+            |candidate| candidate.node as usize,
+        );
+        let covered = candidates[..width].iter().fold(0usize, |total, candidate| {
+            let node = candidate.node as usize;
+            total.saturating_add((child_offsets[node + 1] - child_offsets[node]) as usize)
+        });
+        if covered >= nprobe || ranked == total {
+            return width;
+        }
+        ranked = ranked.saturating_mul(2).min(total);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

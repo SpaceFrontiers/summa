@@ -43,7 +43,8 @@ pub(crate) use reader::combine_ordinal_results;
 #[cfg(feature = "native")]
 pub mod pin;
 pub use reader::{
-    BmpDimStats, DensePlanCache, SegmentReader, SparseIndex, VectorIndex, VectorSearchResult,
+    BmpDimStats, DensePlanCache, SegmentReader, SparseIndex, VectorIndex, VectorOrdinals,
+    VectorSearchResult,
 };
 pub use store::*;
 #[cfg(feature = "native")]

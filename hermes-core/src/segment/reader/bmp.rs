@@ -648,6 +648,15 @@ impl BmpIndex {
         );
     }
 
+    /// True when block payloads are heap/RAM-backed (RAM directory or a heap
+    /// pin copy) and therefore always resident: `MADV_WILLNEED` would be a
+    /// no-op, so the executor skips collecting and coalescing block ranges.
+    #[cfg(feature = "native")]
+    #[inline]
+    pub(crate) fn block_data_resident(&self) -> bool {
+        !self.block_data_bytes.is_mmap()
+    }
+
     /// Page-level prefetch (`MADV_WILLNEED`) of a block-data byte range.
     ///
     /// Used by the BMP executor to batch-prefetch the surviving blocks of a

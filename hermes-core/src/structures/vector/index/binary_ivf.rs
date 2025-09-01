@@ -21,11 +21,13 @@ use crate::dsl::IvfRoutingMode;
 use crate::structures::simd::{HammingKernel, scores_from_hamming};
 #[cfg(test)]
 use crate::structures::simd::{batch_hamming_scores, hamming_distance};
+#[cfg(test)]
+use crate::structures::vector::ivf::routing::select_best;
 use crate::structures::vector::ivf::routing::{
     HIERARCHICAL_TRAINING_THRESHOLD, HnswRoutingGraph, IvfProbePlan, IvfRoutingTopology,
     PairDistance, QueryDistance, allocate_child_clusters,
     binary_probe_fingerprint_with_parent_beam, effective_binary_routing_mode, routing_parent_count,
-    select_best, select_best_candidates, select_parent_beam_for_build_with_oversample,
+    select_best_candidates, select_parent_beam_for_build_with_oversample,
     select_parent_beam_with_oversample,
 };
 use crate::structures::vector::progress::PhaseProgress;
@@ -389,7 +391,7 @@ impl BinaryCoarseQuantizer {
         visit("binary leaf centroids", &self.centroids);
     }
 
-    pub fn probe(&self, query: &[u8], k: usize, mode: IvfRoutingMode) -> IvfProbePlan {
+    pub fn probe(&self, query: &[u8], k: usize, mode: IvfRoutingMode) -> io::Result<IvfProbePlan> {
         self.probe_with_parent_beam(
             query,
             k,
@@ -423,17 +425,18 @@ impl BinaryCoarseQuantizer {
         k: usize,
         mode: IvfRoutingMode,
         parent_beam_oversample: usize,
-    ) -> IvfProbePlan {
+    ) -> io::Result<IvfProbePlan> {
+        self.check_code_len(query, "probe")?;
         let take = k.clamp(1, self.num_clusters as usize);
         let effective_mode = effective_binary_routing_mode(mode, self.num_clusters as usize);
         let cluster_ids = match effective_mode {
-            IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_k_nearest(query, take),
+            IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_k_nearest(query, take)?,
             IvfRoutingMode::TwoLevel => {
-                self.find_k_nearest_two_level(query, take, parent_beam_oversample)
+                self.find_k_nearest_two_level(query, take, parent_beam_oversample)?
             }
-            IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(query, take),
+            IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(query, take)?,
         };
-        IvfProbePlan::new(
+        Ok(IvfProbePlan::new(
             self.version,
             binary_probe_fingerprint_with_parent_beam(
                 query,
@@ -442,36 +445,63 @@ impl BinaryCoarseQuantizer {
                 parent_beam_oversample,
             ),
             cluster_ids,
-        )
+        ))
     }
 
     /// Assign one code to its leaf.
     ///
     /// Segment construction routes every vector through here, so this path must
-    /// stay allocation-free.
-    pub fn assign(&self, code: &[u8], mode: IvfRoutingMode) -> u32 {
+    /// stay allocation-free. A code of the wrong width, or a router that cannot
+    /// produce a leaf, is an error: silently assigning cluster 0 would build a
+    /// payload that scores as valid but never finds those vectors.
+    pub fn assign(&self, code: &[u8], mode: IvfRoutingMode) -> io::Result<u32> {
+        self.check_code_len(code, "assign")?;
         let parent_beam_oversample =
             adaptive_binary_parent_beam_oversample(self.num_clusters as usize);
         match effective_binary_routing_mode(mode, self.num_clusters as usize) {
-            IvfRoutingMode::Hnsw => self.find_nearest_hnsw_for_build(code).unwrap_or(0),
+            IvfRoutingMode::Hnsw => self.find_nearest_hnsw_for_build(code)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "binary HNSW centroid router produced no leaf for a valid code",
+                )
+            }),
             IvfRoutingMode::TwoLevel => self
                 .find_k_nearest_two_level_for_build(
                     code,
                     BUILD_ASSIGNMENT_CANDIDATES.min(self.num_clusters as usize),
                     parent_beam_oversample,
-                )
+                )?
                 .first()
                 .copied()
-                .unwrap_or(0),
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "binary two-level centroid router produced no leaf for a valid code",
+                    )
+                }),
             IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_nearest(code),
         }
     }
 
-    fn find_nearest(&self, query: &[u8]) -> u32 {
-        let byte_len = self.byte_len();
-        if query.len() != byte_len {
-            return 0;
+    fn check_code_len(&self, code: &[u8], operation: &str) -> io::Result<()> {
+        if code.len() != self.byte_len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "binary IVF {operation}: code has {} bytes but the quantizer expects {} \
+                     ({} bits)",
+                    code.len(),
+                    self.byte_len(),
+                    self.dim_bits
+                ),
+            ));
         }
+        Ok(())
+    }
+
+    fn find_nearest(&self, query: &[u8]) -> io::Result<u32> {
+        let byte_len = self.byte_len();
+        self.check_code_len(query, "find_nearest")?;
         let kernel = HammingKernel::resolve();
         let mut distances = [0u32; BINARY_CENTROID_SCAN_BLOCK];
         let mut best = (u32::MAX, 0u32);
@@ -493,26 +523,41 @@ impl BinaryCoarseQuantizer {
                 }
             }
         }
-        best.1
+        Ok(best.1)
     }
 
-    fn find_k_nearest(&self, query: &[u8], k: usize) -> Vec<u32> {
-        if query.len() != self.byte_len() {
-            return Vec::new();
+    /// Exact flat probe: every centroid is scored, then the `k` nearest are
+    /// selected on integers. Hamming distances stay `u32` and are packed with
+    /// the cluster ID into one `u64` (`distance << 32 | id`), so an unstable
+    /// nth-element partition on plain integers yields exactly the ordering the
+    /// float `1 - d / dim` score with an ID tie-break produced, without the
+    /// float round trip or a `num_clusters`-wide permutation per query.
+    fn find_k_nearest(&self, query: &[u8], k: usize) -> io::Result<Vec<u32>> {
+        self.check_code_len(query, "find_k_nearest")?;
+        let num_clusters = self.num_clusters as usize;
+        let take = k.min(num_clusters);
+        if take == 0 {
+            return Ok(Vec::new());
         }
-        // A flat probe scores every centroid; at production cluster counts the
-        // score buffer is hundreds of KiB, so it comes from reusable scratch.
-        with_centroid_score_scratch(self.num_clusters as usize, |scores| {
-            scores_from_hamming(
-                HammingKernel::resolve(),
+        Ok(with_binary_probe_scratch(|scratch| {
+            scratch.distances.clear();
+            scratch.distances.resize(num_clusters, 0);
+            HammingKernel::resolve().distances(
                 query,
                 &self.centroids,
                 self.byte_len(),
-                self.dim_bits,
-                scores,
+                &mut scratch.distances,
             );
-            select_best::<true>(scores, k)
-        })
+            scratch.packed.clear();
+            scratch.packed.extend(
+                scratch
+                    .distances
+                    .iter()
+                    .enumerate()
+                    .map(|(id, &distance)| (u64::from(distance) << 32) | id as u64),
+            );
+            select_best_packed(&mut scratch.packed, take)
+        }))
     }
 
     fn find_k_nearest_two_level(
@@ -520,7 +565,7 @@ impl BinaryCoarseQuantizer {
         query: &[u8],
         k: usize,
         parent_beam_oversample: usize,
-    ) -> Vec<u32> {
+    ) -> io::Result<Vec<u32>> {
         self.find_k_nearest_two_level_impl::<false>(query, k, parent_beam_oversample)
     }
 
@@ -529,7 +574,7 @@ impl BinaryCoarseQuantizer {
         query: &[u8],
         k: usize,
         parent_beam_oversample: usize,
-    ) -> Vec<u32> {
+    ) -> io::Result<Vec<u32>> {
         self.find_k_nearest_two_level_impl::<true>(query, k, parent_beam_oversample)
     }
 
@@ -538,7 +583,7 @@ impl BinaryCoarseQuantizer {
         query: &[u8],
         k: usize,
         parent_beam_oversample: usize,
-    ) -> Vec<u32> {
+    ) -> io::Result<Vec<u32>> {
         let Some(BinaryCentroidRouter::TwoLevel {
             parent_centroids,
             topology,
@@ -549,113 +594,150 @@ impl BinaryCoarseQuantizer {
         if topology.parent_count() <= 1 {
             return self.find_k_nearest(query, k);
         }
+        self.check_code_len(query, "two-level probe")?;
         let byte_len = self.byte_len();
         let kernel = HammingKernel::resolve();
-        let mut parent_scores = vec![0.0; topology.parent_count()];
-        scores_from_hamming(
-            kernel,
-            query,
-            parent_centroids,
-            byte_len,
-            self.dim_bits,
-            &mut parent_scores,
-        );
-        let parents = if FOR_BUILD {
-            select_parent_beam_for_build_with_oversample::<true>(
-                &parent_scores,
-                topology,
-                k,
-                parent_beam_oversample,
-                parent_beam_oversample.min(BINARY_PARENT_BEAM_OVERSAMPLE_MEDIUM),
-            )
-        } else {
-            select_parent_beam_with_oversample::<true>(
-                &parent_scores,
-                topology,
-                k,
-                parent_beam_oversample,
-            )
-        };
-        let candidate_count = parents
-            .iter()
-            .map(|&parent| topology.children(parent as usize).len())
-            .sum();
-        let mut candidates = Vec::with_capacity(candidate_count);
-        // Each parent owns a contiguous leaf run, so its children are one
-        // batched pass over the centroid matrix rather than one kernel call
-        // (and one runtime feature detection) per leaf.
-        let mut leaf_scores = vec![0.0f32; 0];
-        for parent in parents {
-            let children = topology.children(parent as usize);
-            match topology.children_run(parent as usize) {
-                Some((first_leaf, count)) => {
-                    leaf_scores.clear();
-                    leaf_scores.resize(count, 0.0);
-                    let start = first_leaf as usize * byte_len;
-                    scores_from_hamming(
-                        kernel,
-                        query,
-                        &self.centroids[start..start + count * byte_len],
-                        byte_len,
-                        self.dim_bits,
-                        &mut leaf_scores,
-                    );
-                    candidates.extend(
-                        (first_leaf..first_leaf + count as u32).zip(leaf_scores.iter().copied()),
-                    );
-                }
-                None => {
-                    for &leaf in children {
-                        let offset = leaf as usize * byte_len;
-                        let distance =
-                            kernel.distance(query, &self.centroids[offset..offset + byte_len]);
-                        candidates.push((leaf, 1.0 - distance as f32 / self.dim_bits as f32));
+        Ok(with_binary_probe_scratch(|scratch| {
+            let parent_scores = &mut scratch.parent_scores;
+            parent_scores.clear();
+            parent_scores.resize(topology.parent_count(), 0.0);
+            scores_from_hamming(
+                kernel,
+                query,
+                parent_centroids,
+                byte_len,
+                self.dim_bits,
+                parent_scores,
+            );
+            let parents = if FOR_BUILD {
+                select_parent_beam_for_build_with_oversample::<true>(
+                    parent_scores,
+                    topology,
+                    k,
+                    parent_beam_oversample,
+                    parent_beam_oversample.min(BINARY_PARENT_BEAM_OVERSAMPLE_MEDIUM),
+                )
+            } else {
+                select_parent_beam_with_oversample::<true>(
+                    parent_scores,
+                    topology,
+                    k,
+                    parent_beam_oversample,
+                )
+            };
+            let candidate_count = parents
+                .iter()
+                .map(|&parent| topology.children(parent as usize).len())
+                .sum();
+            let candidates = &mut scratch.candidates;
+            candidates.clear();
+            candidates.reserve(candidate_count);
+            // Each parent owns a contiguous leaf run, so its children are one
+            // batched pass over the centroid matrix rather than one kernel call
+            // (and one runtime feature detection) per leaf.
+            let leaf_scores = &mut scratch.leaf_scores;
+            for parent in parents {
+                let children = topology.children(parent as usize);
+                match topology.children_run(parent as usize) {
+                    Some((first_leaf, count)) => {
+                        leaf_scores.clear();
+                        leaf_scores.resize(count, 0.0);
+                        let start = first_leaf as usize * byte_len;
+                        scores_from_hamming(
+                            kernel,
+                            query,
+                            &self.centroids[start..start + count * byte_len],
+                            byte_len,
+                            self.dim_bits,
+                            leaf_scores,
+                        );
+                        candidates.extend(
+                            (first_leaf..first_leaf + count as u32)
+                                .zip(leaf_scores.iter().copied()),
+                        );
+                    }
+                    None => {
+                        for &leaf in children {
+                            let offset = leaf as usize * byte_len;
+                            let distance =
+                                kernel.distance(query, &self.centroids[offset..offset + byte_len]);
+                            candidates.push((leaf, 1.0 - distance as f32 / self.dim_bits as f32));
+                        }
                     }
                 }
             }
-        }
-        select_best_candidates::<true>(&mut candidates, k)
+            select_best_candidates::<true>(candidates, k)
+        }))
     }
 
-    fn find_k_nearest_hnsw(&self, query: &[u8], k: usize) -> Vec<u32> {
+    fn find_k_nearest_hnsw(&self, query: &[u8], k: usize) -> io::Result<Vec<u32>> {
         let Some(BinaryCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
             return self.find_k_nearest(query, k);
         };
-        graph.search(
+        self.check_code_len(query, "HNSW probe")?;
+        Ok(graph.search(
             BinaryCentroidDistance::new(query, &self.centroids, self.byte_len()),
             k,
-        )
+        ))
     }
 
-    fn find_nearest_hnsw_for_build(&self, query: &[u8]) -> Option<u32> {
+    fn find_nearest_hnsw_for_build(&self, query: &[u8]) -> io::Result<Option<u32>> {
         let Some(BinaryCentroidRouter::Hnsw(graph)) = self.routing_index.as_ref() else {
-            return Some(self.find_nearest(query));
+            return self.find_nearest(query).map(Some);
         };
-        graph.search_best_for_build(BinaryCentroidDistance::new(
+        self.check_code_len(query, "HNSW assign")?;
+        Ok(graph.search_best_for_build(BinaryCentroidDistance::new(
             query,
             &self.centroids,
             self.byte_len(),
-        ))
+        )))
     }
 }
 
 /// Centroid rows scored per stack block during a flat scan.
 const BINARY_CENTROID_SCAN_BLOCK: usize = 64;
 
-thread_local! {
-    /// Flat probing scores every centroid; at production cluster counts that
-    /// buffer is hundreds of KiB per query, so it is retained per thread.
-    static CENTROID_SCORE_SCRATCH: std::cell::RefCell<Vec<f32>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+/// Per-thread probe buffers. A flat probe scores every centroid (hundreds of
+/// KiB at production cluster counts) and the two-level probe needs parent
+/// scores, the child candidate list and a per-parent leaf score block; none
+/// of them should be allocated per query.
+#[derive(Default)]
+struct BinaryProbeScratch {
+    distances: Vec<u32>,
+    packed: Vec<u64>,
+    parent_scores: Vec<f32>,
+    candidates: Vec<(u32, f32)>,
+    leaf_scores: Vec<f32>,
 }
 
-fn with_centroid_score_scratch<T>(len: usize, scope: impl FnOnce(&mut [f32]) -> T) -> T {
-    CENTROID_SCORE_SCRATCH.with(|scratch| {
-        let mut scores = scratch.borrow_mut();
-        scores.clear();
-        scores.resize(len, 0.0);
-        scope(&mut scores)
+thread_local! {
+    static BINARY_PROBE_SCRATCH: std::cell::RefCell<BinaryProbeScratch> =
+        std::cell::RefCell::new(BinaryProbeScratch::default());
+}
+
+fn with_binary_probe_scratch<T>(scope: impl FnOnce(&mut BinaryProbeScratch) -> T) -> T {
+    BINARY_PROBE_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => scope(&mut scratch),
+        // Re-entrant use is not expected; a private buffer keeps the probe
+        // correct rather than panicking inside a query.
+        Err(_) => scope(&mut BinaryProbeScratch::default()),
     })
+}
+
+/// Select the `take` smallest `(distance << 32 | id)` keys and return their
+/// IDs in ascending `(distance, id)` order. Integer keys make the nth-element
+/// partition branch-cheap and the tie-break exact.
+fn select_best_packed(packed: &mut Vec<u64>, take: usize) -> Vec<u32> {
+    let take = take.min(packed.len());
+    if take == 0 {
+        return Vec::new();
+    }
+    if take < packed.len() {
+        packed.select_nth_unstable(take);
+        packed.truncate(take);
+    }
+    packed.sort_unstable();
+    packed.iter().map(|&key| key as u32).collect()
 }
 
 fn default_max_train_samples() -> usize {
@@ -860,13 +942,13 @@ impl BinaryIvfBuilder {
             codes
                 .par_chunks_exact(byte_len)
                 .map(|code| quantizer.assign(code, self.routing))
-                .collect()
+                .collect::<io::Result<Vec<u32>>>()?
         };
         #[cfg(not(feature = "native"))]
         let assignments: Vec<u32> = codes
             .chunks_exact(byte_len)
             .map(|code| quantizer.assign(code, self.routing))
-            .collect();
+            .collect::<io::Result<Vec<u32>>>()?;
 
         // Insert grouped by leaf: one map lookup and one reservation per
         // distinct leaf in the batch instead of per code. Sorting by
@@ -1749,7 +1831,7 @@ mod tests {
         let labels: Vec<_> = (0..n as u32).map(|doc_id| (doc_id, 0)).collect();
         let query: Vec<u8> = (0..byte_len).map(|_| rng.random()).collect();
         let (quantizer, index) = trained_index(dim, 8, &codes, &labels);
-        let plan = quantizer.probe(&query, 8, IvfRoutingMode::Flat);
+        let plan = quantizer.probe(&query, 8, IvfRoutingMode::Flat).unwrap();
         let actual = index.search_in_clusters(&query, 20, &plan.cluster_ids);
 
         let mut scores = vec![0.0; n];
@@ -1845,14 +1927,18 @@ mod tests {
         quantizer.validate().unwrap();
 
         let query = [0u8; 8];
-        let narrow = quantizer.probe_with_parent_beam(&query, 32, IvfRoutingMode::TwoLevel, 4);
-        let wide = quantizer.probe_with_parent_beam(&query, 32, IvfRoutingMode::TwoLevel, 8);
+        let narrow = quantizer
+            .probe_with_parent_beam(&query, 32, IvfRoutingMode::TwoLevel, 4)
+            .unwrap();
+        let wide = quantizer
+            .probe_with_parent_beam(&query, 32, IvfRoutingMode::TwoLevel, 8)
+            .unwrap();
         assert!(!narrow.cluster_ids.contains(&(target as u32)));
         assert_eq!(wide.cluster_ids.first(), Some(&(target as u32)));
         assert_eq!(wide.cluster_ids.len(), 32);
         assert_ne!(narrow.request_fingerprint, wide.request_fingerprint);
 
-        let default_plan = quantizer.probe(&query, 32, IvfRoutingMode::Auto);
+        let default_plan = quantizer.probe(&query, 32, IvfRoutingMode::Auto).unwrap();
         assert_eq!(
             default_plan.request_fingerprint,
             quantizer.request_fingerprint(&query, 32, IvfRoutingMode::Auto),
@@ -1938,7 +2024,7 @@ mod tests {
         let probes = clustered_binary_codes(byte_len, 64, 4, 14, 0x9ab_cdef);
         let exact: Vec<u32> = probes
             .chunks_exact(byte_len)
-            .map(|code| quantizer.find_nearest(code))
+            .map(|code| quantizer.find_nearest(code).unwrap())
             .collect();
 
         let recall_at = |ef: usize| -> f64 {
@@ -2225,7 +2311,7 @@ mod tests {
             .unwrap();
         let index = builder.finish().unwrap();
         assert_eq!(index.len(), 6);
-        let plan = quantizer.probe(&[0xf0], 2, IvfRoutingMode::Flat);
+        let plan = quantizer.probe(&[0xf0], 2, IvfRoutingMode::Flat).unwrap();
         assert_eq!(
             index.search_in_clusters(&[0xf0], 1, &plan.cluster_ids)[0].0,
             3
@@ -2389,13 +2475,67 @@ mod tests {
         assert_eq!(
             &*quantizer
                 .probe(&[0x00], 1, IvfRoutingMode::TwoLevel)
+                .unwrap()
                 .cluster_ids,
             &[0]
         );
         assert_eq!(
-            quantizer.assign(&[0x00], IvfRoutingMode::TwoLevel),
+            quantizer.assign(&[0x00], IvfRoutingMode::TwoLevel).unwrap(),
             best_leaf as u32
         );
+    }
+
+    /// A query or code of the wrong byte width used to probe zero clusters or
+    /// assign cluster 0 silently; both must now be loud errors.
+    #[test]
+    fn binary_probe_and_assign_reject_codes_with_the_wrong_byte_length() {
+        let codes = [0x00, 0x01, 0x02, 0xf0, 0xf1, 0xf2];
+        let config = BinaryIvfConfig::new(8, 2);
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, codes.len(), "test").unwrap();
+        for mode in [
+            IvfRoutingMode::Flat,
+            IvfRoutingMode::Auto,
+            IvfRoutingMode::TwoLevel,
+            IvfRoutingMode::Hnsw,
+        ] {
+            let error = quantizer.probe(&[0xf0, 0x0f], 2, mode).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:?}");
+            assert!(error.to_string().contains("2 bytes"), "{error}");
+            let error = quantizer.assign(&[], mode).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:?}");
+            assert!(error.to_string().contains("expects 1"), "{error}");
+        }
+        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat).unwrap();
+        assert!(
+            builder
+                .add_batch(&quantizer, &codes[..4], &[(0, 0), (1, 0)])
+                .is_err()
+        );
+        assert_eq!(builder.len, 0);
+    }
+
+    /// The integer `(distance << 32 | id)` selection must reproduce the float
+    /// `1 - d / dim` ordering with ID tie-breaks exactly, for every `k`.
+    #[test]
+    fn flat_probe_integer_selection_matches_float_score_ordering() {
+        let dim = 64;
+        let byte_len = dim / 8;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(29);
+        let codes: Vec<u8> = (0..4_000 * byte_len).map(|_| rng.random()).collect();
+        let mut config = BinaryIvfConfig::new(dim, 64);
+        config.routing = IvfRoutingMode::Flat;
+        config.train_iters = 3;
+        config.max_train_samples = 4_000;
+        let quantizer = BinaryCoarseQuantizer::train(config, &codes, 4_000, "test").unwrap();
+        for query in codes.chunks_exact(byte_len).take(16) {
+            let mut scores = vec![0.0f32; quantizer.num_clusters as usize];
+            batch_hamming_scores(query, &quantizer.centroids, byte_len, dim, &mut scores);
+            for k in [1usize, 3, 8, 64] {
+                let expected = select_best::<true>(&scores, k);
+                let got = quantizer.find_k_nearest(query, k).unwrap();
+                assert_eq!(got, expected, "k={k}");
+            }
+        }
     }
 
     #[test]
@@ -2409,7 +2549,7 @@ mod tests {
             config.max_train_samples = 256;
             let quantizer = BinaryCoarseQuantizer::train(config, &codes, 256, "test").unwrap();
             quantizer.validate_routing(routing).unwrap();
-            let plan = quantizer.probe(&codes[..8], 8, routing);
+            let plan = quantizer.probe(&codes[..8], 8, routing).unwrap();
             assert_eq!(plan.cluster_ids.len(), 8);
             assert!(
                 plan.cluster_ids

@@ -3,13 +3,15 @@
 //! This is the executable float routing core. The trained tree is global to an
 //! index generation; immutable segments only store terminal leaf identifiers.
 
+use std::cell::RefCell;
 use std::ops::Range;
 
 use rand::{Rng, SeedableRng};
 
+use super::quantized_dot::QuantizedDotKernel;
 use super::{
-    AhCodebook, AhQuery, DEFAULT_ANISOTROPIC_THRESHOLD, MAX_SCANN_TREE_LEVELS, ScannEncoding,
-    ScannFormatError, ScannResult, ScannRoutingLevel, ScannTrainedArtifact,
+    AhCodebook, AhQuery, DEFAULT_ANISOTROPIC_THRESHOLD, FastScanQuery, MAX_SCANN_TREE_LEVELS,
+    ScannEncoding, ScannFormatError, ScannResult, ScannRoutingLevel, ScannTrainedArtifact,
     ScannTrainedArtifactView,
 };
 
@@ -19,10 +21,34 @@ pub struct RoutedLeaf {
     pub squared_distance: f32,
 }
 
+/// Beam-search candidate: `(node, squared distance)`. Node identifiers are
+/// `u32` like every other ScaNN directory entry, so a candidate is 8 bytes
+/// instead of the 16 a `(usize, f32)` pair costs after padding.
+type RoutingCandidate = (u32, f32);
+
 #[derive(Clone, Debug, Default)]
 pub struct RoutingScratch {
-    active: Vec<(usize, f32)>,
-    next: Vec<(usize, f32)>,
+    active: Vec<RoutingCandidate>,
+    next: Vec<RoutingCandidate>,
+    /// Per-level query transform for the fixed-point centroid plane.
+    scaled_query: Vec<f32>,
+}
+
+thread_local! {
+    /// Serving-path routing scratch. Query routing happens once per query per
+    /// index generation, and the beam buffers are a few KiB, so retaining them
+    /// per thread removes three allocations per query without a scratch
+    /// threaded through every caller.
+    static ROUTING_SCRATCH: RefCell<RoutingScratch> = RefCell::new(RoutingScratch::default());
+}
+
+fn with_routing_scratch<T>(scope: impl FnOnce(&mut RoutingScratch) -> T) -> T {
+    ROUTING_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => scope(&mut scratch),
+        // Re-entrant use is not expected; fall back to a fresh scratch rather
+        // than panicking inside a query.
+        Err(_) => scope(&mut RoutingScratch::default()),
+    })
 }
 
 /// Reusable storage for assigning and AH-encoding float vectors. Segment
@@ -86,7 +112,17 @@ struct QuantizedFloatRoutingLevel {
     centroid_codes: Range<usize>,
     minimums: Vec<f32>,
     steps: Vec<f32>,
+    /// `sum step_i^2 * code_i^2` per centroid: the query-independent term of
+    /// the expanded squared distance (see `quantized_dot`). One f32 per
+    /// centroid, computed once when the artifact is opened.
+    code_norms: Vec<f32>,
     child_offsets: Vec<u32>,
+}
+
+/// Query-side constants for scoring one fixed-point routing level.
+struct ScaledLevelQuery {
+    /// `sum (q_i - min_i)^2`.
+    constant: f32,
 }
 
 /// Small executable metadata for a persisted float ScaNN model. Quantized
@@ -101,6 +137,8 @@ pub struct QuantizedFloatScannModel {
     levels: Vec<QuantizedFloatRoutingLevel>,
     codebook: AhCodebook,
     anisotropic_threshold: f32,
+    /// Resolved once per model so routing never repeats feature detection.
+    kernel: QuantizedDotKernel,
 }
 
 /// Borrowed executable pairing of small model metadata with the mmap/file
@@ -123,6 +161,9 @@ pub struct FloatScannQuery {
     routed_leaves: Vec<u32>,
     centroid_dots: Vec<f32>,
     ah: AhQuery,
+    /// Integer FastScan lookup table derived from `ah`. Built once here
+    /// because the query is shared (Arc) across every segment of the field.
+    fast_scan: FastScanQuery,
 }
 
 impl FloatScannModel {
@@ -285,11 +326,11 @@ impl FloatScannModel {
                 query.len(),
             ));
         }
-        Ok(FloatScannQuery {
+        Ok(FloatScannQuery::new(
             routed_leaves,
             centroid_dots,
-            ah: self.codebook.query_dot_product(query)?,
-        })
+            self.codebook.query_dot_product(query)?,
+        ))
     }
 
     pub fn anisotropic_threshold(&self) -> f32 {
@@ -328,11 +369,14 @@ impl QuantizedFloatScannModel {
             let centroid_codes = artifact.level_centroid_codes_range(index).ok_or_else(|| {
                 ScannFormatError::new("ScaNN artifact centroid range disappeared")
             })?;
+            let steps: Vec<f32> = level.steps().collect();
+            let code_norms = quantized_code_norms(&steps, level.centroid_codes, dimension)?;
             levels.push(QuantizedFloatRoutingLevel {
                 centroid_count: level.centroid_count as usize,
                 centroid_codes,
                 minimums: level.minimums().collect(),
-                steps: level.steps().collect(),
+                steps,
+                code_norms,
                 child_offsets: level.child_offsets().collect(),
             });
         }
@@ -344,6 +388,7 @@ impl QuantizedFloatScannModel {
             levels,
             codebook,
             anisotropic_threshold: DEFAULT_ANISOTROPIC_THRESHOLD,
+            kernel: QuantizedDotKernel::resolve(),
         };
         model.validate_metadata()?;
         Ok(model)
@@ -378,6 +423,7 @@ impl QuantizedFloatScannModel {
                 total
                     .saturating_add(level.minimums.len() * std::mem::size_of::<f32>())
                     .saturating_add(level.steps.len() * std::mem::size_of::<f32>())
+                    .saturating_add(level.code_norms.len() * std::mem::size_of::<f32>())
                     .saturating_add(level.child_offsets.len() * std::mem::size_of::<u32>())
             })
     }
@@ -396,6 +442,7 @@ impl QuantizedFloatScannModel {
         for (index, level) in self.levels.iter().enumerate() {
             if level.minimums.len() != self.dimension
                 || level.steps.len() != self.dimension
+                || level.code_norms.len() != level.centroid_count
                 || level.centroid_codes.len() != level.centroid_count.saturating_mul(self.dimension)
                 || level.centroid_codes.end > self.artifact_len
             {
@@ -478,34 +525,46 @@ impl QuantizedFloatScannModelView<'_> {
     }
 
     pub fn prepare_query(&self, query: &[f32], probes: usize) -> ScannResult<FloatScannQuery> {
-        let routed = self.route(query, probes)?;
-        let level = self
-            .model
-            .levels
-            .last()
-            .expect("validated non-empty levels");
-        let codes = self.level_codes(level);
-        let mut routed_leaves = Vec::with_capacity(routed.len());
-        let mut centroid_dots = Vec::with_capacity(routed.len());
-        for routed_leaf in routed {
-            let row = &codes[routed_leaf.leaf as usize * self.model.dimension
-                ..(routed_leaf.leaf as usize + 1) * self.model.dimension];
-            let dot = query
+        with_routing_scratch(|scratch| {
+            let mut routed = Vec::with_capacity(probes);
+            self.route_with_scratch(query, probes, scratch, &mut routed)?;
+            let level = self
+                .model
+                .levels
+                .last()
+                .expect("validated non-empty levels");
+            let codes = self.level_codes(level);
+            // dot(q, c) = sum q_i * min_i + sum (q_i * step_i) * code_i: the
+            // first term is query-only, the second is one `f32 x u8` kernel
+            // call per routed leaf.
+            let dimension = self.model.dimension;
+            let scaled = &mut scratch.scaled_query;
+            scaled.clear();
+            scaled.extend(
+                query
+                    .iter()
+                    .zip(&level.steps)
+                    .map(|(&value, &step)| value.algebraic_mul(step)),
+            );
+            let offset = query
                 .iter()
-                .enumerate()
-                .map(|(coordinate, &value)| {
-                    value
-                        * (level.minimums[coordinate]
-                            + level.steps[coordinate] * f32::from(row[coordinate]))
-                })
-                .sum();
-            routed_leaves.push(routed_leaf.leaf);
-            centroid_dots.push(dot);
-        }
-        Ok(FloatScannQuery {
-            routed_leaves,
-            centroid_dots,
-            ah: self.model.codebook.query_dot_product(query)?,
+                .zip(&level.minimums)
+                .fold(0.0f64, |acc, (&value, &minimum)| {
+                    acc + f64::from(value) * f64::from(minimum)
+                }) as f32;
+            let mut routed_leaves = Vec::with_capacity(routed.len());
+            let mut centroid_dots = Vec::with_capacity(routed.len());
+            for routed_leaf in &routed {
+                let leaf = routed_leaf.leaf as usize;
+                let row = &codes[leaf * dimension..(leaf + 1) * dimension];
+                routed_leaves.push(routed_leaf.leaf);
+                centroid_dots.push(offset.algebraic_add(self.model.kernel.dot(scaled, row)));
+            }
+            Ok(FloatScannQuery::new(
+                routed_leaves,
+                centroid_dots,
+                self.model.codebook.query_dot_product(query)?,
+            ))
         })
     }
 
@@ -513,9 +572,12 @@ impl QuantizedFloatScannModelView<'_> {
         self.model.anisotropic_threshold
     }
 
+    #[cfg(test)]
     fn route(&self, query: &[f32], probes: usize) -> ScannResult<Vec<RoutedLeaf>> {
         let mut output = Vec::with_capacity(probes);
-        self.route_with_scratch(query, probes, &mut RoutingScratch::default(), &mut output)?;
+        with_routing_scratch(|scratch| {
+            self.route_with_scratch(query, probes, scratch, &mut output)
+        })?;
         Ok(output)
     }
 
@@ -537,11 +599,13 @@ impl QuantizedFloatScannModelView<'_> {
             ));
         }
         scratch.active.clear();
+        let scaled = Self::scale_query(&self.model.levels[0], query, &mut scratch.scaled_query);
         self.score_range_into(
             &self.model.levels[0],
+            &scaled,
+            &scratch.scaled_query,
             0,
             self.model.levels[0].centroid_count,
-            query,
             &mut scratch.active,
         );
         if self.model.levels.len() == 1 {
@@ -553,20 +617,23 @@ impl QuantizedFloatScannModelView<'_> {
                 &self.model.levels[0].child_offsets,
                 intermediate_routing_beam(probes),
                 probes,
-                |candidate| candidate.0,
+                |candidate| candidate.0 as usize,
             );
             scratch.active.truncate(initial_width);
         }
         for level_index in 1..self.model.levels.len() {
             let level = &self.model.levels[level_index];
             let offsets = &self.model.levels[level_index - 1].child_offsets;
+            let scaled = Self::scale_query(level, query, &mut scratch.scaled_query);
             scratch.next.clear();
             for &(parent, _) in &scratch.active {
+                let parent = parent as usize;
                 self.score_range_into(
                     level,
+                    &scaled,
+                    &scratch.scaled_query,
                     offsets[parent] as usize,
                     offsets[parent + 1] as usize,
-                    query,
                     &mut scratch.next,
                 );
             }
@@ -579,7 +646,7 @@ impl QuantizedFloatScannModelView<'_> {
                     &level.child_offsets,
                     intermediate_routing_beam(probes),
                     probes,
-                    |candidate| candidate.0,
+                    |candidate| candidate.0 as usize,
                 );
                 scratch.next.truncate(width);
             }
@@ -591,37 +658,59 @@ impl QuantizedFloatScannModelView<'_> {
                 .active
                 .iter()
                 .map(|&(leaf, squared_distance)| RoutedLeaf {
-                    leaf: leaf as u32,
+                    leaf,
                     squared_distance,
                 }),
         );
         Ok(())
     }
 
+    /// Fill `scaled` with `q'_i = (q_i - min_i) * step_i` for one level and
+    /// return the query-only constant `sum (q_i - min_i)^2`. The constant is
+    /// accumulated in f64: it is the large term that the centroid-dependent
+    /// part is subtracted from, so its rounding would otherwise dominate.
+    fn scale_query(
+        level: &QuantizedFloatRoutingLevel,
+        query: &[f32],
+        scaled: &mut Vec<f32>,
+    ) -> ScaledLevelQuery {
+        scaled.clear();
+        scaled.reserve(query.len());
+        let mut constant = 0.0f64;
+        for ((&value, &minimum), &step) in query.iter().zip(&level.minimums).zip(&level.steps) {
+            let shifted = value - minimum;
+            constant += f64::from(shifted) * f64::from(shifted);
+            scaled.push(shifted.algebraic_mul(step));
+        }
+        ScaledLevelQuery {
+            constant: constant as f32,
+        }
+    }
+
+    /// Score centroids `start..end` of one level with the expanded squared
+    /// distance `C - 2 * dot(q', code) + N_c`. `N_c` was precomputed when the
+    /// artifact was opened, so the loop is one `f32 x u8` dot per centroid.
     fn score_range_into(
         &self,
         level: &QuantizedFloatRoutingLevel,
+        scaled: &ScaledLevelQuery,
+        scaled_query: &[f32],
         start: usize,
         end: usize,
-        query: &[f32],
-        output: &mut Vec<(usize, f32)>,
+        output: &mut Vec<RoutingCandidate>,
     ) {
         let codes = self.level_codes(level);
+        let dimension = self.model.dimension;
+        let kernel = self.model.kernel;
         output.reserve(end.saturating_sub(start));
         output.extend((start..end).map(|centroid| {
-            let row =
-                &codes[centroid * self.model.dimension..(centroid + 1) * self.model.dimension];
-            let distance = query
-                .iter()
-                .enumerate()
-                .map(|(coordinate, &value)| {
-                    let decoded = level.minimums[coordinate]
-                        + level.steps[coordinate] * f32::from(row[coordinate]);
-                    let difference = value - decoded;
-                    difference * difference
-                })
-                .sum();
-            (centroid, distance)
+            let row = &codes[centroid * dimension..(centroid + 1) * dimension];
+            let dot = kernel.dot(scaled_query, row);
+            let distance = scaled
+                .constant
+                .algebraic_add(level.code_norms[centroid].algebraic_sub(dot.algebraic_mul(2.0)));
+            // Rounding in the expanded form can dip a tiny distance below zero.
+            (centroid as u32, distance.max(0.0))
         }));
     }
 
@@ -631,12 +720,40 @@ impl QuantizedFloatScannModelView<'_> {
 }
 
 impl FloatScannQuery {
+    fn new(routed_leaves: Vec<u32>, centroid_dots: Vec<f32>, ah: AhQuery) -> Self {
+        let fast_scan = FastScanQuery::new(&ah);
+        if fast_scan.is_degenerate() {
+            crate::observe::scann_degenerate_fast_scan_query();
+            super::warn_rate_limited(&DEGENERATE_FAST_SCAN_QUERIES, |count| {
+                format!(
+                    "[scann] FastScan lookup table is degenerate (all-zero AH scores); every \
+                     leaf row scores as its centroid dot ({count} queries so far)"
+                )
+            });
+        }
+        Self {
+            routed_leaves,
+            centroid_dots,
+            ah,
+            fast_scan,
+        }
+    }
+
     pub fn routed_leaves(&self) -> &[u32] {
         &self.routed_leaves
     }
 
-    /// Centroid contribution for one routed leaf. Segment scanners use this
-    /// alongside the shared AH lookup table without allocating row wrappers.
+    /// Routed leaves paired with their centroid dot products, in beam order.
+    /// Segment scanners iterate this instead of looking each leaf up again.
+    pub fn routed(&self) -> impl ExactSizeIterator<Item = (u32, f32)> + '_ {
+        self.routed_leaves
+            .iter()
+            .copied()
+            .zip(self.centroid_dots.iter().copied())
+    }
+
+    /// Centroid contribution for one routed leaf. Linear in the probe count;
+    /// hot scans use [`Self::routed`] instead.
     pub fn centroid_dot(&self, leaf: u32) -> Option<f32> {
         self.routed_leaves
             .iter()
@@ -647,6 +764,11 @@ impl FloatScannQuery {
     /// Borrow the query-specific AH lookup table for packed/FastScan rows.
     pub fn ah_query(&self) -> &AhQuery {
         &self.ah
+    }
+
+    /// Integer FastScan table shared by every segment scanning this query.
+    pub fn fast_scan(&self) -> &FastScanQuery {
+        &self.fast_scan
     }
 
     /// Returns `None` when the row's leaf was not selected by the query beam.
@@ -688,7 +810,9 @@ impl FloatRoutingTree {
     /// Route to the closest terminal partitions with a bounded beam.
     pub fn route(&self, query: &[f32], probes: usize) -> ScannResult<Vec<RoutedLeaf>> {
         let mut output = Vec::with_capacity(probes);
-        self.route_with_scratch(query, probes, &mut RoutingScratch::default(), &mut output)?;
+        with_routing_scratch(|scratch| {
+            self.route_with_scratch(query, probes, scratch, &mut output)
+        })?;
         Ok(output)
     }
 
@@ -729,7 +853,7 @@ impl FloatRoutingTree {
                 &self.child_offsets[0],
                 intermediate_routing_beam(probes),
                 probes,
-                |candidate| candidate.0,
+                |candidate| candidate.0 as usize,
             );
             scratch.active.truncate(initial_width);
         }
@@ -737,8 +861,8 @@ impl FloatRoutingTree {
             let offsets = &self.child_offsets[level - 1];
             scratch.next.clear();
             for &(parent, _) in &scratch.active {
-                let start = offsets[parent] as usize;
-                let end = offsets[parent + 1] as usize;
+                let start = offsets[parent as usize] as usize;
+                let end = offsets[parent as usize + 1] as usize;
                 score_range_into(
                     &self.levels[level],
                     self.dimension,
@@ -757,7 +881,7 @@ impl FloatRoutingTree {
                     &self.child_offsets[level],
                     intermediate_routing_beam(probes),
                     probes,
-                    |candidate| candidate.0,
+                    |candidate| candidate.0 as usize,
                 );
                 scratch.next.truncate(width);
             }
@@ -769,7 +893,7 @@ impl FloatRoutingTree {
                 .active
                 .iter()
                 .map(|&(leaf, squared_distance)| RoutedLeaf {
-                    leaf: leaf as u32,
+                    leaf,
                     squared_distance,
                 }),
         );
@@ -1435,12 +1559,12 @@ fn score_range_into(
     start: usize,
     end: usize,
     query: &[f32],
-    output: &mut Vec<(usize, f32)>,
+    output: &mut Vec<RoutingCandidate>,
 ) {
     output.reserve(end.saturating_sub(start));
     output.extend((start..end).map(|index| {
         (
-            index,
+            index as u32,
             squared_l2(
                 &centroids[index * dimension..(index + 1) * dimension],
                 query,
@@ -1449,8 +1573,40 @@ fn score_range_into(
     }));
 }
 
-fn keep_best(values: &mut Vec<(usize, f32)>, count: usize) {
-    let compare = |left: &(usize, f32), right: &(usize, f32)| {
+/// Query-independent `sum step_i^2 * code_i^2` for every centroid of one
+/// fixed-point routing level. Strict f64 accumulation per centroid: this runs
+/// once per artifact open, and the value is subtracted from a similarly sized
+/// query constant at query time.
+fn quantized_code_norms(
+    steps: &[f32],
+    centroid_codes: &[u8],
+    dimension: usize,
+) -> ScannResult<Vec<f32>> {
+    if dimension == 0 || steps.len() != dimension || !centroid_codes.len().is_multiple_of(dimension)
+    {
+        return Err(ScannFormatError::new(
+            "quantized ScaNN routing level shape does not match its dimension",
+        ));
+    }
+    let step_squares: Vec<f32> = steps.iter().map(|&step| step * step).collect();
+    Ok(centroid_codes
+        .chunks_exact(dimension)
+        .map(|row| {
+            row.iter()
+                .zip(&step_squares)
+                .fold(0.0f64, |acc, (&code, &step_square)| {
+                    let code = f64::from(code);
+                    acc + f64::from(step_square) * code * code
+                }) as f32
+        })
+        .collect())
+}
+
+static DEGENERATE_FAST_SCAN_QUERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn keep_best(values: &mut Vec<RoutingCandidate>, count: usize) {
+    let compare = |left: &RoutingCandidate, right: &RoutingCandidate| {
         left.1
             .total_cmp(&right.1)
             .then_with(|| left.0.cmp(&right.0))
@@ -1469,7 +1625,7 @@ fn keep_best(values: &mut Vec<(usize, f32)>, count: usize) {
     values.sort_unstable_by(compare);
 }
 
-fn sort_routing_candidates(values: &mut [(usize, f32)]) {
+fn sort_routing_candidates(values: &mut [RoutingCandidate]) {
     values.sort_unstable_by(|left, right| {
         left.1
             .total_cmp(&right.1)
@@ -1716,7 +1872,96 @@ mod tests {
             let query = reopened.prepare_query(point, 8).unwrap();
             assert!(query.score(&encoded).unwrap().unwrap().is_finite());
             assert_eq!(quantized_view.encode(point).unwrap(), encoded);
-            assert_eq!(quantized_view.prepare_query(point, 8).unwrap(), query);
+            // The mmap-backed route scores the expanded squared distance with
+            // an `f32 x u8` kernel, so centroid dots agree with the decoded
+            // owned tree to float tolerance rather than bit-for-bit.
+            let quantized_query = quantized_view.prepare_query(point, 8).unwrap();
+            assert_eq!(quantized_query.routed_leaves(), query.routed_leaves());
+            assert_eq!(quantized_query.ah_query(), query.ah_query());
+            for ((leaf, quantized_dot), (_, exact_dot)) in
+                quantized_query.routed().zip(query.routed())
+            {
+                assert!(
+                    (quantized_dot - exact_dot).abs() <= 1e-4 * (1.0 + exact_dot.abs()),
+                    "leaf {leaf}: quantized centroid dot {quantized_dot} vs {exact_dot}"
+                );
+            }
+        }
+    }
+
+    /// The expanded-distance kernel route must select the same leaves as
+    /// decoding every centroid coordinate, up to float tolerance on ties.
+    #[test]
+    fn quantized_kernel_routing_matches_decoded_reference_distances() {
+        let dimension = 24usize;
+        let points = 512usize;
+        let data: Vec<f32> = (0..points * dimension)
+            .map(|index| {
+                let row = index / dimension;
+                let coordinate = index % dimension;
+                (((row * 73 + coordinate * 151 + row * coordinate * 19) % 997) as f32 / 498.5) - 1.0
+            })
+            .collect();
+        let (model, _) = FloatScannModel::train(
+            &data,
+            points,
+            dimension,
+            &[4, 32],
+            4,
+            3,
+            0xfa57,
+            DEFAULT_ANISOTROPIC_THRESHOLD,
+        )
+        .unwrap();
+        let artifact = ScannTrainedArtifact::new(
+            5,
+            100_000,
+            super::super::ScannConfig {
+                dimension: dimension as u32,
+                tree_levels: 2,
+                num_leaves: 32,
+                encoding: ScannEncoding::AsymmetricHash {
+                    dimensions_per_block: 4,
+                    bits_per_code: 4,
+                },
+            },
+            model.routing.to_quantized_levels(),
+            Some(model.codebook.to_artifact()),
+        )
+        .unwrap();
+        let bytes = artifact.to_bytes().unwrap();
+        let view = ScannTrainedArtifactView::parse(&bytes).unwrap();
+        let quantized = QuantizedFloatScannModel::from_artifact_view(&view).unwrap();
+        let quantized_view = quantized.view(&bytes).unwrap();
+        // Reference: decode the same quantized leaf plane into an owned tree.
+        let decoded = FloatRoutingTree::from_quantized_levels(&artifact.levels, dimension).unwrap();
+        for point in data.chunks_exact(dimension).take(64) {
+            let expected = decoded.route(point, 6).unwrap();
+            let got = quantized_view.route(point, 6).unwrap();
+            let expected_leaves: Vec<u32> = expected.iter().map(|leaf| leaf.leaf).collect();
+            let got_leaves: Vec<u32> = got.iter().map(|leaf| leaf.leaf).collect();
+            if expected_leaves != got_leaves {
+                // Ties (or near-ties) may order differently; the retained
+                // distance frontier must still match within tolerance.
+                let worst_expected = expected.last().unwrap().squared_distance;
+                for leaf in &got {
+                    assert!(
+                        leaf.squared_distance <= worst_expected + 1e-3,
+                        "kernel route kept leaf {} at {} beyond reference frontier {worst_expected}",
+                        leaf.leaf,
+                        leaf.squared_distance
+                    );
+                }
+            }
+            for (reference, kernel) in expected.iter().zip(&got) {
+                assert!(
+                    (reference.squared_distance - kernel.squared_distance).abs()
+                        <= 1e-3 * (1.0 + reference.squared_distance),
+                    "distance drift {} vs {}",
+                    reference.squared_distance,
+                    kernel.squared_distance
+                );
+            }
         }
     }
 

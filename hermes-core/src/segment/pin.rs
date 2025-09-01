@@ -76,6 +76,37 @@ impl PinPolicy {
 
 static PIN_POLICY: OnceLock<PinPolicy> = OnceLock::new();
 
+/// Hot-metadata size per segment above which running with pinning disabled
+/// (the default: `HERMES_PIN_METADATA_BUDGET_MB` unset or 0) is worth one
+/// warning at open. Below this the kernel keeps the pages warm anyway.
+pub const UNPINNED_METADATA_WARN_THRESHOLD_BYTES: u64 = 16 * 1024 * 1024;
+
+static WARNED_PINNING_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Pinning is disabled and a segment carries `intended_bytes` of mmap-backed
+/// hot metadata that would have been pinned. Warns once per process (with the
+/// env var to set) when that exceeds
+/// [`UNPINNED_METADATA_WARN_THRESHOLD_BYTES`]; a silent zero default would
+/// otherwise look identical to a healthy configuration.
+pub(crate) fn warn_if_pinning_disabled(index_label: &str, segment_id: u128, intended_bytes: u64) {
+    if intended_bytes < UNPINNED_METADATA_WARN_THRESHOLD_BYTES {
+        return;
+    }
+    if WARNED_PINNING_DISABLED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "[pin] index={} segment {:016x}: hot-metadata pinning is disabled (budget 0) but this \
+         segment has {} of mmap-backed per-query metadata; set HERMES_PIN_METADATA_BUDGET_MB \
+         (and HERMES_PIN_MODE=mlock|copy) to keep it resident under memory pressure \
+         (reported once per process)",
+        index_label,
+        segment_id,
+        crate::format_bytes(intended_bytes),
+    );
+}
+
 /// Override the process-wide pin policy. Must be called before the first
 /// segment is opened; returns false (and warns) if the policy was already
 /// initialized.

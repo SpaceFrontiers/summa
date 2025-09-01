@@ -21,6 +21,10 @@ pub struct BinaryDenseVectorQuery {
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
     probe_cache: Arc<Mutex<Option<crate::structures::IvfProbePlan>>>,
+    /// Shared copy of `vector` for the async per-segment scorer futures,
+    /// which cannot borrow `self`. Built once; revalidated against `vector`
+    /// (which is `pub`) before reuse.
+    shared_vector: std::sync::OnceLock<Arc<[u8]>>,
 }
 
 impl std::fmt::Display for BinaryDenseVectorQuery {
@@ -41,6 +45,20 @@ impl BinaryDenseVectorQuery {
             vector,
             combiner: MultiValueCombiner::Max,
             probe_cache: Arc::new(Mutex::new(None)),
+            shared_vector: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The packed query as a shared slice for scorer futures (one allocation
+    /// per query, not per segment). See `DenseVectorQuery::shared_vector`.
+    fn shared_vector(&self) -> Arc<[u8]> {
+        let shared = self
+            .shared_vector
+            .get_or_init(|| Arc::from(self.vector.as_slice()));
+        if shared.as_ref() == self.vector.as_slice() {
+            Arc::clone(shared)
+        } else {
+            Arc::from(self.vector.as_slice())
         }
     }
 
@@ -53,7 +71,7 @@ impl BinaryDenseVectorQuery {
 impl Query for BinaryDenseVectorQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
-        let vector = self.vector.clone();
+        let vector = self.shared_vector();
         let combiner = self.combiner;
         let probe_cache = Arc::clone(&self.probe_cache);
         Box::pin(async move {

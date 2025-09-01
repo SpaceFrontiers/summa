@@ -2366,3 +2366,123 @@ async fn test_tq_multi_value_sum_aggregates_before_candidate_cut() {
     );
     assert!((results[0].score - 1.6).abs() < 1e-5);
 }
+
+/// `combine_ordinal_results` groups multi-valued raw hits without a hash map
+/// (stable sort + run grouping). Pins what the executors depend on: every
+/// document's ordinals keep their encounter order (the combiner's float
+/// accumulation and the reported positions are order-sensitive), the final
+/// order is score desc / doc id asc, truncation applies after combining, and
+/// the single-valued fast path stores its ordinal inline.
+#[test]
+fn combine_ordinal_results_groups_by_doc_preserving_ordinal_encounter_order() {
+    use crate::query::MultiValueCombiner;
+    use crate::segment::combine_ordinal_results;
+
+    // Raw hits arrive in score order (as an executor emits them), so the
+    // ordinals of one document are interleaved and out of ordinal order.
+    let raw: Vec<(u32, u16, f32)> = vec![
+        (7, 3, 0.9),
+        (2, 0, 0.8),
+        (7, 0, 0.7),
+        (9, 1, 0.6),
+        (2, 5, 0.55),
+        (7, 1, 0.5),
+        (4, 0, 0.4),
+    ];
+
+    let results = combine_ordinal_results(raw.iter().copied(), MultiValueCombiner::Sum, 10);
+    let by_doc: std::collections::HashMap<u32, &crate::segment::VectorSearchResult> =
+        results.iter().map(|r| (r.doc_id, r)).collect();
+
+    // Encounter order per document, not ordinal order.
+    assert_eq!(
+        by_doc[&7].ordinals.as_slice(),
+        &[(3, 0.9), (0, 0.7), (1, 0.5)]
+    );
+    assert_eq!(by_doc[&2].ordinals.as_slice(), &[(0, 0.8), (5, 0.55)]);
+    assert_eq!(by_doc[&9].ordinals.as_slice(), &[(1, 0.6)]);
+    assert!(
+        !by_doc[&9].ordinals.spilled(),
+        "single ordinal stays inline"
+    );
+
+    // Combined with the same left-to-right accumulation as the combiner.
+    let expected_7 = MultiValueCombiner::Sum.combine(&[(3, 0.9), (0, 0.7), (1, 0.5)]);
+    assert_eq!(by_doc[&7].score.to_bits(), expected_7.to_bits());
+
+    // Score desc, doc asc; sums: 7 → 2.1, 2 → 1.35, 9 → 0.6, 4 → 0.4.
+    let order: Vec<u32> = results.iter().map(|r| r.doc_id).collect();
+    assert_eq!(order, vec![7, 2, 9, 4]);
+
+    // Truncation happens after combining every document.
+    let top2 = combine_ordinal_results(raw.iter().copied(), MultiValueCombiner::Sum, 2);
+    assert_eq!(
+        top2.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+        vec![7, 2]
+    );
+
+    // Ties break on doc id ascending.
+    let tied = combine_ordinal_results(
+        [(5u32, 0u16, 1.0f32), (3, 1, 0.5), (3, 0, 0.5), (8, 0, 1.0)],
+        MultiValueCombiner::Sum,
+        10,
+    );
+    assert_eq!(
+        tied.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+        vec![3, 5, 8]
+    );
+
+    // Single-valued fast path: inline ordinal, same ordering rules.
+    let single = combine_ordinal_results(
+        [(4u32, 0u16, 0.2f32), (1, 0, 0.9), (6, 0, 0.9)],
+        MultiValueCombiner::Max,
+        10,
+    );
+    assert_eq!(
+        single.iter().map(|r| r.doc_id).collect::<Vec<_>>(),
+        vec![1, 6, 4]
+    );
+    assert!(single.iter().all(|r| !r.ordinals.spilled()));
+    assert_eq!(single[0].ordinals.as_slice(), &[(0, 0.9)]);
+}
+
+/// A float `DenseVectorQuery` can never be served by a Hamming (binary IVF /
+/// binary flat) field. The segment used to return an empty result set from
+/// the `VectorIndex::BinaryIvf` arm; the rule is fail loud, so both the
+/// schema gate and the segment arm now return an actionable error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_dense_query_on_binary_field_errors_instead_of_empty() {
+    use crate::query::DenseVectorQuery;
+
+    let byte_len = 8;
+    let mut sb = SchemaBuilder::default();
+    let bvec = sb.add_binary_dense_vector_field("bvec", byte_len * 8, true, true);
+    let schema = sb.build();
+
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for i in 0u8..8 {
+        let mut doc = Document::new();
+        doc.add_binary_dense_vector(bvec, vec![i; byte_len]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let query = DenseVectorQuery::new(bvec, vec![1.0f32; byte_len * 8]);
+    let error = searcher
+        .search(&query, 5)
+        .await
+        .expect_err("a float dense query against a binary field must error, not return nothing");
+    let message = error.to_string();
+    assert!(
+        message.contains("dense_vector") || message.contains("BinaryDenseVectorQuery"),
+        "error must name the capability mismatch, got: {message}"
+    );
+}

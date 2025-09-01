@@ -90,6 +90,10 @@ impl MultiValueCombiner {
             return 0.0;
         }
 
+        // Strict IEEE accumulation on purpose: these reductions run over a
+        // handful of ordinals per document, and measured `algebraic_add`
+        // (docs/algebraic-float-reductions.md) made the exp-bound LogSumExp
+        // loop slower at n=5 (16.5 → 20.4 ns) while changing rounding.
         match self {
             MultiValueCombiner::Sum => scores.iter().map(|(_, s)| s).sum(),
             MultiValueCombiner::Max => scores
@@ -114,7 +118,7 @@ impl MultiValueCombiner {
 
                 let mut weight_sum = 0.0f32;
                 let mut weighted = 0.0f32;
-                for (_, s) in scores {
+                for &(_, s) in scores {
                     let weight = (t * (s - max_score)).exp();
                     weight_sum += weight;
                     weighted += weight * s;
@@ -122,17 +126,38 @@ impl MultiValueCombiner {
                 weighted / weight_sum
             }
             MultiValueCombiner::WeightedTopK { k, decay } => {
-                // Sort scores descending and take top k
-                let mut sorted: Vec<f32> = scores.iter().map(|(_, s)| *s).collect();
-                sorted.sort_unstable_by(|a, b| b.total_cmp(a));
-                sorted.truncate(*k);
+                let k = (*k).min(scores.len());
+                if k == 0 {
+                    return 0.0;
+                }
+                // Select the top k scores without allocating for the common
+                // small-document case: a stack buffer for up to 16 values,
+                // `select_nth_unstable` to partition when k < len, then sort
+                // only the top k (the decay weights are rank-dependent).
+                const INLINE: usize = 16;
+                let mut inline = [0.0f32; INLINE];
+                let mut spilled: Vec<f32>;
+                let values: &mut [f32] = if scores.len() <= INLINE {
+                    for (slot, &(_, s)) in inline.iter_mut().zip(scores) {
+                        *slot = s;
+                    }
+                    &mut inline[..scores.len()]
+                } else {
+                    spilled = scores.iter().map(|&(_, s)| s).collect();
+                    spilled.as_mut_slice()
+                };
+                if k < values.len() {
+                    values.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+                }
+                let top = &mut values[..k];
+                top.sort_unstable_by(|a, b| b.total_cmp(a));
 
                 // Apply exponential decay weights
                 let mut weight = 1.0f32;
                 let mut weighted_sum = 0.0f32;
                 let mut weight_total = 0.0f32;
 
-                for score in sorted {
+                for &score in top.iter() {
                     weighted_sum += weight * score;
                     weight_total += weight;
                     weight *= decay;
@@ -263,6 +288,37 @@ mod tests {
         // weight_total = 1.7
         // result = 2.7 / 1.7 ≈ 1.588
         assert!((result - 1.588).abs() < 0.01);
+    }
+
+    /// The stack/select path must agree with a plain full sort for every
+    /// length around the inline buffer boundary and every k, including
+    /// ties and k larger than the input.
+    #[test]
+    fn weighted_top_k_selection_matches_full_sort_across_inline_boundary() {
+        for len in [1usize, 2, 5, 15, 16, 17, 40] {
+            let scores: Vec<(u32, f32)> = (0..len)
+                .map(|i| (i as u32, ((i * 7919) % 13) as f32 / 13.0))
+                .collect();
+            for k in [1usize, 2, 3, 5, 16, 17, 64] {
+                let combiner = MultiValueCombiner::weighted_top_k_with_params(k, 0.7);
+                let actual = combiner.combine(&scores);
+
+                let mut sorted: Vec<f32> = scores.iter().map(|&(_, s)| s).collect();
+                sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+                sorted.truncate(k);
+                let (mut w, mut ws, mut wt) = (1.0f32, 0.0f32, 0.0f32);
+                for s in sorted {
+                    ws += w * s;
+                    wt += w;
+                    w *= 0.7;
+                }
+                let expected = ws / wt;
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "len {len} k {k}: {actual} vs {expected}"
+                );
+            }
+        }
     }
 
     #[test]

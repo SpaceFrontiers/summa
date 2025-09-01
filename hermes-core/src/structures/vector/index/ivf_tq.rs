@@ -107,6 +107,12 @@ impl TqIvfQueryPlan {
         let normalized_query = normalized_cosine_query(query);
         let route: IvfProbePlan = coarse_centroids.probe(&normalized_query, nprobe, routing);
         let effective_nprobe = nprobe.clamp(1, coarse_centroids.num_clusters as usize);
+        if effective_nprobe != nprobe {
+            log::debug!(
+                "[ivf_tq] nprobe {nprobe} clamped to {effective_nprobe}: codebook has {} leaves",
+                coarse_centroids.num_clusters
+            );
+        }
         let cluster_dots = route
             .cluster_ids
             .iter()

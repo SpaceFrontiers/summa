@@ -1814,6 +1814,90 @@ pub fn norm_f32(v: &[f32]) -> f32 {
     norm_squared_f32(v).sqrt()
 }
 
+/// f32 dot / fused dot+norm kernel resolved once for a whole batch.
+///
+/// The batch scorers (`batch_*_precomp`) call a kernel once per stored
+/// vector; resolving it up front keeps runtime feature detection out of that
+/// loop (mirrors [`HammingKernel`]). Every variant has the scalar fallback.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseF32Kernel {
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
+    #[cfg(target_arch = "x86_64")]
+    Avx2Fma,
+    #[cfg(target_arch = "x86_64")]
+    Sse,
+    Scalar,
+}
+
+impl DenseF32Kernel {
+    /// Detect the widest kernel this CPU supports.
+    #[inline]
+    pub fn resolve() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if neon::is_available() {
+                Self::Neon
+            } else {
+                Self::Scalar
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx512f") {
+                return Self::Avx512;
+            }
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                return Self::Avx2Fma;
+            }
+            if sse::is_available() {
+                return Self::Sse;
+            }
+            Self::Scalar
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            Self::Scalar
+        }
+    }
+
+    /// `dot(a[..count], b[..count])`. Callers guarantee `count` is in bounds.
+    #[inline]
+    pub fn dot(self, a: &[f32], b: &[f32], count: usize) -> f32 {
+        debug_assert!(count <= a.len() && count <= b.len());
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe { dot_product_f32_neon(a, b, count) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => unsafe { dot_product_f32_avx512(a, b, count) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2Fma => unsafe { dot_product_f32_avx2(a, b, count) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse => unsafe { dot_product_f32_sse(a, b, count) },
+            Self::Scalar => dot_product_f32_scalar(&a[..count], &b[..count]),
+        }
+    }
+
+    /// `(dot(a, b), dot(b, b))` over the first `count` elements.
+    #[inline]
+    pub fn fused_dot_norm(self, a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
+        debug_assert!(count <= a.len() && count <= b.len());
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe { fused_dot_norm_neon(a, b, count) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => unsafe { fused_dot_norm_avx512(a, b, count) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2Fma => unsafe { fused_dot_norm_avx2(a, b, count) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse => unsafe { fused_dot_norm_sse(a, b, count) },
+            Self::Scalar => fused_dot_norm_scalar(&a[..count], &b[..count]),
+        }
+    }
+}
+
 /// Compute dot product of two f32 arrays with SIMD acceleration
 #[inline]
 pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
@@ -1823,28 +1907,7 @@ pub fn dot_product_f32(a: &[f32], b: &[f32], count: usize) -> f32 {
         a.len(),
         b.len()
     );
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            return unsafe { dot_product_f32_neon(a, b, count) };
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return unsafe { dot_product_f32_avx512(a, b, count) };
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { dot_product_f32_avx2(a, b, count) };
-        }
-        if sse::is_available() {
-            return unsafe { dot_product_f32_sse(a, b, count) };
-        }
-    }
-
-    // Scalar fallback
-    dot_product_f32_scalar(&a[..count], &b[..count])
+    DenseF32Kernel::resolve().dot(a, b, count)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1888,9 +1951,26 @@ unsafe fn dot_product_f32_neon(a: &[f32], b: &[f32], count: usize) -> f32 {
     let acc = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
     let mut sum = vaddvq_f32(acc);
 
-    let base = chunks16 * 16;
-    for i in 0..remainder {
-        sum += a[base + i] * b[base + i];
+    // Up to 15 trailing elements: one 4-lane accumulator over the remaining
+    // full lane groups, then an algebraic scalar tail of at most 3.
+    let mut base = chunks16 * 16;
+    // LLVM's algebraic scalar loop lowers an exactly 8-lane remainder to a
+    // better two-vector reduction than this generic accumulator on NEON.
+    // Keep the manual tail for 4/12 lanes, where it wins.
+    if remainder >= 4 && remainder != 8 {
+        let mut tail = vdupq_n_f32(0.0);
+        while base + 4 <= count {
+            tail = vfmaq_f32(
+                tail,
+                vld1q_f32(a.as_ptr().add(base)),
+                vld1q_f32(b.as_ptr().add(base)),
+            );
+            base += 4;
+        }
+        sum += vaddvq_f32(tail);
+    }
+    for i in base..count {
+        sum = sum.algebraic_add(a[i].algebraic_mul(b[i]));
     }
 
     sum
@@ -1947,9 +2027,29 @@ unsafe fn dot_product_f32_avx2(a: &[f32], b: &[f32], count: usize) -> f32 {
 
     let mut sum = _mm_cvtss_f32(final_sum);
 
-    let base = chunks32 * 32;
-    for i in 0..remainder {
-        sum += a[base + i] * b[base + i];
+    // Up to 31 trailing elements: one 8-lane accumulator over the remaining
+    // full lane groups, then an algebraic scalar tail of at most 7.
+    let mut base = chunks32 * 32;
+    if remainder >= 8 {
+        let mut tail = _mm256_setzero_ps();
+        while base + 8 <= count {
+            tail = _mm256_fmadd_ps(
+                _mm256_loadu_ps(a.as_ptr().add(base)),
+                _mm256_loadu_ps(b.as_ptr().add(base)),
+                tail,
+            );
+            base += 8;
+        }
+        let hi = _mm256_extractf128_ps(tail, 1);
+        let lo = _mm256_castps256_ps128(tail);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_shuffle_ps(sum128, sum128, 0b10_11_00_01);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        sum += _mm_cvtss_f32(_mm_add_ss(sums, shuf2));
+    }
+    for i in base..count {
+        sum = sum.algebraic_add(a[i].algebraic_mul(b[i]));
     }
 
     sum
@@ -1981,10 +2081,10 @@ unsafe fn dot_product_f32_sse(a: &[f32], b: &[f32], count: usize) -> f32 {
 
     let mut sum = _mm_cvtss_f32(final_sum);
 
-    // Handle remainder
+    // Handle remainder (at most 3 elements)
     let base = chunks * 4;
     for i in 0..remainder {
-        sum += a[base + i] * b[base + i];
+        sum = sum.algebraic_add(a[base + i].algebraic_mul(b[base + i]));
     }
 
     sum
@@ -2031,9 +2131,23 @@ unsafe fn dot_product_f32_avx512(a: &[f32], b: &[f32], count: usize) -> f32 {
     let acc = _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3));
     let mut sum = _mm512_reduce_add_ps(acc);
 
-    let base = chunks64 * 64;
-    for i in 0..remainder {
-        sum += a[base + i] * b[base + i];
+    // Up to 63 trailing elements: one 16-lane accumulator over the remaining
+    // full lane groups, then an algebraic scalar tail of at most 15.
+    let mut base = chunks64 * 64;
+    if remainder >= 16 {
+        let mut tail = _mm512_setzero_ps();
+        while base + 16 <= count {
+            tail = _mm512_fmadd_ps(
+                _mm512_loadu_ps(a.as_ptr().add(base)),
+                _mm512_loadu_ps(b.as_ptr().add(base)),
+                tail,
+            );
+            base += 16;
+        }
+        sum += _mm512_reduce_add_ps(tail);
+    }
+    for i in base..count {
+        sum = sum.algebraic_add(a[i].algebraic_mul(b[i]));
     }
 
     sum
@@ -2078,10 +2192,22 @@ unsafe fn fused_dot_norm_avx512(a: &[f32], b: &[f32], count: usize) -> (f32, f32
     let mut dot = _mm512_reduce_add_ps(acc_dot);
     let mut norm = _mm512_reduce_add_ps(acc_norm);
 
-    let base = chunks64 * 64;
-    for i in 0..remainder {
-        dot += a[base + i] * b[base + i];
-        norm += b[base + i] * b[base + i];
+    let mut base = chunks64 * 64;
+    if remainder >= 16 {
+        let mut tail_dot = _mm512_setzero_ps();
+        let mut tail_norm = _mm512_setzero_ps();
+        while base + 16 <= count {
+            let vb = _mm512_loadu_ps(b.as_ptr().add(base));
+            tail_dot = _mm512_fmadd_ps(_mm512_loadu_ps(a.as_ptr().add(base)), vb, tail_dot);
+            tail_norm = _mm512_fmadd_ps(vb, vb, tail_norm);
+            base += 16;
+        }
+        dot += _mm512_reduce_add_ps(tail_dot);
+        norm += _mm512_reduce_add_ps(tail_norm);
+    }
+    for i in base..count {
+        dot = dot.algebraic_add(a[i].algebraic_mul(b[i]));
+        norm = norm.algebraic_add(b[i].algebraic_mul(b[i]));
     }
 
     (dot, norm)
@@ -2096,28 +2222,7 @@ unsafe fn fused_dot_norm_avx512(a: &[f32], b: &[f32], count: usize) -> (f32, f32
 /// Loads `b` only once (halves memory bandwidth vs two separate dot products).
 #[inline]
 fn fused_dot_norm(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        if neon::is_available() {
-            return unsafe { fused_dot_norm_neon(a, b, count) };
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512f") {
-            return unsafe { fused_dot_norm_avx512(a, b, count) };
-        }
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            return unsafe { fused_dot_norm_avx2(a, b, count) };
-        }
-        if sse::is_available() {
-            return unsafe { fused_dot_norm_sse(a, b, count) };
-        }
-    }
-
-    // Scalar fallback
-    fused_dot_norm_scalar(&a[..count], &b[..count])
+    DenseF32Kernel::resolve().fused_dot_norm(a, b, count)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2163,10 +2268,22 @@ unsafe fn fused_dot_norm_neon(a: &[f32], b: &[f32], count: usize) -> (f32, f32) 
     let mut dot = vaddvq_f32(acc_dot);
     let mut norm = vaddvq_f32(acc_norm);
 
-    let base = chunks16 * 16;
-    for i in 0..remainder {
-        dot += a[base + i] * b[base + i];
-        norm += b[base + i] * b[base + i];
+    let mut base = chunks16 * 16;
+    if remainder >= 4 {
+        let mut tail_dot = vdupq_n_f32(0.0);
+        let mut tail_norm = vdupq_n_f32(0.0);
+        while base + 4 <= count {
+            let vb = vld1q_f32(b.as_ptr().add(base));
+            tail_dot = vfmaq_f32(tail_dot, vld1q_f32(a.as_ptr().add(base)), vb);
+            tail_norm = vfmaq_f32(tail_norm, vb, vb);
+            base += 4;
+        }
+        dot += vaddvq_f32(tail_dot);
+        norm += vaddvq_f32(tail_norm);
+    }
+    for i in base..count {
+        dot = dot.algebraic_add(a[i].algebraic_mul(b[i]));
+        norm = norm.algebraic_add(b[i].algebraic_mul(b[i]));
     }
 
     (dot, norm)
@@ -2226,10 +2343,31 @@ unsafe fn fused_dot_norm_avx2(a: &[f32], b: &[f32], count: usize) -> (f32, f32) 
     let shuf2_n = _mm_movehl_ps(sums_n, sums_n);
     let mut norm = _mm_cvtss_f32(_mm_add_ss(sums_n, shuf2_n));
 
-    let base = chunks32 * 32;
-    for i in 0..remainder {
-        dot += a[base + i] * b[base + i];
-        norm += b[base + i] * b[base + i];
+    let mut base = chunks32 * 32;
+    if remainder >= 8 {
+        let mut tail_dot = _mm256_setzero_ps();
+        let mut tail_norm = _mm256_setzero_ps();
+        while base + 8 <= count {
+            let vb = _mm256_loadu_ps(b.as_ptr().add(base));
+            tail_dot = _mm256_fmadd_ps(_mm256_loadu_ps(a.as_ptr().add(base)), vb, tail_dot);
+            tail_norm = _mm256_fmadd_ps(vb, vb, tail_norm);
+            base += 8;
+        }
+        let reduce = |v: __m256| -> f32 {
+            let hi = _mm256_extractf128_ps(v, 1);
+            let lo = _mm256_castps256_ps128(v);
+            let sum128 = _mm_add_ps(lo, hi);
+            let shuf = _mm_shuffle_ps(sum128, sum128, 0b10_11_00_01);
+            let sums = _mm_add_ps(sum128, shuf);
+            let shuf2 = _mm_movehl_ps(sums, sums);
+            _mm_cvtss_f32(_mm_add_ss(sums, shuf2))
+        };
+        dot += reduce(tail_dot);
+        norm += reduce(tail_norm);
+    }
+    for i in base..count {
+        dot = dot.algebraic_add(a[i].algebraic_mul(b[i]));
+        norm = norm.algebraic_add(b[i].algebraic_mul(b[i]));
     }
 
     (dot, norm)
@@ -2270,8 +2408,8 @@ unsafe fn fused_dot_norm_sse(a: &[f32], b: &[f32], count: usize) -> (f32, f32) {
 
     let base = chunks * 4;
     for i in 0..remainder {
-        dot += a[base + i] * b[base + i];
-        norm += b[base + i] * b[base + i];
+        dot = dot.algebraic_add(a[base + i].algebraic_mul(b[base + i]));
+        norm = norm.algebraic_add(b[base + i].algebraic_mul(b[base + i]));
     }
 
     (dot, norm)
@@ -2978,80 +3116,142 @@ unsafe fn dot_product_u8_sse(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
 // ============================================================================
 // Platform dispatch
 // ============================================================================
+/// f16 scoring kernel resolved once per batch (see [`DenseF32Kernel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantF16Kernel {
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    #[cfg(target_arch = "x86_64")]
+    F16c,
+    /// SSE4.1 fused kernel; the dot-only form has no SSE variant and falls
+    /// back to scalar, exactly as the previous per-call dispatch did.
+    #[cfg(target_arch = "x86_64")]
+    Sse,
+    Scalar,
+}
+
+impl QuantF16Kernel {
+    #[inline]
+    pub fn resolve() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::Neon
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
+                return Self::F16c;
+            }
+            if sse::is_available() {
+                return Self::Sse;
+            }
+            Self::Scalar
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            Self::Scalar
+        }
+    }
+
+    #[inline]
+    pub fn fused_dot_norm(self, query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe { neon_quant::fused_dot_norm_f16(query_f16, vec_f16, dim) },
+            #[cfg(target_arch = "x86_64")]
+            Self::F16c => unsafe { fused_dot_norm_f16_f16c(query_f16, vec_f16, dim) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse => unsafe { fused_dot_norm_f16_sse(query_f16, vec_f16, dim) },
+            Self::Scalar => fused_dot_norm_f16_scalar(query_f16, vec_f16, dim),
+        }
+    }
+
+    #[inline]
+    pub fn dot(self, query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe { neon_quant::dot_product_f16(query_f16, vec_f16, dim) },
+            #[cfg(target_arch = "x86_64")]
+            Self::F16c => unsafe { dot_product_f16_f16c(query_f16, vec_f16, dim) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse => dot_product_f16_scalar(query_f16, vec_f16, dim),
+            Self::Scalar => dot_product_f16_scalar(query_f16, vec_f16, dim),
+        }
+    }
+}
+
+/// u8 scoring kernel resolved once per batch (see [`DenseF32Kernel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantU8Kernel {
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    #[cfg(target_arch = "x86_64")]
+    Sse,
+    Scalar,
+}
+
+impl QuantU8Kernel {
+    #[inline]
+    pub fn resolve() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::Neon
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            if sse::is_available() {
+                return Self::Sse;
+            }
+            Self::Scalar
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        {
+            Self::Scalar
+        }
+    }
+
+    #[inline]
+    pub fn fused_dot_norm(self, query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe { neon_quant::fused_dot_norm_u8(query, vec_u8, dim) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse => unsafe { fused_dot_norm_u8_sse(query, vec_u8, dim) },
+            Self::Scalar => fused_dot_norm_u8_scalar(query, vec_u8, dim),
+        }
+    }
+
+    #[inline]
+    pub fn dot(self, query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
+        match self {
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => unsafe { neon_quant::dot_product_u8(query, vec_u8, dim) },
+            #[cfg(target_arch = "x86_64")]
+            Self::Sse => unsafe { dot_product_u8_sse(query, vec_u8, dim) },
+            Self::Scalar => dot_product_u8_scalar(query, vec_u8, dim),
+        }
+    }
+}
+
 #[inline]
 fn fused_dot_norm_f16(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { neon_quant::fused_dot_norm_f16(query_f16, vec_f16, dim) };
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
-            return unsafe { fused_dot_norm_f16_f16c(query_f16, vec_f16, dim) };
-        }
-        if sse::is_available() {
-            return unsafe { fused_dot_norm_f16_sse(query_f16, vec_f16, dim) };
-        }
-    }
-
-    #[allow(unreachable_code)]
-    fused_dot_norm_f16_scalar(query_f16, vec_f16, dim)
+    QuantF16Kernel::resolve().fused_dot_norm(query_f16, vec_f16, dim)
 }
 
 #[inline]
 fn fused_dot_norm_u8(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { neon_quant::fused_dot_norm_u8(query, vec_u8, dim) };
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if sse::is_available() {
-            return unsafe { fused_dot_norm_u8_sse(query, vec_u8, dim) };
-        }
-    }
-
-    #[allow(unreachable_code)]
-    fused_dot_norm_u8_scalar(query, vec_u8, dim)
+    QuantU8Kernel::resolve().fused_dot_norm(query, vec_u8, dim)
 }
 
 // ── Dot-product-only dispatch (for unit_norm vectors) ─────────────────────
 #[inline]
 fn dot_product_f16_quant(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { neon_quant::dot_product_f16(query_f16, vec_f16, dim) };
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("f16c") && is_x86_feature_detected!("fma") {
-            return unsafe { dot_product_f16_f16c(query_f16, vec_f16, dim) };
-        }
-    }
-
-    #[allow(unreachable_code)]
-    dot_product_f16_scalar(query_f16, vec_f16, dim)
+    QuantF16Kernel::resolve().dot(query_f16, vec_f16, dim)
 }
 
 #[inline]
 fn dot_product_u8_quant(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { neon_quant::dot_product_u8(query, vec_u8, dim) };
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if sse::is_available() {
-            return unsafe { dot_product_u8_sse(query, vec_u8, dim) };
-        }
-    }
-
-    #[allow(unreachable_code)]
-    dot_product_u8_scalar(query, vec_u8, dim)
+    QuantU8Kernel::resolve().dot(query, vec_u8, dim)
 }
 
 // ============================================================================
@@ -3302,14 +3502,44 @@ pub fn batch_cosine_scores_precomp(
         "precomputed cosine vectors are truncated: need {required}, got {}",
         vectors.len()
     );
-    for i in 0..n {
-        let vec = &vectors[i * dim..(i + 1) * dim];
-        let (dot, norm_v_sq) = fused_dot_norm(query, vec, dim);
-        scores[i] = if norm_v_sq < f32::EPSILON {
-            0.0
-        } else {
-            dot * inv_norm_q * fast_inv_sqrt(norm_v_sq)
-        };
+    // Dispatch outside the row loop. Calling `DenseF32Kernel::fused_dot_norm`
+    // through a loop-carried enum was measurably slower on Sapphire Rapids;
+    // these arms preserve a direct target-feature call without repeating CPU
+    // detection for every stored vector.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    macro_rules! score_simd_rows {
+        ($kernel:path) => {{
+            for i in 0..n {
+                let vec = &vectors[i * dim..(i + 1) * dim];
+                let (dot, norm_v_sq) = unsafe { $kernel(query, vec, dim) };
+                scores[i] = if norm_v_sq < f32::EPSILON {
+                    0.0
+                } else {
+                    dot * inv_norm_q * fast_inv_sqrt(norm_v_sq)
+                };
+            }
+        }};
+    }
+    match DenseF32Kernel::resolve() {
+        #[cfg(target_arch = "aarch64")]
+        DenseF32Kernel::Neon => score_simd_rows!(fused_dot_norm_neon),
+        #[cfg(target_arch = "x86_64")]
+        DenseF32Kernel::Avx512 => score_simd_rows!(fused_dot_norm_avx512),
+        #[cfg(target_arch = "x86_64")]
+        DenseF32Kernel::Avx2Fma => score_simd_rows!(fused_dot_norm_avx2),
+        #[cfg(target_arch = "x86_64")]
+        DenseF32Kernel::Sse => score_simd_rows!(fused_dot_norm_sse),
+        DenseF32Kernel::Scalar => {
+            for i in 0..n {
+                let vec = &vectors[i * dim..(i + 1) * dim];
+                let (dot, norm_v_sq) = fused_dot_norm_scalar(query, vec);
+                scores[i] = if norm_v_sq < f32::EPSILON {
+                    0.0
+                } else {
+                    dot * inv_norm_q * fast_inv_sqrt(norm_v_sq)
+                };
+            }
+        }
     }
 }
 
@@ -3343,10 +3573,11 @@ pub fn batch_cosine_scores_f16_precomp(
             "precomputed f16 cosine vectors are not 2-byte aligned"
         );
     }
+    let kernel = QuantF16Kernel::resolve();
     for i in 0..n {
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
         let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
-        let (dot, norm_v_sq) = fused_dot_norm_f16(query_f16, f16_slice, dim);
+        let (dot, norm_v_sq) = kernel.fused_dot_norm(query_f16, f16_slice, dim);
         scores[i] = if norm_v_sq < f32::EPSILON {
             0.0
         } else {
@@ -3378,9 +3609,10 @@ pub fn batch_cosine_scores_u8_precomp(
         "precomputed u8 cosine vectors are truncated: need {required} bytes, got {}",
         vectors_raw.len()
     );
+    let kernel = QuantU8Kernel::resolve();
     for i in 0..n {
         let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
-        let (dot, norm_v_sq) = fused_dot_norm_u8(query, u8_slice, dim);
+        let (dot, norm_v_sq) = kernel.fused_dot_norm(query, u8_slice, dim);
         scores[i] = if norm_v_sq < f32::EPSILON {
             0.0
         } else {
@@ -3408,9 +3640,10 @@ pub fn batch_dot_scores_precomp(
         "precomputed dot vectors are truncated: need {required}, got {}",
         vectors.len()
     );
+    let kernel = DenseF32Kernel::resolve();
     for i in 0..n {
         let vec = &vectors[i * dim..(i + 1) * dim];
-        scores[i] = dot_product_f32(query, vec, dim) * inv_norm_q;
+        scores[i] = kernel.dot(query, vec, dim) * inv_norm_q;
     }
 }
 
@@ -3444,10 +3677,11 @@ pub fn batch_dot_scores_f16_precomp(
             "precomputed f16 dot vectors are not 2-byte aligned"
         );
     }
+    let kernel = QuantF16Kernel::resolve();
     for i in 0..n {
         let raw = &vectors_raw[i * vec_bytes..(i + 1) * vec_bytes];
         let f16_slice = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const u16, dim) };
-        scores[i] = dot_product_f16_quant(query_f16, f16_slice, dim) * inv_norm_q;
+        scores[i] = kernel.dot(query_f16, f16_slice, dim) * inv_norm_q;
     }
 }
 
@@ -3474,9 +3708,10 @@ pub fn batch_dot_scores_u8_precomp(
         "precomputed u8 dot vectors are truncated: need {required} bytes, got {}",
         vectors_raw.len()
     );
+    let kernel = QuantU8Kernel::resolve();
     for i in 0..n {
         let u8_slice = &vectors_raw[i * dim..(i + 1) * dim];
-        scores[i] = dot_product_u8_quant(query, u8_slice, dim) * inv_norm_q;
+        scores[i] = kernel.dot(query, u8_slice, dim) * inv_norm_q;
     }
 }
 
@@ -3638,11 +3873,44 @@ impl HammingKernel {
         }
     }
 
+    /// Bytes consumed per vector iteration; below this width the SIMD kernel
+    /// has no full vector to work on and runs entirely in its remainder loop.
+    #[inline]
+    fn vector_bytes(self) -> usize {
+        match self {
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx512 => 64,
+            #[cfg(target_arch = "x86_64")]
+            Self::Avx2 => 32,
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => 16,
+            Self::Scalar => 8,
+        }
+    }
+
+    /// Kernel to use for `byte_len`-byte codes. Codes narrower than one SIMD
+    /// vector (e.g. 64-bit fields) go through the plain `u64::count_ones`
+    /// loop: measured on aarch64/NEON, 1,024 rows of 8-byte codes score in
+    /// 0.98 µs through the scalar loop against 1.21 µs through the NEON entry
+    /// point, which was only executing its per-byte remainder. At one full
+    /// vector or more the SIMD kernel wins (32 bytes: 1.23 vs 1.28 µs;
+    /// 128 bytes: 2.73 vs 3.60 µs). AVX2/AVX-512 widths are not measured here;
+    /// the rule is the same "no full vector, no SIMD" and cannot be slower than
+    /// running the remainder loop alone.
+    #[inline]
+    fn for_byte_len(self, byte_len: usize) -> Self {
+        if byte_len < self.vector_bytes() {
+            Self::Scalar
+        } else {
+            self
+        }
+    }
+
     /// Hamming distance between two equal-length packed-bit vectors.
     #[inline]
     pub fn distance(self, a: &[u8], b: &[u8]) -> u32 {
         debug_assert_eq!(a.len(), b.len(), "Hamming vector byte length mismatch");
-        match self {
+        match self.for_byte_len(a.len()) {
             #[cfg(target_arch = "x86_64")]
             Self::Avx512 => unsafe { hamming_distance_avx512(a, b) },
             #[cfg(target_arch = "x86_64")]
@@ -3695,6 +3963,7 @@ impl HammingKernel {
             let start = index * byte_len;
             &db[start..start + byte_len]
         };
+        let kernel = self.for_byte_len(byte_len);
         macro_rules! score_with {
             ($one:expr, $four:expr) => {{
                 let mut i = 0;
@@ -3714,7 +3983,7 @@ impl HammingKernel {
                 }
             }};
         }
-        match self {
+        match kernel {
             #[cfg(target_arch = "x86_64")]
             Self::Avx512 => score_with!(
                 |query, row| unsafe { hamming_distance_avx512(query, row) },
@@ -4645,6 +4914,31 @@ mod tests {
         }
     }
 
+    /// Codes narrower than one SIMD vector must take the `u64::count_ones`
+    /// loop; codes at least one vector wide keep the resolved kernel.
+    #[test]
+    fn hamming_kernel_routes_sub_vector_codes_to_the_scalar_loop() {
+        let kernel = HammingKernel::resolve();
+        let width = kernel.vector_bytes();
+        assert_eq!(HammingKernel::Scalar.for_byte_len(1), HammingKernel::Scalar);
+        assert_eq!(kernel.for_byte_len(width - 1), HammingKernel::Scalar);
+        assert_eq!(kernel.for_byte_len(width), kernel);
+        assert_eq!(kernel.for_byte_len(width * 5 + 3), kernel);
+        // The routed kernel is exact at every width around the cut.
+        for byte_len in [width - 1, width, width + 1] {
+            let (query, db) = hamming_matrix(9, byte_len);
+            let mut got = vec![0u32; 9];
+            kernel.distances(&query, &db, byte_len, &mut got);
+            for (row, &distance) in got.iter().enumerate() {
+                assert_eq!(
+                    distance,
+                    hamming_distance_scalar(&query, &db[row * byte_len..(row + 1) * byte_len]),
+                    "row {row} at byte_len {byte_len}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn scores_from_hamming_matches_batch_scores_across_blocks() {
         let kernel = HammingKernel::resolve();
@@ -4942,7 +5236,9 @@ mod algebraic_reduction_tests {
 
     /// Dimensions that straddle every SIMD chunk width used in this module
     /// (4/8/16 lanes) plus their tails, and realistic embedding widths.
-    const ALGEBRAIC_TEST_DIMS: [usize; 12] = [0, 1, 3, 4, 7, 8, 15, 16, 17, 64, 384, 768];
+    const ALGEBRAIC_TEST_DIMS: [usize; 18] = [
+        0, 1, 3, 4, 7, 8, 15, 16, 17, 64, 100, 127, 200, 300, 384, 768, 1000, 1536,
+    ];
 
     #[test]
     fn test_algebraic_squared_l2_matches_f64_reference() {
@@ -5008,6 +5304,61 @@ mod algebraic_reduction_tests {
             let (scalar_dot, scalar_norm) = fused_dot_norm_scalar(&a, &b);
             assert!((fused_dot - scalar_dot).abs() <= tolerance);
             assert!((fused_norm - scalar_norm).abs() <= (fused_norm.abs() * 1e-5).max(1e-5));
+        }
+    }
+
+    /// The SIMD remainder pass must agree with an f64 reference at every
+    /// tail length (4/8/12 trailing lanes plus a scalar rest), and the
+    /// batch-resolved kernels must be the very same code paths as the
+    /// per-call dispatchers.
+    #[test]
+    fn test_simd_tail_dims_match_f64_reference_and_resolved_kernels() {
+        for dim in ALGEBRAIC_TEST_DIMS {
+            let a = algebraic_test_vector(dim, 0x51ed_0006);
+            let b = algebraic_test_vector(dim, 0x51ed_0007);
+            let reference: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(&x, &y)| f64::from(x) * f64::from(y))
+                .sum();
+            let dispatched = dot_product_f32(&a, &b, dim);
+            let tolerance = (reference.abs() * 1e-5).max(1e-5);
+            assert!(
+                (f64::from(dispatched) - reference).abs() <= tolerance,
+                "dim {dim}: dot {dispatched} drifted from f64 reference {reference}"
+            );
+            let kernel = DenseF32Kernel::resolve();
+            assert_eq!(kernel.dot(&a, &b, dim).to_bits(), dispatched.to_bits());
+            let (fused_dot, fused_norm) = fused_dot_norm(&a, &b, dim);
+            let (kernel_dot, kernel_norm) = kernel.fused_dot_norm(&a, &b, dim);
+            assert_eq!(kernel_dot.to_bits(), fused_dot.to_bits());
+            assert_eq!(kernel_norm.to_bits(), fused_norm.to_bits());
+            let norm_reference: f64 = b.iter().map(|&y| f64::from(y) * f64::from(y)).sum();
+            assert!(
+                (f64::from(fused_norm) - norm_reference).abs() <= (norm_reference * 1e-5).max(1e-5),
+                "dim {dim}: fused norm {fused_norm} drifted from {norm_reference}"
+            );
+
+            let query_f16: Vec<u16> = a.iter().map(|&v| f32_to_f16(v)).collect();
+            let vec_f16: Vec<u16> = b.iter().map(|&v| f32_to_f16(v)).collect();
+            let f16_kernel = QuantF16Kernel::resolve();
+            let (d, n) = fused_dot_norm_f16(&query_f16, &vec_f16, dim);
+            let (kd, kn) = f16_kernel.fused_dot_norm(&query_f16, &vec_f16, dim);
+            assert_eq!((kd.to_bits(), kn.to_bits()), (d.to_bits(), n.to_bits()));
+            assert_eq!(
+                f16_kernel.dot(&query_f16, &vec_f16, dim).to_bits(),
+                dot_product_f16_quant(&query_f16, &vec_f16, dim).to_bits()
+            );
+
+            let vec_u8: Vec<u8> = b.iter().map(|&v| f32_to_u8_saturating(v)).collect();
+            let u8_kernel = QuantU8Kernel::resolve();
+            let (d, n) = fused_dot_norm_u8(&a, &vec_u8, dim);
+            let (kd, kn) = u8_kernel.fused_dot_norm(&a, &vec_u8, dim);
+            assert_eq!((kd.to_bits(), kn.to_bits()), (d.to_bits(), n.to_bits()));
+            assert_eq!(
+                u8_kernel.dot(&a, &vec_u8, dim).to_bits(),
+                dot_product_u8_quant(&a, &vec_u8, dim).to_bits()
+            );
         }
     }
 

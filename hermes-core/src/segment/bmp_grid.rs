@@ -52,6 +52,56 @@ pub(crate) fn block_grid_scale(grid_bits: u8) -> u32 {
     }
 }
 
+/// SIMD kernel selection for the grid codec, resolved once per query.
+///
+/// `is_x86_feature_detected!` is an atomic load plus a bit test; the BMP
+/// executor used to pay it once per `(dimension, superblock)` pair inside the
+/// D-grid pass. Hot callers detect once and pass this by value. On non-x86
+/// targets the struct is empty and every `_with` kernel takes the mandatory
+/// NEON or portable path.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GridKernels {
+    #[cfg(target_arch = "x86_64")]
+    bmi2: bool,
+    #[cfg(target_arch = "x86_64")]
+    sse41: bool,
+}
+
+impl GridKernels {
+    #[inline]
+    pub(crate) fn detect() -> Self {
+        Self {
+            #[cfg(target_arch = "x86_64")]
+            bmi2: is_x86_feature_detected!("bmi2"),
+            #[cfg(target_arch = "x86_64")]
+            sse41: is_x86_feature_detected!("sse4.1"),
+        }
+    }
+}
+
+/// Resolved payload location of one `(dimension, group)` pair inside `rows`.
+///
+/// Locating a group parses the row offset, checkpoint record and up to 15
+/// selector bytes with checked arithmetic. The executor resolves each pair
+/// once per prefetch window and reuses the result for the D-grid pass
+/// instead of resolving the same pair a second time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResolvedGridGroup {
+    width: u8,
+    start: usize,
+    end: usize,
+}
+
+impl ResolvedGridGroup {
+    /// Byte range of the packed payload within the grid rows; `None` for an
+    /// all-zero group, which has no payload to prefetch.
+    #[cfg(feature = "native")]
+    #[inline]
+    pub(crate) fn payload_range(self) -> Option<Range<usize>> {
+        (self.start < self.end).then_some(self.start..self.end)
+    }
+}
+
 /// Ceiling-quantize an exact u8 maximum without underestimating it.
 #[cfg(any(feature = "native", feature = "wasm", test))]
 #[inline]
@@ -213,6 +263,18 @@ impl<'a> PackedGridGroup<'a> {
 
     /// Decode a range within this group into one byte per value.
     pub(crate) fn decode(self, start: usize, count: usize, output: &mut [u8]) {
+        self.decode_with(GridKernels::detect(), start, count, output)
+    }
+
+    /// [`Self::decode`] with kernels resolved once by the caller.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+    pub(crate) fn decode_with(
+        self,
+        kernels: GridKernels,
+        start: usize,
+        count: usize,
+        output: &mut [u8],
+    ) {
         debug_assert!(start + count <= GRID_GROUP_CELLS);
         debug_assert!(output.len() >= count);
         if self.width == 0 {
@@ -225,7 +287,7 @@ impl<'a> PackedGridGroup<'a> {
         }
 
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("bmi2") && (start * usize::from(self.width)).is_multiple_of(8) {
+        if kernels.bmi2 && (start * usize::from(self.width)).is_multiple_of(8) {
             // SAFETY: BMI2 was detected at runtime. Each complete chunk reads
             // exactly `width` payload bytes and writes eight output bytes.
             unsafe {
@@ -270,7 +332,20 @@ impl<'a> PackedGridGroup<'a> {
     /// is a direct copy; x86 BMI2 expands widths one through three eight cells
     /// at a time. A bounded eight-cell unpacker handles AArch64 and the
     /// portable fallback without per-cell division.
+    #[cfg(test)]
     pub(crate) fn decode_u4_packed(self, start: usize, count: usize, output: &mut [u8]) {
+        self.decode_u4_packed_with(GridKernels::detect(), start, count, output)
+    }
+
+    /// [`Self::decode_u4_packed`] with kernels resolved once by the caller.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+    pub(crate) fn decode_u4_packed_with(
+        self,
+        kernels: GridKernels,
+        start: usize,
+        count: usize,
+        output: &mut [u8],
+    ) {
         debug_assert!(self.width <= 4);
         debug_assert!(start + count <= GRID_GROUP_CELLS);
         let output_len = count.div_ceil(2);
@@ -285,7 +360,7 @@ impl<'a> PackedGridGroup<'a> {
         }
 
         #[cfg(target_arch = "x86_64")]
-        if is_x86_feature_detected!("bmi2")
+        if kernels.bmi2
             && (start * usize::from(self.width)).is_multiple_of(8)
             && count.is_multiple_of(8)
         {
@@ -465,8 +540,29 @@ unsafe fn decode_u4_packed_bmi2(
 /// BMP's phase-one dimensions. This is the only production u4 accumulation
 /// kernel: compressed widths 1–3 are normalized by `decode_u4_packed`, and a
 /// width-4 group uses the same representation directly.
-#[inline]
+#[cfg(test)]
 pub(crate) fn accumulate_packed_u4(
+    packed: &[u8],
+    count: usize,
+    multiplier: u32,
+    output: &mut [u32],
+    secondary: Option<&mut [u32]>,
+) -> u64 {
+    accumulate_packed_u4_with(
+        GridKernels::detect(),
+        packed,
+        count,
+        multiplier,
+        output,
+        secondary,
+    )
+}
+
+/// [`accumulate_packed_u4`] with kernels resolved once by the caller.
+#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+pub(crate) fn accumulate_packed_u4_with(
+    kernels: GridKernels,
     packed: &[u8],
     count: usize,
     multiplier: u32,
@@ -499,7 +595,7 @@ pub(crate) fn accumulate_packed_u4(
     }
 
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("sse4.1") {
+    if kernels.sse41 {
         let secondary_ptr = secondary.as_mut().map(|values| values.as_mut_ptr());
         // SAFETY: runtime detection proves SSE4.1 support; pointers cover
         // `count` elements.
@@ -539,8 +635,21 @@ pub(crate) fn accumulate_packed_u4(
 }
 
 /// Add decoded grid cells to integer bounds.
-#[inline]
+#[cfg(test)]
 pub(crate) fn accumulate_u8(values: &[u8], count: usize, multiplier: u32, output: &mut [u32]) {
+    accumulate_u8_with(GridKernels::detect(), values, count, multiplier, output)
+}
+
+/// [`accumulate_u8`] with kernels resolved once by the caller.
+#[inline]
+#[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+pub(crate) fn accumulate_u8_with(
+    kernels: GridKernels,
+    values: &[u8],
+    count: usize,
+    multiplier: u32,
+    output: &mut [u32],
+) {
     debug_assert!(values.len() >= count);
     debug_assert!(output.len() >= count);
 
@@ -553,7 +662,7 @@ pub(crate) fn accumulate_u8(values: &[u8], count: usize, multiplier: u32, output
     }
 
     #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("sse4.1") {
+    if kernels.sse41 {
         // SAFETY: runtime detection proves SSE4.1 support and all slices cover
         // `count`.
         unsafe {
@@ -1005,11 +1114,32 @@ impl CompressedGrid {
         Ok((start as usize, end as usize))
     }
 
+    /// Random access to one group's packed payload.
     pub(crate) fn group(
         &self,
         dimension: usize,
         group: usize,
     ) -> crate::Result<PackedGridGroup<'_>> {
+        Ok(self.resolved(self.resolve_group(dimension, group)?))
+    }
+
+    /// View a group previously located by [`Self::resolve_group`].
+    #[inline]
+    pub(crate) fn resolved(&self, group: ResolvedGridGroup) -> PackedGridGroup<'_> {
+        PackedGridGroup {
+            width: group.width,
+            bytes: &self.rows.as_slice()[group.start..group.end],
+        }
+    }
+
+    /// Locate one group's payload without decoding it. This is the checked
+    /// metadata walk behind [`Self::group`]; hot callers keep the result and
+    /// call [`Self::resolved`] instead of walking the metadata again.
+    pub(crate) fn resolve_group(
+        &self,
+        dimension: usize,
+        group: usize,
+    ) -> crate::Result<ResolvedGridGroup> {
         if group >= self.layout.groups() {
             return Err(crate::Error::Corruption(format!(
                 "BMP compressed-grid group {group} exceeds {}",
@@ -1099,9 +1229,10 @@ impl CompressedGrid {
                 "BMP compressed-grid payload {payload_start}..{payload_end} exceeds row end {row_end}"
             )));
         }
-        Ok(PackedGridGroup {
+        Ok(ResolvedGridGroup {
             width,
-            bytes: &rows[payload_start..payload_end],
+            start: payload_start,
+            end: payload_end,
         })
     }
 
@@ -1134,24 +1265,13 @@ impl CompressedGrid {
         Ok(start..end)
     }
 
-    /// Byte range of one group's packed payload. Call after its metadata range
-    /// has had prefetch lead; locating the payload reads the checkpoint and
-    /// selector but does not decode its cells.
+    /// True when the row payload is heap/RAM-backed (a RAM directory or a
+    /// `PinMode::Copy` heap copy) and therefore always resident. `madvise`
+    /// is a no-op on such memory, so callers skip the range bookkeeping.
     #[cfg(feature = "native")]
-    pub(crate) fn group_payload_range(
-        &self,
-        dimension: usize,
-        group: usize,
-    ) -> crate::Result<Option<Range<usize>>> {
-        let packed = self.group(dimension, group)?;
-        if packed.bytes.is_empty() {
-            return Ok(None);
-        }
-        let base = self.rows.as_slice().as_ptr() as usize;
-        let start = (packed.bytes.as_ptr() as usize)
-            .checked_sub(base)
-            .ok_or_else(|| crate::Error::Internal("BMP grid pointer underflow".into()))?;
-        Ok(Some(start..start + packed.bytes.len()))
+    #[inline]
+    pub(crate) fn rows_resident(&self) -> bool {
+        !self.rows.is_mmap()
     }
 
     /// Coalesce nearby row ranges and issue bounded `MADV_WILLNEED` hints.

@@ -526,6 +526,9 @@ pub struct TqQueryPlan {
     qjl_lut_i8: Vec<i8>,
     base_dequant: f32,
     qjl_dequant: f32,
+    /// LUT16 kernel resolved once per query instead of once per 16-vector
+    /// block (runtime feature detection is not free on x86_64).
+    kernel: lut16::Lut16Kernel,
     /// Full-precision tables, retained for the reference estimator in tests.
     #[cfg(test)]
     reference_luts: (Vec<f32>, Vec<f32>),
@@ -587,6 +590,7 @@ impl TqQueryPlan {
             qjl_lut_i8,
             base_dequant,
             qjl_dequant,
+            kernel: lut16::Lut16Kernel::resolve(),
             #[cfg(test)]
             reference_luts: (base_lut, qjl_lut),
         }
@@ -652,7 +656,7 @@ pub fn tq_score_block(plan: &TqQueryPlan, block: &[u8], scores: &mut [f32; TQ_BL
     let (gamma_bytes, nibble_bytes) = block.split_at(TQ_BLOCK_LANES * size_of::<f32>());
     let mut base = [0i32; TQ_BLOCK_LANES];
     let mut qjl = [0i32; TQ_BLOCK_LANES];
-    lut16::accumulate_block(
+    plan.kernel.accumulate(
         &plan.base_lut_i8,
         &plan.qjl_lut_i8,
         nibble_bytes,
@@ -660,15 +664,14 @@ pub fn tq_score_block(plan: &TqQueryPlan, block: &[u8], scores: &mut [f32; TQ_BL
         &mut base,
         &mut qjl,
     );
-    for lane in 0..TQ_BLOCK_LANES {
-        let gamma = f32::from_le_bytes(
-            gamma_bytes[lane * 4..lane * 4 + 4]
-                .try_into()
-                .expect("gamma slice is 4 bytes"),
-        );
-        scores[lane] =
-            base[lane] as f32 * plan.base_dequant + gamma * qjl[lane] as f32 * plan.qjl_dequant;
-    }
+    lut16::finish_block(
+        gamma_bytes,
+        &base,
+        &qjl,
+        plan.base_dequant,
+        plan.qjl_dequant,
+        scores,
+    );
 }
 
 /// Pack up to 16 nibble rows (+ gammas) into one block. Missing lanes are
@@ -730,7 +733,7 @@ pub fn tq_score_ivf_block(
     let (gamma_bytes, nibble_bytes) = rest.split_at(lane_f32);
     let mut base = [0i32; TQ_BLOCK_LANES];
     let mut qjl = [0i32; TQ_BLOCK_LANES];
-    lut16::accumulate_block(
+    plan.kernel.accumulate(
         &plan.base_lut_i8,
         &plan.qjl_lut_i8,
         nibble_bytes,
@@ -738,22 +741,16 @@ pub fn tq_score_ivf_block(
         &mut base,
         &mut qjl,
     );
-    for lane in 0..TQ_BLOCK_LANES {
-        let scale = f32::from_le_bytes(
-            scale_bytes[lane * 4..lane * 4 + 4]
-                .try_into()
-                .expect("scale slice is 4 bytes"),
-        );
-        let gamma = f32::from_le_bytes(
-            gamma_bytes[lane * 4..lane * 4 + 4]
-                .try_into()
-                .expect("gamma slice is 4 bytes"),
-        );
-        scores[lane] = cluster_dot
-            + scale
-                * (base[lane] as f32 * plan.base_dequant
-                    + gamma * qjl[lane] as f32 * plan.qjl_dequant);
-    }
+    lut16::finish_ivf_block(
+        scale_bytes,
+        gamma_bytes,
+        &base,
+        &qjl,
+        plan.base_dequant,
+        plan.qjl_dequant,
+        cluster_dot,
+        scores,
+    );
 }
 
 mod lut16 {
@@ -761,9 +758,81 @@ mod lut16 {
     use super::TQ_ACCUMULATE_CHUNK_DIMS;
     use super::TQ_BLOCK_LANES;
 
-    /// Accumulate both LUT sums for 16 lanes over all dimensions.
-    /// `nibble_bytes` is dimension-major: 8 bytes per dimension, byte `j`
-    /// holding lane `j` (low nibble) and lane `j + 8` (high nibble).
+    /// LUT16 accumulation kernel, resolved once per query plan (mirrors
+    /// `simd::HammingKernel`) so the per-block path carries no runtime
+    /// feature detection.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Lut16Kernel {
+        #[cfg(target_arch = "aarch64")]
+        Neon,
+        #[cfg(target_arch = "x86_64")]
+        Avx2,
+        #[cfg(target_arch = "x86_64")]
+        Ssse3,
+        /// Portable fallback (and the WASM path). NEON is baseline on
+        /// aarch64, so it is never resolved there.
+        #[cfg_attr(target_arch = "aarch64", allow(dead_code))]
+        Scalar,
+    }
+
+    impl Lut16Kernel {
+        pub(super) fn resolve() -> Self {
+            #[cfg(target_arch = "aarch64")]
+            {
+                Self::Neon
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    return Self::Avx2;
+                }
+                if std::arch::is_x86_feature_detected!("ssse3") {
+                    return Self::Ssse3;
+                }
+                Self::Scalar
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+            {
+                Self::Scalar
+            }
+        }
+
+        /// Accumulate both LUT sums for 16 lanes over all dimensions.
+        /// `nibble_bytes` is dimension-major: 8 bytes per dimension, byte `j`
+        /// holding lane `j` (low nibble) and lane `j + 8` (high nibble).
+        #[inline]
+        pub(super) fn accumulate(
+            self,
+            base_lut: &[i8],
+            qjl_lut: &[i8],
+            nibble_bytes: &[u8],
+            padded_dim: usize,
+            base: &mut [i32; TQ_BLOCK_LANES],
+            qjl: &mut [i32; TQ_BLOCK_LANES],
+        ) {
+            match self {
+                #[cfg(target_arch = "aarch64")]
+                Self::Neon => unsafe {
+                    accumulate_block_neon(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
+                },
+                #[cfg(target_arch = "x86_64")]
+                Self::Avx2 => unsafe {
+                    accumulate_block_avx2(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
+                },
+                #[cfg(target_arch = "x86_64")]
+                Self::Ssse3 => unsafe {
+                    accumulate_block_ssse3(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
+                },
+                Self::Scalar => {
+                    accumulate_block_scalar(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
+                }
+            }
+        }
+    }
+
+    /// Accumulate with the kernel resolved for this CPU (test/oracle entry
+    /// point; the search path resolves once per plan).
+    #[cfg(test)]
     pub(super) fn accumulate_block(
         base_lut: &[i8],
         qjl_lut: &[i8],
@@ -772,29 +841,266 @@ mod lut16 {
         base: &mut [i32; TQ_BLOCK_LANES],
         qjl: &mut [i32; TQ_BLOCK_LANES],
     ) {
+        Lut16Kernel::resolve().accumulate(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
+    }
+
+    /// Flat-TQ epilogue: `score[lane] = base·bd + gamma·qjl·qd`.
+    ///
+    /// The SIMD forms below use plain multiplies and adds in the same order
+    /// as the scalar reference — no FMA — so every path is bit-identical
+    /// (pinned by `epilogue_matches_scalar_reference_bit_exactly`).
+    #[inline]
+    pub(super) fn finish_block(
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        assert!(gamma_bytes.len() >= TQ_BLOCK_LANES * 4);
         #[cfg(target_arch = "aarch64")]
         {
-            // NEON is baseline on aarch64.
-            unsafe { accumulate_block_neon(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl) }
+            unsafe { finish_block_neon(gamma_bytes, base, qjl, base_dequant, qjl_dequant, scores) }
             return;
         }
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx2") {
-                unsafe {
-                    accumulate_block_avx2(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
-                }
-                return;
-            }
-            if std::arch::is_x86_feature_detected!("ssse3") {
-                unsafe {
-                    accumulate_block_ssse3(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl)
-                }
-                return;
-            }
+            // SSE2 is baseline on x86_64.
+            finish_block_sse2(gamma_bytes, base, qjl, base_dequant, qjl_dequant, scores);
+            return;
         }
         #[allow(unreachable_code)]
-        accumulate_block_scalar(base_lut, qjl_lut, nibble_bytes, padded_dim, base, qjl);
+        finish_block_scalar(gamma_bytes, base, qjl, base_dequant, qjl_dequant, scores);
+    }
+
+    /// IVF-TQ epilogue: `score[lane] = cluster_dot + scale·(base·bd + gamma·qjl·qd)`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finish_ivf_block(
+        scale_bytes: &[u8],
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        cluster_dot: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        assert!(scale_bytes.len() >= TQ_BLOCK_LANES * 4);
+        assert!(gamma_bytes.len() >= TQ_BLOCK_LANES * 4);
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe {
+                finish_ivf_block_neon(
+                    scale_bytes,
+                    gamma_bytes,
+                    base,
+                    qjl,
+                    base_dequant,
+                    qjl_dequant,
+                    cluster_dot,
+                    scores,
+                )
+            }
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            finish_ivf_block_sse2(
+                scale_bytes,
+                gamma_bytes,
+                base,
+                qjl,
+                base_dequant,
+                qjl_dequant,
+                cluster_dot,
+                scores,
+            );
+            return;
+        }
+        #[allow(unreachable_code)]
+        finish_ivf_block_scalar(
+            scale_bytes,
+            gamma_bytes,
+            base,
+            qjl,
+            base_dequant,
+            qjl_dequant,
+            cluster_dot,
+            scores,
+        );
+    }
+
+    // The scalar epilogues are the portable fallback and the exactness oracle
+    // for the SIMD forms; on SIMD targets only tests reach them.
+    #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+    #[inline]
+    fn lane_f32(bytes: &[u8], lane: usize) -> f32 {
+        f32::from_le_bytes(
+            bytes[lane * 4..lane * 4 + 4]
+                .try_into()
+                .expect("lane slice is 4 bytes"),
+        )
+    }
+
+    /// Scalar reference for [`finish_block`].
+    #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+    pub(super) fn finish_block_scalar(
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        for lane in 0..TQ_BLOCK_LANES {
+            let gamma = lane_f32(gamma_bytes, lane);
+            scores[lane] =
+                base[lane] as f32 * base_dequant + gamma * qjl[lane] as f32 * qjl_dequant;
+        }
+    }
+
+    /// Scalar reference for [`finish_ivf_block`].
+    #[cfg_attr(any(target_arch = "aarch64", target_arch = "x86_64"), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finish_ivf_block_scalar(
+        scale_bytes: &[u8],
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        cluster_dot: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        for lane in 0..TQ_BLOCK_LANES {
+            let scale = lane_f32(scale_bytes, lane);
+            let gamma = lane_f32(gamma_bytes, lane);
+            scores[lane] = cluster_dot
+                + scale
+                    * (base[lane] as f32 * base_dequant + gamma * qjl[lane] as f32 * qjl_dequant);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    unsafe fn finish_block_neon(
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        use std::arch::aarch64::*;
+        // SAFETY: the caller asserted a gamma column of at least 16
+        // little-endian f32 values; `base`/`qjl`/`scores` are 16-lane arrays,
+        // so every 4-lane load/store below is in bounds. Byte loads avoid any
+        // alignment assumption on the mmap-backed column.
+        unsafe {
+            let bd = vdupq_n_f32(base_dequant);
+            let qd = vdupq_n_f32(qjl_dequant);
+            for quarter in 0..4 {
+                let gamma = vreinterpretq_f32_u8(vld1q_u8(gamma_bytes.as_ptr().add(quarter * 16)));
+                let b = vcvtq_f32_s32(vld1q_s32(base.as_ptr().add(quarter * 4)));
+                let j = vcvtq_f32_s32(vld1q_s32(qjl.as_ptr().add(quarter * 4)));
+                let score = vaddq_f32(vmulq_f32(b, bd), vmulq_f32(vmulq_f32(gamma, j), qd));
+                vst1q_f32(scores.as_mut_ptr().add(quarter * 4), score);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn finish_ivf_block_neon(
+        scale_bytes: &[u8],
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        cluster_dot: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        use std::arch::aarch64::*;
+        // SAFETY: as `finish_block_neon`; the scale column is a second
+        // 16 × f32 prefix of the same block, asserted by the caller.
+        unsafe {
+            let bd = vdupq_n_f32(base_dequant);
+            let qd = vdupq_n_f32(qjl_dequant);
+            let cd = vdupq_n_f32(cluster_dot);
+            for quarter in 0..4 {
+                let scale = vreinterpretq_f32_u8(vld1q_u8(scale_bytes.as_ptr().add(quarter * 16)));
+                let gamma = vreinterpretq_f32_u8(vld1q_u8(gamma_bytes.as_ptr().add(quarter * 16)));
+                let b = vcvtq_f32_s32(vld1q_s32(base.as_ptr().add(quarter * 4)));
+                let j = vcvtq_f32_s32(vld1q_s32(qjl.as_ptr().add(quarter * 4)));
+                let inner = vaddq_f32(vmulq_f32(b, bd), vmulq_f32(vmulq_f32(gamma, j), qd));
+                vst1q_f32(
+                    scores.as_mut_ptr().add(quarter * 4),
+                    vaddq_f32(cd, vmulq_f32(scale, inner)),
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn finish_block_sse2(
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        use std::arch::x86_64::*;
+        // SAFETY: SSE2 is part of the x86_64 baseline; all loads/stores are
+        // unaligned forms over the 16-lane arrays and the >=64-byte gamma
+        // column asserted by the caller.
+        unsafe {
+            let bd = _mm_set1_ps(base_dequant);
+            let qd = _mm_set1_ps(qjl_dequant);
+            for quarter in 0..4 {
+                let gamma = _mm_loadu_ps(gamma_bytes.as_ptr().add(quarter * 16).cast::<f32>());
+                let b = _mm_cvtepi32_ps(_mm_loadu_si128(base.as_ptr().add(quarter * 4).cast()));
+                let j = _mm_cvtepi32_ps(_mm_loadu_si128(qjl.as_ptr().add(quarter * 4).cast()));
+                let score = _mm_add_ps(_mm_mul_ps(b, bd), _mm_mul_ps(_mm_mul_ps(gamma, j), qd));
+                _mm_storeu_ps(scores.as_mut_ptr().add(quarter * 4), score);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::too_many_arguments)]
+    fn finish_ivf_block_sse2(
+        scale_bytes: &[u8],
+        gamma_bytes: &[u8],
+        base: &[i32; TQ_BLOCK_LANES],
+        qjl: &[i32; TQ_BLOCK_LANES],
+        base_dequant: f32,
+        qjl_dequant: f32,
+        cluster_dot: f32,
+        scores: &mut [f32; TQ_BLOCK_LANES],
+    ) {
+        use std::arch::x86_64::*;
+        // SAFETY: as `finish_block_sse2`, plus the >=64-byte scale column.
+        unsafe {
+            let bd = _mm_set1_ps(base_dequant);
+            let qd = _mm_set1_ps(qjl_dequant);
+            let cd = _mm_set1_ps(cluster_dot);
+            for quarter in 0..4 {
+                let scale = _mm_loadu_ps(scale_bytes.as_ptr().add(quarter * 16).cast::<f32>());
+                let gamma = _mm_loadu_ps(gamma_bytes.as_ptr().add(quarter * 16).cast::<f32>());
+                let b = _mm_cvtepi32_ps(_mm_loadu_si128(base.as_ptr().add(quarter * 4).cast()));
+                let j = _mm_cvtepi32_ps(_mm_loadu_si128(qjl.as_ptr().add(quarter * 4).cast()));
+                let inner = _mm_add_ps(_mm_mul_ps(b, bd), _mm_mul_ps(_mm_mul_ps(gamma, j), qd));
+                _mm_storeu_ps(
+                    scores.as_mut_ptr().add(quarter * 4),
+                    _mm_add_ps(cd, _mm_mul_ps(scale, inner)),
+                );
+            }
+        }
     }
 
     /// Scalar fallback mirroring the SIMD integer arithmetic exactly
@@ -1405,6 +1711,84 @@ mod tests {
             "base sums must match exactly"
         );
         assert_eq!(qjl_reference, qjl_dispatch, "qjl sums must match exactly");
+    }
+
+    #[test]
+    fn epilogue_matches_scalar_reference_bit_exactly() {
+        let mut state = 4242u64;
+        for trial in 0..256 {
+            let mut base = [0i32; TQ_BLOCK_LANES];
+            let mut qjl = [0i32; TQ_BLOCK_LANES];
+            let mut scale_bytes = Vec::with_capacity(TQ_BLOCK_LANES * 4);
+            let mut gamma_bytes = Vec::with_capacity(TQ_BLOCK_LANES * 4);
+            for lane in 0..TQ_BLOCK_LANES {
+                base[lane] = (splitmix64(&mut state) % 40_000) as i32 - 20_000;
+                qjl[lane] = (splitmix64(&mut state) % 40_000) as i32 - 20_000;
+                let scale = (splitmix64(&mut state) % 10_000) as f32 / 10_000.0;
+                let gamma = (splitmix64(&mut state) % 10_000) as f32 / 10_000.0;
+                // Include padded (zero) lanes and a negative scale.
+                let scale = match lane {
+                    15 => 0.0,
+                    7 => -scale,
+                    _ => scale,
+                };
+                scale_bytes.extend_from_slice(&scale.to_le_bytes());
+                gamma_bytes.extend_from_slice(&gamma.to_le_bytes());
+            }
+            let base_dequant = 1e-4 + (trial as f32) * 1e-6;
+            let qjl_dequant = 3e-5 + (trial as f32) * 1e-7;
+            let cluster_dot = (trial as f32) / 256.0 - 0.5;
+
+            let mut expected = [0.0f32; TQ_BLOCK_LANES];
+            let mut actual = [0.0f32; TQ_BLOCK_LANES];
+            lut16::finish_ivf_block_scalar(
+                &scale_bytes,
+                &gamma_bytes,
+                &base,
+                &qjl,
+                base_dequant,
+                qjl_dequant,
+                cluster_dot,
+                &mut expected,
+            );
+            lut16::finish_ivf_block(
+                &scale_bytes,
+                &gamma_bytes,
+                &base,
+                &qjl,
+                base_dequant,
+                qjl_dequant,
+                cluster_dot,
+                &mut actual,
+            );
+            assert_eq!(
+                expected.map(f32::to_bits),
+                actual.map(f32::to_bits),
+                "IVF epilogue must be bit-identical to the scalar reference (trial {trial})"
+            );
+
+            lut16::finish_block_scalar(
+                &gamma_bytes,
+                &base,
+                &qjl,
+                base_dequant,
+                qjl_dequant,
+                &mut expected,
+            );
+            lut16::finish_block(
+                &gamma_bytes,
+                &base,
+                &qjl,
+                base_dequant,
+                qjl_dequant,
+                &mut actual,
+            );
+            assert_eq!(
+                expected.map(f32::to_bits),
+                actual.map(f32::to_bits),
+                "flat epilogue must be bit-identical to the scalar reference (trial {trial})"
+            );
+        }
     }
 
     #[test]

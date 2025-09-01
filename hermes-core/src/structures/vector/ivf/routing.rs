@@ -14,13 +14,6 @@ use crate::structures::vector::progress::PhaseProgress;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Automatic routing switches to a centroid graph at this leaf count.
-///
-/// Float centroids are wide (a 768-dim leaf is 3 KiB), so a flat pass over them
-/// gets expensive at far fewer leaves than for packed binary codes. This value
-/// is the historical one and is *not* backed by a crossover measurement; see
-/// [`BINARY_HNSW_AUTO_THRESHOLD`] for the measured binary counterpart, and
-/// measure the float case the same way before changing this.
 pub const HNSW_AUTO_THRESHOLD: usize = 4_096;
 
 pub const BINARY_HNSW_AUTO_THRESHOLD: usize = 32_768;
@@ -1308,7 +1301,6 @@ pub fn select_best<const HIGHER_IS_BETTER: bool>(scores: &[f32], take: usize) ->
     if take == 0 {
         return Vec::new();
     }
-    let mut order: Vec<u32> = (0..scores.len() as u32).collect();
     let compare = |left: &u32, right: &u32| {
         let left_score = scores[*left as usize];
         let right_score = scores[*right as usize];
@@ -1319,12 +1311,37 @@ pub fn select_best<const HIGHER_IS_BETTER: bool>(scores: &[f32], take: usize) ->
         };
         score_order.then_with(|| left.cmp(right))
     };
+    // The full index permutation is `scores.len()` wide (hundreds of KiB at
+    // production leaf counts) but only `take` entries leave this function, so
+    // the permutation lives in per-thread scratch and the result is exact-size.
+    SELECT_BEST_ORDER.with(|cell| {
+        let Ok(mut order) = cell.try_borrow_mut() else {
+            // Re-entrant use (not expected): fall back to a private buffer.
+            let mut order: Vec<u32> = (0..scores.len() as u32).collect();
+            return select_best_in(&mut order, take, compare);
+        };
+        order.clear();
+        order.extend(0..scores.len() as u32);
+        select_best_in(&mut order, take, compare)
+    })
+}
+
+thread_local! {
+    static SELECT_BEST_ORDER: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn select_best_in(
+    order: &mut Vec<u32>,
+    take: usize,
+    compare: impl Fn(&u32, &u32) -> std::cmp::Ordering,
+) -> Vec<u32> {
     if take < order.len() {
-        order.select_nth_unstable_by(take, compare);
+        order.select_nth_unstable_by(take, &compare);
         order.truncate(take);
     }
-    order.sort_unstable_by(compare);
-    order
+    order.sort_unstable_by(&compare);
+    order.clone()
 }
 
 /// Select leaf IDs from a scored candidate set. Candidate IDs need not be

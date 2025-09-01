@@ -354,6 +354,24 @@ macro_rules! define_query_traits {
             fn matched_positions(&self) -> Option<MatchedPositions> {
                 None
             }
+
+            /// Standalone fast path for scorers that wrap an already ranked
+            /// top-k list (vector executors). When this query is the top-level
+            /// query of a segment search, the caller may take the ranked list
+            /// directly instead of walking the DocSet and re-collecting it:
+            /// the result must be exactly what a `TopKCollector` of size
+            /// `limit` would produce (score desc, doc id asc, `total_seen`).
+            ///
+            /// Only valid before the first `advance`/`seek`. Default: `None`
+            /// (the scorer must be driven).
+            fn precomputed_top_k(
+                &mut self,
+                limit: usize,
+                collect_positions: bool,
+            ) -> Option<(Vec<super::SearchResult>, u32)> {
+                let _ = (limit, collect_positions);
+                None
+            }
         }
     };
 }

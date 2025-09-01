@@ -401,6 +401,10 @@ pub struct LazyFlatVectorData {
     pub quantization: DenseVectorQuantization,
     /// Zero-copy doc_id index: packed [u32_le doc_id + u16_le ordinal] × num_vectors
     doc_ids_bytes: OwnedBytes,
+    /// Whether `doc_ids_bytes` holds the complete `num_vectors ×
+    /// DOC_ID_ENTRY_SIZE` map. Validated once at open so per-vector lookups
+    /// need no length arithmetic; training-only readers leave it false.
+    has_doc_map: bool,
     /// File handle for this field's flat data region in the .vectors file
     handle: FileHandle,
     /// Byte offset within handle where raw vector data starts (after header)
@@ -623,12 +627,14 @@ impl LazyFlatVectorData {
             previous = Some(current);
         }
 
+        debug_assert!(!load_doc_map || doc_ids_bytes.len() == doc_ids_byte_len_usize);
         Ok(Self {
             dim,
             num_vectors,
             num_docs_with_vectors,
             quantization,
             doc_ids_bytes,
+            has_doc_map: load_doc_map,
             handle,
             vectors_offset: header_len,
             vbs,
@@ -1011,29 +1017,31 @@ impl LazyFlatVectorData {
         (start, entries)
     }
 
-    /// Read doc_id at index from raw bytes (no ordinal).
+    /// One packed doc-map entry. The map length was validated at open, so
+    /// this is a flag test plus a single bounds check on the entry slice.
     #[inline]
-    fn doc_id_at(&self, idx: usize) -> u32 {
-        assert_eq!(
-            self.doc_ids_bytes.len(),
-            self.num_vectors * DOC_ID_ENTRY_SIZE,
+    fn doc_map_entry(&self, idx: usize) -> &[u8; DOC_ID_ENTRY_SIZE] {
+        assert!(
+            self.has_doc_map,
             "document IDs are unavailable on a training-only flat-vector reader",
         );
         let off = idx * DOC_ID_ENTRY_SIZE;
-        let d = &self.doc_ids_bytes[off..];
+        self.doc_ids_bytes[off..off + DOC_ID_ENTRY_SIZE]
+            .try_into()
+            .expect("doc-map entry slice is DOC_ID_ENTRY_SIZE bytes")
+    }
+
+    /// Read doc_id at index from raw bytes (no ordinal).
+    #[inline]
+    fn doc_id_at(&self, idx: usize) -> u32 {
+        let d = self.doc_map_entry(idx);
         u32::from_le_bytes([d[0], d[1], d[2], d[3]])
     }
 
     /// Get doc_id and ordinal at index (parsed from zero-copy mmap bytes).
     #[inline]
     pub fn get_doc_id(&self, idx: usize) -> (u32, u16) {
-        assert_eq!(
-            self.doc_ids_bytes.len(),
-            self.num_vectors * DOC_ID_ENTRY_SIZE,
-            "document IDs are unavailable on a training-only flat-vector reader",
-        );
-        let off = idx * DOC_ID_ENTRY_SIZE;
-        let d = &self.doc_ids_bytes[off..];
+        let d = self.doc_map_entry(idx);
         let doc_id = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
         let ordinal = u16::from_le_bytes([d[4], d[5]]);
         (doc_id, ordinal)

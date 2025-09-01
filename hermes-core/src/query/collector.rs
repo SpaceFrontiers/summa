@@ -885,11 +885,6 @@ pub(crate) fn search_segment_shared_sync_planned(
     lsp_plan: Option<std::sync::Arc<super::bmp::LspSegmentPlan>>,
 ) -> Result<(Vec<SearchResult>, u32)> {
     let segment_limit = limit.min(reader.num_docs() as usize);
-    let mut collector = if collect_positions {
-        TopKCollector::with_positions(segment_limit)
-    } else {
-        TopKCollector::new(segment_limit)
-    };
     let options = super::ScorerOptions {
         collect_positions,
         initial_threshold: shared_threshold.get(),
@@ -897,8 +892,33 @@ pub(crate) fn search_segment_shared_sync_planned(
         lsp_plan,
     };
     let mut scorer = query.scorer_sync_with_options(reader, segment_limit, options)?;
-    drive_scorer(scorer.as_mut(), &mut collector);
-    Ok(collector.into_results_with_count())
+    Ok(top_k_from_scorer(
+        scorer.as_mut(),
+        segment_limit,
+        collect_positions,
+    ))
+}
+
+/// Collect a segment's top-k from a freshly built top-level scorer.
+///
+/// Scorers wrapping an already ranked list (vector executors) hand it over
+/// through [`Scorer::precomputed_top_k`]; everything else is driven through a
+/// `TopKCollector`. Both produce the same `(results, total_seen)`.
+fn top_k_from_scorer(
+    scorer: &mut dyn super::Scorer,
+    segment_limit: usize,
+    collect_positions: bool,
+) -> (Vec<SearchResult>, u32) {
+    if let Some(ranked) = scorer.precomputed_top_k(segment_limit, collect_positions) {
+        return ranked;
+    }
+    let mut collector = if collect_positions {
+        TopKCollector::with_positions(segment_limit)
+    } else {
+        TopKCollector::new(segment_limit)
+    };
+    drive_scorer(scorer, &mut collector);
+    collector.into_results_with_count()
 }
 
 /// Per-segment search seeded with a cross-segment top-k floor (async).
@@ -955,11 +975,6 @@ pub(crate) async fn search_segment_shared_planned(
     lsp_plan: Option<std::sync::Arc<super::bmp::LspSegmentPlan>>,
 ) -> Result<(Vec<SearchResult>, u32)> {
     let segment_limit = limit.min(reader.num_docs() as usize);
-    let mut collector = if collect_positions {
-        TopKCollector::with_positions(segment_limit)
-    } else {
-        TopKCollector::new(segment_limit)
-    };
     let options = super::ScorerOptions {
         collect_positions,
         initial_threshold: shared_threshold.get(),
@@ -969,8 +984,11 @@ pub(crate) async fn search_segment_shared_planned(
     let mut scorer = query
         .scorer_with_options(reader, segment_limit, options)
         .await?;
-    drive_scorer(scorer.as_mut(), &mut collector);
-    Ok(collector.into_results_with_count())
+    Ok(top_k_from_scorer(
+        scorer.as_mut(),
+        segment_limit,
+        collect_positions,
+    ))
 }
 
 #[cfg(test)]

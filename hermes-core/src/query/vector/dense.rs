@@ -37,6 +37,10 @@ pub struct DenseVectorQuery {
     /// segment scorers spawned for this query. The caches are versioned, so a
     /// query reused after an index generation change recomputes safely.
     plan_cache: Arc<crate::segment::DensePlanCache>,
+    /// Shared copy of `vector` for the async per-segment scorer futures,
+    /// which cannot borrow `self`. Built once; revalidated against `vector`
+    /// (which is `pub`) before reuse.
+    shared_vector: std::sync::OnceLock<Arc<[f32]>>,
 }
 
 impl std::fmt::Display for DenseVectorQuery {
@@ -62,6 +66,21 @@ impl DenseVectorQuery {
             rerank_factor: DEFAULT_DENSE_RERANK_FACTOR,
             combiner: MultiValueCombiner::Max,
             plan_cache: Arc::new(Default::default()),
+            shared_vector: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The query vector as a shared slice for scorer futures. One allocation
+    /// per query instead of one per segment; falls back to a fresh copy if
+    /// the public `vector` was edited after the first scorer was built.
+    fn shared_vector(&self) -> Arc<[f32]> {
+        let shared = self
+            .shared_vector
+            .get_or_init(|| Arc::from(self.vector.as_slice()));
+        if shared.as_ref() == self.vector.as_slice() {
+            Arc::clone(shared)
+        } else {
+            Arc::from(self.vector.as_slice())
         }
     }
 
@@ -93,7 +112,7 @@ impl DenseVectorQuery {
 impl Query for DenseVectorQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
-        let vector = self.vector.clone();
+        let vector = self.shared_vector();
         let nprobe = self.nprobe;
         let rerank_factor = self.rerank_factor;
         let combiner = self.combiner;

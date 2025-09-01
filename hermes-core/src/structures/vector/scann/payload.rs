@@ -1,7 +1,10 @@
 use super::{ScannConfig, ScannEncoding, ScannFormatError, ScannResult, ScannTrainedArtifact};
 
 const MAGIC: &[u8; 8] = b"HSCNSEGM";
-pub const SCANN_SEGMENT_PAYLOAD_VERSION: u16 = 1;
+/// Version 2: FastScan groups use the block-pair layout described in
+/// `docs/fast-scan-layout-v2.md`. Version 1 groups (one block per 16-byte
+/// word, two rows per byte) are refused; rebuild the generation.
+pub const SCANN_SEGMENT_PAYLOAD_VERSION: u16 = 2;
 
 /// One immutable physical leaf extent. Document IDs are little-endian u32
 /// values relative to `doc_base`; ordinals are little-endian u16 values.

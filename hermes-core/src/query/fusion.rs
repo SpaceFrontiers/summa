@@ -167,11 +167,16 @@ pub fn fuse_ranked_lists_chunked(
 ) -> Vec<SearchResult> {
     type ChunkKey = (u128, u32, u32); // (segment, doc, ordinal)
 
-    let mut fused: FxHashMap<ChunkKey, f32> = FxHashMap::default();
+    // Every (chunk key, list index, contribution) triple. Sorting this once
+    // by (key, list index) replaces two hash maps (per-chunk fusion and
+    // per-document grouping) with one sort plus two nested run-length
+    // passes; the list index keeps the per-key summation in list order, so
+    // fused scores are bit-identical to accumulating into a map.
+    let mut contributions: Vec<(ChunkKey, u16, f32)> = Vec::new();
     // Reused scratch: this list's chunks as (key, chunk_score)
     let mut chunks: Vec<(ChunkKey, f32)> = Vec::new();
 
-    for (list, weight) in lists {
+    for (list_index, (list, weight)) in lists.into_iter().enumerate() {
         chunks.clear();
         for result in &list {
             let mut had_positions = false;
@@ -206,6 +211,8 @@ pub fn fuse_ranked_lists_chunked(
             _ => (0.0, 0.0),
         };
 
+        contributions.reserve(chunks.len());
+        let list_index = list_index as u16;
         for (rank, &(key, score)) in chunks.iter().enumerate() {
             let contribution = match method {
                 FusionMethod::Rrf { k } => weight * rrf_contribution(k, rank + 1),
@@ -217,35 +224,47 @@ pub fn fuse_ranked_lists_chunked(
                     }
                 }
             };
-            *fused.entry(key).or_insert(0.0) += contribution;
+            contributions.push((key, list_index, contribution));
         }
     }
 
-    // Group fused chunks by document and combine into doc scores
-    let mut docs: FxHashMap<(u128, u32), Vec<(u32, f32)>> = FxHashMap::default();
-    for ((segment_id, doc_id, ordinal), score) in fused {
-        docs.entry((segment_id, doc_id))
-            .or_default()
-            .push((ordinal, score));
-    }
+    // Sort by (segment, doc, ordinal, list) so one pass yields documents as
+    // runs of ordinals, each ordinal a run of list contributions in list
+    // order. Ordinals come out ascending, as before.
+    contributions.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    let mut results: Vec<SearchResult> = docs
-        .into_iter()
-        .map(|((segment_id, doc_id), mut ordinals)| {
-            ordinals.sort_unstable_by_key(|&(ord, _)| ord);
-            let score = combiner.combine(&ordinals);
-            let scored_positions: Vec<ScoredPosition> = ordinals
-                .into_iter()
-                .map(|(ord, s)| ScoredPosition::new(ord, s))
-                .collect();
-            SearchResult {
-                doc_id,
-                score,
-                segment_id,
-                positions: vec![(0, scored_positions)],
+    let mut results: Vec<SearchResult> = Vec::new();
+    let mut ordinals: Vec<(u32, f32)> = Vec::new();
+    let mut index = 0;
+    while index < contributions.len() {
+        let (segment_id, doc_id, _) = contributions[index].0;
+        ordinals.clear();
+        while index < contributions.len() {
+            let (seg, doc, ordinal) = contributions[index].0;
+            if seg != segment_id || doc != doc_id {
+                break;
             }
-        })
-        .collect();
+            let mut fused = 0.0f32;
+            while index < contributions.len()
+                && contributions[index].0 == (segment_id, doc_id, ordinal)
+            {
+                fused += contributions[index].2;
+                index += 1;
+            }
+            ordinals.push((ordinal, fused));
+        }
+        let score = combiner.combine(&ordinals);
+        let scored_positions: Vec<ScoredPosition> = ordinals
+            .iter()
+            .map(|&(ord, s)| ScoredPosition::new(ord, s))
+            .collect();
+        results.push(SearchResult {
+            doc_id,
+            score,
+            segment_id,
+            positions: vec![(0, scored_positions)],
+        });
+    }
 
     if results.len() > limit {
         results.select_nth_unstable_by(limit, compare_search_results_desc);
@@ -519,6 +538,101 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// The sort-based fusion must reproduce the hash-map formulation exactly:
+    /// per-chunk contributions summed in list order (bit-identical floats),
+    /// ordinals ascending, documents keyed by (segment, doc).
+    #[test]
+    fn chunked_fusion_sort_grouping_matches_hash_map_reference() {
+        use rustc_hash::FxHashMap;
+
+        fn seg(mut result: SearchResult, segment_id: u128) -> SearchResult {
+            result.segment_id = segment_id;
+            result
+        }
+        let lists = vec![
+            (
+                vec![
+                    chunked(1, &[(2, 9.0), (0, 8.5)]),
+                    seg(chunked(1, &[(0, 7.0)]), 2),
+                    chunked(5, &[(1, 6.0)]),
+                    result(8, 5.0),
+                ],
+                1.0,
+            ),
+            (
+                vec![
+                    chunked(5, &[(1, 0.9), (4, 0.8)]),
+                    chunked(1, &[(0, 0.7)]),
+                    seg(chunked(1, &[(0, 0.6)]), 2),
+                    result(9, 0.5),
+                ],
+                0.7,
+            ),
+            (vec![chunked(1, &[(2, 3.0)]), chunked(8, &[(0, 2.0)])], 1.3),
+        ];
+
+        // Reference: accumulate per (segment, doc, ordinal) in list order.
+        let mut reference: FxHashMap<(u128, u32, u32), f32> = FxHashMap::default();
+        for (list, weight) in &lists {
+            let mut chunks: Vec<((u128, u32, u32), f32)> = Vec::new();
+            for r in list {
+                let mut had = false;
+                for (_, positions) in &r.positions {
+                    for p in positions {
+                        had = true;
+                        chunks.push(((r.segment_id, r.doc_id, p.position), p.score));
+                    }
+                }
+                if !had {
+                    chunks.push(((r.segment_id, r.doc_id, 0), r.score));
+                }
+            }
+            chunks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for (rank, &(key, _)) in chunks.iter().enumerate() {
+                *reference.entry(key).or_insert(0.0) += weight * rrf_contribution(60.0, rank + 1);
+            }
+        }
+
+        let fused = fuse_ranked_lists_chunked(
+            lists,
+            FusionMethod::Rrf { k: 60.0 },
+            MultiValueCombiner::Max,
+            100,
+        );
+        let mut seen = 0;
+        for result in &fused {
+            let (_, positions) = &result.positions[0];
+            let ordinals: Vec<u32> = positions.iter().map(|p| p.position).collect();
+            let mut sorted = ordinals.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                ordinals, sorted,
+                "ordinals ascending for doc {}",
+                result.doc_id
+            );
+            let mut best = f32::NEG_INFINITY;
+            for p in positions {
+                let expected = reference[&(result.segment_id, result.doc_id, p.position)];
+                assert_eq!(
+                    p.score.to_bits(),
+                    expected.to_bits(),
+                    "chunk ({}, {}, {}) fused score",
+                    result.segment_id,
+                    result.doc_id,
+                    p.position
+                );
+                best = best.max(expected);
+                seen += 1;
+            }
+            assert_eq!(result.score.to_bits(), best.to_bits());
+        }
+        assert_eq!(seen, reference.len(), "every fused chunk is reported once");
+        assert_eq!(fused.len(), 5, "(1,seg1) (1,seg2) 5 8 9");
+        for pair in fused.windows(2) {
+            assert!(compare_search_results_desc(&pair[0], &pair[1]).is_le());
+        }
     }
 
     #[test]

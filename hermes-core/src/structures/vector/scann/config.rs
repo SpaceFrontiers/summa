@@ -99,8 +99,9 @@ impl ScannEncoding {
     }
 
     /// Encoded byte length for one leaf's corpus-sized code column. AH uses
-    /// the imported 32-lane FastScan layout for complete blocks and compact
-    /// row-major packing for the tail.
+    /// the 32-lane FastScan v2 layout (two blocks per 32-byte word, odd block
+    /// counts padded; see `docs/fast-scan-layout-v2.md`) for complete groups
+    /// and compact row-major packing for the tail.
     pub fn leaf_code_bytes(self, dimension: u32, rows: usize) -> ScannResult<usize> {
         match self {
             Self::BinaryHamming => self
@@ -115,8 +116,7 @@ impl ScannEncoding {
                 let blocks = (dimension as usize).div_ceil(usize::from(dimensions_per_block));
                 let full_rows = rows / SCANN_FAST_SCAN_LANES;
                 let tail_rows = rows % SCANN_FAST_SCAN_LANES;
-                let full_block_bytes = blocks
-                    .checked_mul(SCANN_FAST_SCAN_LANES / 2)
+                let full_block_bytes = super::packed_block_bytes(blocks)
                     .ok_or_else(|| ScannFormatError::new("ScaNN FastScan block size overflows"))?;
                 let tail_row_bytes = blocks.div_ceil(2);
                 full_rows
@@ -267,7 +267,13 @@ mod tests {
             bits_per_code: 4,
         };
         assert_eq!(encoding.row_code_bytes(5).unwrap(), 2);
-        assert_eq!(encoding.leaf_code_bytes(5, 32).unwrap(), 48);
-        assert_eq!(encoding.leaf_code_bytes(5, 33).unwrap(), 50);
+        // FastScan v2 stores two blocks per 32-byte word: three blocks pad to
+        // two words (64 bytes) per complete 32-row group, and the 33rd row is
+        // a row-major tail of `ceil(3 / 2)` bytes.
+        assert_eq!(encoding.leaf_code_bytes(5, 32).unwrap(), 64);
+        assert_eq!(encoding.leaf_code_bytes(5, 33).unwrap(), 66);
+        // An even block count needs no padding.
+        assert_eq!(encoding.leaf_code_bytes(8, 32).unwrap(), 64);
+        assert_eq!(encoding.leaf_code_bytes(8, 64).unwrap(), 128);
     }
 }
