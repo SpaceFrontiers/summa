@@ -184,29 +184,183 @@ const L0_SIZE: usize = 16;
 /// Level-1 skip entry — 4 bytes (just `last_doc`).
 const L1_SIZE: usize = 4;
 
-/// Footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) + max_tf(4) = 24 bytes.
+/// Legacy footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) + max_tf(4) = 24 bytes.
 const FOOTER_SIZE: usize = 24;
 
-/// Read a compact L0 entry from raw bytes at the given index.
+/// Current footer: the legacy footer followed by `total_positions(8) +
+/// flags(4) + min_len(4) + magic(4)`. A list ends with the magic iff it has
+/// the extended footer; a legacy footer ends with `max_tf`, which the u16
+/// term frequency of the builder keeps far below the magic, so both forms
+/// remain readable.
+const FOOTER_V2_SIZE: usize = FOOTER_SIZE + 20;
+
+/// "BPL2" little-endian.
+const FOOTER_MAGIC: u32 = 0x324C_5042;
+
+/// Footer flag: a `u64` position cursor per L0 block follows the L1 entries.
+const FLAG_POS_CURSORS: u32 = 1;
+
+/// Footer flag: the fourth L0 word packs `max_tf` (low 16 bits) and the
+/// block's minimum scoring-unit length (high 16 bits) instead of an `f32`
+/// max tf, so a block bound can use real length normalisation.
+const FLAG_LEN_BOUNDS: u32 = 2;
+
+/// Footer flag: a packed `(max_tf, min_len)` word per L1 group follows the
+/// L1 `last_doc` entries (superblock bounds: the maximum and minimum over
+/// the group's blocks), so an executor can skip eight blocks at once.
+const FLAG_L1_BOUNDS: u32 = 4;
+
+/// Superblock bounds derived from packed L0 words: per `L1_INTERVAL` group
+/// the maximum `max_tf` and minimum `min_len` of its blocks.
+fn group_bounds_from_l0(l0: &[u8], l0_count: usize) -> Vec<u32> {
+    let mut groups = Vec::with_capacity(l0_count.div_ceil(L1_INTERVAL));
+    let mut idx = 0;
+    while idx < l0_count {
+        let end = (idx + L1_INTERVAL).min(l0_count);
+        let mut max_tf = 0u32;
+        let mut min_len = u32::MAX;
+        for block in idx..end {
+            let (_, _, _, word) = read_l0(l0, block);
+            let (tf, len) = unpack_bounds(word, true);
+            max_tf = max_tf.max(tf);
+            min_len = min_len.min(len.unwrap_or(1));
+        }
+        groups.push(pack_bounds(max_tf, min_len));
+        idx = end;
+    }
+    groups
+}
+
+/// Pack block bounds into the fourth L0 word (both saturate at u16).
+#[inline]
+fn pack_bounds(max_tf: u32, min_len: u32) -> u32 {
+    max_tf.min(u16::MAX as u32) | (min_len.min(u16::MAX as u32) << 16)
+}
+
+/// Unpack the fourth L0 word: `(max_tf, min_len)`; `min_len` is `None` for
+/// legacy lists whose word is an `f32` max tf.
+#[inline]
+fn unpack_bounds(word: u32, packed: bool) -> (u32, Option<u32>) {
+    if packed {
+        (word & 0xFFFF, Some(word >> 16))
+    } else {
+        (f32::from_bits(word) as u32, None)
+    }
+}
+
+/// Size of one position cursor (`u64`: values before the block in the
+/// term's position stream).
+const CURSOR_SIZE: usize = 8;
+
+/// Parsed footer of either format plus the derived section layout.
+struct Footer {
+    stream_len: usize,
+    l0_count: usize,
+    l1_count: usize,
+    doc_count: u32,
+    max_tf: u32,
+    total_positions: u64,
+    has_cursors: bool,
+    len_bounds: bool,
+    l1_bounds: bool,
+    min_len: u32,
+}
+
+impl Footer {
+    fn parse(raw: &[u8]) -> io::Result<Self> {
+        if raw.len() < FOOTER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "posting data too short",
+            ));
+        }
+        let extended = raw.len() >= FOOTER_V2_SIZE
+            && u32::from_le_bytes(raw[raw.len() - 4..].try_into().unwrap()) == FOOTER_MAGIC;
+        let f = raw.len()
+            - if extended {
+                FOOTER_V2_SIZE
+            } else {
+                FOOTER_SIZE
+            };
+        let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+        let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
+        let l1_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap()) as usize;
+        let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
+        let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
+        let (total_positions, flags, min_len) = if extended {
+            let total = u64::from_le_bytes(raw[f + 24..f + 32].try_into().unwrap());
+            let flags = u32::from_le_bytes(raw[f + 32..f + 36].try_into().unwrap());
+            let min_len = u32::from_le_bytes(raw[f + 36..f + 40].try_into().unwrap());
+            (total, flags, min_len)
+        } else {
+            (0, 0, 0)
+        };
+        let footer = Self {
+            stream_len,
+            l0_count,
+            l1_count,
+            doc_count,
+            max_tf,
+            total_positions,
+            has_cursors: flags & FLAG_POS_CURSORS != 0,
+            len_bounds: flags & FLAG_LEN_BOUNDS != 0,
+            l1_bounds: flags & FLAG_L1_BOUNDS != 0,
+            min_len,
+        };
+        if footer.cursors_end() > f {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "posting list sections exceed the footer offset",
+            ));
+        }
+        Ok(footer)
+    }
+
+    fn l0_start(&self) -> usize {
+        self.stream_len
+    }
+    fn l0_end(&self) -> usize {
+        self.l0_start() + self.l0_count * L0_SIZE
+    }
+    fn l1_end(&self) -> usize {
+        self.l0_end() + self.l1_count * L1_SIZE
+    }
+    fn l1_bounds_end(&self) -> usize {
+        self.l1_end() + if self.l1_bounds { self.l1_count * 4 } else { 0 }
+    }
+    fn cursors_end(&self) -> usize {
+        self.l1_bounds_end()
+            + if self.has_cursors {
+                self.l0_count * CURSOR_SIZE
+            } else {
+                0
+            }
+    }
+}
+
+/// Read a compact L0 entry from raw bytes at the given index: `(first_doc,
+/// last_doc, offset, bounds word)`. The bounds word is packed `(max_tf,
+/// min_len)` for current lists and an `f32` max tf for legacy ones; see
+/// [`unpack_bounds`].
 ///
 /// Uses a single bounds check (`[..L0_SIZE]`) instead of 4× `try_into().unwrap()`.
 #[inline]
-fn read_l0(bytes: &[u8], idx: usize) -> (u32, u32, u32, f32) {
+fn read_l0(bytes: &[u8], idx: usize) -> (u32, u32, u32, u32) {
     let b = &bytes[idx * L0_SIZE..][..L0_SIZE];
     let first_doc = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
     let last_doc = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
     let offset = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-    let max_weight = f32::from_le_bytes([b[12], b[13], b[14], b[15]]);
-    (first_doc, last_doc, offset, max_weight)
+    let bounds = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
+    (first_doc, last_doc, offset, bounds)
 }
 
 /// Write a compact L0 entry.
 #[inline]
-fn write_l0(buf: &mut Vec<u8>, first_doc: u32, last_doc: u32, offset: u32, max_weight: f32) {
+fn write_l0(buf: &mut Vec<u8>, first_doc: u32, last_doc: u32, offset: u32, bounds: u32) {
     buf.extend_from_slice(&first_doc.to_le_bytes());
     buf.extend_from_slice(&last_doc.to_le_bytes());
     buf.extend_from_slice(&offset.to_le_bytes());
-    buf.extend_from_slice(&max_weight.to_le_bytes());
+    buf.extend_from_slice(&bounds.to_le_bytes());
 }
 
 /// Compute block data size from the 8-byte header at `stream[pos..]`.
@@ -238,16 +392,30 @@ pub struct BlockPostingList {
     /// Level-1 skip `last_doc` values — one per `L1_INTERVAL` blocks.
     /// Stored as `Vec<u32>` for direct SIMD-accelerated `find_first_ge_u32`.
     l1_docs: Vec<u32>,
+    /// Packed `(max_tf, min_len)` per L1 group (superblock bounds); empty
+    /// for legacy lists.
+    l1_bounds: Vec<u32>,
     /// Total posting count.
     doc_count: u32,
     /// Max TF across all blocks.
     max_tf: u32,
+    /// Per-block position cursors (`u64` × `l0_count`): number of values in
+    /// the term's position stream before the block. `None` for terms
+    /// without positions and for legacy lists.
+    pos_cursors: Option<OwnedBytes>,
+    /// Sum of term frequencies (= values in the position stream) when
+    /// cursors are present.
+    total_positions: u64,
+    /// Whether L0 bounds words are packed `(max_tf, min_len)`.
+    len_bounds: bool,
+    /// Minimum scoring-unit length over the whole list (with `len_bounds`).
+    min_len: u32,
 }
 
 impl BlockPostingList {
-    /// Read L0 entry by block index. Returns `(first_doc, last_doc, offset, max_weight)`.
+    /// Read L0 entry by block index. Returns `(first_doc, last_doc, offset, bounds word)`.
     #[inline]
-    fn read_l0_entry(&self, idx: usize) -> (u32, u32, u32, f32) {
+    fn read_l0_entry(&self, idx: usize) -> (u32, u32, u32, u32) {
         read_l0(&self.l0_bytes, idx)
     }
 
@@ -260,11 +428,42 @@ impl BlockPostingList {
     /// [packed tfs: count × bytes_per_value(tf_bits)]
     /// ```
     pub fn from_posting_list(list: &PostingList) -> io::Result<Self> {
+        Self::build(list, false, None)
+    }
+
+    /// Like [`Self::from_posting_list`], for a term whose positions are
+    /// stored as a v2 stream: every block records how many positions precede
+    /// it (the cumulative term frequency), so a reader can address the
+    /// stream from the doc postings alone.
+    pub fn from_posting_list_with_positions(list: &PostingList) -> io::Result<Self> {
+        Self::build(list, true, None)
+    }
+
+    /// Build with position cursors on demand and, when `length_of` is given,
+    /// the minimum scoring-unit length per block (and over the list) so
+    /// MaxScore bounds use real length normalisation. Without lengths the
+    /// minimum is 1, which any real unit satisfies.
+    pub fn from_posting_list_with(
+        list: &PostingList,
+        with_positions: bool,
+        length_of: Option<&dyn Fn(DocId) -> u32>,
+    ) -> io::Result<Self> {
+        Self::build(list, with_positions, length_of)
+    }
+
+    fn build(
+        list: &PostingList,
+        with_positions: bool,
+        length_of: Option<&dyn Fn(DocId) -> u32>,
+    ) -> io::Result<Self> {
         let mut stream: Vec<u8> = Vec::new();
         let mut l0_buf: Vec<u8> = Vec::new();
         let mut l1_docs: Vec<u32> = Vec::new();
+        let mut cursors: Vec<u8> = Vec::new();
+        let mut positions_so_far = 0u64;
         let mut l0_count = 0usize;
         let mut max_tf = 0u32;
+        let mut list_min_len = u32::MAX;
 
         let postings = &list.postings;
         let mut i = 0;
@@ -331,15 +530,27 @@ impl BlockPostingList {
                 simd::pack_rounded(&tf_buf, rounded, &mut stream[start..]);
             }
 
-            // L0 skip entry
+            // L0 skip entry with the block's bounds
+            let block_min_len = length_of.map_or(1, |length_of| {
+                block
+                    .iter()
+                    .map(|p| length_of(p.doc_id).max(1))
+                    .min()
+                    .unwrap_or(1)
+            });
+            list_min_len = list_min_len.min(block_min_len);
             write_l0(
                 &mut l0_buf,
                 base_doc_id,
                 last_doc_id,
                 block_start,
-                block_max_tf as f32,
+                pack_bounds(block_max_tf, block_min_len),
             );
             l0_count += 1;
+            if with_positions {
+                cursors.extend_from_slice(&positions_so_far.to_le_bytes());
+                positions_so_far += block.iter().map(|p| p.term_freq as u64).sum::<u64>();
+            }
 
             // L1 entry at the end of each L1_INTERVAL group
             if l0_count.is_multiple_of(L1_INTERVAL) {
@@ -354,14 +565,24 @@ impl BlockPostingList {
             let (_, last_doc, _, _) = read_l0(&l0_buf, l0_count - 1);
             l1_docs.push(last_doc);
         }
+        let l1_bounds = group_bounds_from_l0(&l0_buf, l0_count);
 
         Ok(Self {
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
             l0_count,
             l1_docs,
+            l1_bounds,
             doc_count: postings.len() as u32,
             max_tf,
+            pos_cursors: with_positions.then(|| OwnedBytes::new(cursors)),
+            total_positions: positions_so_far,
+            len_bounds: true,
+            min_len: if list_min_len == u32::MAX {
+                1
+            } else {
+                list_min_len
+            },
         })
     }
 
@@ -372,7 +593,10 @@ impl BlockPostingList {
     /// [stream: block data]
     /// [L0 entries: l0_count × 16 bytes (first_doc, last_doc, offset, max_weight)]
     /// [L1 entries: l1_count × 4 bytes (last_doc)]
-    /// [footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) + max_tf(4) = 24 bytes]
+    /// [L1 bounds: l1_count × 4 bytes (packed max_tf, min_len), FLAG_L1_BOUNDS]
+    /// [position cursors: l0_count × 8 bytes, only with positions]
+    /// [footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) + max_tf(4)
+    ///          + total_positions(8) + flags(4) + min_len(4) + magic(4) = 44 bytes]
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         writer.write_all(&self.stream)?;
@@ -380,81 +604,166 @@ impl BlockPostingList {
         for &doc in &self.l1_docs {
             writer.write_u32::<LittleEndian>(doc)?;
         }
+        for &bounds in &self.l1_bounds {
+            writer.write_u32::<LittleEndian>(bounds)?;
+        }
+        if let Some(cursors) = &self.pos_cursors {
+            writer.write_all(cursors)?;
+        }
+        Self::write_footer(
+            writer,
+            self.stream.len() as u64,
+            self.l0_count,
+            self.l1_docs.len(),
+            self.doc_count,
+            self.max_tf,
+            self.total_positions,
+            self.pos_cursors.is_some(),
+            self.len_bounds.then_some(self.min_len),
+            !self.l1_bounds.is_empty(),
+        )
+    }
 
-        // Footer (24 bytes)
-        writer.write_u64::<LittleEndian>(self.stream.len() as u64)?;
-        writer.write_u32::<LittleEndian>(self.l0_count as u32)?;
-        writer.write_u32::<LittleEndian>(self.l1_docs.len() as u32)?;
-        writer.write_u32::<LittleEndian>(self.doc_count)?;
-        writer.write_u32::<LittleEndian>(self.max_tf)?;
-
+    #[allow(clippy::too_many_arguments)]
+    fn write_footer<W: Write>(
+        writer: &mut W,
+        stream_len: u64,
+        l0_count: usize,
+        l1_count: usize,
+        doc_count: u32,
+        max_tf: u32,
+        total_positions: u64,
+        has_cursors: bool,
+        min_len: Option<u32>,
+        l1_bounds: bool,
+    ) -> io::Result<()> {
+        writer.write_u64::<LittleEndian>(stream_len)?;
+        writer.write_u32::<LittleEndian>(l0_count as u32)?;
+        writer.write_u32::<LittleEndian>(l1_count as u32)?;
+        writer.write_u32::<LittleEndian>(doc_count)?;
+        writer.write_u32::<LittleEndian>(max_tf)?;
+        writer.write_u64::<LittleEndian>(total_positions)?;
+        let mut flags = 0u32;
+        if has_cursors {
+            flags |= FLAG_POS_CURSORS;
+        }
+        if min_len.is_some() {
+            flags |= FLAG_LEN_BOUNDS;
+        }
+        if l1_bounds {
+            flags |= FLAG_L1_BOUNDS;
+        }
+        writer.write_u32::<LittleEndian>(flags)?;
+        writer.write_u32::<LittleEndian>(min_len.unwrap_or(0))?;
+        writer.write_u32::<LittleEndian>(FOOTER_MAGIC)?;
         Ok(())
     }
 
-    /// Deserialize from a byte slice (footer-based format).
+    /// Deserialize from a byte slice (either footer format).
     pub fn deserialize(raw: &[u8]) -> io::Result<Self> {
-        if raw.len() < FOOTER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "posting data too short",
-            ));
-        }
-
-        let f = raw.len() - FOOTER_SIZE;
-        let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
-        let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
-        let l1_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap()) as usize;
-        let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
-        let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
-
-        let l0_start = stream_len;
-        let l0_end = l0_start + l0_count * L0_SIZE;
-        let l1_start = l0_end;
-
-        let l1_docs = Self::extract_l1_docs(&raw[l1_start..], l1_count);
-
-        Ok(Self {
-            stream: OwnedBytes::new(raw[..stream_len].to_vec()),
-            l0_bytes: OwnedBytes::new(raw[l0_start..l0_end].to_vec()),
-            l0_count,
-            l1_docs,
-            doc_count,
-            max_tf,
-        })
+        Self::deserialize_zero_copy(OwnedBytes::new(raw.to_vec()))
     }
 
     /// Zero-copy deserialization from OwnedBytes.
-    /// Stream and L0 are sliced from the source without copying.
+    /// Stream, L0 and cursors are sliced from the source without copying.
     /// L1 is extracted into a `Vec<u32>` for SIMD-friendly access (tiny: ≤ N/8 entries).
     pub fn deserialize_zero_copy(raw: OwnedBytes) -> io::Result<Self> {
-        if raw.len() < FOOTER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "posting data too short",
-            ));
-        }
-
-        let f = raw.len() - FOOTER_SIZE;
-        let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
-        let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
-        let l1_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap()) as usize;
-        let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
-        let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
-
-        let l0_start = stream_len;
-        let l0_end = l0_start + l0_count * L0_SIZE;
-        let l1_start = l0_end;
-
-        let l1_docs = Self::extract_l1_docs(&raw[l1_start..], l1_count);
+        let footer = Footer::parse(raw.as_slice())?;
+        let l1_docs = Self::extract_l1_docs(&raw[footer.l0_end()..], footer.l1_count);
+        let l1_bounds = if footer.l1_bounds {
+            Self::extract_l1_docs(&raw[footer.l1_end()..], footer.l1_count)
+        } else {
+            Vec::new()
+        };
+        let pos_cursors = footer
+            .has_cursors
+            .then(|| raw.slice(footer.l1_bounds_end()..footer.cursors_end()));
 
         Ok(Self {
-            stream: raw.slice(0..stream_len),
-            l0_bytes: raw.slice(l0_start..l0_end),
-            l0_count,
+            stream: raw.slice(0..footer.stream_len),
+            l0_bytes: raw.slice(footer.l0_start()..footer.l0_end()),
+            l0_count: footer.l0_count,
             l1_docs,
-            doc_count,
-            max_tf,
+            l1_bounds,
+            doc_count: footer.doc_count,
+            max_tf: footer.max_tf,
+            pos_cursors,
+            total_positions: footer.total_positions,
+            len_bounds: footer.len_bounds,
+            min_len: footer.min_len,
         })
+    }
+
+    /// Minimum scoring-unit length over the list, when the list stores
+    /// length bounds (`None` for legacy lists).
+    pub fn min_len(&self) -> Option<u32> {
+        self.len_bounds.then_some(self.min_len)
+    }
+
+    /// `(max_tf, min_len)` of a block; `min_len` is `None` for legacy lists.
+    #[inline]
+    pub fn block_bounds(&self, block_idx: usize) -> Option<(u32, Option<u32>)> {
+        if block_idx >= self.l0_count {
+            return None;
+        }
+        let (_, _, _, word) = self.read_l0_entry(block_idx);
+        Some(unpack_bounds(word, self.len_bounds))
+    }
+
+    /// `(max_tf, min_len)` over the L1 group (`L1_INTERVAL` blocks) that
+    /// contains `block_idx`; `None` for legacy lists without group bounds.
+    #[inline]
+    pub fn group_bounds(&self, block_idx: usize) -> Option<(u32, u32)> {
+        if block_idx >= self.l0_count {
+            return None;
+        }
+        let word = *self.l1_bounds.get(block_idx / L1_INTERVAL)?;
+        let (max_tf, min_len) = unpack_bounds(word, true);
+        Some((max_tf, min_len.unwrap_or(1)))
+    }
+
+    /// Last doc of the L1 group containing `block_idx`.
+    #[inline]
+    pub fn group_last_doc(&self, block_idx: usize) -> Option<DocId> {
+        self.l1_docs.get(block_idx / L1_INTERVAL).copied()
+    }
+
+    /// Whether `block_idx` opens an L1 group.
+    #[inline]
+    pub fn is_group_start(&self, block_idx: usize) -> bool {
+        block_idx.is_multiple_of(L1_INTERVAL)
+    }
+
+    /// Index of the first block after the L1 group containing `block_idx`
+    /// (clamped to the block count).
+    #[inline]
+    pub fn next_group_block(&self, block_idx: usize) -> usize {
+        ((block_idx / L1_INTERVAL + 1) * L1_INTERVAL).min(self.l0_count)
+    }
+
+    /// Whether serialized bytes carry position cursors (cheap footer check).
+    pub fn has_cursors_bytes(raw: &[u8]) -> bool {
+        Footer::parse(raw).is_ok_and(|footer| footer.has_cursors)
+    }
+
+    /// Whether this list carries a position cursor per block.
+    pub fn has_position_cursors(&self) -> bool {
+        self.pos_cursors.is_some()
+    }
+
+    /// Number of values in the term's position stream (0 without cursors).
+    pub fn total_positions(&self) -> u64 {
+        self.total_positions
+    }
+
+    /// Values in the term's position stream before block `block_idx`.
+    #[inline]
+    pub fn pos_cursor(&self, block_idx: usize) -> Option<u64> {
+        let cursors = self.pos_cursors.as_ref()?;
+        let p = block_idx * CURSOR_SIZE;
+        cursors
+            .get(p..p + CURSOR_SIZE)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
     }
 
     /// Extract L1 last_doc values from raw LE bytes into a Vec<u32>.
@@ -483,11 +792,7 @@ impl BlockPostingList {
 
     /// Get block's max term frequency for block-max pruning
     pub fn block_max_tf(&self, block_idx: usize) -> Option<u32> {
-        if block_idx >= self.l0_count {
-            return None;
-        }
-        let (_, _, _, max_weight) = self.read_l0_entry(block_idx);
-        Some(max_weight as u32)
+        self.block_bounds(block_idx).map(|(max_tf, _)| max_tf)
     }
 
     /// Concatenate blocks from multiple posting lists with doc_id remapping.
@@ -499,11 +804,28 @@ impl BlockPostingList {
         let mut l0_count = 0usize;
         let mut total_docs = 0u32;
         let mut max_tf = 0u32;
+        let all_cursors = sources.iter().all(|(s, _)| s.has_position_cursors());
+        if !all_cursors && sources.iter().any(|(s, _)| s.has_position_cursors()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot concatenate posting lists with and without position cursors",
+            ));
+        }
+        let mut cursors: Vec<u8> = Vec::new();
+        let mut positions_before = 0u64;
+        let mut min_len = u32::MAX;
 
         for (source, doc_offset) in sources {
             max_tf = max_tf.max(source.max_tf);
+            min_len = min_len.min(source.min_len().unwrap_or(1));
             for block_idx in 0..source.num_blocks() {
-                let (first_doc, last_doc, offset, max_weight) = source.read_l0_entry(block_idx);
+                if all_cursors {
+                    let cursor = source.pos_cursor(block_idx).unwrap_or(0) + positions_before;
+                    cursors.extend_from_slice(&cursor.to_le_bytes());
+                }
+                let (first_doc, last_doc, offset, word) = source.read_l0_entry(block_idx);
+                let (block_max_tf, block_min_len) = unpack_bounds(word, source.len_bounds);
+                let bounds = pack_bounds(block_max_tf, block_min_len.unwrap_or(1));
                 let blk_size = block_data_size(&source.stream, offset as usize);
                 let block_bytes = &source.stream[offset as usize..offset as usize + blk_size];
 
@@ -527,7 +849,7 @@ impl BlockPostingList {
                     first_doc + doc_offset,
                     new_last,
                     new_offset,
-                    max_weight,
+                    bounds,
                 );
                 l0_count += 1;
                 total_docs += count as u32;
@@ -536,6 +858,7 @@ impl BlockPostingList {
                     l1_docs.push(new_last);
                 }
             }
+            positions_before += source.total_positions;
         }
 
         // Final L1 entry for partial group
@@ -543,14 +866,20 @@ impl BlockPostingList {
             let (_, last_doc, _, _) = read_l0(&l0_buf, l0_count - 1);
             l1_docs.push(last_doc);
         }
+        let l1_bounds = group_bounds_from_l0(&l0_buf, l0_count);
 
         Ok(Self {
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
             l0_count,
             l1_docs,
+            l1_bounds,
             doc_count: total_docs,
             max_tf,
+            pos_cursors: all_cursors.then(|| OwnedBytes::new(cursors)),
+            total_positions: if all_cursors { positions_before } else { 0 },
+            len_bounds: true,
+            min_len: if min_len == u32::MAX { 1 } else { min_len },
         })
     }
 
@@ -572,54 +901,55 @@ impl BlockPostingList {
         sources: &[(&[u8], u32)], // (serialized_bytes, doc_offset)
         writer: &mut W,
     ) -> crate::Result<(u32, usize)> {
-        struct SourceMeta {
-            stream_len: usize,
-            l0_count: usize,
-        }
-
-        let mut metas: Vec<SourceMeta> = Vec::with_capacity(sources.len());
+        let mut metas: Vec<Footer> = Vec::with_capacity(sources.len());
         let mut total_docs = 0u32;
         let mut merged_max_tf = 0u32;
+        let mut merged_min_len = u32::MAX;
 
         for (source_index, (raw, _)) in sources.iter().enumerate() {
-            if raw.len() < FOOTER_SIZE {
-                return Err(crate::Error::Corruption(format!(
-                    "posting list source {} is shorter than its footer: {} bytes < {}",
-                    source_index,
-                    raw.len(),
-                    FOOTER_SIZE,
-                )));
-            }
-            let f = raw.len() - FOOTER_SIZE;
-            let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
-            let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
-            // l1_count not needed — we rebuild L1
-            let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
-            let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
-            total_docs += doc_count;
-            merged_max_tf = merged_max_tf.max(max_tf);
-            metas.push(SourceMeta {
-                stream_len,
-                l0_count,
-            });
+            let footer = Footer::parse(raw).map_err(|e| {
+                crate::Error::Corruption(format!(
+                    "posting list source {source_index} has an invalid footer: {e}"
+                ))
+            })?;
+            total_docs += footer.doc_count;
+            merged_max_tf = merged_max_tf.max(footer.max_tf);
+            merged_min_len = merged_min_len.min(if footer.len_bounds { footer.min_len } else { 1 });
+            metas.push(footer);
+        }
+        let all_cursors = metas.iter().all(|m| m.has_cursors);
+        if !all_cursors && metas.iter().any(|m| m.has_cursors) {
+            return Err(crate::Error::Corruption(
+                "cannot concatenate posting lists with and without position cursors".into(),
+            ));
         }
 
         // Phase 1: Stream block data, reading L0 entries on-the-fly.
-        // Accumulate output L0 + L1 (bounded).
+        // Accumulate output L0 + L1 + cursors (bounded).
         let mut out_l0: Vec<u8> = Vec::new();
         let mut out_l1_docs: Vec<u32> = Vec::new();
+        let mut out_cursors: Vec<u8> = Vec::new();
+        let mut positions_before = 0u64;
         let mut out_l0_count = 0usize;
         let mut stream_written = 0u64;
         let mut patch_buf = [0u8; 8];
 
         for (src_idx, meta) in metas.iter().enumerate() {
             let (raw, doc_offset) = &sources[src_idx];
-            let l0_base = meta.stream_len; // L0 entries start right after stream
+            let l0_base = meta.l0_start(); // L0 entries start right after stream
             let src_stream = &raw[..meta.stream_len];
+            let cursors_base = meta.l1_bounds_end();
 
             for i in 0..meta.l0_count {
                 // Read source L0 entry directly from raw bytes
-                let (first_doc, last_doc, offset, max_weight) = read_l0(&raw[l0_base..], i);
+                let (first_doc, last_doc, offset, word) = read_l0(&raw[l0_base..], i);
+                let (block_max_tf, block_min_len) = unpack_bounds(word, meta.len_bounds);
+                let bounds = pack_bounds(block_max_tf, block_min_len.unwrap_or(1));
+                if all_cursors {
+                    let p = cursors_base + i * CURSOR_SIZE;
+                    let cursor = u64::from_le_bytes(raw[p..p + CURSOR_SIZE].try_into().unwrap());
+                    out_cursors.extend_from_slice(&(cursor + positions_before).to_le_bytes());
+                }
 
                 // Compute block size from header
                 let blk_size = block_data_size(src_stream, offset as usize);
@@ -639,7 +969,7 @@ impl BlockPostingList {
                     first_doc + doc_offset,
                     new_last,
                     stream_written as u32,
-                    max_weight,
+                    bounds,
                 );
                 out_l0_count += 1;
 
@@ -657,6 +987,7 @@ impl BlockPostingList {
 
                 stream_written += blk_size as u64;
             }
+            positions_before += meta.total_positions;
         }
 
         // Final L1 entry for partial group
@@ -665,20 +996,39 @@ impl BlockPostingList {
             out_l1_docs.push(last_doc);
         }
 
-        // Phase 2: Write L0 + L1 + footer
+        // Phase 2: Write L0 + L1 + L1 bounds + cursors + footer
+        let out_l1_bounds = group_bounds_from_l0(&out_l0, out_l0_count);
         writer.write_all(&out_l0)?;
         for &doc in &out_l1_docs {
             writer.write_u32::<LittleEndian>(doc)?;
         }
+        for &bounds in &out_l1_bounds {
+            writer.write_u32::<LittleEndian>(bounds)?;
+        }
+        writer.write_all(&out_cursors)?;
+        Self::write_footer(
+            writer,
+            stream_written,
+            out_l0_count,
+            out_l1_docs.len(),
+            total_docs,
+            merged_max_tf,
+            if all_cursors { positions_before } else { 0 },
+            all_cursors,
+            Some(if merged_min_len == u32::MAX {
+                1
+            } else {
+                merged_min_len
+            }),
+            true,
+        )?;
 
-        writer.write_u64::<LittleEndian>(stream_written)?;
-        writer.write_u32::<LittleEndian>(out_l0_count as u32)?;
-        writer.write_u32::<LittleEndian>(out_l1_docs.len() as u32)?;
-        writer.write_u32::<LittleEndian>(total_docs)?;
-        writer.write_u32::<LittleEndian>(merged_max_tf)?;
-
-        let l1_bytes_len = out_l1_docs.len() * L1_SIZE;
-        let total_bytes = stream_written as usize + out_l0.len() + l1_bytes_len + FOOTER_SIZE;
+        let l1_bytes_len = out_l1_docs.len() * L1_SIZE + out_l1_bounds.len() * 4;
+        let total_bytes = stream_written as usize
+            + out_l0.len()
+            + l1_bytes_len
+            + out_cursors.len()
+            + FOOTER_V2_SIZE;
         Ok((total_docs, total_bytes))
     }
 
@@ -866,6 +1216,10 @@ pub struct BlockPostingIterator<'a> {
     block_doc_ids: Vec<u32>,
     block_tfs: Vec<u32>,
     position_in_block: usize,
+    /// Sum of the term frequencies of the postings before
+    /// `position_in_block` in the current block (position stream offset
+    /// relative to the block's cursor).
+    tf_prefix: u64,
     exhausted: bool,
 }
 
@@ -878,6 +1232,7 @@ impl<'a> BlockPostingIterator<'a> {
             block_doc_ids: Vec::with_capacity(BLOCK_SIZE),
             block_tfs: Vec::with_capacity(BLOCK_SIZE),
             position_in_block: 0,
+            tf_prefix: 0,
             exhausted,
         };
         if !iter.exhausted {
@@ -894,6 +1249,7 @@ impl<'a> BlockPostingIterator<'a> {
             block_doc_ids: Vec::with_capacity(BLOCK_SIZE),
             block_tfs: Vec::with_capacity(BLOCK_SIZE),
             position_in_block: 0,
+            tf_prefix: 0,
             exhausted,
         };
         if !iter.exhausted {
@@ -910,9 +1266,19 @@ impl<'a> BlockPostingIterator<'a> {
 
         self.current_block = block_idx;
         self.position_in_block = 0;
+        self.tf_prefix = 0;
 
         self.block_list
             .decode_block_into(block_idx, &mut self.block_doc_ids, &mut self.block_tfs);
+    }
+
+    /// Offset of the current posting's positions in the term's position
+    /// stream (see `structures::postings::positions_v2`): the block's cursor
+    /// plus the term frequencies of the postings before it in the block.
+    /// Meaningful only for lists built with position cursors.
+    #[inline]
+    pub fn position_cursor(&self) -> u64 {
+        self.block_list.pos_cursor(self.current_block).unwrap_or(0) + self.tf_prefix
     }
 
     pub fn doc(&self) -> DocId {
@@ -938,6 +1304,9 @@ impl<'a> BlockPostingIterator<'a> {
             return TERMINATED;
         }
 
+        if let Some(&tf) = self.block_tfs.get(self.position_in_block) {
+            self.tf_prefix += tf as u64;
+        }
         self.position_in_block += 1;
         if self.position_in_block >= self.block_doc_ids.len() {
             self.load_block(self.current_block + 1);
@@ -966,6 +1335,10 @@ impl<'a> BlockPostingIterator<'a> {
         // SIMD linear scan within block on cached doc_ids
         let remaining = &self.block_doc_ids[self.position_in_block..];
         let pos = crate::structures::simd::find_first_ge_u32(remaining, target);
+        self.tf_prefix += self.block_tfs[self.position_in_block..self.position_in_block + pos]
+            .iter()
+            .map(|&tf| tf as u64)
+            .sum::<u64>();
         self.position_in_block += pos;
 
         if self.position_in_block >= self.block_doc_ids.len() {
@@ -1003,8 +1376,9 @@ impl<'a> BlockPostingIterator<'a> {
         if self.exhausted || self.current_block >= self.block_list.l0_count {
             0
         } else {
-            let (_, _, _, max_weight) = self.block_list.read_l0_entry(self.current_block);
-            max_weight as u32
+            self.block_list
+                .block_max_tf(self.current_block)
+                .unwrap_or(0)
         }
     }
 }
@@ -1723,9 +2097,208 @@ mod tests {
         let bpl = build_bpl(&docs);
         let bytes = serialize_bpl(&bpl);
 
-        let expected =
-            bpl.stream.len() + bpl.l0_count * L0_SIZE + bpl.l1_docs.len() * L1_SIZE + FOOTER_SIZE;
+        let expected = bpl.stream.len()
+            + bpl.l0_count * L0_SIZE
+            + bpl.l1_docs.len() * (L1_SIZE + 4)
+            + FOOTER_V2_SIZE;
         assert_eq!(bytes.len(), expected);
+    }
+
+    fn build_bpl_with_positions(postings: &[(u32, u32)]) -> BlockPostingList {
+        let mut list = PostingList::new();
+        for &(doc, tf) in postings {
+            list.push(doc, tf);
+        }
+        BlockPostingList::from_posting_list_with_positions(&list).unwrap()
+    }
+
+    /// Expected cursor of every posting: the cumulative tf before it.
+    fn expected_cursors(postings: &[(u32, u32)]) -> Vec<u64> {
+        let mut acc = 0u64;
+        postings
+            .iter()
+            .map(|&(_, tf)| {
+                let c = acc;
+                acc += tf as u64;
+                c
+            })
+            .collect()
+    }
+
+    fn iterator_cursors(bpl: &BlockPostingList) -> Vec<u64> {
+        let mut it = bpl.iterator();
+        let mut out = Vec::new();
+        while it.doc() != TERMINATED {
+            out.push(it.position_cursor());
+            it.advance();
+        }
+        out
+    }
+
+    #[test]
+    fn position_cursors_survive_serialization_and_seeks() {
+        let docs: Vec<(u32, u32)> = (0..700u32).map(|i| (i * 3, i % 5 + 1)).collect();
+        let bpl = build_bpl_with_positions(&docs);
+        assert!(bpl.has_position_cursors());
+        assert_eq!(
+            bpl.total_positions(),
+            docs.iter().map(|&(_, tf)| tf as u64).sum::<u64>()
+        );
+        assert_eq!(bpl.pos_cursor(0), Some(0));
+        assert_eq!(
+            bpl.pos_cursor(1),
+            Some(docs[..128].iter().map(|&(_, tf)| tf as u64).sum::<u64>())
+        );
+        assert_eq!(iterator_cursors(&bpl), expected_cursors(&docs));
+
+        let bytes = serialize_bpl(&bpl);
+        assert_eq!(
+            bytes.len(),
+            bpl.stream.len()
+                + bpl.l0_count * (L0_SIZE + CURSOR_SIZE)
+                + bpl.l1_docs.len() * (L1_SIZE + 4)
+                + FOOTER_V2_SIZE
+        );
+        assert!(BlockPostingList::has_cursors_bytes(&bytes));
+        let decoded =
+            BlockPostingList::deserialize_zero_copy(OwnedBytes::new(bytes.clone())).unwrap();
+        assert_eq!(iterator_cursors(&decoded), expected_cursors(&docs));
+        assert_eq!(decoded.total_positions(), bpl.total_positions());
+
+        // Seeking within and across blocks keeps the cursor exact.
+        let mut it = decoded.iterator();
+        let expected = expected_cursors(&docs);
+        for (i, &(doc, _)) in docs.iter().enumerate().step_by(37) {
+            assert_eq!(it.seek(doc), doc);
+            assert_eq!(it.position_cursor(), expected[i], "cursor at doc {doc}");
+        }
+        let mut it = decoded.iterator();
+        assert_eq!(it.seek(docs[600].0 + 1), docs[601].0);
+        assert_eq!(it.position_cursor(), expected[601]);
+
+        // Lists without positions carry no cursors (the iterator's prefix
+        // sum is then relative to nothing and never consulted).
+        let plain = build_bpl(&docs);
+        assert!(!plain.has_position_cursors());
+        assert_eq!(plain.pos_cursor(0), None);
+        assert_eq!(plain.total_positions(), 0);
+    }
+
+    #[test]
+    fn length_bounds_are_packed_per_block_and_survive_merges() {
+        let docs: Vec<(u32, u32)> = (0..300u32).map(|i| (i, i % 3 + 1)).collect();
+        let length_of = |doc: u32| 10 + (doc % 50) * 7;
+        let mut list = PostingList::new();
+        for &(doc, tf) in &docs {
+            list.push(doc, tf);
+        }
+        let bpl = BlockPostingList::from_posting_list_with(&list, true, Some(&length_of)).unwrap();
+        assert_eq!(bpl.min_len(), Some(10));
+        assert_eq!(bpl.block_bounds(0), Some((3, Some(10))));
+        // Block 2 covers docs 256..300: min length there is doc 256 (256 % 50 = 6 → 52).
+        assert_eq!(bpl.block_bounds(2), Some((3, Some(52))));
+        assert_eq!(bpl.block_max_tf(2), Some(3));
+
+        let bytes = serialize_bpl(&bpl);
+        let decoded = BlockPostingList::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.min_len(), Some(10));
+        assert_eq!(decoded.block_bounds(2), Some((3, Some(52))));
+        // Superblock bounds: one group of three blocks here, max tf 3 and
+        // the smallest length of the whole list.
+        assert_eq!(decoded.group_bounds(0), Some((3, 10)));
+        assert_eq!(decoded.group_bounds(2), Some((3, 10)));
+        assert_eq!(decoded.group_bounds(3), None);
+        assert_eq!(decoded.group_last_doc(1), Some(299));
+        assert_eq!(decoded.next_group_block(1), 3);
+
+        // Without lengths the minimum is 1, which every real unit satisfies.
+        let plain = build_bpl(&docs);
+        assert_eq!(plain.min_len(), Some(1));
+        assert_eq!(plain.block_bounds(0), Some((3, Some(1))));
+
+        // Streaming merge keeps per-block bounds and takes the list minimum.
+        let mut out = Vec::new();
+        BlockPostingList::concatenate_streaming(&[(&bytes, 0), (&bytes, 1000)], &mut out).unwrap();
+        let merged = BlockPostingList::deserialize(&out).unwrap();
+        assert_eq!(merged.min_len(), Some(10));
+        assert_eq!(merged.block_bounds(2), Some((3, Some(52))));
+        assert_eq!(merged.block_bounds(3), Some((3, Some(10))));
+        assert_eq!(merged.block_max_tf(5), Some(3));
+        // Six blocks: one full group of eight would need more; here both
+        // lists' blocks share group 0.
+        assert_eq!(merged.group_bounds(5), Some((3, 10)));
+        assert_eq!(merged.group_last_doc(5), Some(1299));
+        assert_eq!(merged.next_group_block(5), 6);
+    }
+
+    #[test]
+    fn legacy_footer_without_magic_still_deserializes() {
+        let docs: Vec<(u32, u32)> = (0..300u32).map(|i| (i * 2, 1 + i % 3)).collect();
+        let bpl = build_bpl(&docs);
+        let bytes = serialize_bpl(&bpl);
+        // A pre-magic list is the same bytes without the 16-byte extension.
+        let legacy = bytes[..bytes.len() - (FOOTER_V2_SIZE - FOOTER_SIZE)].to_vec();
+        assert!(!BlockPostingList::has_cursors_bytes(&legacy));
+        // Legacy lists carry an f32 max tf per block and no lengths.
+        let decoded = BlockPostingList::deserialize(&legacy).unwrap();
+        assert_eq!(collect_postings(&decoded), docs);
+        assert_eq!(decoded.max_tf(), 3);
+        assert!(!decoded.has_position_cursors());
+        assert_eq!(decoded.min_len(), None);
+        assert_eq!(decoded.group_bounds(0), None);
+        // And the legacy bytes concatenate into a current-format list.
+        let mut out = Vec::new();
+        let (count, written) =
+            BlockPostingList::concatenate_streaming(&[(&legacy, 0), (&legacy, 1000)], &mut out)
+                .unwrap();
+        assert_eq!(count, 600);
+        assert_eq!(written, out.len());
+        let merged = BlockPostingList::deserialize(&out).unwrap();
+        assert_eq!(merged.doc_count(), 600);
+        assert!(!merged.has_position_cursors());
+    }
+
+    #[test]
+    fn streaming_merge_rebases_position_cursors() {
+        let a: Vec<(u32, u32)> = (0..200u32).map(|i| (i, i % 4 + 1)).collect();
+        let b: Vec<(u32, u32)> = (0..150u32).map(|i| (i * 2, 2)).collect();
+        let bytes_a = serialize_bpl(&build_bpl_with_positions(&a));
+        let bytes_b = serialize_bpl(&build_bpl_with_positions(&b));
+        let mut out = Vec::new();
+        let (count, written) =
+            BlockPostingList::concatenate_streaming(&[(&bytes_a, 0), (&bytes_b, 1000)], &mut out)
+                .unwrap();
+        assert_eq!(count, 350);
+        assert_eq!(written, out.len());
+        let merged = BlockPostingList::deserialize(&out).unwrap();
+        assert!(merged.has_position_cursors());
+        let all: Vec<(u32, u32)> = a
+            .iter()
+            .copied()
+            .chain(b.iter().map(|&(d, tf)| (d + 1000, tf)))
+            .collect();
+        assert_eq!(collect_postings(&merged), all);
+        assert_eq!(iterator_cursors(&merged), expected_cursors(&all));
+        assert_eq!(
+            merged.total_positions(),
+            all.iter().map(|&(_, tf)| tf as u64).sum::<u64>()
+        );
+        // The in-memory reference agrees.
+        let reference = BlockPostingList::concatenate_blocks(&[
+            (build_bpl_with_positions(&a), 0),
+            (build_bpl_with_positions(&b), 1000),
+        ])
+        .unwrap();
+        assert_eq!(iterator_cursors(&reference), expected_cursors(&all));
+        // Mixing lists with and without cursors is refused.
+        let plain = serialize_bpl(&build_bpl(&b));
+        assert!(
+            BlockPostingList::concatenate_streaming(
+                &[(&bytes_a, 0), (&plain, 1000)],
+                &mut Vec::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]

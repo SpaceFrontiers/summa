@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
-use crate::structures::{BlockPostingIterator, BlockPostingList, PositionPostingList, TERMINATED};
+use crate::structures::{BlockPostingIterator, BlockPostingList, TERMINATED, TermPositions};
 use crate::{DocId, Score};
 
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture};
@@ -18,6 +18,12 @@ pub struct PhraseQuery {
     pub field: Field,
     /// Terms in the phrase, in order
     pub terms: Vec<Vec<u8>>,
+    /// Token offset of each term inside the phrase, ascending, one per term.
+    /// `offsets[i + 1] - offsets[i]` is the required distance between two
+    /// consecutive terms: 1 for adjacent words, more when index-time stop
+    /// words were dropped between them (`quantum@0 art@3`). [`PhraseQuery::new`]
+    /// makes every term adjacent.
+    pub offsets: Vec<u32>,
     /// Optional slop (max distance between terms, 0 = exact phrase)
     pub slop: u32,
     /// Optional global statistics for cross-segment IDF
@@ -26,10 +32,17 @@ pub struct PhraseQuery {
 
 impl std::fmt::Display for PhraseQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let terms: Vec<_> = self
+        let terms: Vec<String> = self
             .terms
             .iter()
-            .map(|t| String::from_utf8_lossy(t))
+            .zip(&self.offsets)
+            .map(|(term, offset)| {
+                if self.is_adjacent() {
+                    String::from_utf8_lossy(term).into_owned()
+                } else {
+                    format!("{}@{offset}", String::from_utf8_lossy(term))
+                }
+            })
             .collect();
         write!(f, "Phrase({}:\"{}\"", self.field.0, terms.join(" "))?;
         if self.slop > 0 {
@@ -49,17 +62,38 @@ impl std::fmt::Debug for PhraseQuery {
         f.debug_struct("PhraseQuery")
             .field("field", &self.field)
             .field("terms", &terms)
+            .field("offsets", &self.offsets)
             .field("slop", &self.slop)
             .finish()
     }
 }
 
 impl PhraseQuery {
-    /// Create a new exact phrase query
+    /// Create a new exact phrase query of adjacent terms.
     pub fn new(field: Field, terms: Vec<Vec<u8>>) -> Self {
+        let offsets = (0..terms.len() as u32).collect();
         Self {
             field,
             terms,
+            offsets,
+            slop: 0,
+            global_stats: None,
+        }
+    }
+
+    /// Create a phrase whose terms carry their token offsets, as produced by
+    /// a tokenizer that drops stop words without renumbering (`(0, quantum)`,
+    /// `(3, art)` for "quantum of the art"). Offsets must be ascending.
+    pub fn with_offsets(field: Field, terms: Vec<(u32, Vec<u8>)>) -> Self {
+        debug_assert!(
+            terms.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "phrase offsets must be strictly ascending"
+        );
+        let (offsets, terms): (Vec<u32>, Vec<Vec<u8>>) = terms.into_iter().unzip();
+        Self {
+            field,
+            terms,
+            offsets,
             slop: 0,
             global_stats: None,
         }
@@ -67,21 +101,22 @@ impl PhraseQuery {
 
     /// Create from text using the simple tokenizer (whitespace split,
     /// punctuation stripped, lowercased). Fields with a stemming tokenizer
-    /// should tokenize the phrase themselves and call [`PhraseQuery::new`] so
-    /// the query terms match the indexed stems.
+    /// should tokenize the phrase themselves and call
+    /// [`PhraseQuery::with_offsets`] so the query terms match the indexed
+    /// stems and keep the gaps of dropped stop words.
     pub fn text(field: Field, phrase: &str) -> Self {
         use crate::tokenizer::Tokenizer;
-        let terms: Vec<Vec<u8>> = crate::tokenizer::SimpleTokenizer
+        let terms: Vec<(u32, Vec<u8>)> = crate::tokenizer::SimpleTokenizer
             .tokenize(phrase)
             .into_iter()
-            .map(|token| token.text.into_bytes())
+            .map(|token| (token.position, token.text.into_bytes()))
             .collect();
-        Self {
-            field,
-            terms,
-            slop: 0,
-            global_stats: None,
-        }
+        Self::with_offsets(field, terms)
+    }
+
+    /// Whether every term must directly follow the previous one.
+    fn is_adjacent(&self) -> bool {
+        self.offsets.windows(2).all(|pair| pair[1] == pair[0] + 1)
     }
 
     /// Set slop (max distance between terms)
@@ -104,7 +139,8 @@ impl PhraseQuery {
 /// The phrase is a conjunction, so draining the positional scorer costs one
 /// pass over the matching chunks only.
 fn build_chunked_phrase_scorer<'a>(
-    term_data: Vec<(BlockPostingList, PositionPostingList)>,
+    term_data: Vec<(BlockPostingList, TermPositions)>,
+    offsets: &[u32],
     slop: u32,
     reader: &SegmentReader,
     field: Field,
@@ -123,8 +159,10 @@ fn build_chunked_phrase_scorer<'a>(
         .map(|(p, _)| super::bm25_idf(p.doc_count() as f32, num_chunks))
         .sum();
     let (postings, positions): (Vec<_>, Vec<_>) = term_data.into_iter().unzip();
-    let mut scorer = PhraseScorer::new(postings, positions, slop, idf, chunk_map.avg_len())
-        .with_chunk_lengths(chunk_map.clone());
+    let mut scorer =
+        PhraseScorer::new(postings, positions, offsets, slop, idf, chunk_map.avg_len())
+            .with_lengths(Lengths::Chunks(chunk_map.clone()))
+            .with_params(super::Bm25Params::for_field(reader.schema(), field));
 
     use super::docset::DocSet as _;
     let mut raw: Vec<(u32, u16, f32)> = Vec::new();
@@ -133,14 +171,19 @@ fn build_chunked_phrase_scorer<'a>(
         raw.push((doc_id, ordinal, scorer.score()));
         scorer.advance();
     }
+    // Every matching document is kept: a phrase is also used as a MUST
+    // constraint (verifier or bitset), where truncating to `limit` would
+    // silently reject documents that do contain the phrase.
+    let _ = limit;
     let combined =
-        crate::segment::combine_ordinal_results(raw, super::MultiValueCombiner::Max, limit.max(1));
+        crate::segment::combine_ordinal_results(raw, super::MultiValueCombiner::Max, usize::MAX);
     Ok(Box::new(super::vector::VectorResultScorer::new(combined, field.0)) as Box<dyn Scorer + 'a>)
 }
 
 /// Build a PhraseScorer from already-fetched term data.
 fn build_phrase_scorer<'a>(
-    term_data: Vec<(BlockPostingList, PositionPostingList)>,
+    term_data: Vec<(BlockPostingList, TermPositions)>,
+    offsets: &[u32],
     slop: u32,
     reader: &SegmentReader,
     field: Field,
@@ -155,13 +198,12 @@ fn build_phrase_scorer<'a>(
         .sum();
     let avg_field_len = reader.avg_field_len(field);
     let (postings, positions): (Vec<_>, Vec<_>) = term_data.into_iter().unzip();
-    Box::new(PhraseScorer::new(
-        postings,
-        positions,
-        slop,
-        idf,
-        avg_field_len,
-    ))
+    let mut scorer = PhraseScorer::new(postings, positions, offsets, slop, idf, avg_field_len)
+        .with_params(super::Bm25Params::for_field(reader.schema(), field));
+    if let Some(lengths) = reader.doc_lengths(field) {
+        scorer = scorer.with_lengths(Lengths::Docs(lengths.clone()));
+    }
+    Box::new(scorer)
 }
 
 // ── Shared early-return checks for phrase scorer ─────────────────────────
@@ -189,6 +231,12 @@ macro_rules! phrase_early_returns {
 }
 
 impl Query for PhraseQuery {
+    fn text_terms(&self, out: &mut Vec<(Field, Vec<u8>)>) {
+        for term in &self.terms {
+            out.push((self.field, term.clone()));
+        }
+    }
+
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
     }
@@ -201,6 +249,7 @@ impl Query for PhraseQuery {
     ) -> ScorerFuture<'a> {
         let field = self.field;
         let terms = self.terms.clone();
+        let offsets = self.offsets.clone();
         let slop = self.slop;
 
         Box::pin(async move {
@@ -228,9 +277,13 @@ impl Query for PhraseQuery {
             }
 
             if reader.is_chunked_field(field) {
-                return build_chunked_phrase_scorer(term_data, slop, reader, field, limit);
+                return build_chunked_phrase_scorer(
+                    term_data, &offsets, slop, reader, field, limit,
+                );
             }
-            Ok(build_phrase_scorer(term_data, slop, reader, field))
+            Ok(build_phrase_scorer(
+                term_data, &offsets, slop, reader, field,
+            ))
         })
     }
 
@@ -261,7 +314,7 @@ impl Query for PhraseQuery {
 
         // Parallel fetch across all terms via rayon
         use rayon::prelude::*;
-        let pairs: crate::Result<Vec<Option<(BlockPostingList, PositionPostingList)>>> = self
+        let pairs: crate::Result<Vec<Option<(BlockPostingList, TermPositions)>>> = self
             .terms
             .par_iter()
             .map(|term| {
@@ -282,11 +335,68 @@ impl Query for PhraseQuery {
         }
 
         if reader.is_chunked_field(self.field) {
-            return build_chunked_phrase_scorer(term_data, self.slop, reader, self.field, limit);
+            return build_chunked_phrase_scorer(
+                term_data,
+                &self.offsets,
+                self.slop,
+                reader,
+                self.field,
+                limit,
+            );
         }
         Ok(build_phrase_scorer(
-            term_data, self.slop, reader, self.field,
+            term_data,
+            &self.offsets,
+            self.slop,
+            reader,
+            self.field,
         ))
+    }
+
+    /// Every document containing the phrase, as a bitset (documents, also
+    /// for chunked fields). Lets the planner push a quoted span into the
+    /// MaxScore executors as an O(1) predicate instead of a verifier.
+    #[cfg(feature = "sync")]
+    fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        if self.terms.is_empty() {
+            return None;
+        }
+        let mut bitset = super::DocBitset::new(reader.num_docs());
+        if self.terms.len() == 1 {
+            // A one-term phrase is the term itself; walk its postings and
+            // resolve chunk ids to documents where needed.
+            let list = reader
+                .get_postings_sync(self.field, &self.terms[0])
+                .ok()??;
+            let chunk_map = reader.chunk_map(self.field);
+            let mut it = list.iterator();
+            while it.doc() != TERMINATED {
+                let doc = chunk_map.map_or(it.doc(), |map| map.doc_id(it.doc()));
+                bitset.set(doc);
+                it.advance();
+            }
+            return Some(bitset);
+        }
+        let mut scorer = self
+            .scorer_sync_with_options(reader, usize::MAX, super::ScorerOptions::with_positions())
+            .ok()?;
+        while scorer.doc() != TERMINATED {
+            bitset.set(scorer.doc());
+            scorer.advance();
+        }
+        Some(bitset)
+    }
+
+    /// Matches are at most the rarest term's postings; the planner only
+    /// needs the order of magnitude to pick which clause to materialize.
+    #[cfg(feature = "sync")]
+    fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {
+        let mut min = u64::MAX;
+        for term in &self.terms {
+            let list = reader.get_postings_sync(self.field, term).ok()??;
+            min = min.min(u64::from(list.doc_count()));
+        }
+        Some((min / 10).max(1))
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
@@ -314,23 +424,49 @@ impl Query for PhraseQuery {
     }
 }
 
+/// Real lengths of the scoring units of a phrase: chunk lengths of a chunked
+/// field or persisted document lengths of a plain field.
+enum Lengths {
+    Chunks(crate::segment::chunk_map::ChunkMap),
+    Docs(crate::segment::chunk_map::DocLengths),
+}
+
+impl Lengths {
+    fn length(&self, id: u32) -> u32 {
+        match self {
+            Lengths::Chunks(map) => map.length(id),
+            Lengths::Docs(lengths) => lengths.length(id),
+        }
+    }
+}
+
 /// Scorer that checks phrase positions
 struct PhraseScorer {
     /// Posting iterators for each term
     posting_iters: Vec<BlockPostingIterator<'static>>,
-    /// Position iterators for each term
-    position_lists: Vec<PositionPostingList>,
+    /// Positions of each term (legacy list or cursor-addressed stream)
+    position_lists: Vec<TermPositions>,
+    /// One decoded position block, reused across documents and terms
+    position_scratch: Vec<u32>,
+    /// Required distance of each term from the first one (`offsets[i] -
+    /// offsets[0]`); `deltas[0]` is 0.
+    deltas: Vec<u32>,
     /// Max slop between terms
     slop: u32,
     /// Current matching document
     current_doc: DocId,
+    /// Number of phrase occurrences in the current document (phrase
+    /// frequency), the `tf` of the phrase for BM25.
+    current_matches: u32,
     /// Combined IDF
     idf: f32,
+    /// Per-field k1/b.
+    params: super::Bm25Params,
     /// Average field length
     avg_field_len: f32,
-    /// Real per-chunk lengths for chunked fields (posting ids are virtual
-    /// chunk ids). `None` keeps the historic `tf`-as-length approximation.
-    chunk_lengths: Option<crate::segment::chunk_map::ChunkMap>,
+    /// Real lengths of the scoring units. `None` keeps the historic
+    /// `tf`-as-length approximation.
+    lengths: Option<Lengths>,
     /// Reusable position buffers (one per term, avoids per-document allocation)
     position_bufs: Vec<Vec<u32>>,
 }
@@ -338,7 +474,8 @@ struct PhraseScorer {
 impl PhraseScorer {
     fn new(
         posting_lists: Vec<BlockPostingList>,
-        position_lists: Vec<PositionPostingList>,
+        position_lists: Vec<TermPositions>,
+        offsets: &[u32],
         slop: u32,
         idf: f32,
         avg_field_len: f32,
@@ -349,14 +486,24 @@ impl PhraseScorer {
             .collect();
 
         let num_terms = position_lists.len();
+        // Offsets are optional for callers that built the query term by
+        // term; missing entries mean adjacency.
+        let first = offsets.first().copied().unwrap_or(0);
+        let deltas: Vec<u32> = (0..num_terms)
+            .map(|i| offsets.get(i).map_or(i as u32, |o| o - first))
+            .collect();
         let mut scorer = Self {
             posting_iters,
             position_lists,
+            position_scratch: Vec::new(),
+            deltas,
             slop,
             current_doc: 0,
+            current_matches: 0,
+            params: super::Bm25Params::default(),
             idf,
             avg_field_len,
-            chunk_lengths: None,
+            lengths: None,
             position_bufs: (0..num_terms).map(|_| Vec::new()).collect(),
         };
 
@@ -364,9 +511,15 @@ impl PhraseScorer {
         scorer
     }
 
-    /// Score with each chunk's real length (chunked fields).
-    fn with_chunk_lengths(mut self, lengths: crate::segment::chunk_map::ChunkMap) -> Self {
-        self.chunk_lengths = Some(lengths);
+    /// Score with the real length of each scoring unit.
+    fn with_lengths(mut self, lengths: Lengths) -> Self {
+        self.lengths = Some(lengths);
+        self
+    }
+
+    /// Score with the field's BM25 parameters.
+    fn with_params(mut self, params: super::Bm25Params) -> Self {
+        self.params = params;
         self
     }
 
@@ -423,43 +576,48 @@ impl PhraseScorer {
 
     /// Check if positions form a valid phrase for the given document
     fn check_phrase_positions(&mut self, doc_id: DocId) -> bool {
-        // Get positions for each term into reusable buffers (zero allocation)
-        for (i, pos_list) in self.position_lists.iter().enumerate() {
-            if !pos_list.get_positions_into(doc_id, &mut self.position_bufs[i]) {
+        // Get positions for each term into reusable buffers (zero allocation).
+        // The doc-posting iterator of every term is parked on `doc_id`, so
+        // its cursor and term frequency address the term's position stream.
+        for i in 0..self.position_lists.len() {
+            let cursor = self.posting_iters[i].position_cursor();
+            let tf = self.posting_iters[i].term_freq();
+            if !self.position_lists[i].positions_into(
+                doc_id,
+                cursor,
+                tf,
+                &mut self.position_scratch,
+                &mut self.position_bufs[i],
+            ) {
                 return false;
             }
         }
 
-        // Check for consecutive positions
-        // For exact phrase (slop=0), position[i+1] = position[i] + 1
-        self.find_phrase_match_from_bufs()
+        // Count the occurrences: every position of the first term that
+        // starts a full match. The count is the phrase frequency BM25 scores.
+        self.current_matches = self.count_phrase_matches_in_bufs();
+        self.current_matches > 0
     }
 
-    /// Find phrase match using the internal reusable buffers
-    fn find_phrase_match_from_bufs(&self) -> bool {
+    /// Number of phrase occurrences in the internal reusable buffers.
+    fn count_phrase_matches_in_bufs(&self) -> u32 {
         if self.position_bufs.is_empty() || self.position_bufs[0].is_empty() {
-            return false;
+            return 0;
         }
-
-        for &first_pos in &self.position_bufs[0] {
-            if self.check_phrase_from_position(first_pos, &self.position_bufs) {
-                return true;
-            }
-        }
-
-        false
+        self.position_bufs[0]
+            .iter()
+            .filter(|&&first_pos| self.check_phrase_from_position(first_pos, &self.position_bufs))
+            .count() as u32
     }
 
     /// Check if a phrase exists starting from the given position
     fn check_phrase_from_position(&self, start_pos: u32, term_positions: &[Vec<u32>]) -> bool {
-        let mut expected_pos = start_pos;
-
         for (i, positions) in term_positions.iter().enumerate() {
             if i == 0 {
                 continue; // Skip first term, already matched
             }
 
-            expected_pos += 1;
+            let expected_pos = start_pos + self.deltas[i];
 
             // Find a position within slop distance
             let found = positions.iter().any(|&pos| {
@@ -517,21 +675,23 @@ impl Scorer for PhraseScorer {
             return 0.0;
         }
 
-        // Sum term frequencies for BM25 scoring
-        let tf: f32 = self
-            .posting_iters
-            .iter()
-            .map(|it| it.term_freq() as f32)
-            .sum();
+        // BM25 over the phrase frequency with the summed idf of the terms
+        // (Lucene semantics): a document with two occurrences of the phrase
+        // outranks one with a single occurrence at equal length.
+        let tf = self.current_matches.max(1) as f32;
 
-        // Chunked fields know the real chunk length; other fields keep the
-        // `tf`-as-length approximation.
-        let doc_len = match &self.chunk_lengths {
-            Some(lengths) => lengths.length(self.current_doc) as f32,
-            None => tf,
+        // Real unit length when the segment has it; otherwise the summed
+        // term frequency stands in for the length (legacy segments).
+        let doc_len = match &self.lengths {
+            Some(lengths) => (lengths.length(self.current_doc) as f32).max(1.0),
+            None => self
+                .posting_iters
+                .iter()
+                .map(|it| it.term_freq() as f32)
+                .sum::<f32>()
+                .max(tf),
         };
 
-        // Phrase matches get a boost since they're more precise
-        super::bm25_score(tf, self.idf, doc_len, self.avg_field_len) * 1.5
+        self.params.score(tf, self.idf, doc_len, self.avg_field_len)
     }
 }

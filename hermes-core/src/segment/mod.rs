@@ -21,6 +21,8 @@ pub(crate) mod reader;
 pub(crate) mod reorder;
 mod store;
 #[cfg(feature = "native")]
+pub(crate) mod text_reorder;
+#[cfg(feature = "native")]
 mod tracker;
 mod types;
 mod vector_data;

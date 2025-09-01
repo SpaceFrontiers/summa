@@ -974,7 +974,26 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     // every binary merge already compacts its ANN payload to one extent per
     // cluster, so a segment reaching reorder is at fragmentation 1.0 and
     // there is nothing to rewrite.
+    // Chunked text fields with the `reorder` attribute get their own BP
+    // order over their virtual ids; when any is planned the text files are
+    // rewritten instead of cloned (`text_reorder.rs`).
+    let text_plans = super::text_reorder::plan_text_reorders(
+        &reader,
+        schema,
+        memory_budget,
+        bp_budget,
+        cancellation.as_deref(),
+        rayon_pool.clone(),
+    )
+    .await?;
+    let rewrite_text = !text_plans.is_empty();
     let copy_start = std::time::Instant::now();
+    let text_file = |path: &Path| {
+        path == src_files.term_dict.as_path()
+            || path == src_files.postings.as_path()
+            || path == src_files.positions.as_path()
+            || path == src_files.chunks.as_path()
+    };
     for (src, dst, required) in [
         (&src_files.term_dict, &dst_files.term_dict, true),
         (&src_files.postings, &dst_files.postings, true),
@@ -1003,6 +1022,9 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         if cancellation_requested(cancellation.as_deref()) {
             return Err(crate::Error::IndexClosed);
         }
+        if rewrite_text && text_file(src) {
+            continue;
+        }
         clone_segment_file(
             dir,
             schema.index_label(),
@@ -1018,7 +1040,20 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         schema.index_label(),
         copy_start.elapsed().as_secs_f64(),
     );
-
+    let text_converged = if rewrite_text {
+        super::text_reorder::rewrite_text_files(
+            dir,
+            &reader,
+            &dst_files,
+            schema,
+            &text_plans,
+            cancellation.as_deref(),
+        )
+        .await?;
+        text_plans.iter().all(|plan| plan.converged)
+    } else {
+        true
+    };
     // Rebuild sparse file with reordered BMP data
     let bp_converged = reorder_sparse_file(
         dir,
@@ -1032,7 +1067,6 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         rayon_pool,
     )
     .await?;
-
     // Write new meta with output segment ID
     let src_meta = reader.meta();
     let meta = SegmentMeta {
@@ -1045,7 +1079,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     dir.write_durable(&dst_files.meta, &meta.serialize()?)
         .await?;
 
-    Ok((output_id.to_hex(), num_docs, bp_converged))
+    Ok((output_id.to_hex(), num_docs, bp_converged && text_converged))
 }
 
 /// Rewrite only a segment's dense-vector file while retaining every immutable

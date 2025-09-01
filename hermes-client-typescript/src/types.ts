@@ -82,6 +82,14 @@ export interface MatchQuery {
   text: string;
   /** Passed to the field's tokenizer; a dynamic stemmer reads a language list ("ru,en"). */
   tokenizerHint?: string;
+  /** Proximity rescoring weight for the top BM25 candidates (0 = off). */
+  proximityWeight?: number;
+  /** Unordered proximity window size (0 = 8). */
+  proximityWindow?: number;
+  /** Approximate text top-k: skip candidates below threshold / heapFactor (<= 1 = exact). */
+  heapFactor?: number;
+  /** Keep only the highest-idf terms of a long query (0 = all). */
+  maxTerms?: number;
 }
 
 /** Consecutive-terms query on a field indexed with token positions. */
@@ -248,4 +256,6 @@ export interface SearchRequest {
   reranker?: Reranker;
   /** Shared first-stage candidate pool (0 = result window, maximum: 2x). */
   candidateLimit?: number;
+  /** Anytime mode: wall-clock budget of the scoring phase in ms (0 = exact). */
+  timeBudgetMs?: number;
 }

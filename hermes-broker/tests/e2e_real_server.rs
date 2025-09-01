@@ -235,6 +235,8 @@ async fn broker_routes_real_hermes_servers() {
     let mut search = broker_search_client(&broker).await;
     let found = search
         .search(SearchRequest {
+            time_budget_ms: 0,
+            text_stats: None,
             index_name: "docs_e2e".to_string(),
             query: Some(Query {
                 query: Some(query::Query::Term(TermQuery {
@@ -274,6 +276,8 @@ async fn broker_routes_real_hermes_servers() {
     // of shard 0's corpus.
     let empty = search
         .search(SearchRequest {
+            time_budget_ms: 0,
+            text_stats: None,
             index_name: "social_e2e".to_string(),
             query: Some(Query {
                 query: Some(query::Query::Term(TermQuery {

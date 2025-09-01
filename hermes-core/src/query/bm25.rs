@@ -11,6 +11,73 @@ pub const BM25_K1: f32 = 1.2;
 /// 0 = no length normalization, 1 = full normalization
 pub const BM25_B: f32 = 0.75;
 
+/// Per-field BM25 parameters (`indexed<k1: ..., b: ...>` in the schema).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bm25Params {
+    pub k1: f32,
+    pub b: f32,
+}
+
+impl Default for Bm25Params {
+    fn default() -> Self {
+        Self {
+            k1: BM25_K1,
+            b: BM25_B,
+        }
+    }
+}
+
+impl Bm25Params {
+    /// Resolve a field's parameters from its schema entry.
+    pub fn for_field(schema: &crate::dsl::Schema, field: crate::dsl::Field) -> Self {
+        let entry = schema.get_field_entry(field);
+        Self {
+            k1: entry.and_then(|e| e.bm25_k1).unwrap_or(BM25_K1),
+            b: entry.and_then(|e| e.bm25_b).unwrap_or(BM25_B),
+        }
+    }
+
+    /// BM25 score of one term occurrence set.
+    #[inline]
+    pub fn score(self, tf: f32, idf: f32, doc_len: f32, avg_doc_len: f32) -> f32 {
+        let length_norm = 1.0 - self.b + self.b * (doc_len / avg_doc_len.max(1.0));
+        let tf_norm = (tf * (self.k1 + 1.0)) / (tf + self.k1 * length_norm);
+        idf * tf_norm
+    }
+
+    /// BM25F score with a field boost.
+    #[inline]
+    pub fn score_boosted(
+        self,
+        tf: f32,
+        idf: f32,
+        doc_len: f32,
+        avg_doc_len: f32,
+        field_boost: f32,
+    ) -> f32 {
+        let length_norm = 1.0 - self.b + self.b * (doc_len / avg_doc_len.max(1.0));
+        let tf_norm =
+            (tf * field_boost * (self.k1 + 1.0)) / (tf * field_boost + self.k1 * length_norm);
+        idf * tf_norm
+    }
+
+    /// Upper bound with the shortest possible unit (length 0).
+    #[inline]
+    pub fn upper_bound(self, max_tf: f32, idf: f32) -> f32 {
+        let min_length_norm = 1.0 - self.b;
+        let tf_norm = (max_tf * (self.k1 + 1.0)) / (max_tf + self.k1 * min_length_norm);
+        idf * tf_norm
+    }
+
+    /// Upper bound with a known minimum unit length.
+    #[inline]
+    pub fn upper_bound_with_len(self, max_tf: f32, idf: f32, min_len: f32, avg_len: f32) -> f32 {
+        let length_norm = 1.0 - self.b + self.b * (min_len / avg_len.max(1.0));
+        let tf_norm = (max_tf * (self.k1 + 1.0)) / (max_tf + self.k1 * length_norm);
+        idf * tf_norm
+    }
+}
+
 /// Compute BM25 score for a term occurrence
 ///
 /// # Arguments
@@ -49,6 +116,16 @@ pub fn bm25f_score(tf: f32, idf: f32, doc_len: f32, avg_doc_len: f32, field_boos
 pub fn bm25_upper_bound(max_tf: f32, idf: f32) -> f32 {
     let min_length_norm = 1.0 - BM25_B;
     let tf_norm = (max_tf * (BM25_K1 + 1.0)) / (max_tf + BM25_K1 * min_length_norm);
+    idf * tf_norm
+}
+
+/// BM25 upper bound with a known minimum length of the scoring units the
+/// bound covers (a block or a whole list): the shortest unit has the
+/// weakest length normalisation, so it bounds every longer one.
+#[inline]
+pub fn bm25_upper_bound_with_len(max_tf: f32, idf: f32, min_len: f32, avg_len: f32) -> f32 {
+    let length_norm = 1.0 - BM25_B + BM25_B * (min_len / avg_len.max(1.0));
+    let tf_norm = (max_tf * (BM25_K1 + 1.0)) / (max_tf + BM25_K1 * length_norm);
     idf * tf_norm
 }
 

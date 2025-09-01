@@ -144,7 +144,7 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | bmp_block_size_kwarg | bmp_grid_bits_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | sparse_max_weight_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | bmp_block_size_kwarg | bmp_grid_bits_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | sparse_max_weight_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | bm25_k1_kwarg | bm25_b_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -153,6 +153,11 @@ positions_kwarg = { "positions" | "ordinal" | "token_position" }
 // Chunked text: every value of the field is its own BM25 scoring unit
 // (see docs/chunked-text-fields.md).
 chunked_kwarg = { "chunked" }
+// BM25 parameters of a text field (defaults k1 1.2, b 0.75):
+//   field body: text<en_stem> [indexed<token_position, k1: 0.9, b: 0.4>]
+bm25_k1_kwarg = { "k1" ~ ":" ~ bm25_param_spec }
+bm25_b_kwarg = { "b" ~ ":" ~ bm25_param_spec }
+bm25_param_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
 index_type_spec = { "flat" | "ivf_pq" | "ivf_tq" | "ivf" | "scann" | "tq" }
 num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }

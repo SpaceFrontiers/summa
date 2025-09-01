@@ -3312,6 +3312,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tokenizers",
  "tokio",
+ "unicode-normalization",
+ "unicode-segmentation",
  "uuid",
  "zstd 0.13.3",
 ]

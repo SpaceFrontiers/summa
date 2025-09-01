@@ -57,7 +57,11 @@ rust-openzl = "0.1"
 
 # Text processing
 rust-stemmers = "1.2"
-stop-words = "0.10"
+# NLTK lists (~150-250 words per language) for the routed languages; the
+# default ISO lists are far larger and drop content words such as "state".
+stop-words = { version = "0.10", features = ["nltk"] }
+unicode-segmentation = "1.12"
+unicode-normalization = "0.1"
 
 # Collections and utilities
 rustc-hash = "2.1"

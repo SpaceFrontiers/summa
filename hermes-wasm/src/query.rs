@@ -299,7 +299,7 @@ fn field_tokens(
     tokenizer_hint: Option<&str>,
     schema: &Schema,
     tokenizers: &TokenizerRegistry,
-) -> Result<(hermes_core::Field, Vec<String>), JsValue> {
+) -> Result<(hermes_core::Field, Vec<(u32, String)>), JsValue> {
     let field = schema
         .get_field(field_name)
         .ok_or_else(|| JsValue::from_str(&format!("Unknown field: '{}'", field_name)))?;
@@ -311,10 +311,10 @@ fn field_tokens(
         .get(tokenizer_name)
         .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
     let hint = tokenizer_hint.map(str::trim).filter(|h| !h.is_empty());
-    let tokens: Vec<String> = tok
+    let tokens: Vec<(u32, String)> = tok
         .tokenize_hinted(text, hint)
         .into_iter()
-        .map(|t| t.text)
+        .map(|t| (t.position, t.text))
         .collect();
     if tokens.is_empty() {
         return Err(JsValue::from_str("No tokens in query"));
@@ -334,10 +334,10 @@ fn tokenize_and_build(
 ) -> Result<Box<dyn Query>, JsValue> {
     let (field, tokens) = field_tokens(field_name, text, tokenizer_hint, schema, tokenizers)?;
     if tokens.len() == 1 {
-        return Ok(Box::new(TermQuery::text(field, &tokens[0])));
+        return Ok(Box::new(TermQuery::text(field, &tokens[0].1)));
     }
     let mut bq = BooleanQuery::new();
-    for token in tokens {
+    for (_, token) in tokens {
         if must {
             bq = bq.must(TermQuery::text(field, &token));
         } else {
@@ -383,8 +383,13 @@ pub(crate) fn convert_query(
             schema,
             tokenizers,
         )?;
-        let terms = tokens.into_iter().map(String::into_bytes).collect();
-        return Ok(Box::new(PhraseQuery::new(field, terms).with_slop(pq.slop)));
+        let terms = tokens
+            .into_iter()
+            .map(|(offset, token)| (offset, token.into_bytes()))
+            .collect();
+        return Ok(Box::new(
+            PhraseQuery::with_offsets(field, terms).with_slop(pq.slop),
+        ));
     }
 
     if let Some(ref bq) = js.boolean {

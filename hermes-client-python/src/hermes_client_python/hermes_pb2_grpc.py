@@ -55,6 +55,12 @@ class SearchServiceStub:
             response_deserializer=hermes__pb2.GetIndexInfoResponse.FromString,
             _registered_method=True,
         )
+        self.GetTextStats = channel.unary_unary(
+            "/hermes.SearchService/GetTextStats",
+            request_serializer=hermes__pb2.GetTextStatsRequest.SerializeToString,
+            response_deserializer=hermes__pb2.GetTextStatsResponse.FromString,
+            _registered_method=True,
+        )
 
 
 class SearchServiceServicer:
@@ -78,6 +84,17 @@ class SearchServiceServicer:
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
+    def GetTextStats(self, request, context):
+        """Text statistics (document frequencies, corpus sizes, average lengths)
+        of the BM25 terms of a query over this backend's index. A broker that
+        scatters one index over several shards sums the responses and sends the
+        total back as `SearchRequest.text_stats`, so every shard scores with
+        the same IDF.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
 
 def add_SearchServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -95,6 +112,11 @@ def add_SearchServiceServicer_to_server(servicer, server):
             servicer.GetIndexInfo,
             request_deserializer=hermes__pb2.GetIndexInfoRequest.FromString,
             response_serializer=hermes__pb2.GetIndexInfoResponse.SerializeToString,
+        ),
+        "GetTextStats": grpc.unary_unary_rpc_method_handler(
+            servicer.GetTextStats,
+            request_deserializer=hermes__pb2.GetTextStatsRequest.FromString,
+            response_serializer=hermes__pb2.GetTextStatsResponse.SerializeToString,
         ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -187,6 +209,36 @@ class SearchService:
             "/hermes.SearchService/GetIndexInfo",
             hermes__pb2.GetIndexInfoRequest.SerializeToString,
             hermes__pb2.GetIndexInfoResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def GetTextStats(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/hermes.SearchService/GetTextStats",
+            hermes__pb2.GetTextStatsRequest.SerializeToString,
+            hermes__pb2.GetTextStatsResponse.FromString,
             options,
             channel_credentials,
             insecure,

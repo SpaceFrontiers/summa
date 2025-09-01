@@ -30,9 +30,7 @@ fn validate_token_expansion(kind: &str, count: usize, maximum: usize) -> Result<
     Ok(())
 }
 
-/// Resolve a text field and tokenize query text with the field's configured
-/// tokenizer, so stemmers (static or hinted dynamic ones) match the indexing
-/// path. An empty `tokenizer_hint` means "no hint".
+/// [`field_token_stream`] reduced to the token texts.
 fn field_tokens(
     kind: &str,
     schema: &Schema,
@@ -41,6 +39,23 @@ fn field_tokens(
     tokenizer_hint: &str,
     shape: &QueryShapeLimits,
 ) -> Result<(hermes_core::Field, Vec<String>), String> {
+    let (field, tokens) =
+        field_token_stream(kind, schema, field_name, text, tokenizer_hint, shape)?;
+    Ok((field, tokens.into_iter().map(|t| t.text).collect()))
+}
+
+/// Resolve a text field and tokenize query text with the field's configured
+/// tokenizer, so stemmers (static or hinted dynamic ones) match the indexing
+/// path. An empty `tokenizer_hint` means "no hint". Tokens keep the
+/// positions the tokenizer assigned, including gaps of dropped stop words.
+fn field_token_stream(
+    kind: &str,
+    schema: &Schema,
+    field_name: &str,
+    text: &str,
+    tokenizer_hint: &str,
+    shape: &QueryShapeLimits,
+) -> Result<(hermes_core::Field, Vec<hermes_core::tokenizer::Token>), String> {
     let field = schema
         .get_field(field_name)
         .ok_or_else(|| format!("Field '{field_name}' not found"))?;
@@ -60,13 +75,52 @@ fn field_tokens(
         .get(tokenizer_name)
         .unwrap_or_else(|| Box::new(hermes_core::SimpleTokenizer));
     let hint = Some(tokenizer_hint.trim()).filter(|hint| !hint.is_empty());
-    let tokens: Vec<String> = tokenizer
-        .tokenize_hinted(text, hint)
-        .into_iter()
-        .map(|t| t.text)
-        .collect();
+    let tokens = tokenizer.tokenize_hinted(text, hint);
     validate_token_expansion(kind, tokens.len(), shape.max_text_query_tokens)?;
     Ok((field, tokens))
+}
+
+/// Whether a clause is a phrase (or a Boolean made only of such phrases)
+/// that tokenizes to nothing on its field, typically because every word is a
+/// stop word of the field's tokenizer. Such a constraint can be neither
+/// verified nor refuted from the index, so Boolean conversion drops it.
+fn is_unverifiable_phrase(
+    q: &proto::Query,
+    schema: &Schema,
+    shape: &QueryShapeLimits,
+) -> Result<bool, String> {
+    match &q.query {
+        Some(ProtoQueryType::Phrase(phrase)) => {
+            if phrase.text.strip_suffix('*').is_some() {
+                return Ok(false);
+            }
+            let (_, tokens) = field_token_stream(
+                "PhraseQuery",
+                schema,
+                &phrase.field,
+                &phrase.text,
+                &phrase.tokenizer_hint,
+                shape,
+            )?;
+            Ok(tokens.is_empty())
+        }
+        Some(ProtoQueryType::Boolean(inner)) => {
+            let clauses = inner
+                .must
+                .iter()
+                .chain(&inner.should)
+                .chain(&inner.must_not);
+            let mut any = false;
+            for clause in clauses {
+                any = true;
+                if !is_unverifiable_phrase(clause, schema, shape)? {
+                    return Ok(false);
+                }
+            }
+            Ok(any)
+        }
+        _ => Ok(false),
+    }
 }
 
 /// Convert proto combiner enum to core MultiValueCombiner
@@ -160,20 +214,54 @@ pub fn convert_query(
                 ));
             }
 
-            if tokens.len() == 1 {
+            // Query term de-duplication: a repeated token becomes one clause
+            // weighted by its query term frequency (same score as the
+            // repeated clauses, one cursor instead of several).
+            let mut distinct: Vec<(String, f32)> = Vec::with_capacity(tokens.len());
+            for token in tokens {
+                match distinct.iter_mut().find(|(t, _)| *t == token) {
+                    Some((_, count)) => *count += 1.0,
+                    None => distinct.push((token, 1.0)),
+                }
+            }
+            let term_clause = |token: &str, count: f32| -> Box<dyn Query> {
+                if count > 1.0 {
+                    Box::new(hermes_core::query::BoostQuery::new(
+                        TermQuery::text(field, token),
+                        count,
+                    ))
+                } else {
+                    Box::new(TermQuery::text(field, token))
+                }
+            };
+
+            if distinct.len() == 1 {
                 // Single token - use TermQuery directly
-                return Ok(Box::new(TermQuery::text(field, &tokens[0])));
+                let (token, count) = &distinct[0];
+                return Ok(term_clause(token, *count));
             }
 
             // Multiple tokens - use BooleanQuery with SHOULD clauses (MaxScore fast path)
             let mut query = BooleanQuery::new();
-            for token in tokens {
-                query = query.should(TermQuery::text(field, &token));
+            for (token, count) in &distinct {
+                query = query.should(term_clause(token, *count));
+            }
+            if match_query.proximity_weight > 0.0 {
+                query = query.with_proximity(hermes_core::query::ProximityConfig::new(
+                    match_query.proximity_weight,
+                    match_query.proximity_window,
+                ));
+            }
+            if match_query.heap_factor > 1.0 {
+                query = query.with_text_heap_factor(match_query.heap_factor);
+            }
+            if match_query.max_terms > 0 {
+                query = query.with_max_terms(match_query.max_terms as usize);
             }
             Ok(Box::new(query))
         }
         Some(ProtoQueryType::Phrase(phrase_query)) => {
-            let (field, tokens) = field_tokens(
+            let (field, tokens) = field_token_stream(
                 "PhraseQuery",
                 schema,
                 &phrase_query.field,
@@ -183,15 +271,19 @@ pub fn convert_query(
             )?;
             if tokens.is_empty() {
                 return Err(format!(
-                    "No tokens in phrase query text '{}'",
+                    "No tokens in phrase query text '{}' after tokenization (only stop words?)",
                     phrase_query.text
                 ));
             }
             // PhraseQuery itself collapses one term to a TermQuery and, on a
-            // field without positions, degrades to a MUST of the terms.
-            let terms = tokens.into_iter().map(String::into_bytes).collect();
+            // field without positions, degrades to a MUST of the terms. Token
+            // offsets keep the gaps of stop words the tokenizer dropped.
+            let terms = tokens
+                .into_iter()
+                .map(|t| (t.position, t.text.into_bytes()))
+                .collect();
             Ok(Box::new(
-                PhraseQuery::new(field, terms).with_slop(phrase_query.slop),
+                PhraseQuery::with_offsets(field, terms).with_slop(phrase_query.slop),
             ))
         }
         Some(ProtoQueryType::Boolean(bool_query)) => {
@@ -596,15 +688,34 @@ fn convert_boolean_query(
     shape: &QueryShapeLimits,
 ) -> Result<Box<dyn Query>, String> {
     let mut bq = BooleanQuery::new();
+    // A quoted span made only of stop words has no postings to check; as a
+    // MUST it would empty the result set and as a SHOULD it would contribute
+    // nothing, so it is dropped rather than failing the whole request.
+    let skip = |q: &proto::Query| -> Result<bool, String> {
+        let unverifiable = is_unverifiable_phrase(q, schema, shape)?;
+        if unverifiable {
+            warn!("Dropping phrase clause without searchable tokens: {q:?}");
+        }
+        Ok(unverifiable)
+    };
     for q in &bool_query.must {
+        if skip(q)? {
+            continue;
+        }
         let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
         bq.must.push(inner.into());
     }
     for q in &bool_query.should {
+        if skip(q)? {
+            continue;
+        }
         let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
         bq.should.push(inner.into());
     }
     for q in &bool_query.must_not {
+        if skip(q)? {
+            continue;
+        }
         let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
         bq.must_not.push(inner.into());
     }
@@ -753,6 +864,13 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             // Chunked text: every value is its own BM25 unit
             if entry.chunked {
                 idx_params.push("chunked".to_string());
+            }
+            // BM25 parameters of a text field
+            if let Some(k1) = entry.bm25_k1 {
+                idx_params.push(format!("k1: {k1}"));
+            }
+            if let Some(b) = entry.bm25_b {
+                idx_params.push(format!("b: {b}"));
             }
 
             // Positions (for text/sparse)
@@ -1241,8 +1359,129 @@ pub fn convert_proto_to_document(
     Ok(doc)
 }
 
+/// Render the text statistics of one searcher for `GetTextStats`.
+pub fn text_stats_to_proto(
+    stats: &hermes_core::query::GlobalStats,
+    schema: &hermes_core::Schema,
+) -> crate::proto::TextStats {
+    let mut fields: Vec<crate::proto::TextFieldStats> = stats
+        .text_fields()
+        .filter_map(|(field, field_stats)| {
+            let name = schema.get_field_name(field)?;
+            let mut terms: Vec<crate::proto::TermDocFreq> = field_stats
+                .doc_freqs
+                .iter()
+                .map(|(term, df)| crate::proto::TermDocFreq {
+                    term: term.as_bytes().to_vec(),
+                    doc_freq: *df,
+                })
+                .collect();
+            terms.sort_by(|a, b| a.term.cmp(&b.term));
+            Some(crate::proto::TextFieldStats {
+                field: name.to_string(),
+                corpus_size: field_stats.corpus_size,
+                avg_len: field_stats.avg_field_len,
+                terms,
+            })
+        })
+        .collect();
+    fields.sort_by(|a, b| a.field.cmp(&b.field));
+    crate::proto::TextStats {
+        total_docs: stats.total_docs(),
+        fields,
+    }
+}
+
+/// Build the scoring statistics a search runs with from a broker-supplied
+/// `SearchRequest.text_stats`. Fields unknown to this schema are dropped.
+pub fn text_stats_from_proto(
+    stats: &crate::proto::TextStats,
+    schema: &hermes_core::Schema,
+) -> hermes_core::query::GlobalStats {
+    let mut builder = hermes_core::query::GlobalStatsBuilder::new();
+    builder.total_docs = stats.total_docs;
+    for field_stats in &stats.fields {
+        let Some(field) = schema.get_field(&field_stats.field) else {
+            continue;
+        };
+        builder.set_avg_field_len(field, field_stats.avg_len.max(1.0));
+        builder.set_text_corpus_size(field, field_stats.corpus_size);
+        for term in &field_stats.terms {
+            if term.doc_freq > 0 {
+                builder.add_text_df(
+                    field,
+                    String::from_utf8_lossy(&term.term).into_owned(),
+                    term.doc_freq,
+                );
+            }
+        }
+    }
+    builder.build(0)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn match_query_deduplicates_repeated_tokens() {
+        let mut builder = hermes_core::SchemaBuilder::default();
+        builder.add_text_field_with_tokenizer("body", true, false, "simple");
+        let schema = builder.build();
+        let query = proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: "body".to_string(),
+                text: "needle needle haystack needle".to_string(),
+                tokenizer_hint: String::new(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
+            })),
+        };
+        let shape = QueryShapeLimits::default();
+        let converted = convert_query(&query, &schema, None, None, &shape).unwrap();
+        let rendered = converted.to_string();
+        assert_eq!(rendered.matches("needle").count(), 1, "{rendered}");
+        assert!(rendered.contains("haystack"), "{rendered}");
+        assert!(rendered.contains('3'), "boost of 3 expected: {rendered}");
+    }
+
+    #[test]
+    fn text_stats_round_trip_through_proto() {
+        use hermes_core::query::GlobalStatsBuilder;
+        let mut builder = hermes_core::SchemaBuilder::default();
+        let body = builder.add_text_field_with_tokenizer("body", true, false, "simple");
+        let title = builder.add_text_field_with_tokenizer("title", true, false, "simple");
+        let schema = builder.build();
+        let mut builder = GlobalStatsBuilder::new();
+        builder.total_docs = 1_000;
+        builder.set_text_corpus_size(body, 12_345);
+        builder.set_avg_field_len(body, 48.5);
+        builder.add_text_df(body, "needle".to_string(), 7);
+        builder.add_text_df(body, "haystack".to_string(), 900);
+        builder.set_text_corpus_size(title, 1_000);
+        builder.set_avg_field_len(title, 6.0);
+        builder.add_text_df(title, "needle".to_string(), 3);
+        let stats = builder.build(0);
+
+        let wire = text_stats_to_proto(&stats, &schema);
+        assert_eq!(wire.total_docs, 1_000);
+        assert_eq!(wire.fields.len(), 2);
+        let body_wire = wire.fields.iter().find(|f| f.field == "body").unwrap();
+        assert_eq!(body_wire.corpus_size, 12_345);
+        assert_eq!(body_wire.terms.len(), 2);
+
+        let back = text_stats_from_proto(&wire, &schema);
+        assert_eq!(back.total_docs(), 1_000);
+        assert_eq!(back.text_corpus_size(body), 12_345);
+        assert_eq!(back.text_df(body, "needle"), Some(7));
+        assert_eq!(back.text_df(title, "needle"), Some(3));
+        assert!((back.avg_field_len(body) - 48.5).abs() < 1e-6);
+        // IDF uses the field's corpus (chunks), not the document total.
+        let expected = ((12_345.0f32 - 7.0 + 0.5) / (7.0 + 0.5) + 1.0).ln();
+        assert!((back.text_idf(body, "needle") - expected).abs() < 1e-5);
+        assert_eq!(back.text_idf(body, "absent"), 0.0);
+    }
+
     use super::*;
 
     fn shape() -> QueryShapeLimits {
@@ -1265,8 +1504,94 @@ mod tests {
             false,
             "stem(by: languages, default: simple)",
         );
+        builder.add_text_field_with_tokenizer(
+            "stopped",
+            true,
+            false,
+            "stem(by: languages, default: simple, stop_words: true)",
+        );
         builder.add_u64_field("views", true, false);
         builder.build()
+    }
+
+    fn boolean_proto(must: Vec<proto::Query>, should: Vec<proto::Query>) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::Boolean(proto::BooleanQuery {
+                must,
+                should,
+                must_not: vec![],
+            })),
+        }
+    }
+
+    #[test]
+    fn phrase_query_keeps_the_gaps_of_dropped_stop_words() {
+        let schema = stemmed_text_schema();
+        let query = convert_query(
+            &phrase_proto("stopped", "Quantum of the Arts", 0, "en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(rendered.contains("quantum@0 art@3"), "{rendered}");
+
+        // Without stop words the same text is four adjacent terms.
+        let plain = convert_query(
+            &phrase_proto("content", "Quantum of the Arts", 0, "en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(plain.contains("\"quantum of the art\""), "{plain}");
+    }
+
+    #[test]
+    fn boolean_conversion_drops_phrases_made_only_of_stop_words() {
+        let schema = stemmed_text_schema();
+        let empty = phrase_proto("stopped", "to be or not to be", 0, "en");
+
+        // Standalone: an error, as for any query without tokens.
+        assert!(convert_query(&empty, &schema, None, None, &shape()).is_err());
+
+        // Inside a Boolean the clause disappears and the rest survives, also
+        // when it is wrapped in its own SHOULD-only Boolean (the shape a
+        // client uses to try a phrase under several fields or hints).
+        let wrapped = boolean_proto(vec![], vec![empty.clone(), empty.clone()]);
+        let query = convert_query(
+            &boolean_proto(
+                vec![empty.clone(), wrapped],
+                vec![match_proto("stopped", "hamlet", "en")],
+            ),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(!rendered.contains("Phrase("), "{rendered}");
+        assert!(rendered.contains("hamlet"), "{rendered}");
+
+        // A phrase with surviving terms is kept.
+        let kept = convert_query(
+            &boolean_proto(
+                vec![phrase_proto("stopped", "the origin of species", 0, "en")],
+                vec![],
+            ),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(kept.contains("origin@1 speci@3"), "{kept}");
     }
 
     fn phrase_proto(field: &str, text: &str, slop: u32, hint: &str) -> proto::Query {
@@ -1286,6 +1611,10 @@ mod tests {
                 field: field.to_string(),
                 text: text.to_string(),
                 tokenizer_hint: hint.to_string(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
             })),
         }
     }
@@ -1552,6 +1881,10 @@ mod tests {
                 field: "title".to_string(),
                 text: "*".to_string(),
                 tokenizer_hint: String::new(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
             })),
         };
         let explicit_empty_prefix = proto::Query {
@@ -1673,6 +2006,81 @@ mod tests {
     }
 
     #[test]
+    fn match_query_carries_proximity_rescoring() {
+        let schema = stemmed_text_schema();
+        let query = convert_query(
+            &proto::Query {
+                query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                    field: "body".to_string(),
+                    text: "running foxes".to_string(),
+                    tokenizer_hint: String::new(),
+                    proximity_weight: 0.5,
+                    proximity_window: 0,
+                    heap_factor: 0.0,
+                    max_terms: 0,
+                })),
+            },
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(rendered.contains("~proximity(0.5, 8)"), "{rendered}");
+
+        let tuned = convert_query(
+            &proto::Query {
+                query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                    field: "body".to_string(),
+                    text: "running foxes jump".to_string(),
+                    tokenizer_hint: String::new(),
+                    proximity_weight: 0.0,
+                    proximity_window: 0,
+                    heap_factor: 1.5,
+                    max_terms: 2,
+                })),
+            },
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(tuned.contains("~heap(1.5)"), "{tuned}");
+        assert!(tuned.contains("~max_terms(2)"), "{tuned}");
+        let off = convert_query(
+            &match_proto("body", "running foxes", ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        assert!(!off.to_string().contains("~proximity"), "{off}");
+    }
+
+    #[test]
+    fn schema_to_sdl_renders_bm25_parameters() {
+        let input = r#"
+            index documents {
+                field title: text<en_stem> [indexed<token_position, k1: 0.9, b: 0.4>]
+            }
+        "#;
+        let schema = hermes_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        assert!(rendered.contains("k1: 0.9"), "{rendered}");
+        assert!(rendered.contains("b: 0.4"), "{rendered}");
+        let reparsed = hermes_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let entry = reparsed
+            .get_field_entry(reparsed.get_field("title").unwrap())
+            .unwrap();
+        assert_eq!(entry.bm25_k1, Some(0.9));
+        assert_eq!(entry.bm25_b, Some(0.4));
+    }
+
+    #[test]
     fn schema_to_sdl_renders_chunked_text_fields() {
         let input = r#"
             index documents {
@@ -1698,6 +2106,10 @@ mod tests {
                 field: "content".to_string(),
                 text: "need*".to_string(),
                 tokenizer_hint: String::new(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
             })),
         };
         let error = convert_query(&query, &schema, None, None, &QueryShapeLimits::default())

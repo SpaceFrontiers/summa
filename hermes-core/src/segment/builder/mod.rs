@@ -812,7 +812,10 @@ impl SegmentBuilder {
                         }
 
                         if let Some(&slot) = self.field_to_slot.get(&field.0) {
-                            self.doc_field_lengths[base_idx + slot] = token_count;
+                            // Multi-valued fields: the document's length is
+                            // the sum over its values.
+                            let len = &mut self.doc_field_lengths[base_idx + slot];
+                            *len = len.saturating_add(token_count);
                         }
                     }
 
@@ -1391,7 +1394,8 @@ impl SegmentBuilder {
             FxHashMap::default()
         };
 
-        // Phase 1b: chunk maps of chunked text fields (small: 8 bytes per chunk).
+        // Phase 1b: chunk maps of chunked text fields (8 bytes per chunk) and
+        // per-document length columns of plain text fields (2 bytes per doc).
         let chunk_maps = std::mem::take(&mut self.chunk_maps);
         {
             let mut fields: Vec<(u32, &super::chunk_map::ChunkMapBuilder)> = chunk_maps
@@ -1399,13 +1403,52 @@ impl SegmentBuilder {
                 .filter(|(_, map)| !map.is_empty())
                 .map(|(field_id, map)| (*field_id, map))
                 .collect();
-            if !fields.is_empty() {
-                fields.sort_by_key(|(field_id, _)| *field_id);
+            fields.sort_by_key(|(field_id, _)| *field_id);
+            let num_docs = self.next_doc_id as usize;
+            let mut columns: Vec<(u32, Vec<u16>, u64)> = Vec::new();
+            for (&field_id, &slot) in &self.field_to_slot {
+                if self
+                    .schema
+                    .get_field_entry(crate::dsl::Field(field_id))
+                    .is_some_and(|entry| entry.chunked)
+                {
+                    continue;
+                }
+                let mut total = 0u64;
+                let lengths: Vec<u16> = (0..num_docs)
+                    .map(|doc| {
+                        let len = self.doc_field_lengths[doc * self.num_indexed_fields + slot];
+                        total += u64::from(len);
+                        len.min(super::chunk_map::MAX_CHUNK_LENGTH) as u16
+                    })
+                    .collect();
+                if total > 0 {
+                    columns.push((field_id, lengths, total));
+                }
+            }
+            columns.sort_by_key(|(field_id, _, _)| *field_id);
+            let norms: Vec<super::chunk_map::DocLengthsColumn<'_>> = columns
+                .iter()
+                .map(
+                    |(field_id, lengths, total)| super::chunk_map::DocLengthsColumn {
+                        field_id: *field_id,
+                        lengths,
+                        total_tokens: *total,
+                    },
+                )
+                .collect();
+            if !fields.is_empty() || !norms.is_empty() {
                 let mut writer = dir.streaming_writer(&files.chunks).await?;
-                super::chunk_map::write_chunk_maps(&mut *writer, &fields)?;
+                super::chunk_map::write_chunk_maps(&mut *writer, &fields, &norms)?;
                 writer.finish()?;
             }
         }
+        let length_lookup = postings::LengthLookup {
+            doc_lengths: &self.doc_field_lengths,
+            num_indexed_fields: self.num_indexed_fields,
+            field_to_slot: &self.field_to_slot,
+            chunk_maps: &chunk_maps,
+        };
 
         // Phase 2: 4-way parallel build — postings, store, dense vectors, sparse vectors
         // These are fully independent: different source data, different output files.
@@ -1480,6 +1523,7 @@ impl SegmentBuilder {
                                     inverted_index,
                                     term_interner,
                                     &position_offsets,
+                                    &length_lookup,
                                     &mut term_dict_writer,
                                     &mut postings_writer,
                                     spill_arg,
@@ -1546,6 +1590,7 @@ impl SegmentBuilder {
                 inverted_index,
                 term_interner,
                 &position_offsets,
+                &length_lookup,
                 &mut term_dict_writer,
                 &mut postings_writer,
             )?;

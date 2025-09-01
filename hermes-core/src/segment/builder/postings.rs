@@ -131,6 +131,32 @@ impl PositionPostingListBuilder {
     }
 }
 
+/// Length of every scoring unit while a segment is built: chunk lengths of
+/// chunked fields and per-document field lengths of plain fields. Block
+/// bounds of the doc postings are derived from it.
+pub(super) struct LengthLookup<'a> {
+    pub doc_lengths: &'a [u32],
+    pub num_indexed_fields: usize,
+    pub field_to_slot: &'a FxHashMap<u32, usize>,
+    pub chunk_maps: &'a FxHashMap<u32, crate::segment::chunk_map::ChunkMapBuilder>,
+}
+
+impl LengthLookup<'_> {
+    /// Length of scoring unit `id` (virtual chunk id or document id) of `field`.
+    pub fn length(&self, field_id: u32, id: u32) -> u32 {
+        if let Some(map) = self.chunk_maps.get(&field_id) {
+            return map.length(id);
+        }
+        let Some(&slot) = self.field_to_slot.get(&field_id) else {
+            return 0;
+        };
+        self.doc_lengths
+            .get(id as usize * self.num_indexed_fields + slot)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
 /// Intermediate result for parallel posting serialization
 pub(super) enum SerializedPosting {
     /// Inline posting (small enough to fit in TermInfo)
@@ -158,6 +184,7 @@ pub(super) fn build_postings_streaming(
     inverted_index: HashMap<TermKey, PostingListBuilder>,
     term_interner: Rodeo,
     position_offsets: &FxHashMap<Vec<u8>, (u64, u64)>,
+    lengths: &LengthLookup<'_>,
     term_dict_writer: &mut dyn Write,
     postings_writer: &mut dyn Write,
     #[cfg(feature = "native")] spill_reader: Option<(
@@ -272,8 +299,16 @@ pub(super) fn build_postings_streaming(
         }
 
         let mut posting_bytes = Vec::new();
-        let block_list =
-            crate::structures::BlockPostingList::from_posting_list(&full_postings)?;
+        // Terms with positions carry a position cursor per block so the
+        // stream written by `build_positions_streaming` is addressable; every
+        // block records the shortest scoring unit it covers for its bound.
+        let field_id = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+        let length_of = |id: u32| lengths.length(field_id, id);
+        let block_list = crate::structures::BlockPostingList::from_posting_list_with(
+            &full_postings,
+            has_positions,
+            Some(&length_of),
+        )?;
         block_list.serialize(&mut posting_bytes)?;
         let result = SerializedPosting::External {
             bytes: posting_bytes,
@@ -338,7 +373,7 @@ pub(super) fn build_positions_streaming(
     term_interner: &Rodeo,
     writer: &mut dyn Write,
 ) -> Result<FxHashMap<Vec<u8>, (u64, u64)>> {
-    use crate::structures::PositionPostingList;
+    use crate::structures::PositionStreamEncoder;
 
     let mut position_offsets: FxHashMap<Vec<u8>, (u64, u64)> = FxHashMap::default();
 
@@ -360,18 +395,21 @@ pub(super) fn build_positions_streaming(
     let mut buf = Vec::new();
 
     for (key, pos_builder) in entries {
-        let mut pos_list = PositionPostingList::with_capacity(pos_builder.postings.len());
-        for (doc_id, positions) in pos_builder.postings {
-            pos_list.push(doc_id, positions);
-        }
-
-        // Serialize to reusable buffer, then write
+        // Encode to a reusable buffer, then write. Positions per document are
+        // capped like the u16 term frequency of the doc postings so the two
+        // stay in step (the cursor of every later block depends on it).
         buf.clear();
-        pos_list.serialize(&mut buf).map_err(crate::Error::Io)?;
+        let mut encoder = PositionStreamEncoder::new(&mut buf);
+        for (_doc_id, mut positions) in pos_builder.postings {
+            positions.truncate(u16::MAX as usize);
+            encoder.push_doc(&mut positions).map_err(crate::Error::Io)?;
+        }
+        let (_total, len) = encoder.finish().map_err(crate::Error::Io)?;
+        debug_assert_eq!(len as usize, buf.len());
         writer.write_all(&buf)?;
 
-        position_offsets.insert(key, (current_offset, buf.len() as u64));
-        current_offset += buf.len() as u64;
+        position_offsets.insert(key, (current_offset, len));
+        current_offset += len;
     }
 
     Ok(position_offsets)

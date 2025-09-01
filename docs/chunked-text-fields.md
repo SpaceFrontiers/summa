@@ -38,9 +38,13 @@ field content: text<stem(by: languages, default: simple)> [indexed<chunked, toke
 Each chunked field owns a segment-local, dense **virtual id** space. The
 `n`-th chunk value indexed for the field (across all documents, in indexing
 order) gets virtual id `n`; documents are added in doc-id order, so virtual
-ids are sorted by `(doc_id, ordinal)`. Term postings and position lists of a
+ids start out sorted by `(doc_id, ordinal)`. A reorder pass on a field with
+the `reorder` attribute permutes them (BP over the field's postings,
+`docs/lexical-vertical.md`); no query path depends on the order. Term
+postings and position lists of a
 chunked field are keyed by virtual id and use the existing
-`BlockPostingList` / `PositionPostingList` formats unchanged. Token positions
+`BlockPostingList` format and the cursor-addressed position stream of
+`docs/lexical-vertical.md` ("Position list format v2"). Token positions
 restart at 0 in every chunk, so a `PhraseQuery` can never match across a chunk
 boundary.
 
@@ -54,9 +58,9 @@ per field:        doc_ids u32 × n | ordinals u16 × n | lengths u16 × n
 
 `lengths` is the token count of the chunk (saturating at 65 535) and gives
 BM25 its real length normalisation: `score = idf · tf · (k1 + 1) /
-(tf + k1 · (1 − b + b · len / avg_len))`. Non-chunked fields keep the historic
-`tf`-as-length approximation; upper bounds are unchanged (they already assume
-the shortest possible document).
+(tf + k1 · (1 − b + b · len / avg_len))`. Plain fields score with the per-document
+length columns of the same file (`.chunks` version 2, section kind 1) and
+block bounds use each block's minimum length (`docs/lexical-vertical.md`).
 
 `FieldStats` of a chunked field count chunks: `doc_count` is the number of
 chunks and `total_tokens / doc_count` is the average chunk length. IDF uses

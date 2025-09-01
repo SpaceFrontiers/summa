@@ -134,6 +134,10 @@ macro_rules! term_plan {
                     limit,
                     reader,
                     field,
+                    None,
+                    None,
+                    1.0,
+                    None,
                 )
             }
             Some(posting_list) => {
@@ -146,7 +150,11 @@ macro_rules! term_plan {
                     None
                 };
 
-                let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0);
+                let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0)
+                    .with_params(super::Bm25Params::for_field(reader.schema(), field));
+                if let Some(lengths) = reader.doc_lengths(field) {
+                    scorer = scorer.with_doc_lengths(lengths.clone());
+                }
                 if let Some(pos) = positions {
                     scorer = scorer.with_positions(field.0, pos);
                 }
@@ -177,7 +185,10 @@ impl Query for TermQuery {
     ) -> ScorerFuture<'a> {
         let field = self.field;
         let term = self.term.clone();
-        let global_stats = self.global_stats.clone();
+        let global_stats = self
+            .global_stats
+            .clone()
+            .or_else(|| options.global_stats.clone());
         let load_positions = options.collect_positions;
         Box::pin(async move {
             term_plan!(
@@ -221,10 +232,14 @@ impl Query for TermQuery {
         limit: usize,
         options: super::ScorerOptions,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let global_stats = self
+            .global_stats
+            .clone()
+            .or_else(|| options.global_stats.clone());
         term_plan!(
             self.field,
             &self.term,
-            self.global_stats.as_ref(),
+            global_stats.as_ref(),
             reader,
             limit,
             options.collect_positions,
@@ -279,8 +294,13 @@ impl Query for TermQuery {
         Some(bitset)
     }
 
+    fn text_terms(&self, out: &mut Vec<(Field, Vec<u8>)>) {
+        out.push((self.field, self.term.clone()));
+    }
+
     fn decompose(&self) -> super::QueryDecomposition {
         super::QueryDecomposition::TextTerm(TermQueryInfo {
+            weight: 1.0,
             field: self.field,
             term: self.term.clone(),
         })
@@ -296,8 +316,12 @@ struct TermScorer {
     field_boost: f32,
     /// Field ID for position reporting
     field_id: u32,
-    /// Position posting list (if positions are enabled)
-    positions: Option<crate::structures::PositionPostingList>,
+    /// Positions of the term (if positions are enabled)
+    positions: Option<crate::structures::TermPositions>,
+    /// Persisted per-document field lengths; `None` keeps `tf` as the length.
+    lengths: Option<crate::segment::chunk_map::DocLengths>,
+    /// Per-field k1/b.
+    params: super::Bm25Params,
 }
 
 impl TermScorer {
@@ -314,13 +338,27 @@ impl TermScorer {
             field_boost,
             field_id: 0,
             positions: None,
+            lengths: None,
+            params: super::Bm25Params::default(),
         }
+    }
+
+    /// Score with the field's BM25 parameters.
+    pub fn with_params(mut self, params: super::Bm25Params) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Score with the field's persisted per-document lengths.
+    pub fn with_doc_lengths(mut self, lengths: crate::segment::chunk_map::DocLengths) -> Self {
+        self.lengths = Some(lengths);
+        self
     }
 
     pub fn with_positions(
         mut self,
         field_id: u32,
-        positions: crate::structures::PositionPostingList,
+        positions: crate::structures::TermPositions,
     ) -> Self {
         self.field_id = field_id;
         self.positions = Some(positions);
@@ -430,15 +468,26 @@ impl Scorer for FastFieldTextScorer<'_> {
 impl Scorer for TermScorer {
     fn score(&self) -> Score {
         let tf = self.iterator.term_freq() as f32;
-        // Note: Using tf as doc_len proxy since we don't store per-doc field lengths.
-        // This is a common approximation - longer docs tend to have higher TF.
-        super::bm25f_score(tf, self.idf, tf, self.avg_field_len, self.field_boost)
+        // Persisted field length when the segment has norms; otherwise `tf`
+        // stands in for the length (legacy segments).
+        let doc_len = self
+            .lengths
+            .as_ref()
+            .map(|lengths| lengths.length(self.iterator.doc()) as f32)
+            .filter(|len| *len > 0.0)
+            .unwrap_or(tf);
+        self.params
+            .score_boosted(tf, self.idf, doc_len, self.avg_field_len, self.field_boost)
     }
 
     fn matched_positions(&self) -> Option<super::MatchedPositions> {
         let positions = self.positions.as_ref()?;
         let doc_id = self.iterator.doc();
-        let pos = positions.get_positions(doc_id)?;
+        let pos = positions.positions(
+            doc_id,
+            self.iterator.position_cursor(),
+            self.iterator.term_freq(),
+        )?;
         let score = self.score();
         // Each position contributes equally to the term score
         let per_position_score = if pos.is_empty() {

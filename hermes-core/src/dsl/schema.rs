@@ -79,6 +79,12 @@ pub struct FieldEntry {
     /// per-chunk ordinal in results (`docs/chunked-text-fields.md`). Text only.
     #[serde(default)]
     pub chunked: bool,
+    /// BM25 k1 of a text field; `None` = `BM25_K1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_k1: Option<f32>,
+    /// BM25 b of a text field; `None` = `BM25_B`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bm25_b: Option<f32>,
 }
 
 impl FieldEntry {
@@ -1042,6 +1048,8 @@ impl SchemaBuilder {
             primary_key: false,
             reorder: false,
             chunked: false,
+            bm25_k1: None,
+            bm25_b: None,
         });
         field
     }
@@ -1095,6 +1103,8 @@ impl SchemaBuilder {
             primary_key: false,
             reorder: false,
             chunked: false,
+            bm25_k1: None,
+            bm25_b: None,
         });
         field
     }
@@ -1143,6 +1153,8 @@ impl SchemaBuilder {
             primary_key: false,
             reorder: false,
             chunked: false,
+            bm25_k1: None,
+            bm25_b: None,
         });
         field
     }
@@ -1193,6 +1205,8 @@ impl SchemaBuilder {
             primary_key: false,
             reorder: false,
             chunked: false,
+            bm25_k1: None,
+            bm25_b: None,
         });
         field
     }
@@ -1229,6 +1243,14 @@ impl SchemaBuilder {
     pub fn set_reorder(&mut self, field: Field, reorder: bool) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.reorder = reorder;
+        }
+    }
+
+    /// Set the BM25 parameters of a text field (`None` keeps the default).
+    pub fn set_bm25_params(&mut self, field: Field, k1: Option<f32>, b: Option<f32>) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.bm25_k1 = k1;
+            entry.bm25_b = b;
         }
     }
 

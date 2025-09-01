@@ -18,7 +18,8 @@ use super::doc_offsets;
 use crate::Result;
 use crate::segment::reader::SegmentReader;
 use crate::structures::{
-    BlockPostingList, PositionPostingList, PostingList, SSTableWriter, TERMINATED, TermInfo,
+    BlockPostingList, PositionPostingList, PositionStream, PositionStreamEncoder, PostingList,
+    SSTableWriter, TERMINATED, TermInfo,
 };
 
 /// Entry for k-way merge heap
@@ -213,7 +214,7 @@ impl SegmentMerger {
     /// concatenation (O(blocks) instead of O(postings)), including the
     /// single-source case.
     /// Otherwise: full decode → remap doc IDs → re-encode.
-    async fn merge_term(
+    pub(crate) async fn merge_term(
         &self,
         segments: &[SegmentReader],
         sources: &mut [(usize, TermInfo, u32)],
@@ -230,25 +231,39 @@ impl SegmentMerger {
             .iter()
             .all(|(_, ti, _)| ti.external_info().is_some());
 
+        // Read every external source's postings up front (in parallel); the
+        // slow path below decodes them and the fast path copies their blocks.
+        let read_futs: Vec<_> = sources
+            .iter()
+            .map(|(seg_idx, ti, doc_off)| {
+                let external = ti.external_info();
+                let seg = &segments[*seg_idx];
+                let doc_off = *doc_off;
+                async move {
+                    Ok::<_, crate::Error>(match external {
+                        Some((off, len)) => Some((seg.read_postings(off, len).await?, doc_off)),
+                        None => None,
+                    })
+                }
+            })
+            .collect();
+        let raw_sources: Vec<Option<(Vec<u8>, u32)>> =
+            futures::future::try_join_all(read_futs).await?;
+        // Block copies keep position cursors only when every source has
+        // them; a legacy source with positions (no cursors) is re-encoded so
+        // the merged term always addresses a v2 stream.
+        let cursors_ready = !any_positions
+            || raw_sources.iter().all(|raw| {
+                raw.as_ref()
+                    .is_some_and(|(bytes, _)| BlockPostingList::has_cursors_bytes(bytes))
+            });
+
         // === Merge postings ===
-        let (posting_offset, posting_len, doc_count) = if all_external {
+        let (posting_offset, posting_len, doc_count) = if all_external && cursors_ready {
             // Fast path: streaming merge (blocks → output writer, no buffering)
-            // Read all segments' postings in parallel
-            let read_futs: Vec<_> = sources
-                .iter()
-                .map(|(seg_idx, ti, doc_off)| {
-                    let (off, len) = ti.external_info().unwrap();
-                    let seg = &segments[*seg_idx];
-                    let doc_off = *doc_off;
-                    async move {
-                        let bytes = seg.read_postings(off, len).await?;
-                        Ok::<_, crate::Error>((bytes, doc_off))
-                    }
-                })
-                .collect();
-            let raw_sources: Vec<(Vec<u8>, u32)> = futures::future::try_join_all(read_futs).await?;
             let refs: Vec<(&[u8], u32)> = raw_sources
                 .iter()
+                .flatten()
                 .map(|(b, off)| (b.as_slice(), *off))
                 .collect();
             let offset = postings_out.offset();
@@ -258,15 +273,14 @@ impl SegmentMerger {
         } else {
             // Decode all sources into a flat PostingList, remap doc IDs
             let mut merged = PostingList::new();
-            for (seg_idx, ti, doc_off) in sources.iter() {
+            for ((_, ti, doc_off), raw) in sources.iter().zip(&raw_sources) {
                 if let Some((ids, tfs)) = ti.decode_inline() {
                     for (id, tf) in ids.into_iter().zip(tfs) {
                         merged.add(id + doc_off, tf);
                     }
                 } else {
-                    let (off, len) = ti.external_info().unwrap();
-                    let bytes = segments[*seg_idx].read_postings(off, len).await?;
-                    let bpl = BlockPostingList::deserialize(&bytes)?;
+                    let (bytes, _) = raw.as_ref().expect("external term has posting bytes");
+                    let bpl = BlockPostingList::deserialize(bytes)?;
                     let mut it = bpl.iterator();
                     while it.doc() != TERMINATED {
                         merged.add(it.doc() + doc_off, it.term_freq());
@@ -284,12 +298,17 @@ impl SegmentMerger {
                 return Ok(inline);
             }
             let offset = postings_out.offset();
-            let block = BlockPostingList::from_posting_list(&merged)?;
+            let block = if any_positions {
+                BlockPostingList::from_posting_list_with_positions(&merged)?
+            } else {
+                BlockPostingList::from_posting_list(&merged)?
+            };
             buf.clear();
             block.serialize(buf)?;
             postings_out.write_all(buf)?;
             (offset, buf.len() as u64, merged.doc_count())
         };
+        drop(raw_sources);
 
         // === Merge positions (if any source has them) ===
         if any_positions {
@@ -314,19 +333,46 @@ impl SegmentMerger {
                 .flatten()
                 .collect();
             if !raw_pos.is_empty() {
-                let refs: Vec<(&[u8], u32)> = raw_pos
-                    .iter()
-                    .map(|(b, off)| (b.as_slice(), *off))
-                    .collect();
+                // Re-pack every source into one v2 stream: v2 sources
+                // contribute their raw delta values block by block, legacy
+                // lists are decoded per document. The values of source k
+                // land after those of sources 0..k, matching the cursor
+                // rebasing of the block copy above.
                 let offset = positions_out.offset();
-                let (_doc_count, bytes_written) =
-                    PositionPostingList::concatenate_streaming(&refs, positions_out)?;
+                let mut encoder = PositionStreamEncoder::new(&mut *positions_out);
+                let mut values: Vec<u32> = Vec::with_capacity(128);
+                for (bytes, _) in raw_pos {
+                    if PositionStream::is_stream(&bytes) {
+                        let stream =
+                            PositionStream::open(crate::directories::OwnedBytes::new(bytes))?;
+                        for idx in 0..stream.num_blocks() {
+                            if !stream.decode_block(idx, &mut values) {
+                                return Err(crate::Error::Corruption(
+                                    "position stream block failed to decode during merge".into(),
+                                ));
+                            }
+                            encoder.push_values(&values)?;
+                        }
+                    } else {
+                        let legacy = PositionPostingList::deserialize(&bytes)?;
+                        let mut it = legacy.iter();
+                        while it.doc() != TERMINATED {
+                            values.clear();
+                            values.extend_from_slice(it.positions());
+                            // Legacy term frequencies saturate at u16::MAX.
+                            values.truncate(u16::MAX as usize);
+                            encoder.push_doc(&mut values)?;
+                            it.advance();
+                        }
+                    }
+                }
+                let (_total, bytes_written) = encoder.finish()?;
                 return Ok(TermInfo::external_with_positions(
                     posting_offset,
                     posting_len,
                     doc_count,
                     offset,
-                    bytes_written as u64,
+                    bytes_written,
                 ));
             }
         }

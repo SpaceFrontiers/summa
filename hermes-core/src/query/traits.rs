@@ -8,21 +8,6 @@ use std::pin::Pin;
 use crate::segment::SegmentReader;
 use crate::{DocId, Result, Score};
 
-/// BM25 parameters
-#[derive(Debug, Clone, Copy)]
-pub struct Bm25Params {
-    /// Term frequency saturation parameter (typically 1.2-2.0)
-    pub k1: f32,
-    /// Length normalization parameter (typically 0.75)
-    pub b: f32,
-}
-
-impl Default for Bm25Params {
-    fn default() -> Self {
-        Self { k1: 1.2, b: 0.75 }
-    }
-}
-
 /// Future type for scorer creation
 #[cfg(not(target_arch = "wasm32"))]
 pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 'a>>> + Send + 'a>>;
@@ -49,6 +34,12 @@ pub struct ScorerOptions {
     pub shared_threshold: Option<super::scoring::SharedThreshold>,
     /// Query-global LSP/0 selection projected onto this segment.
     pub(crate) lsp_plan: Option<std::sync::Arc<super::bmp::LspSegmentPlan>>,
+    /// Query-global text statistics (document frequencies, corpus sizes,
+    /// average lengths aggregated over every segment of the searcher, or
+    /// supplied by a broker across shards). Text scorers use them for IDF
+    /// and length normalisation so a term scores the same in every segment;
+    /// a query's own `with_global_stats` takes precedence.
+    pub global_stats: Option<std::sync::Arc<super::GlobalStats>>,
 }
 
 impl ScorerOptions {
@@ -58,6 +49,7 @@ impl ScorerOptions {
             initial_threshold: 0.0,
             shared_threshold: None,
             lsp_plan: None,
+            global_stats: None,
         }
     }
 
@@ -70,6 +62,7 @@ impl ScorerOptions {
             initial_threshold: 0.0,
             shared_threshold: None,
             lsp_plan: None,
+            global_stats: self.global_stats.clone(),
         }
     }
 }
@@ -111,6 +104,25 @@ impl DocBitset {
         let bit = doc_id as usize % 64;
         if word < self.bits.len() {
             self.bits[word] |= 1u64 << bit;
+        }
+    }
+
+    /// First set bit at or after `from`, if any.
+    pub fn next_set_bit(&self, from: DocId) -> Option<DocId> {
+        let mut word = from as usize / 64;
+        if word >= self.bits.len() {
+            return None;
+        }
+        let mut bits = self.bits[word] & (u64::MAX << (from % 64));
+        loop {
+            if bits != 0 {
+                return Some((word * 64 + bits.trailing_zeros() as usize) as DocId);
+            }
+            word += 1;
+            if word >= self.bits.len() {
+                return None;
+            }
+            bits = self.bits[word];
         }
     }
 
@@ -188,6 +200,10 @@ pub struct TermQueryInfo {
     pub field: crate::dsl::Field,
     /// Term bytes (lowercase)
     pub term: Vec<u8>,
+    /// Query-side weight of the term (a boost, or the query term frequency
+    /// of a de-duplicated match); scales the term's idf, hence its scores
+    /// and bounds alike. 1.0 = plain.
+    pub weight: f32,
 }
 
 /// Info for MaxScore-optimizable sparse term queries
@@ -306,6 +322,13 @@ macro_rules! define_query_traits {
                 QueryDecomposition::Opaque
             }
 
+            /// Append every `(field, term)` this query scores with BM25 to
+            /// `out`. The searcher aggregates their document frequencies
+            /// across segments before scoring (see `ScorerOptions::global_stats`).
+            fn text_terms(&self, out: &mut Vec<(crate::dsl::Field, Vec<u8>)>) {
+                let _ = out;
+            }
+
             /// True if this query is a pure filter (always scores 1.0, no positions).
             /// Used by the planner to convert non-selective MUST filters into predicates.
             fn is_filter(&self) -> bool {
@@ -398,6 +421,10 @@ impl Query for Box<dyn Query> {
         options: ScorerOptions,
     ) -> ScorerFuture<'a> {
         (**self).scorer_with_options(reader, limit, options)
+    }
+
+    fn text_terms(&self, out: &mut Vec<(crate::dsl::Field, Vec<u8>)>) {
+        (**self).text_terms(out)
     }
 
     fn decompose(&self) -> QueryDecomposition {

@@ -1049,22 +1049,26 @@ pub async fn open_positions_file<D: Directory>(
     }
 }
 
-/// Load the virtual-id maps of chunked text fields from `.chunks`.
+/// Load the virtual-id maps of chunked text fields and the per-document
+/// lengths (norms) of plain text fields from `.chunks`.
 ///
-/// Absent file = no chunk was indexed in this segment (the builder only
-/// writes the file when a chunked field received values).
+/// Absent file = no chunk and no text token was indexed in this segment
+/// (the builder only writes the file when a section has data).
 pub async fn load_chunk_maps_file<D: Directory>(
     dir: &D,
     files: &SegmentFiles,
     schema: &Schema,
-) -> Result<FxHashMap<u32, crate::segment::chunk_map::ChunkMap>> {
-    if !schema.fields().any(|(_, entry)| entry.chunked) {
-        return Ok(FxHashMap::default());
+) -> Result<crate::segment::chunk_map::ChunkMapFile> {
+    if !schema
+        .fields()
+        .any(|(_, entry)| entry.indexed && entry.field_type == crate::dsl::FieldType::Text)
+    {
+        return Ok(Default::default());
     }
     let handle = match dir.open_read(&files.chunks).await {
         Ok(handle) => handle,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FxHashMap::default());
+            return Ok(Default::default());
         }
         Err(error) => return Err(crate::Error::Io(error)),
     };

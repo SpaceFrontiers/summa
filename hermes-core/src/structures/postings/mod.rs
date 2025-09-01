@@ -19,6 +19,7 @@ mod horizontal_bp128;
 mod opt_p4d;
 mod partitioned_ef;
 mod positions;
+mod positions_v2;
 mod posting;
 mod posting_common;
 mod posting_format;
@@ -44,6 +45,9 @@ pub use partitioned_ef::{
 pub use positions::{
     MAX_ELEMENT_ORDINAL, MAX_TOKEN_POSITION, PositionPostingIterator, PositionPostingList,
     PostingWithPositions, decode_element_ordinal, decode_token_position, encode_position,
+};
+pub use positions_v2::{
+    POSITION_STREAM_BLOCK, PositionStream, PositionStreamEncoder, TermPositions,
 };
 pub use posting::{
     BLOCK_SIZE as POSTING_BLOCK_SIZE, BlockPostingIterator, BlockPostingList, Posting, PostingList,

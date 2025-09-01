@@ -121,11 +121,20 @@ impl Query for BoostQuery {
             .flatten()
     }
 
+    fn text_terms(&self, out: &mut Vec<(crate::dsl::Field, Vec<u8>)>) {
+        self.inner.text_terms(out);
+    }
+
     fn decompose(&self) -> super::QueryDecomposition {
-        if self.boost == 1.0 {
-            self.inner.decompose()
-        } else {
-            super::QueryDecomposition::Opaque
+        match self.inner.decompose() {
+            // A boosted text term stays on the text MaxScore path: the
+            // weight scales its idf, so scores and bounds scale together.
+            super::QueryDecomposition::TextTerm(mut info) => {
+                info.weight *= self.boost;
+                super::QueryDecomposition::TextTerm(info)
+            }
+            other if self.boost == 1.0 => other,
+            _ => super::QueryDecomposition::Opaque,
         }
     }
 }

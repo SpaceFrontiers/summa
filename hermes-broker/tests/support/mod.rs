@@ -129,6 +129,20 @@ impl SearchService for MockBackend {
         }))
     }
 
+    async fn get_text_stats(
+        &self,
+        request: Request<GetTextStatsRequest>,
+    ) -> Result<Response<GetTextStatsResponse>, Status> {
+        self.check_available()?;
+        let _ = request.into_inner();
+        Ok(Response::new(GetTextStatsResponse {
+            stats: Some(TextStats {
+                total_docs: 42,
+                fields: vec![],
+            }),
+        }))
+    }
+
     async fn get_index_info(
         &self,
         request: Request<GetIndexInfoRequest>,
@@ -406,6 +420,7 @@ pub fn rich_search_response() -> SearchResponse {
         },
     );
     SearchResponse {
+        truncated: false,
         hits: vec![
             SearchHit {
                 address: Some(DocAddress {
@@ -448,6 +463,8 @@ pub fn rich_search_response() -> SearchResponse {
 
 pub fn simple_search_request(index_name: &str) -> SearchRequest {
     SearchRequest {
+        time_budget_ms: 0,
+        text_stats: None,
         index_name: index_name.to_string(),
         query: Some(Query {
             query: Some(query::Query::All(AllQuery {})),

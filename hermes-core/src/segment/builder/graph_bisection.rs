@@ -397,6 +397,28 @@ fn build_csr_offsets(counts: &[u32]) -> Vec<u64> {
 }
 
 impl ForwardIndex {
+    /// Build from a ready CSR (`terms[offsets[d]..offsets[d + 1]]` are the
+    /// compact term ids of entity `d`), e.g. the postings of a chunked text
+    /// field keyed by virtual chunk id.
+    pub(crate) fn from_csr(
+        terms: Vec<u32>,
+        offsets: Vec<u64>,
+        num_terms: usize,
+        memory_budget_bytes: usize,
+        budget_limited: bool,
+    ) -> Self {
+        let non_degree_bytes =
+            terms.len() * std::mem::size_of::<u32>() + offsets.len() * std::mem::size_of::<u64>();
+        let lanes = parallel_bisect_lanes(memory_budget_bytes, non_degree_bytes, num_terms);
+        Self {
+            terms,
+            offsets,
+            num_terms,
+            parallel_bisect_lanes: lanes.max(1),
+            budget_limited,
+        }
+    }
+
     #[inline]
     pub fn num_docs(&self) -> usize {
         if self.offsets.is_empty() {

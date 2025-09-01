@@ -595,10 +595,10 @@ impl QueryLanguageParser {
         };
 
         let tokenizer = self.get_tokenizer(field_id);
-        let tokens: Vec<String> = tokenizer
+        let tokens: Vec<(u32, String)> = tokenizer
             .tokenize(phrase)
             .into_iter()
-            .map(|t| t.text.to_lowercase())
+            .map(|t| (t.position, t.text.to_lowercase()))
             .collect();
 
         if tokens.is_empty() {
@@ -606,13 +606,17 @@ impl QueryLanguageParser {
         }
 
         if tokens.len() == 1 {
-            return Ok(Box::new(TermQuery::text(field_id, &tokens[0])));
+            return Ok(Box::new(TermQuery::text(field_id, &tokens[0].1)));
         }
 
         // Positional phrase query; on a field without positions it degrades to
-        // an AND of the terms inside PhraseQuery itself.
-        let phrase_terms = |tokens: &[String]| -> Vec<Vec<u8>> {
-            tokens.iter().map(|t| t.clone().into_bytes()).collect()
+        // an AND of the terms inside PhraseQuery itself. Token positions come
+        // from the tokenizer so gaps left by dropped stop words survive.
+        let phrase_terms = |tokens: &[(u32, String)]| -> Vec<(u32, Vec<u8>)> {
+            tokens
+                .iter()
+                .map(|(offset, t)| (*offset, t.clone().into_bytes()))
+                .collect()
         };
 
         // If no field specified and multiple default fields, wrap in OR
@@ -620,20 +624,23 @@ impl QueryLanguageParser {
             let mut outer = BooleanQuery::new();
             for &f in &self.default_fields {
                 let tokenizer = self.get_tokenizer(f);
-                let tokens: Vec<String> = tokenizer
+                let tokens: Vec<(u32, String)> = tokenizer
                     .tokenize(phrase)
                     .into_iter()
-                    .map(|t| t.text.to_lowercase())
+                    .map(|t| (t.position, t.text.to_lowercase()))
                     .collect();
                 if tokens.is_empty() {
                     continue;
                 }
-                outer = outer.should(PhraseQuery::new(f, phrase_terms(&tokens)));
+                outer = outer.should(PhraseQuery::with_offsets(f, phrase_terms(&tokens)));
             }
             return Ok(Box::new(outer));
         }
 
-        Ok(Box::new(PhraseQuery::new(field_id, phrase_terms(&tokens))))
+        Ok(Box::new(PhraseQuery::with_offsets(
+            field_id,
+            phrase_terms(&tokens),
+        )))
     }
 
     fn get_tokenizer(&self, field: Field) -> BoxedTokenizer {

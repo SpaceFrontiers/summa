@@ -59,6 +59,8 @@ pub use postings::{
     PartitionedEliasFano,
     PositionPostingIterator,
     PositionPostingList,
+    PositionStream,
+    PositionStreamEncoder,
     Posting,
     PostingFormat,
     PostingList,
@@ -96,6 +98,7 @@ pub use postings::{
     SparseVector,
     SparseVectorConfig,
     TERMINATED,
+    TermPositions,
     // Vertical BP128
     VERTICAL_BP128_BLOCK_SIZE,
     VerticalBP128Block,

@@ -177,18 +177,26 @@ fn clean_word(word: &str) -> String {
 /// Used by `SimpleTokenizer` (identity transform) and `StemmerTokenizer` (stem transform).
 /// The transform receives an owned `String` so identity transforms avoid extra allocations.
 fn tokenize_and_clean(text: &str, transform: impl Fn(String) -> String) -> Vec<Token> {
+    tokenize_and_clean_filtered(text, |word| Some(transform(word)))
+}
+
+/// Like [`tokenize_and_clean`], but `transform` may drop a word by returning
+/// `None`. A dropped word still consumes a position, so the surviving tokens
+/// keep their original distances (a phrase indexed as `quantum@0 art@3`
+/// keeps the gap of the two stop words between them).
+fn tokenize_and_clean_filtered(
+    text: &str,
+    transform: impl Fn(String) -> Option<String>,
+) -> Vec<Token> {
     let mut tokens = Vec::with_capacity(text.len() / 5);
     let mut position = 0u32;
     for (offset, word) in split_whitespace_with_offsets(text) {
         if !word.is_empty() {
             let cleaned = clean_word(word);
             if !cleaned.is_empty() {
-                tokens.push(Token::new(
-                    transform(cleaned),
-                    position,
-                    offset,
-                    offset + word.len(),
-                ));
+                if let Some(text) = transform(cleaned) {
+                    tokens.push(Token::new(text, position, offset, offset + word.len()));
+                }
                 position += 1;
             }
         }
@@ -274,7 +282,7 @@ impl Language {
             Language::Russian => LANGUAGE::Russian,
             Language::Spanish => LANGUAGE::Spanish,
             Language::Swedish => LANGUAGE::Swedish,
-            Language::Tamil => LANGUAGE::English, // Tamil not supported, fallback to English
+            Language::Tamil => LANGUAGE::Tamil,
             Language::Turkish => LANGUAGE::Turkish,
         }
     }
@@ -602,6 +610,153 @@ fn with_stemmers<R>(languages: &[Language], f: impl FnOnce(&[&rust_stemmers::Ste
     })
 }
 
+/// Word segmentation of a [`DynamicStemmer`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Segmenter {
+    /// Split on whitespace, strip every non-alphanumeric character
+    /// (`float-zero` → `floatzero`, no CJK segmentation).
+    #[default]
+    Simple,
+    /// UAX #29 word boundaries (`float-zero` → `float`, `zero`; `p53`,
+    /// `co2` and `10.1007` stay whole), character bigrams over runs of Han,
+    /// Hiragana and Katakana, and diacritic folding of Latin, Cyrillic and
+    /// Greek tokens after stemming (`résumé` → `resume`).
+    Unicode,
+}
+
+/// Whether `c` belongs to a script that is bigrammed instead of stemmed.
+#[inline]
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x30FF      // Hiragana, Katakana
+            | 0x31F0..=0x31FF // Katakana phonetic extensions
+            | 0x3400..=0x4DBF // CJK extension A
+            | 0x4E00..=0x9FFF // CJK unified ideographs
+            | 0xF900..=0xFAFF // CJK compatibility ideographs
+            | 0xFF66..=0xFF9F // half-width Katakana
+            | 0x20000..=0x2FA1F // CJK extensions B..F, compatibility supplement
+    )
+}
+
+/// Fold diacritics of Latin, Cyrillic and Greek text: compatibility
+/// decomposition, then every combining mark is dropped. Other scripts are
+/// returned unchanged (their combining marks are letters in their own right).
+fn fold_diacritics(word: String) -> String {
+    if word.is_ascii() {
+        return word;
+    }
+    if !matches!(
+        Script::of_token(&word),
+        Script::Latin | Script::Cyrillic | Script::Greek
+    ) {
+        return word;
+    }
+    use unicode_normalization::UnicodeNormalization;
+    use unicode_normalization::char::is_combining_mark;
+    word.nfkd()
+        .filter(|c| !is_combining_mark(*c))
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// UAX #29 tokenization with CJK bigrams and diacritic folding. `transform`
+/// receives each cleaned (lowercased, punctuation-free) non-CJK word and may
+/// drop it by returning `None`; dropped words still consume a position.
+/// Folding happens after the transform, so stop lists and stemmers see the
+/// original letters.
+fn tokenize_unicode_filtered(
+    text: &str,
+    transform: impl Fn(String) -> Option<String>,
+) -> Vec<Token> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut tokens = Vec::with_capacity(text.len() / 5);
+    let mut position = 0u32;
+    // Contiguous run of CJK characters: (byte offset, char).
+    let mut run: Vec<(usize, char)> = Vec::new();
+    let mut run_end = 0usize;
+
+    fn flush_run(run: &mut Vec<(usize, char)>, tokens: &mut Vec<Token>, position: &mut u32) {
+        match run.len() {
+            0 => {}
+            1 => {
+                let (offset, c) = run[0];
+                tokens.push(Token::new(
+                    c.to_string(),
+                    *position,
+                    offset,
+                    offset + c.len_utf8(),
+                ));
+                *position += 1;
+            }
+            _ => {
+                for pair in run.windows(2) {
+                    let (start, a) = pair[0];
+                    let (next, b) = pair[1];
+                    let mut text = String::with_capacity(a.len_utf8() + b.len_utf8());
+                    text.push(a);
+                    text.push(b);
+                    tokens.push(Token::new(text, *position, start, next + b.len_utf8()));
+                    *position += 1;
+                }
+            }
+        }
+        run.clear();
+    }
+
+    for (offset, word) in text.unicode_word_indices() {
+        if word.chars().all(is_cjk_char) {
+            // UAX #29 yields one word per ideograph but keeps kana runs
+            // together; either way the characters join the current run when
+            // they are adjacent in the text.
+            if !run.is_empty() && offset != run_end {
+                flush_run(&mut run, &mut tokens, &mut position);
+            }
+            let mut at = offset;
+            for c in word.chars() {
+                run.push((at, c));
+                at += c.len_utf8();
+            }
+            run_end = at;
+            continue;
+        }
+        flush_run(&mut run, &mut tokens, &mut position);
+        let cleaned = clean_word(word);
+        if cleaned.is_empty() {
+            continue;
+        }
+        if let Some(out) = transform(cleaned) {
+            tokens.push(Token::new(
+                fold_diacritics(out),
+                position,
+                offset,
+                offset + word.len(),
+            ));
+        }
+        position += 1;
+    }
+    flush_run(&mut run, &mut tokens, &mut position);
+    tokens
+}
+
+/// Stop words of a language (NLTK lists), shared for the process lifetime.
+fn stop_word_set(language: Language) -> Option<&'static HashSet<String>> {
+    static SETS: std::sync::OnceLock<RwLock<HashMap<Language, &'static HashSet<String>>>> =
+        std::sync::OnceLock::new();
+    let sets = SETS.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Some(set) = sets.read().get(&language) {
+        return Some(set);
+    }
+    let set: &'static HashSet<String> = Box::leak(Box::new(
+        stop_words::get(language.to_stop_words_language())
+            .iter()
+            .map(|word| word.to_string())
+            .collect(),
+    ));
+    Some(*sets.write().entry(language).or_insert(set))
+}
+
 /// Stemmer whose language is selected per call from the tokenizer hint.
 ///
 /// The hint is a comma-separated list of language codes or names (`"ru,en"`).
@@ -613,17 +768,54 @@ fn with_stemmers<R>(languages: &[Language], f: impl FnOnce(&[&rust_stemmers::Ste
 /// Because Snowball stemmers are script-local, one field can hold mixed
 /// Cyrillic/Latin documents and still stem each part correctly.
 ///
-/// Declared in SDL as `text<stem(by: <field>, default: <language|simple>)>`;
+/// With `stop_words` enabled, the stop words of the language a token is
+/// routed to are dropped before stemming. Dropped words keep consuming
+/// positions, so phrase distances are preserved (`"quantum of the art"`
+/// becomes `quantum@0 art@3`).
+///
+/// Declared in SDL as
+/// `text<stem(by: <field>, default: <language|simple>, stop_words: <bool>, segmenter: <simple|unicode>)>`;
 /// see [`TokenizerSpec`].
 #[derive(Debug, Clone, Default)]
 pub struct DynamicStemmer {
     default: Option<Language>,
+    stop_words: bool,
+    segmenter: Segmenter,
 }
 
 impl DynamicStemmer {
     /// Create a dynamic stemmer; `default` applies when no hint is present.
+    /// Stop words are kept unless [`DynamicStemmer::with_stop_words`] is set;
+    /// words are split by [`Segmenter::Simple`] unless
+    /// [`DynamicStemmer::with_segmenter`] is set.
     pub fn new(default: Option<Language>) -> Self {
-        Self { default }
+        Self {
+            default,
+            stop_words: false,
+            segmenter: Segmenter::Simple,
+        }
+    }
+
+    /// Choose the word segmentation (see [`Segmenter`]).
+    pub fn with_segmenter(mut self, segmenter: Segmenter) -> Self {
+        self.segmenter = segmenter;
+        self
+    }
+
+    /// The word segmentation in use.
+    pub fn segmenter(&self) -> Segmenter {
+        self.segmenter
+    }
+
+    /// Drop the routed language's stop words (positions are preserved).
+    pub fn with_stop_words(mut self, enabled: bool) -> Self {
+        self.stop_words = enabled;
+        self
+    }
+
+    /// Whether stop words are dropped.
+    pub fn strips_stop_words(&self) -> bool {
+        self.stop_words
     }
 
     /// Default language used when no hint is given.
@@ -644,32 +836,39 @@ impl DynamicStemmer {
         languages
     }
 
-    fn tokenize_with_languages(&self, text: &str, languages: &[Language]) -> Vec<Token> {
-        match languages {
-            [] => tokenize_and_clean(text, |s| s),
-            [single] => {
-                let script = single.script();
-                with_stemmers(languages, |stemmers| {
-                    let stemmer = stemmers[0];
-                    tokenize_and_clean(text, |s| {
-                        if Script::of_token(&s) == script {
-                            stem_owned(stemmer, s)
-                        } else {
-                            s
-                        }
-                    })
-                })
-            }
-            many => with_stemmers(many, |stemmers| {
-                tokenize_and_clean(text, |s| {
-                    let script = Script::of_token(&s);
-                    match many.iter().position(|language| language.script() == script) {
-                        Some(index) => stem_owned(stemmers[index], s),
-                        None => s,
-                    }
-                })
-            }),
+    fn segment(&self, text: &str, transform: impl Fn(String) -> Option<String>) -> Vec<Token> {
+        match self.segmenter {
+            Segmenter::Simple => tokenize_and_clean_filtered(text, transform),
+            Segmenter::Unicode => tokenize_unicode_filtered(text, transform),
         }
+    }
+
+    fn tokenize_with_languages(&self, text: &str, languages: &[Language]) -> Vec<Token> {
+        if languages.is_empty() {
+            return self.segment(text, Some);
+        }
+        // Stop lists follow the same script routing as the stemmers: a token
+        // is checked against (and then stemmed with) the first hinted
+        // language of its script.
+        let stops: Vec<Option<&'static HashSet<String>>> = languages
+            .iter()
+            .map(|language| self.stop_words.then(|| stop_word_set(*language)).flatten())
+            .collect();
+        with_stemmers(languages, |stemmers| {
+            self.segment(text, |s| {
+                let script = Script::of_token(&s);
+                let Some(index) = languages
+                    .iter()
+                    .position(|language| language.script() == script)
+                else {
+                    return Some(s);
+                };
+                if stops[index].is_some_and(|set| set.contains(s.as_str())) {
+                    return None;
+                }
+                Some(stem_owned(stemmers[index], s))
+            })
+        })
     }
 }
 
@@ -677,7 +876,7 @@ impl Tokenizer for DynamicStemmer {
     fn tokenize(&self, text: &str) -> Vec<Token> {
         match self.default {
             Some(language) => self.tokenize_with_languages(text, &[language]),
-            None => tokenize_and_clean(text, |s| s),
+            None => self.segment(text, Some),
         }
     }
 
@@ -700,10 +899,11 @@ impl Tokenizer for DynamicStemmer {
 /// Parsed form of a tokenizer name in the schema.
 ///
 /// Plain names refer to a registered tokenizer (`simple`, `en_stem`, ...).
-/// `stem(by: <field>, default: <language|simple>)` declares a
-/// [`DynamicStemmer`] whose per-document hint is read from `<field>` in the
-/// same document. The canonical string form is stored in
-/// `FieldEntry::tokenizer`, so index metadata needs no new field.
+/// `stem(by: <field>, default: <language|simple>, stop_words: <bool>)`
+/// declares a [`DynamicStemmer`] whose per-document hint is read from
+/// `<field>` in the same document. The canonical string form is stored in
+/// `FieldEntry::tokenizer`, so index metadata needs no new field; specs
+/// without `stop_words` render exactly as before.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenizerSpec {
     /// A registered tokenizer name.
@@ -714,6 +914,10 @@ pub enum TokenizerSpec {
         by: String,
         /// Language applied when the hint field is absent; `None` = simple.
         default: Option<Language>,
+        /// Drop the routed language's stop words (positions keep their gaps).
+        stop_words: bool,
+        /// Word segmentation; `Simple` is the historic behaviour.
+        segmenter: Segmenter,
     },
 }
 
@@ -732,6 +936,8 @@ impl TokenizerSpec {
         };
         let mut by = None;
         let mut default = None;
+        let mut stop_words = false;
+        let mut segmenter = Segmenter::Simple;
         for param in params.split(',') {
             let param = param.trim();
             if param.is_empty() {
@@ -754,6 +960,28 @@ impl TokenizerSpec {
                         })?),
                     };
                 }
+                "stop_words" => {
+                    stop_words = match value {
+                        "true" => true,
+                        "false" => false,
+                        other => {
+                            return Err(format!(
+                                "tokenizer spec '{spec}': 'stop_words' must be true or false, got '{other}'"
+                            ));
+                        }
+                    };
+                }
+                "segmenter" => {
+                    segmenter = match value {
+                        "simple" => Segmenter::Simple,
+                        "unicode" => Segmenter::Unicode,
+                        other => {
+                            return Err(format!(
+                                "tokenizer spec '{spec}': 'segmenter' must be simple or unicode, got '{other}'"
+                            ));
+                        }
+                    };
+                }
                 other => {
                     return Err(format!(
                         "tokenizer spec '{spec}': unknown parameter '{other}'"
@@ -762,7 +990,12 @@ impl TokenizerSpec {
             }
         }
         let by = by.ok_or_else(|| format!("tokenizer spec '{spec}' requires 'by: <field>'"))?;
-        Ok(TokenizerSpec::DynamicStem { by, default })
+        Ok(TokenizerSpec::DynamicStem {
+            by,
+            default,
+            stop_words,
+            segmenter,
+        })
     }
 
     /// Field whose values hint the tokenizer, for dynamic specs.
@@ -777,9 +1010,16 @@ impl TokenizerSpec {
     pub fn dynamic_tokenizer(&self) -> Option<BoxedTokenizer> {
         match self {
             TokenizerSpec::Named(_) => None,
-            TokenizerSpec::DynamicStem { default, .. } => {
-                Some(Box::new(DynamicStemmer::new(*default)))
-            }
+            TokenizerSpec::DynamicStem {
+                default,
+                stop_words,
+                segmenter,
+                ..
+            } => Some(Box::new(
+                DynamicStemmer::new(*default)
+                    .with_stop_words(*stop_words)
+                    .with_segmenter(*segmenter),
+            )),
         }
     }
 }
@@ -788,12 +1028,24 @@ impl std::fmt::Display for TokenizerSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TokenizerSpec::Named(name) => f.write_str(name),
-            TokenizerSpec::DynamicStem { by, default } => {
+            TokenizerSpec::DynamicStem {
+                by,
+                default,
+                stop_words,
+                segmenter,
+            } => {
                 let default = match default {
                     None => "simple".to_string(),
                     Some(language) => language_code(*language).to_string(),
                 };
-                write!(f, "stem(by: {by}, default: {default})")
+                write!(f, "stem(by: {by}, default: {default}")?;
+                if *stop_words {
+                    write!(f, ", stop_words: true")?;
+                }
+                if *segmenter == Segmenter::Unicode {
+                    write!(f, ", segmenter: unicode")?;
+                }
+                write!(f, ")")
             }
         }
     }
@@ -1350,6 +1602,134 @@ mod tests {
         tokens.iter().map(|t| t.text.as_str()).collect()
     }
 
+    fn positions(tokens: &[Token]) -> Vec<u32> {
+        tokens.iter().map(|t| t.position).collect()
+    }
+
+    #[test]
+    fn unicode_segmenter_splits_on_word_boundaries_and_folds() {
+        let plain = DynamicStemmer::new(None).with_segmenter(Segmenter::Unicode);
+        let tokens = hinted(
+            &plain,
+            "Float-zero determinants: p53/CO2, 10.1007/s1 résumé",
+            None,
+        );
+        assert_eq!(
+            texts(&tokens),
+            vec![
+                "float",
+                "zero",
+                "determinants",
+                "p53",
+                "co2",
+                "101007",
+                "s1",
+                "resume"
+            ]
+        );
+        assert_eq!(positions(&tokens), (0..8).collect::<Vec<u32>>());
+        // Offsets still point at the original words.
+        assert_eq!(
+            &"Float-zero determinants: p53/CO2, 10.1007/s1 résumé"
+                [tokens[7].offset_from..tokens[7].offset_to],
+            "résumé"
+        );
+
+        // Stemming sees the original letters, folding runs afterwards; the
+        // simple segmenter keeps the historic behaviour.
+        let english = DynamicStemmer::new(None).with_segmenter(Segmenter::Unicode);
+        assert_eq!(
+            texts(&hinted(&english, "Running foxes' café", Some("en"))),
+            vec!["run", "fox", "cafe"]
+        );
+        assert_eq!(
+            texts(&hinted(
+                &DynamicStemmer::new(None),
+                "Float-zero café",
+                Some("en")
+            )),
+            vec!["floatzero", "café"]
+        );
+        // Cyrillic folding drops combining marks but keeps the letters.
+        assert_eq!(texts(&hinted(&plain, "ёлка", None)), vec!["елка"]);
+        // Stop words are removed before folding and keep their gap.
+        let stopping = DynamicStemmer::new(None)
+            .with_stop_words(true)
+            .with_segmenter(Segmenter::Unicode);
+        let tokens = hinted(&stopping, "state-of-the-art résumé", Some("en"));
+        assert_eq!(tokens.len(), 3, "{:?}", texts(&tokens));
+        assert_eq!(&texts(&tokens)[..2], ["state", "art"]);
+        assert!(tokens[2].text.starts_with("resum"), "{:?}", tokens[2].text);
+        assert!(tokens[2].text.is_ascii(), "folded after stemming");
+        assert_eq!(positions(&tokens), vec![0, 3, 4]);
+    }
+
+    #[test]
+    fn unicode_segmenter_bigrams_cjk_runs() {
+        let t = DynamicStemmer::new(None).with_segmenter(Segmenter::Unicode);
+        let tokens = hinted(&t, "東京都 tower", Some("en"));
+        assert_eq!(texts(&tokens), vec!["東京", "京都", "tower"]);
+        assert_eq!(positions(&tokens), vec![0, 1, 2]);
+        assert_eq!(
+            &"東京都 tower"[tokens[1].offset_from..tokens[1].offset_to],
+            "京都"
+        );
+        // A lone ideograph is its own token; runs split at any non-CJK word.
+        assert_eq!(
+            texts(&hinted(&t, "東 tower 京都", None)),
+            vec!["東", "tower", "京都"]
+        );
+        // Katakana runs are bigrammed too, and a run stops where the text
+        // stops being contiguous.
+        assert_eq!(
+            texts(&hinted(&t, "トウキョウ タワー", None)),
+            vec!["トウ", "ウキ", "キョ", "ョウ", "タワ", "ワー"]
+        );
+        // Mixed script without spaces: the ideographs form one run, the
+        // Latin word follows.
+        assert_eq!(texts(&hinted(&t, "東京tower", None)), vec!["東京", "tower"]);
+        // Phrase offsets follow the bigram positions.
+        let query = hinted(&t, "東京都", None);
+        assert_eq!(positions(&query), vec![0, 1]);
+    }
+
+    #[test]
+    fn dynamic_stemmer_drops_stop_words_but_keeps_positions() {
+        let stemmer = DynamicStemmer::new(None).with_stop_words(true);
+        let tokens = hinted(&stemmer, "Quantum of the Art", Some("en"));
+        assert_eq!(texts(&tokens), vec!["quantum", "art"]);
+        assert_eq!(positions(&tokens), vec![0, 3]);
+        // Byte offsets still point at the surviving words.
+        assert_eq!(tokens[1].offset_from, "Quantum of the ".len());
+
+        // Stop words are matched before stemming, per script-routed language.
+        let tokens = hinted(&stemmer, "бегущие и собаки the foxes", Some("ru,en"));
+        assert_eq!(texts(&tokens), vec!["бегущ", "собак", "fox"]);
+        assert_eq!(positions(&tokens), vec![0, 2, 4]);
+
+        // Tokens of a script no hinted language covers are untouched.
+        assert_eq!(
+            texts(&hinted(&stemmer, "the 日本語 fox", Some("en"))),
+            vec!["日本語", "fox"]
+        );
+
+        // No hint and no default: nothing is stemmed and nothing is dropped.
+        assert_eq!(
+            texts(&hinted(&stemmer, "the fox", None)),
+            vec!["the", "fox"]
+        );
+        // A default language applies its stop list too.
+        let english = DynamicStemmer::new(Some(Language::English)).with_stop_words(true);
+        assert_eq!(texts(&hinted(&english, "the fox", None)), vec!["fox"]);
+        // Off by default.
+        assert_eq!(
+            texts(&hinted(&DynamicStemmer::new(None), "the fox", Some("en"))),
+            vec!["the", "fox"]
+        );
+        // Only stop words: no tokens at all.
+        assert!(hinted(&stemmer, "to be or not to be", Some("en")).is_empty());
+    }
+
     #[test]
     fn dynamic_stemmer_selects_language_from_hint() {
         let stemmer = DynamicStemmer::new(None);
@@ -1445,7 +1825,9 @@ mod tests {
             spec,
             TokenizerSpec::DynamicStem {
                 by: "languages".to_string(),
-                default: None
+                default: None,
+                stop_words: false,
+                segmenter: Segmenter::Simple,
             }
         );
         assert_eq!(spec.to_string(), "stem(by: languages, default: simple)");
@@ -1457,9 +1839,52 @@ mod tests {
             TokenizerSpec::parse("stem(by: lang)").unwrap(),
             TokenizerSpec::DynamicStem {
                 by: "lang".to_string(),
-                default: None
+                default: None,
+                stop_words: false,
+                segmenter: Segmenter::Simple,
             }
         );
+
+        let spec =
+            TokenizerSpec::parse("stem(by: languages, default: simple, stop_words: true)").unwrap();
+        assert_eq!(
+            spec,
+            TokenizerSpec::DynamicStem {
+                by: "languages".to_string(),
+                default: None,
+                stop_words: true,
+                segmenter: Segmenter::Simple,
+            }
+        );
+        assert_eq!(
+            spec.to_string(),
+            "stem(by: languages, default: simple, stop_words: true)"
+        );
+        // `stop_words: false` is the default and renders as the historic form.
+        assert_eq!(
+            TokenizerSpec::parse("stem(by: lang, stop_words: false)")
+                .unwrap()
+                .to_string(),
+            "stem(by: lang, default: simple)"
+        );
+        assert!(TokenizerSpec::parse("stem(by: lang, stop_words: maybe)").is_err());
+        let spec =
+            TokenizerSpec::parse("stem(by: languages, stop_words: true, segmenter: unicode)")
+                .unwrap();
+        assert_eq!(
+            spec,
+            TokenizerSpec::DynamicStem {
+                by: "languages".to_string(),
+                default: None,
+                stop_words: true,
+                segmenter: Segmenter::Unicode,
+            }
+        );
+        assert_eq!(
+            spec.to_string(),
+            "stem(by: languages, default: simple, stop_words: true, segmenter: unicode)"
+        );
+        assert!(TokenizerSpec::parse("stem(by: lang, segmenter: icu)").is_err());
 
         assert!(TokenizerSpec::parse("stem(default: en)").is_err());
         assert!(TokenizerSpec::parse("stem(by: lang, default: klingon)").is_err());
@@ -1488,6 +1913,12 @@ mod tests {
                 .get("stem(by: languages, default: klingon)")
                 .is_none()
         );
+        let stopping = registry
+            .get("stem(by: languages, default: simple, stop_words: true)")
+            .expect("stop-word spec resolves");
+        let tokens = stopping.tokenize_hinted("the running foxes", Some("en"));
+        assert_eq!(texts(&tokens), vec!["run", "fox"]);
+        assert_eq!(positions(&tokens), vec![1, 2]);
         // Static tokenizers accept and ignore hints.
         let simple = registry.get("en_stem").unwrap();
         assert_eq!(

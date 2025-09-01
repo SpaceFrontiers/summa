@@ -12,6 +12,13 @@ service SearchService {
 
   // Get index info
   rpc GetIndexInfo(GetIndexInfoRequest) returns (GetIndexInfoResponse);
+
+  // Text statistics (document frequencies, corpus sizes, average lengths)
+  // of the BM25 terms of a query over this backend's index. A broker that
+  // scatters one index over several shards sums the responses and sends the
+  // total back as `SearchRequest.text_stats`, so every shard scores with
+  // the same IDF.
+  rpc GetTextStats(GetTextStatsRequest) returns (GetTextStatsResponse);
 }
 
 // Index service
@@ -184,14 +191,33 @@ message MatchQuery {
   // each query token with the first listed language of the token's script.
   // Empty = the tokenizer's default.
   string tokenizer_hint = 3;
+  // Proximity rescoring (sequential dependence): the top candidates of the
+  // BM25 pass gain a bonus for adjacent query terms occurring next to each
+  // other (ordered windows) or within `proximity_window` positions
+  // (unordered windows, half weight), scaled by this weight. 0 = off.
+  // Approximate: the bonus applies to an over-fetched candidate pool.
+  float proximity_weight = 4;
+  // Unordered window size; 0 = 8.
+  uint32 proximity_window = 5;
+  // Approximate MaxScore: scale the pruning threshold by 1/heap_factor
+  // (0 or 1 = exact, rank-safe; 1.5 prunes more aggressively at some
+  // recall cost). Same semantics as SparseVectorQuery.heap_factor.
+  float heap_factor = 6;
+  // Long queries: keep only the `max_terms` rarest (highest idf) tokens for
+  // scoring; 0 = all tokens. Approximate.
+  uint32 max_terms = 7;
 }
 
 // Phrase query - text is tokenized server-side with the field's tokenizer
-// (so stemming matches indexing) and the terms must occur consecutively
-// (slop 0) or within `slop` positions of each other. Requires the field to be
-// indexed with token positions (`indexed<token_position>` or
-// `indexed<positions>`); without positions the engine degrades to a MUST of
-// the terms. Scored with BM25 like MatchQuery.
+// (so stemming matches indexing) and the terms must occur at the distances
+// the tokenizer assigned (consecutively unless the tokenizer dropped stop
+// words between them, whose positions are kept as gaps) or within `slop`
+// positions of that. Requires the field to be indexed with token positions
+// (`indexed<token_position>` or `indexed<positions>`); without positions the
+// engine degrades to a MUST of the terms. Scored with BM25 over the phrase
+// frequency (occurrences of the whole phrase) and the summed idf of its terms.
+// A phrase whose words are all stop words is rejected standalone and dropped
+// (with a server warning) when it is a clause of a BooleanQuery.
 message PhraseQuery {
   string field = 1;
   string text = 2;
@@ -231,6 +257,49 @@ message SearchRequest {
   // First-stage candidate pool. 0 uses offset + limit; explicit values must
   // be between offset + limit and the 2x ceiling.
   uint32 candidate_limit = 7;
+  // Anytime mode: wall-clock budget in milliseconds for the scoring phase.
+  // Text (BM25) MaxScore executors stop at the deadline and return the best
+  // results found so far; `SearchResponse.truncated` reports that it fired.
+  // 0 = unbounded (exact top-k).
+  uint64 time_budget_ms = 8;
+  // Cross-shard text statistics for BM25 (see `GetTextStats`). When set they
+  // replace the backend's own statistics for the listed fields and terms;
+  // unset = the backend aggregates over its own segments.
+  TextStats text_stats = 9;
+}
+
+message GetTextStatsRequest {
+  string index_name = 1;
+  // The query whose BM25 terms are collected (after this backend's own
+  // tokenization); sparse, dense and filter clauses contribute nothing.
+  Query query = 2;
+}
+
+message GetTextStatsResponse {
+  TextStats stats = 1;
+}
+
+// BM25 statistics of a set of text terms.
+message TextStats {
+  // Documents in the index (or the sum over shards).
+  uint64 total_docs = 1;
+  repeated TextFieldStats fields = 2;
+}
+
+message TextFieldStats {
+  string field = 1;
+  // Scoring units of the field: documents for a plain field, chunks for a
+  // chunked one.
+  uint64 corpus_size = 2;
+  // Average length of a scoring unit in tokens.
+  float avg_len = 3;
+  repeated TermDocFreq terms = 4;
+}
+
+message TermDocFreq {
+  // Index-time token bytes.
+  bytes term = 1;
+  uint64 doc_freq = 2;
 }
 
 // Unique document address: segment + local doc_id
@@ -287,6 +356,9 @@ message SearchResponse {
   uint64 total_hits = 2;
   uint64 took_ms = 3;
   SearchTimings timings = 4;
+  // True when `time_budget_ms` expired before every candidate was scored;
+  // the hits are then the best-so-far, not the exact top-k.
+  bool truncated = 5;
 }
 
 // Detailed timing breakdown for search phases (all values in microseconds)

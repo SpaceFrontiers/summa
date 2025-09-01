@@ -35,6 +35,12 @@ pub struct LazyGlobalStats {
     text_idf_cache: RwLock<FxHashMap<u32, FxHashMap<String, f32>>>,
     /// Cached average field lengths: field_id -> avg_len
     avg_field_len_cache: RwLock<FxHashMap<u32, f32>>,
+    /// Cached text document frequencies: field_id -> (term -> df), summed
+    /// over the segments (chunk counts for chunked fields).
+    text_df_cache: RwLock<FxHashMap<u32, FxHashMap<Vec<u8>, u64>>>,
+    /// Cached BM25 corpus size per text field (documents, or chunks for a
+    /// chunked field), summed over the segments.
+    text_corpus_cache: RwLock<FxHashMap<u32, u64>>,
 }
 
 impl LazyGlobalStats {
@@ -48,7 +54,80 @@ impl LazyGlobalStats {
             sparse_total_vectors_cache: RwLock::new(FxHashMap::default()),
             text_idf_cache: RwLock::new(FxHashMap::default()),
             avg_field_len_cache: RwLock::new(FxHashMap::default()),
+            text_df_cache: RwLock::new(FxHashMap::default()),
+            text_corpus_cache: RwLock::new(FxHashMap::default()),
         }
+    }
+
+    /// Document frequency of a text term summed over every segment (chunk
+    /// frequency for a chunked field), cached per term. Uses the synchronous
+    /// term dictionary lookup; without the `sync` feature it is 0 and scorers
+    /// fall back to per-segment statistics.
+    pub fn text_df(&self, field: Field, term: &[u8]) -> u64 {
+        {
+            let cache = self.text_df_cache.read();
+            if let Some(field_cache) = cache.get(&field.0)
+                && let Some(&df) = field_cache.get(term)
+            {
+                return df;
+            }
+        }
+        let df = self.compute_text_df_bytes(field, term);
+        self.text_df_cache
+            .write()
+            .entry(field.0)
+            .or_default()
+            .insert(term.to_vec(), df);
+        df
+    }
+
+    /// BM25 corpus size of a text field summed over every segment: documents
+    /// for a plain field, chunks for a chunked field.
+    pub fn text_corpus_size(&self, field: Field) -> u64 {
+        if let Some(&size) = self.text_corpus_cache.read().get(&field.0) {
+            return size;
+        }
+        let size: u64 = self
+            .segments
+            .iter()
+            .map(|segment| segment.text_corpus_size(field) as u64)
+            .sum();
+        self.text_corpus_cache.write().insert(field.0, size);
+        size
+    }
+
+    /// Materialise the statistics one query needs: per-field corpus size and
+    /// average length, and the searcher-wide document frequency of every
+    /// `(field, term)` in `terms`. Scorers given these statistics score a
+    /// term identically in every segment.
+    pub fn text_stats_for(&self, terms: &[(Field, Vec<u8>)]) -> GlobalStats {
+        let mut builder = GlobalStatsBuilder::new();
+        builder.total_docs = self.total_docs;
+        let mut fields_seen: FxHashMap<u32, ()> = FxHashMap::default();
+        for (field, term) in terms {
+            if fields_seen.insert(field.0, ()).is_none() {
+                builder.set_avg_field_len(*field, self.avg_field_len(*field));
+                builder.set_text_corpus_size(*field, self.text_corpus_size(*field));
+            }
+            let df = self.text_df(*field, term);
+            if df > 0 {
+                builder.add_text_df(*field, String::from_utf8_lossy(term).into_owned(), df);
+            }
+        }
+        builder.build(0)
+    }
+
+    #[cfg(feature = "sync")]
+    fn compute_text_df_bytes(&self, field: Field, term: &[u8]) -> u64 {
+        self.segments
+            .iter()
+            .map(|segment| segment.text_doc_freq_sync(field, term).unwrap_or(0) as u64)
+            .sum()
+    }
+
+    #[cfg(not(feature = "sync"))]
+    fn compute_text_df_bytes(&self, _field: Field, _term: &[u8]) -> u64 {
+        0
     }
 
     /// Total documents across all segments
@@ -175,9 +254,10 @@ impl LazyGlobalStats {
             }
         }
 
-        // Slow path: compute and cache
+        // Slow path: compute and cache. The corpus is the field's scoring
+        // units (chunks for a chunked field), matching the local formula.
         let df = self.compute_text_df(field, term);
-        let n = self.total_docs as f32;
+        let n = self.text_corpus_size(field) as f32;
         let df_f = df as f32;
         let idf = if df > 0 {
             ((n - df_f + 0.5) / (df_f + 0.5) + 1.0).ln()
@@ -260,15 +340,9 @@ impl LazyGlobalStats {
         total
     }
 
-    /// Compute document frequency for a text term (not cached - internal)
-    ///
-    /// Note: This is expensive as it requires async term lookup.
-    /// For now, returns 0 - text IDF should be computed via term dictionary.
-    fn compute_text_df(&self, _field: Field, _term: &str) -> u64 {
-        // Text term lookup requires async access to term dictionary
-        // For now, this is a placeholder - actual implementation would
-        // need to be async or use pre-computed stats
-        0
+    /// Document frequency of a text term over the segments (not cached).
+    fn compute_text_df(&self, field: Field, term: &str) -> u64 {
+        self.text_df(field, term.as_bytes())
     }
 
     /// Number of segments
@@ -317,6 +391,9 @@ pub struct TextFieldStats {
     pub doc_freqs: FxHashMap<String, u64>,
     /// Average field length (for BM25)
     pub avg_field_len: f32,
+    /// BM25 corpus size of the field (documents, or chunks for a chunked
+    /// field); 0 = use the index-wide document total.
+    pub corpus_size: u64,
 }
 
 impl GlobalStats {
@@ -359,11 +436,36 @@ impl GlobalStats {
         if let Some(stats) = self.text_stats.get(&field.0)
             && let Some(&df) = stats.doc_freqs.get(term)
         {
-            let n = self.total_docs as f32;
+            let n = if stats.corpus_size > 0 {
+                stats.corpus_size as f32
+            } else {
+                self.total_docs as f32
+            };
             let df = df as f32;
             return ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
         }
         0.0
+    }
+
+    /// Document frequency recorded for a text term, if any.
+    pub fn text_df(&self, field: Field, term: &str) -> Option<u64> {
+        self.text_stats
+            .get(&field.0)
+            .and_then(|stats| stats.doc_freqs.get(term).copied())
+    }
+
+    /// BM25 corpus size recorded for a text field (0 when unknown).
+    pub fn text_corpus_size(&self, field: Field) -> u64 {
+        self.text_stats
+            .get(&field.0)
+            .map_or(0, |stats| stats.corpus_size)
+    }
+
+    /// Text fields with recorded statistics.
+    pub fn text_fields(&self) -> impl Iterator<Item = (Field, &TextFieldStats)> {
+        self.text_stats
+            .iter()
+            .map(|(id, stats)| (Field(*id), stats))
     }
 
     /// Get average field length for BM25
@@ -430,6 +532,12 @@ impl GlobalStatsBuilder {
     pub fn set_avg_field_len(&mut self, field: Field, avg_len: f32) {
         let stats = self.text_stats.entry(field.0).or_default();
         stats.avg_field_len = avg_len;
+    }
+
+    /// Set the BM25 corpus size of a text field (documents or chunks).
+    pub fn set_text_corpus_size(&mut self, field: Field, corpus_size: u64) {
+        let stats = self.text_stats.entry(field.0).or_default();
+        stats.corpus_size = corpus_size;
     }
 
     /// Build the final GlobalStats

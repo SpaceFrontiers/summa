@@ -11,7 +11,7 @@ use super::SegmentMerger;
 use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::Schema;
-use crate::segment::chunk_map::{ChunkMapSource, write_merged_chunk_maps};
+use crate::segment::chunk_map::{ChunkMapSource, DocLengthsSource, write_merged_chunk_maps};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 
@@ -51,16 +51,23 @@ impl SegmentMerger {
         segments: &[SegmentReader],
         files: &SegmentFiles,
     ) -> Result<u64> {
-        let mut chunked_fields: Vec<u32> = self
-            .schema
-            .fields()
-            .filter(|(_, entry)| entry.chunked)
-            .map(|(field, _)| field.0)
-            .collect();
-        if chunked_fields.is_empty() || segments.iter().all(|s| !s.has_chunks_file()) {
+        if segments.iter().all(|s| !s.has_chunks_file()) {
             return Ok(0);
         }
+        let mut chunked_fields: Vec<u32> = Vec::new();
+        let mut plain_fields: Vec<u32> = Vec::new();
+        for (field, entry) in self.schema.fields() {
+            if !entry.indexed || entry.field_type != crate::dsl::FieldType::Text {
+                continue;
+            }
+            if entry.chunked {
+                chunked_fields.push(field.0);
+            } else {
+                plain_fields.push(field.0);
+            }
+        }
         chunked_fields.sort_unstable();
+        plain_fields.sort_unstable();
 
         let doc_offs = super::doc_offsets(segments)?;
         let mut fields: Vec<(u32, Vec<ChunkMapSource<'_>>)> = Vec::new();
@@ -75,18 +82,37 @@ impl SegmentMerger {
                 fields.push((field_id, sources));
             }
         }
-        if fields.is_empty() {
+        // Norms are dense per document: a source without the section
+        // contributes zeros for its documents so doc ids keep lining up.
+        let mut norms: Vec<(u32, Vec<DocLengthsSource<'_>>)> = Vec::new();
+        for field_id in plain_fields {
+            let field = crate::dsl::Field(field_id);
+            if segments.iter().all(|s| s.doc_lengths(field).is_none()) {
+                continue;
+            }
+            let sources = segments
+                .iter()
+                .map(|segment| DocLengthsSource {
+                    lengths: segment.doc_lengths(field),
+                    num_docs: segment.num_docs(),
+                })
+                .collect();
+            norms.push((field_id, sources));
+        }
+        if fields.is_empty() && norms.is_empty() {
             return Ok(0);
         }
 
         self.ensure_not_cancelled()?;
         let mut writer = dir.streaming_writer_cold(&files.chunks).await?;
-        let bytes = write_merged_chunk_maps(&mut *writer, &fields).map_err(crate::Error::Io)?;
+        let bytes =
+            write_merged_chunk_maps(&mut *writer, &fields, &norms).map_err(crate::Error::Io)?;
         writer.finish()?;
         log::info!(
-            "[merge] index={} chunk maps done: {} fields, {}",
+            "[merge] index={} chunk maps done: {} chunked fields, {} norm columns, {}",
             self.schema.index_label(),
             fields.len(),
+            norms.len(),
             crate::format_bytes(bytes),
         );
         Ok(bytes)

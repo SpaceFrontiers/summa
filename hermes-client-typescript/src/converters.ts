@@ -49,6 +49,10 @@ export function buildQuery(q: Query): PbQuery {
         field: q.match.field,
         text: q.match.text,
         tokenizerHint: q.match.tokenizerHint ?? "",
+        proximityWeight: q.match.proximityWeight ?? 0,
+        proximityWindow: q.match.proximityWindow ?? 0,
+        heapFactor: q.match.heapFactor ?? 0,
+        maxTerms: q.match.maxTerms ?? 0,
       },
     };
   }

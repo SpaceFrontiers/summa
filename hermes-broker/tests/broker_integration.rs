@@ -43,6 +43,7 @@ async fn pass_through_is_identical() {
 
     // For map-free payloads the forwarding really is byte-identical.
     let hit_free_of_maps = SearchResponse {
+        truncated: brokered.truncated,
         hits: vec![],
         total_hits: brokered.total_hits,
         took_ms: brokered.took_ms,

@@ -7,15 +7,25 @@
 //! length normalisation. See `docs/chunked-text-fields.md`.
 //!
 //! ```text
-//! [magic "CHNK"][version u32 = 1][num_fields u32]
-//! TOC × num_fields: [field_id u32][num_chunks u32][total_tokens u64][data_offset u64]
-//! per field:        doc_ids u32 × n | ordinals u16 × n | lengths u16 × n
+//! [magic "CHNK"][version u32 = 2][num_sections u32]
+//! TOC × num_sections: [field_id u32][kind u32][count u32][total_tokens u64][data_offset u64]
+//! kind 0 (chunk map):   doc_ids u32 × n | ordinals u16 × n | lengths u16 × n
+//! kind 1 (doc lengths): lengths u16 × num_docs        (norms of a plain text field)
 //! ```
 //!
+//! Version 1 files have 24-byte entries without `kind` and hold chunk maps
+//! only; they are still read.
+//!
 //! Virtual ids are assigned in indexing order, and documents are indexed in
-//! doc-id order, so `doc_ids` is non-decreasing and `(doc_id, ordinal)` is
-//! strictly increasing. Merges concatenate sections and add the document
-//! offset to `doc_ids`; ordinals and lengths are copied verbatim.
+//! doc-id order, so `doc_ids` starts out non-decreasing. A reorder pass on a
+//! field with the `reorder` attribute permutes the virtual ids (BP over the
+//! field's postings, `segment/text_reorder.rs`); no query path depends on the
+//! order. Merges concatenate sections and add the document offset to
+//! `doc_ids`; ordinals and lengths are copied verbatim.
+//!
+//! A doc-length section stores the token count of the field in every
+//! document of the segment (0 when the document has no value), so BM25 can
+//! normalise plain fields by their real length instead of `tf`.
 
 use std::io::{self, Write};
 
@@ -26,9 +36,12 @@ use crate::DocId;
 use crate::directories::OwnedBytes;
 
 const MAGIC: u32 = 0x4B4E_4843; // "CHNK"
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const HEADER_SIZE: usize = 12;
-const TOC_ENTRY_SIZE: usize = 24;
+const TOC_ENTRY_SIZE_V1: usize = 24;
+const TOC_ENTRY_SIZE: usize = 28;
+const KIND_CHUNK_MAP: u32 = 0;
+const KIND_DOC_LENGTHS: u32 = 1;
 
 /// Token count stored per chunk; longer chunks saturate.
 pub const MAX_CHUNK_LENGTH: u32 = u16::MAX as u32;
@@ -75,25 +88,54 @@ impl ChunkMapBuilder {
     fn section_bytes(&self) -> u64 {
         self.doc_ids.len() as u64 * 8
     }
+
+    /// Token count of virtual id `vid` (saturated at `MAX_CHUNK_LENGTH`).
+    pub fn length(&self, vid: u32) -> u32 {
+        self.lengths
+            .get(vid as usize)
+            .map_or(0, |len| u32::from(*len))
+    }
 }
 
-/// Write every chunked field's map as one `.chunks` file.
+/// Per-document token counts of one plain text field, ready to be written.
+pub struct DocLengthsColumn<'a> {
+    pub field_id: u32,
+    /// One entry per document of the segment (0 = no value).
+    pub lengths: &'a [u16],
+    /// Sum of the unsaturated token counts.
+    pub total_tokens: u64,
+}
+
+/// Write every chunked field's map and every plain field's length column as
+/// one `.chunks` file.
 ///
-/// `fields` must be sorted by field id and contain only non-empty builders.
+/// `fields` must be sorted by field id and contain only non-empty builders;
+/// `norms` likewise sorted, one column per field.
 pub fn write_chunk_maps<W: Write + ?Sized>(
     writer: &mut W,
     fields: &[(u32, &ChunkMapBuilder)],
+    norms: &[DocLengthsColumn<'_>],
 ) -> io::Result<u64> {
-    let mut offset = (HEADER_SIZE + TOC_ENTRY_SIZE * fields.len()) as u64;
+    let sections = fields.len() + norms.len();
+    let mut offset = (HEADER_SIZE + TOC_ENTRY_SIZE * sections) as u64;
     writer.write_u32::<LittleEndian>(MAGIC)?;
     writer.write_u32::<LittleEndian>(VERSION)?;
-    writer.write_u32::<LittleEndian>(fields.len() as u32)?;
+    writer.write_u32::<LittleEndian>(sections as u32)?;
     for (field_id, map) in fields {
         writer.write_u32::<LittleEndian>(*field_id)?;
+        writer.write_u32::<LittleEndian>(KIND_CHUNK_MAP)?;
         writer.write_u32::<LittleEndian>(map.len() as u32)?;
         writer.write_u64::<LittleEndian>(map.total_tokens)?;
         writer.write_u64::<LittleEndian>(offset)?;
         offset += map.section_bytes();
+    }
+    for column in norms {
+        writer.write_u32::<LittleEndian>(column.field_id)?;
+        writer.write_u32::<LittleEndian>(KIND_DOC_LENGTHS)?;
+        writer.write_u32::<LittleEndian>(column.lengths.len() as u32)?;
+        writer.write_u64::<LittleEndian>(column.total_tokens)?;
+        writer.write_u64::<LittleEndian>(offset)?;
+        offset += column.lengths.len() as u64 * 2;
     }
     for (_, map) in fields {
         for doc_id in &map.doc_ids {
@@ -106,7 +148,82 @@ pub fn write_chunk_maps<W: Write + ?Sized>(
             writer.write_u16::<LittleEndian>(*length)?;
         }
     }
+    for column in norms {
+        for length in column.lengths {
+            writer.write_u16::<LittleEndian>(*length)?;
+        }
+    }
     Ok(offset)
+}
+
+/// Read-only per-document lengths of one plain text field, backed by the
+/// mapped `.chunks` file.
+#[derive(Debug, Clone)]
+pub struct DocLengths {
+    lengths: OwnedBytes,
+    num_docs: u32,
+    total_tokens: u64,
+}
+
+impl DocLengths {
+    /// In-memory lengths column (tests).
+    #[cfg(test)]
+    pub(crate) fn from_lengths(lengths: &[u16]) -> Self {
+        let mut bytes = Vec::with_capacity(lengths.len() * 2);
+        for len in lengths {
+            bytes.extend_from_slice(&len.to_le_bytes());
+        }
+        Self {
+            lengths: OwnedBytes::new(bytes),
+            num_docs: lengths.len() as u32,
+            total_tokens: lengths.iter().map(|&l| u64::from(l)).sum(),
+        }
+    }
+
+    pub fn num_docs(&self) -> u32 {
+        self.num_docs
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.total_tokens
+    }
+
+    /// Average length over documents that have the field (1.0 when none).
+    pub fn avg_len(&self) -> f32 {
+        let with_value = self
+            .lengths
+            .as_slice()
+            .chunks_exact(2)
+            .filter(|b| b[0] != 0 || b[1] != 0)
+            .count();
+        if with_value == 0 {
+            1.0
+        } else {
+            (self.total_tokens as f64 / with_value as f64) as f32
+        }
+    }
+
+    /// Token count of the field in `doc_id` (0 when absent or out of range,
+    /// saturated at `MAX_CHUNK_LENGTH`).
+    #[inline]
+    pub fn length(&self, doc_id: DocId) -> u32 {
+        let at = doc_id as usize * 2;
+        self.lengths
+            .as_slice()
+            .get(at..at + 2)
+            .map_or(0, |b| u32::from(u16::from_le_bytes([b[0], b[1]])))
+    }
+
+    pub(crate) fn length_bytes(&self) -> &[u8] {
+        self.lengths.as_slice()
+    }
+}
+
+/// Everything a `.chunks` file holds.
+#[derive(Debug, Default)]
+pub struct ChunkMapFile {
+    pub chunk_maps: FxHashMap<u32, ChunkMap>,
+    pub doc_lengths: FxHashMap<u32, DocLengths>,
 }
 
 /// Read-only chunk map of one field, backed by the mapped `.chunks` file.
@@ -186,8 +303,8 @@ impl ChunkMap {
     }
 }
 
-/// Parse a `.chunks` file into per-field maps.
-pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<FxHashMap<u32, ChunkMap>> {
+/// Parse a `.chunks` file into per-field chunk maps and length columns.
+pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
     let data = bytes.as_slice();
     if data.len() < HEADER_SIZE {
         return Err(io::Error::new(
@@ -204,52 +321,84 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<FxHashMap<u32, ChunkMap>
         ));
     }
     let version = cursor.read_u32::<LittleEndian>()?;
-    if version != VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unsupported chunk map version {version} (expected {VERSION})"),
-        ));
-    }
-    let num_fields = cursor.read_u32::<LittleEndian>()? as usize;
-    if data.len() < HEADER_SIZE + TOC_ENTRY_SIZE * num_fields {
+    let entry_size = match version {
+        1 => TOC_ENTRY_SIZE_V1,
+        VERSION => TOC_ENTRY_SIZE,
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported chunk map version {other} (expected {VERSION})"),
+            ));
+        }
+    };
+    let num_sections = cursor.read_u32::<LittleEndian>()? as usize;
+    if data.len() < HEADER_SIZE + entry_size * num_sections {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk map table of contents truncated",
         ));
     }
-    let mut maps = FxHashMap::default();
-    for _ in 0..num_fields {
+    let overflow = || io::Error::new(io::ErrorKind::InvalidData, "chunk map size overflow");
+    let mut file = ChunkMapFile::default();
+    for _ in 0..num_sections {
         let field_id = cursor.read_u32::<LittleEndian>()?;
-        let num_chunks = cursor.read_u32::<LittleEndian>()?;
+        let kind = if version == 1 {
+            KIND_CHUNK_MAP
+        } else {
+            cursor.read_u32::<LittleEndian>()?
+        };
+        let count = cursor.read_u32::<LittleEndian>()?;
         let total_tokens = cursor.read_u64::<LittleEndian>()?;
         let offset = cursor.read_u64::<LittleEndian>()? as usize;
-        let n = num_chunks as usize;
+        let n = count as usize;
+        let bytes_per_entry = match kind {
+            KIND_CHUNK_MAP => 8,
+            KIND_DOC_LENGTHS => 2,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unknown chunk map section kind {other} for field {field_id}"),
+                ));
+            }
+        };
         let end = offset
-            .checked_add(n.checked_mul(8).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "chunk map size overflow")
-            })?)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "chunk map size overflow"))?;
+            .checked_add(n.checked_mul(bytes_per_entry).ok_or_else(overflow)?)
+            .ok_or_else(overflow)?;
         if end > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("chunk map section of field {field_id} exceeds file length"),
             ));
         }
-        let doc_ids = bytes.slice(offset..offset + n * 4);
-        let ordinals = bytes.slice(offset + n * 4..offset + n * 6);
-        let lengths = bytes.slice(offset + n * 6..end);
-        maps.insert(
-            field_id,
-            ChunkMap {
-                doc_ids,
-                ordinals,
-                lengths,
-                num_chunks,
-                total_tokens,
-            },
-        );
+        match kind {
+            KIND_CHUNK_MAP => {
+                let doc_ids = bytes.slice(offset..offset + n * 4);
+                let ordinals = bytes.slice(offset + n * 4..offset + n * 6);
+                let lengths = bytes.slice(offset + n * 6..end);
+                file.chunk_maps.insert(
+                    field_id,
+                    ChunkMap {
+                        doc_ids,
+                        ordinals,
+                        lengths,
+                        num_chunks: count,
+                        total_tokens,
+                    },
+                );
+            }
+            _ => {
+                file.doc_lengths.insert(
+                    field_id,
+                    DocLengths {
+                        lengths: bytes.slice(offset..end),
+                        num_docs: count,
+                        total_tokens,
+                    },
+                );
+            }
+        }
     }
-    Ok(maps)
+    Ok(file)
 }
 
 /// One source section of a merged chunk map.
@@ -259,24 +408,34 @@ pub struct ChunkMapSource<'a> {
     pub doc_offset: u32,
 }
 
+/// One source of a merged length column: the source segment's column when it
+/// has one, and its document count (zeros are written for a missing column).
+pub struct DocLengthsSource<'a> {
+    pub lengths: Option<&'a DocLengths>,
+    pub num_docs: u32,
+}
+
 /// Write the merged `.chunks` file: per field, the sources' sections are
 /// concatenated in order (virtual ids of a later source are offset by the
-/// chunk counts of the earlier ones, matching the posting merge).
+/// chunk counts of the earlier ones, matching the posting merge; length
+/// columns follow the document order of the merge).
 ///
-/// `fields` must be sorted by field id; a field with zero total chunks is
-/// skipped.
+/// `fields` and `norms` must be sorted by field id; a field with zero total
+/// chunks is skipped.
 pub fn write_merged_chunk_maps<W: Write + ?Sized>(
     writer: &mut W,
     fields: &[(u32, Vec<ChunkMapSource<'_>>)],
+    norms: &[(u32, Vec<DocLengthsSource<'_>>)],
 ) -> io::Result<u64> {
     let live: Vec<&(u32, Vec<ChunkMapSource<'_>>)> = fields
         .iter()
         .filter(|(_, sources)| sources.iter().any(|s| s.map.num_chunks() > 0))
         .collect();
-    let mut offset = (HEADER_SIZE + TOC_ENTRY_SIZE * live.len()) as u64;
+    let sections = live.len() + norms.len();
+    let mut offset = (HEADER_SIZE + TOC_ENTRY_SIZE * sections) as u64;
     writer.write_u32::<LittleEndian>(MAGIC)?;
     writer.write_u32::<LittleEndian>(VERSION)?;
-    writer.write_u32::<LittleEndian>(live.len() as u32)?;
+    writer.write_u32::<LittleEndian>(sections as u32)?;
     for (field_id, sources) in &live {
         let mut num_chunks = 0u64;
         let mut total_tokens = 0u64;
@@ -291,10 +450,30 @@ pub fn write_merged_chunk_maps<W: Write + ?Sized>(
             )
         })?;
         writer.write_u32::<LittleEndian>(*field_id)?;
+        writer.write_u32::<LittleEndian>(KIND_CHUNK_MAP)?;
         writer.write_u32::<LittleEndian>(num_chunks)?;
         writer.write_u64::<LittleEndian>(total_tokens)?;
         writer.write_u64::<LittleEndian>(offset)?;
         offset += u64::from(num_chunks) * 8;
+    }
+    for (field_id, sources) in norms {
+        let num_docs: u64 = sources.iter().map(|s| u64::from(s.num_docs)).sum();
+        let num_docs = u32::try_from(num_docs).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("field {field_id} exceeds u32::MAX documents after merge"),
+            )
+        })?;
+        let total_tokens: u64 = sources
+            .iter()
+            .filter_map(|s| s.lengths.map(DocLengths::total_tokens))
+            .sum();
+        writer.write_u32::<LittleEndian>(*field_id)?;
+        writer.write_u32::<LittleEndian>(KIND_DOC_LENGTHS)?;
+        writer.write_u32::<LittleEndian>(num_docs)?;
+        writer.write_u64::<LittleEndian>(total_tokens)?;
+        writer.write_u64::<LittleEndian>(offset)?;
+        offset += u64::from(num_docs) * 2;
     }
     let mut patched: Vec<u8> = Vec::new();
     for (_, sources) in &live {
@@ -324,6 +503,34 @@ pub fn write_merged_chunk_maps<W: Write + ?Sized>(
             writer.write_all(source.map.length_bytes())?;
         }
     }
+    let zeros = [0u8; 2 * 1024];
+    for (_, sources) in norms {
+        for source in sources {
+            match source.lengths {
+                Some(lengths) if lengths.num_docs() == source.num_docs => {
+                    writer.write_all(lengths.length_bytes())?;
+                }
+                Some(lengths) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "length column covers {} documents, segment has {}",
+                            lengths.num_docs(),
+                            source.num_docs
+                        ),
+                    ));
+                }
+                None => {
+                    let mut remaining = source.num_docs as usize * 2;
+                    while remaining > 0 {
+                        let take = remaining.min(zeros.len());
+                        writer.write_all(&zeros[..take])?;
+                        remaining -= take;
+                    }
+                }
+            }
+        }
+    }
     Ok(offset)
 }
 
@@ -344,8 +551,8 @@ mod tests {
         let a = build(&[(0, 0, 10), (0, 1, 20), (3, 0, 70_000)]);
         let b = build(&[(1, 0, 5)]);
         let mut out = Vec::new();
-        write_chunk_maps(&mut out, &[(2, &a), (7, &b)]).unwrap();
-        let maps = read_chunk_maps(OwnedBytes::new(out)).unwrap();
+        write_chunk_maps(&mut out, &[(2, &a), (7, &b)], &[]).unwrap();
+        let maps = read_chunk_maps(OwnedBytes::new(out)).unwrap().chunk_maps;
         let a = &maps[&2];
         assert_eq!(a.num_chunks(), 3);
         assert_eq!(a.resolve(0), (0, 0));
@@ -363,11 +570,15 @@ mod tests {
         let first = build(&[(0, 0, 10), (1, 0, 11), (1, 1, 12)]);
         let second = build(&[(0, 0, 20), (0, 1, 21)]);
         let mut raw_first = Vec::new();
-        write_chunk_maps(&mut raw_first, &[(4, &first)]).unwrap();
+        write_chunk_maps(&mut raw_first, &[(4, &first)], &[]).unwrap();
         let mut raw_second = Vec::new();
-        write_chunk_maps(&mut raw_second, &[(4, &second)]).unwrap();
-        let first = read_chunk_maps(OwnedBytes::new(raw_first)).unwrap();
-        let second = read_chunk_maps(OwnedBytes::new(raw_second)).unwrap();
+        write_chunk_maps(&mut raw_second, &[(4, &second)], &[]).unwrap();
+        let first = read_chunk_maps(OwnedBytes::new(raw_first))
+            .unwrap()
+            .chunk_maps;
+        let second = read_chunk_maps(OwnedBytes::new(raw_second))
+            .unwrap()
+            .chunk_maps;
 
         let mut merged = Vec::new();
         write_merged_chunk_maps(
@@ -385,9 +596,10 @@ mod tests {
                     },
                 ],
             )],
+            &[],
         )
         .unwrap();
-        let merged = read_chunk_maps(OwnedBytes::new(merged)).unwrap();
+        let merged = read_chunk_maps(OwnedBytes::new(merged)).unwrap().chunk_maps;
         let map = &merged[&4];
         assert_eq!(map.num_chunks(), 5);
         assert_eq!(map.total_tokens(), 74);
@@ -412,8 +624,97 @@ mod tests {
 
         let a = build(&[(0, 0, 10)]);
         let mut out = Vec::new();
-        write_chunk_maps(&mut out, &[(1, &a)]).unwrap();
+        write_chunk_maps(&mut out, &[(1, &a)], &[]).unwrap();
         out.truncate(out.len() - 1);
         assert!(read_chunk_maps(OwnedBytes::new(out)).is_err());
+    }
+
+    #[test]
+    fn doc_length_columns_round_trip_and_merge_with_zero_fill() {
+        let a = build(&[(0, 0, 10)]);
+        let column = [7u16, 0, 300];
+        let mut out = Vec::new();
+        write_chunk_maps(
+            &mut out,
+            &[(1, &a)],
+            &[DocLengthsColumn {
+                field_id: 5,
+                lengths: &column,
+                total_tokens: 307,
+            }],
+        )
+        .unwrap();
+        let file = read_chunk_maps(OwnedBytes::new(out)).unwrap();
+        assert_eq!(file.chunk_maps[&1].num_chunks(), 1);
+        let norms = &file.doc_lengths[&5];
+        assert_eq!(norms.num_docs(), 3);
+        assert_eq!(
+            (0..4).map(|d| norms.length(d)).collect::<Vec<_>>(),
+            vec![7, 0, 300, 0]
+        );
+        assert_eq!(norms.total_tokens(), 307);
+        assert!(
+            (norms.avg_len() - 153.5).abs() < 1e-3,
+            "{}",
+            norms.avg_len()
+        );
+
+        // Merge: a source without the column contributes zeros for its docs.
+        let mut merged = Vec::new();
+        write_merged_chunk_maps(
+            &mut merged,
+            &[],
+            &[(
+                5,
+                vec![
+                    DocLengthsSource {
+                        lengths: None,
+                        num_docs: 2,
+                    },
+                    DocLengthsSource {
+                        lengths: Some(norms),
+                        num_docs: 3,
+                    },
+                ],
+            )],
+        )
+        .unwrap();
+        let merged = read_chunk_maps(OwnedBytes::new(merged)).unwrap();
+        assert!(merged.chunk_maps.is_empty());
+        let norms = &merged.doc_lengths[&5];
+        assert_eq!(norms.num_docs(), 5);
+        assert_eq!(
+            (0..5).map(|d| norms.length(d)).collect::<Vec<_>>(),
+            vec![0, 0, 7, 0, 300]
+        );
+        assert_eq!(norms.total_tokens(), 307);
+    }
+
+    #[test]
+    fn version_one_files_still_read() {
+        let a = build(&[(0, 0, 10), (2, 0, 4)]);
+        let mut out = Vec::new();
+        out.write_u32::<LittleEndian>(MAGIC).unwrap();
+        out.write_u32::<LittleEndian>(1).unwrap();
+        out.write_u32::<LittleEndian>(1).unwrap();
+        out.write_u32::<LittleEndian>(9).unwrap();
+        out.write_u32::<LittleEndian>(2).unwrap();
+        out.write_u64::<LittleEndian>(14).unwrap();
+        out.write_u64::<LittleEndian>((HEADER_SIZE + TOC_ENTRY_SIZE_V1) as u64)
+            .unwrap();
+        for doc in &a.doc_ids {
+            out.write_u32::<LittleEndian>(*doc).unwrap();
+        }
+        for ord in &a.ordinals {
+            out.write_u16::<LittleEndian>(*ord).unwrap();
+        }
+        for len in &a.lengths {
+            out.write_u16::<LittleEndian>(*len).unwrap();
+        }
+        let file = read_chunk_maps(OwnedBytes::new(out)).unwrap();
+        assert!(file.doc_lengths.is_empty());
+        let map = &file.chunk_maps[&9];
+        assert_eq!(map.resolve(1), (2, 0));
+        assert_eq!(map.length(1), 4);
     }
 }

@@ -14,7 +14,7 @@ use crate::metrics as m;
 use crate::proto::hermes::search_service_server::SearchService;
 use crate::proto::hermes::{
     GetDocumentRequest, GetDocumentResponse, GetIndexInfoRequest, GetIndexInfoResponse,
-    SearchRequest, SearchResponse,
+    GetTextStatsRequest, GetTextStatsResponse, SearchRequest, SearchResponse,
 };
 
 pub struct BrokerSearchService {
@@ -154,6 +154,31 @@ impl SearchService for BrokerSearchService {
             .map(|_| tonic::Code::Ok)
             .unwrap_or_else(|s| s.code());
         record_backend(&backend_id, "get_document", started, code);
+        result.map(|r| Response::new(r.into_inner()))
+    }
+
+    /// One index lives on one shard today, so the statistics of that shard
+    /// are the whole; a scatter-gather broker sums this per shard and sends
+    /// the total back as `SearchRequest.text_stats`.
+    async fn get_text_stats(
+        &self,
+        request: Request<GetTextStatsRequest>,
+    ) -> Result<Response<GetTextStatsResponse>, Status> {
+        self.ctx.check_admission()?;
+        let timeout = forward_timeout(request.metadata());
+        let req = request.into_inner();
+        let (channels, backend_id) = self.read_route(&req.index_name)?;
+        let mut outbound = Request::new(req);
+        if let Some(t) = timeout {
+            outbound.set_timeout(t);
+        }
+        let started = Instant::now();
+        let result = channels.search.clone().get_text_stats(outbound).await;
+        let code = result
+            .as_ref()
+            .map(|_| tonic::Code::Ok)
+            .unwrap_or_else(|s| s.code());
+        record_backend(&backend_id, "get_text_stats", started, code);
         result.map(|r| Response::new(r.into_inner()))
     }
 

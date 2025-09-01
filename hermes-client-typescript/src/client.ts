@@ -281,6 +281,8 @@ export class HermesClient {
           ? buildReranker(request.reranker)
           : undefined,
         candidateLimit: request.candidateLimit ?? 0,
+        timeBudgetMs: request.timeBudgetMs ?? 0,
+        textStats: undefined,
       },
       this.callOptions(timeoutMs),
     );

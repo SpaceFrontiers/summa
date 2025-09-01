@@ -1926,6 +1926,8 @@ pub struct SegmentReader {
     fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
     /// Virtual-id maps of chunked text fields per field_id
     chunk_maps: FxHashMap<u32, super::chunk_map::ChunkMap>,
+    /// Per-document field lengths of plain (non-chunked) text fields.
+    doc_lengths: FxHashMap<u32, super::chunk_map::DocLengths>,
     /// Dense-vector hot-metadata pin accounting (see `segment::pin`).
     #[cfg(feature = "native")]
     dense_pin_report: crate::segment::pin::PinReport,
@@ -2016,8 +2018,11 @@ impl SegmentReader {
         // Load fast-field columns from .fast file
         let fast_fields = loader::load_fast_fields_file(dir, &files, &schema).await?;
 
-        // Load chunk maps of chunked text fields from .chunks file
-        let chunk_maps = loader::load_chunk_maps_file(dir, &files, &schema).await?;
+        // Load chunk maps of chunked text fields and per-document field
+        // lengths (norms) from the .chunks file
+        let chunk_file = loader::load_chunk_maps_file(dir, &files, &schema).await?;
+        let chunk_maps = chunk_file.chunk_maps;
+        let doc_lengths = chunk_file.doc_lengths;
 
         // Log segment loading stats
         {
@@ -2078,6 +2083,7 @@ impl SegmentReader {
             positions_handle,
             fast_fields,
             chunk_maps,
+            doc_lengths,
             #[cfg(feature = "native")]
             dense_pin_report: Default::default(),
             #[cfg(feature = "native")]
@@ -2299,6 +2305,12 @@ impl SegmentReader {
         &self.chunk_maps
     }
 
+    /// Persisted per-document lengths of a plain text field, when this
+    /// segment recorded any token for it.
+    pub fn doc_lengths(&self, field: Field) -> Option<&super::chunk_map::DocLengths> {
+        self.doc_lengths.get(&field.0)
+    }
+
     /// Whether `field` is declared chunked in the schema (its postings are
     /// keyed by virtual chunk ids, never by document ids).
     pub fn is_chunked_field(&self, field: Field) -> bool {
@@ -2326,7 +2338,7 @@ impl SegmentReader {
 
     /// Whether this segment carries a `.chunks` file.
     pub fn has_chunks_file(&self) -> bool {
-        !self.chunk_maps.is_empty()
+        !self.chunk_maps.is_empty() || !self.doc_lengths.is_empty()
     }
 
     /// Get term dictionary stats for debugging
@@ -3562,7 +3574,7 @@ impl SegmentReader {
         &self,
         field: Field,
         term: &[u8],
-    ) -> Result<Option<crate::structures::PositionPostingList>> {
+    ) -> Result<Option<crate::structures::TermPositions>> {
         // Get positions handle
         let handle = match &self.positions_handle {
             Some(h) => h,
@@ -3590,13 +3602,10 @@ impl SegmentReader {
         // the term dictionary. Direct `offset + length` can wrap in release
         // builds and alias an unrelated range.
         let range = checked_file_range(offset, length, handle.len(), "position list")?;
-        let slice = handle.slice(range);
-        let data = slice.read_bytes().await?;
-
-        // Deserialize
-        let pos_list = crate::structures::PositionPostingList::deserialize(data.as_slice())?;
-
-        Ok(Some(pos_list))
+        // Zero-copy on mmap directories: a v2 stream is decoded per block
+        // on demand, only for the documents a scorer asks about.
+        let data = handle.read_bytes_range(range).await?;
+        Ok(Some(crate::structures::TermPositions::open(data)?))
     }
 
     /// Check if positions are available for a field
@@ -3613,6 +3622,18 @@ impl SegmentReader {
 // ── Synchronous search methods (mmap/RAM only) ─────────────────────────────
 #[cfg(feature = "sync")]
 impl SegmentReader {
+    /// Document frequency of a text term from the term dictionary alone (no
+    /// posting bytes are read). 0 when the term is absent.
+    pub fn text_doc_freq_sync(&self, field: Field, term: &[u8]) -> Result<u32> {
+        let mut key = Vec::with_capacity(4 + term.len());
+        key.extend_from_slice(&field.0.to_le_bytes());
+        key.extend_from_slice(term);
+        Ok(self
+            .term_dict
+            .get_sync(&key)?
+            .map_or(0, |info| info.doc_freq()))
+    }
+
     /// Synchronous posting list lookup — requires Inline (mmap/RAM) file handles.
     pub fn get_postings_sync(&self, field: Field, term: &[u8]) -> Result<Option<BlockPostingList>> {
         // Build key: field_id + term
@@ -3712,7 +3733,7 @@ impl SegmentReader {
         &self,
         field: Field,
         term: &[u8],
-    ) -> Result<Option<crate::structures::PositionPostingList>> {
+    ) -> Result<Option<crate::structures::TermPositions>> {
         let handle = match &self.positions_handle {
             Some(h) => h,
             None => return Ok(None),
@@ -3735,10 +3756,8 @@ impl SegmentReader {
         };
 
         let range = checked_file_range(offset, length, handle.len(), "position list")?;
-        let slice = handle.slice(range);
-        let data = slice.read_bytes_sync()?;
-
-        let pos_list = crate::structures::PositionPostingList::deserialize(data.as_slice())?;
+        let data = handle.read_bytes_range_sync(range)?;
+        let pos_list = crate::structures::TermPositions::open(data)?;
         Ok(Some(pos_list))
     }
 

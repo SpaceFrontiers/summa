@@ -146,18 +146,35 @@ argument of `TermQuery`, `MatchQuery` and `PhraseQuery`:
 
 ```
 field languages: text<raw_ci> [fast]
-field content: text<stem(by: languages, default: simple)> [indexed<token_position>]
+field content: text<stem(by: languages, default: simple, stop_words: true)> [indexed<token_position>]
 ```
 
 - `by` names a text field of the same index; all of its values in a document
   form the hint (`"ru,en"`).
 - `default` is the language used when a document (or query) carries no
   recognised hint; `simple` means no stemming.
+- `stop_words` (default `false`) drops the routed language's stop words
+  before stemming. Surviving tokens keep their positions, so phrase queries
+  keep the original word distances (`"quantum of the art"` is
+  `quantum@0 art@3` on both sides and does not match `quantum art`).
+- `segmenter` (default `simple`): `unicode` splits at UAX #29 word
+  boundaries (`float-zero` → `float`, `zero`), bigrams runs of Han, Hiragana
+  and Katakana, and folds diacritics of Latin, Cyrillic and Greek tokens
+  after stemming.
+- `reorder` on a chunked text field lets the reorder pass permute the
+  field's virtual chunk ids with Recursive Graph Bisection over the field's
+  own postings (smaller postings, tighter block bounds). Only that field's
+  postings, positions and chunk map are rewritten; document ids never move.
 - Each token is stemmed with the first hinted language whose script matches
   the token (Snowball stemmers are script-local), so Cyrillic and Latin text
   in one document both stem correctly; same-script languages use the first
   listed one.
 - `indexed<token_position>` enables phrase queries on the field.
+- `indexed<k1: 0.9, b: 0.4>` sets the field's BM25 parameters (defaults
+  1.2 and 0.75; `b` must lie in 0..=1). They apply to every BM25 path
+  (MaxScore bounds and scores, term and phrase scorers) at query time; the
+  stored block bounds are parameter-free, so no rebuild is needed to change
+  them.
 
 See `docs/dynamic-tokenizer-and-phrase.md` for the design.
 

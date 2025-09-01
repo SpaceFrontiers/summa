@@ -32,6 +32,8 @@ thiserror = { workspace = true }
 log = "0.4"
 lru = "0.12"
 rust-stemmers = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-normalization = { workspace = true }
 stop-words = { workspace = true }
 pest = { workspace = true }
 pest_derive = { workspace = true }

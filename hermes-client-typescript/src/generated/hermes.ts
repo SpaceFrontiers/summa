@@ -306,15 +306,40 @@ export interface MatchQuery {
    * Empty = the tokenizer's default.
    */
   tokenizerHint: string;
+  /**
+   * Proximity rescoring (sequential dependence): the top candidates of the
+   * BM25 pass gain a bonus for adjacent query terms occurring next to each
+   * other (ordered windows) or within `proximity_window` positions
+   * (unordered windows, half weight), scaled by this weight. 0 = off.
+   * Approximate: the bonus applies to an over-fetched candidate pool.
+   */
+  proximityWeight: number;
+  /** Unordered window size; 0 = 8. */
+  proximityWindow: number;
+  /**
+   * Approximate MaxScore: scale the pruning threshold by 1/heap_factor
+   * (0 or 1 = exact, rank-safe; 1.5 prunes more aggressively at some
+   * recall cost). Same semantics as SparseVectorQuery.heap_factor.
+   */
+  heapFactor: number;
+  /**
+   * Long queries: keep only the `max_terms` rarest (highest idf) tokens for
+   * scoring; 0 = all tokens. Approximate.
+   */
+  maxTerms: number;
 }
 
 /**
  * Phrase query - text is tokenized server-side with the field's tokenizer
- * (so stemming matches indexing) and the terms must occur consecutively
- * (slop 0) or within `slop` positions of each other. Requires the field to be
- * indexed with token positions (`indexed<token_position>` or
- * `indexed<positions>`); without positions the engine degrades to a MUST of
- * the terms. Scored with BM25 like MatchQuery.
+ * (so stemming matches indexing) and the terms must occur at the distances
+ * the tokenizer assigned (consecutively unless the tokenizer dropped stop
+ * words between them, whose positions are kept as gaps) or within `slop`
+ * positions of that. Requires the field to be indexed with token positions
+ * (`indexed<token_position>` or `indexed<positions>`); without positions the
+ * engine degrades to a MUST of the terms. Scored with BM25 over the phrase
+ * frequency (occurrences of the whole phrase) and the summed idf of its terms.
+ * A phrase whose words are all stop words is rejected standalone and dropped
+ * (with a server warning) when it is a clause of a BooleanQuery.
  */
 export interface PhraseQuery {
   field: string;
@@ -370,6 +395,57 @@ export interface SearchRequest {
    * be between offset + limit and the 2x ceiling.
    */
   candidateLimit: number;
+  /**
+   * Anytime mode: wall-clock budget in milliseconds for the scoring phase.
+   * Text (BM25) MaxScore executors stop at the deadline and return the best
+   * results found so far; `SearchResponse.truncated` reports that it fired.
+   * 0 = unbounded (exact top-k).
+   */
+  timeBudgetMs: number;
+  /**
+   * Cross-shard text statistics for BM25 (see `GetTextStats`). When set they
+   * replace the backend's own statistics for the listed fields and terms;
+   * unset = the backend aggregates over its own segments.
+   */
+  textStats: TextStats | undefined;
+}
+
+export interface GetTextStatsRequest {
+  indexName: string;
+  /**
+   * The query whose BM25 terms are collected (after this backend's own
+   * tokenization); sparse, dense and filter clauses contribute nothing.
+   */
+  query: Query | undefined;
+}
+
+export interface GetTextStatsResponse {
+  stats: TextStats | undefined;
+}
+
+/** BM25 statistics of a set of text terms. */
+export interface TextStats {
+  /** Documents in the index (or the sum over shards). */
+  totalDocs: number;
+  fields: TextFieldStats[];
+}
+
+export interface TextFieldStats {
+  field: string;
+  /**
+   * Scoring units of the field: documents for a plain field, chunks for a
+   * chunked one.
+   */
+  corpusSize: number;
+  /** Average length of a scoring unit in tokens. */
+  avgLen: number;
+  terms: TermDocFreq[];
+}
+
+export interface TermDocFreq {
+  /** Index-time token bytes. */
+  term: Uint8Array;
+  docFreq: number;
 }
 
 /** Unique document address: segment + local doc_id */
@@ -439,7 +515,14 @@ export interface SearchResponse {
   hits: SearchHit[];
   totalHits: number;
   tookMs: number;
-  timings: SearchTimings | undefined;
+  timings:
+    | SearchTimings
+    | undefined;
+  /**
+   * True when `time_budget_ms` expired before every candidate was scored;
+   * the hits are then the best-so-far, not the exact top-k.
+   */
+  truncated: boolean;
 }
 
 /** Detailed timing breakdown for search phases (all values in microseconds) */
@@ -2293,7 +2376,7 @@ export const RangeQuery: MessageFns<RangeQuery> = {
 };
 
 function createBaseMatchQuery(): MatchQuery {
-  return { field: "", text: "", tokenizerHint: "" };
+  return { field: "", text: "", tokenizerHint: "", proximityWeight: 0, proximityWindow: 0, heapFactor: 0, maxTerms: 0 };
 }
 
 export const MatchQuery: MessageFns<MatchQuery> = {
@@ -2306,6 +2389,18 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     }
     if (message.tokenizerHint !== "") {
       writer.uint32(26).string(message.tokenizerHint);
+    }
+    if (message.proximityWeight !== 0) {
+      writer.uint32(37).float(message.proximityWeight);
+    }
+    if (message.proximityWindow !== 0) {
+      writer.uint32(40).uint32(message.proximityWindow);
+    }
+    if (message.heapFactor !== 0) {
+      writer.uint32(53).float(message.heapFactor);
+    }
+    if (message.maxTerms !== 0) {
+      writer.uint32(56).uint32(message.maxTerms);
     }
     return writer;
   },
@@ -2341,6 +2436,38 @@ export const MatchQuery: MessageFns<MatchQuery> = {
           message.tokenizerHint = reader.string();
           continue;
         }
+        case 4: {
+          if (tag !== 37) {
+            break;
+          }
+
+          message.proximityWeight = reader.float();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.proximityWindow = reader.uint32();
+          continue;
+        }
+        case 6: {
+          if (tag !== 53) {
+            break;
+          }
+
+          message.heapFactor = reader.float();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.maxTerms = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2359,6 +2486,26 @@ export const MatchQuery: MessageFns<MatchQuery> = {
         : isSet(object.tokenizer_hint)
         ? globalThis.String(object.tokenizer_hint)
         : "",
+      proximityWeight: isSet(object.proximityWeight)
+        ? globalThis.Number(object.proximityWeight)
+        : isSet(object.proximity_weight)
+        ? globalThis.Number(object.proximity_weight)
+        : 0,
+      proximityWindow: isSet(object.proximityWindow)
+        ? globalThis.Number(object.proximityWindow)
+        : isSet(object.proximity_window)
+        ? globalThis.Number(object.proximity_window)
+        : 0,
+      heapFactor: isSet(object.heapFactor)
+        ? globalThis.Number(object.heapFactor)
+        : isSet(object.heap_factor)
+        ? globalThis.Number(object.heap_factor)
+        : 0,
+      maxTerms: isSet(object.maxTerms)
+        ? globalThis.Number(object.maxTerms)
+        : isSet(object.max_terms)
+        ? globalThis.Number(object.max_terms)
+        : 0,
     };
   },
 
@@ -2373,6 +2520,18 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     if (message.tokenizerHint !== "") {
       obj.tokenizerHint = message.tokenizerHint;
     }
+    if (message.proximityWeight !== 0) {
+      obj.proximityWeight = message.proximityWeight;
+    }
+    if (message.proximityWindow !== 0) {
+      obj.proximityWindow = Math.round(message.proximityWindow);
+    }
+    if (message.heapFactor !== 0) {
+      obj.heapFactor = message.heapFactor;
+    }
+    if (message.maxTerms !== 0) {
+      obj.maxTerms = Math.round(message.maxTerms);
+    }
     return obj;
   },
 
@@ -2384,6 +2543,10 @@ export const MatchQuery: MessageFns<MatchQuery> = {
     message.field = object.field ?? "";
     message.text = object.text ?? "";
     message.tokenizerHint = object.tokenizerHint ?? "";
+    message.proximityWeight = object.proximityWeight ?? 0;
+    message.proximityWindow = object.proximityWindow ?? 0;
+    message.heapFactor = object.heapFactor ?? 0;
+    message.maxTerms = object.maxTerms ?? 0;
     return message;
   },
 };
@@ -2819,6 +2982,8 @@ function createBaseSearchRequest(): SearchRequest {
     fieldsToLoad: [],
     reranker: undefined,
     candidateLimit: 0,
+    timeBudgetMs: 0,
+    textStats: undefined,
   };
 }
 
@@ -2844,6 +3009,12 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     }
     if (message.candidateLimit !== 0) {
       writer.uint32(56).uint32(message.candidateLimit);
+    }
+    if (message.timeBudgetMs !== 0) {
+      writer.uint32(64).uint64(message.timeBudgetMs);
+    }
+    if (message.textStats !== undefined) {
+      TextStats.encode(message.textStats, writer.uint32(74).fork()).join();
     }
     return writer;
   },
@@ -2911,6 +3082,22 @@ export const SearchRequest: MessageFns<SearchRequest> = {
           message.candidateLimit = reader.uint32();
           continue;
         }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.timeBudgetMs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 9: {
+          if (tag !== 74) {
+            break;
+          }
+
+          message.textStats = TextStats.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2941,6 +3128,16 @@ export const SearchRequest: MessageFns<SearchRequest> = {
         : isSet(object.candidate_limit)
         ? globalThis.Number(object.candidate_limit)
         : 0,
+      timeBudgetMs: isSet(object.timeBudgetMs)
+        ? globalThis.Number(object.timeBudgetMs)
+        : isSet(object.time_budget_ms)
+        ? globalThis.Number(object.time_budget_ms)
+        : 0,
+      textStats: isSet(object.textStats)
+        ? TextStats.fromJSON(object.textStats)
+        : isSet(object.text_stats)
+        ? TextStats.fromJSON(object.text_stats)
+        : undefined,
     };
   },
 
@@ -2967,6 +3164,12 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     if (message.candidateLimit !== 0) {
       obj.candidateLimit = Math.round(message.candidateLimit);
     }
+    if (message.timeBudgetMs !== 0) {
+      obj.timeBudgetMs = Math.round(message.timeBudgetMs);
+    }
+    if (message.textStats !== undefined) {
+      obj.textStats = TextStats.toJSON(message.textStats);
+    }
     return obj;
   },
 
@@ -2984,6 +3187,426 @@ export const SearchRequest: MessageFns<SearchRequest> = {
       ? Reranker.fromPartial(object.reranker)
       : undefined;
     message.candidateLimit = object.candidateLimit ?? 0;
+    message.timeBudgetMs = object.timeBudgetMs ?? 0;
+    message.textStats = (object.textStats !== undefined && object.textStats !== null)
+      ? TextStats.fromPartial(object.textStats)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseGetTextStatsRequest(): GetTextStatsRequest {
+  return { indexName: "", query: undefined };
+}
+
+export const GetTextStatsRequest: MessageFns<GetTextStatsRequest> = {
+  encode(message: GetTextStatsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.indexName !== "") {
+      writer.uint32(10).string(message.indexName);
+    }
+    if (message.query !== undefined) {
+      Query.encode(message.query, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetTextStatsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetTextStatsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.indexName = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.query = Query.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetTextStatsRequest {
+    return {
+      indexName: isSet(object.indexName)
+        ? globalThis.String(object.indexName)
+        : isSet(object.index_name)
+        ? globalThis.String(object.index_name)
+        : "",
+      query: isSet(object.query) ? Query.fromJSON(object.query) : undefined,
+    };
+  },
+
+  toJSON(message: GetTextStatsRequest): unknown {
+    const obj: any = {};
+    if (message.indexName !== "") {
+      obj.indexName = message.indexName;
+    }
+    if (message.query !== undefined) {
+      obj.query = Query.toJSON(message.query);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetTextStatsRequest>): GetTextStatsRequest {
+    return GetTextStatsRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetTextStatsRequest>): GetTextStatsRequest {
+    const message = createBaseGetTextStatsRequest();
+    message.indexName = object.indexName ?? "";
+    message.query = (object.query !== undefined && object.query !== null) ? Query.fromPartial(object.query) : undefined;
+    return message;
+  },
+};
+
+function createBaseGetTextStatsResponse(): GetTextStatsResponse {
+  return { stats: undefined };
+}
+
+export const GetTextStatsResponse: MessageFns<GetTextStatsResponse> = {
+  encode(message: GetTextStatsResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.stats !== undefined) {
+      TextStats.encode(message.stats, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): GetTextStatsResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseGetTextStatsResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.stats = TextStats.decode(reader, reader.uint32());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): GetTextStatsResponse {
+    return { stats: isSet(object.stats) ? TextStats.fromJSON(object.stats) : undefined };
+  },
+
+  toJSON(message: GetTextStatsResponse): unknown {
+    const obj: any = {};
+    if (message.stats !== undefined) {
+      obj.stats = TextStats.toJSON(message.stats);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<GetTextStatsResponse>): GetTextStatsResponse {
+    return GetTextStatsResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<GetTextStatsResponse>): GetTextStatsResponse {
+    const message = createBaseGetTextStatsResponse();
+    message.stats = (object.stats !== undefined && object.stats !== null)
+      ? TextStats.fromPartial(object.stats)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseTextStats(): TextStats {
+  return { totalDocs: 0, fields: [] };
+}
+
+export const TextStats: MessageFns<TextStats> = {
+  encode(message: TextStats, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.totalDocs !== 0) {
+      writer.uint32(8).uint64(message.totalDocs);
+    }
+    for (const v of message.fields) {
+      TextFieldStats.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TextStats {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTextStats();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.totalDocs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.fields.push(TextFieldStats.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TextStats {
+    return {
+      totalDocs: isSet(object.totalDocs)
+        ? globalThis.Number(object.totalDocs)
+        : isSet(object.total_docs)
+        ? globalThis.Number(object.total_docs)
+        : 0,
+      fields: globalThis.Array.isArray(object?.fields) ? object.fields.map((e: any) => TextFieldStats.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: TextStats): unknown {
+    const obj: any = {};
+    if (message.totalDocs !== 0) {
+      obj.totalDocs = Math.round(message.totalDocs);
+    }
+    if (message.fields?.length) {
+      obj.fields = message.fields.map((e) => TextFieldStats.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TextStats>): TextStats {
+    return TextStats.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TextStats>): TextStats {
+    const message = createBaseTextStats();
+    message.totalDocs = object.totalDocs ?? 0;
+    message.fields = object.fields?.map((e) => TextFieldStats.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseTextFieldStats(): TextFieldStats {
+  return { field: "", corpusSize: 0, avgLen: 0, terms: [] };
+}
+
+export const TextFieldStats: MessageFns<TextFieldStats> = {
+  encode(message: TextFieldStats, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.field !== "") {
+      writer.uint32(10).string(message.field);
+    }
+    if (message.corpusSize !== 0) {
+      writer.uint32(16).uint64(message.corpusSize);
+    }
+    if (message.avgLen !== 0) {
+      writer.uint32(29).float(message.avgLen);
+    }
+    for (const v of message.terms) {
+      TermDocFreq.encode(v!, writer.uint32(34).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TextFieldStats {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTextFieldStats();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.field = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.corpusSize = longToNumber(reader.uint64());
+          continue;
+        }
+        case 3: {
+          if (tag !== 29) {
+            break;
+          }
+
+          message.avgLen = reader.float();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.terms.push(TermDocFreq.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TextFieldStats {
+    return {
+      field: isSet(object.field) ? globalThis.String(object.field) : "",
+      corpusSize: isSet(object.corpusSize)
+        ? globalThis.Number(object.corpusSize)
+        : isSet(object.corpus_size)
+        ? globalThis.Number(object.corpus_size)
+        : 0,
+      avgLen: isSet(object.avgLen)
+        ? globalThis.Number(object.avgLen)
+        : isSet(object.avg_len)
+        ? globalThis.Number(object.avg_len)
+        : 0,
+      terms: globalThis.Array.isArray(object?.terms) ? object.terms.map((e: any) => TermDocFreq.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: TextFieldStats): unknown {
+    const obj: any = {};
+    if (message.field !== "") {
+      obj.field = message.field;
+    }
+    if (message.corpusSize !== 0) {
+      obj.corpusSize = Math.round(message.corpusSize);
+    }
+    if (message.avgLen !== 0) {
+      obj.avgLen = message.avgLen;
+    }
+    if (message.terms?.length) {
+      obj.terms = message.terms.map((e) => TermDocFreq.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TextFieldStats>): TextFieldStats {
+    return TextFieldStats.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TextFieldStats>): TextFieldStats {
+    const message = createBaseTextFieldStats();
+    message.field = object.field ?? "";
+    message.corpusSize = object.corpusSize ?? 0;
+    message.avgLen = object.avgLen ?? 0;
+    message.terms = object.terms?.map((e) => TermDocFreq.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseTermDocFreq(): TermDocFreq {
+  return { term: new Uint8Array(0), docFreq: 0 };
+}
+
+export const TermDocFreq: MessageFns<TermDocFreq> = {
+  encode(message: TermDocFreq, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.term.length !== 0) {
+      writer.uint32(10).bytes(message.term);
+    }
+    if (message.docFreq !== 0) {
+      writer.uint32(16).uint64(message.docFreq);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): TermDocFreq {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseTermDocFreq();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.term = reader.bytes();
+          continue;
+        }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.docFreq = longToNumber(reader.uint64());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): TermDocFreq {
+    return {
+      term: isSet(object.term) ? bytesFromBase64(object.term) : new Uint8Array(0),
+      docFreq: isSet(object.docFreq)
+        ? globalThis.Number(object.docFreq)
+        : isSet(object.doc_freq)
+        ? globalThis.Number(object.doc_freq)
+        : 0,
+    };
+  },
+
+  toJSON(message: TermDocFreq): unknown {
+    const obj: any = {};
+    if (message.term.length !== 0) {
+      obj.term = base64FromBytes(message.term);
+    }
+    if (message.docFreq !== 0) {
+      obj.docFreq = Math.round(message.docFreq);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<TermDocFreq>): TermDocFreq {
+    return TermDocFreq.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<TermDocFreq>): TermDocFreq {
+    const message = createBaseTermDocFreq();
+    message.term = object.term ?? new Uint8Array(0);
+    message.docFreq = object.docFreq ?? 0;
     return message;
   },
 };
@@ -3820,7 +4443,7 @@ export const DenseVector: MessageFns<DenseVector> = {
 };
 
 function createBaseSearchResponse(): SearchResponse {
-  return { hits: [], totalHits: 0, tookMs: 0, timings: undefined };
+  return { hits: [], totalHits: 0, tookMs: 0, timings: undefined, truncated: false };
 }
 
 export const SearchResponse: MessageFns<SearchResponse> = {
@@ -3836,6 +4459,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     }
     if (message.timings !== undefined) {
       SearchTimings.encode(message.timings, writer.uint32(34).fork()).join();
+    }
+    if (message.truncated !== false) {
+      writer.uint32(40).bool(message.truncated);
     }
     return writer;
   },
@@ -3879,6 +4505,14 @@ export const SearchResponse: MessageFns<SearchResponse> = {
           message.timings = SearchTimings.decode(reader, reader.uint32());
           continue;
         }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.truncated = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -3902,6 +4536,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
         ? globalThis.Number(object.took_ms)
         : 0,
       timings: isSet(object.timings) ? SearchTimings.fromJSON(object.timings) : undefined,
+      truncated: isSet(object.truncated) ? globalThis.Boolean(object.truncated) : false,
     };
   },
 
@@ -3919,6 +4554,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     if (message.timings !== undefined) {
       obj.timings = SearchTimings.toJSON(message.timings);
     }
+    if (message.truncated !== false) {
+      obj.truncated = message.truncated;
+    }
     return obj;
   },
 
@@ -3933,6 +4571,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     message.timings = (object.timings !== undefined && object.timings !== null)
       ? SearchTimings.fromPartial(object.timings)
       : undefined;
+    message.truncated = object.truncated ?? false;
     return message;
   },
 };
@@ -6855,6 +7494,21 @@ export const SearchServiceDefinition = {
       requestType: GetIndexInfoRequest,
       requestStream: false,
       responseType: GetIndexInfoResponse,
+      responseStream: false,
+      options: {},
+    },
+    /**
+     * Text statistics (document frequencies, corpus sizes, average lengths)
+     * of the BM25 terms of a query over this backend's index. A broker that
+     * scatters one index over several shards sums the responses and sends the
+     * total back as `SearchRequest.text_stats`, so every shard scores with
+     * the same IDF.
+     */
+    getTextStats: {
+      name: "GetTextStats",
+      requestType: GetTextStatsRequest,
+      requestStream: false,
+      responseType: GetTextStatsResponse,
       responseStream: false,
       options: {},
     },

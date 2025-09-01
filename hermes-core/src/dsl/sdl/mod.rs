@@ -84,6 +84,10 @@ pub struct FieldDef {
     pub primary: bool,
     /// Whether build-time document reordering (BP) is enabled for BMP fields
     pub reorder: bool,
+    /// BM25 k1 of a text field (`indexed<k1: ...>`), `None` = default
+    pub bm25_k1: Option<f32>,
+    /// BM25 b of a text field (`indexed<b: ...>`), `None` = default
+    pub bm25_b: Option<f32>,
     /// Chunked text field (`indexed<chunked>`): each value is its own BM25 unit
     pub chunked: bool,
 }
@@ -174,6 +178,9 @@ impl IndexDef {
             }
             if field.chunked {
                 builder.set_chunked(f, true);
+            }
+            if field.bm25_k1.is_some() || field.bm25_b.is_some() {
+                builder.set_bm25_params(f, field.bm25_k1, field.bm25_b);
             }
             // Set positions: explicit > auto (ordinal for multi vectors)
             let positions = field.positions.or({
@@ -304,6 +311,9 @@ struct IndexConfig {
     positions: Option<super::schema::PositionMode>,
     // Chunked text field: every value is its own BM25 unit
     chunked: bool,
+    // BM25 parameters of a text field
+    bm25_k1: Option<f32>,
+    bm25_b: Option<f32>,
 }
 
 /// Parsed attributes from SDL field definition
@@ -628,6 +638,27 @@ fn parse_single_index_config_param(
         Rule::chunked_kwarg => {
             config.chunked = true;
         }
+        Rule::bm25_k1_kwarg => {
+            if let Some(v) = p.into_inner().next() {
+                config.bm25_k1 = Some(v.as_str().parse().map_err(|_| {
+                    Error::Schema(format!("invalid BM25 k1 value '{}'", v.as_str()))
+                })?);
+            }
+        }
+        Rule::bm25_b_kwarg => {
+            if let Some(v) = p.into_inner().next() {
+                let b: f32 = v
+                    .as_str()
+                    .parse()
+                    .map_err(|_| Error::Schema(format!("invalid BM25 b value '{}'", v.as_str())))?;
+                if !(0.0..=1.0).contains(&b) {
+                    return Err(Error::Schema(format!(
+                        "BM25 b must be between 0 and 1, got {b}"
+                    )));
+                }
+                config.bm25_b = Some(b);
+            }
+        }
         _ => {}
     }
 
@@ -837,9 +868,18 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     // Merge index config into vector configs if both exist
     let mut positions = None;
     let mut chunked = false;
+    let mut bm25_k1 = None;
+    let mut bm25_b = None;
     if let Some(idx_cfg) = index_config {
         positions = idx_cfg.positions;
         chunked = idx_cfg.chunked;
+        bm25_k1 = idx_cfg.bm25_k1;
+        bm25_b = idx_cfg.bm25_b;
+        if (bm25_k1.is_some() || bm25_b.is_some()) && field_type != FieldType::Text {
+            return Err(Error::Schema(format!(
+                "field '{name}': BM25 `k1`/`b` require a text field, got {field_type:?}"
+            )));
+        }
         if chunked {
             if field_type != FieldType::Text {
                 return Err(Error::Schema(format!(
@@ -892,6 +932,8 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         primary,
         reorder,
         chunked,
+        bm25_k1,
+        bm25_b,
     })
 }
 
@@ -3186,6 +3228,41 @@ mod tests {
         let indexes = parse_sdl(sdl).unwrap();
         let schema = indexes[0].to_schema();
         assert!(schema.primary_field().is_none());
+    }
+
+    #[test]
+    fn bm25_parameters_parse_per_text_field() {
+        let sdl = r#"
+            index documents {
+                field title: text<en_stem> [indexed<token_position, k1: 0.9, b: 0.4>]
+                field body: text<en_stem> [indexed<chunked, token_position, b: 0.3>]
+                field plain: text<en_stem> [indexed]
+            }
+        "#;
+        let schema = parse_sdl(sdl).unwrap()[0].to_schema();
+        let entry = |name: &str| {
+            schema
+                .get_field_entry(schema.get_field(name).unwrap())
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(entry("title").bm25_k1, Some(0.9));
+        assert_eq!(entry("title").bm25_b, Some(0.4));
+        assert_eq!(entry("body").bm25_k1, None);
+        assert_eq!(entry("body").bm25_b, Some(0.3));
+        assert!(entry("body").chunked);
+        assert_eq!(entry("plain").bm25_k1, None);
+        assert_eq!(entry("plain").bm25_b, None);
+        let params =
+            crate::query::Bm25Params::for_field(&schema, schema.get_field("title").unwrap());
+        assert_eq!((params.k1, params.b), (0.9, 0.4));
+        let params =
+            crate::query::Bm25Params::for_field(&schema, schema.get_field("plain").unwrap());
+        assert_eq!((params.k1, params.b), (1.2, 0.75));
+
+        // Validation: b outside 0..=1, and parameters on a non-text field.
+        assert!(parse_sdl("index i { field t: text [indexed<b: 1.5>] }").is_err());
+        assert!(parse_sdl("index i { field n: u64 [indexed<k1: 0.9>] }").is_err());
     }
 
     #[test]

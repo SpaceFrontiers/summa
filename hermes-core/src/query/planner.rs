@@ -73,31 +73,122 @@ pub(super) fn prepare_text_maxscore(
 /// per-segment cell here caused cross-query threshold leaks under
 /// concurrent searches (one query's threshold wrongly pruning another's
 /// results).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finish_text_maxscore<'a>(
     posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
     avg_field_len: f32,
+    lengths: Option<&'a crate::segment::chunk_map::DocLengths>,
     limit: usize,
     shared_threshold: &std::cell::Cell<f32>,
-    index_label: &str,
-    field_label: &str,
+    reader: &'a SegmentReader,
+    field: crate::Field,
+    predicate: Option<DocPredicate<'a>>,
+    params: super::Bm25Params,
+    proximity: Option<(super::ProximityConfig, Vec<Vec<u8>>)>,
+    heap_factor: f32,
+    budget: Option<&super::SharedThreshold>,
 ) -> crate::Result<Box<dyn Scorer + 'a>> {
     if posting_lists.is_empty() {
         return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
     }
-    let mut executor = MaxScoreExecutor::text(posting_lists, avg_field_len, limit)
-        .with_metric_labels(index_label, field_label);
+    // Proximity rescoring works on an over-fetched candidate pool and adds
+    // a non-negative bonus, so a BM25 floor from other segments cannot seed
+    // the pass and no floor is published from it.
+    let proximity = proximity.filter(|(config, terms)| config.is_active() && terms.len() >= 2);
+    let executor_limit = if proximity.is_some() {
+        limit
+            .saturating_mul(super::proximity::PROXIMITY_OVER_FETCH)
+            .max(64)
+    } else {
+        limit
+    };
+    let idfs: Vec<f32> = posting_lists.iter().map(|(_, idf)| *idf).collect();
+    let mut executor = MaxScoreExecutor::text(
+        posting_lists,
+        avg_field_len,
+        executor_limit,
+        lengths,
+        params,
+        heap_factor,
+    )
+    .with_metric_labels(
+        reader.schema().index_label(),
+        reader.schema().get_field_name(field).unwrap_or("?"),
+    );
+    if let Some(predicate) = predicate {
+        executor = executor.with_predicate(predicate);
+    }
+    executor = executor.with_budget(budget.cloned());
+    // An approximate pass neither consumes nor publishes the exact floor.
+    let exact = heap_factor <= 1.0;
     let initial = shared_threshold.get();
-    if initial > 0.0 {
+    if initial > 0.0 && proximity.is_none() && exact {
         executor.seed_threshold(initial);
     }
-    let results = executor.execute_sync()?;
-    if results.len() >= limit
+    let mut results = executor.execute_sync()?;
+    if let Some((config, terms)) = proximity {
+        let terms: Vec<(Vec<u8>, f32)> = terms.into_iter().zip(idfs).collect();
+        super::proximity::rescore_sync(
+            reader,
+            field,
+            &terms,
+            params,
+            lengths.map(super::LengthSource::Docs),
+            avg_field_len,
+            config,
+            &mut results,
+        )?;
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.doc_id.cmp(&b.doc_id))
+        });
+        results.truncate(limit);
+    } else if exact
+        && results.len() >= limit
         && let Some(last) = results.last()
         && last.score > shared_threshold.get()
     {
         shared_threshold.set(last.score);
     }
     Ok(Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>)
+}
+
+/// Long-query cap: keep the `max_terms` rarest terms (highest idf) of a
+/// field group, in their original order, dropping the rest. `0` keeps all.
+pub(super) fn cap_terms(
+    posting_lists: &mut Vec<(crate::structures::BlockPostingList, f32)>,
+    term_bytes: &mut Vec<Vec<u8>>,
+    max_terms: usize,
+) {
+    if max_terms == 0 || posting_lists.len() <= max_terms {
+        return;
+    }
+    let mut by_idf: Vec<(usize, f32)> = posting_lists
+        .iter()
+        .enumerate()
+        .map(|(i, (_, idf))| (i, *idf))
+        .collect();
+    by_idf.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut keep = vec![false; posting_lists.len()];
+    for (i, _) in by_idf.into_iter().take(max_terms) {
+        keep[i] = true;
+    }
+    let mut index = 0;
+    posting_lists.retain(|_| {
+        let kept = keep[index];
+        index += 1;
+        kept
+    });
+    if term_bytes.len() == keep.len() {
+        let mut index = 0;
+        term_bytes.retain(|_| {
+            let kept = keep[index];
+            index += 1;
+            kept
+        });
+    }
 }
 
 /// Over-fetch factor for chunked text MaxScore: the executor ranks chunks and
@@ -137,15 +228,21 @@ pub(super) fn text_maxscore_allowed(
 /// score)` pairs — the same shape sparse vectors produce. Cross-segment
 /// threshold seeding is deliberately not applied: the k-th chunk score of a
 /// full heap is not a document-level floor after `Max` folding.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_chunked_text_maxscore<'a>(
     posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
     limit: usize,
-    reader: &SegmentReader,
+    reader: &'a SegmentReader,
     field: crate::Field,
+    predicate: Option<DocPredicate<'a>>,
+    proximity: Option<(super::ProximityConfig, Vec<Vec<u8>>)>,
+    heap_factor: f32,
+    budget: Option<&super::SharedThreshold>,
 ) -> crate::Result<Box<dyn Scorer + 'a>> {
     if posting_lists.is_empty() {
         return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
     }
+    let proximity = proximity.filter(|(config, terms)| config.is_active() && terms.len() >= 2);
     let Some(chunk_map) = reader.chunk_map(field) else {
         return Err(crate::Error::Corruption(format!(
             "chunked text field '{}' has postings but segment {:016x} carries no chunk map",
@@ -153,20 +250,47 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
             reader.meta().id,
         )));
     };
-    let executor_limit = bounded_sparse_executor_limit(limit, CHUNKED_TEXT_OVER_FETCH_FACTOR)
+    let over_fetch = if proximity.is_some() {
+        CHUNKED_TEXT_OVER_FETCH_FACTOR * super::proximity::PROXIMITY_OVER_FETCH as f32
+    } else {
+        CHUNKED_TEXT_OVER_FETCH_FACTOR
+    };
+    let executor_limit = bounded_sparse_executor_limit(limit, over_fetch)
         .min(chunk_map.num_chunks() as usize)
         .max(1);
-    let executor = MaxScoreExecutor::text_chunked(
+    let idfs: Vec<f32> = posting_lists.iter().map(|(_, idf)| *idf).collect();
+    let params = super::Bm25Params::for_field(reader.schema(), field);
+    let mut executor = MaxScoreExecutor::text_chunked(
         posting_lists,
         chunk_map.avg_len(),
         executor_limit,
         chunk_map,
+        params,
+        heap_factor,
     )
     .with_metric_labels(
         reader.schema().index_label(),
         reader.schema().get_field_name(field).unwrap_or("?"),
     );
-    let raw = executor.execute_sync()?;
+    if let Some(predicate) = predicate {
+        // The executor walks virtual chunk ids; filters are per document.
+        executor = executor.with_predicate(Box::new(move |vid| predicate(chunk_map.doc_id(vid))));
+    }
+    executor = executor.with_budget(budget.cloned());
+    let mut raw = executor.execute_sync()?;
+    if let Some((config, terms)) = proximity {
+        let terms: Vec<(Vec<u8>, f32)> = terms.into_iter().zip(idfs).collect();
+        super::proximity::rescore_sync(
+            reader,
+            field,
+            &terms,
+            params,
+            Some(super::LengthSource::Chunks(chunk_map)),
+            chunk_map.avg_len(),
+            config,
+            &mut raw,
+        )?;
+    }
     let combined = crate::segment::combine_ordinal_results(
         raw.into_iter().map(|hit| {
             let (doc_id, ordinal) = chunk_map.resolve(hit.doc_id);
@@ -639,6 +763,101 @@ pub(super) fn build_combined_bitset(
 
 // ── Result scorers ───────────────────────────────────────────────────────
 
+/// Union of a scored result stream with the documents of a filter bitset:
+/// documents the stream does not produce are yielded with score 0. Used when
+/// a filtered text MaxScore pass finds fewer than `limit` scored documents,
+/// so documents matching only the MUST clauses still fill the result list
+/// (Boolean semantics: SHOULD is optional once a MUST clause exists).
+pub(super) struct BitsetFillScorer<'a> {
+    inner: Box<dyn Scorer + 'a>,
+    bitset: std::sync::Arc<super::DocBitset>,
+    /// Next bitset document not yet consumed.
+    next_bit: Option<DocId>,
+    current: DocId,
+    on_inner: bool,
+}
+
+impl<'a> BitsetFillScorer<'a> {
+    pub(super) fn new(
+        inner: Box<dyn Scorer + 'a>,
+        bitset: std::sync::Arc<super::DocBitset>,
+    ) -> Self {
+        let next_bit = bitset.next_set_bit(0);
+        let mut scorer = Self {
+            inner,
+            bitset,
+            next_bit,
+            current: 0,
+            on_inner: false,
+        };
+        scorer.settle();
+        scorer
+    }
+
+    /// Position on the smaller of the two heads.
+    fn settle(&mut self) {
+        let inner_doc = self.inner.doc();
+        let bit_doc = self.next_bit.unwrap_or(TERMINATED);
+        self.current = inner_doc.min(bit_doc);
+        self.on_inner = inner_doc == self.current && inner_doc != TERMINATED;
+    }
+}
+
+impl super::docset::DocSet for BitsetFillScorer<'_> {
+    fn doc(&self) -> DocId {
+        self.current
+    }
+
+    fn advance(&mut self) -> DocId {
+        if self.current == TERMINATED {
+            return TERMINATED;
+        }
+        if self.on_inner {
+            self.inner.advance();
+        }
+        if self.next_bit == Some(self.current) {
+            self.next_bit = self
+                .current
+                .checked_add(1)
+                .and_then(|d| self.bitset.next_set_bit(d));
+        }
+        self.settle();
+        self.current
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target <= self.current {
+            return self.current;
+        }
+        self.inner.seek(target);
+        self.next_bit = self.bitset.next_set_bit(target);
+        self.settle();
+        self.current
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.bitset.count().max(self.inner.size_hint())
+    }
+}
+
+impl Scorer for BitsetFillScorer<'_> {
+    fn score(&self) -> Score {
+        if self.on_inner {
+            self.inner.score()
+        } else {
+            0.0
+        }
+    }
+
+    fn matched_positions(&self) -> Option<super::MatchedPositions> {
+        if self.on_inner {
+            self.inner.matched_positions()
+        } else {
+            None
+        }
+    }
+}
+
 /// Scorer that iterates over pre-computed top-k results
 pub(super) struct TopKResultScorer {
     results: Vec<ScoredDoc>,
@@ -714,6 +933,7 @@ mod tests {
             initial_threshold: 5.0,
             shared_threshold: Some(shared),
             lsp_plan: None,
+            global_stats: None,
         };
 
         let single_sum = bmp_threshold(&options, MultiValueCombiner::Sum, true, true);
@@ -741,6 +961,7 @@ mod tests {
             initial_threshold: 0.0,
             shared_threshold: Some(shared),
             lsp_plan: None,
+            global_stats: None,
         };
 
         let clamped = bmp_threshold(&options, MultiValueCombiner::Sum, true, false);
