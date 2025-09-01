@@ -103,21 +103,51 @@ the hermes namespace. Static mode (`--discovery static --backend
 "id=..,addr=..,shard=..[,role=..]"`) feeds the identical machinery and is
 what local development and the integration tests use.
 
-## Phase 2 (designed, not yet built): partitioned indexes
+## Phase 2: partitioned indexes
 
-One logical index across several shards. Fan out per-shard with
-`offset=0, limit=offset+limit` (candidate_limit forwards unchanged — the
-per-shard window keeps it valid; multi-shard windows above the server's
-10 000 limit cap are rejected). Merge policy: RRF over shard-local ranks when
-the query is rank-shaped (top-level `FusionQuery`, `reranker.rrf_k > 0`,
-`PrefixQuery` — their scores are shard-local), score merge for pure
-dense/binary similarity (corpus-independent). Dedup key `(segment_id,
-doc_id)` — segment ids are UUIDv7-like, collision-safe across shards.
-`total_hits` = saturating sum ("documents scored", as ever, not matched).
-Writes route documents by a pinned FNV-1a 64 hash of the primary key;
-partition order = placement-rule order (an immutable contract);
-repartitioning = full rebuild. Partial shard failure fails the request —
-a silently-partial result set is a wrong answer.
+One logical index across several shards, declared by a multi-shard placement
+rule: `--placement "documents*=2,3,4"`. Partition order = rule order (an
+immutable contract: repartitioning or reordering = full rebuild). Every
+partition must host the index; a partition without it fails the request
+with `FAILED_PRECONDITION` instead of serving a partial view.
+
+Writes:
+
+- `CreateIndex` creates the index on every partition master (the schema is
+  sent verbatim to each).
+- `BatchIndexDocuments` and streaming `IndexDocuments` route each document
+  to the partition of a pinned FNV-1a 64 hash of its primary key (the field
+  declared `primary` in the schema, read once via `GetIndexInfo` and cached
+  per index). A document without the primary key is refused at the broker
+  with its request position; `DocumentError.index` values from a partition
+  are mapped back to request positions. The stream's 512-message / 4 MiB
+  flushes are split per partition.
+- `Commit`, `ForceMerge`, `Reorder`, `DeleteIndex`, `RetrainVectorIndex`
+  and `AlterVectorIndex` go to every partition master; counts are summed,
+  `success` is the conjunction.
+
+Reads:
+
+- `Search` first asks every partition for `GetTextStats` of the query's
+  text terms (skipped for queries without BM25 terms or when the caller
+  already supplied `text_stats`), sums them, and sends the sum as
+  `SearchRequest.text_stats` so every partition scores with corpus-wide
+  document frequencies and lengths. Each partition is then queried with
+  `offset=0, limit=offset+limit` (`candidate_limit` forwards unchanged;
+  windows above the server's 10 000 cap are rejected) and the responses
+  merge by score descending, ties by `(segment_id, doc_id)` (segment ids
+  are UUIDv7-like, collision-safe across shards). Rank-fused (RRF) and
+  dense scores are functions of shard-local ranks or corpus-independent
+  and merge the same way. `total_hits` = saturating sum, timings = maximum,
+  `truncated` = any. Admission takes one permit per partition backend.
+- `GetDocument` asks every partition; the one holding the segment answers.
+- `GetIndexInfo` sums document/segment/memory counts and per-field stats;
+  `GetTextStats` merges like the search prepass.
+
+Partial partition failure fails the request (`partition '<shard>' of index
+'<name>': <status>`) — a silently-partial result set is a wrong answer.
+The admin `GetTopology` reports `merge_policy = "score"` and the cached
+primary-key field for partitioned indexes.
 
 ## Phase 3 (designed, not yet built): master/follower replication
 

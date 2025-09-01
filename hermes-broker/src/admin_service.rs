@@ -83,11 +83,12 @@ impl BrokerService for BrokerAdminService {
                     replicas,
                 });
             }
+            let partitioned = route.partitions().is_some();
             indexes.push(IndexTopology {
                 index_name: name.clone(),
                 partitions,
-                merge_policy: "passthrough".to_string(),
-                primary_key_field: String::new(),
+                merge_policy: if partitioned { "score" } else { "passthrough" }.to_string(),
+                primary_key_field: self.ctx.primary_key_cached(name).unwrap_or_default(),
                 ambiguous: route.ambiguous(),
             });
         }

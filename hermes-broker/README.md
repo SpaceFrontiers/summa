@@ -21,6 +21,10 @@ Design doc: [docs/broker.md](../docs/broker.md). Metrics:
   wins), so dated index families stay on their shard. The same rules pin
   reads/writes when an index name transiently exists on two shards during a
   host-to-host migration.
+- Partitions an index across shards with a shard list:
+  `--placement "documents*=2,3,4"`. Documents hash by primary key to one
+  partition; searches fan out with shared BM25 statistics and merge by score;
+  every other RPC fans out to all partitions. See `docs/broker.md`.
 - Evicts unreachable backends after a grace period and recovers them after
   two successful probes; propagates client deadlines untouched (no
   broker-imposed timeouts); mirrors hermes-server's admission, message-size

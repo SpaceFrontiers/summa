@@ -1,9 +1,11 @@
 //! Shared state handed to every gRPC service implementation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arc_swap::ArcSwap;
+use parking_lot::RwLock;
 use tokio::sync::{Notify, Semaphore};
 use tonic::Status;
 
@@ -26,6 +28,9 @@ pub struct BrokerContext {
     /// Set when the shutdown signal fires; new RPCs are refused while tonic
     /// drains in-flight ones.
     pub shutting_down: Arc<AtomicBool>,
+    /// Primary-key field per partitioned index, resolved from its schema on
+    /// the first write (`routes::primary_key_field`).
+    pub primary_keys: RwLock<HashMap<String, String>>,
 }
 
 impl BrokerContext {

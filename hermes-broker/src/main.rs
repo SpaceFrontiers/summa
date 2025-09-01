@@ -13,9 +13,11 @@ mod discovery;
 mod index_service;
 mod kube_discovery;
 mod metrics;
+mod partition;
 mod placement;
 mod poller;
 mod proto;
+mod routes;
 mod search_service;
 mod topology;
 
@@ -91,7 +93,9 @@ struct Args {
 
     /// CreateIndex placement rule (repeatable, first match wins): "pattern=shard",
     /// e.g. "documents*=0". Also pins reads/writes when an index name appears
-    /// on several shards during a migration.
+    /// on several shards during a migration. A shard list ("documents*=2,3,4")
+    /// declares a partitioned index: documents hash by primary key across the
+    /// listed shards (in that order) and reads fan out and merge.
     #[arg(long = "placement")]
     placements: Vec<String>,
 
@@ -292,10 +296,16 @@ async fn async_main(args: Args) -> Result<()> {
         .map(|s| placement::parse_placement(s))
         .collect::<Result<Vec<_>>>()?;
     for rule in &placement_rules {
-        info!(
-            "placement rule: {} -> shard '{}'",
-            rule.pattern, rule.shard.0
-        );
+        let shards: Vec<&str> = rule.shards.iter().map(|s| s.0.as_str()).collect();
+        if shards.len() == 1 {
+            info!("placement rule: {} -> shard '{}'", rule.pattern, shards[0]);
+        } else {
+            info!(
+                "placement rule: {} -> partitions [{}]",
+                rule.pattern,
+                shards.join(", ")
+            );
+        }
     }
     let placement = Arc::new(PlacementRules::new(placement_rules, args.placement_default));
 
@@ -405,6 +415,7 @@ async fn async_main(args: Args) -> Result<()> {
             .map(|n| Arc::new(Semaphore::new(n))),
         read_rotation: AtomicUsize::new(0),
         shutting_down: Arc::clone(&shutting_down),
+        primary_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
     });
 
     let search_service = search_service::BrokerSearchService {

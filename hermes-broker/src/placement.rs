@@ -11,7 +11,10 @@ use crate::topology::ShardId;
 #[derive(Debug, Clone)]
 pub struct PlacementRule {
     pub pattern: String,
-    pub shard: ShardId,
+    /// One shard pins the index to it; several shards partition the index
+    /// across them, in this (immutable) order: writes hash the primary key
+    /// to a position in this list, reads fan out to all of them.
+    pub shards: Vec<ShardId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -35,27 +38,47 @@ impl PlacementRules {
     }
 
     /// First rule whose glob matches the index name.
-    pub fn shard_for(&self, index_name: &str) -> Option<&ShardId> {
+    /// Shards of the first matching rule.
+    pub fn shards_for(&self, index_name: &str) -> Option<&[ShardId]> {
         self.rules
             .iter()
             .find(|r| glob_match(&r.pattern, index_name))
-            .map(|r| &r.shard)
+            .map(|r| r.shards.as_slice())
+    }
+
+    /// First shard of the first matching rule (the whole placement for an
+    /// unpartitioned index).
+    pub fn shard_for(&self, index_name: &str) -> Option<&ShardId> {
+        self.shards_for(index_name)
+            .and_then(|shards| shards.first())
     }
 }
 
 /// Parse one `--placement "pattern=shard"` argument. The shard id follows the
 /// last `=` so patterns themselves may not contain `=` (index names cannot
 /// either, per hermes-server's index-name validation).
+/// `pattern=shard` or `pattern=shardA,shardB,...` (partitions in order).
 pub fn parse_placement(s: &str) -> anyhow::Result<PlacementRule> {
-    let (pattern, shard) = s
-        .rsplit_once('=')
-        .ok_or_else(|| anyhow::anyhow!("invalid --placement '{s}': expected 'pattern=shard'"))?;
-    if pattern.is_empty() || shard.is_empty() {
+    let (pattern, shards) = s.rsplit_once('=').ok_or_else(|| {
+        anyhow::anyhow!("invalid --placement '{s}': expected 'pattern=shard[,shard...]'")
+    })?;
+    if pattern.is_empty() || shards.is_empty() {
         anyhow::bail!("invalid --placement '{s}': empty pattern or shard");
+    }
+    let mut parsed: Vec<ShardId> = Vec::new();
+    for shard in shards.split(',') {
+        let shard = shard.trim();
+        if shard.is_empty() {
+            anyhow::bail!("invalid --placement '{s}': empty shard id");
+        }
+        if parsed.iter().any(|p| p.0 == shard) {
+            anyhow::bail!("invalid --placement '{s}': shard '{shard}' listed twice");
+        }
+        parsed.push(ShardId(shard.to_string()));
     }
     Ok(PlacementRule {
         pattern: pattern.to_string(),
-        shard: ShardId(shard.to_string()),
+        shards: parsed,
     })
 }
 
@@ -126,6 +149,20 @@ mod tests {
         assert!(parse_placement("documents*=").is_err());
         let rule = parse_placement("social*=fin2").unwrap();
         assert_eq!(rule.pattern, "social*");
-        assert_eq!(rule.shard.0, "fin2");
+        assert_eq!(rule.shards.len(), 1);
+        assert_eq!(rule.shards[0].0, "fin2");
+    }
+
+    #[test]
+    fn placement_parses_partition_lists() {
+        let rule = parse_placement("documents_2026*=2, 3,4").unwrap();
+        let shards: Vec<&str> = rule.shards.iter().map(|s| s.0.as_str()).collect();
+        assert_eq!(shards, vec!["2", "3", "4"]);
+        assert!(parse_placement("documents*=2,,3").is_err());
+        assert!(parse_placement("documents*=2,2").is_err());
+        let rules = PlacementRules::new(vec![rule], PlacementDefault::Single);
+        assert_eq!(rules.shards_for("documents_20260905").unwrap().len(), 3);
+        assert_eq!(rules.shard_for("documents_20260905").unwrap().0, "2");
+        assert!(rules.shards_for("social").is_none());
     }
 }

@@ -115,25 +115,40 @@ pub struct ShardGroup {
 pub struct IndexRoute {
     /// Shard ids on which routable backends advertise this index (sorted).
     pub shards: BTreeSet<ShardId>,
-    /// Placement rule match, if any.
-    pub ruled_shard: Option<ShardId>,
+    /// Shards of the matching placement rule, in rule order: one shard pins
+    /// the index, several partition it (`partitions`). Empty = no rule.
+    pub ruled: Vec<ShardId>,
 }
 
 impl IndexRoute {
+    /// The one shard a rule pins the index to (unpartitioned routes).
+    pub fn ruled_shard(&self) -> Option<&ShardId> {
+        match self.ruled.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Partition shards, in order, when the rule lists several.
+    pub fn partitions(&self) -> Option<&[ShardId]> {
+        (self.ruled.len() > 1).then_some(self.ruled.as_slice())
+    }
+
     /// Seen on several shards with no rule pinning one — migration transient.
+    /// A partitioned index is never ambiguous: every shard of its rule is a
+    /// partition.
     pub fn ambiguous(&self) -> bool {
-        self.shards.len() > 1
-            && !self
-                .ruled_shard
-                .as_ref()
-                .is_some_and(|r| self.shards.contains(r))
+        if self.partitions().is_some() {
+            return false;
+        }
+        self.shards.len() > 1 && !self.ruled_shard().is_some_and(|r| self.shards.contains(r))
     }
 
     /// The shard a read goes to. Ambiguous routes resolve to the
     /// lexicographically-first shard so behavior stays deterministic during
     /// migrations; the bool reports the ambiguity for metrics.
     fn read_shard(&self) -> (&ShardId, bool) {
-        if let Some(ruled) = &self.ruled_shard
+        if let Some(ruled) = self.ruled_shard()
             && let Some(shard) = self.shards.get(ruled)
         {
             return (shard, false);
@@ -199,7 +214,10 @@ impl TopologySnapshot {
                     .entry(name.clone())
                     .or_insert_with(|| IndexRoute {
                         shards: BTreeSet::new(),
-                        ruled_shard: placement.shard_for(name).cloned(),
+                        ruled: placement
+                            .shards_for(name)
+                            .map(<[ShardId]>::to_vec)
+                            .unwrap_or_default(),
                     })
                     .shards
                     .insert(backend.endpoint.shard.clone());
@@ -242,6 +260,41 @@ impl TopologySnapshot {
     ) -> Result<ReadSelection<'_>, Status> {
         let route = self.route(index_name)?;
         let (shard, ambiguous) = route.read_shard();
+        let mut selection = self.select_read_backend_on(index_name, shard, rotation)?;
+        selection.ambiguous = ambiguous;
+        Ok(selection)
+    }
+
+    /// Partition shards of `index_name` when its placement rule lists
+    /// several; every partition must advertise the index (a partially
+    /// present partitioned index cannot answer correctly).
+    pub fn partitions(&self, index_name: &str) -> Result<Option<&[ShardId]>, Status> {
+        let route = self.route(index_name)?;
+        let Some(partitions) = route.partitions() else {
+            return Ok(None);
+        };
+        let missing: Vec<&str> = partitions
+            .iter()
+            .filter(|shard| !route.shards.contains(shard))
+            .map(|shard| shard.0.as_str())
+            .collect();
+        if !missing.is_empty() {
+            return Err(Status::unavailable(format!(
+                "index '{index_name}' is partitioned over {} shards but partition(s) [{}] carry no healthy copy",
+                partitions.len(),
+                missing.join(", ")
+            )));
+        }
+        Ok(Some(partitions))
+    }
+
+    /// Pick the backend serving a read for `index_name` on one shard.
+    pub fn select_read_backend_on(
+        &self,
+        index_name: &str,
+        shard: &ShardId,
+        rotation: usize,
+    ) -> Result<ReadSelection<'_>, Status> {
         let group = self.shards.get(shard).ok_or_else(|| {
             Status::internal(format!("shard '{}' vanished from snapshot", shard.0))
         })?;
@@ -259,7 +312,7 @@ impl TopologySnapshot {
             return Ok(ReadSelection {
                 backend: b,
                 stale: false,
-                ambiguous,
+                ambiguous: false,
             });
         }
         // Grace path: no healthy replica; better a possibly-stale answer from
@@ -268,13 +321,64 @@ impl TopologySnapshot {
             return Ok(ReadSelection {
                 backend: b,
                 stale: true,
-                ambiguous,
+                ambiguous: false,
             });
         }
         Err(Status::unavailable(format!(
             "index '{index_name}': no routable replica on shard '{}'",
             shard.0
         )))
+    }
+
+    /// The master of one partition shard of `index_name`.
+    pub fn select_write_backend_on(
+        &self,
+        index_name: &str,
+        shard: &ShardId,
+    ) -> Result<&Backend, Status> {
+        let master = self.shard_master(shard)?;
+        if !master.routable() {
+            return Err(Status::unavailable(format!(
+                "index '{index_name}': shard '{}' master '{}' is unavailable",
+                shard.0, master.endpoint.id.0
+            )));
+        }
+        Ok(master)
+    }
+
+    /// The masters CreateIndex lands on: one per shard of the placement
+    /// rule (several for a partitioned index), or the single shard the
+    /// placement default picks.
+    pub fn select_create_backends(
+        &self,
+        index_name: &str,
+        placement: &PlacementRules,
+    ) -> Result<Vec<&Backend>, Status> {
+        match placement.shards_for(index_name) {
+            Some(shards) if shards.len() > 1 => {
+                let mut masters = Vec::with_capacity(shards.len());
+                for shard in shards {
+                    if !self.shards.contains_key(shard) {
+                        return Err(Status::failed_precondition(format!(
+                            "placement rule for '{index_name}' partitions over shard '{}' but no backend carries that shard id",
+                            shard.0
+                        )));
+                    }
+                    let master = self.shard_master(shard)?;
+                    if !master.routable() {
+                        return Err(Status::unavailable(format!(
+                            "shard '{}' master '{}' is unavailable",
+                            shard.0, master.endpoint.id.0
+                        )));
+                    }
+                    masters.push(master);
+                }
+                Ok(masters)
+            }
+            _ => self
+                .select_create_backend(index_name, placement)
+                .map(|backend| vec![backend]),
+        }
     }
 
     /// The unique master of a shard, or why there is none. A single unlabeled
@@ -324,7 +428,7 @@ impl TopologySnapshot {
         let route = self.route(index_name)?;
         let shard = if route.shards.len() == 1 {
             route.shards.iter().next().expect("len checked")
-        } else if let Some(ruled) = &route.ruled_shard
+        } else if let Some(ruled) = route.ruled_shard()
             && route.shards.contains(ruled)
         {
             route.shards.get(ruled).expect("contains checked")

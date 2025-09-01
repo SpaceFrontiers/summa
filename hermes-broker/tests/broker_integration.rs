@@ -381,3 +381,297 @@ async fn get_index_info_and_get_document_pass_through() {
         .await
         .unwrap();
 }
+
+/// Three partitions of `documents` on shards 2, 3 and 4 (a multi-shard
+/// placement rule): writes hash by primary key, reads fan out and merge.
+async fn partitioned_fixture() -> (Vec<MockBackend>, BrokerProc) {
+    let mocks: Vec<MockBackend> = (0..3).map(|_| MockBackend::new(&["documents"])).collect();
+    let mut specs = Vec::new();
+    for (i, mock) in mocks.iter().enumerate() {
+        mock.state.lock().schema =
+            "index documents {\n  field id: text<raw_ci> [indexed, stored, fast, primary]\n  field title: text [indexed]\n}"
+                .to_string();
+        let addr = mock.spawn().await;
+        specs.push(backend_spec(&format!("m{i}"), &addr, &(i + 2).to_string()));
+    }
+    let broker = spawn_broker(&specs, &["--placement", "documents*=2,3,4"]);
+    wait_for_indexes(&broker, &["documents"], Duration::from_secs(10)).await;
+    (mocks, broker)
+}
+
+fn text_doc(id: &str) -> NamedDocument {
+    NamedDocument {
+        fields: vec![FieldEntry {
+            name: "id".to_string(),
+            value: Some(FieldValue {
+                value: Some(field_value::Value::Text(id.to_string())),
+            }),
+        }],
+    }
+}
+
+fn scored_hit(id: &str, score: f32) -> SearchHit {
+    let mut fields = std::collections::HashMap::new();
+    fields.insert(
+        "id".to_string(),
+        FieldValueList {
+            values: vec![FieldValue {
+                value: Some(field_value::Value::Text(id.to_string())),
+            }],
+        },
+    );
+    SearchHit {
+        score,
+        fields,
+        ..Default::default()
+    }
+}
+
+fn hit_id(hit: &SearchHit) -> String {
+    match &hit.fields["id"].values[0].value {
+        Some(field_value::Value::Text(t)) => t.clone(),
+        other => panic!("unexpected id value {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_create_and_commit_fan_out_to_every_partition() {
+    let (mocks, broker) = partitioned_fixture().await;
+    let mut index = broker_index_client(&broker).await;
+    index
+        .create_index(CreateIndexRequest {
+            index_name: "documents_20260904".to_string(),
+            schema: "index documents_20260904 {}".to_string(),
+        })
+        .await
+        .unwrap();
+    let commit = index
+        .commit(CommitRequest {
+            index_name: "documents".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(commit.success);
+    // Each mock reports 7 docs on commit.
+    assert_eq!(commit.num_docs, 21);
+    for mock in &mocks {
+        let state = mock.state.lock();
+        assert_eq!(state.creates, vec!["documents_20260904"]);
+        assert_eq!(state.commits, vec!["documents"]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_batches_are_hash_routed_by_primary_key() {
+    let (mocks, broker) = partitioned_fixture().await;
+    let ids: Vec<String> = (0..300).map(|i| format!("doc-{i}")).collect();
+    let documents: Vec<NamedDocument> = ids.iter().map(|id| text_doc(id)).collect();
+    let response = broker_index_client(&broker)
+        .await
+        .batch_index_documents(BatchIndexDocumentsRequest {
+            index_name: "documents".to_string(),
+            documents,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.indexed_count, 300);
+    assert_eq!(response.error_count, 0);
+
+    let counts: Vec<usize> = mocks
+        .iter()
+        .map(|mock| {
+            let state = mock.state.lock();
+            assert_eq!(state.batches.len(), 1, "one batch per partition");
+            state.batches[0].1
+        })
+        .collect();
+    assert_eq!(counts.iter().sum::<usize>(), 300);
+    assert!(
+        counts.iter().all(|c| *c > 50),
+        "FNV-1a should spread 300 keys across 3 partitions, got {counts:?}"
+    );
+
+    // Same keys again land on the same partitions: routing is a pure
+    // function of the key.
+    let documents: Vec<NamedDocument> = ids.iter().map(|id| text_doc(id)).collect();
+    broker_index_client(&broker)
+        .await
+        .batch_index_documents(BatchIndexDocumentsRequest {
+            index_name: "documents".to_string(),
+            documents,
+        })
+        .await
+        .unwrap();
+    for (mock, count) in mocks.iter().zip(&counts) {
+        let state = mock.state.lock();
+        assert_eq!(state.batches[1].1, *count);
+    }
+
+    // A document without the primary key is refused at the broker with its
+    // request position, and never reaches a backend.
+    let response = broker_index_client(&broker)
+        .await
+        .batch_index_documents(BatchIndexDocumentsRequest {
+            index_name: "documents".to_string(),
+            documents: vec![
+                text_doc("doc-a"),
+                NamedDocument { fields: vec![] },
+                text_doc("doc-b"),
+            ],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.indexed_count, 2);
+    assert_eq!(response.error_count, 1);
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(response.errors[0].index, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_stream_routes_each_flush_by_primary_key() {
+    let (mocks, broker) = partitioned_fixture().await;
+    let stream = tokio_stream::iter((0..100).map(|i| IndexDocumentRequest {
+        index_name: "documents".to_string(),
+        fields: text_doc(&format!("doc-{i}")).fields,
+    }));
+    let response = broker_index_client(&broker)
+        .await
+        .index_documents(stream)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.indexed_count, 100);
+    let total: usize = mocks
+        .iter()
+        .map(|m| m.state.lock().batches.iter().map(|b| b.1).sum::<usize>())
+        .sum();
+    assert_eq!(total, 100);
+    assert!(mocks.iter().all(|m| !m.state.lock().batches.is_empty()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_search_merges_by_score_with_shared_stats() {
+    let (mocks, broker) = partitioned_fixture().await;
+    let canned = [
+        vec![scored_hit("p0-a", 9.0), scored_hit("p0-b", 3.0)],
+        vec![
+            scored_hit("p1-a", 7.0),
+            scored_hit("p1-b", 6.0),
+            scored_hit("p1-c", 1.0),
+        ],
+        vec![scored_hit("p2-a", 8.0)],
+    ];
+    for (mock, hits) in mocks.iter().zip(canned) {
+        let mut state = mock.state.lock();
+        state.search_response = SearchResponse {
+            hits,
+            total_hits: 100,
+            took_ms: 5,
+            timings: None,
+            truncated: false,
+        };
+    }
+
+    let mut request = simple_search_request("documents");
+    request.query = Some(Query {
+        query: Some(query::Query::Match(MatchQuery {
+            field: "title".to_string(),
+            text: "quantum".to_string(),
+            ..Default::default()
+        })),
+    });
+    request.offset = 1;
+    request.limit = 3;
+    let response = broker_search_client(&broker)
+        .await
+        .search(request)
+        .await
+        .unwrap()
+        .into_inner();
+    let ids: Vec<String> = response.hits.iter().map(hit_id).collect();
+    // Global order: p0-a 9, p2-a 8, p1-a 7, p1-b 6, p1-c 1, p0-b 3 → offset 1, limit 3.
+    assert_eq!(ids, vec!["p2-a", "p1-a", "p1-b"]);
+    assert_eq!(response.total_hits, 300);
+
+    for mock in &mocks {
+        let state = mock.state.lock();
+        assert_eq!(state.search_requests.len(), 1);
+        let sent = &state.search_requests[0];
+        // Every partition is asked for the full window from the top.
+        assert_eq!(sent.offset, 0);
+        assert_eq!(sent.limit, 4);
+        // ...with the merged corpus statistics attached.
+        assert_eq!(sent.text_stats.as_ref().map(|s| s.total_docs), Some(126));
+    }
+
+    // A query without text terms skips the statistics round trip.
+    broker_search_client(&broker)
+        .await
+        .search(simple_search_request("documents"))
+        .await
+        .unwrap();
+    for mock in &mocks {
+        let state = mock.state.lock();
+        assert_eq!(state.search_requests.len(), 2);
+        assert!(state.search_requests[1].text_stats.is_none());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partitioned_reads_aggregate_and_fail_on_any_partition() {
+    let (mocks, broker) = partitioned_fixture().await;
+    let mut search = broker_search_client(&broker).await;
+    let info = search
+        .get_index_info(GetIndexInfoRequest {
+            index_name: "documents".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.num_docs, 126);
+    assert_eq!(info.num_segments, 9);
+    assert!(info.schema.contains("primary"));
+
+    // GetDocument: the partition holding the segment answers.
+    mocks[0].state.lock().document_missing = true;
+    mocks[1].state.lock().document_missing = true;
+    search
+        .get_document(GetDocumentRequest {
+            index_name: "documents".to_string(),
+            address: Some(DocAddress {
+                segment_id: "seg".to_string(),
+                doc_id: 1,
+            }),
+        })
+        .await
+        .unwrap();
+    mocks[2].state.lock().document_missing = true;
+    let missing = search
+        .get_document(GetDocumentRequest {
+            index_name: "documents".to_string(),
+            address: Some(DocAddress {
+                segment_id: "seg".to_string(),
+                doc_id: 1,
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing.code(), tonic::Code::NotFound);
+
+    // A dead partition makes the whole read fail rather than return a
+    // partial answer.
+    mocks[1].state.lock().unavailable = true;
+    let failed = search
+        .search(simple_search_request("documents"))
+        .await
+        .unwrap_err();
+    assert_eq!(failed.code(), tonic::Code::Unavailable);
+    assert!(
+        failed.message().contains("partition"),
+        "{}",
+        failed.message()
+    );
+}

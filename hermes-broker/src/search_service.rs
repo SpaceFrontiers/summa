@@ -1,7 +1,12 @@
-//! SearchService pass-through: exact index → its backend, request and
-//! response forwarded verbatim. The broker adds only admission (never more
-//! in-flight searches per backend than the backend itself would admit),
-//! deadline propagation, and routing metrics.
+//! SearchService routing: reads go to a routable replica of the shard
+//! hosting the index and are forwarded verbatim.
+//!
+//! A partitioned index fans reads out: `Search` first collects the text
+//! statistics of the query's terms from every partition and sends the sum
+//! back with each partition's request (so BM25 scores are comparable across
+//! partitions), then merges the per-partition windows by score
+//! (`partition::merge_search_responses`). `GetDocument` asks every
+//! partition, `GetIndexInfo` and `GetTextStats` aggregate.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,53 +16,148 @@ use tonic::{Request, Response, Status};
 use crate::client::{capacity_exhausted, forward_timeout};
 use crate::context::{BrokerContext, code_label};
 use crate::metrics as m;
+use crate::partition;
 use crate::proto::hermes::search_service_server::SearchService;
 use crate::proto::hermes::{
     GetDocumentRequest, GetDocumentResponse, GetIndexInfoRequest, GetIndexInfoResponse,
     GetTextStatsRequest, GetTextStatsResponse, SearchRequest, SearchResponse,
 };
+use crate::routes::{Route, Target, record_backend};
+
+/// hermes-server refuses result windows above this; a partitioned search
+/// widens every partition's window to `offset + limit`, which must fit.
+const MAX_PARTITION_WINDOW: u32 = 10_000;
 
 pub struct BrokerSearchService {
     pub ctx: Arc<BrokerContext>,
 }
 
-impl BrokerSearchService {
-    /// Resolve the read backend for an index, recording routing metrics.
-    fn read_route(
-        &self,
-        index_name: &str,
-    ) -> Result<(crate::client::BackendChannels, String), Status> {
-        let snapshot = self.ctx.snapshot.load();
-        let selection = snapshot.select_read_backend(index_name, self.ctx.next_rotation())?;
-        if selection.ambiguous {
-            metrics::counter!(m::AMBIGUOUS_INDEX, "index" => index_name.to_string()).increment(1);
+/// One unary read RPC sent whole to every target of the route; all must
+/// succeed (a partitioned read with a missing partition is a wrong answer).
+macro_rules! forward_read {
+    ($self:ident, $req:expr, $timeout:expr, $route:expr, $method:ident, $rpc_name:literal) => {{
+        let req = $req;
+        let index_name = req.index_name.clone();
+        let route: &Route = $route;
+        let calls = route.targets().iter().map(|target| {
+            let mut outbound = Request::new(req.clone());
+            if let Some(t) = $timeout {
+                outbound.set_timeout(t);
+            }
+            let mut client = target.channels.search.clone();
+            let target: Target = target.clone();
+            async move {
+                let started = Instant::now();
+                let result = client.$method(outbound).await;
+                (target, started, result)
+            }
+        });
+        let mut responses = Vec::with_capacity(route.targets().len());
+        for (target, started, result) in futures::future::join_all(calls).await {
+            let code = result
+                .as_ref()
+                .map(|_| tonic::Code::Ok)
+                .unwrap_or_else(|s| s.code());
+            record_backend(&target.backend_id, $rpc_name, started, code);
+            match result {
+                Ok(response) => responses.push(response.into_inner()),
+                Err(status) if route.is_partitioned() => {
+                    return Err(partition::partition_failure(
+                        &index_name,
+                        &target.shard,
+                        status,
+                    ));
+                }
+                Err(status) => return Err(status),
+            }
         }
-        if selection.stale {
-            metrics::counter!(
-                m::STALE_TOPOLOGY_SERVES,
-                "backend" => selection.backend.endpoint.id.0.clone()
-            )
-            .increment(1);
-        }
-        let channels = self.ctx.pool.get(&selection.backend.endpoint.addr)?;
-        Ok((channels, selection.backend.endpoint.id.0.clone()))
-    }
+        Ok::<_, Status>(responses)
+    }};
 }
 
-fn record_backend(backend: &str, rpc: &'static str, started: Instant, code: tonic::Code) {
-    metrics::histogram!(
-        m::BACKEND_DURATION,
-        "backend" => backend.to_string(),
-        "rpc" => rpc,
-    )
-    .record(started.elapsed().as_secs_f64());
-    metrics::counter!(
-        m::BACKEND_REQUESTS,
-        "backend" => backend.to_string(),
-        "rpc" => rpc,
-        "code" => code_label(code),
-    )
-    .increment(1);
+impl BrokerSearchService {
+    /// Admission for one search on every target of the route: try_acquire
+    /// (never queue), so overload is reported immediately with the same
+    /// message hermes-server uses.
+    fn admit(
+        &self,
+        index_name: &str,
+        route: &Route,
+    ) -> Result<Vec<tokio::sync::OwnedSemaphorePermit>, Status> {
+        let mut permits = Vec::with_capacity(route.targets().len() + 1);
+        if let Some(global) = &self.ctx.global_search_permits {
+            permits.push(global.clone().try_acquire_owned().map_err(|_| {
+                metrics::counter!(
+                    m::ADMISSION_REJECTED,
+                    "index" => index_name.to_string(), "scope" => "global"
+                )
+                .increment(1);
+                capacity_exhausted()
+            })?);
+        }
+        for target in route.targets() {
+            permits.push(
+                target
+                    .channels
+                    .search_permits
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        metrics::counter!(
+                            m::ADMISSION_REJECTED,
+                            "index" => index_name.to_string(), "scope" => "backend"
+                        )
+                        .increment(1);
+                        capacity_exhausted()
+                    })?,
+            );
+        }
+        Ok(permits)
+    }
+
+    async fn search_partitioned(
+        &self,
+        mut req: SearchRequest,
+        timeout: Option<std::time::Duration>,
+        route: &Route,
+    ) -> Result<SearchResponse, Status> {
+        let offset = req.offset;
+        let limit = req.limit;
+        let window = offset.saturating_add(limit);
+        if window > MAX_PARTITION_WINDOW {
+            return Err(Status::invalid_argument(format!(
+                "offset + limit = {window} exceeds the {MAX_PARTITION_WINDOW} window a partitioned index can merge"
+            )));
+        }
+        // Shared BM25 statistics: every partition scores with the sum.
+        if req.text_stats.is_none()
+            && let Some(query) = req.query.clone()
+            && partition::has_text_terms(&query)
+        {
+            let stats = forward_read!(
+                self,
+                GetTextStatsRequest {
+                    index_name: req.index_name.clone(),
+                    query: Some(query),
+                },
+                timeout,
+                route,
+                get_text_stats,
+                "get_text_stats"
+            )?;
+            req.text_stats = Some(partition::merge_text_stats(
+                stats.into_iter().filter_map(|s| s.stats).collect(),
+            ));
+        }
+        req.offset = 0;
+        req.limit = window;
+        let responses = forward_read!(self, req, timeout, route, search, "search")?;
+        Ok(partition::merge_search_responses(
+            responses,
+            offset as usize,
+            limit as usize,
+        ))
+    }
 }
 
 #[tonic::async_trait]
@@ -73,47 +173,25 @@ impl SearchService for BrokerSearchService {
         let started = Instant::now();
 
         let result: Result<SearchResponse, Status> = async {
-            let (channels, backend_id) = self.read_route(&req.index_name)?;
-
-            // try_acquire (never queue): overload is reported immediately with
-            // the same message hermes-server uses, so client backoff/retry
-            // logic cannot tell the broker and the backend apart.
-            let _global = match &self.ctx.global_search_permits {
-                Some(permits) => Some(permits.clone().try_acquire_owned().map_err(|_| {
-                    metrics::counter!(
-                        m::ADMISSION_REJECTED,
-                        "index" => index_name.clone(), "scope" => "global"
-                    )
-                    .increment(1);
-                    capacity_exhausted()
-                })?),
-                None => None,
-            };
-            let _backend = channels
-                .search_permits
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| {
-                    metrics::counter!(
-                        m::ADMISSION_REJECTED,
-                        "index" => index_name.clone(), "scope" => "backend"
-                    )
-                    .increment(1);
-                    capacity_exhausted()
-                })?;
-
-            let mut outbound = Request::new(req);
-            if let Some(t) = timeout {
-                outbound.set_timeout(t);
+            let route = self.ctx.read_route(&req.index_name)?;
+            let _permits = self.admit(&index_name, &route)?;
+            match &route {
+                Route::Single(target) => {
+                    let mut outbound = Request::new(req);
+                    if let Some(t) = timeout {
+                        outbound.set_timeout(t);
+                    }
+                    let call_started = Instant::now();
+                    let result = target.channels.search.clone().search(outbound).await;
+                    let code = result
+                        .as_ref()
+                        .map(|_| tonic::Code::Ok)
+                        .unwrap_or_else(|s| s.code());
+                    record_backend(&target.backend_id, "search", call_started, code);
+                    result.map(|r| r.into_inner())
+                }
+                Route::Partitioned(_) => self.search_partitioned(req, timeout, &route).await,
             }
-            let call_started = Instant::now();
-            let result = channels.search.clone().search(outbound).await;
-            let code = result
-                .as_ref()
-                .map(|_| tonic::Code::Ok)
-                .unwrap_or_else(|s| s.code());
-            record_backend(&backend_id, "search", call_started, code);
-            result.map(|r| r.into_inner())
         }
         .await;
 
@@ -142,24 +220,49 @@ impl SearchService for BrokerSearchService {
         self.ctx.check_admission()?;
         let timeout = forward_timeout(request.metadata());
         let req = request.into_inner();
-        let (channels, backend_id) = self.read_route(&req.index_name)?;
-        let mut outbound = Request::new(req);
-        if let Some(t) = timeout {
-            outbound.set_timeout(t);
+        let route = self.ctx.read_route(&req.index_name)?;
+        // A document address names a segment, which lives on exactly one
+        // partition: ask every partition, the one that has it answers.
+        let calls = route.targets().iter().map(|target| {
+            let mut outbound = Request::new(req.clone());
+            if let Some(t) = timeout {
+                outbound.set_timeout(t);
+            }
+            let mut client = target.channels.search.clone();
+            let target: Target = target.clone();
+            async move {
+                let started = Instant::now();
+                let result = client.get_document(outbound).await;
+                (target, started, result)
+            }
+        });
+        let mut not_found: Option<Status> = None;
+        let mut failure: Option<Status> = None;
+        for (target, started, result) in futures::future::join_all(calls).await {
+            let code = result
+                .as_ref()
+                .map(|_| tonic::Code::Ok)
+                .unwrap_or_else(|s| s.code());
+            record_backend(&target.backend_id, "get_document", started, code);
+            match result {
+                Ok(response) => return Ok(Response::new(response.into_inner())),
+                Err(status) if status.code() == tonic::Code::NotFound => {
+                    not_found.get_or_insert(status);
+                }
+                Err(status) => {
+                    failure.get_or_insert(if route.is_partitioned() {
+                        partition::partition_failure(&req.index_name, &target.shard, status)
+                    } else {
+                        status
+                    });
+                }
+            }
         }
-        let started = Instant::now();
-        let result = channels.search.clone().get_document(outbound).await;
-        let code = result
-            .as_ref()
-            .map(|_| tonic::Code::Ok)
-            .unwrap_or_else(|s| s.code());
-        record_backend(&backend_id, "get_document", started, code);
-        result.map(|r| Response::new(r.into_inner()))
+        Err(failure
+            .or(not_found)
+            .unwrap_or_else(|| Status::not_found("document not found")))
     }
 
-    /// One index lives on one shard today, so the statistics of that shard
-    /// are the whole; a scatter-gather broker sums this per shard and sends
-    /// the total back as `SearchRequest.text_stats`.
     async fn get_text_stats(
         &self,
         request: Request<GetTextStatsRequest>,
@@ -167,19 +270,17 @@ impl SearchService for BrokerSearchService {
         self.ctx.check_admission()?;
         let timeout = forward_timeout(request.metadata());
         let req = request.into_inner();
-        let (channels, backend_id) = self.read_route(&req.index_name)?;
-        let mut outbound = Request::new(req);
-        if let Some(t) = timeout {
-            outbound.set_timeout(t);
-        }
-        let started = Instant::now();
-        let result = channels.search.clone().get_text_stats(outbound).await;
-        let code = result
-            .as_ref()
-            .map(|_| tonic::Code::Ok)
-            .unwrap_or_else(|s| s.code());
-        record_backend(&backend_id, "get_text_stats", started, code);
-        result.map(|r| Response::new(r.into_inner()))
+        let route = self.ctx.read_route(&req.index_name)?;
+        let responses =
+            forward_read!(self, req, timeout, &route, get_text_stats, "get_text_stats")?;
+        let stats = if route.is_partitioned() {
+            Some(partition::merge_text_stats(
+                responses.into_iter().filter_map(|r| r.stats).collect(),
+            ))
+        } else {
+            responses.into_iter().next().and_then(|r| r.stats)
+        };
+        Ok(Response::new(GetTextStatsResponse { stats }))
     }
 
     async fn get_index_info(
@@ -189,18 +290,9 @@ impl SearchService for BrokerSearchService {
         self.ctx.check_admission()?;
         let timeout = forward_timeout(request.metadata());
         let req = request.into_inner();
-        let (channels, backend_id) = self.read_route(&req.index_name)?;
-        let mut outbound = Request::new(req);
-        if let Some(t) = timeout {
-            outbound.set_timeout(t);
-        }
-        let started = Instant::now();
-        let result = channels.search.clone().get_index_info(outbound).await;
-        let code = result
-            .as_ref()
-            .map(|_| tonic::Code::Ok)
-            .unwrap_or_else(|s| s.code());
-        record_backend(&backend_id, "get_index_info", started, code);
-        result.map(|r| Response::new(r.into_inner()))
+        let route = self.ctx.read_route(&req.index_name)?;
+        let responses =
+            forward_read!(self, req, timeout, &route, get_index_info, "get_index_info")?;
+        Ok(Response::new(partition::merge_index_info(responses)))
     }
 }

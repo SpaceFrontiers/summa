@@ -46,6 +46,13 @@ pub struct MockState {
     pub deletes: Vec<String>,
     /// Recorded index names per Search call.
     pub searches: Vec<String>,
+    /// Recorded full Search requests (offset/limit/text_stats as received).
+    pub search_requests: Vec<SearchRequest>,
+    /// Schema SDL returned by GetIndexInfo (a `primary` field makes the
+    /// index partitionable).
+    pub schema: String,
+    /// When set, GetDocument answers NOT_FOUND.
+    pub document_missing: bool,
 }
 
 #[derive(Clone)]
@@ -58,6 +65,7 @@ impl MockBackend {
         Self {
             state: Arc::new(Mutex::new(MockState {
                 indexes: indexes.iter().map(|s| s.to_string()).collect(),
+                schema: "index mock {}".to_string(),
                 ..Default::default()
             })),
         }
@@ -115,7 +123,8 @@ impl SearchService for MockBackend {
         let req = request.into_inner();
         let mut state = self.state.lock();
         state.search_timeouts.push(timeout);
-        state.searches.push(req.index_name);
+        state.searches.push(req.index_name.clone());
+        state.search_requests.push(req);
         Ok(Response::new(state.search_response.clone()))
     }
 
@@ -124,6 +133,9 @@ impl SearchService for MockBackend {
         _request: Request<GetDocumentRequest>,
     ) -> Result<Response<GetDocumentResponse>, Status> {
         self.check_available()?;
+        if self.state.lock().document_missing {
+            return Err(Status::not_found("document not found"));
+        }
         Ok(Response::new(GetDocumentResponse {
             fields: Default::default(),
         }))
@@ -153,7 +165,7 @@ impl SearchService for MockBackend {
             index_name: req.index_name,
             num_docs: 42,
             num_segments: 3,
-            schema: "index mock {}".to_string(),
+            schema: self.state.lock().schema.clone(),
             memory_stats: None,
             vector_stats: vec![],
             text_fields: vec![],
