@@ -86,6 +86,18 @@ The broker forwards `SearchRequest` opaquely but must be rebuilt against the
 new proto: a stale decoder drops the unknown oneof field and the server then
 rejects the request as having no query.
 
+## Performance notes (2026-09-03)
+
+Measured on an M-series laptop with a 1.1 MB English text (`tokenize_hinted`,
+release build, single thread): plain cleaning runs at ~340 MiB/s; adding the
+English Snowball stemmer brings it to ~55 MiB/s, and mixed Russian/English
+with `"ru,en"` to ~54 MiB/s. The stemmer itself (~120 ns per word) is the
+cost; the tokenizer around it now fetches the thread-local stemmers once per
+call instead of once per token and keeps a token's allocation when stemming
+leaves it unchanged (+8% over the first implementation). Query-time
+resolution of a `stem(...)` spec is cached per spec string in
+`TokenizerRegistry` (~1 µs per query for a five-word query).
+
 ## Not in scope
 
 - JSON (`SchemaFieldConfig`) schemas: the dynamic spec is SDL-only.

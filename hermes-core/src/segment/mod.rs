@@ -12,6 +12,7 @@ pub(crate) mod bmp_adaptive;
 pub(crate) mod bmp_grid;
 #[cfg(any(feature = "native", feature = "wasm"))]
 mod builder;
+pub mod chunk_map;
 pub(crate) mod format;
 #[cfg(feature = "native")]
 mod merger;

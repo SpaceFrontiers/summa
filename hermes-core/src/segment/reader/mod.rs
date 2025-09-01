@@ -1593,6 +1593,8 @@ pub struct SegmentReader {
     positions_handle: Option<FileHandle>,
     /// Fast-field columnar readers per field_id
     fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
+    /// Virtual-id maps of chunked text fields per field_id
+    chunk_maps: FxHashMap<u32, super::chunk_map::ChunkMap>,
     /// Dense-vector hot-metadata pin accounting (see `segment::pin`).
     #[cfg(feature = "native")]
     dense_pin_report: crate::segment::pin::PinReport,
@@ -1683,6 +1685,9 @@ impl SegmentReader {
         // Load fast-field columns from .fast file
         let fast_fields = loader::load_fast_fields_file(dir, &files, &schema).await?;
 
+        // Load chunk maps of chunked text fields from .chunks file
+        let chunk_maps = loader::load_chunk_maps_file(dir, &files, &schema).await?;
+
         // Log segment loading stats
         {
             let mut parts = vec![format!(
@@ -1715,6 +1720,13 @@ impl SegmentReader {
             if !fast_fields.is_empty() {
                 parts.push(format!("fast: {} fields", fast_fields.len()));
             }
+            for (field_id, map) in &chunk_maps {
+                parts.push(format!(
+                    "chunked text field {}: {} chunks",
+                    field_id,
+                    map.num_chunks()
+                ));
+            }
             log::debug!("{}", parts.join(", "));
         }
 
@@ -1734,6 +1746,7 @@ impl SegmentReader {
             sparse_file_backed_bytes,
             positions_handle,
             fast_fields,
+            chunk_maps,
             #[cfg(feature = "native")]
             dense_pin_report: Default::default(),
             #[cfg(feature = "native")]
@@ -1930,6 +1943,47 @@ impl SegmentReader {
     /// Get all fast-field readers.
     pub fn fast_fields(&self) -> &FxHashMap<u32, crate::structures::fast_field::FastFieldReader> {
         &self.fast_fields
+    }
+
+    /// Virtual-id map of a chunked text field, when the field is chunked and
+    /// this segment indexed at least one chunk of it.
+    pub fn chunk_map(&self, field: Field) -> Option<&super::chunk_map::ChunkMap> {
+        self.chunk_maps.get(&field.0)
+    }
+
+    /// All chunk maps of this segment.
+    pub fn chunk_maps(&self) -> &FxHashMap<u32, super::chunk_map::ChunkMap> {
+        &self.chunk_maps
+    }
+
+    /// Whether `field` is declared chunked in the schema (its postings are
+    /// keyed by virtual chunk ids, never by document ids).
+    pub fn is_chunked_field(&self, field: Field) -> bool {
+        self.schema
+            .get_field_entry(field)
+            .is_some_and(|entry| entry.chunked)
+    }
+
+    /// Number of chunks a chunked field holds in this segment (0 when none).
+    pub fn num_chunks(&self, field: Field) -> u32 {
+        self.chunk_maps
+            .get(&field.0)
+            .map_or(0, |map| map.num_chunks())
+    }
+
+    /// BM25 corpus size for `field`: chunks for a chunked field, documents
+    /// otherwise.
+    pub fn text_corpus_size(&self, field: Field) -> f32 {
+        if self.is_chunked_field(field) {
+            self.num_chunks(field) as f32
+        } else {
+            self.meta.num_docs as f32
+        }
+    }
+
+    /// Whether this segment carries a `.chunks` file.
+    pub fn has_chunks_file(&self) -> bool {
+        !self.chunk_maps.is_empty()
     }
 
     /// Get term dictionary stats for debugging

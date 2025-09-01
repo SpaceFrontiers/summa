@@ -1,5 +1,6 @@
 //! Segment merger for combining multiple segments
 
+mod chunk_maps;
 mod dense;
 mod fast_fields;
 mod postings;
@@ -623,8 +624,10 @@ impl SegmentMerger {
 
         let fast_fut = async { self.merge_fast_fields(dir, segments, &files).await };
 
-        let (postings_result, store_result, fast_bytes) =
-            tokio::try_join!(postings_fut, store_fut, fast_fut)?;
+        let chunks_fut = async { self.merge_chunk_maps(dir, segments, &files).await };
+
+        let (postings_result, store_result, fast_bytes, _chunk_bytes) =
+            tokio::try_join!(postings_fut, store_fut, fast_fut, chunks_fut)?;
         self.ensure_not_cancelled()?;
 
         log::info!(

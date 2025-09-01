@@ -13,6 +13,7 @@ use std::io::Write;
 
 use super::OffsetWriter;
 use super::SegmentMerger;
+use super::chunk_maps::chunk_offsets;
 use super::doc_offsets;
 use crate::Result;
 use crate::segment::reader::SegmentReader;
@@ -64,6 +65,16 @@ impl SegmentMerger {
         positions_out: &mut OffsetWriter,
     ) -> Result<usize> {
         let doc_offs = doc_offsets(segments)?;
+        // Chunked text fields key their postings by virtual chunk id, so their
+        // terms stack with the field's chunk-count offsets, not document offsets.
+        let chunk_offs = chunk_offsets(&self.schema, segments)?;
+        let offset_for = |key: &[u8], segment_idx: usize| -> u32 {
+            let field_id = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+            match chunk_offs.get(&field_id) {
+                Some(offsets) => offsets[segment_idx],
+                None => doc_offs[segment_idx],
+            }
+        };
 
         // Parallel prefetch all term dict blocks
         let prefetch_start = std::time::Instant::now();
@@ -97,11 +108,12 @@ impl SegmentMerger {
         let mut heap: BinaryHeap<MergeEntry> = BinaryHeap::new();
         for (seg_idx, iter) in iterators.iter_mut().enumerate() {
             if let Some((key, term_info)) = iter.next().await.map_err(crate::Error::from)? {
+                let doc_offset = offset_for(&key, seg_idx);
                 heap.push(MergeEntry {
                     key,
                     term_info,
                     segment_idx: seg_idx,
-                    doc_offset: doc_offs[seg_idx],
+                    doc_offset,
                 });
             }
         }
@@ -130,11 +142,12 @@ impl SegmentMerger {
                 .await
                 .map_err(crate::Error::from)?
             {
+                let doc_offset = offset_for(&key, first.segment_idx);
                 heap.push(MergeEntry {
                     key,
                     term_info,
                     segment_idx: first.segment_idx,
-                    doc_offset: doc_offs[first.segment_idx],
+                    doc_offset,
                 });
             }
 
@@ -152,11 +165,12 @@ impl SegmentMerger {
                     .await
                     .map_err(crate::Error::from)?
                 {
+                    let doc_offset = offset_for(&key, entry.segment_idx);
                     heap.push(MergeEntry {
                         key,
                         term_info,
                         segment_idx: entry.segment_idx,
-                        doc_offset: doc_offs[entry.segment_idx],
+                        doc_offset,
                     });
                 }
             }

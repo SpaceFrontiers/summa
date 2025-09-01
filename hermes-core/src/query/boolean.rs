@@ -9,8 +9,8 @@ use crate::{DocId, Score};
 use super::planner::{
     build_combined_bitset, build_sparse_bmp_results, build_sparse_bmp_results_filtered,
     build_sparse_maxscore_executor, chain_predicates, combine_sparse_results, compute_idf,
-    extract_all_sparse_infos, finish_text_maxscore, prepare_per_field_grouping,
-    prepare_text_maxscore,
+    extract_all_sparse_infos, finish_chunked_text_maxscore, finish_text_maxscore,
+    prepare_per_field_grouping, prepare_text_maxscore, text_maxscore_allowed,
 };
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture};
 
@@ -201,9 +201,9 @@ macro_rules! boolean_plan {
         // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
         if must.is_empty() && must_not.is_empty() && should.len() >= 2 {
             // 2a. Text MaxScore (single-field, all term queries)
-            if !scorer_options.collect_positions
-                && let Some((mut infos, text_field, avg_field_len, num_docs)) =
+            if let Some((mut infos, text_field, avg_field_len, num_docs)) =
                 prepare_text_maxscore(should, reader, global_stats)
+                && text_maxscore_allowed(reader, text_field, scorer_options.collect_positions)
             {
                 let mut posting_lists = Vec::with_capacity(infos.len());
                 for info in infos.drain(..) {
@@ -213,6 +213,10 @@ macro_rules! boolean_plan {
                         let idf = compute_idf(&pl, info.field, &info.term, num_docs, global_stats);
                         posting_lists.push((pl, idf));
                     }
+                }
+                // Chunked field: score chunks, fold to documents with ordinals.
+                if reader.is_chunked_field(text_field) {
+                    return finish_chunked_text_maxscore(posting_lists, limit, reader, text_field);
                 }
                 // Seed from the cross-segment floor: this path scores final
                 // per-doc BM25 into a top-`limit` heap, so a floor carried from
@@ -249,26 +253,38 @@ macro_rules! boolean_plan {
             }
 
             // 2c. Per-field text MaxScore (multi-field term grouping)
-            if !scorer_options.collect_positions
-                && let Some(grouping) =
-                    prepare_per_field_grouping(should, reader, limit, global_stats)
-            {
+            if let Some(grouping) = prepare_per_field_grouping(
+                should,
+                reader,
+                limit,
+                global_stats,
+                scorer_options.collect_positions,
+            ) {
                 let mut scorers: Vec<Box<dyn Scorer + '_>> = Vec::new();
                 // Query-local cross-group threshold seeding (see finish_text_maxscore)
                 let shared_threshold = std::cell::Cell::new(0.0f32);
                 for (field, avg_field_len, infos) in &grouping.multi_term_groups {
+                    // Chunked fields: IDF over chunks, not documents.
+                    let corpus_size = reader.text_corpus_size(*field);
                     let mut posting_lists = Vec::with_capacity(infos.len());
                     for info in infos {
                         if let Some(pl) = reader.$get_postings_fn(info.field, &info.term)
                             $(. $aw)* ?
                         {
                             let idf = compute_idf(
-                                &pl, *field, &info.term, grouping.num_docs, global_stats,
+                                &pl, *field, &info.term, corpus_size, global_stats,
                             );
                             posting_lists.push((pl, idf));
                         }
                     }
-                    if !posting_lists.is_empty() {
+                    if reader.is_chunked_field(*field) {
+                        scorers.push(finish_chunked_text_maxscore(
+                            posting_lists,
+                            grouping.per_field_limit,
+                            reader,
+                            *field,
+                        )?);
+                    } else if !posting_lists.is_empty() {
                         scorers.push(finish_text_maxscore(
                             posting_lists,
                             *avg_field_len,
@@ -291,10 +307,12 @@ macro_rules! boolean_plan {
         }
 
         // ── 3. Filter push-down (MUST + SHOULD) ─────────────────────────
-        if !scorer_options.collect_positions
-            && !should.is_empty()
-            && !must.is_empty()
-        {
+        //
+        // Position collection no longer disables this path: fast-field
+        // predicates carry no positions to lose and verifier scorers keep
+        // theirs. Only the posting-list bitset shortcut is skipped when
+        // positions are requested, because a bitset cannot report them.
+        if !should.is_empty() && !must.is_empty() {
             // Pre-check: is SHOULD all-sparse? This determines whether we can
             // use bitset fallback for MUST clauses that lack fast-field predicates.
             // For sparse SHOULD, the predicate is pushed into BMP/MaxScore traversal
@@ -303,6 +321,7 @@ macro_rules! boolean_plan {
             // don't match SHOULD), so those go to verifier → BooleanScorer.
             let should_is_sparse = scorer_options.lsp_plan.is_some()
                 || extract_all_sparse_infos(should).is_some();
+            let bitset_predicates_allowed = should_is_sparse && !scorer_options.collect_positions;
 
             // 3a. Compile MUST → predicates (O(1)) vs verifier scorers (seek)
             //
@@ -315,7 +334,7 @@ macro_rules! boolean_plan {
                 if let Some(pred) = q.as_doc_predicate(reader) {
                     log::debug!("BooleanQuery planner 3a: MUST clause → predicate ({})", q);
                     predicates.push(pred);
-                } else if should_is_sparse {
+                } else if bitset_predicates_allowed {
                     if let Some(bitset) = q.as_doc_bitset(reader) {
                         log::debug!("BooleanQuery planner 3a: MUST clause → bitset predicate ({})", q);
                         predicates.push(Box::new(move |doc_id| bitset.contains(doc_id)));
@@ -339,7 +358,7 @@ macro_rules! boolean_plan {
                     let negated: super::DocPredicate<'_> =
                         Box::new(move |doc_id| !pred(doc_id));
                     predicates.push(negated);
-                } else if should_is_sparse {
+                } else if bitset_predicates_allowed {
                     if let Some(bitset) = q.as_doc_bitset(reader) {
                         log::debug!("BooleanQuery planner 3a: MUST_NOT clause → bitset predicate ({})", q);
                         predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
@@ -886,9 +905,51 @@ impl Scorer for BooleanScorer<'_> {
         if all_positions.is_empty() {
             None
         } else {
-            Some(all_positions)
+            Some(merge_matched_positions(all_positions))
         }
     }
+}
+
+/// Coalesce the position lists that several clauses reported for one field.
+///
+/// Two term clauses on the same chunked field each report the chunk ordinal
+/// they matched; the union must present one entry per chunk whose score is
+/// the sum of the clause contributions (the chunk's BM25 score), not the same
+/// ordinal twice. Distinct positions are left untouched, so token positions of
+/// `positions`-mode fields keep their per-term scores.
+pub(super) fn merge_matched_positions(
+    positions: super::MatchedPositions,
+) -> super::MatchedPositions {
+    if positions.len() < 2 {
+        return positions;
+    }
+    let mut merged: super::MatchedPositions = Vec::with_capacity(positions.len());
+    for (field_id, scored) in positions {
+        match merged
+            .iter_mut()
+            .find(|(existing, _)| *existing == field_id)
+        {
+            Some((_, existing)) => existing.extend(scored),
+            None => merged.push((field_id, scored)),
+        }
+    }
+    for (_, scored) in &mut merged {
+        if scored.len() < 2 {
+            continue;
+        }
+        scored.sort_by_key(|sp| sp.position);
+        let mut write = 0usize;
+        for read in 1..scored.len() {
+            if scored[read].position == scored[write].position {
+                scored[write].score += scored[read].score;
+            } else {
+                write += 1;
+                scored[write] = scored[read];
+            }
+        }
+        scored.truncate(write + 1);
+    }
+    merged
 }
 
 #[cfg(test)]

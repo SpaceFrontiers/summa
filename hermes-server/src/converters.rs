@@ -132,6 +132,15 @@ pub fn convert_query(
                 if prefix.is_empty() {
                     return Err("Prefix query must not be empty".to_string());
                 }
+                if schema
+                    .get_field_entry(field)
+                    .is_some_and(|entry| entry.chunked)
+                {
+                    return Err(format!(
+                        "Prefix queries are not supported on chunked text field '{}'; use a MatchQuery or PhraseQuery",
+                        match_query.field
+                    ));
+                }
                 return Ok(Box::new(PrefixQuery::text(field, prefix)));
             }
 
@@ -740,6 +749,11 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
 
         if entry.indexed {
             let mut idx_params = Vec::new();
+
+            // Chunked text: every value is its own BM25 unit
+            if entry.chunked {
+                idx_params.push("chunked".to_string());
+            }
 
             // Positions (for text/sparse)
             if let Some(pos) = entry.positions {
@@ -1656,6 +1670,40 @@ mod tests {
         let mut too_wide = base;
         too_wide.matryoshka_dims = 4;
         assert!(convert_reranker(&too_wide, &schema).is_err());
+    }
+
+    #[test]
+    fn schema_to_sdl_renders_chunked_text_fields() {
+        let input = r#"
+            index documents {
+                field languages: text<raw_ci> [fast]
+                field content: text<stem(by: languages, default: simple)> [indexed<chunked, token_position>]
+            }
+        "#;
+        let schema = hermes_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        assert!(
+            rendered.contains("indexed<chunked, token_position>"),
+            "{rendered}"
+        );
+        let reparsed = hermes_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let entry = reparsed
+            .get_field_entry(reparsed.get_field("content").unwrap())
+            .unwrap();
+        assert!(entry.chunked);
+
+        // Prefix queries cannot be re-keyed from chunk ids to documents.
+        let query = proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: "content".to_string(),
+                text: "need*".to_string(),
+                tokenizer_hint: String::new(),
+            })),
+        };
+        let error = convert_query(&query, &schema, None, None, &QueryShapeLimits::default())
+            .err()
+            .expect("prefix on a chunked field must be rejected");
+        assert!(error.contains("chunked"), "{error}");
     }
 
     #[test]

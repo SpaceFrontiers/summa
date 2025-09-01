@@ -393,6 +393,8 @@ pub struct SegmentFiles {
     pub positions: PathBuf,
     /// Fast-field columnar storage for O(1) doc→value access
     pub fast: PathBuf,
+    /// Virtual-id → (doc, ordinal, length) maps of chunked text fields
+    pub chunks: PathBuf,
 }
 
 impl SegmentFiles {
@@ -407,6 +409,7 @@ impl SegmentFiles {
             sparse: PathBuf::from(format!("{}.sparse", prefix)),
             positions: PathBuf::from(format!("{}.pos", prefix)),
             fast: PathBuf::from(format!("{}.fast", prefix)),
+            chunks: PathBuf::from(format!("{}.chunks", prefix)),
         }
     }
 
@@ -432,7 +435,7 @@ impl SegmentFiles {
 
     /// Every permanent or temporary path owned by this segment ID.
     #[cfg(feature = "native")]
-    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 9] {
+    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 10] {
         [
             self.term_dict.clone(),
             self.postings.clone(),
@@ -443,6 +446,7 @@ impl SegmentFiles {
             self.sparse_skip_temp(),
             self.positions.clone(),
             self.fast.clone(),
+            self.chunks.clone(),
         ]
     }
 }

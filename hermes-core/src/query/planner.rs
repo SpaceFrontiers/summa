@@ -60,7 +60,8 @@ pub(super) fn prepare_text_maxscore(
     let avg_field_len = global_stats
         .map(|s| s.avg_field_len(field))
         .unwrap_or_else(|| reader.avg_field_len(field));
-    let num_docs = reader.num_docs() as f32;
+    // Chunked fields: IDF over chunks, not documents.
+    let num_docs = reader.text_corpus_size(field);
     Some((infos, field, avg_field_len, num_docs))
 }
 
@@ -99,6 +100,84 @@ pub(super) fn finish_text_maxscore<'a>(
     Ok(Box::new(TopKResultScorer::new(results)) as Box<dyn Scorer + 'a>)
 }
 
+/// Over-fetch factor for chunked text MaxScore: the executor ranks chunks and
+/// `Max` folding collapses a document's chunks into one hit, so fetch more
+/// raw chunks than documents requested (same budget as sparse vectors).
+const CHUNKED_TEXT_OVER_FETCH_FACTOR: f32 = 2.0;
+
+/// Whether the text MaxScore fast path may serve a field when the caller
+/// asked for positions.
+///
+/// Without positions it always may. With positions it may unless the field's
+/// position mode tracks element ordinals (`positions` / `ordinal`): those
+/// callers expect the raw encoded positions of every hit, which the top-k
+/// executor does not produce. Phrase-only (`token_position`) fields report no
+/// positions and chunked fields report chunk ordinals, both via MaxScore.
+pub(super) fn text_maxscore_allowed(
+    reader: &SegmentReader,
+    field: crate::Field,
+    collect_positions: bool,
+) -> bool {
+    if !collect_positions || reader.is_chunked_field(field) {
+        return true;
+    }
+    !reader
+        .schema()
+        .get_field_entry(field)
+        .and_then(|entry| entry.positions)
+        .is_some_and(|mode| mode.tracks_ordinal())
+}
+
+/// Run BM25 MaxScore over a chunked field and fold the chunk hits into
+/// documents with per-ordinal scores.
+///
+/// Posting ids are virtual chunk ids; every hit is resolved through the
+/// segment's chunk map, grouped by document with `Max`, and served by a
+/// `VectorTopKResultScorer` so `matched_positions` carries `(ordinal, chunk
+/// score)` pairs — the same shape sparse vectors produce. Cross-segment
+/// threshold seeding is deliberately not applied: the k-th chunk score of a
+/// full heap is not a document-level floor after `Max` folding.
+pub(crate) fn finish_chunked_text_maxscore<'a>(
+    posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
+    limit: usize,
+    reader: &SegmentReader,
+    field: crate::Field,
+) -> crate::Result<Box<dyn Scorer + 'a>> {
+    if posting_lists.is_empty() {
+        return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>);
+    }
+    let Some(chunk_map) = reader.chunk_map(field) else {
+        return Err(crate::Error::Corruption(format!(
+            "chunked text field '{}' has postings but segment {:016x} carries no chunk map",
+            reader.schema().get_field_name(field).unwrap_or("?"),
+            reader.meta().id,
+        )));
+    };
+    let executor_limit = bounded_sparse_executor_limit(limit, CHUNKED_TEXT_OVER_FETCH_FACTOR)
+        .min(chunk_map.num_chunks() as usize)
+        .max(1);
+    let executor = MaxScoreExecutor::text_chunked(
+        posting_lists,
+        chunk_map.avg_len(),
+        executor_limit,
+        chunk_map,
+    )
+    .with_metric_labels(
+        reader.schema().index_label(),
+        reader.schema().get_field_name(field).unwrap_or("?"),
+    );
+    let raw = executor.execute_sync()?;
+    let combined = crate::segment::combine_ordinal_results(
+        raw.into_iter().map(|hit| {
+            let (doc_id, ordinal) = chunk_map.resolve(hit.doc_id);
+            (doc_id, ordinal, hit.score)
+        }),
+        MultiValueCombiner::Max,
+        limit,
+    );
+    Ok(Box::new(VectorTopKResultScorer::new(combined, field.0)) as Box<dyn Scorer + 'a>)
+}
+
 // ── Per-field grouping ───────────────────────────────────────────────────
 
 /// Shared grouping result for per-field MaxScore.
@@ -109,7 +188,6 @@ pub(super) struct PerFieldGrouping {
     pub fallback_indices: Vec<usize>,
     /// Limit per field group (over-fetched to compensate for cross-field scoring)
     pub per_field_limit: usize,
-    pub num_docs: f32,
 }
 
 /// Group SHOULD clauses by field for per-field MaxScore.
@@ -119,13 +197,16 @@ pub(super) fn prepare_per_field_grouping(
     reader: &SegmentReader,
     limit: usize,
     global_stats: Option<&Arc<GlobalStats>>,
+    collect_positions: bool,
 ) -> Option<PerFieldGrouping> {
     let mut field_groups: rustc_hash::FxHashMap<crate::Field, Vec<(usize, TermQueryInfo)>> =
         rustc_hash::FxHashMap::default();
     let mut non_term_indices: Vec<usize> = Vec::new();
 
     for (i, q) in should.iter().enumerate() {
-        if let super::QueryDecomposition::TextTerm(info) = q.decompose() {
+        if let super::QueryDecomposition::TextTerm(info) = q.decompose()
+            && text_maxscore_allowed(reader, info.field, collect_positions)
+        {
             field_groups.entry(info.field).or_default().push((i, info));
         } else {
             non_term_indices.push(i);
@@ -137,7 +218,6 @@ pub(super) fn prepare_per_field_grouping(
     }
 
     let per_field_limit = super::max_candidate_limit(limit).min(reader.num_docs() as usize);
-    let num_docs = reader.num_docs() as f32;
 
     let mut multi_term_groups = Vec::new();
     let mut fallback_indices = non_term_indices;
@@ -159,7 +239,6 @@ pub(super) fn prepare_per_field_grouping(
         multi_term_groups,
         fallback_indices,
         per_field_limit,
-        num_docs,
     })
 }
 

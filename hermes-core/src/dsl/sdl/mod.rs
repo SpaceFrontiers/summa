@@ -84,6 +84,8 @@ pub struct FieldDef {
     pub primary: bool,
     /// Whether build-time document reordering (BP) is enabled for BMP fields
     pub reorder: bool,
+    /// Chunked text field (`indexed<chunked>`): each value is its own BM25 unit
+    pub chunked: bool,
 }
 
 /// Parsed index definition
@@ -169,6 +171,9 @@ impl IndexDef {
             }
             if field.reorder {
                 builder.set_reorder(f, true);
+            }
+            if field.chunked {
+                builder.set_chunked(f, true);
             }
             // Set positions: explicit > auto (ordinal for multi vectors)
             let positions = field.positions.or({
@@ -297,6 +302,8 @@ struct IndexConfig {
     max_weight: Option<f32>,
     // Position tracking mode for phrase queries
     positions: Option<super::schema::PositionMode>,
+    // Chunked text field: every value is its own BM25 unit
+    chunked: bool,
 }
 
 /// Parsed attributes from SDL field definition
@@ -618,6 +625,9 @@ fn parse_single_index_config_param(
                 _ => PositionMode::Full, // "positions" or any other value defaults to Full
             });
         }
+        Rule::chunked_kwarg => {
+            config.chunked = true;
+        }
         _ => {}
     }
 
@@ -826,8 +836,33 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
 
     // Merge index config into vector configs if both exist
     let mut positions = None;
+    let mut chunked = false;
     if let Some(idx_cfg) = index_config {
         positions = idx_cfg.positions;
+        chunked = idx_cfg.chunked;
+        if chunked {
+            if field_type != FieldType::Text {
+                return Err(Error::Schema(format!(
+                    "field '{name}': `chunked` requires a text field, got {field_type:?}"
+                )));
+            }
+            if let Some(mode) = positions
+                && mode != super::schema::PositionMode::TokenPosition
+            {
+                return Err(Error::Schema(format!(
+                    "field '{name}': a chunked text field may only declare `token_position` \
+                     (positions restart in every chunk and the chunk is the ordinal); \
+                     `{}` is not allowed",
+                    match mode {
+                        super::schema::PositionMode::Ordinal => "ordinal",
+                        super::schema::PositionMode::Full => "positions",
+                        super::schema::PositionMode::TokenPosition => unreachable!(),
+                    }
+                )));
+            }
+            // Stored values of a chunked field round-trip as an array.
+            multi = true;
+        }
         if let Some(ref mut bv_config) = binary_dense_vector_config {
             apply_index_config_to_binary_dense_vector(bv_config, idx_cfg)?;
         } else if let Some(ref mut dv_config) = dense_vector_config {
@@ -856,6 +891,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         fast,
         primary,
         reorder,
+        chunked,
     })
 }
 
@@ -1660,6 +1696,57 @@ mod tests {
         // Default should be indexed and stored
         assert!(field.indexed);
         assert!(field.stored);
+    }
+
+    #[test]
+    fn chunked_text_field_parses_and_implies_multi() {
+        let sdl = r#"
+            index documents {
+                field languages: text<raw_ci> [fast]
+                field content: text<stem(by: languages, default: simple)> [indexed<chunked, token_position>]
+                field notes: text<simple> [indexed<chunked>, stored]
+            }
+        "#;
+        let index = parse_single_index(sdl).unwrap();
+        let content = &index.fields[1];
+        assert!(content.chunked);
+        assert!(content.multi, "chunked implies multi-valued storage");
+        assert_eq!(
+            content.positions,
+            Some(crate::dsl::PositionMode::TokenPosition)
+        );
+        let notes = &index.fields[2];
+        assert!(notes.chunked && notes.stored && notes.positions.is_none());
+
+        let schema = index.to_schema();
+        let entry = schema
+            .get_field_entry(schema.get_field("content").unwrap())
+            .unwrap();
+        assert!(entry.chunked && entry.multi);
+        assert!(
+            !schema
+                .get_field_entry(schema.get_field("languages").unwrap())
+                .unwrap()
+                .chunked
+        );
+    }
+
+    #[test]
+    fn chunked_rejects_non_text_and_ordinal_position_modes() {
+        let non_text = parse_sdl("index i { field n: u64 [indexed<chunked>] }").unwrap_err();
+        assert!(
+            non_text.to_string().contains("requires a text field"),
+            "{non_text}"
+        );
+
+        for mode in ["positions", "ordinal"] {
+            let sdl = format!("index i {{ field c: text<simple> [indexed<chunked, {mode}>] }}");
+            let error = parse_sdl(&sdl).unwrap_err();
+            assert!(
+                error.to_string().contains("token_position"),
+                "{mode}: {error}"
+            );
+        }
     }
 
     #[test]

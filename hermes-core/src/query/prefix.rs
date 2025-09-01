@@ -49,11 +49,25 @@ impl PrefixQuery {
     }
 }
 
+/// Prefix unions materialise document-id sets; postings of a chunked field
+/// are keyed by virtual chunk ids, so the union would filter the wrong
+/// documents. Fail loudly instead of silently mis-matching.
+fn reject_chunked(reader: &SegmentReader, field: Field) -> crate::Result<()> {
+    if reader.is_chunked_field(field) {
+        return Err(crate::Error::Query(format!(
+            "PrefixQuery is not supported on chunked text field '{}'; use a MatchQuery or PhraseQuery",
+            reader.schema().get_field_name(field).unwrap_or("?")
+        )));
+    }
+    Ok(())
+}
+
 impl Query for PrefixQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let prefix = self.prefix.clone();
         Box::pin(async move {
+            reject_chunked(reader, field)?;
             let postings = reader.get_prefix_postings(field, &prefix).await?;
             if postings.is_empty() {
                 return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
@@ -72,6 +86,7 @@ impl Query for PrefixQuery {
         reader: &'a SegmentReader,
         _limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        reject_chunked(reader, self.field)?;
         let postings = reader.get_prefix_postings_sync(self.field, &self.prefix)?;
         if postings.is_empty() {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
@@ -107,6 +122,9 @@ impl Query for PrefixQuery {
 
     #[cfg(feature = "sync")]
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        if reader.is_chunked_field(self.field) {
+            return None;
+        }
         let postings = reader
             .get_prefix_postings_sync(self.field, &self.prefix)
             .ok()?;

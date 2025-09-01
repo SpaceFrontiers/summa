@@ -1,6 +1,7 @@
 mod basic;
 mod bmp;
 mod boolean;
+mod chunked;
 mod merge;
 mod pin;
 mod primary_key;

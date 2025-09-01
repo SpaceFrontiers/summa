@@ -298,6 +298,10 @@ pub struct SegmentBuilder {
     /// Current element ordinal for multi-valued fields (reset per document)
     current_element_ordinal: FxHashMap<u32, u32>,
 
+    /// Virtual-id maps of chunked text fields: field -> (doc, ordinal, length)
+    /// per chunk. Postings of these fields are keyed by the virtual id.
+    chunk_maps: FxHashMap<u32, super::chunk_map::ChunkMapBuilder>,
+
     /// Whether the once-per-segment position-encoding saturation warning
     /// has already been emitted (see MAX_POSITION_ELEMENT_ORDINAL).
     position_saturation_warned: bool,
@@ -416,6 +420,7 @@ impl SegmentBuilder {
             store_buffer: Vec::with_capacity(STORE_BUFFER_SIZE),
             next_doc_id: 0,
             field_stats: FxHashMap::default(),
+            chunk_maps: FxHashMap::default(),
             doc_field_lengths: Vec::new(),
             num_indexed_fields,
             field_to_slot,
@@ -756,7 +761,45 @@ impl SegmentBuilder {
 
             match (&entry.field_type, value) {
                 (FieldType::Text, FieldValue::Text(text)) => {
-                    if entry.indexed {
+                    if entry.indexed && entry.chunked {
+                        // Chunked field: this value is its own scoring unit.
+                        // Postings and positions are keyed by the virtual id;
+                        // the chunk map resolves it back to (doc, ordinal).
+                        let field_id = field.0;
+                        let element_ordinal = self.next_element_ordinal(field_id);
+                        let ordinal = u16::try_from(element_ordinal).map_err(|_| {
+                            crate::Error::Document(format!(
+                                "chunked field {field_id} has more than {} chunk values in one document",
+                                u16::MAX as usize + 1
+                            ))
+                        })?;
+                        let hinted = self.resolve_tokenizer_hint(*field, &doc, element_ordinal);
+                        let vid = self
+                            .chunk_maps
+                            .get(&field.0)
+                            .map_or(0usize, |map| map.len());
+                        let vid = u32::try_from(vid).map_err(|_| {
+                            crate::Error::Document(format!(
+                                "chunked field {field_id} exceeds u32::MAX chunks in one segment"
+                            ))
+                        })?;
+                        // Positions restart at 0 in every chunk (ordinal 0 in
+                        // the encoded position; the schema forbids ordinal
+                        // tracking modes on chunked fields).
+                        let token_count = self.index_text_field(*field, vid, text, 0, hinted)?;
+                        self.chunk_maps.entry(field.0).or_default().push(
+                            doc_id,
+                            ordinal,
+                            token_count,
+                        )?;
+                        self.estimated_memory += 8;
+
+                        // Chunk statistics: `doc_count` counts chunks so
+                        // `avg_field_len` is the average chunk length.
+                        let stats = self.field_stats.entry(field.0).or_default();
+                        stats.total_tokens += token_count as u64;
+                        stats.doc_count += 1;
+                    } else if entry.indexed {
                         let element_ordinal = self.next_element_ordinal(field.0);
                         let hinted = self.resolve_tokenizer_hint(*field, &doc, element_ordinal);
                         let token_count =
@@ -1347,6 +1390,22 @@ impl SegmentBuilder {
         } else {
             FxHashMap::default()
         };
+
+        // Phase 1b: chunk maps of chunked text fields (small: 8 bytes per chunk).
+        let chunk_maps = std::mem::take(&mut self.chunk_maps);
+        {
+            let mut fields: Vec<(u32, &super::chunk_map::ChunkMapBuilder)> = chunk_maps
+                .iter()
+                .filter(|(_, map)| !map.is_empty())
+                .map(|(field_id, map)| (*field_id, map))
+                .collect();
+            if !fields.is_empty() {
+                fields.sort_by_key(|(field_id, _)| *field_id);
+                let mut writer = dir.streaming_writer(&files.chunks).await?;
+                super::chunk_map::write_chunk_maps(&mut *writer, &fields)?;
+                writer.finish()?;
+            }
+        }
 
         // Phase 2: 4-way parallel build — postings, store, dense vectors, sparse vectors
         // These are fully independent: different source data, different output files.

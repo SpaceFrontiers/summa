@@ -97,6 +97,49 @@ impl PhraseQuery {
     }
 }
 
+/// Phrase over a chunked field: match and score every chunk (posting ids are
+/// virtual chunk ids, positions restart per chunk so a phrase never spans two
+/// chunks), then fold the chunk hits into documents with per-ordinal scores.
+///
+/// The phrase is a conjunction, so draining the positional scorer costs one
+/// pass over the matching chunks only.
+fn build_chunked_phrase_scorer<'a>(
+    term_data: Vec<(BlockPostingList, PositionPostingList)>,
+    slop: u32,
+    reader: &SegmentReader,
+    field: Field,
+    limit: usize,
+) -> crate::Result<Box<dyn Scorer + 'a>> {
+    let Some(chunk_map) = reader.chunk_map(field) else {
+        return Err(crate::Error::Corruption(format!(
+            "chunked text field '{}' has postings but segment {:016x} carries no chunk map",
+            reader.schema().get_field_name(field).unwrap_or("?"),
+            reader.meta().id,
+        )));
+    };
+    let num_chunks = chunk_map.num_chunks() as f32;
+    let idf: f32 = term_data
+        .iter()
+        .map(|(p, _)| super::bm25_idf(p.doc_count() as f32, num_chunks))
+        .sum();
+    let (postings, positions): (Vec<_>, Vec<_>) = term_data.into_iter().unzip();
+    let mut scorer = PhraseScorer::new(postings, positions, slop, idf, chunk_map.avg_len())
+        .with_chunk_lengths(chunk_map.clone());
+
+    use super::docset::DocSet as _;
+    let mut raw: Vec<(u32, u16, f32)> = Vec::new();
+    while scorer.doc() != TERMINATED {
+        let (doc_id, ordinal) = chunk_map.resolve(scorer.doc());
+        raw.push((doc_id, ordinal, scorer.score()));
+        scorer.advance();
+    }
+    let combined =
+        crate::segment::combine_ordinal_results(raw, super::MultiValueCombiner::Max, limit.max(1));
+    Ok(Box::new(super::planner::VectorTopKResultScorer::new(
+        combined, field.0,
+    )) as Box<dyn Scorer + 'a>)
+}
+
 /// Build a PhraseScorer from already-fetched term data.
 fn build_phrase_scorer<'a>(
     term_data: Vec<(BlockPostingList, PositionPostingList)>,
@@ -186,6 +229,9 @@ impl Query for PhraseQuery {
                 }
             }
 
+            if reader.is_chunked_field(field) {
+                return build_chunked_phrase_scorer(term_data, slop, reader, field, limit);
+            }
             Ok(build_phrase_scorer(term_data, slop, reader, field))
         })
     }
@@ -237,6 +283,9 @@ impl Query for PhraseQuery {
             }
         }
 
+        if reader.is_chunked_field(self.field) {
+            return build_chunked_phrase_scorer(term_data, self.slop, reader, self.field, limit);
+        }
         Ok(build_phrase_scorer(
             term_data, self.slop, reader, self.field,
         ))
@@ -281,6 +330,9 @@ struct PhraseScorer {
     idf: f32,
     /// Average field length
     avg_field_len: f32,
+    /// Real per-chunk lengths for chunked fields (posting ids are virtual
+    /// chunk ids). `None` keeps the historic `tf`-as-length approximation.
+    chunk_lengths: Option<crate::segment::chunk_map::ChunkMap>,
     /// Reusable position buffers (one per term, avoids per-document allocation)
     position_bufs: Vec<Vec<u32>>,
 }
@@ -306,11 +358,18 @@ impl PhraseScorer {
             current_doc: 0,
             idf,
             avg_field_len,
+            chunk_lengths: None,
             position_bufs: (0..num_terms).map(|_| Vec::new()).collect(),
         };
 
         scorer.find_next_phrase_match();
         scorer
+    }
+
+    /// Score with each chunk's real length (chunked fields).
+    fn with_chunk_lengths(mut self, lengths: crate::segment::chunk_map::ChunkMap) -> Self {
+        self.chunk_lengths = Some(lengths);
+        self
     }
 
     /// Find next document where all terms appear as a phrase
@@ -467,7 +526,14 @@ impl Scorer for PhraseScorer {
             .map(|it| it.term_freq() as f32)
             .sum();
 
+        // Chunked fields know the real chunk length; other fields keep the
+        // `tf`-as-length approximation.
+        let doc_len = match &self.chunk_lengths {
+            Some(lengths) => lengths.length(self.current_doc) as f32,
+            None => tf,
+        };
+
         // Phrase matches get a boost since they're more precise
-        super::bm25_score(tf, self.idf, tf, self.avg_field_len) * 1.5
+        super::bm25_score(tf, self.idf, doc_len, self.avg_field_len) * 1.5
     }
 }

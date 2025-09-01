@@ -75,6 +75,10 @@ pub struct FieldEntry {
     /// into the same blocks for better pruning effectiveness.
     #[serde(default)]
     pub reorder: bool,
+    /// Chunked text field: every value is its own BM25 scoring unit with a
+    /// per-chunk ordinal in results (`docs/chunked-text-fields.md`). Text only.
+    #[serde(default)]
+    pub chunked: bool,
 }
 
 impl FieldEntry {
@@ -1037,6 +1041,7 @@ impl SchemaBuilder {
             fast: false,
             primary_key: false,
             reorder: false,
+            chunked: false,
         });
         field
     }
@@ -1089,6 +1094,7 @@ impl SchemaBuilder {
             fast: false,
             primary_key: false,
             reorder: false,
+            chunked: false,
         });
         field
     }
@@ -1136,6 +1142,7 @@ impl SchemaBuilder {
             fast: false,
             primary_key: false,
             reorder: false,
+            chunked: false,
         });
         field
     }
@@ -1185,6 +1192,7 @@ impl SchemaBuilder {
             fast: false,
             primary_key: false,
             reorder: false,
+            chunked: false,
         });
         field
     }
@@ -1221,6 +1229,17 @@ impl SchemaBuilder {
     pub fn set_reorder(&mut self, field: Field, reorder: bool) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.reorder = reorder;
+        }
+    }
+
+    /// Mark a text field as chunked: each value is indexed as its own BM25
+    /// unit and results carry per-chunk ordinals. Implies `multi`.
+    pub fn set_chunked(&mut self, field: Field, chunked: bool) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.chunked = chunked;
+            if chunked {
+                entry.multi = true;
+            }
         }
     }
 

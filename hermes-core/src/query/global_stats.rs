@@ -213,7 +213,8 @@ impl LazyGlobalStats {
 
         for segment in &self.segments {
             let avg_len = segment.avg_field_len(field);
-            let doc_count = segment.num_docs() as u64;
+            // Chunked fields average over chunks, not documents.
+            let doc_count = segment.text_corpus_size(field) as u64;
             if avg_len > 0.0 && doc_count > 0 {
                 weighted_sum += avg_len as f64 * doc_count as f64;
                 total_weight += doc_count;

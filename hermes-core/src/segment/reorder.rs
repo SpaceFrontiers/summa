@@ -983,6 +983,11 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
             &dst_files.positions,
             reader.has_positions_file(),
         ),
+        (
+            &src_files.chunks,
+            &dst_files.chunks,
+            reader.has_chunks_file(),
+        ),
         (&src_files.store, &dst_files.store, true),
         (
             &src_files.fast,
@@ -1082,6 +1087,11 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
             &src_files.positions,
             &dst_files.positions,
             reader.has_positions_file(),
+        ),
+        (
+            &src_files.chunks,
+            &dst_files.chunks,
+            reader.has_chunks_file(),
         ),
         (&src_files.store, &dst_files.store, true),
         (

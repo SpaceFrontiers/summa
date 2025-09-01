@@ -446,6 +446,12 @@ enum CursorVariant<'a> {
         denom_tf_coeff: f32,
         /// Precomputed: BM25_K1 * (1.0 - BM25_B) — denominator constant
         denom_const: f32,
+        /// Precomputed: BM25_K1 * BM25_B / avg_len — per-token length
+        /// coefficient, used when `lengths` supplies real chunk lengths.
+        denom_len_coeff: f32,
+        /// Real per-posting lengths (chunked fields: posting ids are virtual
+        /// chunk ids). `None` keeps the historic `tf`-as-length approximation.
+        lengths: Option<&'a crate::segment::chunk_map::ChunkMap>,
         tfs: Vec<u32>,
         /// Deferred TF decode state: (block_offset, tf_start, count).
         /// Set when doc_ids are decoded but TFs/scores are not yet computed.
@@ -560,6 +566,26 @@ impl<'a> TermCursor<'a> {
         idf: f32,
         avg_field_len: f32,
     ) -> Self {
+        Self::text_with_lengths(posting_list, idf, avg_field_len, None)
+    }
+
+    /// Full-text BM25 cursor over a chunked field: posting ids are virtual
+    /// chunk ids and `lengths` supplies each chunk's real token count.
+    pub fn text_chunked(
+        posting_list: crate::structures::BlockPostingList,
+        idf: f32,
+        avg_chunk_len: f32,
+        lengths: &'a crate::segment::chunk_map::ChunkMap,
+    ) -> Self {
+        Self::text_with_lengths(posting_list, idf, avg_chunk_len, Some(lengths))
+    }
+
+    fn text_with_lengths(
+        posting_list: crate::structures::BlockPostingList,
+        idf: f32,
+        avg_field_len: f32,
+        lengths: Option<&'a crate::segment::chunk_map::ChunkMap>,
+    ) -> Self {
         let max_tf = posting_list.max_tf() as f32;
         let max_score = super::bm25_upper_bound(max_tf.max(1.0), idf);
         let num_blocks = posting_list.num_blocks();
@@ -583,6 +609,8 @@ impl<'a> TermCursor<'a> {
                 idf_times_k1_plus_1: idf * (super::BM25_K1 + 1.0),
                 denom_tf_coeff: 1.0 + super::BM25_K1 * (super::BM25_B / safe_avg),
                 denom_const: super::BM25_K1 * (1.0 - super::BM25_B),
+                denom_len_coeff: super::BM25_K1 * super::BM25_B / safe_avg,
+                lengths,
                 tfs: Vec::with_capacity(128),
                 deferred_tf: None,
             },
@@ -770,6 +798,8 @@ impl<'a> TermCursor<'a> {
             idf_times_k1_plus_1,
             denom_tf_coeff,
             denom_const,
+            denom_len_coeff,
+            lengths,
             tfs,
             deferred_tf,
             ..
@@ -780,13 +810,30 @@ impl<'a> TermCursor<'a> {
             let num_scale = *idf_times_k1_plus_1;
             let d_tf = *denom_tf_coeff;
             let d_const = *denom_const;
+            let d_len = *denom_len_coeff;
             self.scores.clear();
             self.scores.resize(count, 0.0);
-            for i in 0..count {
-                let tf = unsafe { *tfs.get_unchecked(i) } as f32;
-                let score = (num_scale * tf) / (d_tf * tf + d_const);
-                unsafe {
-                    *self.scores.get_unchecked_mut(i) = score;
+            match lengths {
+                // Chunked field: real BM25 length normalisation per chunk.
+                Some(map) => {
+                    for i in 0..count {
+                        let tf = unsafe { *tfs.get_unchecked(i) } as f32;
+                        let vid = unsafe { *self.doc_ids.get_unchecked(i) };
+                        let len = map.length(vid) as f32;
+                        let score = (num_scale * tf) / (tf + d_const + d_len * len);
+                        unsafe {
+                            *self.scores.get_unchecked_mut(i) = score;
+                        }
+                    }
+                }
+                None => {
+                    for i in 0..count {
+                        let tf = unsafe { *tfs.get_unchecked(i) } as f32;
+                        let score = (num_scale * tf) / (d_tf * tf + d_const);
+                        unsafe {
+                            *self.scores.get_unchecked_mut(i) = score;
+                        }
+                    }
                 }
             }
         }
@@ -1250,6 +1297,22 @@ impl<'a> MaxScoreExecutor<'a> {
         let cursors: Vec<TermCursor<'a>> = posting_lists
             .into_iter()
             .map(|(pl, idf)| TermCursor::text(pl, idf, avg_field_len))
+            .collect();
+        Self::new(cursors, k, 1.0)
+    }
+
+    /// Executor for BM25 over a chunked text field: posting ids are virtual
+    /// chunk ids, scored with each chunk's real length. Results carry the
+    /// virtual id in `doc_id`; the caller resolves it through `lengths`.
+    pub fn text_chunked(
+        posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
+        avg_chunk_len: f32,
+        k: usize,
+        lengths: &'a crate::segment::chunk_map::ChunkMap,
+    ) -> Self {
+        let cursors: Vec<TermCursor<'a>> = posting_lists
+            .into_iter()
+            .map(|(pl, idf)| TermCursor::text_chunked(pl, idf, avg_chunk_len, lengths))
             .collect();
         Self::new(cursors, k, 1.0)
     }

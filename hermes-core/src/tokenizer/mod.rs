@@ -573,14 +573,32 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
-/// Stem `word` with the cached Snowball stemmer for `language`.
-fn stem_cached(language: Language, word: &str) -> String {
+/// Stem an owned, already cleaned token, reusing its allocation when the
+/// stemmer leaves it unchanged (the common case for short and stop-like
+/// words, and for every token of a script the stemmer does not touch).
+#[inline]
+fn stem_owned(stemmer: &rust_stemmers::Stemmer, word: String) -> String {
+    match stemmer.stem(&word) {
+        std::borrow::Cow::Borrowed(_) => word,
+        std::borrow::Cow::Owned(stemmed) => stemmed,
+    }
+}
+
+/// Run `f` with the cached Snowball stemmers for `languages`, in order.
+///
+/// The thread-local cache is borrowed once per tokenization call instead of
+/// once per token, so the hot loop pays no `RefCell` borrow or hash lookup.
+fn with_stemmers<R>(languages: &[Language], f: impl FnOnce(&[&rust_stemmers::Stemmer]) -> R) -> R {
     STEMMER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let stemmer = cache
-            .entry(language)
-            .or_insert_with(|| rust_stemmers::Stemmer::create(language.to_algorithm()));
-        stemmer.stem(word).into_owned()
+        for language in languages {
+            cache
+                .entry(*language)
+                .or_insert_with(|| rust_stemmers::Stemmer::create(language.to_algorithm()));
+        }
+        let stemmers: Vec<&rust_stemmers::Stemmer> =
+            languages.iter().map(|language| &cache[language]).collect();
+        f(&stemmers)
     })
 }
 
@@ -629,22 +647,27 @@ impl DynamicStemmer {
     fn tokenize_with_languages(&self, text: &str, languages: &[Language]) -> Vec<Token> {
         match languages {
             [] => tokenize_and_clean(text, |s| s),
-            [single] if single.script() == Script::Latin => {
-                let language = *single;
-                tokenize_and_clean(text, |s| {
-                    if Script::of_token(&s) == Script::Latin {
-                        stem_cached(language, &s)
-                    } else {
-                        s
-                    }
+            [single] => {
+                let script = single.script();
+                with_stemmers(languages, |stemmers| {
+                    let stemmer = stemmers[0];
+                    tokenize_and_clean(text, |s| {
+                        if Script::of_token(&s) == script {
+                            stem_owned(stemmer, s)
+                        } else {
+                            s
+                        }
+                    })
                 })
             }
-            many => tokenize_and_clean(text, |s| {
-                let script = Script::of_token(&s);
-                match many.iter().find(|language| language.script() == script) {
-                    Some(language) => stem_cached(*language, &s),
-                    None => s,
-                }
+            many => with_stemmers(many, |stemmers| {
+                tokenize_and_clean(text, |s| {
+                    let script = Script::of_token(&s);
+                    match many.iter().position(|language| language.script() == script) {
+                        Some(index) => stem_owned(stemmers[index], s),
+                        None => s,
+                    }
+                })
             }),
         }
     }
@@ -837,6 +860,10 @@ impl Clone for BoxedTokenizer {
 #[derive(Clone)]
 pub struct TokenizerRegistry {
     tokenizers: Arc<RwLock<HashMap<String, BoxedTokenizer>>>,
+    /// Parsed `stem(...)` specs, keyed by their spec string. Query conversion
+    /// resolves the field tokenizer on every request; parsing the spec each
+    /// time was measurable at query rates.
+    dynamic: Arc<RwLock<HashMap<String, BoxedTokenizer>>>,
 }
 
 impl TokenizerRegistry {
@@ -844,6 +871,7 @@ impl TokenizerRegistry {
     pub fn new() -> Self {
         let registry = Self {
             tokenizers: Arc::new(RwLock::new(HashMap::new())),
+            dynamic: Arc::new(RwLock::new(HashMap::new())),
         };
         registry.register_defaults();
         registry
@@ -950,13 +978,21 @@ impl TokenizerRegistry {
 
     /// Get a tokenizer by name or by a `stem(by: ..., default: ...)` spec.
     ///
-    /// Dynamic specs are not stored in the registry: a fresh
-    /// [`DynamicStemmer`] is built from the spec on every call.
+    /// Dynamic specs are parsed once per distinct spec string and cached; a
+    /// malformed spec is not cached and yields `None` on every call.
     pub fn get(&self, name: &str) -> Option<BoxedTokenizer> {
         if name.starts_with("stem(") {
-            return TokenizerSpec::parse(name)
+            if let Some(tokenizer) = self.dynamic.read().get(name) {
+                return Some(tokenizer.clone());
+            }
+            let tokenizer = TokenizerSpec::parse(name)
                 .ok()
-                .and_then(|spec| spec.dynamic_tokenizer());
+                .and_then(|spec| spec.dynamic_tokenizer())?;
+            self.dynamic
+                .write()
+                .entry(name.to_string())
+                .or_insert_with(|| tokenizer.clone());
+            return Some(tokenizer);
         }
         let tokenizers = self.tokenizers.read();
         tokenizers.get(name).cloned()

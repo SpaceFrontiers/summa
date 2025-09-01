@@ -161,6 +161,31 @@ field content: text<stem(by: languages, default: simple)> [indexed<token_positio
 
 See `docs/dynamic-tokenizer-and-phrase.md` for the design.
 
+### Chunked text fields
+
+A multi-valued text field declared `chunked` indexes **every value as its own
+BM25 unit**, the way sparse and dense vector fields treat every value as one
+vector:
+
+```
+field content: text<stem(by: languages, default: simple)> [indexed<chunked, token_position>]
+```
+
+- Postings, IDF and the average length are computed over chunks; BM25 uses
+  each chunk's real token count for length normalisation.
+- Hits report the matching chunks as `ordinal_scores` (ordinal `n` = the
+  `n`-th value sent for the field), so `FusionQuery` compounds a chunk found
+  by a text query and by a vector query when both fields receive their values
+  in the same chunk order, and clients can render the matching passage.
+- The document score is the best chunk (`Max`).
+- `token_position` keeps phrase queries per chunk; positions restart in every
+  value, so a phrase never matches across two chunks. `positions` and
+  `ordinal` are rejected on chunked fields (the chunk is the ordinal).
+- `chunked` implies `multi`; prefix (`term*`) queries are not supported on
+  chunked fields.
+
+See `docs/chunked-text-fields.md` for the design.
+
 ### Available Tokenizers
 
 | Name                      | Aliases      | Description                                        |

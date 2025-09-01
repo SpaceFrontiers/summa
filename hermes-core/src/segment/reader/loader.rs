@@ -1049,6 +1049,34 @@ pub async fn open_positions_file<D: Directory>(
     }
 }
 
+/// Load the virtual-id maps of chunked text fields from `.chunks`.
+///
+/// Absent file = no chunk was indexed in this segment (the builder only
+/// writes the file when a chunked field received values).
+pub async fn load_chunk_maps_file<D: Directory>(
+    dir: &D,
+    files: &SegmentFiles,
+    schema: &Schema,
+) -> Result<FxHashMap<u32, crate::segment::chunk_map::ChunkMap>> {
+    if !schema.fields().any(|(_, entry)| entry.chunked) {
+        return Ok(FxHashMap::default());
+    }
+    let handle = match dir.open_read(&files.chunks).await {
+        Ok(handle) => handle,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FxHashMap::default());
+        }
+        Err(error) => return Err(crate::Error::Io(error)),
+    };
+    let bytes = handle.read_bytes().await?;
+    crate::segment::chunk_map::read_chunk_maps(bytes).map_err(|error| {
+        crate::Error::Corruption(format!(
+            "chunk map file {} is unreadable: {error}",
+            files.chunks.display()
+        ))
+    })
+}
+
 /// Load fast-field columns from `.fast` file.
 /// Returns a map of field_id → FastFieldReader.
 pub async fn load_fast_fields_file<D: Directory>(

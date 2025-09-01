@@ -102,13 +102,14 @@ fn compute_term_idf(
 //   $get_positions_fn – get_positions | get_positions_sync
 //   $($aw)*          – .await  (present for async, absent for sync)
 macro_rules! term_plan {
-    ($field:expr, $term:expr, $global_stats:expr, $reader:expr,
+    ($field:expr, $term:expr, $global_stats:expr, $reader:expr, $limit:expr,
      $load_positions:expr, $get_postings_fn:ident, $get_positions_fn:ident
      $(, $aw:tt)*) => {{
         let field: Field = $field;
         let term: &[u8] = $term;
         let global_stats: Option<&Arc<GlobalStats>> = $global_stats;
         let reader: &SegmentReader = $reader;
+        let limit: usize = $limit;
 
         // Non-indexed fields → fast-field-only path
         let is_indexed = reader.schema().get_field_entry(field).is_none_or(|e| e.indexed);
@@ -123,6 +124,18 @@ macro_rules! term_plan {
         let postings = reader.$get_postings_fn(field, term) $(. $aw)* ?;
 
         match postings {
+            // Chunked field: postings are keyed by virtual chunk id. Score the
+            // chunks, fold them back to documents and report the ordinals.
+            Some(posting_list) if reader.is_chunked_field(field) => {
+                let num_chunks = reader.text_corpus_size(field);
+                let idf = super::bm25_idf(posting_list.doc_count() as f32, num_chunks);
+                super::planner::finish_chunked_text_maxscore(
+                    vec![(posting_list, idf)],
+                    limit,
+                    reader,
+                    field,
+                )
+            }
             Some(posting_list) => {
                 let (idf, avg_field_len) =
                     compute_term_idf(&posting_list, field, reader, global_stats, term);
@@ -159,7 +172,7 @@ impl Query for TermQuery {
     fn scorer_with_options<'a>(
         &self,
         reader: &'a SegmentReader,
-        _limit: usize,
+        limit: usize,
         options: super::ScorerOptions,
     ) -> ScorerFuture<'a> {
         let field = self.field;
@@ -172,6 +185,7 @@ impl Query for TermQuery {
                 &term,
                 global_stats.as_ref(),
                 reader,
+                limit,
                 load_positions,
                 get_postings,
                 get_positions,
@@ -204,7 +218,7 @@ impl Query for TermQuery {
     fn scorer_sync_with_options<'a>(
         &self,
         reader: &'a SegmentReader,
-        _limit: usize,
+        limit: usize,
         options: super::ScorerOptions,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         term_plan!(
@@ -212,6 +226,7 @@ impl Query for TermQuery {
             &self.term,
             self.global_stats.as_ref(),
             reader,
+            limit,
             options.collect_positions,
             get_postings_sync,
             get_positions_sync
@@ -232,6 +247,10 @@ impl Query for TermQuery {
 
     #[cfg(feature = "sync")]
     fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {
+        // Chunked postings count chunks, not documents.
+        if reader.is_chunked_field(self.field) {
+            return None;
+        }
         // Exact: the posting list header carries the doc count.
         let pl = reader.get_postings_sync(self.field, &self.term).ok()??;
         Some(pl.doc_count() as u64)
@@ -239,6 +258,11 @@ impl Query for TermQuery {
 
     #[cfg(feature = "sync")]
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        // Chunked postings are keyed by virtual chunk ids, not document ids;
+        // a bitset over them would filter the wrong documents.
+        if reader.is_chunked_field(self.field) {
+            return None;
+        }
         // Build bitset from posting list: O(M) where M = matching doc count.
         // Much faster than O(N) fast-field scan for selective terms.
         let pl = reader.get_postings_sync(self.field, &self.term).ok()??;
