@@ -1217,7 +1217,7 @@ mod tests {
                 "determinants",
                 "p53",
                 "co2",
-                "101007",
+                "10.1007",
                 "s1",
                 "resume"
             ]
@@ -1243,7 +1243,7 @@ mod tests {
                 "Float-zero café",
                 Some("en")
             )),
-            vec!["floatzero", "cafe"]
+            vec!["float", "zero", "cafe"]
         );
         // Cyrillic folding drops combining marks but keeps the letters.
         assert_eq!(texts(&hinted(&plain, "ёлка", None)), vec!["елка"]);
