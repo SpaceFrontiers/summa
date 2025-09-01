@@ -3243,7 +3243,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-broker"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3272,7 +3272,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3320,7 +3320,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "anyhow",
  "axum",
@@ -3354,7 +3354,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "anyhow",
  "pest",
@@ -3366,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "anyhow",
  "clap",
@@ -3399,7 +3399,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3418,7 +3418,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3441,7 +3441,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.114"
+version = "1.8.115"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -7358,9 +7358,9 @@ dependencies = [
 
 [[package]]
 name = "tinyvec"
-version = "1.12.0"
+version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f"
+checksum = "4cf0ded5c4e56918d8f8a339e1bb67d038d3bc6d144ac407904015ba2e4cde9b"
 dependencies = [
  "tinyvec_macros",
 ]
