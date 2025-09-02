@@ -2,6 +2,8 @@
 target/
 /dist/
 
+/.context/
+
 # Data files (generated indexes, processed data)
 /data/
 *.zst

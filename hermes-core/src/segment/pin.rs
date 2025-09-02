@@ -55,10 +55,33 @@ impl PinPolicy {
     /// hermes-server expose CLI flags and honor these environment values when
     /// the corresponding flags are unset.
     pub fn from_env() -> Self {
-        let budget_mb: u64 = std::env::var("HERMES_PIN_METADATA_BUDGET_MB")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let budget_bytes = match std::env::var("HERMES_PIN_METADATA_BUDGET_MB") {
+            Ok(value) => match value
+                .parse::<u64>()
+                .ok()
+                .and_then(|mb| mb.checked_mul(1024 * 1024))
+            {
+                Some(bytes) => bytes,
+                None => {
+                    log::warn!(
+                        "HERMES_PIN_METADATA_BUDGET_MB '{}' is invalid or too large; \
+                         using budget 0 (pinning disabled); set a non-negative MiB value \
+                         no larger than {}",
+                        value,
+                        u64::MAX / (1024 * 1024),
+                    );
+                    0
+                }
+            },
+            Err(std::env::VarError::NotPresent) => 0,
+            Err(error) => {
+                log::warn!(
+                    "HERMES_PIN_METADATA_BUDGET_MB cannot be read: {}; pinning disabled",
+                    error
+                );
+                0
+            }
+        };
         let mode = match std::env::var("HERMES_PIN_MODE").as_deref() {
             Ok("copy") => PinMode::Copy,
             Ok("mlock") | Err(_) => PinMode::Mlock,
@@ -67,10 +90,7 @@ impl PinPolicy {
                 PinMode::Mlock
             }
         };
-        Self {
-            budget_bytes: budget_mb * 1024 * 1024,
-            mode,
-        }
+        Self { budget_bytes, mode }
     }
 }
 

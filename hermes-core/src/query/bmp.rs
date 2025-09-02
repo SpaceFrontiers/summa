@@ -59,7 +59,8 @@ use crate::segment::{BMP_SUPERBLOCK_SIZE, BmpIndex};
 /// Prefetch a memory location for reading with temporal locality.
 ///
 /// This is a no-op on unsupported platforms. On aarch64/x86_64 it issues
-/// a hardware prefetch hint that has zero cost if the data is already cached.
+/// a hardware prefetch hint. Its cost and benefit depend on the processor and
+/// workload, including when the requested line is already cached.
 #[inline(always)]
 fn prefetch_read<T>(ptr: *const T) {
     #[cfg(target_arch = "aarch64")]

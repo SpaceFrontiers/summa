@@ -3478,6 +3478,7 @@ dependencies = [
  "rayon",
  "rustc-hash 2.1.3",
  "serde_json",
+ "tempfile",
  "tokio",
  "tonic",
  "tonic-build",

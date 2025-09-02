@@ -20,7 +20,7 @@ jobs:
       - name: Check documentation
         run: uv run --python 3.12 scripts/check_docs.py
       - name: Test documentation checker
-        run: uv run --python 3.12 --with markdown-it-py==4.0.0 python -m unittest discover -s scripts -p 'test_*.py'
+        run: uv run --python 3.12 --with markdown-it-py==4.0.0 python -m unittest discover -s scripts -p 'test_check_docs.py'
 
   # Main Rust CI - fmt, clippy, test, build in one job
   rust:
@@ -50,6 +50,11 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+      - name: Search system ownership contracts
+        run: |
+          python3 scripts/check_search.py contracts
+          python3 -m unittest discover -s scripts -p 'test_check_search.py'
 
       - name: Require official accelerator repositories
         shell: bash

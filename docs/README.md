@@ -7,6 +7,10 @@ directory. Package READMEs below document each executable or library.
 ## Getting started and interfaces
 
 
+## Search engineering and performance
+
+- [Search system engineering contract](search-system-contract.md)
+
 ## Schema, text search, and query behavior
 
 - [Hermes Schema Definition Language (SDL)](schema.md)
