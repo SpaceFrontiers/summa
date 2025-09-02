@@ -12,6 +12,9 @@ use crate::proto::index_service_server::IndexService;
 use crate::proto::*;
 use crate::registry::IndexRegistry;
 
+#[cfg(test)]
+mod tests;
+
 /// Index service implementation
 pub struct IndexServiceImpl {
     pub registry: Arc<IndexRegistry>,
@@ -57,9 +60,9 @@ impl IndexServiceImpl {
                         error: format!("Duplicate primary key: {}", key),
                     });
                 }
-                Err(hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress) => {
+                Err(e @ (hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress)) => {
                     warn!(
-                        "Indexing backpressure during stream batch: indexed {}/{} docs",
+                        "Indexing backpressure during stream batch: {e}; indexed {}/{} docs",
                         count, total_docs
                     );
                     break;
@@ -144,14 +147,16 @@ impl IndexService for IndexServiceImpl {
                             error: format!("Duplicate primary key: {}", key),
                         });
                     }
-                    Err(hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress) => {
+                    Err(
+                        e @ (hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress),
+                    ) => {
                         let skipped = total_docs - i;
                         warn!(
-                            "Indexing backpressure during batch_index: index={}, indexed {}/{} docs, {} skipped",
+                            "Indexing backpressure during batch_index: {e}; index={}, indexed {}/{} docs, {} skipped",
                             req.index_name, indexed_count, total_docs, skipped
                         );
                         let error = format!(
-                            "Indexing backpressure — {} remaining documents skipped",
+                            "Indexing backpressure ({e}) — {} remaining documents skipped",
                             skipped
                         );
                         loggable_doc_errors += 1;
@@ -309,37 +314,44 @@ impl IndexService for IndexServiceImpl {
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
 
-        let changed = writer
-            .write()
-            .await
-            .commit()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
+        // Admission is cancellable while waiting for the writer. Once we own
+        // it, transfer the guard BEFORE the first commit poll. Client deadlines
+        // and disconnects then detach only the waiter, never the flush itself.
+        // Keeping this guard through reader reload also makes registry shutdown
+        // wait for the whole operation (and serializes concurrent commits).
+        let mut writer = writer.write_owned().await;
+        tokio::spawn(async move {
+            let result = async {
+                let changed = loop {
+                    match writer.commit().await {
+                        Err(e @ hermes_core::Error::CommitFlushTimeout { .. }) => {
+                            warn!("Commit still draining: index={}; {e}; retrying retained generation", req.index_name);
+                        }
+                        result => break result.map_err(crate::error::hermes_error_to_status)?,
+                    }
+                };
 
-        // Force reader reload to pick up newly committed segments.
-        // Without this, the 1-second debounce in reader.searcher() would
-        // return the stale pre-commit searcher.
-        let reader = index
-            .reader()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
-        if changed {
-            reader
-                .reload()
-                .await
-                .map_err(crate::error::hermes_error_to_status)?;
-        }
-        let searcher = reader
-            .searcher()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
-
-        info!("Committed: {} (changed={})", req.index_name, changed);
-
-        Ok(Response::new(CommitResponse {
-            success: true,
-            num_docs: searcher.num_docs(),
-        }))
+                // Reload even if the requesting client has gone away.
+                let reader = index.reader().await.map_err(crate::error::hermes_error_to_status)?;
+                if changed {
+                    reader.reload().await.map_err(crate::error::hermes_error_to_status)?;
+                }
+                let searcher = reader.searcher().await.map_err(crate::error::hermes_error_to_status)?;
+                info!("Committed: {} (changed={})", req.index_name, changed);
+                Ok(Response::new(CommitResponse {
+                    success: true,
+                    num_docs: searcher.num_docs(),
+                }))
+            }.await;
+            // Detached failures must remain visible to operators. Only flush
+            // timeouts are retried, never corruption or publication errors.
+            if let Err(error) = &result {
+                warn!("Commit failed: index={}; {error}", req.index_name);
+            }
+            result
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Commit task failed: {e}")))?
     }
 
     async fn force_merge(

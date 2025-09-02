@@ -113,17 +113,16 @@ impl IndexRegistry {
         }
     }
 
-    /// Close lifecycle admission immediately when process shutdown starts.
+    /// Close request admission immediately when process shutdown starts.
     ///
     /// This method is synchronous so the signal future can stop new work
     /// before tonic finishes draining in-flight RPCs.
     pub fn begin_shutdown(&self) {
-        if self.shutting_down.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        for handle in self.handles.read().values() {
-            handle.index.segment_manager().begin_shutdown();
-        }
+        self.shutting_down.store(true, Ordering::Release);
+        // Do not close segment-build admission here: an accepted commit may
+        // still be draining documents, even after its RPC was cancelled.
+        // shutdown() acquires each writer lock before stopping its manager,
+        // so the commit's owned guard protects the entire flush/publication.
     }
 
     /// Stop all index writers while Tokio is still alive, then drain every

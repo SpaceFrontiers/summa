@@ -37,6 +37,14 @@ pub enum Error {
     #[error("Commit is still finalizing or awaiting retry")]
     CommitInProgress,
 
+    #[error(
+        "Commit flush timed out: {flushed_workers}/{total_workers} workers flushed; writer remains paused, retry commit"
+    )]
+    CommitFlushTimeout {
+        flushed_workers: usize,
+        total_workers: usize,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 

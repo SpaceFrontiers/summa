@@ -84,6 +84,23 @@ deduplicated once, and response hydration is charged before field values are
 cloned into protobuf objects. A response that would exceed its memory/encoding
 budget fails with `RESOURCE_EXHAUSTED`; request fewer hits or fields.
 
+### Commit completion and timeouts
+
+Once a `Commit` acquires the index writer, the server owns its completion even
+if the client disconnects or its RPC deadline expires. A slow worker flush is
+reported every five minutes and automatically retried against the same paused
+generation; it never resumes workers early or publishes only the fast workers.
+Concurrent commits serialize on that writer. Cancellation while waiting to
+acquire the writer does not start a commit.
+
+A client deadline is therefore an unknown outcome, not an abort. Retry `Commit`
+to observe completion. Publication/build errors remain errors and are logged
+even if the original client is gone; only worker-flush timeouts are retried
+automatically. Backpressure messages distinguish a full queue from a paused
+commit. Graceful shutdown waits for an accepted commit to finish, but a forced
+process kill cannot preserve that guarantee: allow sufficient termination grace
+and stop ingestion/commit outstanding work before a deployment restart.
+
 ### Background merge and reorder
 
 The server uses one BP CPU pool and one whole-pass gate across all indexes.

@@ -271,6 +271,10 @@ pub struct SegmentBuilder {
     /// Avoids allocating a new hashmap for each text field per document
     local_positions: FxHashMap<Spur, Vec<u32>>,
 
+    /// Terms with nonempty position scratch from the previous field/chunk.
+    /// Reset only these, never the vocabulary accumulated by the whole segment.
+    local_position_terms: Vec<Spur>,
+
     /// Reusable buffer for tokenization to avoid per-token String allocations
     token_buffer: String,
 
@@ -426,6 +430,7 @@ impl SegmentBuilder {
             field_to_slot,
             local_tf_buffer: FxHashMap::default(),
             local_positions: FxHashMap::default(),
+            local_position_terms: Vec::new(),
             token_buffer: String::with_capacity(64),
             numeric_buffer: String::with_capacity(32),
             config,
@@ -922,9 +927,11 @@ impl SegmentBuilder {
         // Also collect positions if enabled
         // Reuse buffers to avoid allocations
         self.local_tf_buffer.clear();
-        // Clear position Vecs in-place (keeps allocated capacity for reuse)
-        for v in self.local_positions.values_mut() {
-            v.clear();
+        // Retain per-term allocations, but visit only the preceding field's
+        // terms. Scanning local_positions costs O(segment vocabulary) for
+        // EVERY field/chunk, including fields that do not record positions.
+        for term in self.local_position_terms.drain(..) {
+            self.local_positions.get_mut(&term).unwrap().clear();
         }
 
         let mut token_position = 0u32;
@@ -962,10 +969,11 @@ impl SegmentBuilder {
                             (encoded_ordinal << 20) | self.saturate_token_position(token.position)
                         }
                     };
-                    self.local_positions
-                        .entry(term_spur)
-                        .or_default()
-                        .push(encoded_pos);
+                    let positions = self.local_positions.entry(term_spur).or_default();
+                    if positions.is_empty() {
+                        self.local_position_terms.push(term_spur);
+                    }
+                    positions.push(encoded_pos);
                 }
             }
             // Variants share a position with their original and are not
@@ -1004,10 +1012,11 @@ impl SegmentBuilder {
                             (encoded_ordinal << 20) | self.saturate_token_position(token_position)
                         }
                     };
-                    self.local_positions
-                        .entry(term_spur)
-                        .or_default()
-                        .push(encoded_pos);
+                    let positions = self.local_positions.entry(term_spur).or_default();
+                    if positions.is_empty() {
+                        self.local_position_terms.push(term_spur);
+                    }
+                    positions.push(encoded_pos);
                 }
 
                 token_position += 1;
@@ -1755,6 +1764,80 @@ mod tests {
 
     fn builder_for(schema: Schema) -> SegmentBuilder {
         SegmentBuilder::new(Arc::new(schema), SegmentBuilderConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn position_scratch_resets_only_touched_terms_across_fields_and_chunks() {
+        use crate::dsl::PositionMode;
+        use crate::tokenizer::SimpleTokenizer;
+
+        for custom in [false, true] {
+            for mode in [
+                PositionMode::Ordinal,
+                PositionMode::TokenPosition,
+                PositionMode::Full,
+            ] {
+                let mut schema = SchemaBuilder::default();
+                let body = schema.add_text_field("body", true, false);
+                schema.set_positions(body, mode);
+                let other = schema.add_text_field("other", true, false);
+                schema.set_positions(other, PositionMode::TokenPosition);
+                let no_positions = schema.add_text_field("no_positions", true, false);
+                let mut builder = builder_for(schema.build());
+                if custom {
+                    builder.set_tokenizer(body, Box::new(SimpleTokenizer));
+                }
+
+                // Accumulate segment vocabulary while each field/chunk has
+                // just two unique terms. Duplicate tokens must be reset once.
+                for doc in 0..2_000 {
+                    builder
+                        .index_text_field(
+                            body,
+                            doc,
+                            &format!("unique{doc} anchor anchor"),
+                            0,
+                            false,
+                        )
+                        .unwrap();
+                    assert_eq!(builder.local_position_terms.len(), 2);
+                }
+                assert_eq!(builder.local_positions.len(), 2_001);
+                let anchor = builder.term_interner.get("anchor").unwrap();
+                let capacity = builder.local_positions[&anchor].capacity();
+
+                builder
+                    .index_text_field(no_positions, 2_000, "anchor plain", 0, false)
+                    .unwrap();
+                assert!(builder.local_position_terms.is_empty());
+                assert!(builder.local_positions[&anchor].is_empty());
+                assert_eq!(builder.local_positions[&anchor].capacity(), capacity);
+                builder
+                    .index_text_field(other, 2_000, "anchor", 0, false)
+                    .unwrap();
+                builder.index_text_field(body, 2_000, "", 0, false).unwrap();
+                assert!(builder.local_position_terms.is_empty());
+                builder
+                    .index_text_field(body, 2_000, "anchor", 1, false)
+                    .unwrap();
+                builder
+                    .index_text_field(body, 2_001, "anchor", 2, false)
+                    .unwrap();
+
+                assert_eq!(builder.positions_for_term(other, "anchor"), vec![0]);
+                let positions = builder.positions_for_term(body, "anchor");
+                assert_eq!(
+                    positions.len(),
+                    4_002,
+                    "positions leaked between chunks or fields"
+                );
+                let expected = match mode {
+                    PositionMode::TokenPosition => [0, 0],
+                    PositionMode::Ordinal | PositionMode::Full => [1 << 20, 2 << 20],
+                };
+                assert_eq!(&positions[4_000..], &expected);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
