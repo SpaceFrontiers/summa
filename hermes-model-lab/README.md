@@ -37,7 +37,7 @@ It starts with a clearly marked synthetic trace. Real JSON bundles are opened
 entirely in the browser; selected files never leave the machine. Live query
 controls remain disabled when no `/api/status` endpoint is present.
 
-Create a bundle from a checkpoint, optionally including trainer metrics:
+From the repository root, create a bundle from a checkpoint, optionally including trainer metrics:
 
 ```bash
 cargo run -p hermes-llm -- trace \
@@ -56,6 +56,8 @@ bounded defaults. Training can add the optional layer-gradient heatmap with
 `hermes-train train --layer-metrics-every N`.
 
 ## Quality checks and production bundle
+
+From `hermes-model-lab`, using Node.js 22.12+ and pnpm 10+:
 
 ```bash
 pnpm install --frozen-lockfile

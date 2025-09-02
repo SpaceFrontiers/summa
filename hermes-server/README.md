@@ -239,7 +239,7 @@ rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
 
 #### RetrainVectorIndex
 
-Train new global IVF-PQ or binary-IVF codebooks from the current corpus and
+Train new global IVF-TQ, binary-IVF, or ScaNN artifacts from the current corpus and
 rebuild every ANN segment. The complete segment/codebook generation is
 published atomically; existing readers keep the previous generation.
 

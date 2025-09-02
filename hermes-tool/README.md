@@ -49,9 +49,12 @@ hermes-tool info --index ./my-index
 hermes-tool search --index ./my-index --query 'title:hermes' --limit 10
 hermes-tool merge --index ./my-index
 hermes-tool reorder --index ./my-index
-hermes-tool heatmap --index ./my-index --field embedding
+hermes-tool heatmap --index ./my-index --field sparse_embedding
 hermes-tool warmup --index ./my-index --cache-size 67108864
 ```
+
+`heatmap` requires a BMP sparse-vector field; the example name assumes your
+schema defines `sparse_embedding`.
 
 `index` accepts memory, indexing-thread, compression-thread, and optimization
 controls. Run `hermes-tool index --help` before tuning them; the defaults are

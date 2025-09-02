@@ -6,6 +6,12 @@
 > approach is modeled on **SID-1** (SID AI, _"SID-1 Technical Report: Test-Time
 > Compute for Retrieval"_, Dec 2025) and adapted to Hermes' concrete API surface.
 
+The current executable workflow and supported training task contracts are
+documented in [training workflows](training-objectives-and-curricula.md) and
+the [trainer guide](../hermes-train/README.md). This document retains the
+agentic-search research proposal and does not imply that every proposed tool
+or rollout service is implemented.
+
 ---
 
 ## 1. What SID-1 actually does (the parts worth copying)

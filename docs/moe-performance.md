@@ -1,5 +1,8 @@
 # MoE A100 performance
 
+These are historical measurements from 2026-07-21, not a fresh run of the
+current target selection and reporting requirements.
+
 The measured geometry is 8,192 tokens, hidden size 512, expert width 768,
 eight experts, and top-2 routing. Each result below is the median of 100 timed
 iterations after 20 warmups; lower latency is better.

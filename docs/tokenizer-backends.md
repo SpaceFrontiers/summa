@@ -44,7 +44,15 @@ overhead. Hermes currently parses JSONL itself, passes batches of strings to
 the tokenizer, and reuses a persistent causal-token cache after the first
 pass, so the published headline speedup does not transfer directly.
 
-## Extraction status — 2026-07-22
+## Current extraction
+
+The extraction has since been refreshed to GigaToken 0.10.0 at commit
+`34a1599f0c0ae7d7cd0d1c530e6522320158b360`. See the
+[provenance register](../hermes-tokenizer/UPSTREAM.md) for the current revision
+and refresh policy. The July evaluation above measured 0.9.0; it is not a
+new measurement of the current extraction.
+
+### Initial extraction — 2026-07-22
 
 The optimized byte-level BPE engine, persistent pretoken cache, merge kernels,
 and fast pretokenizers were extracted into `hermes-tokenizer` from GigaToken

@@ -9,7 +9,7 @@ contiguity analysis). At `[5120, 50304]` f32 chunks that was ~400 ms per
 optimizer step on an A100 — the single largest elementwise cost in training.
 
 `CubeBackend` now implements `LinearCrossEntropyBackend` with two row-wise
-kernels instead (`hermes-llm/src/model/linear_cross_entropy.rs`, `mod gpu`):
+kernels instead ([`hermes-llm/src/model/linear_cross_entropy/`](../hermes-llm/src/model/linear_cross_entropy/), `mod gpu`):
 
 - `ce_row_statistics` — one block per row computes online log-sum-exp
   `(max, sum)` and captures the target logit in a single pass over the

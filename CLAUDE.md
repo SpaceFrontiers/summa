@@ -52,6 +52,7 @@ Hermes is a high-performance, embeddable full-text search engine written in Rust
 - **hermes-core**: Core search engine library (async, BM25 ranking, WAND optimization)
 - **hermes-tool**: CLI for index management and data processing pipelines
 - **hermes-server**: gRPC server for remote search operations
+- **hermes-broker**: gRPC routing, partitioned indexes, and cross-shard BM25 statistics
 - **hermes-wasm**: WebAssembly bindings for browsers (search + indexing)
 - **hermes-web**: Vue/WASM search UI
 - **hermes-model-lab**: Standalone local LLM trace and observability UI
@@ -85,11 +86,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Build WASM (requires Homebrew LLVM for zstd cross-compilation)
-cd hermes-wasm && bash build.sh
+(cd hermes-wasm && bash build.sh)
 
 # Build Python packages
-cd hermes-client-python && uv build
-cd hermes-mal-python && maturin build --release
+(cd hermes-client-python && uv build)
+(cd hermes-mal-python && maturin build --release)
 
 # hermes-train (LLM training) tests
 cargo test -p hermes-train
@@ -112,7 +113,7 @@ Key modules:
 - `directories/` - Storage abstraction layer (filesystem, HTTP, RAM, memory-mapped, caching)
 - `dsl/` - Schema Definition Language parser (pest-based)
 - `structures/` - Low-level data structures (SSTables, bitpacked posting lists, skip lists)
-- `tokenizer/` - Language-aware tokenization with 15+ Snowball stemmers
+- `tokenizer/` - Language-aware tokenization, dynamic stemming, and optional CJK morphology
 - `compression/` - Zstd compression with configurable levels
 - `merge/` - Segment merge strategies (tiered, no-merge)
 
@@ -186,8 +187,8 @@ index articles {
 }
 ```
 
-Field types: `text`, `u64`, `i64`, `f64`, `bytes`
-Attributes: `indexed`, `stored` (default: both)
+Field types: `text`, `u64`, `i64`, `f64`, `bytes`, `json`, `dense_vector<dim>`, `sparse_vector`
+Attributes: `indexed`, `stored` (default: both), `primary`, `fast`, `reorder`
 Tokenizers: `default`, `simple`, `en_stem`, `de_stem`, `fr_stem`, `es_stem`, `it_stem`, `pt_stem`, `ru_stem`, `ar_stem`, and more
 
 Full SDL reference: `docs/schema.md`
@@ -196,7 +197,7 @@ Full SDL reference: `docs/schema.md`
 
 - Rust 1.98+ (see `rust-toolchain.toml`)
 - Python 3.12+ (for Python bindings)
-- Node.js 20+ (for WASM and web)
+- Node.js 22.12+ (for WASM and web)
 - pnpm 10+ (for TypeScript and web packages)
 - uv (for the Python gRPC client)
 - maturin (for the MAL Python wheel)

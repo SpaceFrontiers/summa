@@ -191,7 +191,7 @@ await client.search(
 )
 ```
 
-Other supported variants are `binary_dense_vector`, `boost`, `range`,
+Other supported variants are `phrase`, `binary_dense_vector`, `boost`, `range`,
 `prefix`, and `all`. Search results expose the full `DocAddress` needed by
 `get_document()`:
 
@@ -206,13 +206,13 @@ Every RPC accepts an optional `timeout` in seconds. A per-call value overrides
 the client default:
 
 ```python
-client = HermesClient("localhost:50051", default_timeout=5.0)
-results = await client.search(
-    "articles",
-    query={"all": {}},
-    timeout=0.5,
-)
-await client.force_merge("articles", timeout=3600)
+async with HermesClient("localhost:50051", default_timeout=5.0) as client:
+    results = await client.search(
+        "articles",
+        query={"all": {}},
+        timeout=0.5,
+    )
+    await client.force_merge("articles", timeout=3600)
 ```
 
 gRPC failures raise `grpc.RpcError` (normally

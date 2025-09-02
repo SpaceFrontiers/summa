@@ -4,20 +4,21 @@ A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and 
 
 ## Why Hermes?
 
-| Feature                 | Hermes              | Tantivy | Qdrant  | Elasticsearch |
-| ----------------------- | ------------------- | ------- | ------- | ------------- |
-| BM25 Full-text search   | Yes                 | Yes     | No      | Yes           |
-| Dense vectors (ANN)     | Yes (IVF-TQ + HNSW) | No      | Yes     | Plugin        |
-| Sparse vectors (SPLADE) | Yes (native)        | No      | Partial | No            |
-| WASM / Browser          | Yes                 | No      | No      | No            |
-| IPFS storage            | Yes                 | No      | No      | No            |
-| Embeddable library      | Yes                 | Yes     | No      | No            |
+- Combine BM25, phrase queries, sparse vectors, and dense ANN in one index.
+- Choose IVF-TQ, binary IVF, or ScaNN routing through the [schema](docs/schema.md).
+- Embed the Rust library, serve gRPC through a server or sharding broker, or
+  search static index files in a browser through WASM.
+- Train and inspect MAL-defined language models with the shared inference and
+  training stack.
+
+Start with the [documentation index](docs/README.md),
 
 ## Packages
 
 | Package                    | Description                                                  | Distribution                                                  |
 | -------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------- |
 | `hermes-core`              | Core search engine library                                   | [crates.io](https://crates.io/crates/hermes-core)             |
+| `hermes-broker`            | Sharding and routing for gRPC servers                        | [crates.io](https://crates.io/crates/hermes-broker)           |
 | `hermes-server`            | gRPC server for remote search and indexing                   | [crates.io](https://crates.io/crates/hermes-server)           |
 | `hermes-tool`              | CLI for index management and data processing                 | [crates.io](https://crates.io/crates/hermes-tool)             |
 | `hermes-wasm`              | WASM bindings for browser search and indexing                | [npm](https://www.npmjs.com/package/hermes-wasm)              |
@@ -39,26 +40,35 @@ A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and 
 ```bash
 cargo install hermes-tool
 
-# Create an index from an SDL schema
+# Create a small schema and dataset in a new working directory.
+cat > schema.sdl <<'SDL'
+index articles {
+    field title: text<en_stem> [indexed, stored]
+    field body: text [indexed, stored]
+}
+SDL
+cat > documents.jsonl <<'JSONL'
+{"title":"Hybrid Search","body":"Combining BM25 with vectors"}
+{"title":"Browser Search","body":"Search static indexes with WASM"}
+JSONL
+
 hermes-tool create -i ./my_index -s schema.sdl
 
 # Index documents from JSONL (with progress logging every 50k docs)
 cat documents.jsonl | hermes-tool index -i ./my_index --stdin -p 50000
 
-# Or from compressed files with optimization mode
-zstdcat dump.zst | hermes-tool index -i ./my_index --stdin -O performance
-
 # Commit, merge, and inspect
 hermes-tool commit -i ./my_index
 hermes-tool merge -i ./my_index
 hermes-tool info -i ./my_index
+hermes-tool search -i ./my_index --query 'title:hybrid' --limit 10
 ```
 
 ### Rust Library
 
 ```rust
 use hermes_core::{
-    Index, IndexConfig, MmapDirectory, Document,
+    Index, IndexConfig, MmapDirectory,
     index_json_document, parse_single_index,
 };
 
@@ -72,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             field body: text [indexed]
             field views: u64 [indexed, stored]
         }
-    "#)?;
+    "#)?.to_schema();
     let index = Index::create(dir, schema, IndexConfig::default()).await?;
 
     // Add documents
@@ -200,7 +210,7 @@ async with HermesClient("localhost:50051") as client:
 
 ### WASM (Browser)
 
-Hermes compiles to WebAssembly and can search indexes hosted over HTTP or IPFS directly in the browser, with IndexedDB-backed slice caching for near-zero cold-start latency on repeat visits.
+Hermes compiles to WebAssembly and can search indexes hosted over HTTP or IPFS directly in the browser, with IndexedDB-backed slice caching to reuse downloaded slices on repeat visits.
 
 ```javascript
 import init, { RemoteIndex, IpfsIndex } from "hermes-wasm";
@@ -227,19 +237,19 @@ await index.save_cache_to_idb();
 
 **Unified hybrid search** -- BM25 text ranking, SPLADE sparse vectors, and global IVF-TQ dense vectors share the same index, segments, and query pipeline. No sidecar services required.
 
-**6 posting list formats** -- Adaptive format selection per list: HorizontalBP128, VerticalBP128, Elias-Fano, Partitioned Elias-Fano, Roaring bitmaps, and OptP4D. The engine picks the best format based on list density and length.
+**Configurable posting codecs** -- The production posting container supports rounded-width packing, exact-width packing, and patched frame-of-reference (Pfor) blocks. `--posting-codec` and `-O` control the size/decode tradeoff; see [posting codecs](docs/posting-codecs.md).
 
 **Block-Max MaxScore** -- Top-k retrieval uses MaxScore partitioning (Turtle & Flood 1995) combined with block-max pruning (Ding & Suel 2011) and conjunction optimization. A single unified `MaxScoreExecutor` handles both BM25 text and sparse vector queries.
 
 **Multi-value combiners** -- Documents with multiple vectors per field (e.g., chunked passages) are scored with configurable strategies: Sum, Max, Avg, LogSumExp (smooth approximation), or WeightedTopK with exponential decay.
 
-**Matryoshka reranking** -- L2 reranker supports Matryoshka dimensionality reduction: scores candidates on leading dimensions first, then full-dimension exact scoring on survivors only. Skips 50-70% of cosine computations.
+**Matryoshka reranking** -- L2 reranker supports Matryoshka dimensionality reduction: scores candidates on leading dimensions first, then full-dimension exact scoring on survivors only. The savings depend on the candidate pool and dimension schedule.
 
 **SOAR multi-probe** -- IVF-TQ indexes default to Google's SOAR (Spilling with Orthogonality-Amplified Residuals) in selective mode, calibrating one secondary assignment for at most 30% of vectors; `soar: off` disables it explicitly.
 
-**SimHash dedup pipeline** -- Stream-oriented CLI tools for near-duplicate detection: pipe through `simhash`, `sort`, then `index` to deduplicate million-document corpora before indexing.
+**SimHash preprocessing** -- Stream JSONL through `simhash` and `sort` to compute fingerprints and order records before ingestion. Apply your duplicate-selection rule before indexing; sorting alone does not remove near-duplicates.
 
-**18 language stemmers** -- Snowball stemmers for Arabic, Danish, Dutch, English, Finnish, French, German, Greek, Hungarian, Italian, Norwegian, Portuguese, Romanian, Russian, Spanish, Swedish, Tamil, and Turkish. Plus HuggingFace tokenizer integration.
+**Language-aware tokenization** -- Snowball stemming, per-document language hints, stop words with phrase-gap preservation, Unicode segmentation, and optional Japanese/Korean morphology. Hugging Face tokenizers are also supported; see the [tokenizer reference](docs/schema.md#tokenizers).
 
 **Storage abstraction** -- Filesystem (mmap), HTTP (range requests), RAM, IPFS (JS fetch callbacks), and slice-caching directories. The same index binary works across all backends.
 
@@ -254,7 +264,7 @@ index articles {
     field body: text [indexed]
     field author: text<raw_ci> [indexed, stored]
     field published_at: u64 [indexed, stored]
-    field embedding: dense_vector<768> [stored]
+    field embedding: dense_vector<768> [indexed, stored]
     field sparse_embedding: sparse_vector [indexed]
 }
 ```
@@ -270,8 +280,8 @@ Full SDL reference: [docs/schema.md](docs/schema.md)
 ### Prerequisites
 
 - Rust 1.98+ (see `rust-toolchain.toml`)
-- Python 3.12+ (for Python client and bindings)
-- Node.js 20+ (for WASM and web UI)
+- Python 3.12+ for development and MAL bindings (the gRPC client supports 3.10+)
+- Node.js 22.12+ (for WASM and web UI; see [Vite requirements](https://vite.dev/guide/#scaffolding-your-first-vite-project))
 - pnpm 10+ (for TypeScript and web projects)
 - uv and maturin (for Python projects)
 - wasm-pack (for WASM builds)
@@ -284,16 +294,16 @@ Full SDL reference: [docs/schema.md](docs/schema.md)
 cargo build --release
 
 # Build WASM (requires Homebrew LLVM on macOS for zstd cross-compilation)
-cd hermes-wasm && bash build.sh
+(cd hermes-wasm && bash build.sh)
 
 # Build the Python gRPC client
-cd hermes-client-python && uv build
+(cd hermes-client-python && uv build)
 
 # Build the MAL Python binding
-cd hermes-mal-python && maturin build --release
+(cd hermes-mal-python && maturin build --release)
 ```
 
-Alternatively you may build everything in docker via `docker compose`.
+Docker Compose provides the Rust and WASM build services:
 
 Examples:
 

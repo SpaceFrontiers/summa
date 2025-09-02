@@ -1,5 +1,8 @@
 # Large-candidate-pool retrieval evaluation
 
+Implemented by [`hermes-train/src/retrieval_pool.rs`](../hermes-train/src/retrieval_pool.rs).
+The run-specific examples below describe the motivating experiment.
+
 ## Why
 
 `hermes-train eval --objective contrastive_retrieval` scores retrieval **in
@@ -28,7 +31,8 @@ alike; negatives in the current eval shards are other queries' positives, so
 each shard is already a closed ranking set). Embed the whole pool once, embed
 every query, and rank each query's own positive against the **entire pool**.
 
-Pool sizes available today, from `.context/heldout-eval/`:
+Historical pool sizes from the run-local `.context/heldout-eval/` artifacts
+(not checked in; supply your own held-out shards to reproduce an evaluation):
 
 | shard                                    | queries | unique documents |
 | ---------------------------------------- | ------- | ---------------- |
