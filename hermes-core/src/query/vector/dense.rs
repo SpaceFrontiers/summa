@@ -110,6 +110,13 @@ impl DenseVectorQuery {
 }
 
 impl Query for DenseVectorQuery {
+    fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
+        Ok(crate::query::CandidateQuery::new(
+            self.field,
+            crate::query::candidate_scoring::ScoreComponent::Dense(self.vector.clone()),
+        ))
+    }
+
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let vector = self.shared_vector();

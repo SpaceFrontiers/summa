@@ -150,12 +150,24 @@ impl BrokerSearchService {
         }
         req.offset = 0;
         req.limit = window;
+        let expected_method = if req.l1.is_some() {
+            Some("linear_v1")
+        } else if req.score_export.is_some() {
+            Some("feature_export_v1")
+        } else {
+            None
+        };
         let responses = forward_read!(self, req, timeout, route, search, "search")?;
-        Ok(partition::merge_search_responses(
-            responses,
-            offset as usize,
-            limit as usize,
-        ))
+        if expected_method.is_some_and(|expected| {
+            responses
+                .iter()
+                .any(|response| response.ranking_method != expected)
+        }) {
+            return Err(Status::failed_precondition(
+                "a shard does not support the requested candidate scoring contract; complete the Hermes rollout",
+            ));
+        }
+        partition::merge_search_responses(responses, offset as usize, limit as usize)
     }
 }
 
@@ -176,6 +188,13 @@ impl SearchService for BrokerSearchService {
             let _permits = self.admit(&index_name, &route)?;
             match &route {
                 Route::Single(target) => {
+                    let expected_method = if req.l1.is_some() {
+                        Some("linear_v1")
+                    } else if req.score_export.is_some() {
+                        Some("feature_export_v1")
+                    } else {
+                        None
+                    };
                     let mut outbound = Request::new(req);
                     if let Some(t) = timeout {
                         outbound.set_timeout(t);
@@ -187,7 +206,17 @@ impl SearchService for BrokerSearchService {
                         .map(|_| tonic::Code::Ok)
                         .unwrap_or_else(|s| s.code());
                     record_backend(&target.backend_id, "search", call_started, code);
-                    result.map(|r| r.into_inner())
+                    result.and_then(|r| {
+                        let response = r.into_inner();
+                        if expected_method
+                            .is_some_and(|expected| response.ranking_method != expected)
+                        {
+                            return Err(Status::failed_precondition(
+                                "backend lacks requested candidate scoring contract",
+                            ));
+                        }
+                        Ok(response)
+                    })
                 }
                 Route::Partitioned(_) => self.search_partitioned(req, timeout, &route).await,
             }

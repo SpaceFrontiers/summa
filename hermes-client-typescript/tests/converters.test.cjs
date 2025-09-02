@@ -99,3 +99,20 @@ test("sparse query conversion preserves optional LSP gamma presence", () => {
   });
   assert.equal(exhaustive.sparseVector.lspGamma, 0);
 });
+
+test("named scoring branches retain scopes, eligibility and omission of RRF weights", () => {
+  const { ScoreScope } = require("../dist/generated/hermes.js");
+  const result = buildQuery({ fusion: {
+    queries: [{ name: "body", scope: "chunk", query: { match: { field: "body", text: "hemoglobin" } } },
+              { name: "title", scope: "document", scoreOnly: true, query: { match: { field: "title", text: "hemoglobin" } } }],
+    candidateDepth: 42,
+    filters: [{ phrase: { field: "body", text: "red blood cells" } }],
+  } }).fusion;
+  assert.equal(result.queries[0].weight, 0);
+  assert.equal(result.queries[0].name, "body");
+  assert.equal(result.queries[0].scope, ScoreScope.SCORE_SCOPE_CHUNK);
+  assert.equal(result.queries[1].scope, ScoreScope.SCORE_SCOPE_DOCUMENT);
+  assert.equal(result.queries[1].scoreOnly, true);
+  assert.equal(result.filters[0].phrase.text, "red blood cells");
+  assert.equal(result.candidateDepth, 42);
+});

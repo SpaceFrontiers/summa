@@ -359,6 +359,11 @@ fn validate_query_shape<'a>(
                         "FusionQuery is only supported at the top level",
                     ));
                 }
+                if fusion.filters.len() > 64 {
+                    return Err(Status::invalid_argument(
+                        "common fusion filters exceed 64 clauses",
+                    ));
+                }
                 if fusion.queries.len() > MAX_FUSION_SUB_QUERIES {
                     return Err(Status::invalid_argument(format!(
                         "FusionQuery supports at most {MAX_FUSION_SUB_QUERIES} sub-queries \
@@ -366,8 +371,17 @@ fn validate_query_shape<'a>(
                         fusion.queries.len()
                     )));
                 }
-                budget.add_clauses(fusion.queries.len())?;
+                budget.add_clauses(fusion.queries.len() + fusion.filters.len())?;
+                for filter in &fusion.filters {
+                    stack.push((filter, depth + 1));
+                }
                 for weighted in &fusion.queries {
+                    if weighted.name.len() > 128 {
+                        return Err(Status::invalid_argument(
+                            "fusion branch name exceeds 128 bytes",
+                        ));
+                    }
+                    budget.add_text(weighted.name.len())?;
                     let child = weighted
                         .query
                         .as_ref()
@@ -414,6 +428,104 @@ fn validate_search_request_shape(
              {} bytes (got {selected_name_bytes})",
             shape.max_fields_to_load_name_bytes
         )));
+    }
+
+    let scoring = req.l1.is_some() || req.score_export.is_some();
+    if scoring {
+        let Some(query::Query::Fusion(fusion)) = &root.query else {
+            return Err(Status::invalid_argument(
+                "l1/score_export require named fusion branches",
+            ));
+        };
+        if fusion.queries.len() > MAX_FUSION_SUB_QUERIES {
+            return Err(Status::invalid_argument("too many fusion branches"));
+        }
+        let names: Vec<&str> = fusion.queries.iter().map(|q| q.name.as_str()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for branch in &fusion.queries {
+            if branch.name.is_empty()
+                || branch.name.len() > 128
+                || !branch
+                    .name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+                || !seen.insert(branch.name.as_str())
+            {
+                return Err(Status::invalid_argument(
+                    "l1/score_export require unique, nonempty branch names",
+                ));
+            }
+            if !matches!(
+                ScoreScope::try_from(branch.scope),
+                Ok(ScoreScope::Document | ScoreScope::Chunk)
+            ) {
+                return Err(Status::invalid_argument(
+                    "l1/score_export require explicit document/chunk scopes",
+                ));
+            }
+        }
+        if fusion.queries.iter().all(|branch| branch.score_only) {
+            return Err(Status::invalid_argument(
+                "at least one branch must nominate candidates",
+            ));
+        }
+        if let Some(model) = &req.l1 {
+            if model.weights.len() > MAX_FUSION_SUB_QUERIES
+                || model.transforms.len() > MAX_FUSION_SUB_QUERIES
+            {
+                return Err(Status::invalid_argument(
+                    "l1 coefficient count exceeds branch limit",
+                ));
+            }
+            if model
+                .weights
+                .keys()
+                .chain(model.transforms.keys())
+                .any(|name| name.len() > 128)
+            {
+                return Err(Status::invalid_argument(
+                    "l1 coefficient name exceeds 128 bytes",
+                ));
+            }
+            super::candidate_scoring::linear_model(model)
+                .validate(&names)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if fusion.method != FusionMethod::FusionRrf as i32
+                || !matches!(fusion.combiner, 0 | 1)
+                || fusion.rrf_k != 0.0
+                || fusion.queries.iter().any(|q| q.weight != 0.0)
+                || req.reranker.as_ref().is_some_and(|r| r.rrf_k != 0.0)
+            {
+                return Err(Status::invalid_argument(
+                    "l1 directly determines ranking; legacy fusion weights/method/rrf_k must be unset",
+                ));
+            }
+        }
+        if req.time_budget_ms != 0 {
+            return Err(Status::invalid_argument(
+                "l1/score_export require complete scoring; time_budget_ms must be unset",
+            ));
+        }
+        if req.l1.is_none() && (req.offset != 0 || req.reranker.is_some()) {
+            return Err(Status::invalid_argument(
+                "export-only requests require offset=0 and no reranker",
+            ));
+        }
+        if req
+            .score_export
+            .as_ref()
+            .is_some_and(|export| export.passages_per_document > 65536)
+        {
+            return Err(Status::invalid_argument(
+                "score_export passages_per_document exceeds 65536",
+            ));
+        }
+    } else if let Some(query::Query::Fusion(fusion)) = &root.query
+        && (fusion.candidate_depth != 0 || fusion.queries.iter().any(|q| q.score_only))
+    {
+        return Err(Status::invalid_argument(
+            "candidate_depth/score_only require l1 or score_export",
+        ));
     }
 
     let mut budget = validate_query_shape(root, shape)?;
@@ -537,7 +649,17 @@ pub(super) fn validate_search_budget(
             }
         }
 
-        let candidate_slots = candidate_limit
+        let depth = if fusion.candidate_depth == 0 {
+            candidate_limit
+        } else {
+            fusion.candidate_depth as usize
+        };
+        if depth > max_candidate_limit {
+            return Err(Status::invalid_argument(format!(
+                "fusion candidate_depth exceeds {max_candidate_limit}"
+            )));
+        }
+        let candidate_slots = depth
             .checked_mul(fusion.queries.len())
             .ok_or_else(|| Status::invalid_argument("Fusion candidate budget is too large"))?;
         if candidate_slots > MAX_FUSION_CANDIDATE_SLOTS {

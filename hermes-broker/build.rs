@@ -1,4 +1,6 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=../hermes-proto/hermes.proto");
+    println!("cargo:rerun-if-changed=../hermes-proto/hermes-broker.proto");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     // File descriptor sets feed gRPC server reflection (grpcurl et al. can
     // then call the broker without local .proto files).

@@ -48,6 +48,8 @@ async fn pass_through_is_identical() {
         total_hits: brokered.total_hits,
         took_ms: brokered.took_ms,
         timings: brokered.timings,
+
+        ..Default::default()
     };
     assert_eq!(
         hit_free_of_maps.encode_to_vec(),
@@ -572,6 +574,8 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
             took_ms: 5,
             timings: None,
             truncated: false,
+
+            ..Default::default()
         };
     }
 
@@ -635,6 +639,8 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
                         })),
                     }),
                     weight: 1.0,
+
+                    ..Default::default()
                 },
                 WeightedQuery {
                     query: Some(Query {
@@ -645,6 +651,8 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
                         })),
                     }),
                     weight: 1.0,
+
+                    ..Default::default()
                 },
             ],
             ..Default::default()

@@ -16,6 +16,7 @@ pub mod chunk_map;
 pub(crate) mod format;
 #[cfg(feature = "native")]
 mod merger;
+pub(crate) mod ordinal_lookup;
 pub(crate) mod reader;
 #[cfg(feature = "native")]
 pub(crate) mod reorder;

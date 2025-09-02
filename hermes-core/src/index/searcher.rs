@@ -1437,6 +1437,104 @@ impl<D: Directory + 'static> Searcher<D> {
         Ok((fused, total_seen))
     }
 
+    /// Retrieve independent branches and retain the complete bounded document
+    /// union. No rank fusion or cross-branch top-k runs before feature scoring.
+    pub async fn search_candidate_union(
+        &self,
+        queries: &[Arc<dyn crate::query::Query>],
+        depth: usize,
+        stats: Arc<crate::query::GlobalStats>,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        if queries.is_empty()
+            || queries.len() > crate::query::MAX_FUSION_SUB_QUERIES
+            || depth == 0
+            || depth
+                .checked_mul(queries.len())
+                .is_none_or(|slots| slots > crate::query::MAX_FUSION_CANDIDATE_SLOTS)
+        {
+            return Err(crate::Error::Query(
+                "invalid candidate union branch/depth budget".into(),
+            ));
+        }
+        #[cfg(feature = "sync")]
+        let lists = if !self.segments.is_empty()
+            && tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            use rayon::prelude::*;
+            tokio::task::block_in_place(|| {
+                self.install_search_cpu(|| {
+                    queries
+                        .par_iter()
+                        .map(|query| {
+                            let (results, seen, _) = self.search_internal_sync_budgeted(
+                                query.as_ref(),
+                                depth,
+                                0,
+                                true,
+                                None,
+                                Some(stats.clone()),
+                            )?;
+                            Ok((results, seen))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })?
+        } else {
+            self.search_candidate_branches_async(queries, depth, stats)
+                .await?
+        };
+        #[cfg(not(feature = "sync"))]
+        let lists = self
+            .search_candidate_branches_async(queries, depth, stats)
+            .await?;
+        let mut union = std::collections::BTreeMap::new();
+        let mut total_seen = 0u32;
+        let mut positions = 0usize;
+        for (list, seen) in lists {
+            total_seen = total_seen.saturating_add(seen);
+            for mut result in list {
+                positions = positions
+                    .saturating_add(result.positions.iter().map(|(_, p)| p.len()).sum::<usize>());
+                if positions > crate::query::MAX_FUSION_CHUNK_SLOTS {
+                    return Err(crate::Error::Query(
+                        "candidate union ordinal budget exceeded".into(),
+                    ));
+                }
+                // Nomination magnitudes are intentionally not a mixed-vertical
+                // score. Export requests get features; linear supplies rank.
+                result.score = 0.0;
+                match union.entry((result.segment_id, result.doc_id)) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(result);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().positions.extend(result.positions);
+                    }
+                }
+            }
+        }
+        Ok((union.into_values().collect(), total_seen))
+    }
+
+    async fn search_candidate_branches_async(
+        &self,
+        queries: &[Arc<dyn crate::query::Query>],
+        depth: usize,
+        stats: Arc<crate::query::GlobalStats>,
+    ) -> Result<Vec<(Vec<crate::query::SearchResult>, u32)>> {
+        futures::future::try_join_all(queries.iter().map(|query| {
+            let stats = stats.clone();
+            async move {
+                let (results, seen, _) = self
+                    .search_with_positions_budgeted_stats(query.as_ref(), depth, None, Some(stats))
+                    .await?;
+                Ok((results, seen))
+            }
+        }))
+        .await
+    }
+
     /// Two-stage search: L1 retrieval + L2 dense vector reranking
     ///
     /// Runs the query to get `l1_limit` candidates, then reranks by exact

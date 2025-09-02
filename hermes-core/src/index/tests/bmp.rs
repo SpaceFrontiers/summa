@@ -1829,6 +1829,44 @@ async fn test_bmp_reorder_multi_field() {
             ));
             continue;
         }
+        use crate::query::{
+            CandidateFeature, CandidateScoringPlan, LinearModel, Query, ScoreScope,
+        };
+        let other = SparseVectorQuery::new(sparse_b, vec![(1000 + i as u32, 1.0)]);
+        let plan = CandidateScoringPlan {
+            features: vec![
+                CandidateFeature {
+                    name: "a".into(),
+                    scope: ScoreScope::Document,
+                    query: query.candidate_query().unwrap(),
+                },
+                CandidateFeature {
+                    name: "b".into(),
+                    scope: ScoreScope::Document,
+                    query: other.candidate_query().unwrap(),
+                },
+            ],
+            model: Some(LinearModel {
+                weights: std::collections::BTreeMap::from([("b".into(), 1.0)]),
+                ..Default::default()
+            }),
+            export_passages: 1,
+            all_passages: true,
+        };
+        let backfilled = searcher
+            .score_candidates(&results, &plan, None)
+            .await
+            .unwrap();
+        let expected = searcher.search(&other, 5).await.unwrap();
+        assert_eq!(
+            backfilled[0].result.score, expected[0].score,
+            "field-local BMP reorders must backfill the same document"
+        );
+        assert!(
+            backfilled[0].features.passages.is_empty(),
+            "document vectors are not body ordinal zero"
+        );
+        assert!(backfilled[0].features.document.iter().all(Option::is_some));
         let doc = searcher
             .doc(results[0].segment_id, results[0].doc_id)
             .await

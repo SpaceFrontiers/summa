@@ -310,7 +310,7 @@ macro_rules! boolean_plan {
                 // Chunked field: score chunks, fold to documents with ordinals.
                 if reader.is_chunked_field(text_field) {
                     return finish_chunked_text_maxscore(
-                        posting_lists, limit, reader, text_field, None,
+                        posting_lists, avg_field_len, limit, reader, text_field, eligibility_predicate(&scorer_options),
                         $proximity.map(|config| (config, term_bytes)),
                         $text_tuning.0,
                         scorer_options.shared_threshold.as_ref(),
@@ -330,7 +330,7 @@ macro_rules! boolean_plan {
                     &shared_threshold,
                     reader,
                     text_field,
-                    None,
+                    eligibility_predicate(&scorer_options),
                     super::Bm25Params::for_field(reader.schema(), text_field),
                     $proximity.map(|config| (config, term_bytes)),
                     $text_tuning.0,
@@ -387,10 +387,11 @@ macro_rules! boolean_plan {
                     if reader.is_chunked_field(*field) {
                         scorers.push(finish_chunked_text_maxscore(
                             posting_lists,
+                            *avg_field_len,
                             grouping.per_field_limit,
                             reader,
                             *field,
-                            None,
+                            eligibility_predicate(&scorer_options),
                             $proximity.map(|config| (config, term_bytes)),
                             $text_tuning.0,
                             scorer_options.shared_threshold.as_ref(),
@@ -404,7 +405,7 @@ macro_rules! boolean_plan {
                             &shared_threshold,
                             reader,
                             *field,
-                            None,
+                            eligibility_predicate(&scorer_options),
                             super::Bm25Params::for_field(reader.schema(), *field),
                             $proximity.map(|config| (config, term_bytes)),
                             $text_tuning.0,
@@ -594,7 +595,7 @@ macro_rules! boolean_plan {
                         Box::new(move |doc_id| filter.contains(doc_id));
                     let scorer = if reader.is_chunked_field(field) {
                         finish_chunked_text_maxscore(
-                            posting_lists, group_limit, reader, field, Some(predicate),
+                            posting_lists, avg_field_len, group_limit, reader, field, Some(predicate),
                             $proximity.map(|config| (config, term_bytes)),
                             $text_tuning.0,
                             scorer_options.shared_threshold.as_ref(),
@@ -919,6 +920,18 @@ macro_rules! boolean_plan {
 }
 
 impl Query for BooleanQuery {
+    fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
+        if !self.must.is_empty() || !self.must_not.is_empty() || self.proximity.is_some() {
+            return Err(crate::Error::Query("L1 scoring branches support SHOULD composition; move required/excluded constraints into fusion.filters and use explicit phrase branches for proximity".into()));
+        }
+        if let super::QueryDecomposition::SparseTerms(infos) = self.decompose() {
+            return super::CandidateQuery::from_decomposition(
+                super::QueryDecomposition::SparseTerms(infos),
+            );
+        }
+        super::CandidateQuery::sum(self.should.iter().map(|query| query.candidate_query()))
+    }
+
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
     }
@@ -1375,6 +1388,13 @@ pub(super) fn merge_matched_positions(
         scored.truncate(write + 1);
     }
     merged
+}
+
+fn eligibility_predicate(options: &super::ScorerOptions) -> Option<super::DocPredicate<'static>> {
+    options.eligibility.as_ref().map(|filter| {
+        let filter = filter.clone();
+        Box::new(move |doc| filter.contains(doc)) as super::DocPredicate<'static>
+    })
 }
 
 #[cfg(test)]

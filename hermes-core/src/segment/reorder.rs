@@ -1077,6 +1077,15 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         num_docs: src_meta.num_docs,
         field_stats: src_meta.field_stats.clone(),
     };
+    super::ordinal_lookup::write_generation_lookups(
+        dir,
+        schema,
+        &meta,
+        &[&reader],
+        (rewrite_text, true),
+        memory_budget,
+    )
+    .await?;
     // Durable: the reordered segment replaces its fsynced source, so a
     // non-durable .meta could be the only copy across a power failure.
     dir.write_durable(&dst_files.meta, &meta.serialize()?)
@@ -1168,6 +1177,15 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
         num_docs: src_meta.num_docs,
         field_stats: src_meta.field_stats.clone(),
     };
+    super::ordinal_lookup::write_generation_lookups(
+        dir,
+        target_schema,
+        &meta,
+        &[&reader],
+        (false, false),
+        0,
+    )
+    .await?;
     dir.write_durable(&dst_files.meta, &meta.serialize()?)
         .await?;
 

@@ -395,6 +395,8 @@ pub struct SegmentFiles {
     pub fast: PathBuf,
     /// Virtual-id → (doc, ordinal, length) maps of chunked text fields
     pub chunks: PathBuf,
+    /// Optional logical-to-physical maps for reordered scoring fields.
+    pub ordinal_lookup: PathBuf,
 }
 
 impl SegmentFiles {
@@ -410,6 +412,7 @@ impl SegmentFiles {
             positions: PathBuf::from(format!("{}.pos", prefix)),
             fast: PathBuf::from(format!("{}.fast", prefix)),
             chunks: PathBuf::from(format!("{}.chunks", prefix)),
+            ordinal_lookup: PathBuf::from(format!("{}.lookup", prefix)),
         }
     }
 
@@ -435,7 +438,7 @@ impl SegmentFiles {
 
     /// Every permanent or temporary path owned by this segment ID.
     #[cfg(feature = "native")]
-    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 10] {
+    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 11] {
         [
             self.term_dict.clone(),
             self.postings.clone(),
@@ -447,6 +450,7 @@ impl SegmentFiles {
             self.positions.clone(),
             self.fast.clone(),
             self.chunks.clone(),
+            self.ordinal_lookup.clone(),
         ]
     }
 }

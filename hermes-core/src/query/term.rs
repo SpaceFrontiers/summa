@@ -73,7 +73,7 @@ impl TermQuery {
 }
 
 /// Compute (idf, avg_field_len) from a posting list, using global stats when available.
-fn compute_term_idf(
+pub(super) fn compute_term_idf(
     posting_list: &BlockPostingList,
     field: Field,
     reader: &SegmentReader,
@@ -87,7 +87,7 @@ fn compute_term_idf(
             return (global_idf, stats.avg_field_len(field));
         }
     }
-    let num_docs = reader.num_docs() as f32;
+    let num_docs = reader.text_corpus_size(field);
     let doc_freq = posting_list.doc_count() as f32;
     (
         super::bm25_idf(doc_freq, num_docs),
@@ -103,7 +103,7 @@ fn compute_term_idf(
 //   $($aw)*          – .await  (present for async, absent for sync)
 macro_rules! term_plan {
     ($field:expr, $term:expr, $global_stats:expr, $reader:expr, $limit:expr,
-     $load_positions:expr, $budget:expr, $get_postings_fn:ident, $get_positions_fn:ident
+     $load_positions:expr, $eligibility:expr, $budget:expr, $get_postings_fn:ident, $get_positions_fn:ident
      $(, $aw:tt)*) => {{
         let field: Field = $field;
         let term: &[u8] = $term;
@@ -131,14 +131,18 @@ macro_rules! term_plan {
             // Chunked field: postings are keyed by virtual chunk id. Score the
             // chunks, fold them back to documents and report the ordinals.
             Some(posting_list) if reader.is_chunked_field(field) => {
-                let num_chunks = reader.text_corpus_size(field);
-                let idf = super::bm25_idf(posting_list.doc_count() as f32, num_chunks);
+                let (idf, avg_field_len) =
+                    compute_term_idf(&posting_list, field, reader, global_stats, term);
                 super::planner::finish_chunked_text_maxscore(
                     vec![(posting_list, idf)],
+                    avg_field_len,
                     limit,
                     reader,
                     field,
-                    None,
+                    $eligibility.as_ref().map(|filter| {
+                        let filter = filter.clone();
+                        Box::new(move |doc| filter.contains(doc)) as super::DocPredicate<'_>
+                    }),
                     None,
                     1.0,
                     budget,
@@ -203,6 +207,7 @@ impl Query for TermQuery {
                 reader,
                 limit,
                 load_positions,
+                options.eligibility,
                 options.shared_threshold.as_ref(),
                 get_postings,
                 get_positions,
@@ -249,6 +254,7 @@ impl Query for TermQuery {
             reader,
             limit,
             options.collect_positions,
+            options.eligibility,
             options.shared_threshold.as_ref(),
             get_postings_sync,
             get_positions_sync
@@ -523,4 +529,38 @@ impl Scorer for TermScorer {
             .collect();
         Some(vec![(self.field_id, scored_positions)])
     }
+}
+
+/// Point BM25 probes. Targets are sorted physical IDs, never a retrieval top-k.
+pub(super) async fn score_term_candidates(
+    reader: &SegmentReader,
+    field: Field,
+    terms: &[(Vec<u8>, f32)],
+    targets: &[u32],
+    stats: Option<&Arc<GlobalStats>>,
+) -> crate::Result<Vec<f32>> {
+    let mut scores = vec![0.0; targets.len()];
+    let params = super::Bm25Params::for_field(reader.schema(), field);
+    for (term, weight) in terms {
+        let Some(postings) = reader.get_postings(field, term).await? else {
+            continue;
+        };
+        let (idf, avg_len) = compute_term_idf(&postings, field, reader, stats, term);
+        let mut cursor = postings.into_iterator();
+        for (index, &target) in targets.iter().enumerate() {
+            if cursor.seek(target) != target {
+                continue;
+            }
+            let tf = cursor.term_freq() as f32;
+            let length = if let Some(map) = reader.chunk_map(field) {
+                map.bm25_length(target) as f32
+            } else if let Some(lengths) = reader.doc_lengths(field) {
+                lengths.length(target) as f32
+            } else {
+                tf
+            };
+            scores[index] += params.score(tf, idf * weight, length, avg_len);
+        }
+    }
+    Ok(scores)
 }

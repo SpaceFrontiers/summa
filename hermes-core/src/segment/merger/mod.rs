@@ -754,6 +754,18 @@ impl SegmentMerger {
             field_stats: merged_field_stats,
         };
 
+        let lookup_sources: Vec<_> = segments.iter().collect();
+        super::ordinal_lookup::write_generation_lookups(
+            dir,
+            &self.schema,
+            &meta,
+            &lookup_sources,
+            (false, self.reorder_bmp),
+            self.bp_memory_budget,
+        )
+        .await?;
+        self.ensure_not_cancelled()?;
+
         // Durable: replace_segments deletes the fsynced source segments right
         // after publishing this output, so a non-durable .meta could be the
         // only copy of the merged documents across a power failure.

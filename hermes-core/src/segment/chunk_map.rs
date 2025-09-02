@@ -238,6 +238,7 @@ pub struct ChunkMap {
     /// this segment. BM25 floors every chunk length at this value so a short
     /// tail chunk is not rewarded for being short (`docs/chunked-bm25.md`).
     length_floor: u32,
+    logically_ordered: bool,
     /// Derived once at open; never persisted or assumed from schema flags.
     doc_ids_monotonic: bool,
 }
@@ -265,6 +266,20 @@ fn nominal_chunk_length(lengths: &[u8]) -> u32 {
 }
 
 impl ChunkMap {
+    pub(crate) fn logically_ordered(&self) -> bool {
+        self.logically_ordered
+    }
+
+    pub(crate) fn ordered_slots_for_document(
+        &self,
+        doc: DocId,
+    ) -> impl Iterator<Item = (u16, u32)> + '_ {
+        super::ordinal_lookup::ordered_document_slots(self.num_chunks, doc, |slot| {
+            let (doc, ordinal) = self.resolve(slot);
+            Some(super::ordinal_lookup::LogicalUnit { doc, ordinal })
+        })
+    }
+
     pub(crate) fn is_doc_ordered(&self) -> bool {
         self.doc_ids_monotonic
     }
@@ -437,6 +452,18 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                 let ordinals = bytes.slice(offset + n * 4..offset + n * 6);
                 let lengths = bytes.slice(offset + n * 6..end);
                 let length_floor = nominal_chunk_length(lengths.as_slice());
+                let logically_ordered = super::ordinal_lookup::logically_ordered(
+                    doc_ids
+                        .as_slice()
+                        .chunks_exact(4)
+                        .zip(ordinals.as_slice().chunks_exact(2))
+                        .map(|(doc, ordinal)| {
+                            Some(super::ordinal_lookup::LogicalUnit {
+                                doc: u32::from_le_bytes(doc.try_into().unwrap()),
+                                ordinal: u16::from_le_bytes(ordinal.try_into().unwrap()),
+                            })
+                        }),
+                );
                 let doc_ids_monotonic = doc_ids
                     .as_slice()
                     .chunks_exact(4)
@@ -451,6 +478,7 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                         num_chunks: count,
                         total_tokens,
                         length_floor,
+                        logically_ordered,
                         doc_ids_monotonic,
                     },
                 );

@@ -1,6 +1,10 @@
 export { HermesClient } from "./client";
 export type { HermesClientOptions } from "./client";
 export type {
+  CandidateScores,
+  PassageScores,
+  FeatureTransform,
+  L1Ranking,
   DocAddress,
   Document,
   OrdinalScore,

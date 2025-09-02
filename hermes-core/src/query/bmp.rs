@@ -1990,6 +1990,73 @@ fn compute_block_ubs_and_presence(
     Ok(blocks_with_query_terms)
 }
 
+/// Exact candidate probes use the very same integer query quantization and
+/// dequantization as exhaustive BMP retrieval. Nomination/LSP never enters
+/// this path. Targets must be real physical slots in ascending order.
+pub(crate) fn score_bmp_candidates(
+    index: &BmpIndex,
+    terms: &[(u32, f32)],
+    targets: &[u32],
+) -> crate::Result<Vec<f32>> {
+    use crate::segment::bmp_adaptive::AdaptivePostings;
+    let mut scores = vec![0.0; targets.len()];
+    let Some(prepared) = prepare_bmp_query(index.dims(), terms, terms)? else {
+        return Ok(scores);
+    };
+    let dequant = prepared.dequant_for(index)?;
+    let mut start = 0;
+    while start < targets.len() {
+        let block_id = targets[start] / index.bmp_block_size;
+        let mut end = start + 1;
+        while end < targets.len() && targets[end] / index.bmp_block_size == block_id {
+            end += 1;
+        }
+        // Missing/empty blocks contain no nonzero terms. Real-slot identity is
+        // validated by the reader before this call.
+        let (byte_start, byte_end) = index.block_data_range(block_id);
+        if byte_start == byte_end {
+            start = end;
+            continue;
+        }
+        let block = index.parse_block(block_id).ok_or_else(|| {
+            crate::Error::Corruption(format!("cannot decode candidate BMP block {block_id}"))
+        })?;
+        let mut units = [0u32; 256];
+        for &(dimension, weight) in &prepared.query_by_dim_u16 {
+            let Some(term) = block.find_dimension(dimension) else {
+                continue;
+            };
+            let postings = block.postings(term).ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "cannot decode candidate BMP dimension {dimension}"
+                ))
+            })?;
+            match postings {
+                AdaptivePostings::Dense(impacts) => {
+                    for &target in &targets[start..end] {
+                        let slot = (target % index.bmp_block_size) as usize;
+                        units[slot] += u32::from(impacts[slot]) * u32::from(weight);
+                    }
+                }
+                AdaptivePostings::Sparse(postings) => {
+                    for &target in &targets[start..end] {
+                        let slot = (target % index.bmp_block_size) as u8;
+                        if let Ok(p) = postings.binary_search_by_key(&slot, |p| p.local_slot) {
+                            units[slot as usize] +=
+                                u32::from(postings[p].impact) * u32::from(weight);
+                        }
+                    }
+                }
+            }
+        }
+        for i in start..end {
+            scores[i] = units[(targets[i] % index.bmp_block_size) as usize] as f32 * dequant;
+        }
+        start = end;
+    }
+    Ok(scores)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;

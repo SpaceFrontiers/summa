@@ -1,3 +1,5 @@
+import type { CandidateScores, L1Ranking } from "./generated/hermes";
+export type { CandidateScores, FeatureTransform, L1Ranking, PassageScores } from "./generated/hermes";
 // =============================================================================
 // Response types
 // =============================================================================
@@ -25,6 +27,7 @@ export interface SearchHit {
   score: number;
   fields: Record<string, any>;
   ordinalScores: OrdinalScore[];
+  candidateScores?: CandidateScores;
 }
 
 /** Detailed timing breakdown for search phases (all values in microseconds). */
@@ -33,6 +36,7 @@ export interface SearchTimings {
   rerankUs: number;
   loadUs: number;
   totalUs: number;
+  candidateScoringUs?: number;
 }
 
 /** Search response with hits and metadata. */
@@ -41,6 +45,8 @@ export interface SearchResponse {
   totalHits: number;
   tookMs: number;
   timings?: SearchTimings;
+  rankingMethod?: string;
+  truncated?: boolean;
 }
 
 /** Per-field vector statistics. */
@@ -58,6 +64,8 @@ export interface IndexInfo {
   numSegments: number;
   schema: string;
   vectorStats: VectorFieldStats[];
+  candidateScoringVersion?: number;
+  unpreparedCandidateFields?: string[];
 }
 
 // =============================================================================
@@ -185,6 +193,10 @@ export interface PrefixQuery {
 
 /** Weighted sub-query for hybrid fusion */
 export interface WeightedQuery {
+  /** Required for L1/export; unique coefficient identity. */
+  name?: string;
+  scope?: "document" | "chunk";
+  scoreOnly?: boolean;
   query: Query;
   /** Contribution scale (default: 1.0) */
   weight?: number;
@@ -196,6 +208,8 @@ export interface WeightedQuery {
  * Only valid at the top level of a search request.
  */
 export interface FusionQuery {
+  filters?: Query[];
+  candidateDepth?: number;
   queries: WeightedQuery[];
   /** Fusion method (default: "rrf") */
   method?: "rrf" | "normalized_weighted_sum";
@@ -249,6 +263,8 @@ export interface Reranker {
 // =============================================================================
 
 export interface SearchRequest {
+  l1?: Pick<L1Ranking, "weights"> & Partial<Omit<L1Ranking, "weights">>;
+  scoreExport?: { passagesPerDocument?: number; allPassages?: boolean };
   query: Query;
   limit?: number;
   offset?: number;

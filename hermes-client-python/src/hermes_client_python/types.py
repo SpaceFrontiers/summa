@@ -158,6 +158,20 @@ class OrdinalScore:
 
 
 @dataclass
+class PassageScores:
+    ordinal: int
+    scores: dict[str, float]
+    l1_score: float | None = None
+
+
+@dataclass
+class CandidateScores:
+    document: dict[str, float]
+    passages: list[PassageScores]
+    scored_passages: int
+
+
+@dataclass
 class SearchHit:
     """A single search result."""
 
@@ -165,6 +179,7 @@ class SearchHit:
     score: float
     fields: dict[str, Any] = field(default_factory=dict)
     ordinal_scores: list[OrdinalScore] = field(default_factory=list)
+    candidate_scores: CandidateScores | None = None
 
 
 @dataclass
@@ -175,6 +190,7 @@ class SearchTimings:
     rerank_us: int
     load_us: int
     total_us: int
+    candidate_scoring_us: int = 0
 
 
 @dataclass
@@ -185,6 +201,8 @@ class SearchResponse:
     total_hits: int
     took_ms: int
     timings: SearchTimings | None = None
+    ranking_method: str = ""
+    truncated: bool = False
 
 
 @dataclass
@@ -206,3 +224,5 @@ class IndexInfo:
     num_segments: int
     schema: str
     vector_stats: list[VectorFieldStats] = field(default_factory=list)
+    candidate_scoring_version: int = 0
+    unprepared_candidate_fields: list[str] = field(default_factory=list)

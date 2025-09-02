@@ -147,6 +147,8 @@ export class HermesClient {
       numDocs: response.numDocs,
       numSegments: response.numSegments,
       schema: response.schema,
+      candidateScoringVersion: response.candidateScoringVersion,
+      unpreparedCandidateFields: response.unpreparedCandidateFields,
       vectorStats: (response.vectorStats ?? []).map((stats) => ({
         fieldName: stats.fieldName,
         vectorType: stats.vectorType,
@@ -283,6 +285,8 @@ export class HermesClient {
         candidateLimit: request.candidateLimit ?? 0,
         timeBudgetMs: request.timeBudgetMs ?? 0,
         textStats: undefined,
+        l1: request.l1 ? { weights: request.l1.weights, bias: request.l1.bias ?? 0, transforms: request.l1.transforms ?? {} } : undefined,
+        scoreExport: request.scoreExport ? { passagesPerDocument: request.scoreExport.passagesPerDocument ?? 0, allPassages: request.scoreExport.allPassages ?? false } : undefined,
       },
       this.callOptions(timeoutMs),
     );
@@ -293,6 +297,7 @@ export class HermesClient {
         docId: hit.address?.docId ?? 0,
       },
       score: hit.score,
+      candidateScores: hit.candidateScores,
       fields: Object.fromEntries(
         Object.entries(hit.fields).map(([name, value]) => [
           name,
@@ -311,12 +316,15 @@ export class HermesClient {
           rerankUs: Number(response.timings.rerankUs),
           loadUs: Number(response.timings.loadUs),
           totalUs: Number(response.timings.totalUs),
+          candidateScoringUs: Number(response.timings.candidateScoringUs),
         }
       : undefined;
 
     return {
       hits,
       totalHits: response.totalHits,
+      rankingMethod: response.rankingMethod,
+      truncated: response.truncated,
       tookMs: response.tookMs,
       timings,
     };

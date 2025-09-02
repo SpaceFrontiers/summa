@@ -128,6 +128,7 @@ pub struct BmpIndex {
     /// True when every stored vector is ordinal zero. This is derived from
     /// the physical document map rather than trusting schema declarations.
     single_valued: bool,
+    logically_ordered: bool,
 
     // ── Zero-copy OwnedBytes sections (keeps backing store alive) ────
     /// Section A: block_data_starts[block_id] = byte offset into block_data_bytes
@@ -259,6 +260,7 @@ impl BmpIndex {
                 grid_bits,
                 num_real_docs,
                 single_valued: true,
+                logically_ordered: true,
                 block_data_starts_bytes: OwnedBytes::empty(),
                 block_data_bytes: OwnedBytes::empty(),
                 block_grid: CompressedGrid::empty(),
@@ -415,6 +417,19 @@ impl BmpIndex {
         )?;
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
+        let logically_ordered = crate::segment::ordinal_lookup::logically_ordered(
+            doc_map_ids_bytes
+                .as_slice()
+                .chunks_exact(4)
+                .zip(doc_map_ordinals_bytes.as_slice().chunks_exact(2))
+                .map(|(doc, ordinal)| {
+                    let doc = u32::from_le_bytes(doc.try_into().unwrap());
+                    (doc != u32::MAX).then(|| crate::segment::ordinal_lookup::LogicalUnit {
+                        doc,
+                        ordinal: u16::from_le_bytes(ordinal.try_into().unwrap()),
+                    })
+                }),
+        );
         let single_valued = doc_map_ordinals_bytes
             .as_slice()
             .chunks_exact(2)
@@ -498,6 +513,7 @@ impl BmpIndex {
             grid_bits,
             num_real_docs,
             single_valued,
+            logically_ordered,
             block_data_starts_bytes,
             block_data_bytes,
             block_grid,
@@ -522,6 +538,21 @@ impl BmpIndex {
     pub(crate) fn read_raw_blob(&self) -> std::io::Result<OwnedBytes> {
         self.source
             .read_bytes_range_sync(self.blob_offset..self.blob_offset + self.blob_len)
+    }
+
+    pub(crate) fn logically_ordered(&self) -> bool {
+        self.logically_ordered
+    }
+
+    pub(crate) fn ordered_slots_for_document(
+        &self,
+        doc: u32,
+    ) -> impl Iterator<Item = (u16, u32)> + '_ {
+        crate::segment::ordinal_lookup::ordered_document_slots(self.num_virtual_docs, doc, |slot| {
+            let (doc, ordinal) = self.virtual_to_doc(slot);
+            (doc != u32::MAX)
+                .then_some(crate::segment::ordinal_lookup::LogicalUnit { doc, ordinal })
+        })
     }
 
     /// Convert a compact virtual_id to (doc_id, ordinal) via table lookup.

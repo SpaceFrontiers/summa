@@ -231,6 +231,7 @@ pub(super) fn text_maxscore_allowed(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_chunked_text_maxscore<'a>(
     posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
+    avg_field_len: f32,
     limit: usize,
     reader: &'a SegmentReader,
     field: crate::Field,
@@ -262,7 +263,7 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
     let params = super::Bm25Params::for_field(reader.schema(), field);
     let mut executor = MaxScoreExecutor::text_chunked(
         posting_lists,
-        chunk_map.avg_len(),
+        avg_field_len,
         executor_limit,
         chunk_map,
         params,
@@ -286,7 +287,7 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
             &terms,
             params,
             Some(super::LengthSource::Chunks(chunk_map)),
-            chunk_map.avg_len(),
+            avg_field_len,
             config,
             &mut raw,
         )?;
@@ -482,7 +483,17 @@ pub(crate) fn build_sparse_bmp_results(
     limit: usize,
     options: &super::ScorerOptions,
 ) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
-    build_sparse_bmp_results_inner(infos, reader, limit, None, options)
+    if let Some(filter) = &options.eligibility {
+        build_sparse_bmp_results_inner(
+            infos,
+            reader,
+            limit,
+            Some(&|doc| filter.contains(doc)),
+            options,
+        )
+    } else {
+        build_sparse_bmp_results_inner(infos, reader, limit, None, options)
+    }
 }
 
 /// Build a sparse BMP executor with a document predicate filter.
@@ -937,6 +948,7 @@ mod tests {
         let shared = super::super::SharedThreshold::new();
         shared.raise(7.0);
         let options = super::super::ScorerOptions {
+            eligibility: None,
             collect_positions: false,
             initial_threshold: 5.0,
             shared_threshold: Some(shared),
@@ -965,6 +977,7 @@ mod tests {
     fn bmp_threshold_from_a_clamped_heap_is_never_published() {
         let shared = super::super::SharedThreshold::new();
         let options = super::super::ScorerOptions {
+            eligibility: None,
             collect_positions: false,
             initial_threshold: 0.0,
             shared_threshold: Some(shared),

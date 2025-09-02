@@ -1017,6 +1017,51 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
     Ok(scored)
 }
 
+/// Backfill a selected set of flat vector values without ANN candidate
+/// generation. Shares range planning, bounded buffers and SIMD kernels with
+/// the existing exact reranker. Targets are sorted and unique.
+pub(super) async fn score_vector_candidates<D: crate::directories::Directory + 'static>(
+    searcher: &crate::index::Searcher<D>,
+    flat: &crate::segment::LazyFlatVectorData,
+    vector: &[f32],
+    binary_vector: &[u8],
+    unit_norm: bool,
+    targets: &[u32],
+) -> crate::Result<Vec<f32>> {
+    use crate::structures::simd;
+    let norm = simd::dot_product_f32(vector, vector, vector.len());
+    let query_f16: Vec<u16> = vector.iter().map(|&v| simd::f32_to_f16(v)).collect();
+    let pq = PrecompQuery {
+        query: vector,
+        inv_norm_q: if norm < f32::EPSILON {
+            0.0
+        } else {
+            simd::fast_inv_sqrt(norm)
+        },
+        query_f16: &query_f16,
+    };
+    let vbs = flat.vector_byte_size();
+    let batch_len = rerank_batch_len(vbs);
+    let mut raw = vec![0u8; batch_len.min(targets.len()) * vbs];
+    let mut runs = Vec::new();
+    let mut scores = vec![0.0; targets.len()];
+    for (batch, out) in targets.chunks(batch_len).zip(scores.chunks_mut(batch_len)) {
+        plan_flat_read_runs(batch.iter().map(|&target| target as usize), &mut runs);
+        let raw = &mut raw[..batch.len() * vbs];
+        read_flat_vector_runs(flat, &runs, raw).await?;
+        if !binary_vector.is_empty() {
+            searcher.install_search_cpu(|| {
+                simd::batch_hamming_scores(binary_vector, raw, binary_vector.len(), flat.dim, out)
+            });
+        } else {
+            searcher.install_search_cpu(|| {
+                score_batch_precomp(&pq, raw, flat.quantization, flat.dim, out, unit_norm)
+            })?;
+        }
+    }
+    Ok(scores)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

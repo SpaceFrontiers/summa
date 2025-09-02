@@ -748,6 +748,43 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
         let mut out = Vec::new();
         for (i, query) in queries.iter().enumerate() {
             let (results, _) = searcher.search_with_positions(&**query, 50).await.unwrap();
+            if i < 2 {
+                use crate::query::{
+                    CandidateFeature, CandidateScoringPlan, LinearModel, ScoreScope,
+                };
+                let plan = CandidateScoringPlan {
+                    features: vec![CandidateFeature {
+                        name: "text".into(),
+                        scope: ScoreScope::Chunk,
+                        query: query.candidate_query().unwrap(),
+                    }],
+                    model: Some(LinearModel {
+                        weights: std::collections::BTreeMap::from([("text".into(), 1.0)]),
+                        ..Default::default()
+                    }),
+                    export_passages: 10,
+                    all_passages: true,
+                };
+                let backfilled = searcher
+                    .score_candidates(&results, &plan, None)
+                    .await
+                    .unwrap();
+                for actual in backfilled {
+                    let expected = results
+                        .iter()
+                        .find(|result| {
+                            result.segment_id == actual.result.segment_id
+                                && result.doc_id == actual.result.doc_id
+                        })
+                        .unwrap();
+                    assert!(
+                        (actual.result.score - expected.score).abs() < 1e-5,
+                        "backfill changed after reorder/merge: {} != {}",
+                        actual.result.score,
+                        expected.score
+                    );
+                }
+            }
             let mut rows: Vec<(u64, i64, Vec<u32>)> = results
                 .iter()
                 .map(|r| {
@@ -955,4 +992,63 @@ fn by_doc_hits(hits: &[crate::query::SearchHit], doc_id: u32) -> f32 {
         .find(|h| h.address.doc_id == doc_id)
         .unwrap_or_else(|| panic!("doc {doc_id} missing"))
         .score
+}
+
+/// A learned coefficient must mean the same thing on every immutable segment.
+#[tokio::test]
+async fn chunked_term_and_phrase_honour_global_idf_and_average_length() {
+    use crate::query::{GlobalStatsBuilder, Query, ScorerOptions};
+    use std::sync::Arc;
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    writer
+        .add_document(doc(&f, "article", &["alpha beta alpha beta"]))
+        .unwrap();
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let reader = &searcher.segment_readers()[0];
+    let mut stats = GlobalStatsBuilder::new();
+    stats.total_docs = 100;
+    stats.set_text_corpus_size(f.content, 100);
+    stats.set_avg_field_len(f.content, 40.0);
+    stats.add_text_df(f.content, "alpha".into(), 10);
+    stats.add_text_df(f.content, "beta".into(), 20);
+    let stats = Arc::new(stats.build(0));
+    let options = ScorerOptions {
+        global_stats: Some(stats.clone()),
+        ..ScorerOptions::default()
+    };
+    for query in [
+        Box::new(TermQuery::text(f.content, "alpha")) as Box<dyn Query>,
+        Box::new(PhraseQuery::text(f.content, "alpha beta")),
+    ] {
+        let mut terms = Vec::new();
+        query.text_terms(&mut terms);
+        let idf: f32 = terms
+            .iter()
+            .map(|(_, t)| stats.text_idf(f.content, &String::from_utf8_lossy(t)))
+            .sum();
+        let expected = crate::query::Bm25Params::default().score(2.0, idf, 4.0, 40.0);
+        let scorer = query
+            .scorer_with_options(reader, 10, options.clone())
+            .await
+            .unwrap();
+        assert_eq!(scorer.doc(), 0);
+        assert!(
+            (scorer.score() - expected).abs() < 1e-5,
+            "{query}: {} != {expected}",
+            scorer.score()
+        );
+        #[cfg(feature = "sync")]
+        {
+            let sync = query
+                .scorer_sync_with_options(reader, 10, options.clone())
+                .unwrap();
+            assert_eq!(sync.score(), scorer.score());
+        }
+    }
 }
