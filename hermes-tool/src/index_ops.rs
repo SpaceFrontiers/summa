@@ -156,6 +156,7 @@ pub async fn index_documents(
     indexing_threads: Option<usize>,
     compression_threads: Option<usize>,
     optimization: hermes_core::structures::IndexOptimization,
+    posting_codec: Option<hermes_core::structures::PostingCodec>,
 ) -> Result<()> {
     let optimization_mode = optimization;
 
@@ -167,6 +168,7 @@ pub async fn index_documents(
         num_compression_threads: compression_threads
             .unwrap_or(default_config.num_compression_threads),
         optimization: optimization_mode,
+        posting_codec,
         ..default_config
     };
     let mut writer = IndexWriter::open(dir, config.clone()).await?;
@@ -186,11 +188,11 @@ pub async fn index_documents(
             .collect::<Vec<_>>()
     );
     info!(
-        "Indexing threads: {}, Compression threads: {}, Optimization: {:?} (zstd level {})",
+        "Indexing threads: {}, Compression threads: {}, Optimization: {:?}, posting codec: {}",
         config.num_indexing_threads,
         config.num_compression_threads,
         optimization_mode,
-        optimization_mode.zstd_level()
+        config.effective_posting_codec()
     );
 
     let count = if use_stdin {
@@ -742,6 +744,7 @@ mod tests {
             None,
             None,
             hermes_core::structures::IndexOptimization::default(),
+            None,
         )
         .await
         .unwrap();
@@ -768,6 +771,7 @@ mod tests {
             None,
             None,
             hermes_core::structures::IndexOptimization::default(),
+            None,
         )
         .await
         .unwrap();

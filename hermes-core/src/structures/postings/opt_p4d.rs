@@ -28,7 +28,7 @@ const MAX_EXCEPTIONS_RATIO: f32 = 0.10;
 
 /// Find the optimal bit width for a block of values
 /// Returns (bit_width, exception_count, total_bits)
-fn find_optimal_bit_width(values: &[u32]) -> (u8, usize, usize) {
+pub(crate) fn find_optimal_bit_width(values: &[u32]) -> (u8, usize, usize) {
     if values.is_empty() {
         return (0, 0, 0);
     }
@@ -96,7 +96,7 @@ fn find_optimal_bit_width(values: &[u32]) -> (u8, usize, usize) {
 /// - For exceptions (values >= 2^b), store only the HIGH (32-b) bits separately with positions
 ///
 /// Returns the packed bytes and a list of exceptions (position, high_bits)
-fn pack_with_exceptions(values: &[u32], bit_width: u8) -> (Vec<u8>, Vec<(u8, u32)>) {
+pub(crate) fn pack_with_exceptions(values: &[u32], bit_width: u8) -> (Vec<u8>, Vec<(u8, u32)>) {
     if bit_width == 0 {
         // All values must be 0, exceptions store full value
         let exceptions: Vec<(u8, u32)> = values
@@ -169,7 +169,7 @@ fn pack_with_exceptions(values: &[u32], bit_width: u8) -> (Vec<u8>, Vec<(u8, u32
 /// - Reconstruct: value = (high_bits << b) | low_bits
 ///
 /// Uses SIMD acceleration for common bit widths (8, 16, 32)
-fn unpack_with_exceptions(
+pub(crate) fn unpack_with_exceptions(
     packed: &[u8],
     bit_width: u8,
     exceptions: &[(u8, u32)],

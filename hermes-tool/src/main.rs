@@ -106,12 +106,33 @@ struct Cli {
 /// Index optimization mode for balancing compression ratio vs query speed
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum OptimizationMode {
-    /// Balanced compression/speed (zstd level 7)
+    /// Rounded posting codec, term dictionary zstd level 9
     Adaptive,
-    /// Best compression ratio (OptP4D + zstd level 22)
+    /// Patched-exception posting codec (pfor), term dictionary zstd level 22
     Size,
-    /// Fastest queries (Roaring + zstd level 3)
+    /// Rounded posting codec, term dictionary zstd level 1
     Performance,
+}
+
+/// Posting block codec (see docs/posting-codecs.md)
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PostingCodecArg {
+    /// Widths rounded to 0/8/16/32 bits: fastest decode, largest
+    Rounded,
+    /// Exact bit widths (BP128): ~1.8x smaller, ~10% slower decode
+    Packed,
+    /// Exact widths with patched exceptions (OptP4D): smallest, ~30% slower decode
+    Pfor,
+}
+
+impl PostingCodecArg {
+    fn to_posting_codec(self) -> hermes_core::structures::PostingCodec {
+        match self {
+            Self::Rounded => hermes_core::structures::PostingCodec::Rounded,
+            Self::Packed => hermes_core::structures::PostingCodec::Packed,
+            Self::Pfor => hermes_core::structures::PostingCodec::Pfor,
+        }
+    }
 }
 
 impl OptimizationMode {
@@ -180,11 +201,15 @@ enum Commands {
         compression_threads: Option<usize>,
 
         /// Index optimization mode
-        /// - adaptive: balanced compression/speed (zstd level 7)
-        /// - size: best compression ratio (OptP4D + zstd level 22)
-        /// - performance: fastest queries (Roaring + zstd level 3)
+        /// - adaptive: rounded posting codec, term dictionary zstd 9
+        /// - size: pfor posting codec, term dictionary zstd 22
+        /// - performance: rounded posting codec, term dictionary zstd 1
         #[arg(short = 'O', long, default_value = "adaptive")]
         optimization: OptimizationMode,
+
+        /// Posting block codec override (default: derived from --optimization)
+        #[arg(long)]
+        posting_codec: Option<PostingCodecArg>,
     },
 
     /// Commit pending changes
@@ -473,6 +498,7 @@ async fn main() -> Result<()> {
             indexing_threads,
             compression_threads,
             optimization,
+            posting_codec,
         } => {
             index_ops::index_documents(
                 index,
@@ -483,6 +509,7 @@ async fn main() -> Result<()> {
                 indexing_threads,
                 compression_threads,
                 optimization.to_index_optimization(),
+                posting_codec.map(PostingCodecArg::to_posting_codec),
             )
             .await?;
         }

@@ -434,7 +434,7 @@ enum Lengths {
 impl Lengths {
     fn length(&self, id: u32) -> u32 {
         match self {
-            Lengths::Chunks(map) => map.length(id),
+            Lengths::Chunks(map) => map.bm25_length(id),
             Lengths::Docs(lengths) => lengths.length(id),
         }
     }

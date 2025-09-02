@@ -31,9 +31,14 @@ use super::vint::{read_vint, write_vint};
 use crate::compression::{CompressionDict, CompressionLevel};
 use crate::directories::{FileHandle, OwnedBytes};
 
-/// SSTable magic number - version 4 with memory-efficient index
-/// Uses FST-based or mmap'd block index to avoid heap allocation
-pub const SSTABLE_MAGIC: u32 = 0x53544234; // "STB4"
+/// SSTable magic number written by this build — version 5: data blocks carry
+/// restart points (every `RESTART_INTERVAL` entries a full key plus a trailer
+/// of restart offsets), so a point lookup binary-searches the restarts and
+/// decodes at most `RESTART_INTERVAL` entries instead of scanning the block.
+pub const SSTABLE_MAGIC: u32 = 0x53544235; // "STB5"
+/// Entries between two restart points inside a data block (v5).
+pub const RESTART_INTERVAL: usize = 16;
+
 /// Block size for SSTable (16KB default)
 pub const BLOCK_SIZE: usize = 16 * 1024;
 
@@ -933,6 +938,11 @@ pub struct SSTableWriter<W: Write, V: SSTableValue> {
     /// Bloom filter key hashes — compact (u64, u64) pairs instead of full keys.
     /// Filter is built at finish() time with correct sizing.
     bloom_hashes: Vec<(u64, u64)>,
+    /// Byte offsets (within the uncompressed block) of the current block's
+    /// restart entries.
+    block_restarts: Vec<u32>,
+    /// Entries written into the current block so far.
+    block_entry_count: usize,
     _phantom: std::marker::PhantomData<V>,
 }
 
@@ -955,6 +965,8 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             config,
             dictionary: None,
             bloom_hashes: Vec::new(),
+            block_restarts: Vec::new(),
+            block_entry_count: 0,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -976,6 +988,8 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             config,
             dictionary: Some(dictionary),
             bloom_hashes: Vec::new(),
+            block_restarts: Vec::new(),
+            block_entry_count: 0,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -990,7 +1004,15 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             self.bloom_hashes.push(bloom_hash_pair(key));
         }
 
-        let prefix_len = common_prefix_len(&self.prev_key, key);
+        // Every RESTART_INTERVAL-th entry is a restart: written with a full
+        // key so a lookup can start decoding there.
+        let restart = self.block_entry_count.is_multiple_of(RESTART_INTERVAL);
+        let prefix_len = if restart {
+            self.block_restarts.push(self.block_buffer.len() as u32);
+            0
+        } else {
+            common_prefix_len(&self.prev_key, key)
+        };
         let suffix = &key[prefix_len..];
 
         write_vint(&mut self.block_buffer, prefix_len as u64)?;
@@ -1001,6 +1023,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
         self.prev_key.clear();
         self.prev_key.extend_from_slice(key);
         self.num_entries += 1;
+        self.block_entry_count += 1;
 
         if self.block_buffer.len() >= BLOCK_SIZE {
             self.flush_block()?;
@@ -1014,6 +1037,15 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
         if self.block_buffer.is_empty() {
             return Ok(());
         }
+
+        // v5 trailer: restart offsets then their count.
+        for offset in &self.block_restarts {
+            self.block_buffer.extend_from_slice(&offset.to_le_bytes());
+        }
+        self.block_buffer
+            .extend_from_slice(&(self.block_restarts.len() as u32).to_le_bytes());
+        self.block_restarts.clear();
+        self.block_entry_count = 0;
 
         // Compress block with dictionary if available
         let compressed = if let Some(ref dict) = self.dictionary {
@@ -1156,6 +1188,79 @@ pub struct AsyncSSTableReader<V: SSTableValue> {
     _phantom: std::marker::PhantomData<V>,
 }
 
+/// A decompressed data block split into its entry stream and restart table.
+struct BlockParts<'b> {
+    entries: &'b [u8],
+    /// Little-endian `u32` offsets into `entries`, ascending; empty for v4.
+    restart_table: &'b [u8],
+}
+
+impl<'b> BlockParts<'b> {
+    fn split(block: &'b [u8]) -> io::Result<Self> {
+        if block.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable block shorter than its restart trailer",
+            ));
+        }
+        let count_at = block.len() - 4;
+        let count = u32::from_le_bytes(block[count_at..].try_into().unwrap()) as usize;
+        let table_len = count.checked_mul(4).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "SSTable restart table overflow")
+        })?;
+        let table_at = count_at.checked_sub(table_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable restart table exceeds its block",
+            )
+        })?;
+        Ok(Self {
+            entries: &block[..table_at],
+            restart_table: &block[table_at..count_at],
+        })
+    }
+
+    #[inline]
+    fn num_restarts(&self) -> usize {
+        self.restart_table.len() / 4
+    }
+
+    #[inline]
+    fn restart_offset(&self, i: usize) -> io::Result<usize> {
+        let at = i * 4;
+        let offset =
+            u32::from_le_bytes(self.restart_table[at..at + 4].try_into().unwrap()) as usize;
+        if offset >= self.entries.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable restart offset outside the block",
+            ));
+        }
+        Ok(offset)
+    }
+
+    /// The full key stored at restart `i` (restart entries carry no prefix).
+    fn restart_key(&self, i: usize) -> io::Result<&'b [u8]> {
+        let offset = self.restart_offset(i)?;
+        let mut reader = &self.entries[offset..];
+        let prefix_len = read_vint(&mut reader)?;
+        if prefix_len != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SSTable restart entry has a non-zero key prefix",
+            ));
+        }
+        let suffix_len = read_vint(&mut reader)? as usize;
+        if suffix_len > reader.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "SSTable restart key truncated",
+            ));
+        }
+        Ok(&reader[..suffix_len])
+    }
+}
+
 /// Bounded block cache with a contention-free read path.
 ///
 /// Normal reads use [`BlockCache::peek`] under a shared lock and deliberately
@@ -1249,7 +1354,10 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         if magic != SSTABLE_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Invalid SSTable magic: 0x{:08X}", magic),
+                format!(
+                    "Invalid SSTable magic: 0x{magic:08X} (required STB5); the term dictionary \
+                     was written by an incompatible Hermes"
+                ),
             ));
         }
 
@@ -1749,8 +1857,36 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         self.search_block(&block_data, key)
     }
 
+    /// Entry stream of a decompressed block (without the v5 restart trailer).
+    fn block_entries<'b>(&self, block_data: &'b [u8]) -> io::Result<&'b [u8]> {
+        Ok(BlockParts::split(block_data)?.entries)
+    }
+
     fn search_block(&self, block_data: &[u8], target_key: &[u8]) -> io::Result<Option<V>> {
-        let mut reader = block_data;
+        let parts = BlockParts::split(block_data)?;
+
+        // v5: binary-search the restart keys for the last restart whose key
+        // is <= target, then decode at most RESTART_INTERVAL entries from it.
+        let start = if parts.num_restarts() > 0 {
+            let (mut lo, mut hi) = (0usize, parts.num_restarts());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if parts.restart_key(mid)? <= target_key {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo == 0 {
+                // Target sorts before the first key of the block.
+                return Ok(None);
+            }
+            parts.restart_offset(lo - 1)?
+        } else {
+            0
+        };
+
+        let mut reader = &parts.entries[start..];
         let mut current_key = Vec::new();
 
         while !reader.is_empty() {
@@ -1792,7 +1928,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
         for block_idx in 0..self.block_index.len() {
             let block_data = self.load_block(block_idx).await?;
-            let mut reader = &block_data[..];
+            let mut reader = self.block_entries(&block_data)?;
             let mut current_key = Vec::new();
 
             while !reader.is_empty() {
@@ -1825,16 +1961,16 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             return Ok((Vec::new(), false));
         }
 
-        let start_block = match self.block_index.locate(prefix) {
-            Some(idx) => idx,
-            None => return Ok((Vec::new(), false)),
-        };
+        // `locate` returns `None` when `prefix` sorts before the first key of
+        // block 0. That is a miss for a point lookup, but a prefix of the
+        // smallest key still matches entries in block 0, so scans start there.
+        let start_block = self.block_index.locate(prefix).unwrap_or(0);
 
         let mut results = Vec::new();
 
         for block_idx in start_block..self.block_index.len() {
             let block_data = self.load_block(block_idx).await?;
-            let mut reader = &block_data[..];
+            let mut reader = self.block_entries(&block_data)?;
             let mut current_key = Vec::new();
 
             while !reader.is_empty() {
@@ -1873,16 +2009,14 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             return Ok((Vec::new(), false));
         }
 
-        let start_block = match self.block_index.locate(prefix) {
-            Some(idx) => idx,
-            None => return Ok((Vec::new(), false)),
-        };
+        // See `prefix_scan_limited`: a prefix of the smallest key lives in block 0.
+        let start_block = self.block_index.locate(prefix).unwrap_or(0);
 
         let mut results = Vec::new();
 
         for block_idx in start_block..self.block_index.len() {
             let block_data = self.load_block_sync(block_idx)?;
-            let mut reader = &block_data[..];
+            let mut reader = self.block_entries(&block_data)?;
             let mut current_key = Vec::new();
 
             while !reader.is_empty() {
@@ -1909,6 +2043,8 @@ pub struct AsyncSSTableIterator<'a, V: SSTableValue> {
     current_block: usize,
     block_data: Option<Arc<[u8]>>,
     block_offset: usize,
+    /// End of the entry stream in `block_data` (excludes the restart trailer).
+    block_entries_end: usize,
     current_key: Vec<u8>,
     finished: bool,
 }
@@ -1920,6 +2056,7 @@ impl<'a, V: SSTableValue> AsyncSSTableIterator<'a, V> {
             current_block: 0,
             block_data: None,
             block_offset: 0,
+            block_entries_end: 0,
             current_key: Vec::new(),
             finished: reader.block_index.is_empty(),
         }
@@ -1931,7 +2068,9 @@ impl<'a, V: SSTableValue> AsyncSSTableIterator<'a, V> {
             return Ok(false);
         }
 
-        self.block_data = Some(self.reader.load_block(self.current_block).await?);
+        let block = self.reader.load_block(self.current_block).await?;
+        self.block_entries_end = self.reader.block_entries(&block)?.len();
+        self.block_data = Some(block);
         self.block_offset = 0;
         self.current_key.clear();
         self.current_block += 1;
@@ -1950,14 +2089,14 @@ impl<'a, V: SSTableValue> AsyncSSTableIterator<'a, V> {
 
         loop {
             let block = self.block_data.as_ref().unwrap();
-            if self.block_offset >= block.len() {
+            if self.block_offset >= self.block_entries_end {
                 if !self.load_next_block().await? {
                     return Ok(None);
                 }
                 continue;
             }
 
-            let mut reader = &block[self.block_offset..];
+            let mut reader = &block[self.block_offset..self.block_entries_end];
             let start_len = reader.len();
 
             let value = decode_block_entry(&mut reader, &mut self.current_key)?;
@@ -2099,6 +2238,127 @@ mod tests {
             let mut reader = buf.as_slice();
             let decoded = read_vint(&mut reader).unwrap();
             assert_eq!(val, decoded, "Failed for value {}", val);
+        }
+    }
+
+    fn keyed_table(num_keys: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut keys: Vec<Vec<u8>> = (0..num_keys)
+            .map(|i| format!("field{:02}/term{:07}", i % 7, i * 7919 % 100_003).into_bytes())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let mut writer = SSTableWriter::<_, u64>::new(Vec::new());
+        for (i, key) in keys.iter().enumerate() {
+            writer.insert(key, &(i as u64)).unwrap();
+        }
+        (writer.finish().unwrap(), keys)
+    }
+
+    async fn check_every_key_and_scan(bytes: Vec<u8>, keys: &[Vec<u8>]) {
+        let handle = FileHandle::from_bytes(OwnedBytes::new(bytes));
+        let reader = AsyncSSTableReader::<u64>::open(handle, 8).await.unwrap();
+        assert!(reader.block_index.len() > 3, "test needs several blocks");
+
+        // Every key is found with its value; the key just before / after is not.
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(reader.get(key).await.unwrap(), Some(i as u64), "key {i}");
+            let mut before = key.clone();
+            *before.last_mut().unwrap() -= 1;
+            let mut after = key.clone();
+            after.push(0);
+            assert!(
+                reader.get(&before).await.unwrap().is_none() || keys.binary_search(&before).is_ok()
+            );
+            assert!(
+                reader.get(&after).await.unwrap().is_none() || keys.binary_search(&after).is_ok()
+            );
+        }
+        assert!(reader.get(b"").await.unwrap().is_none());
+        assert!(reader.get(b"zzz").await.unwrap().is_none());
+
+        // Iteration and prefix scans see exactly the entries, in order.
+        let mut it = reader.iter();
+        let mut seen = Vec::new();
+        while let Some((k, v)) = it.next().await.unwrap() {
+            assert_eq!(v as usize, seen.len());
+            seen.push(k);
+        }
+        assert_eq!(seen, keys);
+        let scanned = reader.prefix_scan(b"field03/").await.unwrap();
+        let expected: Vec<&Vec<u8>> = keys.iter().filter(|k| k.starts_with(b"field03/")).collect();
+        assert_eq!(scanned.len(), expected.len());
+        assert!(scanned.iter().zip(expected).all(|((k, _), e)| k == e));
+        assert_eq!(reader.all_entries().await.unwrap().len(), keys.len());
+        let batch: Vec<&[u8]> = keys.iter().step_by(97).map(|k| k.as_slice()).collect();
+        let got = reader.get_batch(&batch).await.unwrap();
+        assert!(got.iter().all(|v| v.is_some()));
+    }
+
+    /// v5 blocks: restart points every RESTART_INTERVAL entries, lookups
+    /// binary-search them, scans and iteration skip the trailer.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn v5_restart_points_find_every_key_across_blocks() {
+        let (bytes, keys) = keyed_table(20_000);
+        check_every_key_and_scan(bytes, &keys).await;
+    }
+
+    /// An unknown magic is refused with an actionable message.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn unknown_sstable_magic_is_refused() {
+        let (mut bytes, _) = keyed_table(100);
+        let n = bytes.len();
+        bytes[n - 4..].copy_from_slice(&0x5354_4236u32.to_le_bytes()); // "STB6"
+        let handle = FileHandle::from_bytes(OwnedBytes::new(bytes));
+        let err = match AsyncSSTableReader::<u64>::open(handle, 8).await {
+            Ok(_) => panic!("unknown magic must be refused"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("incompatible Hermes"), "{err}");
+    }
+
+    /// A prefix that sorts before the first key of block 0 (a strict prefix
+    /// of the smallest key) must still find its matches in block 0.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn prefix_scan_matches_prefix_of_smallest_key() {
+        let mut writer = SSTableWriter::<_, u64>::new(Vec::new());
+        writer.insert(b"apple", &1).unwrap();
+        writer.insert(b"apricot", &2).unwrap();
+        writer.insert(b"banana", &3).unwrap();
+        let bytes = writer.finish().unwrap();
+        let handle = FileHandle::from_bytes(OwnedBytes::new(bytes));
+        let reader = AsyncSSTableReader::<u64>::open(handle, 4).await.unwrap();
+
+        let keys = |entries: Vec<(Vec<u8>, u64)>| -> Vec<Vec<u8>> {
+            entries.into_iter().map(|(k, _)| k).collect()
+        };
+
+        // "ap" < "apple", so `locate` reports "before block 0"; the scan must
+        // still start at block 0 and return both "ap" keys.
+        assert_eq!(
+            keys(reader.prefix_scan(b"ap").await.unwrap()),
+            vec![b"apple".to_vec(), b"apricot".to_vec()]
+        );
+        assert_eq!(
+            keys(reader.prefix_scan(b"a").await.unwrap()),
+            vec![b"apple".to_vec(), b"apricot".to_vec()]
+        );
+        assert_eq!(
+            keys(reader.prefix_scan(b"ba").await.unwrap()),
+            vec![b"banana".to_vec()]
+        );
+        // Prefixes that sort before every key but match nothing stay empty.
+        assert!(reader.prefix_scan(b"0").await.unwrap().is_empty());
+
+        #[cfg(feature = "sync")]
+        {
+            assert_eq!(
+                keys(reader.prefix_scan_sync(b"ap").unwrap()),
+                vec![b"apple".to_vec(), b"apricot".to_vec()]
+            );
+            assert!(reader.prefix_scan_sync(b"0").unwrap().is_empty());
         }
     }
 

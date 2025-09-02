@@ -121,7 +121,10 @@ impl SegmentMerger {
 
         // Write SSTable entries inline — no buffering needed since
         // SSTableWriter<&mut OffsetWriter> is Send (OffsetWriter is Send).
-        let mut term_dict_writer = SSTableWriter::<&mut OffsetWriter, TermInfo>::new(term_dict);
+        let mut term_dict_writer = SSTableWriter::<&mut OffsetWriter, TermInfo>::with_config(
+            term_dict,
+            crate::structures::SSTableWriterConfig::from_optimization(self.optimization),
+        );
         let mut terms_processed = 0usize;
         let mut serialize_buf: Vec<u8> = Vec::new();
         // Pre-allocate sources buffer outside loop — reused for every term
@@ -298,11 +301,12 @@ impl SegmentMerger {
                 return Ok(inline);
             }
             let offset = postings_out.offset();
-            let block = if any_positions {
-                BlockPostingList::from_posting_list_with_positions(&merged)?
-            } else {
-                BlockPostingList::from_posting_list(&merged)?
-            };
+            let block = BlockPostingList::from_posting_list_with_options(
+                &merged,
+                any_positions,
+                None,
+                self.posting_codec,
+            )?;
             buf.clear();
             block.serialize(buf)?;
             postings_out.write_all(buf)?;

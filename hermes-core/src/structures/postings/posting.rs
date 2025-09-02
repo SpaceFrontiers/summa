@@ -1,17 +1,228 @@
 //! Posting list implementation with compact representation
 //!
-//! Text blocks use SIMD-friendly packed bit-width encoding:
-//! - Doc IDs: delta-encoded, packed at rounded bit width (0/8/16/32)
-//! - Term frequencies: packed at rounded bit width
-//! - Same SIMD primitives as sparse blocks (`simd::pack_rounded` / `unpack_rounded`)
+//! Text blocks hold 128 postings: delta-coded doc ids followed by term
+//! frequencies, each array encoded by one of the [`PostingCodec`]s
+//! (`docs/posting-codecs.md`):
+//! - `Rounded` (default): widths rounded to 0/8/16/32 bits, SIMD widening
+//! - `Packed`: exact bit widths (BP128 style)
+//! - `Pfor`: exact width with patched exceptions (OptP4D style)
+//!
+//! The codec is stored per block in the header, so a single list (for example
+//! the output of a merge) may mix codecs.
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{self, Read, Write};
 
+use super::opt_p4d::{find_optimal_bit_width, pack_with_exceptions, unpack_with_exceptions};
 use super::posting_common::{read_vint, write_vint};
 use crate::DocId;
 use crate::directories::OwnedBytes;
 use crate::structures::simd;
+
+/// Encoding of the packed arrays inside one posting block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostingCodec {
+    /// Widths rounded up to 0/8/16/32 bits; decodes with plain SIMD widening.
+    /// This is the low-overhead performance baseline.
+    #[default]
+    Rounded = 0,
+    /// Exact bit widths (BP128 style): ~1.8× smaller than `Rounded` on the
+    /// repository benchmark for ~10 % slower decoding.
+    Packed = 1,
+    /// Exact width with up to 10 % patched exceptions (OptP4D style):
+    /// smallest, ~30 % slower decoding than `Rounded`.
+    Pfor = 2,
+}
+
+impl PostingCodec {
+    /// Codec id stored in the top two bits of the block header's `doc_bits`.
+    const HEADER_SHIFT: u32 = 6;
+    const WIDTH_MASK: u8 = 0x3F;
+
+    fn from_header_byte(doc_bits: u8) -> io::Result<(Self, u8)> {
+        let width = doc_bits & Self::WIDTH_MASK;
+        let codec = match doc_bits >> Self::HEADER_SHIFT {
+            0 => PostingCodec::Rounded,
+            1 => PostingCodec::Packed,
+            2 => PostingCodec::Pfor,
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "posting block uses unknown codec id {other}; the index was written by a \
+                         newer Hermes"
+                    ),
+                ));
+            }
+        };
+        if width > 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("posting block doc-id width {width} exceeds 32 bits"),
+            ));
+        }
+        Ok((codec, width))
+    }
+
+    fn header_byte(self, width: u8) -> u8 {
+        ((self as u8) << Self::HEADER_SHIFT) | width
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "rounded" | "default" => Some(PostingCodec::Rounded),
+            "packed" | "bp128" | "exact" => Some(PostingCodec::Packed),
+            "pfor" | "optp4d" | "patched" => Some(PostingCodec::Pfor),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PostingCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PostingCodec::Rounded => "rounded",
+            PostingCodec::Packed => "packed",
+            PostingCodec::Pfor => "pfor",
+        })
+    }
+}
+
+// ── Exact-width bit packing (Packed codec) ───────────────────────────────
+/// Bytes needed for `count` values at `width` bits.
+#[inline]
+fn packed_bytes(count: usize, width: u8) -> usize {
+    (count * width as usize).div_ceil(8)
+}
+
+/// Pack `values` at `width` bits each (little-endian bit order) into `out`.
+fn pack_bits(values: &[u32], width: u8, out: &mut Vec<u8>) {
+    if width == 0 || values.is_empty() {
+        return;
+    }
+    if width == 32 {
+        for &v in values {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        return;
+    }
+    let start = out.len();
+    out.resize(start + packed_bytes(values.len(), width), 0);
+    let dst = &mut out[start..];
+    let mut bit_pos = 0usize;
+    for &v in values {
+        let mut acc = (v as u64) << (bit_pos & 7);
+        let mut byte = bit_pos >> 3;
+        let mut remaining = (bit_pos & 7) + width as usize;
+        while remaining > 0 {
+            dst[byte] |= acc as u8;
+            acc >>= 8;
+            byte += 1;
+            remaining = remaining.saturating_sub(8);
+        }
+        bit_pos += width as usize;
+    }
+}
+
+/// Unpack `count` values of `width` bits from `input` into `out`.
+///
+/// Reads stay inside `input` (no over-read past the block), so this is safe
+/// on the last block of a mapped stream.
+fn unpack_bits(input: &[u8], width: u8, out: &mut [u32], count: usize) {
+    match width {
+        0 => out[..count].fill(0),
+        8 => simd::unpack_8bit(input, out, count),
+        16 => simd::unpack_16bit(input, out, count),
+        32 => simd::unpack_32bit(input, out, count),
+        _ => {
+            let mask = (1u64 << width) - 1;
+            let mut bit_pos = 0usize;
+            for slot in out[..count].iter_mut() {
+                let byte = bit_pos >> 3;
+                let word = if byte + 8 <= input.len() {
+                    u64::from_le_bytes(input[byte..byte + 8].try_into().unwrap())
+                } else {
+                    let mut word = 0u64;
+                    for (i, &b) in input[byte..].iter().enumerate() {
+                        word |= (b as u64) << (i * 8);
+                    }
+                    word
+                };
+                *slot = ((word >> (bit_pos & 7)) & mask) as u32;
+                bit_pos += width as usize;
+            }
+        }
+    }
+}
+
+// ── Patched packing (Pfor codec) ─────────────────────────────────────────
+/// Payload of one `Pfor` array: `[n_exceptions u8][packed low bits][(pos u8, high u32) × n]`.
+fn pack_pfor(values: &[u32], out: &mut Vec<u8>) -> u8 {
+    let (width, _, _) = find_optimal_bit_width(values);
+    let (packed, exceptions) = pack_with_exceptions(values, width);
+    out.push(exceptions.len() as u8);
+    out.extend_from_slice(&packed);
+    for (pos, high) in exceptions {
+        out.push(pos);
+        out.extend_from_slice(&high.to_le_bytes());
+    }
+    width
+}
+
+/// Byte length of a `Pfor` array payload for `count` values at `width`.
+fn pfor_payload_len(input: &[u8], count: usize, width: u8) -> io::Result<usize> {
+    let n_exceptions = *input
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "posting block truncated"))?
+        as usize;
+    Ok(1 + packed_bytes(count, width) + n_exceptions * 5)
+}
+
+fn unpack_pfor(input: &[u8], width: u8, out: &mut [u32], count: usize) -> io::Result<()> {
+    let n_exceptions = *input
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "posting block truncated"))?
+        as usize;
+    let packed_len = packed_bytes(count, width);
+    let table_at = 1 + packed_len;
+    if input.len() < table_at + n_exceptions * 5 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "posting block exception table truncated",
+        ));
+    }
+    let packed = &input[1..table_at];
+    let mut exceptions: [(u8, u32); 128] = [(0, 0); 128];
+    for (i, entry) in input[table_at..table_at + n_exceptions * 5]
+        .chunks_exact(5)
+        .enumerate()
+        .take(128)
+    {
+        exceptions[i] = (
+            entry[0],
+            u32::from_le_bytes([entry[1], entry[2], entry[3], entry[4]]),
+        );
+    }
+    if width == 0 {
+        // No low bits: every non-zero value is an exception carrying the value.
+        out[..count].fill(0);
+        for &(pos, value) in &exceptions[..n_exceptions.min(128)] {
+            if (pos as usize) < count {
+                out[pos as usize] = value;
+            }
+        }
+        return Ok(());
+    }
+    unpack_with_exceptions(
+        packed,
+        width,
+        &exceptions[..n_exceptions.min(128)],
+        count,
+        out,
+    );
+    Ok(())
+}
 
 /// A posting entry containing doc_id and term frequency
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -363,21 +574,82 @@ fn write_l0(buf: &mut Vec<u8>, first_doc: u32, last_doc: u32, offset: u32, bound
     buf.extend_from_slice(&bounds.to_le_bytes());
 }
 
-/// Compute block data size from the 8-byte header at `stream[pos..]`.
-///
-/// Header: `[count: u16][first_doc: u32][doc_id_bits: u8][tf_bits: u8]`
-/// Data size = 8 + (count-1) × bytes_per_value(doc_id_bits) + count × bytes_per_value(tf_bits)
+/// Byte length of block `idx` from the L0 offsets: the next block's offset
+/// (or the stream end) minus this block's offset. Header-independent, so a
+/// block payload may carry codec-specific variable-length data.
 #[inline]
-fn block_data_size(stream: &[u8], pos: usize) -> usize {
-    let count = u16::from_le_bytes(stream[pos..pos + 2].try_into().unwrap()) as usize;
-    let doc_rounded = simd::RoundedBitWidth::from_u8(stream[pos + 6]);
-    let tf_rounded = simd::RoundedBitWidth::from_u8(stream[pos + 7]);
-    let delta_bytes = if count > 1 {
-        (count - 1) * doc_rounded.bytes_per_value()
+fn block_len_from_l0(l0_bytes: &[u8], l0_count: usize, stream_len: usize, idx: usize) -> usize {
+    let (_, _, offset, _) = read_l0(l0_bytes, idx);
+    let end = if idx + 1 < l0_count {
+        read_l0(l0_bytes, idx + 1).2 as usize
     } else {
-        0
+        stream_len
     };
-    8 + delta_bytes + count * tf_rounded.bytes_per_value()
+    end.saturating_sub(offset as usize)
+}
+
+/// Encoded doc-id delta array and tf array of one block, with the header
+/// width bytes to store for them.
+struct EncodedBlock {
+    doc_bits: u8,
+    tf_bits: u8,
+}
+
+/// Append the packed arrays of one block to `stream` using `codec`.
+fn encode_block_arrays(
+    codec: PostingCodec,
+    deltas: &[u32],
+    tfs: &[u32],
+    stream: &mut Vec<u8>,
+) -> EncodedBlock {
+    match codec {
+        PostingCodec::Rounded => {
+            let max_delta = deltas.iter().copied().max().unwrap_or(0);
+            let doc_bits = simd::round_bit_width(simd::bits_needed(max_delta));
+            let max_tf = tfs.iter().copied().max().unwrap_or(0);
+            let tf_bits = simd::round_bit_width(simd::bits_needed(max_tf));
+            if !deltas.is_empty() {
+                let rounded = simd::RoundedBitWidth::from_u8(doc_bits);
+                let start = stream.len();
+                stream.resize(start + deltas.len() * rounded.bytes_per_value(), 0);
+                simd::pack_rounded(deltas, rounded, &mut stream[start..]);
+            }
+            {
+                let rounded = simd::RoundedBitWidth::from_u8(tf_bits);
+                let start = stream.len();
+                stream.resize(start + tfs.len() * rounded.bytes_per_value(), 0);
+                simd::pack_rounded(tfs, rounded, &mut stream[start..]);
+            }
+            EncodedBlock {
+                doc_bits: codec.header_byte(doc_bits),
+                tf_bits,
+            }
+        }
+        PostingCodec::Packed => {
+            let max_delta = deltas.iter().copied().max().unwrap_or(0);
+            let doc_bits = simd::bits_needed(max_delta);
+            let max_tf = tfs.iter().copied().max().unwrap_or(0);
+            let tf_bits = simd::bits_needed(max_tf);
+            pack_bits(deltas, doc_bits, stream);
+            pack_bits(tfs, tf_bits, stream);
+            EncodedBlock {
+                doc_bits: codec.header_byte(doc_bits),
+                tf_bits,
+            }
+        }
+        PostingCodec::Pfor => {
+            let doc_bits = if deltas.is_empty() {
+                0
+            } else {
+                pack_pfor(deltas, stream)
+            };
+            let tf_bits = pack_pfor(tfs, stream);
+            EncodedBlock {
+                doc_bits: codec.header_byte(doc_bits),
+                tf_bits,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -428,7 +700,15 @@ impl BlockPostingList {
     /// [packed tfs: count × bytes_per_value(tf_bits)]
     /// ```
     pub fn from_posting_list(list: &PostingList) -> io::Result<Self> {
-        Self::build(list, false, None)
+        Self::build(list, false, None, PostingCodec::Rounded)
+    }
+
+    /// Build a list using an explicit per-block codec.
+    pub fn from_posting_list_with_codec(
+        list: &PostingList,
+        codec: PostingCodec,
+    ) -> io::Result<Self> {
+        Self::build(list, false, None, codec)
     }
 
     /// Like [`Self::from_posting_list`], for a term whose positions are
@@ -436,7 +716,7 @@ impl BlockPostingList {
     /// it (the cumulative term frequency), so a reader can address the
     /// stream from the doc postings alone.
     pub fn from_posting_list_with_positions(list: &PostingList) -> io::Result<Self> {
-        Self::build(list, true, None)
+        Self::build(list, true, None, PostingCodec::Rounded)
     }
 
     /// Build with position cursors on demand and, when `length_of` is given,
@@ -448,13 +728,24 @@ impl BlockPostingList {
         with_positions: bool,
         length_of: Option<&dyn Fn(DocId) -> u32>,
     ) -> io::Result<Self> {
-        Self::build(list, with_positions, length_of)
+        Self::build(list, with_positions, length_of, PostingCodec::Rounded)
+    }
+
+    /// Build with the complete physical layout policy used by index writers.
+    pub fn from_posting_list_with_options(
+        list: &PostingList,
+        with_positions: bool,
+        length_of: Option<&dyn Fn(DocId) -> u32>,
+        codec: PostingCodec,
+    ) -> io::Result<Self> {
+        Self::build(list, with_positions, length_of, codec)
     }
 
     fn build(
         list: &PostingList,
         with_positions: bool,
         length_of: Option<&dyn Fn(DocId) -> u32>,
+        codec: PostingCodec,
     ) -> io::Result<Self> {
         let mut stream: Vec<u8> = Vec::new();
         let mut l0_buf: Vec<u8> = Vec::new();
@@ -498,37 +789,22 @@ impl BlockPostingList {
                 deltas.push(posting.doc_id - prev);
                 prev = posting.doc_id;
             }
-            let max_delta = deltas.iter().copied().max().unwrap_or(0);
-            let doc_id_bits = simd::round_bit_width(simd::bits_needed(max_delta));
 
             // Collect TFs
             tf_buf.clear();
             tf_buf.extend(block.iter().map(|p| p.term_freq));
-            let tf_bits = simd::round_bit_width(simd::bits_needed(block_max_tf));
 
-            // Write 8-byte header: [count: u16][first_doc: u32][doc_id_bits: u8][tf_bits: u8]
+            // Write 8-byte header: [count: u16][first_doc: u32][doc_bits: u8][tf_bits: u8]
+            // (`doc_bits` carries the codec id in its top two bits); the
+            // packed arrays follow.
             stream.write_u16::<LittleEndian>(count as u16)?;
             stream.write_u32::<LittleEndian>(base_doc_id)?;
-            stream.push(doc_id_bits);
-            stream.push(tf_bits);
-
-            // Write packed doc_id deltas ((count-1) values)
-            if count > 1 {
-                let rounded = simd::RoundedBitWidth::from_u8(doc_id_bits);
-                let byte_count = (count - 1) * rounded.bytes_per_value();
-                let start = stream.len();
-                stream.resize(start + byte_count, 0);
-                simd::pack_rounded(&deltas, rounded, &mut stream[start..]);
-            }
-
-            // Write packed TFs (count values)
-            {
-                let rounded = simd::RoundedBitWidth::from_u8(tf_bits);
-                let byte_count = count * rounded.bytes_per_value();
-                let start = stream.len();
-                stream.resize(start + byte_count, 0);
-                simd::pack_rounded(&tf_buf, rounded, &mut stream[start..]);
-            }
+            let header_at = stream.len();
+            stream.push(0);
+            stream.push(0);
+            let encoded = encode_block_arrays(codec, &deltas, &tf_buf, &mut stream);
+            stream[header_at] = encoded.doc_bits;
+            stream[header_at + 1] = encoded.tf_bits;
 
             // L0 skip entry with the block's bounds
             let block_min_len = length_of.map_or(1, |length_of| {
@@ -826,7 +1102,7 @@ impl BlockPostingList {
                 let (first_doc, last_doc, offset, word) = source.read_l0_entry(block_idx);
                 let (block_max_tf, block_min_len) = unpack_bounds(word, source.len_bounds);
                 let bounds = pack_bounds(block_max_tf, block_min_len.unwrap_or(1));
-                let blk_size = block_data_size(&source.stream, offset as usize);
+                let blk_size = source.block_len(block_idx);
                 let block_bytes = &source.stream[offset as usize..offset as usize + blk_size];
 
                 let count = u16::from_le_bytes(block_bytes[0..2].try_into().unwrap());
@@ -886,8 +1162,8 @@ impl BlockPostingList {
     /// Streaming merge: write blocks directly to output writer (bounded memory).
     ///
     /// **Zero-materializing**: reads L0 entries directly from source bytes
-    /// (mmap or &[u8]) without parsing into Vecs. Block sizes computed from
-    /// the 8-byte header (deterministic with packed encoding).
+    /// (mmap or &[u8]) without parsing into Vecs. Block sizes come from the
+    /// L0 offsets, so blocks of any codec are copied verbatim.
     ///
     /// Output L0 + L1 are buffered (bounded O(total_blocks × 16 + total_blocks/8 × 4)).
     /// Block data flows source → output writer without intermediate buffering.
@@ -951,8 +1227,9 @@ impl BlockPostingList {
                     out_cursors.extend_from_slice(&(cursor + positions_before).to_le_bytes());
                 }
 
-                // Compute block size from header
-                let blk_size = block_data_size(src_stream, offset as usize);
+                // Block size from the neighbouring L0 offset (codec-independent)
+                let blk_size =
+                    block_len_from_l0(&raw[l0_base..], meta.l0_count, meta.stream_len, i);
                 let block = &src_stream[offset as usize..offset as usize + blk_size];
 
                 // Write output L0 entry
@@ -1068,35 +1345,43 @@ impl BlockPostingList {
 
         let (_, _, offset, _) = self.read_l0_entry(block_idx);
         let pos = offset as usize;
-        let blk_size = block_data_size(&self.stream, pos);
+        let blk_size = self.block_len(block_idx);
         let block_data = &self.stream[pos..pos + blk_size];
 
-        // 8-byte header: [count: u16][first_doc: u32][doc_id_bits: u8][tf_bits: u8]
+        // 8-byte header: [count: u16][first_doc: u32][doc_bits: u8][tf_bits: u8]
         let count = u16::from_le_bytes(block_data[0..2].try_into().unwrap()) as usize;
         let first_doc = u32::from_le_bytes(block_data[2..6].try_into().unwrap());
-        let doc_id_bits = block_data[6];
+        let (codec, doc_width) = PostingCodec::from_header_byte(block_data[6]).ok()?;
 
         doc_ids.clear();
         doc_ids.resize(count, 0);
         doc_ids[0] = first_doc;
 
-        let doc_rounded = simd::RoundedBitWidth::from_u8(doc_id_bits);
+        let payload = &block_data[8..];
         let deltas_bytes = if count > 1 {
-            (count - 1) * doc_rounded.bytes_per_value()
+            match codec {
+                PostingCodec::Rounded => {
+                    let rounded = simd::RoundedBitWidth::from_u8(doc_width);
+                    let bytes = (count - 1) * rounded.bytes_per_value();
+                    simd::unpack_rounded(&payload[..bytes], rounded, &mut doc_ids[1..], count - 1);
+                    bytes
+                }
+                PostingCodec::Packed => {
+                    let bytes = packed_bytes(count - 1, doc_width);
+                    unpack_bits(&payload[..bytes], doc_width, &mut doc_ids[1..], count - 1);
+                    bytes
+                }
+                PostingCodec::Pfor => {
+                    let bytes = pfor_payload_len(payload, count - 1, doc_width).ok()?;
+                    unpack_pfor(&payload[..bytes], doc_width, &mut doc_ids[1..], count - 1).ok()?;
+                    bytes
+                }
+            }
         } else {
             0
         };
-
-        if count > 1 {
-            simd::unpack_rounded(
-                &block_data[8..8 + deltas_bytes],
-                doc_rounded,
-                &mut doc_ids[1..],
-                count - 1,
-            );
-            for i in 1..count {
-                doc_ids[i] += doc_ids[i - 1];
-            }
+        for i in 1..count {
+            doc_ids[i] = doc_ids[i].wrapping_add(doc_ids[i - 1]);
         }
 
         let tfs_start = 8 + deltas_bytes;
@@ -1113,19 +1398,56 @@ impl BlockPostingList {
         count: usize,
         tfs: &mut Vec<u32>,
     ) {
-        let blk_size = block_data_size(&self.stream, block_offset);
-        let block_data = &self.stream[block_offset..block_offset + blk_size];
+        let block_data = &self.stream[block_offset..];
+        let codec = PostingCodec::from_header_byte(block_data[6])
+            .map(|(codec, _)| codec)
+            .unwrap_or_default();
         let tf_bits = block_data[7];
-        let tf_rounded = simd::RoundedBitWidth::from_u8(tf_bits);
 
         tfs.clear();
         tfs.resize(count, 0);
-        simd::unpack_rounded(
-            &block_data[tf_start..tf_start + count * tf_rounded.bytes_per_value()],
-            tf_rounded,
-            tfs,
-            count,
-        );
+        let payload = &block_data[tf_start..];
+        match codec {
+            PostingCodec::Rounded => {
+                let rounded = simd::RoundedBitWidth::from_u8(tf_bits);
+                simd::unpack_rounded(
+                    &payload[..count * rounded.bytes_per_value()],
+                    rounded,
+                    tfs,
+                    count,
+                );
+            }
+            PostingCodec::Packed => {
+                unpack_bits(
+                    &payload[..packed_bytes(count, tf_bits)],
+                    tf_bits,
+                    tfs,
+                    count,
+                );
+            }
+            PostingCodec::Pfor => {
+                if let Ok(len) = pfor_payload_len(payload, count, tf_bits) {
+                    let _ = unpack_pfor(&payload[..len], tf_bits, tfs, count);
+                }
+            }
+        }
+    }
+
+    /// Byte length of block `block_idx` (from the L0 offsets).
+    #[inline]
+    fn block_len(&self, block_idx: usize) -> usize {
+        block_len_from_l0(&self.l0_bytes, self.l0_count, self.stream.len(), block_idx)
+    }
+
+    /// Codec of block `block_idx` (diagnostics).
+    pub fn block_codec(&self, block_idx: usize) -> Option<PostingCodec> {
+        if block_idx >= self.l0_count {
+            return None;
+        }
+        let (_, _, offset, _) = self.read_l0_entry(block_idx);
+        PostingCodec::from_header_byte(self.stream[offset as usize + 6])
+            .ok()
+            .map(|(codec, _)| codec)
     }
 
     /// First doc_id of a block (from L0 skip entry). Returns `None` if out of range.
@@ -1666,7 +1988,6 @@ mod tests {
         assert_eq!(postings[399].0, 1197); // last doc of seg1 (597+600)
         assert_eq!(postings[400].0, 1200); // first doc of seg2
         assert_eq!(postings[799].0, 2397); // last doc of seg3
-
         // Verify TFs preserved through two rounds of merging
         // Creation formula: tf = (i + seg * 7) % 10 + 1
         for seg in 0u32..4 {
@@ -1848,7 +2169,6 @@ mod tests {
     }
 
     // ── 2-level skip list format tests ──────────────────────────────────
-
     #[test]
     fn test_l0_l1_counts() {
         // 1 block (< L1_INTERVAL) → 1 L1 entry (partial group)
@@ -1883,7 +2203,6 @@ mod tests {
         let bpl = build_bpl(&docs);
         assert_eq!(bpl.num_blocks(), 20);
         assert_eq!(bpl.l1_docs.len(), 3); // ceil(20/8) = 3
-
         // L1[0] = last_doc of block 7 (end of first group)
         let expected_l1_0 = bpl.block_last_doc(7).unwrap();
         assert_eq!(bpl.l1_docs[0], expected_l1_0);
@@ -1969,34 +2288,127 @@ mod tests {
     }
 
     #[test]
-    fn test_block_data_size_helper() {
-        // Build a posting list and verify block_data_size matches actual block sizes
-        let docs: Vec<(u32, u32)> = (0..500u32).map(|i| (i * 7, (i % 20) + 1)).collect();
-        let bpl = build_bpl(&docs);
-
-        for blk in 0..bpl.num_blocks() {
-            let (_, _, offset, _) = bpl.read_l0_entry(blk);
-            let computed_size = block_data_size(&bpl.stream, offset as usize);
-
-            // Verify: next block's offset - this block's offset should equal computed_size
-            // (for all but last block)
-            if blk + 1 < bpl.num_blocks() {
-                let (_, _, next_offset, _) = bpl.read_l0_entry(blk + 1);
-                assert_eq!(
-                    computed_size,
-                    (next_offset - offset) as usize,
-                    "block_data_size mismatch at block {}",
-                    blk
-                );
-            } else {
-                // Last block: offset + size should equal stream length
-                assert_eq!(
-                    offset as usize + computed_size,
-                    bpl.stream.len(),
-                    "last block size mismatch"
-                );
-            }
+    fn block_len_matches_l0_offsets() {
+        // Block lengths derive from neighbouring L0 offsets and add up to the stream.
+        let bpl = build_bpl(&(0..1000).map(|i| (i * 3, 1 + i % 4)).collect::<Vec<_>>());
+        let mut total = 0usize;
+        for b in 0..bpl.num_blocks() {
+            let (_, _, offset, _) = bpl.read_l0_entry(b);
+            assert_eq!(offset as usize, total, "block {b} offset");
+            total += bpl.block_len(b);
         }
+        assert_eq!(total, bpl.stream.len());
+    }
+
+    /// Every codec round-trips doc ids and tfs exactly, `seek` agrees with
+    /// `Rounded`, and `Rounded` output is byte-identical to the historic
+    /// layout (codec id 0, widths 0/8/16/32).
+    #[test]
+    fn every_codec_round_trips_and_seeks() {
+        let mut postings: Vec<(u32, u32)> = Vec::new();
+        let mut doc = 0u32;
+        for i in 0..5000u32 {
+            // Mostly small gaps with rare huge ones (forces exceptions / wide
+            // blocks), tfs mostly 1-3 with rare outliers.
+            doc += if i % 97 == 0 { 100_000 } else { 1 + i % 7 };
+            let tf = if i % 131 == 0 { 5000 } else { 1 + i % 3 };
+            postings.push((doc, tf));
+        }
+        let mut list = PostingList::new();
+        for &(d, tf) in &postings {
+            list.push(d, tf);
+        }
+        let rounded = BlockPostingList::from_posting_list(&list).unwrap();
+        let mut sizes = Vec::new();
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+        ] {
+            let bpl = BlockPostingList::from_posting_list_with_codec(&list, codec).unwrap();
+            assert_eq!(collect_postings(&bpl), postings, "{codec}");
+            for b in 0..bpl.num_blocks() {
+                assert_eq!(bpl.block_codec(b), Some(codec));
+                assert_eq!(bpl.block_max_tf(b), rounded.block_max_tf(b));
+            }
+            // Serialized round trip (both copying and zero-copy paths).
+            let bytes = serialize_bpl(&bpl);
+            let back = BlockPostingList::deserialize(&bytes).unwrap();
+            assert_eq!(collect_postings(&back), postings, "{codec} deserialize");
+            let back =
+                BlockPostingList::deserialize_zero_copy(OwnedBytes::new(bytes.clone())).unwrap();
+            assert_eq!(collect_postings(&back), postings, "{codec} zero-copy");
+            // Seeks land on the same docs as the reference layout.
+            let mut a = rounded.iterator();
+            let mut b = back.iterator();
+            for target in (0..postings.last().unwrap().0 + 10).step_by(2_003) {
+                assert_eq!(a.seek(target), b.seek(target), "{codec} seek {target}");
+                assert_eq!(a.term_freq(), b.term_freq());
+            }
+            sizes.push((codec, bytes.len()));
+        }
+        let rounded_bytes = serialize_bpl(&rounded);
+        assert_eq!(
+            serialize_bpl(
+                &BlockPostingList::from_posting_list_with_codec(&list, PostingCodec::Rounded)
+                    .unwrap()
+            ),
+            rounded_bytes,
+            "Rounded must stay byte-identical"
+        );
+        // Header byte of a Rounded block: codec 0, rounded width.
+        assert!(matches!(rounded.stream[6], 0 | 8 | 16 | 32));
+        let size = |c: PostingCodec| sizes.iter().find(|(k, _)| *k == c).unwrap().1;
+        assert!(size(PostingCodec::Packed) < size(PostingCodec::Rounded));
+        assert!(size(PostingCodec::Pfor) < size(PostingCodec::Packed));
+    }
+
+    /// Blocks of different codecs merge by verbatim copy and decode correctly.
+    #[test]
+    fn mixed_codec_sources_concatenate() {
+        let a: Vec<(u32, u32)> = (0..300u32).map(|i| (i * 5, 1 + i % 9)).collect();
+        let b: Vec<(u32, u32)> = (0..300u32).map(|i| (i * 11 + 3, 2 + i % 5)).collect();
+        let list_a = {
+            let mut l = PostingList::new();
+            a.iter().for_each(|&(d, t)| l.push(d, t));
+            BlockPostingList::from_posting_list_with_codec(&l, PostingCodec::Pfor).unwrap()
+        };
+        let list_b = {
+            let mut l = PostingList::new();
+            b.iter().for_each(|&(d, t)| l.push(d, t));
+            BlockPostingList::from_posting_list_with_codec(&l, PostingCodec::Packed).unwrap()
+        };
+        let offset_b = a.last().unwrap().0 + 1;
+        let expected: Vec<(u32, u32)> = a
+            .iter()
+            .copied()
+            .chain(b.iter().map(|&(d, t)| (d + offset_b, t)))
+            .collect();
+
+        let merged = BlockPostingList::concatenate_blocks(&[
+            (list_a.clone(), 0),
+            (list_b.clone(), offset_b),
+        ])
+        .unwrap();
+        assert_eq!(collect_postings(&merged), expected);
+
+        let bytes_a = serialize_bpl(&list_a);
+        let bytes_b = serialize_bpl(&list_b);
+        let mut out = Vec::new();
+        let (docs, written) = BlockPostingList::concatenate_streaming(
+            &[(bytes_a.as_slice(), 0), (bytes_b.as_slice(), offset_b)],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(docs, 600);
+        assert_eq!(written, out.len());
+        let streamed = BlockPostingList::deserialize(&out).unwrap();
+        assert_eq!(collect_postings(&streamed), expected);
+        assert_eq!(streamed.block_codec(0), Some(PostingCodec::Pfor));
+        assert_eq!(
+            streamed.block_codec(streamed.num_blocks() - 1),
+            Some(PostingCodec::Packed)
+        );
     }
 
     #[test]

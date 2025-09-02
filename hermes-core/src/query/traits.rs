@@ -365,6 +365,18 @@ macro_rules! define_query_traits {
             fn bitset_cardinality_estimate(&self, _reader: &SegmentReader) -> Option<u64> {
                 None
             }
+
+            /// For a query that is a pure disjunction of sub-queries (a Boolean
+            /// query with only SHOULD clauses and no boost), the clauses.
+            ///
+            /// The boolean planner flattens these into the enclosing SHOULD
+            /// list: `OR(OR(a, b), c)` scores exactly like `OR(a, b, c)`, and
+            /// the flat form is eligible for MaxScore and filter push-down
+            /// where the nested form would be an opaque, top-k-truncated
+            /// sub-scorer.
+            fn should_children(&self) -> Option<&[std::sync::Arc<dyn Query>]> {
+                None
+            }
         }
 
         /// Scored document stream: a DocSet that also provides scores.
@@ -441,6 +453,10 @@ impl Query for Box<dyn Query> {
 
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<DocBitset> {
         (**self).as_doc_bitset(reader)
+    }
+
+    fn should_children(&self) -> Option<&[std::sync::Arc<dyn Query>]> {
+        (**self).should_children()
     }
 
     fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {

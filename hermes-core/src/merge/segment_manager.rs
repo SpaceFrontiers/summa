@@ -867,6 +867,10 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     directory: Arc<D>,
     /// Schema for segment operations
     schema: Arc<crate::dsl::Schema>,
+    /// Compression mode used for term dictionaries produced by merges.
+    optimization: crate::structures::IndexOptimization,
+    /// Posting codec used by new segments and merge re-encoding.
+    posting_codec: crate::structures::PostingCodec,
     /// Term cache blocks for segment readers during merge
     term_cache_blocks: usize,
     /// Hard concurrency limit for background merges. A semaphore permit is
@@ -1018,6 +1022,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             delete_fn,
             directory,
             schema,
+            optimization: crate::structures::IndexOptimization::default(),
+            posting_codec: crate::structures::PostingCodec::default(),
             term_cache_blocks,
             merge_permits: Arc::new(Semaphore::new(max_concurrent_merges.max(1))),
             global_merge_permits,
@@ -1028,6 +1034,18 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             background_reorder_pool,
             replacement_refresh: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Set the persisted text-index layout selected by `IndexConfig` (or by
+    /// an explicit `SegmentBuilderConfig` override).
+    pub fn with_posting_config(
+        mut self,
+        optimization: crate::structures::IndexOptimization,
+        posting_codec: crate::structures::PostingCodec,
+    ) -> Self {
+        self.optimization = optimization;
+        self.posting_codec = posting_codec;
+        self
     }
 
     pub(crate) fn set_replacement_refresh<F, Fut>(&self, refresh: F)
@@ -2051,6 +2069,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             ids,
             output_id,
             self.term_cache_blocks,
+            self.optimization,
+            self.posting_codec,
             trained.as_deref(),
             reorder_bmp,
             granularity,
@@ -2278,6 +2298,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         segment_ids_to_merge: &[String],
         output_segment_id: SegmentId,
         term_cache_blocks: usize,
+        optimization: crate::structures::IndexOptimization,
+        posting_codec: crate::structures::PostingCodec,
         trained: Option<&TrainedVectorStructures>,
         reorder_bmp: bool,
         granularity: crate::segment::reorder::BpGranularity,
@@ -2397,6 +2419,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         );
 
         let merger = SegmentMerger::new(Arc::clone(schema))
+            .with_posting_config(optimization, posting_codec)
             .with_bmp_reorder(reorder_bmp)
             .with_granularity(granularity)
             .with_bp_budget(crate::segment::BpBudget {
@@ -3775,6 +3798,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             self.bp_memory_budget_bytes,
             bp_budget,
             granularity,
+            self.optimization,
+            self.posting_codec,
             rayon_pool,
             Some(self.active_operations.cancellation_flag()),
         )

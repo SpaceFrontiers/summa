@@ -953,6 +953,8 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
     granularity: BpGranularity,
+    optimization: crate::structures::IndexOptimization,
+    posting_codec: crate::structures::PostingCodec,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(String, u32, bool)> {
@@ -1047,6 +1049,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
             &dst_files,
             schema,
             &text_plans,
+            (optimization, posting_codec),
             cancellation.as_deref(),
         )
         .await?;

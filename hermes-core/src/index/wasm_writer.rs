@@ -34,6 +34,14 @@ const DEFAULT_WASM_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
 /// Minimum docs before auto-flush (avoids tiny segments).
 const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
 
+fn default_builder_config(index_config: &IndexConfig) -> SegmentBuilderConfig {
+    SegmentBuilderConfig {
+        optimization: index_config.optimization,
+        posting_codec: index_config.effective_posting_codec(),
+        ..SegmentBuilderConfig::default()
+    }
+}
+
 /// Single-threaded IndexWriter for WASM targets.
 ///
 /// Documents are buffered in a `SegmentBuilder` and flushed to segments
@@ -55,7 +63,8 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Create a new index in the directory.
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
-        Self::create_with_config(directory, schema, config, SegmentBuilderConfig::default()).await
+        let builder_config = default_builder_config(&config);
+        Self::create_with_config(directory, schema, config, builder_config).await
     }
 
     /// Create a new index with custom builder config.
@@ -84,7 +93,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Open an existing index for writing.
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
-        Self::open_with_config(directory, config, SegmentBuilderConfig::default()).await
+        let builder_config = default_builder_config(&config);
+        Self::open_with_config(directory, config, builder_config).await
     }
 
     /// Open an existing index with custom builder config.
@@ -413,5 +423,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Number of documents in the current (uncommitted) builder.
     pub fn pending_docs(&self) -> u32 {
         self.builder.as_ref().map(|b| b.num_docs()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_builder_config;
+
+    #[test]
+    fn standard_builder_config_honors_index_posting_policy() {
+        let config = crate::index::IndexConfig {
+            optimization: crate::structures::IndexOptimization::SizeOptimized,
+            ..Default::default()
+        };
+        let builder = default_builder_config(&config);
+        assert_eq!(builder.optimization, config.optimization);
+        assert_eq!(builder.posting_codec, crate::structures::PostingCodec::Pfor);
     }
 }

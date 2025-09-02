@@ -987,3 +987,305 @@ async fn test_narrow_range_with_wide_must_not_term_returns_exact_docs() {
         "narrow range minus wide MUST_NOT term must return exactly the difference"
     );
 }
+
+// ── Filtered text MaxScore (filters pushed into the executor) ────────────
+
+/// 1000 docs with identical two-term text and a fast u64 `timestamp = i`.
+/// Every text query ties on score, so any post-filtering of a truncated
+/// window would keep only the lowest doc ids.
+async fn create_filtered_text_index() -> (
+    Index<crate::directories::MmapDirectory>,
+    crate::dsl::Field, // content (text)
+    crate::dsl::Field, // kind (text, fast) — "even" / "odd"
+    crate::dsl::Field, // timestamp (u64 fast)
+) {
+    use crate::directories::MmapDirectory;
+
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let dir = MmapDirectory::new(tmp_dir.path());
+
+    let mut sb = SchemaBuilder::default();
+    let content = sb.add_text_field("content", true, true);
+    let kind = sb.add_text_field("kind", true, true);
+    let timestamp = sb.add_u64_field("timestamp", false, true);
+    sb.set_fast(timestamp, true);
+    let schema = sb.build();
+
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    for i in 0u64..1000 {
+        let mut doc = Document::new();
+        // Docs 990..=999 carry an extra "gamma" so a required/excluded term
+        // has a selective posting list at the top of the id range.
+        if i >= 990 {
+            doc.add_text(content, "alpha beta gamma");
+        } else {
+            doc.add_text(content, "alpha beta");
+        }
+        doc.add_text(kind, if i % 2 == 0 { "even" } else { "odd" });
+        doc.add_u64(timestamp, i);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    assert_eq!(index.num_docs().await.unwrap(), 1000);
+    (index, content, kind, timestamp)
+}
+
+fn doc_ids(results: &crate::query::SearchResponse) -> HashSet<u32> {
+    results.hits.iter().map(|h| h.address.doc_id).collect()
+}
+
+/// Two-term text SHOULD + a range MUST matching 5 of 1000 docs at the top of
+/// the id range: the filter must be applied inside MaxScore, not to a
+/// truncated top-2k window (which held docs 0..19 and returned nothing).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_text_should_with_selective_range_must_returns_all_matches() {
+    let (index, content, _kind, timestamp) = create_filtered_text_index().await;
+
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(timestamp, Some(995), Some(999)))
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    let results = index.search(&q, 10).await.unwrap();
+    assert_eq!(doc_ids(&results), (995u32..=999).collect::<HashSet<_>>());
+
+    // Enough matches to fill the window: exactly `limit` hits, all in range.
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(timestamp, Some(900), Some(999)))
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    let results = index.search(&q, 10).await.unwrap();
+    assert_eq!(results.hits.len(), 10);
+    assert!(doc_ids(&results).iter().all(|&d| (900..=999).contains(&d)));
+}
+
+/// SHOULD text + MUST_NOT range only (no MUST): previously fell to the
+/// exhaustive BooleanScorer; now the negated predicate is pushed into
+/// MaxScore. Excluding 0..=994 must leave exactly 995..=999.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_text_should_with_must_not_range_excludes_inside_executor() {
+    let (index, content, _kind, timestamp) = create_filtered_text_index().await;
+
+    let q = BooleanQuery::new()
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"))
+        .must_not(RangeQuery::u64(timestamp, None, Some(994)));
+    let results = index.search(&q, 10).await.unwrap();
+    assert_eq!(doc_ids(&results), (995u32..=999).collect::<HashSet<_>>());
+}
+
+/// MUST text term (no fast column) is a scoring requirement: its docs
+/// (990..=999) drive the result, the SHOULD terms add their BM25 — so every
+/// hit scores strictly higher than the same query without the requirement —
+/// and a required term absent from the index matches nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_text_should_with_required_text_term_scores_and_filters() {
+    let (index, content, _kind, _ts) = create_filtered_text_index().await;
+
+    let filtered = BooleanQuery::new()
+        .must(TermQuery::text(content, "gamma"))
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    let results = index.search(&filtered, 20).await.unwrap();
+    assert_eq!(doc_ids(&results), (990u32..=999).collect::<HashSet<_>>());
+
+    let unfiltered = BooleanQuery::new()
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    let base = index.search(&unfiltered, 20).await.unwrap();
+    let base_top = base.hits[0].score;
+    for hit in &results.hits {
+        assert!(
+            hit.score > base_top,
+            "required term must add its BM25: {} <= {}",
+            hit.score,
+            base_top
+        );
+    }
+
+    // A required term that exists nowhere matches nothing.
+    let none = BooleanQuery::new()
+        .must(TermQuery::text(content, "zeta"))
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    assert!(index.search(&none, 20).await.unwrap().hits.is_empty());
+}
+
+/// Lucene semantics for a scoring MUST: SHOULD is optional. Requiring "gamma"
+/// with a SHOULD that matches nothing still returns every "gamma" doc, and a
+/// SHOULD that matches only some of them ranks those first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_required_text_term_keeps_docs_without_should_match() {
+    let (index, content, kind, timestamp) = create_filtered_text_index().await;
+
+    let q = BooleanQuery::new()
+        .must(TermQuery::text(content, "gamma"))
+        .should(TermQuery::text(content, "zeta"));
+    let results = index.search(&q, 20).await.unwrap();
+    assert_eq!(doc_ids(&results), (990u32..=999).collect::<HashSet<_>>());
+
+    let q = BooleanQuery::new()
+        .must(TermQuery::text(content, "gamma"))
+        .must(RangeQuery::u64(timestamp, Some(994), Some(999)))
+        .should(TermQuery::text(kind, "even"));
+    let results = index.search(&q, 20).await.unwrap();
+    assert_eq!(doc_ids(&results), (994u32..=999).collect::<HashSet<_>>());
+    for hit in &results.hits[..3] {
+        assert_eq!(
+            hit.address.doc_id % 2,
+            0,
+            "even docs match SHOULD and rank first"
+        );
+    }
+}
+
+/// MUST_NOT text term on the SHOULD field is an excluded cursor: dropping
+/// "gamma" removes exactly 990..=999 and the window fills from the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_text_should_with_excluded_text_term() {
+    let (index, content, _kind, timestamp) = create_filtered_text_index().await;
+
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(timestamp, Some(985), Some(999)))
+        .must_not(TermQuery::text(content, "gamma"))
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    let results = index.search(&q, 20).await.unwrap();
+    assert_eq!(doc_ids(&results), (985u32..=989).collect::<HashSet<_>>());
+}
+
+/// MUST term on another text field (no fast column) is a requirement that
+/// drives; the range filter and the SHOULD terms apply on top: "odd" ∧
+/// 990..=999, exact, no truncation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_text_should_with_must_term_on_other_field() {
+    let (index, content, kind, timestamp) = create_filtered_text_index().await;
+
+    let q = BooleanQuery::new()
+        .must(TermQuery::text(kind, "odd"))
+        .must(RangeQuery::u64(timestamp, Some(990), Some(999)))
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    let results = index.search(&q, 20).await.unwrap();
+    let expected: HashSet<u32> = (990u32..=999).filter(|d| d % 2 == 1).collect();
+    assert_eq!(doc_ids(&results), expected);
+}
+
+/// Multi-field SHOULD (content + kind) with a selective range MUST: each
+/// per-field executor gets the filter, and the union is exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_multi_field_text_should_with_range_must() {
+    let (index, content, kind, timestamp) = create_filtered_text_index().await;
+
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(timestamp, Some(995), Some(999)))
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"))
+        .should(TermQuery::text(kind, "even"));
+    let results = index.search(&q, 10).await.unwrap();
+    assert_eq!(doc_ids(&results), (995u32..=999).collect::<HashSet<_>>());
+    // Even docs match one more clause and must rank first.
+    assert!(results.hits[0].address.doc_id % 2 == 0);
+    assert!(results.hits[1].address.doc_id % 2 == 0);
+}
+
+/// Per-field top-k truncation is not exact for multi-field SHOULD scoring: a
+/// document can rank below the local cutoff in every field but win after its
+/// field scores are summed. Filter push-down must preserve that winner.
+#[tokio::test]
+async fn test_filtered_multi_field_text_uses_global_score_before_topk() {
+    use crate::directories::RamDirectory;
+
+    let mut schema = SchemaBuilder::default();
+    let left = schema.add_text_field("left", true, false);
+    let right = schema.add_text_field("right", true, false);
+    let filter = schema.add_u64_field("filter", false, false);
+    schema.set_fast(filter, true);
+    let schema = schema.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+
+    let field_text = |needle_count: usize, salt: usize| {
+        let mut tokens = vec!["needle".to_string(); needle_count];
+        tokens.extend((needle_count..20).map(|i| format!("f{salt}x{i}")));
+        tokens.join(" ")
+    };
+    for doc_id in 0..5usize {
+        let (left_tf, right_tf) = match doc_id {
+            0 | 1 => (10, 0),
+            2 | 3 => (0, 10),
+            _ => (2, 2),
+        };
+        let mut doc = Document::new();
+        doc.add_text(left, field_text(left_tf, doc_id * 2));
+        doc.add_text(right, field_text(right_tf, doc_id * 2 + 1));
+        doc.add_u64(filter, 1);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+
+    let query = BooleanQuery::new()
+        .must(RangeQuery::u64(filter, Some(1), Some(1)))
+        .should(TermQuery::text(left, "needle"))
+        .should(TermQuery::text(right, "needle"));
+    let results = index.search(&query, 1).await.unwrap();
+    assert_eq!(results.hits.len(), 1, "{results:?}");
+    assert_eq!(
+        results.hits[0].address.doc_id, 4,
+        "the moderate score from both fields must beat a high score from only one: {results:?}"
+    );
+}
+
+/// A nested pure-SHOULD Boolean (the server's multi-token match shape) is
+/// flattened into the outer SHOULD list, so the filter still reaches the
+/// executor instead of a truncated opaque sub-scorer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_nested_should_boolean_is_flattened_for_filters() {
+    let (index, content, _kind, timestamp) = create_filtered_text_index().await;
+
+    let inner = BooleanQuery::new()
+        .should(TermQuery::text(content, "alpha"))
+        .should(TermQuery::text(content, "beta"));
+    let q = BooleanQuery::new()
+        .must(RangeQuery::u64(timestamp, Some(995), Some(999)))
+        .should(inner);
+    let results = index.search(&q, 10).await.unwrap();
+    assert_eq!(doc_ids(&results), (995u32..=999).collect::<HashSet<_>>());
+}
+
+/// A prefix of the lexicographically smallest term of the segment sorts
+/// before the first term-dictionary block key; the scan must still start at
+/// block 0 ("al" is a prefix of "alpha", the smallest term).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prefix_query_matches_prefix_of_smallest_term() {
+    let (index, content, _kind, _ts) = create_filtered_text_index().await;
+
+    let al = index
+        .search(&PrefixQuery::text(content, "al"), 2000)
+        .await
+        .unwrap();
+    assert_eq!(
+        al.hits.len(),
+        1000,
+        "prefix of the smallest term lost its matches"
+    );
+    let be = index
+        .search(&PrefixQuery::text(content, "be"), 2000)
+        .await
+        .unwrap();
+    assert_eq!(be.hits.len(), 1000);
+    let none = index
+        .search(&PrefixQuery::text(content, "aa"), 2000)
+        .await
+        .unwrap();
+    assert!(none.hits.is_empty());
+}

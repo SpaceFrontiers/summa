@@ -62,6 +62,7 @@ pub use postings::{
     PositionStream,
     PositionStreamEncoder,
     Posting,
+    PostingCodec,
     PostingFormat,
     PostingList,
     PostingListIterator,

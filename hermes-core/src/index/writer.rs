@@ -99,6 +99,8 @@ fn hard_flush_threshold(memory_budget: usize) -> usize {
 fn default_builder_config(index_config: &IndexConfig) -> SegmentBuilderConfig {
     SegmentBuilderConfig {
         num_compression_threads: index_config.num_compression_threads,
+        optimization: index_config.optimization,
+        posting_codec: index_config.effective_posting_codec(),
         ..SegmentBuilderConfig::default()
     }
 }
@@ -709,8 +711,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
         let metadata = super::IndexMetadata::new((*schema).clone());
 
+        // A custom builder config is authoritative for the physical text
+        // layout, including merge re-encoding and the metadata compatibility
+        // gate.
+        let mut segment_config = config.clone();
+        segment_config.optimization = builder_config.optimization;
+        segment_config.posting_codec = Some(builder_config.posting_codec);
         let segment_manager =
-            super::segment_manager_from_config(&directory, &schema, metadata, &config);
+            super::segment_manager_from_config(&directory, &schema, metadata, &segment_config);
         segment_manager.update_metadata(|_| {}).await?;
 
         Ok(Self::new_with_parts(
@@ -756,8 +764,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());
 
+        // See `create_with_config`: custom builders define the on-disk layout.
+        let mut segment_config = config.clone();
+        segment_config.optimization = builder_config.optimization;
+        segment_config.posting_codec = Some(builder_config.posting_codec);
         let segment_manager =
-            super::segment_manager_from_config(&directory, &schema, metadata, &config);
+            super::segment_manager_from_config(&directory, &schema, metadata, &segment_config);
         let swept = segment_manager.cleanup_orphan_segments().await?;
         if swept > 0 {
             log::warn!(

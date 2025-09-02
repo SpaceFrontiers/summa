@@ -62,6 +62,11 @@ pub struct SegmentBuilderConfig {
     pub interner_capacity: usize,
     /// Initial capacity for posting lists hashmap
     pub posting_map_capacity: usize,
+    /// Term-dictionary compression / bloom configuration (from the index
+    /// optimization mode).
+    pub optimization: crate::structures::IndexOptimization,
+    /// Posting block codec (`docs/posting-codecs.md`).
+    pub posting_codec: crate::structures::PostingCodec,
 }
 
 impl Default for SegmentBuilderConfig {
@@ -78,6 +83,8 @@ impl Default for SegmentBuilderConfig {
             num_compression_threads: 1,
             interner_capacity: 1_000_000,
             posting_map_capacity: 500_000,
+            optimization: crate::structures::IndexOptimization::default(),
+            posting_codec: crate::structures::PostingCodec::default(),
         }
     }
 }

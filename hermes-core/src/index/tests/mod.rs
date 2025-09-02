@@ -4,6 +4,7 @@ mod boolean;
 mod chunked;
 mod merge;
 mod pin;
+mod posting_codecs;
 mod primary_key;
 mod range;
 mod search;

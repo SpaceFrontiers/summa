@@ -234,6 +234,32 @@ pub struct ChunkMap {
     lengths: OwnedBytes,
     num_chunks: u32,
     total_tokens: u64,
+    /// Nominal chunk length: the 90th-percentile chunk length of the field in
+    /// this segment. BM25 floors every chunk length at this value so a short
+    /// tail chunk is not rewarded for being short (`docs/chunked-bm25.md`).
+    length_floor: u32,
+}
+
+/// 90th-percentile of a little-endian `u16` length column (0 when empty).
+fn nominal_chunk_length(lengths: &[u8]) -> u32 {
+    let n = lengths.len() / 2;
+    if n == 0 {
+        return 0;
+    }
+    let mut histogram = vec![0u32; u16::MAX as usize + 1];
+    for pair in lengths.chunks_exact(2) {
+        histogram[u16::from_le_bytes([pair[0], pair[1]]) as usize] += 1;
+    }
+    // Smallest length such that at least 90 % of the chunks are ≤ it.
+    let target = (n as u64 * 9).div_ceil(10);
+    let mut seen = 0u64;
+    for (len, &count) in histogram.iter().enumerate() {
+        seen += u64::from(count);
+        if seen >= target {
+            return len as u32;
+        }
+    }
+    u16::MAX as u32
 }
 
 impl ChunkMap {
@@ -255,6 +281,19 @@ impl ChunkMap {
         } else {
             (self.total_tokens as f64 / f64::from(self.num_chunks)) as f32
         }
+    }
+
+    /// Nominal chunk length (90th percentile), the BM25 length floor.
+    #[inline]
+    pub fn length_floor(&self) -> u32 {
+        self.length_floor
+    }
+
+    /// BM25 length of virtual id `vid`: its token count floored at the
+    /// nominal chunk length.
+    #[inline]
+    pub fn bm25_length(&self, vid: u32) -> u32 {
+        self.length(vid).max(self.length_floor)
     }
 
     /// Document owning virtual id `vid`.
@@ -375,6 +414,7 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                 let doc_ids = bytes.slice(offset..offset + n * 4);
                 let ordinals = bytes.slice(offset + n * 4..offset + n * 6);
                 let lengths = bytes.slice(offset + n * 6..end);
+                let length_floor = nominal_chunk_length(lengths.as_slice());
                 file.chunk_maps.insert(
                     field_id,
                     ChunkMap {
@@ -383,6 +423,7 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                         lengths,
                         num_chunks: count,
                         total_tokens,
+                        length_floor,
                     },
                 );
             }

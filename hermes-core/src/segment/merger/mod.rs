@@ -284,6 +284,12 @@ pub(crate) async fn append_and_delete_temp<D: DirectoryWriter>(
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
+    /// Term-dictionary compression settings used for the merged segment.
+    optimization: crate::structures::IndexOptimization,
+    /// Codec used whenever a merge must decode and re-encode postings.
+    /// External blocks still take the zero-copy concatenation path and retain
+    /// their per-block codecs.
+    posting_codec: crate::structures::PostingCodec,
     /// Run BP reordering on BMP sparse fields while writing the merged blob
     /// (instead of byte-level block stacking). The output segment is then
     /// already ordered, so the standalone reorder pass is unnecessary.
@@ -318,6 +324,8 @@ impl SegmentMerger {
     pub fn new(schema: Arc<Schema>) -> Self {
         Self {
             schema,
+            optimization: crate::structures::IndexOptimization::default(),
+            posting_codec: crate::structures::PostingCodec::default(),
             reorder_bmp: false,
             background_pool: None,
             granularity: crate::segment::reorder::BpGranularity::Auto,
@@ -327,6 +335,18 @@ impl SegmentMerger {
             reorder_permits: None,
             reorder_priority: ReorderPriority::AutomaticMerge,
         }
+    }
+
+    /// Configure term-dictionary compression and posting re-encoding for the
+    /// output segment.
+    pub fn with_posting_config(
+        mut self,
+        optimization: crate::structures::IndexOptimization,
+        posting_codec: crate::structures::PostingCodec,
+    ) -> Self {
+        self.optimization = optimization;
+        self.posting_codec = posting_codec;
+        self
     }
 
     /// Enable BP reordering of BMP fields during the merge (see `reorder_bmp`).

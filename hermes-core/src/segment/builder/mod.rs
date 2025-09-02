@@ -1461,6 +1461,8 @@ impl SegmentBuilder {
         #[cfg(feature = "native")]
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
+        let optimization = self.config.optimization;
+        let posting_codec = self.config.posting_codec;
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
         let binary_dense_vectors = std::mem::take(&mut self.binary_dense_vectors);
         let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
@@ -1528,6 +1530,7 @@ impl SegmentBuilder {
                                     &length_lookup,
                                     &mut term_dict_writer,
                                     &mut postings_writer,
+                                    (optimization, posting_codec),
                                     spill_arg,
                                 )
                             },
@@ -1595,6 +1598,7 @@ impl SegmentBuilder {
                 &length_lookup,
                 &mut term_dict_writer,
                 &mut postings_writer,
+                (optimization, posting_codec),
             )?;
             store::build_store_streaming_from_buffer(
                 &self.store_buffer,

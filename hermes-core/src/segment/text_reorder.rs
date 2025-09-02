@@ -32,8 +32,8 @@ use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::segment::{OffsetWriter, SegmentMerger};
 use crate::structures::{
-    BlockPostingList, PositionStreamEncoder, PostingList, SSTableWriter, TERMINATED, TermInfo,
-    TermPositions,
+    BlockPostingList, PositionStreamEncoder, PostingCodec, PostingList, SSTableWriter, TERMINATED,
+    TermInfo, TermPositions,
 };
 
 /// Minimum partition of the bisection: one posting block, the pruning unit.
@@ -285,8 +285,10 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
     dst_files: &SegmentFiles,
     schema: &Arc<Schema>,
     plans: &[TextReorderPlan],
+    posting_config: (crate::structures::IndexOptimization, PostingCodec),
     cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    let (optimization, posting_codec) = posting_config;
     let started = std::time::Instant::now();
     let by_field: FxHashMap<u32, &TextReorderPlan> =
         plans.iter().map(|plan| (plan.field.0, plan)).collect();
@@ -302,13 +304,17 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
         );
     }
 
-    let merger = SegmentMerger::new(Arc::clone(schema));
+    let merger =
+        SegmentMerger::new(Arc::clone(schema)).with_posting_config(optimization, posting_codec);
     let mut postings_out = OffsetWriter::new(dir.streaming_writer_cold(&dst_files.postings).await?);
     let mut positions_out =
         OffsetWriter::new(dir.streaming_writer_cold(&dst_files.positions).await?);
     let mut term_dict_out =
         OffsetWriter::new(dir.streaming_writer_cold(&dst_files.term_dict).await?);
-    let mut term_dict = SSTableWriter::<&mut OffsetWriter, TermInfo>::new(&mut term_dict_out);
+    let mut term_dict = SSTableWriter::<&mut OffsetWriter, TermInfo>::with_config(
+        &mut term_dict_out,
+        crate::structures::SSTableWriterConfig::from_optimization(optimization),
+    );
     let mut buf: Vec<u8> = Vec::new();
     let mut sources: Vec<(usize, TermInfo, u32)> = Vec::with_capacity(1);
     let mut terms = 0usize;
@@ -335,6 +341,7 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
                     &mut postings_out,
                     &mut positions_out,
                     &mut buf,
+                    posting_codec,
                 )
                 .await?
             }
@@ -435,6 +442,7 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
 /// Rewrite one term of a planned field: postings sorted by the new virtual
 /// ids, positions re-encoded in that order, block bounds from the new
 /// lengths.
+#[allow(clippy::too_many_arguments)]
 async fn reorder_term(
     reader: &SegmentReader,
     info: &TermInfo,
@@ -443,6 +451,7 @@ async fn reorder_term(
     postings_out: &mut OffsetWriter,
     positions_out: &mut OffsetWriter,
     buf: &mut Vec<u8>,
+    posting_codec: PostingCodec,
 ) -> Result<TermInfo> {
     // (new vid, tf, positions of the old vid)
     let mut entries: Vec<(u32, u32, Vec<u32>)> = Vec::new();
@@ -503,7 +512,12 @@ async fn reorder_term(
         return Ok(inline);
     }
     let length_of = |vid: u32| new_lengths.get(vid as usize).copied().unwrap_or(1);
-    let block = BlockPostingList::from_posting_list_with(&list, has_positions, Some(&length_of))?;
+    let block = BlockPostingList::from_posting_list_with_options(
+        &list,
+        has_positions,
+        Some(&length_of),
+        posting_codec,
+    )?;
     buf.clear();
     block.serialize(buf)?;
     let posting_offset = postings_out.offset();

@@ -353,8 +353,14 @@ pub struct IndexConfig {
     pub vector_training_memory_bytes: usize,
     /// Merge policy for background segment merging
     pub merge_policy: Box<dyn crate::merge::MergePolicy>,
-    /// Index optimization mode (adaptive, size-optimized, performance-optimized)
+    /// Index optimization mode (adaptive, size-optimized, performance-optimized).
+    /// Selects the term-dictionary compression level and, unless
+    /// `posting_codec` overrides it, the posting block codec
+    /// (`docs/posting-codecs.md`).
     pub optimization: crate::structures::IndexOptimization,
+    /// Explicit posting block codec; `None` derives it from `optimization`
+    /// (`size` → `Pfor`, everything else → `Rounded`).
+    pub posting_codec: Option<crate::structures::PostingCodec>,
     /// Reload interval in milliseconds for IndexReader (how often to check for new segments)
     pub reload_interval_ms: u64,
     /// Maximum number of concurrent background merges per index (default: 4)
@@ -518,6 +524,7 @@ impl Default for IndexConfig {
             // cannot hold slots indefinitely.
             merge_policy: Box::new(crate::merge::TieredMergePolicy::large_scale()),
             optimization: crate::structures::IndexOptimization::default(),
+            posting_codec: None,
             reload_interval_ms: 1000, // 1 second default
             max_concurrent_merges: 4,
             #[cfg(feature = "native")]
@@ -543,6 +550,14 @@ impl Default for IndexConfig {
     }
 }
 
+impl IndexConfig {
+    /// Posting block codec new segments and merges are written with.
+    pub fn effective_posting_codec(&self) -> crate::structures::PostingCodec {
+        self.posting_codec
+            .unwrap_or_else(|| self.optimization.default_posting_codec())
+    }
+}
+
 /// Build the segment-lifecycle owner from the corresponding index policy.
 ///
 /// `Index` and `IndexWriter` both support create/open entry points. Routing
@@ -555,19 +570,22 @@ fn segment_manager_from_config<D: crate::directories::DirectoryWriter + 'static>
     metadata: IndexMetadata,
     config: &IndexConfig,
 ) -> Arc<crate::merge::SegmentManager<D>> {
-    Arc::new(crate::merge::SegmentManager::new(
-        Arc::clone(directory),
-        Arc::clone(schema),
-        metadata,
-        config.merge_policy.clone_box(),
-        config.term_cache_blocks,
-        config.max_concurrent_merges,
-        Arc::clone(&config.background_merge_permits),
-        config.merge_bp_time_budget,
-        config.bp_memory_budget_bytes,
-        Arc::clone(&config.background_reorder_permits),
-        config.background_reorder_pool.clone(),
-    ))
+    Arc::new(
+        crate::merge::SegmentManager::new(
+            Arc::clone(directory),
+            Arc::clone(schema),
+            metadata,
+            config.merge_policy.clone_box(),
+            config.term_cache_blocks,
+            config.max_concurrent_merges,
+            Arc::clone(&config.background_merge_permits),
+            config.merge_bp_time_budget,
+            config.bp_memory_budget_bytes,
+            Arc::clone(&config.background_reorder_permits),
+            config.background_reorder_pool.clone(),
+        )
+        .with_posting_config(config.optimization, config.effective_posting_codec()),
+    )
 }
 
 /// Multi-segment async Index

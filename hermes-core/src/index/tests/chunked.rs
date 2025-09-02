@@ -5,8 +5,8 @@ use crate::directories::RamDirectory;
 use crate::dsl::{Document, Field, PositionMode, Schema, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
 use crate::query::{
-    BooleanQuery, FusionMethod, MultiValueCombiner, PhraseQuery, PrefixQuery, SearchResult,
-    SparseVectorQuery, TermQuery,
+    BooleanQuery, FusionMethod, MultiValueCombiner, PhraseQuery, PrefixQuery, RangeQuery,
+    SearchResult, SparseVectorQuery, TermQuery,
 };
 
 struct Fields {
@@ -187,6 +187,10 @@ async fn chunked_phrase_never_crosses_a_chunk_boundary() {
     assert_eq!(ordinals(by_doc(&results, 1)), vec![1]);
 }
 
+/// Chunk lengths normalise BM25 above the nominal chunk length (the 90th
+/// percentile of the field's chunk lengths) and are floored at it below
+/// (`docs/chunked-bm25.md`): a chunk far longer than nominal scores lower
+/// than a nominal chunk with the same `tf`; a shorter one scores the same.
 #[tokio::test]
 async fn chunked_bm25_normalises_by_real_chunk_length() {
     let f = chunked_schema();
@@ -194,24 +198,42 @@ async fn chunked_bm25_normalises_by_real_chunk_length() {
     let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
         .await
         .unwrap();
-    let long = format!("needle {}", "filler ".repeat(40));
-    writer.add_document(doc(&f, "article", &[&long])).unwrap();
+    // Nine nominal chunks of 10 tokens establish the nominal length.
+    for i in 0..9 {
+        let nominal = format!(
+            "needle {}",
+            (0..9)
+                .map(|j| format!("n{i}x{j}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        writer
+            .add_document(doc(&f, "article", &[&nominal]))
+            .unwrap();
+    }
+    let long = format!("needle {}", "filler ".repeat(200));
+    writer.add_document(doc(&f, "article", &[&long])).unwrap(); // doc 9
     writer
-        .add_document(doc(&f, "article", &["needle filler filler"]))
-        .unwrap();
+        .add_document(doc(&f, "article", &["needle short"]))
+        .unwrap(); // doc 10
     writer.commit().await.unwrap();
 
     let index = open(dir).await;
     let reader = index.reader().await.unwrap();
     let searcher = reader.searcher().await.unwrap();
     let (results, _) = searcher
-        .search_with_positions(&TermQuery::text(f.content, "needle"), 10)
+        .search_with_positions(&TermQuery::text(f.content, "needle"), 20)
         .await
         .unwrap();
-    assert_eq!(results.len(), 2);
+    assert_eq!(results.len(), 11);
+    let nominal = by_doc(&results, 0).score;
     assert!(
-        by_doc(&results, 1).score > by_doc(&results, 0).score,
-        "same tf, shorter chunk must score higher: {results:?}"
+        by_doc(&results, 9).score < nominal,
+        "same tf, chunk longer than nominal must score lower: {results:?}"
+    );
+    assert!(
+        (by_doc(&results, 10).score - nominal).abs() < 1e-5,
+        "same tf, chunk shorter than nominal scores like a nominal one: {results:?}"
     );
 }
 
@@ -617,7 +639,7 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
     // The new documents change idf and average length, so compare the
     // matched documents (and, for the exact-match queries, their ordinals)
     // rather than scores.
-    let merged = snapshot(&open(dir).await, &queries, number).await;
+    let merged = snapshot(&open(dir.clone()).await, &queries, number).await;
     for (i, (a, b)) in after.iter().zip(&merged).enumerate() {
         let a: Vec<(u64, Vec<u32>)> = a.iter().map(|(d, _, o)| (*d, o.clone())).collect();
         let b: Vec<(u64, Vec<u32>)> = b
@@ -633,11 +655,18 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
         }
         assert_eq!(a, b, "query {i}");
     }
-    assert!(
-        merged[0].iter().any(|(d, _, _)| *d >= 600),
-        "{:?}",
-        merged[0]
-    );
+    // The short-tail length floor deliberately removes the old ranking boost
+    // for the new two-token chunks, so they need not enter an unfiltered
+    // top-50 dominated by repeated terms in the older six-token chunks.
+    // Address them through a range filter to verify the merged postings and
+    // chunk map contain every newly appended document.
+    let new_docs = BooleanQuery::new()
+        .must(RangeQuery::u64(number, Some(600), Some(639)))
+        .should(TermQuery::text(content, "quantum"))
+        .should(TermQuery::text(content, "photon"))
+        .should(TermQuery::text(content, "kernel"));
+    let response = open(dir).await.search(&new_docs, 50).await.unwrap();
+    assert_eq!(response.hits.len(), 40, "{response:?}");
 }
 
 #[tokio::test]
@@ -663,4 +692,87 @@ async fn chunked_field_rejects_prefix_queries_loudly() {
         error.to_string().contains("chunked"),
         "prefix on a chunked field must fail with an actionable message: {error}"
     );
+}
+
+/// A short tail chunk is scored with the length floored at the average chunk
+/// length (`docs/chunked-bm25.md`): with the same `tf` it must not outrank a
+/// full-length chunk, and its score must equal the full chunk's.
+#[tokio::test]
+async fn chunked_short_tail_chunk_is_not_rewarded() {
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    let full = |i: usize| {
+        let mut words = vec!["needle".to_string()];
+        for j in 0..99 {
+            words.push(format!("w{i}x{j}"));
+        }
+        words.join(" ")
+    };
+    // doc 0: two full chunks, the needle in the second.
+    writer
+        .add_document(doc(
+            &f,
+            "a",
+            &[&full(0).replace("needle", "blank"), &full(1)],
+        ))
+        .unwrap();
+    // doc 1: one full chunk without the needle and a 4-token tail with it.
+    writer
+        .add_document(doc(
+            &f,
+            "b",
+            &[&full(2).replace("needle", "blank"), "needle tail end here"],
+        ))
+        .unwrap();
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+
+    let results = index
+        .search(&TermQuery::text(f.content, "needle"), 10)
+        .await
+        .unwrap();
+    assert_eq!(results.hits.len(), 2, "{results:?}");
+    let a = by_doc_hits(&results.hits, 0);
+    let b = by_doc_hits(&results.hits, 1);
+    assert!(
+        (a - b).abs() < 1e-5,
+        "tail chunk (len 4) must score like a full chunk: full={a} tail={b}"
+    );
+}
+
+/// Boolean exclusion stays document-scoped even though chunked postings use
+/// virtual chunk ids: a forbidden term in a different chunk must still remove
+/// the whole document.
+#[tokio::test]
+async fn chunked_must_not_excludes_a_match_from_another_chunk() {
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    writer
+        .add_document(doc(&f, "a", &["needle lives here", "forbidden elsewhere"]))
+        .unwrap();
+    writer
+        .add_document(doc(&f, "b", &["needle lives here", "clean elsewhere"]))
+        .unwrap();
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+
+    let query = BooleanQuery::new()
+        .should(TermQuery::text(f.content, "needle"))
+        .must_not(TermQuery::text(f.content, "forbidden"));
+    let results = index.search(&query, 10).await.unwrap();
+    assert_eq!(results.hits.len(), 1, "{results:?}");
+    assert_eq!(results.hits[0].address.doc_id, 1, "{results:?}");
+}
+
+fn by_doc_hits(hits: &[crate::query::SearchHit], doc_id: u32) -> f32 {
+    hits.iter()
+        .find(|h| h.address.doc_id == doc_id)
+        .unwrap_or_else(|| panic!("doc {doc_id} missing"))
+        .score
 }

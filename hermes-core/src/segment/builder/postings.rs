@@ -180,6 +180,7 @@ pub(super) type SpillIndex = HashMap<TermKey, Vec<(u64, u32)>>;
 ///
 /// When `spill_reader` is provided, large posting lists that were spilled to
 /// disk during indexing are loaded and merged with their in-memory tails.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_postings_streaming(
     inverted_index: HashMap<TermKey, PostingListBuilder>,
     term_interner: Rodeo,
@@ -187,11 +188,16 @@ pub(super) fn build_postings_streaming(
     lengths: &LengthLookup<'_>,
     term_dict_writer: &mut dyn Write,
     postings_writer: &mut dyn Write,
+    posting_config: (
+        crate::structures::IndexOptimization,
+        crate::structures::PostingCodec,
+    ),
     #[cfg(feature = "native")] spill_reader: Option<(
         &mut std::io::BufReader<std::fs::File>,
         &SpillIndex,
     )>,
 ) -> Result<()> {
+    let (optimization, posting_codec) = posting_config;
     // Phase 0 (native only): Load spilled postings back into PostingListBuilders.
     // Spilled data (sorted by doc_id) is prepended before in-memory tail.
     #[cfg(feature = "native")]
@@ -304,10 +310,11 @@ pub(super) fn build_postings_streaming(
         // block records the shortest scoring unit it covers for its bound.
         let field_id = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
         let length_of = |id: u32| lengths.length(field_id, id);
-        let block_list = crate::structures::BlockPostingList::from_posting_list_with(
+        let block_list = crate::structures::BlockPostingList::from_posting_list_with_options(
             &full_postings,
             has_positions,
             Some(&length_of),
+            posting_codec,
         )?;
         block_list.serialize(&mut posting_bytes)?;
         let result = SerializedPosting::External {
@@ -332,7 +339,10 @@ pub(super) fn build_postings_streaming(
 
     // Phase 3: Stream directly to writers (no intermediate Vec<u8> accumulation)
     let mut postings_offset = 0u64;
-    let mut writer = SSTableWriter::<_, TermInfo>::new(term_dict_writer);
+    let mut writer = SSTableWriter::<_, TermInfo>::with_config(
+        term_dict_writer,
+        crate::structures::SSTableWriterConfig::from_optimization(optimization),
+    );
 
     for (key, serialized_posting) in serialized {
         let term_info = match serialized_posting {

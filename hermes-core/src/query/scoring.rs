@@ -456,7 +456,7 @@ impl LengthSource<'_> {
     #[inline]
     pub fn length(&self, id: u32) -> u32 {
         match self {
-            LengthSource::Chunks(map) => map.length(id),
+            LengthSource::Chunks(map) => map.bm25_length(id),
             LengthSource::Docs(lengths) => lengths.length(id),
         }
     }

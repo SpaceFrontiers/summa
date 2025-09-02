@@ -157,6 +157,29 @@ impl BooleanQuery {
     }
 }
 
+/// Flatten nested pure-SHOULD Boolean queries into one SHOULD list.
+///
+/// `OR(OR(a, b), c)` scores exactly like `OR(a, b, c)`, and only the flat
+/// form reaches MaxScore and filter push-down. The nested form would be an
+/// opaque sub-scorer whose top-k truncation can hide matches from the outer
+/// query.
+fn flatten_should(should: &[Arc<dyn Query>]) -> std::borrow::Cow<'_, [Arc<dyn Query>]> {
+    if !should.iter().any(|query| query.should_children().is_some()) {
+        return std::borrow::Cow::Borrowed(should);
+    }
+
+    fn push_flat(out: &mut Vec<Arc<dyn Query>>, query: &Arc<dyn Query>) {
+        match query.should_children() {
+            Some(children) => children.iter().for_each(|child| push_flat(out, child)),
+            None => out.push(Arc::clone(query)),
+        }
+    }
+
+    let mut flat = Vec::with_capacity(should.len());
+    should.iter().for_each(|query| push_flat(&mut flat, query));
+    std::borrow::Cow::Owned(flat)
+}
+
 /// Build a SHOULD-only scorer from a vec of optimized scorers.
 fn build_should_scorer<'a>(scorers: Vec<Box<dyn Scorer + 'a>>) -> Box<dyn Scorer + 'a> {
     if scorers.is_empty() {
@@ -194,7 +217,8 @@ macro_rules! boolean_plan {
      $scorer_fn:ident, $get_postings_fn:ident, $execute_fn:ident
      $(, $aw:tt)*) => {{
         let must: &[Arc<dyn Query>] = &$must;
-        let should_all: &[Arc<dyn Query>] = &$should;
+        let should_flat = flatten_should(&$should);
+        let should_all: &[Arc<dyn Query>] = &should_flat;
         let must_not: &[Arc<dyn Query>] = &$must_not;
         let global_stats: Option<&Arc<GlobalStats>> = $global_stats;
         let reader: &SegmentReader = $reader;
@@ -394,7 +418,7 @@ macro_rules! boolean_plan {
         // predicates carry no positions to lose and verifier scorers keep
         // theirs. Only the posting-list bitset shortcut is skipped when
         // positions are requested, because a bitset cannot report them.
-        if !should.is_empty() && !must.is_empty() {
+        if !should.is_empty() && (!must.is_empty() || !must_not.is_empty()) {
             // ── 3-text. Text SHOULD with materializable filters ──────────
             //
             // When every SHOULD clause is a text term and the MUST/MUST_NOT
@@ -429,11 +453,95 @@ macro_rules! boolean_plan {
                 }
                 all_text.then_some(groups)
             };
-            if let Some(groups) = text_groups
+            if must.iter().all(|query| {
+                query.is_filter()
+                    || query.as_doc_predicate(reader).is_some()
+                    || (!matches!(
+                        query.decompose(),
+                        super::QueryDecomposition::TextTerm(_)
+                    ) && query.as_doc_bitset(reader).is_some())
+            })
+                && let Some(groups) = text_groups
+                && (groups.len() == 1
+                    || ($proximity.is_none()
+                        && groups
+                            .iter()
+                            .all(|(field, _)| !reader.is_chunked_field(*field))))
                 && let Some(bitset) = build_combined_bitset(must, must_not, reader)
             {
                 let bitset = std::sync::Arc::new(bitset);
                 let single_field = groups.len() == 1;
+
+                // Scores from different fields are additive. Running a
+                // separate top-k per field and merging those windows is not
+                // exact: a document just below every local cutoff can still
+                // win after its field scores are summed. Non-chunked text
+                // fields share document ids, so put all of their cursors in
+                // one executor and apply the filter there.
+                if !single_field {
+                    let mut cursors = Vec::new();
+                    for (field, infos) in groups {
+                        let corpus_size = reader.text_corpus_size(field);
+                        let avg_field_len = global_stats
+                            .map(|stats| stats.avg_field_len(field))
+                            .unwrap_or_else(|| reader.avg_field_len(field));
+                        let params = super::Bm25Params::for_field(reader.schema(), field);
+                        let mut posting_lists = Vec::with_capacity(infos.len());
+                        let mut term_bytes = Vec::with_capacity(infos.len());
+                        for info in &infos {
+                            if let Some(postings) =
+                                reader.$get_postings_fn(field, &info.term) $(. $aw)* ?
+                            {
+                                let idf = compute_idf(
+                                    &postings,
+                                    field,
+                                    &info.term,
+                                    corpus_size,
+                                    global_stats,
+                                ) * info.weight;
+                                posting_lists.push((postings, idf));
+                                term_bytes.push(info.term.clone());
+                            }
+                        }
+                        cap_terms(&mut posting_lists, &mut term_bytes, $text_tuning.1);
+                        cursors.extend(posting_lists.into_iter().map(|(postings, idf)| {
+                            super::TermCursor::text_with_params(
+                                postings,
+                                idf,
+                                avg_field_len,
+                                reader.doc_lengths(field).map(super::LengthSource::Docs),
+                                params,
+                            )
+                        }));
+                    }
+
+                    let filter = bitset.clone();
+                    let predicate: super::DocPredicate<'_> =
+                        Box::new(move |doc_id| filter.contains(doc_id));
+                    let mut executor = super::MaxScoreExecutor::new(
+                        cursors,
+                        limit,
+                        $text_tuning.0,
+                    )
+                    .with_metric_labels(reader.schema().index_label(), "<multiple>")
+                    .with_predicate(predicate)
+                    .with_budget(scorer_options.shared_threshold.clone());
+                    if $text_tuning.0 <= 1.0 && scorer_options.initial_threshold > 0.0 {
+                        executor.seed_threshold(scorer_options.initial_threshold);
+                    }
+                    let results = executor.execute_sync()?;
+                    let found = results.len() as u32;
+                    let should_scorer: Box<dyn Scorer + '_> =
+                        Box::new(super::planner::TopKResultScorer::new(results));
+                    if !must.is_empty() && (found as usize) < limit && bitset.count() > found {
+                        return Ok(Box::new(super::planner::BitsetFillScorer::new(
+                            should_scorer,
+                            bitset,
+                        )));
+                    }
+                    return Ok(should_scorer);
+                }
+
                 let group_limit = if single_field {
                     limit
                 } else {
@@ -508,7 +616,11 @@ macro_rules! boolean_plan {
                     found
                 );
                 let should_scorer = build_should_scorer(scorers);
-                if complete && (found as usize) < limit && bitset.count() > found {
+                if !must.is_empty()
+                    && complete
+                    && (found as usize) < limit
+                    && bitset.count() > found
+                {
                     return Ok(Box::new(super::planner::BitsetFillScorer::new(
                         should_scorer,
                         bitset,
@@ -652,16 +764,10 @@ macro_rules! boolean_plan {
                 }
             }
 
-            // 3c. PredicatedScorer fallback. Filters can discard candidates,
-            // so use the same bounded candidate budget as other query paths.
-            let has_filters = !predicates.is_empty()
-                || !must_verifiers.is_empty()
-                || !must_not_verifiers.is_empty();
-            let should_limit = if has_filters {
-                super::max_candidate_limit(limit)
-            } else {
-                limit
-            };
+            // 3c. Generic fallback — never filter a truncated SHOULD window.
+            // Sparse retrieval keeps its combined candidate executor. Other
+            // query shapes use the individual SHOULD streams so filters and
+            // scoring requirements see the complete document streams.
             let mut should_options = scorer_options.without_threshold();
             if should_is_sparse {
                 // The outer decomposition built this plan from the complete
@@ -671,9 +777,11 @@ macro_rules! boolean_plan {
                 // and remain cleared.
                 should_options.lsp_plan = scorer_options.lsp_plan.clone();
             }
-            let should_scorer = if should.len() == 1 {
-                should[0].$scorer_fn(reader, should_limit, should_options) $(. $aw)* ?
-            } else {
+            let proximity_should = $proximity.is_some();
+            let combined_should = should.len() == 1 || should_is_sparse || proximity_should;
+            let should_scorer: Option<Box<dyn Scorer + '_>> = if should.len() == 1 {
+                Some(should[0].$scorer_fn(reader, limit, should_options.clone()) $(. $aw)* ?)
+            } else if should_is_sparse || proximity_should {
                 let sub = BooleanQuery {
                     must: Vec::new(),
                     should: should.to_vec(),
@@ -683,39 +791,81 @@ macro_rules! boolean_plan {
                     text_heap_factor: $text_tuning.0,
                     max_terms: $text_tuning.1,
                 };
-                sub.$scorer_fn(reader, should_limit, should_options) $(. $aw)* ?
+                // Proximity is a positive second-stage bonus. Preserve the
+                // complete SHOULD stream before applying outer requirements;
+                // a bounded BM25-only window can omit the document whose
+                // proximity bonus would promote it. Chunked fields use their
+                // virtual-id corpus size, plain fields their document count.
+                let sub_limit = if proximity_should {
+                    should
+                        .first()
+                        .and_then(|query| match query.decompose() {
+                            super::QueryDecomposition::TextTerm(info) => {
+                                Some(reader.text_corpus_size(info.field) as usize)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(reader.num_docs() as usize)
+                        .max(limit)
+                } else {
+                    super::max_candidate_limit(limit)
+                };
+                Some(sub.$scorer_fn(
+                    reader,
+                    sub_limit,
+                    should_options.clone(),
+                ) $(. $aw)* ?)
+            } else {
+                None
+            };
+            let should_scorers: Vec<Box<dyn Scorer + '_>> = match should_scorer {
+                Some(scorer) => vec![scorer],
+                None => {
+                    let mut scorers = Vec::with_capacity(should.len());
+                    for query in should {
+                        scorers.push(query.$scorer_fn(
+                            reader,
+                            limit,
+                            should_options.clone(),
+                        ) $(. $aw)* ?);
+                    }
+                    scorers
+                }
             };
 
-            let use_predicated =
-                must_verifiers.is_empty() || should_scorer.size_hint() >= limit as u32;
-
-            if use_predicated {
+            if must_verifiers.is_empty() {
+                let should_scorer = build_should_scorer(should_scorers);
                 log::debug!(
-                    "BooleanQuery planner: PredicatedScorer {} preds + {} must_v + {} must_not_v, \
-                     SHOULD size_hint={}, over_fetch={}",
-                    predicates.len(), must_verifiers.len(), must_not_verifiers.len(),
-                    should_scorer.size_hint(), should_limit
+                    "BooleanQuery planner: PredicatedScorer {} preds + {} must_not_v, \
+                     SHOULD size_hint={}, combined={}",
+                    predicates.len(), must_not_verifiers.len(),
+                    should_scorer.size_hint(), combined_should
                 );
                 return Ok(Box::new(super::PredicatedScorer::new(
-                    should_scorer, predicates, must_verifiers, must_not_verifiers,
+                    should_scorer, predicates, Vec::new(), must_not_verifiers,
                 )));
             }
 
-            // size_hint < limit with verifiers → BooleanScorer
+            // Scoring MUST clauses drive the conjunction; SHOULD is optional.
             log::debug!(
-                "BooleanQuery planner: BooleanScorer fallback, size_hint={} < limit={}, \
-                 {} must_v + {} must_not_v",
-                should_scorer.size_hint(), limit,
-                must_verifiers.len(), must_not_verifiers.len()
+                "BooleanQuery planner: required-clause BooleanScorer {} must + {} should, \
+                 {} preds + {} must_not_v",
+                must_verifiers.len(), should_scorers.len(),
+                predicates.len(), must_not_verifiers.len()
             );
-            let mut scorer = BooleanScorer {
+            let mut driver = BooleanScorer {
                 must: must_verifiers,
-                should: vec![should_scorer],
-                must_not: must_not_verifiers,
+                should: should_scorers,
+                must_not: Vec::new(),
                 current_doc: 0,
             };
-            scorer.current_doc = scorer.find_next_match();
-            return Ok(Box::new(scorer));
+            driver.current_doc = driver.find_next_match();
+            return Ok(Box::new(super::PredicatedScorer::new(
+                Box::new(driver),
+                predicates,
+                Vec::new(),
+                must_not_verifiers,
+            )));
         }
 
         // ── 4. Standard BooleanScorer fallback ───────────────────────────
@@ -841,6 +991,14 @@ impl Query for BooleanQuery {
         extract_all_sparse_infos(&self.should)
             .map(super::QueryDecomposition::SparseTerms)
             .unwrap_or(super::QueryDecomposition::Opaque)
+    }
+
+    fn should_children(&self) -> Option<&[Arc<dyn Query>]> {
+        if self.must.is_empty() && self.must_not.is_empty() && !self.should.is_empty() {
+            Some(&self.should)
+        } else {
+            None
+        }
     }
 
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {

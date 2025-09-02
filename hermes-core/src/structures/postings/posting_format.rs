@@ -1,15 +1,12 @@
-//! Unified posting list format with automatic compression selection
+//! Legacy standalone posting-list codecs and optimization policy.
 //!
-//! Automatically selects the best compression method based on posting list characteristics:
+//! The standalone `PostingFormat` codecs below remain available for benchmarks
+//! and direct library users. Production indexing writes `BlockPostingList`
+//! with the codec selected by `IndexOptimization`:
 //! - **Inline**: 1-3 postings stored directly in TermInfo (no separate I/O)
-//! - **HorizontalBP128**: Horizontal layout with SIMD (fastest encoding + decoding)
-//! - **Partitioned EF**: Best compression for large lists (>20K)
-//! - **Roaring**: Bitmap-based for very frequent terms (>1% of corpus), fastest iteration
-//!
-//! Supports three optimization modes:
-//! - **Adaptive**: Balanced compression/speed (default, zstd level 7)
-//! - **SizeOptimized**: Best compression ratio (OptP4D + zstd level 22)
-//! - **PerformanceOptimized**: Fastest decoding (Roaring + zstd level 3)
+//! - **Adaptive**: rounded blocks + term-dictionary zstd level 9
+//! - **SizeOptimized**: patched-exception blocks + zstd level 22
+//! - **PerformanceOptimized**: rounded blocks + zstd level 1
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
@@ -30,15 +27,12 @@ pub const PARTITIONED_EF_THRESHOLD: usize = 20_000;
 /// Index optimization mode for balancing compression ratio vs speed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexOptimization {
-    /// Balanced compression and speed (zstd level 7)
-    /// Uses adaptive format selection based on posting list characteristics
+    /// Balanced compression and speed (rounded blocks, zstd level 9).
     #[default]
     Adaptive,
-    /// Optimize for smallest index size (zstd level 22)
-    /// Prefers OptP4D for best compression ratio (optimal bit-width + patched exceptions)
+    /// Optimize for smallest index size (patched exceptions, zstd level 22).
     SizeOptimized,
-    /// Optimize for fastest query performance (zstd level 3)
-    /// Prefers Roaring bitmaps for fastest iteration
+    /// Optimize for fastest query performance (rounded blocks, zstd level 1).
     PerformanceOptimized,
 }
 
@@ -46,9 +40,21 @@ impl IndexOptimization {
     /// Get the zstd compression level for this optimization mode
     pub fn zstd_level(&self) -> i32 {
         match self {
-            IndexOptimization::Adaptive => 7,
+            IndexOptimization::Adaptive => 9,
             IndexOptimization::SizeOptimized => 22,
-            IndexOptimization::PerformanceOptimized => 3,
+            IndexOptimization::PerformanceOptimized => 1,
+        }
+    }
+
+    /// Posting block codec implied by this mode (`docs/posting-codecs.md`):
+    /// `SizeOptimized` packs with patched exceptions, the others keep the
+    /// SIMD-widening rounded layout.
+    pub fn default_posting_codec(&self) -> super::posting::PostingCodec {
+        match self {
+            IndexOptimization::SizeOptimized => super::posting::PostingCodec::Pfor,
+            IndexOptimization::Adaptive | IndexOptimization::PerformanceOptimized => {
+                super::posting::PostingCodec::Rounded
+            }
         }
     }
 

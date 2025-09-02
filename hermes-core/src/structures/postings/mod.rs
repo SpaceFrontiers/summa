@@ -50,8 +50,8 @@ pub use positions_v2::{
     POSITION_STREAM_BLOCK, PositionStream, PositionStreamEncoder, TermPositions,
 };
 pub use posting::{
-    BLOCK_SIZE as POSTING_BLOCK_SIZE, BlockPostingIterator, BlockPostingList, Posting, PostingList,
-    PostingListIterator, TERMINATED,
+    BLOCK_SIZE as POSTING_BLOCK_SIZE, BlockPostingIterator, BlockPostingList, Posting,
+    PostingCodec, PostingList, PostingListIterator, TERMINATED,
 };
 pub use posting_common::{
     BLOCK_SIZE as COMMON_BLOCK_SIZE, RoundedBitWidth, SkipEntry, SkipList, pack_deltas_fixed,
