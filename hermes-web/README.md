@@ -29,21 +29,25 @@ Open http://localhost:5173 in your browser.
 
 ## Manual Setup
 
+Use Node.js 22.12+ and pnpm 10+. Run the WASM build from the repository root.
+
 ### Build WASM
 
 ```bash
-cd ../hermes-wasm
-wasm-pack build --target web --release
+(cd hermes-wasm && bash build.sh)
 ```
 
 ### Install and run
 
 ```bash
-pnpm install
+cd hermes-web
+pnpm install --frozen-lockfile
 pnpm dev
 ```
 
 ## Production Build
+
+Run the following commands from `hermes-web`, after installing dependencies.
 
 ```bash
 pnpm build

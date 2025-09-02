@@ -8,9 +8,9 @@ WebAssembly bindings for the [Hermes](https://github.com/SpaceFrontiers/hermes) 
 - **Pluggable persistence** — bring your own storage (IDB, encrypted, OPFS) via simple JS interface
 - **Remote search** — load pre-built indexes over HTTP with slice caching
 - **IPFS support** — load indexes from IPFS via JavaScript fetch callbacks
-- **15+ language stemmers** — English, German, French, Spanish, Russian, Arabic, and more
+- **Language-aware tokenizers** — English, German, French, Spanish, Russian, Arabic, and more
 - **Query language** — `field:term`, `AND`, `OR`, `NOT`, grouping with parentheses
-- **~3 MB** WASM binary (gzipped ~1.2 MB)
+- **Static deployment** — host the generated JS/WASM and index files over HTTP
 
 ## Quick Start
 
@@ -279,11 +279,13 @@ const results = await index.searchStructured({
 
 ## Building
 
+From the repository root, using Node.js 22.12+ for the test harness:
+
 ```bash
 cd hermes-wasm
 bash build.sh  # requires Homebrew LLVM on macOS
 npm ci
-npm test
+npm test -- --run
 ```
 
 The build script sets `CC` and `AR` to Homebrew LLVM binaries for zstd cross-compilation to `wasm32-unknown-unknown`.
@@ -291,6 +293,8 @@ The root `package.json` is a private Vitest harness; the publishable npm
 metadata is generated in `pkg/` by `wasm-pack` from `Cargo.toml`.
 
 ## Example
+
+Start from the repository root for the commands below.
 
 Open `examples/index.html` in a browser (needs to be served, not opened as file):
 

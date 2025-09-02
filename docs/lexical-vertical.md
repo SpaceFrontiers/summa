@@ -1,12 +1,17 @@
 # Lexical vertical: positions, pruning, reordering, tokenization
 
-Status: research and design (2026-09-03). Nothing here is implemented yet;
-the sequencing at the end is the proposed order. Companion documents:
-`dynamic-tokenizer-and-phrase.md`, `chunked-text-fields.md`,
-`bmp-grid-compression.md`, `merge-time-reorder.md`, `budgeted-reorder.md`,
-`hot-metadata-pinning.md`, `seismic-research.md`, and in azeroth
-`docs/design-docs/2026-09-03-bm25-phrase-retrieval.md` and
-`2026-09-03-fulltext-billion-scale-research.md`.
+Status: implementation ledger and remaining research, reviewed 2026-09-05.
+Positions v3, block bounds, windowed MaxScore, dynamic tokenization, phrase
+queries, and cross-shard BM25 statistics are implemented. Sections below
+identify remaining proposals explicitly; the initial audit records the
+pre-change baseline.
+
+Companion documents: [dynamic tokenization and phrases](dynamic-tokenizer-and-phrase.md),
+[chunked text](chunked-text-fields.md), [posting codecs](posting-codecs.md),
+[BMP compression](bmp-grid-compression.md), [merge-time reorder](merge-time-reorder.md),
+[budgeted reorder](budgeted-reorder.md), [metadata pinning](hot-metadata-pinning.md),
+and [Seismic research](seismic-research.md). The original investigation also
+used private Azeroth design notes, which are not part of this repository.
 
 ## Why a separate vertical
 
@@ -27,9 +32,10 @@ Everything in this document is therefore inverted-list based and doc-ordered,
 and reuses the sparse machinery only where the shape allows it (executor,
 codecs, BP, pinning, cold IO, merge streaming).
 
-## Audit of the text path today
+## Initial audit of the text path (2026-09-03)
 
-Facts, with the file that establishes each one.
+Historical baseline before the changes described below. Current posting
+codecs and format gates are documented in [posting codecs](posting-codecs.md).
 
 - Doc postings (`structures/postings/posting.rs`): 128-posting blocks, header
   `[count u16][first_doc u32][doc_bits u8][tf_bits u8]`, rounded-width bit
@@ -441,12 +447,12 @@ spec, the tokenizer and the renderer).
   passes `GlobalStats` (per-field corpus size in scoring units, average
   length, term df) through `ScorerOptions::global_stats`; a query's own
   `with_global_stats` still wins. Phrase scoring keeps local idf (verifier).
-- Cross-shard IDF (contract implemented 2026-09-03, broker fan-out pending).
+- Cross-shard IDF (implemented, including broker fan-out).
   `GetTextStats(index, query)` returns the statistics of the query's terms on
   one backend; `SearchRequest.text_stats` carries a total back and replaces
-  the backend's own statistics. The broker proxies both today (one index =
-  one shard); a scatter-gather broker sums `GetTextStats` over the shards of
-  an index before fanning the search out. The periodic merged DF table for
+  the backend's own statistics. The partitioned broker sums
+  `GetTextStats` over the shards of an index before fanning the search out;
+  see [partitioned indexes](broker.md#phase-2-partitioned-indexes). The periodic merged DF table for
   terms above a df threshold (the "global DF table" of arXiv:2608.00229)
   stays the fallback if the extra round trip is measured to matter.
 - `PinPolicy`: pin the term dictionary index (FST or raw index) and the
@@ -474,7 +480,7 @@ per-list clustering (all need a bounded vocabulary).
 
 1. `stop_words` spec + gap-preserving positions + `PhraseQuery` offsets.
    Small; unblocks azeroth's templates.
-2. Position format v2 + lazy phrase scorer, `(max_tf, min_len)` block
+2. Position format v3 + lazy phrase scorer, `(max_tf, min_len)` block
    bounds, norms for plain fields (all done). Must precede the first
    text-bearing index generation.
 3. UAX #29 tokenizer, folding, CJK bigrams (done, opt-in `segmenter:
@@ -488,7 +494,7 @@ unicode`).
 6. Anytime/budgeted BM25 and long-query handling (done: `heap_factor`,
    `max_terms`, `time_budget_ms` + `truncated`; bound-ordered traversal open).
 7. Searcher-wide DF (done) and the cross-shard statistics contract (done);
-   broker scatter-gather itself is phase 2 of the broker.
+   broker scatter-gather is implemented in [phase 2](broker.md#phase-2-partitioned-indexes).
 
 ## Lucene and turbopuffer parity checklist
 

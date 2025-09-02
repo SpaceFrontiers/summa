@@ -171,7 +171,7 @@ await client.search("articles", {
 });
 ```
 
-Supported variants are `term`, `match`, `boolean`, `sparseVector`,
+Supported variants are `term`, `match`, `phrase`, `boolean`, `sparseVector`,
 `denseVector`, `binaryDenseVector`, `boost`, `range`, `prefix`, `all`, and
 `fusion`.
 
@@ -193,8 +193,13 @@ const client = new HermesClient("localhost:50051", {
   defaultTimeoutMs: 5_000,
 });
 
-await client.search("articles", { query: { all: {} } }, 500);
-await client.forceMerge("articles", 3_600_000);
+client.connect();
+try {
+  await client.search("articles", { query: { all: {} } }, 500);
+  await client.forceMerge("articles", 3_600_000);
+} finally {
+  client.close();
+}
 ```
 
 Expired calls reject with a gRPC `DEADLINE_EXCEEDED` error.

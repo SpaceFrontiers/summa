@@ -15,8 +15,9 @@ from hermes_mal import parse_mal
 json_str = parse_mal(source)  # -> str (serde JSON of ModelDef)
 ```
 
-The returned JSON is byte-for-byte identical to what `hermes-llm export`
-emits and can be consumed by any serde-compatible tool.
+The returned compact JSON represents the same `ModelDef` as `hermes-llm
+export` (which writes pretty-printed JSON) and can be consumed by any
+serde-compatible tool.
 Syntax errors, unknown keys, and undefined references raise `ValueError`.
 
 ## Development

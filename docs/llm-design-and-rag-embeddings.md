@@ -5,6 +5,10 @@ Transformer+Mamba, agentic retrieval-oriented LLM). Status tags: **[Proven]**
 in ≥1 frontier/production model; **[Emerging]** strong results, spreading;
 **[Frontier]** promising research, not yet validated at scale.
 
+For the current implementation, use the [LLM code map](llm-code-map.md) and
+[training contracts](training-objectives-and-curricula.md). The research
+assessment below retains its original date and model-size assumptions.
+
 ## Part A — LLM architecture & training
 
 ### Attention

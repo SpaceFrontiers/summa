@@ -51,7 +51,7 @@ width, values ≤ 32):
 
 `Rounded` keeps codec id 0 and the existing 0/8/16/32 payload representation.
 That makes it the low-overhead performance baseline; compatibility is governed
-by the format-5 gate below, not by the individual block representation.
+by the index-format gate below, not by the individual block representation.
 
 `Packed` uses `bits_needed(max)` per array. `Pfor` is the OptP4D block
 encoding already in the tree: the width minimising `n·b + exceptions·(8+32)`
@@ -87,8 +87,11 @@ blocks.
 
 ### Format break (fail loud)
 
-This layout ships with metadata format **5** for every index. The reader
-accepts only format 5 and STB5 term dictionaries; old indexes must be rebuilt.
+This layout originally shipped with metadata format **5**. The current
+reader requires metadata format **6** and STB5 term dictionaries. These
+version numbers belong to separate formats and need not advance together. Older indexes must be rebuilt; see
+[`INDEX_META_FORMAT_VERSION`](../hermes-core/src/index/metadata.rs) and the
+[SSTable format gates](../hermes-core/src/structures/sstable.rs).
 Unknown per-block codec ids are rejected instead of being decoded as rounded
 32-bit blocks.
 
