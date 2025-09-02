@@ -2,7 +2,7 @@
 
 Rust 1.98 stabilised `f32`/`f64` **algebraic** arithmetic —
 `algebraic_add`, `algebraic_sub`, `algebraic_mul`, `algebraic_div`,
-`algebraic_rem`. Hermes pins `1.98.0` in `rust-toolchain.toml` and uses these
+`algebraic_rem`. Hermes pins `1.98.1` in `rust-toolchain.toml` and uses these
 operations in the dense-vector reduction kernels.
 
 ## Why they matter here
