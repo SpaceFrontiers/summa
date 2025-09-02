@@ -78,7 +78,7 @@ doc_freq, position_offset, position_len }`. FST or raw mmap index. Not in
 - IDF (`query/global_stats.rs`): lazily aggregated over the segments of one
   searcher; no cross-shard statistics (broker phase 2 merges by RRF).
 
-## Position list format v2
+## Position list format v3
 
 Status: implemented (2026-09-03), `structures/postings/positions_v2.rs`.
 
@@ -91,10 +91,11 @@ One position stream per term, addressed through the doc postings instead of
 through its own skip list:
 
 ```text
-.pos  per term:  [block 0]...[block n-1][block offsets: u32 × n]
-                 [footer: n u32, total_positions u64, magic "POS2"]
+.pos  per term:  [block 0]...[block n-1]
+                 [block index: (byte offset u32, value start u64) × n]
+                 [footer: n u32, total_positions u64, magic "POS3"]
 block:           [count u16][bits u8][pad u8][packed values: count × bytes(bits)]
-                 128 values per block, the last one partial
+                 at most 128 values per block
 ```
 
 - Values are **deltas**: a document's positions are sorted, the first is
@@ -111,7 +112,9 @@ pack_rounded`, 0/8/16/32 bits), so decode is the same SIMD widening.
   before the block's first document (cumulative tf). Inside a block the
   position of document _j_ is `cursor + Σ tf[0..j]`, which the iterator
   keeps as a running prefix (`BlockPostingIterator::position_cursor`).
-  `cursor / 128` is the block, `cursor % 128` the offset in it.
+  The position block index maps that logical cursor to a physical block and
+  offset. Fresh streams have full interior blocks; merged streams may retain
+  a short source tail as an interior block.
 - The doc-posting footer grew by `total_positions u64 + flags u32 + magic
 u32` ("BPL2"); a list ending in the magic has the extension, a legacy
   list ends with its `max_tf` (≤ 65 535 by the builder's u16 tf), so both
@@ -124,31 +127,29 @@ candidate, asks each term's `TermPositions` for
 `[cursor, cursor + tf)`: one or two blocks decoded from the mmap into a
 reused scratch buffer, delta-summed into the term's buffer, then the
 offset-aware sliding match. Nothing is copied to the heap up front.
-`TermPositions::Legacy` wraps the pre-v2 list for segments written before
-the change. Still to do: `MADV_RANDOM` on `.pos` and a bounded `WILLNEED`
-on the candidate's ranges.
+Still to do: `MADV_RANDOM` on `.pos` and a bounded `WILLNEED` on the
+candidate's ranges.
 
 ### Size
 
 With stop words removed and per-chunk restarts, in-document deltas are
 roughly `chunk_len / tf`, so most blocks use 8-bit values: about 1 byte per
-position plus 4 bytes per 128, against 2–3 bytes of absolute vint plus a
+position plus 12 bytes per 128, against 2–3 bytes of absolute vint plus a
 count per document and 20 B of skip entry per 128 documents before. The
 `u64` cursor costs 8 B per 128 postings.
 
 ### Merge
 
-Values are doc-agnostic, so a merge re-packs every source's blocks into one
-fresh stream (`PositionStreamEncoder::push_values`), and the block copy of
-the doc postings shifts each source's cursors by the values of the sources
-before it (`Footer::total_positions`). A legacy source is decoded per
-document and re-encoded, and its doc postings take the decode-and-rebuild
-path so the merged term always addresses a v2 stream.
+Values are doc-agnostic, so a merge copies every encoded source block
+verbatim and rebuilds only the `(byte offset, value start)` index and footer.
+The block copy of the doc postings shifts each source's cursors by the values
+of the sources before it (`Footer::total_positions`). Inline doc postings
+that no longer fit inline are promoted to tiny blocks; existing external
+blocks are never decoded or re-encoded.
 
 ### Compatibility
 
-No production index carries positioned text fields yet; a legacy positioned
-segment is still readable and is converted by its first merge.
+Metadata format version 6 is a clean rebuild boundary for this layout.
 
 ## Doc postings and skip metadata
 

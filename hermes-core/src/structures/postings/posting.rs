@@ -1193,6 +1193,14 @@ impl BlockPostingList {
             merged_min_len = merged_min_len.min(if footer.len_bounds { footer.min_len } else { 1 });
             metas.push(footer);
         }
+
+        // The common single-source term in the first segment needs no doc-id
+        // rebasing and already has a valid index/footer. Copy it wholesale.
+        if sources.len() == 1 && sources[0].1 == 0 {
+            writer.write_all(sources[0].0)?;
+            return Ok((metas[0].doc_count, sources[0].0.len()));
+        }
+
         let all_cursors = metas.iter().all(|m| m.has_cursors);
         if !all_cursors && metas.iter().any(|m| m.has_cursors) {
             return Err(crate::Error::Corruption(

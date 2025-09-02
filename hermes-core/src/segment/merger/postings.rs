@@ -3,24 +3,20 @@
 //! Uses a min-heap to merge terms from all segments in sorted order
 //! without loading all terms into memory at once.
 //!
-//! Optimization: For terms that exist in only one segment, we copy the
-//! posting data directly without decode/encode. Only terms that exist
-//! in multiple segments need full merge.
-
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
-use std::io::Write;
+//! Encoded posting and position blocks are copied directly for both single-
+//! and multi-segment terms. Inline postings are promoted to tiny encoded
+//! blocks only when the merged term no longer fits inline.
 
 use super::OffsetWriter;
 use super::SegmentMerger;
 use super::chunk_maps::chunk_offsets;
 use super::doc_offsets;
 use crate::Result;
+use crate::directories::OwnedBytes;
 use crate::segment::reader::SegmentReader;
-use crate::structures::{
-    BlockPostingList, PositionPostingList, PositionStream, PositionStreamEncoder, PostingList,
-    SSTableWriter, TERMINATED, TermInfo,
-};
+use crate::structures::{BlockPostingList, PositionStream, PostingList, SSTableWriter, TermInfo};
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// Entry for k-way merge heap
 struct MergeEntry {
@@ -126,7 +122,6 @@ impl SegmentMerger {
             crate::structures::SSTableWriterConfig::from_optimization(self.optimization),
         );
         let mut terms_processed = 0usize;
-        let mut serialize_buf: Vec<u8> = Vec::new();
         // Pre-allocate sources buffer outside loop — reused for every term
         let mut sources: Vec<(usize, TermInfo, u32)> = Vec::with_capacity(segments.len());
 
@@ -181,13 +176,7 @@ impl SegmentMerger {
 
             // Process this term (handles both single-source and multi-source)
             let term_info = self
-                .merge_term(
-                    segments,
-                    &mut sources,
-                    postings_out,
-                    positions_out,
-                    &mut serialize_buf,
-                )
+                .merge_term(segments, &mut sources, postings_out, positions_out)
                 .await?;
 
             // Write directly to SSTable (no buffering)
@@ -211,176 +200,157 @@ impl SegmentMerger {
         Ok(terms_processed)
     }
 
-    /// Merge a single term's postings + positions from one or more source segments.
+    /// Merge a single term's postings + positions from one or more segments.
     ///
-    /// Fast path: when all sources are external, uses block-level
-    /// concatenation (O(blocks) instead of O(postings)), including the
-    /// single-source case.
-    /// Otherwise: full decode → remap doc IDs → re-encode.
+    /// Existing external posting and position blocks are always copied in
+    /// their encoded form. Inline postings remain inline when the combined
+    /// value fits; otherwise each tiny inline source is encoded as one block
+    /// and concatenated with the untouched external blocks.
     pub(crate) async fn merge_term(
         &self,
         segments: &[SegmentReader],
         sources: &mut [(usize, TermInfo, u32)],
         postings_out: &mut OffsetWriter,
         positions_out: &mut OffsetWriter,
-        buf: &mut Vec<u8>,
     ) -> Result<TermInfo> {
         sources.sort_by_key(|(_, _, off)| *off);
 
-        let any_positions = sources
+        let has_positions = sources
+            .first()
+            .is_some_and(|(_, info, _)| info.position_info().is_some());
+        if sources
             .iter()
-            .any(|(_, ti, _)| ti.position_info().is_some());
-        let all_external = sources
-            .iter()
-            .all(|(_, ti, _)| ti.external_info().is_some());
+            .any(|(_, info, _)| info.position_info().is_some() != has_positions)
+        {
+            return Err(crate::Error::Corruption(
+                "cannot merge a term with inconsistent position data".into(),
+            ));
+        }
 
-        // Read every external source's postings up front (in parallel); the
-        // slow path below decodes them and the fast path copies their blocks.
+        // Preserve genuinely tiny terms inline. Decoding here is bounded by
+        // MAX_INLINE_POSTINGS and never touches an external posting list.
+        if !has_positions
+            && sources
+                .iter()
+                .all(|(_, info, _)| matches!(info, TermInfo::Inline { .. }))
+        {
+            let mut postings = Vec::new();
+            for (_, info, doc_offset) in sources.iter() {
+                let (ids, tfs) = info.decode_inline().expect("checked inline source");
+                postings.extend(
+                    ids.into_iter()
+                        .zip(tfs)
+                        .map(|(doc, tf)| (doc + doc_offset, tf)),
+                );
+            }
+            if let Some(inline) =
+                TermInfo::try_inline_iter(postings.len(), postings.iter().copied())
+            {
+                return Ok(inline);
+            }
+        }
+
+        // Range reads return Arc/mmap-backed slices, so ordinary external
+        // sources are not copied into an intermediate Vec. Reads still run in
+        // parallel for lazy/remote directories.
         let read_futs: Vec<_> = sources
             .iter()
-            .map(|(seg_idx, ti, doc_off)| {
+            .map(|(seg_idx, ti, _)| {
                 let external = ti.external_info();
                 let seg = &segments[*seg_idx];
-                let doc_off = *doc_off;
                 async move {
                     Ok::<_, crate::Error>(match external {
-                        Some((off, len)) => Some((seg.read_postings(off, len).await?, doc_off)),
+                        Some((off, len)) => Some(seg.read_postings(off, len).await?),
                         None => None,
                     })
                 }
             })
             .collect();
-        let raw_sources: Vec<Option<(Vec<u8>, u32)>> =
+        let external_sources: Vec<Option<OwnedBytes>> =
             futures::future::try_join_all(read_futs).await?;
-        // Block copies keep position cursors only when every source has
-        // them; a legacy source with positions (no cursors) is re-encoded so
-        // the merged term always addresses a v2 stream.
-        let cursors_ready = !any_positions
-            || raw_sources.iter().all(|raw| {
-                raw.as_ref()
-                    .is_some_and(|(bytes, _)| BlockPostingList::has_cursors_bytes(bytes))
-            });
 
-        // === Merge postings ===
-        let (posting_offset, posting_len, doc_count) = if all_external && cursors_ready {
-            // Fast path: streaming merge (blocks → output writer, no buffering)
-            let refs: Vec<(&[u8], u32)> = raw_sources
-                .iter()
-                .flatten()
-                .map(|(b, off)| (b.as_slice(), *off))
-                .collect();
-            let offset = postings_out.offset();
-            let (doc_count, bytes_written) =
-                BlockPostingList::concatenate_streaming(&refs, postings_out)?;
-            (offset, bytes_written as u64, doc_count)
-        } else {
-            // Decode all sources into a flat PostingList, remap doc IDs
-            let mut merged = PostingList::new();
-            for ((_, ti, doc_off), raw) in sources.iter().zip(&raw_sources) {
-                if let Some((ids, tfs)) = ti.decode_inline() {
-                    for (id, tf) in ids.into_iter().zip(tfs) {
-                        merged.add(id + doc_off, tf);
+        let mut posting_sources = Vec::with_capacity(sources.len());
+        for ((_, info, doc_offset), external) in sources.iter().zip(external_sources) {
+            let bytes = match external {
+                Some(bytes) => bytes,
+                None => {
+                    let (ids, tfs) = info.decode_inline().ok_or_else(|| {
+                        crate::Error::Corruption(
+                            "term has neither inline nor external postings".into(),
+                        )
+                    })?;
+                    let mut postings = PostingList::with_capacity(ids.len());
+                    for (doc, tf) in ids.into_iter().zip(tfs) {
+                        postings.push(doc, tf);
                     }
-                } else {
-                    let (bytes, _) = raw.as_ref().expect("external term has posting bytes");
-                    let bpl = BlockPostingList::deserialize(bytes)?;
-                    let mut it = bpl.iterator();
-                    while it.doc() != TERMINATED {
-                        merged.add(it.doc() + doc_off, it.term_freq());
-                        it.advance();
-                    }
+                    let block = BlockPostingList::from_posting_list_with_options(
+                        &postings,
+                        false,
+                        None,
+                        self.posting_codec,
+                    )?;
+                    let mut encoded = Vec::new();
+                    block.serialize(&mut encoded)?;
+                    OwnedBytes::new(encoded)
                 }
-            }
-            // Try to inline (only when no positions)
-            if !any_positions
-                && let Some(inline) = TermInfo::try_inline_iter(
-                    merged.doc_count() as usize,
-                    merged.iter().map(|p| (p.doc_id, p.term_freq)),
-                )
-            {
-                return Ok(inline);
-            }
-            let offset = postings_out.offset();
-            let block = BlockPostingList::from_posting_list_with_options(
-                &merged,
-                any_positions,
-                None,
-                self.posting_codec,
-            )?;
-            buf.clear();
-            block.serialize(buf)?;
-            postings_out.write_all(buf)?;
-            (offset, buf.len() as u64, merged.doc_count())
-        };
-        drop(raw_sources);
-
-        // === Merge positions (if any source has them) ===
-        if any_positions {
-            // Read all position data in parallel
-            let pos_futs: Vec<_> = sources
-                .iter()
-                .filter_map(|(seg_idx, ti, doc_off)| {
-                    let (pos_off, pos_len) = ti.position_info()?;
-                    let seg = &segments[*seg_idx];
-                    let doc_off = *doc_off;
-                    Some(async move {
-                        match seg.read_position_bytes(pos_off, pos_len).await? {
-                            Some(bytes) => Ok::<_, crate::Error>(Some((bytes, doc_off))),
-                            None => Ok(None),
-                        }
-                    })
-                })
-                .collect();
-            let raw_pos: Vec<(Vec<u8>, u32)> = futures::future::try_join_all(pos_futs)
-                .await?
-                .into_iter()
-                .flatten()
-                .collect();
-            if !raw_pos.is_empty() {
-                // Re-pack every source into one v2 stream: v2 sources
-                // contribute their raw delta values block by block, legacy
-                // lists are decoded per document. The values of source k
-                // land after those of sources 0..k, matching the cursor
-                // rebasing of the block copy above.
-                let offset = positions_out.offset();
-                let mut encoder = PositionStreamEncoder::new(&mut *positions_out);
-                let mut values: Vec<u32> = Vec::with_capacity(128);
-                for (bytes, _) in raw_pos {
-                    if PositionStream::is_stream(&bytes) {
-                        let stream =
-                            PositionStream::open(crate::directories::OwnedBytes::new(bytes))?;
-                        for idx in 0..stream.num_blocks() {
-                            if !stream.decode_block(idx, &mut values) {
-                                return Err(crate::Error::Corruption(
-                                    "position stream block failed to decode during merge".into(),
-                                ));
-                            }
-                            encoder.push_values(&values)?;
-                        }
-                    } else {
-                        let legacy = PositionPostingList::deserialize(&bytes)?;
-                        let mut it = legacy.iter();
-                        while it.doc() != TERMINATED {
-                            values.clear();
-                            values.extend_from_slice(it.positions());
-                            // Legacy term frequencies saturate at u16::MAX.
-                            values.truncate(u16::MAX as usize);
-                            encoder.push_doc(&mut values)?;
-                            it.advance();
-                        }
-                    }
-                }
-                let (_total, bytes_written) = encoder.finish()?;
-                return Ok(TermInfo::external_with_positions(
-                    posting_offset,
-                    posting_len,
-                    doc_count,
-                    offset,
-                    bytes_written,
+            };
+            if BlockPostingList::has_cursors_bytes(bytes.as_slice()) != has_positions {
+                return Err(crate::Error::Corruption(
+                    "posting position cursors do not match term position data".into(),
                 ));
             }
+            posting_sources.push((bytes, *doc_offset));
         }
 
-        Ok(TermInfo::external(posting_offset, posting_len, doc_count))
+        let posting_refs: Vec<_> = posting_sources
+            .iter()
+            .map(|(bytes, offset)| (bytes.as_slice(), *offset))
+            .collect();
+        let posting_offset = postings_out.offset();
+        let (doc_count, posting_len) =
+            BlockPostingList::concatenate_streaming(&posting_refs, postings_out)?;
+
+        if has_positions {
+            let pos_futs: Vec<_> = sources
+                .iter()
+                .map(|(seg_idx, ti, _)| {
+                    let (pos_off, pos_len) = ti
+                        .position_info()
+                        .expect("position consistency checked above");
+                    let seg = &segments[*seg_idx];
+                    async move {
+                        seg.read_position_bytes(pos_off, pos_len)
+                            .await?
+                            .ok_or_else(|| {
+                                crate::Error::Corruption(
+                                    "term has positions but the segment has no position file"
+                                        .into(),
+                                )
+                            })
+                    }
+                })
+                .collect();
+            let position_sources = futures::future::try_join_all(pos_futs).await?;
+            let position_refs: Vec<_> = position_sources
+                .iter()
+                .map(|bytes| bytes.as_slice())
+                .collect();
+            let position_offset = positions_out.offset();
+            let (_, position_len) =
+                PositionStream::concatenate_streaming(&position_refs, positions_out)?;
+            return Ok(TermInfo::external_with_positions(
+                posting_offset,
+                posting_len as u64,
+                doc_count,
+                position_offset,
+                position_len,
+            ));
+        }
+
+        Ok(TermInfo::external(
+            posting_offset,
+            posting_len as u64,
+            doc_count,
+        ))
     }
 }

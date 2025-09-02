@@ -6,7 +6,7 @@ use crate::index::{Index, IndexConfig, IndexMetadata, IndexWriter};
 use crate::structures::{IndexOptimization, PostingCodec};
 
 #[tokio::test]
-async fn size_optimization_survives_reencoding_merge() {
+async fn inline_source_is_promoted_without_reencoding_external_blocks() {
     let mut schema = SchemaBuilder::default();
     let body = schema.add_text_field("body", true, false);
     let schema = schema.build();
@@ -20,8 +20,8 @@ async fn size_optimization_survives_reencoding_merge() {
         .await
         .unwrap();
 
-    // One inline source plus one external source forces the merger's
-    // decode/remap/re-encode path for "needle".
+    // One inline source plus one external source must become two copied blocks;
+    // combining all nine postings into one block would expose re-encoding.
     let mut first = Document::new();
     first.add_text(body, "needle");
     writer.add_document(first).unwrap();
@@ -51,9 +51,14 @@ async fn size_optimization_survives_reencoding_merge() {
         .unwrap()
         .unwrap();
     assert!(postings.num_blocks() > 0);
+    assert_eq!(
+        postings.num_blocks(),
+        2,
+        "inline promotion must not collapse/re-encode the external block"
+    );
     assert!(
         (0..postings.num_blocks())
             .all(|block| { postings.block_codec(block) == Some(PostingCodec::Pfor) }),
-        "merge re-encoding must retain the configured size codec"
+        "external and promoted inline blocks retain the configured size codec"
     );
 }
