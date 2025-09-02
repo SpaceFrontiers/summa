@@ -32,6 +32,7 @@ must go through its lifecycle protocol; see
 | `native`         | Filesystem/mmap directories, native writer, parallel builders, and native tokenizers |
 | `wasm`           | Browser-compatible writer/reader components and tokenizer backend                    |
 | `http`           | HTTP-backed directory access                                                         |
+| `cjk-dict`       | Embedded Japanese/Korean morphology dictionaries for the `morph` tokenizer option    |
 | `metrics`        | Runtime metrics emission                                                             |
 | `diagnostics`    | Additional build diagnostics                                                         |
 | `fst-index`      | FST-backed SSTable block indexes; enabled by `native` and `wasm`                     |

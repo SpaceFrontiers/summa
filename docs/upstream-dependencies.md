@@ -1,7 +1,8 @@
 # Upstream dependency pins
 
-Hermes vendors no source repositories and Cargo contains no personal-fork
-URLs. GPU fixes that have not yet merged are fetched from their official
+Cargo dependencies use official repository URLs, with no personal-fork
+URLs. The tokenizer contains an explicitly maintained source extraction; see
+[its upstream provenance](../hermes-tokenizer/UPSTREAM.md). GPU fixes that have not yet merged are fetched from their official
 repositories at the immutable heads of the corresponding upstream pull
 requests.
 
@@ -11,7 +12,8 @@ requests.
 | CubeCL     | `tracel-ai/cubecl@c0efe74d3d4b820fbf992dbbe443ed7125c5205c` | [PR #1440](https://github.com/tracel-ai/cubecl/pull/1440)                                                                        | The allocation-retry and cuBLASLt changes are in a compatible release.                                |
 | Burn       | `tracel-ai/burn@973605c4be470d8beaed21e24a7e7010d4101068`   | [PR #5190](https://github.com/tracel-ai/burn/pull/5190) and prerequisite [PR #5166](https://github.com/tracel-ai/burn/pull/5166) | The integration is rebased on current upstream `main` and uses compatible CubeCL and CubeK revisions. |
 
-The Apache Arrow `object_store` Git revision is an official-repository
+The Apache Arrow [`object_store`](https://github.com/apache/arrow-rs-object-store/commit/c7316d29face118e7409eead0cda098f38589428)
+revision `c7316d29face118e7409eead0cda098f38589428` is an official-repository
 security-fix pin. It can return to crates.io after a release containing the
 pinned `quick-xml` update is available.
 

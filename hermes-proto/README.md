@@ -14,8 +14,9 @@ The protocol exposes:
 - `SearchService` for search, document retrieval by `DocAddress`, and index
   metadata;
 - `IndexService` for index creation, document ingestion, commit, merge,
-  reorder, deletion, listing, and vector-index retraining;
-- recursive text, range, vector, reranker, and fusion query messages;
+  reorder, deletion, listing, vector-index retraining, and atomic vector-index alteration;
+- recursive text, phrase, range, vector, reranker, and fusion query messages;
+- `GetTextStats` and search statistics overrides for consistent cross-shard BM25;
 - repeated `FieldEntry`/`FieldValueList` messages for multi-value fields.
 
 ## Compatibility rules

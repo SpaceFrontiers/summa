@@ -61,13 +61,13 @@ index articles {
 
 Attributes control how fields are processed and stored:
 
-| Attribute | Description                                                                                                                                                                                                     |
-| --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `indexed` | Field is indexed for searching                                                                                                                                                                                  |
-| `stored`  | Field value is stored and can be retrieved                                                                                                                                                                      |
-| `primary` | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                    |
-| `fast`    | Field is a fast field (column-oriented storage for range queries)                                                                                                                                               |
-| `reorder` | Opt this BMP sparse field into BP (graph bisection) reordering — used by the background optimizer, `hermes-tool reorder`, and reorder-on-merge. Fields without it keep insertion order (blob copied unchanged). |
+| Attribute | Description                                                                                                                                                                                                                        |
+| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `indexed` | Field is indexed for searching                                                                                                                                                                                                     |
+| `stored`  | Field value is stored and can be retrieved                                                                                                                                                                                         |
+| `primary` | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                                       |
+| `fast`    | Field is a fast field (column-oriented storage for range queries)                                                                                                                                                                  |
+| `reorder` | Opt a BMP sparse or indexed chunked-text field into BP reordering. Both support standalone/optimizer passes; merge-time BP applies to BMP sparse fields. See [field-level reordering](lexical-vertical.md#field-level-reordering). |
 
 Index-level options (inside the `index { ... }` block):
 

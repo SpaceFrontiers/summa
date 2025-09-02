@@ -11,6 +11,17 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  docs:
+    name: Documentation links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Check documentation
+        run: uv run --python 3.12 scripts/check_docs.py
+      - name: Test documentation checker
+        run: uv run --python 3.12 --with markdown-it-py==4.0.0 python -m unittest discover -s scripts -p 'test_*.py'
+
   # Main Rust CI - fmt, clippy, test, build in one job
   rust:
     name: Rust CI

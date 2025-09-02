@@ -8,7 +8,7 @@ Thank you for your interest in contributing to Hermes. This guide will help you 
 
 - **Rust 1.98+** (see `rust-toolchain.toml` for the exact version)
 - **protoc** (Protocol Buffers compiler, for gRPC builds)
-- **Node.js 20+** (for WASM and web UI development)
+- **Node.js 22.12+** (for WASM and web UI development)
 - **Python 3.12+** (for Python bindings)
 - **wasm-pack** (for WASM builds)
 - **pre-commit** (for automated code quality checks)
@@ -36,22 +36,22 @@ cargo test --workspace
 
 ## Build Commands
 
-| Command                                                                            | Description                       |
-| ---------------------------------------------------------------------------------- | --------------------------------- |
-| `cargo build --release`                                                            | Build all Rust packages           |
-| `cargo test --workspace`                                                           | Run the portable Rust test suite  |
-| `cargo fmt --all -- --check`                                                       | Check Rust formatting             |
-| `cargo clippy --workspace --all-targets -- -D warnings`                            | Run portable Rust lints           |
-| `cargo check -p hermes-core --no-default-features --features native --all-targets` | Check Core's native-only boundary |
-| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`                       | Check all Rust API documentation  |
-| `cd hermes-wasm && bash build.sh && npm ci && npm test`                            | Build and test the WASM package   |
-| `cd hermes-client-python && uv build`                                              | Build the Python gRPC client      |
-| `cd hermes-client-typescript && pnpm install && pnpm run build`                    | Build the TypeScript gRPC client  |
-| `cd hermes-mal-python && maturin build --release`                                  | Build the MAL Python binding      |
-| `cd hermes-web && pnpm test`                                                       | Run the search web unit tests     |
-| `cd hermes-model-lab && pnpm check`                                                | Check and build the LLM Model Lab |
-| `pre-commit run --all-files`                                                       | Run commit-stage hooks            |
-| `pre-commit run --all-files --hook-stage pre-push`                                 | Run push-stage hooks              |
+| Command                                                                                                      | Description                       |
+| ------------------------------------------------------------------------------------------------------------ | --------------------------------- |
+| `cargo build --release`                                                                                      | Build all Rust packages           |
+| `cargo test --workspace`                                                                                     | Run the portable Rust test suite  |
+| `cargo fmt --all -- --check`                                                                                 | Check Rust formatting             |
+| `cargo clippy --workspace --all-targets -- -D warnings`                                                      | Run portable Rust lints           |
+| `cargo check -p hermes-core --no-default-features --features native --all-targets`                           | Check Core's native-only boundary |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`                                                 | Check all Rust API documentation  |
+| `(cd hermes-wasm && bash build.sh && npm ci && npm test -- --run)`                                           | Build and test the WASM package   |
+| `(cd hermes-client-python && uv build)`                                                                      | Build the Python gRPC client      |
+| `pnpm --dir hermes-client-typescript install --frozen-lockfile && pnpm --dir hermes-client-typescript build` | Build the TypeScript gRPC client  |
+| `(cd hermes-mal-python && maturin build --release)`                                                          | Build the MAL Python binding      |
+| `pnpm --dir hermes-web test`                                                                                 | Run the search web unit tests     |
+| `pnpm --dir hermes-model-lab install --frozen-lockfile && pnpm --dir hermes-model-lab check`                 | Check and build the LLM Model Lab |
+| `pre-commit run --all-files`                                                                                 | Run commit-stage hooks            |
+| `pre-commit run --all-files --hook-stage pre-push`                                                           | Run push-stage hooks              |
 
 ## Project Structure
 
@@ -73,9 +73,10 @@ cargo test --workspace
 | **hermes-llm**               | Burn-based shared model, inference, generation, and accelerator kernels                    |
 | **hermes-train**             | Autodiff training for the same `hermes-llm` model and safetensors checkpoints              |
 
-For a deeper look at the core architecture, see `CLAUDE.md`. The shared LLM
-stack is mapped in `docs/llm-code-map.md`; temporary official GPU revisions and
-their release exit criteria live in `docs/upstream-dependencies.md`.
+For architecture and operational guides, start with the
+[documentation index](docs/README.md). The shared LLM stack is mapped in the
+[code map](docs/llm-code-map.md); temporary GPU revisions and their release
+exit criteria live in the [dependency register](docs/upstream-dependencies.md).
 
 ## Submitting Pull Requests
 
@@ -114,16 +115,16 @@ their release exit criteria live in `docs/upstream-dependencies.md`.
 
 If you are looking for a place to start, these areas are well-suited for first-time contributors:
 
-- **Add a new stemmer language**: The tokenizer module (`hermes-core/src/tokenizer/`) supports 15+ Snowball stemmers. Adding a new language involves registering the stemmer and adding tests.
+- **Tokenizer coverage**: Extend Unicode, language-hint, and phrase-gap fixtures in [`hermes-core/src/tokenizer/`](hermes-core/src/tokenizer/).
 - **CLI improvements**: The CLI (`hermes-tool/src/main.rs`) uses clap for argument parsing. Improvements to help text, new utility subcommands, or better error messages are welcome.
 - **Client library examples**: Add usage examples or improve documentation for `hermes-client-python` or other client libraries.
 - **Documentation**: Improve inline docs, add examples to public APIs, or expand the schema reference in `docs/schema.md`.
 
-Look for issues labeled `good first issue` in the issue tracker to find specific tasks.
+Look for issues labeled [`good first issue`](https://github.com/SpaceFrontiers/hermes/labels/good%20first%20issue) in the issue tracker to find specific tasks.
 
 ## Reporting Bugs and Requesting Features
 
-Please use the GitHub issue templates when filing bug reports or feature requests. See `.github/ISSUE_TEMPLATE/` for the available templates.
+Please use the GitHub issue templates when filing bug reports or feature requests. See [the available templates](.github/ISSUE_TEMPLATE/).
 
 ## License
 

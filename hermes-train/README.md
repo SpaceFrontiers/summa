@@ -11,6 +11,10 @@ cargo build --release -p hermes-train --features metal
 cargo build --release -p hermes-train --features cuda
 ```
 
+Build outputs live in `target/release`. To use the commands below from the
+repository root, run `export PATH="$PWD/target/release:$PATH"`.
+[training contracts](../docs/training-objectives-and-curricula.md) for task semantics.
+
 ## WorkflowV2
 
 Validate and inspect resolved paths before a run:

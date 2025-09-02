@@ -1,5 +1,9 @@
 # Generation evaluation
 
+Implemented by [`hermes-train/src/generate_eval.rs`](../hermes-train/src/generate_eval.rs).
+The percentages below describe the motivating 300M experiment, not a fresh
+evaluation of the current checkout.
+
 ## Why
 
 `hermes-train eval` measures teacher-forced cross-entropy: given a correct
