@@ -39,7 +39,8 @@ impl Eq for HeapEntry {}
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Min-heap: lower scores come first (to be evicted).
-        // total_cmp is branchless (compiles to a single comparison instruction).
+        // Keep a total float order and deterministic doc/ordinal tie breaks.
+        // The generic then_with closures inline; no callback allocation is needed.
         other
             .score
             .total_cmp(&self.score)

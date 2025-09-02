@@ -4,9 +4,9 @@
 //! yields documents whose value falls within the specified bounds. Score is
 //! always 1.0 — this is a pure filter query.
 //!
-//! Supports u64, i64, and f64 fields. For i64/f64, bounds are encoded to the
-//! same sortable-u64 representation used by fast fields so that a single raw
-//! u64 comparison covers all types.
+//! Supports u64, i64, and f64 fields. Unsigned and sortable-encoded f64 values
+//! compare in their stored domain; zigzag-encoded i64 values must be decoded
+//! before signed comparison.
 //!
 //! When placed in a `BooleanQuery` MUST clause, the `BooleanScorer`'s
 //! seek-based intersection makes this efficient even on large segments.
@@ -14,7 +14,7 @@
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
-use crate::structures::fast_field::{FAST_FIELD_MISSING, f64_to_sortable_u64, zigzag_encode};
+use crate::structures::fast_field::{FAST_FIELD_MISSING, f64_to_sortable_u64, zigzag_decode};
 use crate::{DocId, Score};
 
 use super::docset::DocSet;
@@ -27,55 +27,50 @@ use super::traits::{CountFuture, Query, Scorer, ScorerFuture};
 pub enum RangeBound {
     /// u64 range — stored raw
     U64 { min: Option<u64>, max: Option<u64> },
-    /// i64 range — will be zigzag-encoded for comparison
+    /// i64 range — stored values are zigzag-decoded before comparison
     I64 { min: Option<i64>, max: Option<i64> },
     /// f64 range — will be sortable-encoded for comparison
     F64 { min: Option<f64>, max: Option<f64> },
 }
 
-impl RangeBound {
-    /// Compile to raw u64 inclusive bounds suitable for direct fast-field comparison.
-    ///
-    /// Returns `(low, high)` where both are inclusive. Missing bounds become
-    /// 0 / u64::MAX-1 (reserving u64::MAX for FAST_FIELD_MISSING sentinel).
-    fn compile(&self) -> (u64, u64) {
+/// One compiled comparison shared by scorer, random probes, and batch scans.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CompiledRange {
+    Raw { lo: u64, hi: u64 },
+    Signed { lo: i64, hi: i64 },
+}
+
+impl CompiledRange {
+    #[inline]
+    fn contains(self, raw: u64) -> bool {
+        if raw == FAST_FIELD_MISSING {
+            return false;
+        }
         match self {
-            RangeBound::U64 { min, max } => {
-                let lo = min.unwrap_or(0);
-                let hi = max.unwrap_or(u64::MAX - 1);
-                (lo, hi)
-            }
-            RangeBound::I64 { min, max } => {
-                // zigzag encoding preserves magnitude, not order.
-                // For correct range comparison on i64, we use sortable encoding
-                // (same as f64 but cast through bits). However, fast fields store
-                // i64 as zigzag. So we must decode per-doc and compare in i64 domain.
-                // We store the raw i64 bounds and handle comparison in the scorer.
-                //
-                // Sentinel: use a special marker to tell the scorer to use i64 path.
-                // We'll handle this in the scorer directly.
-                let lo = min.map(zigzag_encode).unwrap_or(0);
-                let hi = max.map(zigzag_encode).unwrap_or(u64::MAX - 1);
-                (lo, hi)
-            }
-            RangeBound::F64 { min, max } => {
-                let lo = min.map(f64_to_sortable_u64).unwrap_or(0);
-                let hi = max.map(f64_to_sortable_u64).unwrap_or(u64::MAX - 1);
-                (lo, hi)
+            Self::Raw { lo, hi } => raw >= lo && raw <= hi,
+            Self::Signed { lo, hi } => {
+                let value = zigzag_decode(raw);
+                value >= lo && value <= hi
             }
         }
     }
+}
 
-    /// Whether this bound requires per-doc i64 decoding (zigzag doesn't preserve order).
-    fn is_i64(&self) -> bool {
-        matches!(self, RangeBound::I64 { .. })
-    }
-
-    /// Get the raw i64 bounds for the i64 path.
-    fn i64_bounds(&self) -> (i64, i64) {
-        match self {
-            RangeBound::I64 { min, max } => (min.unwrap_or(i64::MIN), max.unwrap_or(i64::MAX)),
-            _ => (i64::MIN, i64::MAX),
+impl RangeBound {
+    fn compile(&self) -> CompiledRange {
+        match *self {
+            Self::U64 { min, max } => CompiledRange::Raw {
+                lo: min.unwrap_or(0),
+                hi: max.unwrap_or(u64::MAX - 1),
+            },
+            Self::I64 { min, max } => CompiledRange::Signed {
+                lo: min.unwrap_or(i64::MIN),
+                hi: max.unwrap_or(i64::MAX),
+            },
+            Self::F64 { min, max } => CompiledRange::Raw {
+                lo: min.map(f64_to_sortable_u64).unwrap_or(0),
+                hi: max.map(f64_to_sortable_u64).unwrap_or(u64::MAX - 1),
+            },
         }
     }
 }
@@ -177,29 +172,30 @@ impl Query for RangeQuery {
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
         let fast_field = reader.fast_field(self.field.0)?;
-        let (raw_lo, raw_hi) = self.bound.compile();
-        let use_i64 = self.bound.is_i64();
-        let (i64_lo, i64_hi) = self.bound.i64_bounds();
-
-        Some(Box::new(move |doc_id: DocId| -> bool {
-            let raw = fast_field.get_u64(doc_id);
-            if raw == FAST_FIELD_MISSING {
-                return false;
-            }
-            if use_i64 {
-                let val = crate::structures::fast_field::zigzag_decode(raw);
-                val >= i64_lo && val <= i64_hi
-            } else {
-                raw >= raw_lo && raw <= raw_hi
-            }
+        let bound = self.bound.compile();
+        Some(Box::new(move |doc_id| {
+            bound.contains(fast_field.get_u64(doc_id))
         }))
     }
 
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
-        // Build bitset from fast-field scan: O(N). Slower than posting-list-based
-        // bitsets but still faster than per-call predicate in BMP (~2ns lookup vs ~30ns).
-        let pred = self.as_doc_predicate(reader)?;
-        Some(super::DocBitset::from_predicate(reader.num_docs(), &*pred))
+        let fast_field = reader.fast_field(self.field.0)?;
+        if fast_field.multi {
+            // Range predicates inspect the first value, not any value. Keep
+            // this path until the reader owns a batch API with that contract.
+            let pred = self.as_doc_predicate(reader)?;
+            return Some(super::DocBitset::from_predicate(reader.num_docs(), &*pred));
+        }
+        let bound = self.bound.compile();
+        let mut bits = super::DocBitset::new(reader.num_docs());
+        // The generic callback can inline. Traverse blocks once and dispatch
+        // the codec per batch instead of doing random access for every doc.
+        fast_field.scan_single_values(|doc_id, raw| {
+            if bound.contains(raw) {
+                bits.set(doc_id);
+            }
+        });
+        Some(bits)
     }
 
     fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {
@@ -232,14 +228,7 @@ impl Query for RangeQuery {
 struct RangeScorer<'a> {
     /// Cached fast-field reader — avoids HashMap lookup per doc in matches()
     fast_field: &'a crate::structures::fast_field::FastFieldReader,
-    /// For u64/f64: compiled raw bounds. For i64: unused.
-    raw_lo: u64,
-    raw_hi: u64,
-    /// For i64 only: decoded bounds.
-    i64_lo: i64,
-    i64_hi: i64,
-    /// Whether to use i64 comparison path.
-    use_i64: bool,
+    bound: CompiledRange,
     /// Current document position.
     current: u32,
     num_docs: u32,
@@ -256,17 +245,9 @@ impl<'a> RangeScorer<'a> {
     ) -> Result<Self, EmptyRangeScorer> {
         let fast_field = reader.fast_field(field.0).ok_or(EmptyRangeScorer)?;
         let num_docs = reader.num_docs();
-        let (raw_lo, raw_hi) = bound.compile();
-        let use_i64 = bound.is_i64();
-        let (i64_lo, i64_hi) = bound.i64_bounds();
-
         let mut scorer = Self {
             fast_field,
-            raw_lo,
-            raw_hi,
-            i64_lo,
-            i64_hi,
-            use_i64,
+            bound: bound.compile(),
             current: 0,
             num_docs,
         };
@@ -280,17 +261,7 @@ impl<'a> RangeScorer<'a> {
 
     #[inline]
     fn matches(&self, doc_id: DocId) -> bool {
-        let raw = self.fast_field.get_u64(doc_id);
-        if raw == FAST_FIELD_MISSING {
-            return false;
-        }
-
-        if self.use_i64 {
-            let val = crate::structures::fast_field::zigzag_decode(raw);
-            val >= self.i64_lo && val <= self.i64_hi
-        } else {
-            raw >= self.raw_lo && raw <= self.raw_hi
-        }
+        self.bound.contains(self.fast_field.get_u64(doc_id))
     }
 
     /// Advance current past non-matching docs.
@@ -378,9 +349,7 @@ mod tests {
             min: Some(10),
             max: Some(100),
         };
-        let (lo, hi) = b.compile();
-        assert_eq!(lo, 10);
-        assert_eq!(hi, 100);
+        assert_eq!(b.compile(), CompiledRange::Raw { lo: 10, hi: 100 });
     }
 
     #[test]
@@ -389,15 +358,19 @@ mod tests {
             min: Some(-1.0),
             max: Some(1.0),
         };
-        let (lo1, hi1) = b1.compile();
-        assert!(lo1 < hi1);
+        let CompiledRange::Raw { lo, hi } = b1.compile() else {
+            panic!("expected raw bounds")
+        };
+        assert!(lo < hi);
 
         let b2 = RangeBound::F64 {
             min: Some(0.0),
             max: Some(100.0),
         };
-        let (lo2, hi2) = b2.compile();
-        assert!(lo2 < hi2);
+        let CompiledRange::Raw { lo, hi } = b2.compile() else {
+            panic!("expected raw bounds")
+        };
+        assert!(lo < hi);
     }
 
     #[test]
@@ -406,9 +379,13 @@ mod tests {
             min: None,
             max: None,
         };
-        let (lo, hi) = b.compile();
-        assert_eq!(lo, 0);
-        assert_eq!(hi, u64::MAX - 1);
+        assert_eq!(
+            b.compile(),
+            CompiledRange::Raw {
+                lo: 0,
+                hi: u64::MAX - 1
+            }
+        );
     }
 
     #[test]

@@ -20,13 +20,15 @@ kernel cannot evict it. The remaining eviction source is bulk one-shot IO:
 
 `O_DIRECT` requires sector-aligned buffers, offsets, and lengths, needs
 special handling for the final unaligned tail, and silently degrades to
-buffered IO on some filesystems. The same eviction guarantee is achieved
-with the write-behind discipline used by rsync/borg/RocksDB:
+buffered IO on some filesystems. Hermes instead limits cache pollution with a
+write-behind discipline; writeback and eviction advice do not provide the same
+cache-bypass guarantee as successful direct I/O:
 
 - **Linux**: each completed 64 MB window starts asynchronous writeback with
   `sync_file_range(WRITE)`. One window later, `posix_fadvise(DONTNEED)` drops
   the preceding clean pages; `finish()` fsyncs and drops the tail. Steady-state
-  page-cache footprint is bounded instead of growing with the segment.
+  intended page-cache footprint is bounded instead of growing with the segment;
+  actual eviction depends on writeback progress and the kernel/filesystem.
 - **Linux byte-identical ranges**: BMP block payloads and ordinal maps use
   `copy_file_range`, so they do not cross a userspace buffer or fault the
   source mmap merely to copy it. Filesystems that do not support the syscall

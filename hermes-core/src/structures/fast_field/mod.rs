@@ -677,6 +677,25 @@ impl FastFieldWriter {
     }
 }
 
+/// Encode a nonempty source's entirely absent column without materializing
+/// per-document values or offsets. Constant codecs carry no value count: the
+/// block index supplies it. Single values retain the missing sentinel; multi
+/// values have constant-zero offsets and the normal empty value column.
+#[cfg(feature = "native")]
+pub(crate) fn missing_block_data(multi: bool) -> io::Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(23);
+    if multi {
+        let mut offsets = Vec::with_capacity(9);
+        codec::serialize_auto(&[0], &mut offsets)?;
+        data.write_u32::<LittleEndian>(offsets.len() as u32)?;
+        data.write_all(&offsets)?;
+        codec::serialize_auto(&[], &mut data)?;
+    } else {
+        codec::serialize_auto(&[FAST_FIELD_MISSING], &mut data)?;
+    }
+    Ok(data)
+}
+
 // ── Reader ────────────────────────────────────────────────────────────────
 
 use crate::directories::OwnedBytes;
@@ -701,10 +720,12 @@ pub struct ColumnBlock {
     pub raw_dict: OwnedBytes,
 }
 
-/// Reads a single fast-field column from mmap/buffer with O(1) doc_id access.
+/// Reads a single fast-field column from mmap/buffer.
 ///
 /// A column is a sequence of independently-decodable blocks. Fresh segments
 /// have one block; merged segments may have multiple (one per source segment).
+/// Random access finds a merged block in O(log blocks), then pays the selected
+/// codec's lookup cost. Full scans should use the batch visitor where applicable.
 ///
 /// **Zero-copy**: all data is borrowed from the underlying mmap / `OwnedBytes`.
 ///
@@ -1013,9 +1034,9 @@ impl FastFieldReader {
             };
         }
 
-        // Multi-block: merge sorted block dictionaries.
-        // Each block dict is already sorted, so we k-way merge in O(total_entries).
-        // Uses a BTreeMap to deduplicate and assign global ordinals.
+        // Multi-block: deduplicate with a BTreeMap and assign sorted global
+        // ordinals. This clones keys and costs O(total_entries * log(unique));
+        // the source dictionaries are sorted, but this is not a streaming merge.
 
         // Phase 1: Collect unique strings → assign global ordinals.
         //
@@ -1214,7 +1235,7 @@ impl FastFieldReader {
 
     /// Batch-scan all values in a single-value column, calling `f(doc_id, raw_value)` for each.
     ///
-    /// Uses `auto_read_batch` internally (one codec dispatch per block, not per value),
+    /// Uses `auto_read_batch` internally (one codec dispatch per batch of up to 256 values),
     /// enabling compiler auto-vectorization for byte-aligned bitpacked columns.
     /// For text columns, returned values are global ordinals (remapped).
     /// For multi-value columns, use `for_each_multi_value` instead.
