@@ -3329,7 +3329,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-broker"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3358,7 +3358,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3408,7 +3408,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "anyhow",
  "axum",
@@ -3442,7 +3442,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "anyhow",
  "pest",
@@ -3454,7 +3454,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3463,7 +3463,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "anyhow",
  "clap",
@@ -3488,7 +3488,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3507,7 +3507,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3530,7 +3530,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3559,7 +3559,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.121"
+version = "1.8.122"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -4044,9 +4044,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.14.1"
+version = "2.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
+checksum = "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -4244,9 +4244,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.104"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0c1080212aad755ea003d18543e8768dd432c48819efd73a7bf1e39b7a5a3a"
+checksum = "ce57d20d1ea864ce2ac172ab472d409214f4fd359f0b2a2775abdf522e2af99e"
 dependencies = [
  "cfg-if 1.0.4",
  "futures-util",
@@ -8499,9 +8499,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b70935747edd64d89de3efa29d73789b806c15798f8e7dca4d8ac356b50ce70"
+checksum = "aecb87a33d3b0c5e3b7aa46336eaf486cffafbd281b195e4c8b80d50df2351bf"
 dependencies = [
  "cfg-if 1.0.4",
  "once_cell",
@@ -8512,9 +8512,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-futures"
-version = "0.4.77"
+version = "0.4.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b7777d5cc23d0e91404e53ce2d5e8ec7acae3026b16233dba62cd3246457950"
+checksum = "6ef4c5d3d2cdf5c54f4231181768f5510842e350db025faf1f7163b1030ed928"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -8522,9 +8522,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77775f8f3f7217702089053b94958f8f54061a3f663417df76e19cbdcca29bc1"
+checksum = "a690d511e3c1a8b3a55e33511e3c2c00c78415cd23650f32b808627f5696b9ed"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -8532,22 +8532,22 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e11d33f857dc2fb11b8bc75aee111aa9cbeb12cd9f25efd3d4c2a3dd4e235284"
+checksum = "411e4887f0071ef2d2164a9d5fdf2d20efbef78fccd3a78b0c10a1dc5295e48a"
 dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
  "wasm-bindgen-shared",
 ]
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.127"
+version = "0.2.128"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
+checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
 ]
@@ -8579,9 +8579,9 @@ dependencies = [
 
 [[package]]
 name = "web-sys"
-version = "0.3.104"
+version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c435338968042f4f59a557f690a253676d47ce13ceb55d70100e7facf6620a30"
+checksum = "9fbddc4a036f00ec4f18c83445bd3115cb306a91da554919a099d9222fe4a7f8"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
