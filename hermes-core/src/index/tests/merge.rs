@@ -80,6 +80,7 @@ async fn timed_out_commit_retries_the_same_generation_then_resumes_ingestion() {
             writer.add_document(make_doc("rejected")),
             Err(Error::CommitInProgress)
         ));
+        index.reader().await.unwrap().reload().await.unwrap();
         assert_eq!(
             index.num_docs().await.unwrap(),
             0,
@@ -93,11 +94,13 @@ async fn timed_out_commit_retries_the_same_generation_then_resumes_ingestion() {
             .unwrap()
             .unwrap()
     );
+    index.reader().await.unwrap().reload().await.unwrap();
     assert_eq!(index.num_docs().await.unwrap(), 2);
 
     writer.add_document(make_doc("next one")).unwrap();
     writer.add_document(make_doc("next two")).unwrap();
     assert!(writer.commit().await.unwrap());
+    index.reader().await.unwrap().reload().await.unwrap();
     assert_eq!(
         index.num_docs().await.unwrap(),
         4,
