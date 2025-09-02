@@ -29,7 +29,7 @@ const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 /// `load` requires this exact version. Metadata/segment compatibility is a
 /// clean rebuild boundary; serde_json would otherwise silently drop fields it
 /// does not know and a later save could destructively rewrite index state.
-pub const INDEX_META_FORMAT_VERSION: u32 = 5;
+pub const INDEX_META_FORMAT_VERSION: u32 = 6;
 
 /// Index-level centroids/codebooks are deliberately bounded before they are
 /// read or decoded. Besides limiting ordinary corruption damage, the matching
@@ -987,7 +987,7 @@ mod tests {
             .await
             .expect_err("metadata from a newer format version must be refused, not silently pruned")
             .to_string();
-        assert!(error.contains("version 5"), "{error}");
+        assert!(error.contains("version 6"), "{error}");
         assert!(error.contains("incompatible"), "{error}");
     }
 
@@ -1007,7 +1007,7 @@ mod tests {
             .await
             .expect_err("temp-file recovery must apply the same version gate")
             .to_string();
-        assert!(error.contains("version 5"), "{error}");
+        assert!(error.contains("version 6"), "{error}");
     }
 
     #[tokio::test]

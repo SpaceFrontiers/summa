@@ -22,7 +22,7 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::Result;
-use crate::directories::{Directory, DirectoryWriter, OwnedBytes};
+use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{Field, FieldType, Schema};
 use crate::segment::builder::graph_bisection::{
     BpProgressLabel, ForwardIndex, graph_bisection_with_progress,
@@ -70,7 +70,7 @@ async fn read_postings(reader: &SegmentReader, info: &TermInfo) -> Result<Vec<(u
         crate::Error::Corruption("term has neither inline nor external postings".into())
     })?;
     let bytes = reader.read_postings(offset, len).await?;
-    let list = BlockPostingList::deserialize(&bytes)?;
+    let list = BlockPostingList::deserialize(bytes.as_slice())?;
     let mut it = list.iterator();
     let mut out = Vec::with_capacity(list.doc_count() as usize);
     while it.doc() != TERMINATED {
@@ -354,7 +354,6 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
                         &mut sources,
                         &mut postings_out,
                         &mut positions_out,
-                        &mut buf,
                     )
                     .await?
             }
@@ -466,7 +465,7 @@ async fn reorder_term(
                         "term has positions but the segment has no file".into(),
                     )
                 })?;
-            Some(TermPositions::open(OwnedBytes::new(bytes))?)
+            Some(TermPositions::open(bytes)?)
         }
         None => None,
     };
@@ -479,7 +478,7 @@ async fn reorder_term(
             crate::Error::Corruption("term has neither inline nor external postings".into())
         })?;
         let bytes = reader.read_postings(offset, len).await?;
-        let list = BlockPostingList::deserialize(&bytes)?;
+        let list = BlockPostingList::deserialize(bytes.as_slice())?;
         let mut it = list.iterator();
         let mut scratch = Vec::new();
         while it.doc() != TERMINATED {

@@ -89,7 +89,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::vector_data::LazyFlatVectorData;
-use crate::directories::{Directory, FileHandle};
+use crate::directories::{Directory, FileHandle, OwnedBytes};
 use crate::dsl::{DenseVectorQuantization, Document, Field, Schema};
 use crate::observe::DenseAnnScanStats;
 use crate::query::{MAX_DENSE_NPROBE, MAX_DENSE_RERANK_FACTOR};
@@ -2715,21 +2715,19 @@ impl SegmentReader {
     }
 
     /// Read raw posting bytes at offset
-    pub async fn read_postings(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+    pub async fn read_postings(&self, offset: u64, len: u64) -> Result<OwnedBytes> {
         let range = checked_file_range(offset, len, self.postings_handle.len(), "posting")?;
-        let bytes = self.postings_handle.read_bytes_range(range).await?;
-        Ok(bytes.to_vec())
+        Ok(self.postings_handle.read_bytes_range(range).await?)
     }
 
     /// Read raw position bytes at offset (for merge)
-    pub async fn read_position_bytes(&self, offset: u64, len: u64) -> Result<Option<Vec<u8>>> {
+    pub async fn read_position_bytes(&self, offset: u64, len: u64) -> Result<Option<OwnedBytes>> {
         let handle = match &self.positions_handle {
             Some(h) => h,
             None => return Ok(None),
         };
         let range = checked_file_range(offset, len, handle.len(), "position")?;
-        let bytes = handle.read_bytes_range(range).await?;
-        Ok(Some(bytes.to_vec()))
+        Ok(Some(handle.read_bytes_range(range).await?))
     }
 
     /// Check if this segment has a positions file

@@ -1,27 +1,27 @@
-//! Position stream v2: positions addressed through the doc postings.
+//! Position stream v3: positions addressed through the doc postings.
 //!
 //! One stream per term, referenced by `TermInfo::External { position_offset,
 //! position_len }`:
 //!
 //! ```text
 //! [block 0][block 1]...[block n-1]
-//! [block offsets: u32 × n]                      byte offset of each block
-//! [footer: num_blocks u32, total_positions u64, magic u32 "POS2"]   16 bytes
+//! [block index: (byte_offset u32, value_start u64) × n]
+//! [footer: num_blocks u32, total_positions u64, magic u32 "POS3"]   16 bytes
 //! block: [count u16][bits u8][pad u8][packed values: count × bytes_per_value(bits)]
 //! ```
 //!
 //! The values form one flat sequence in posting order: for every document
 //! (or chunk) its sorted positions, delta-coded (`p0, p1 - p0, ...`). Blocks
-//! hold exactly [`POSITION_STREAM_BLOCK`] values except the last one, so the
-//! `i`-th value lives in block `i / 128`. The doc postings record, per doc
-//! block, how many values precede the block ([`BlockPostingList::pos_cursor`])
-//! and the posting iterator adds the term frequencies of the postings before
-//! the current one ([`BlockPostingIterator::position_cursor`]); a reader then
-//! decodes only the one or two blocks covering `[cursor, cursor + tf)`.
+//! hold at most [`POSITION_STREAM_BLOCK`] values. The block index records both
+//! the physical byte offset and logical value start, so interior blocks may be
+//! short. The doc postings record, per doc block, how many values precede the
+//! block ([`BlockPostingList::pos_cursor`]) and the posting iterator adds the
+//! term frequencies of the postings before the current one
+//! ([`BlockPostingIterator::position_cursor`]).
 //!
-//! Because the stream is doc-agnostic, a merge re-packs the sources' values
-//! into fresh 128-value blocks without decoding deltas, and the cursors of the
-//! merged doc postings are the sources' cursors shifted by the number of
+//! Because the logical starts do not require interior blocks to be full, merge
+//! copies every encoded source block verbatim and rebuilds only the block index
+//! and footer. The cursors of merged doc postings are shifted by the number of
 //! values that precede each source.
 //!
 //! [`BlockPostingList::pos_cursor`]: super::BlockPostingList::pos_cursor
@@ -40,15 +40,16 @@ use crate::structures::simd;
 pub const POSITION_STREAM_BLOCK: usize = 128;
 
 const BLOCK_HEADER: usize = 4;
+const INDEX_ENTRY: usize = 12;
 const FOOTER: usize = 16;
-/// "POS2" little-endian.
-const MAGIC: u32 = 0x3253_4F50;
+/// "POS3" little-endian.
+const MAGIC: u32 = 0x3353_4F50;
 
 /// Streaming writer of one term's position stream.
 pub struct PositionStreamEncoder<W: Write> {
     writer: W,
     pending: Vec<u32>,
-    offsets: Vec<u32>,
+    index: Vec<(u32, u64)>,
     written: u64,
     total: u64,
     scratch: Vec<u8>,
@@ -59,7 +60,7 @@ impl<W: Write> PositionStreamEncoder<W> {
         Self {
             writer,
             pending: Vec::with_capacity(POSITION_STREAM_BLOCK),
-            offsets: Vec::new(),
+            index: Vec::new(),
             written: 0,
             total: 0,
             scratch: Vec::with_capacity(BLOCK_HEADER + POSITION_STREAM_BLOCK * 4),
@@ -107,7 +108,8 @@ impl<W: Write> PositionStreamEncoder<W> {
                 "position stream exceeds u32::MAX bytes",
             ));
         }
-        self.offsets.push(self.written as u32);
+        self.index
+            .push((self.written as u32, self.total - self.pending.len() as u64));
         let max = self.pending.iter().copied().max().unwrap_or(0);
         let width = simd::RoundedBitWidth::from_exact(simd::bits_needed(max));
         let count = self.pending.len();
@@ -128,14 +130,15 @@ impl<W: Write> PositionStreamEncoder<W> {
     /// `(total_positions, bytes_written)`.
     pub fn finish(mut self) -> io::Result<(u64, u64)> {
         self.flush_block()?;
-        for &offset in &self.offsets {
+        for &(offset, value_start) in &self.index {
             self.writer.write_u32::<LittleEndian>(offset)?;
+            self.writer.write_u64::<LittleEndian>(value_start)?;
         }
         self.writer
-            .write_u32::<LittleEndian>(self.offsets.len() as u32)?;
+            .write_u32::<LittleEndian>(self.index.len() as u32)?;
         self.writer.write_u64::<LittleEndian>(self.total)?;
         self.writer.write_u32::<LittleEndian>(MAGIC)?;
-        let bytes = self.written + (self.offsets.len() * 4) as u64 + FOOTER as u64;
+        let bytes = self.written + (self.index.len() * INDEX_ENTRY) as u64 + FOOTER as u64;
         Ok((self.total, bytes))
     }
 }
@@ -145,39 +148,56 @@ impl<W: Write> PositionStreamEncoder<W> {
 pub struct PositionStream {
     bytes: OwnedBytes,
     num_blocks: usize,
-    offsets_start: usize,
+    index_start: usize,
     total: u64,
+    canonical_blocks: bool,
 }
 
 impl PositionStream {
-    /// Whether `raw` ends with a v2 footer (legacy lists end with a doc count).
+    /// Whether `raw` ends with a current position-stream footer.
     pub fn is_stream(raw: &[u8]) -> bool {
         raw.len() >= FOOTER && u32::from_le_bytes(raw[raw.len() - 4..].try_into().unwrap()) == MAGIC
     }
 
     pub fn open(bytes: OwnedBytes) -> io::Result<Self> {
-        let raw = bytes.as_slice();
-        if !Self::is_stream(raw) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "position stream footer missing",
-            ));
-        }
-        let f = raw.len() - FOOTER;
-        let num_blocks = u32::from_le_bytes(raw[f..f + 4].try_into().unwrap()) as usize;
-        let total = u64::from_le_bytes(raw[f + 4..f + 12].try_into().unwrap());
-        let offsets_start = f.checked_sub(num_blocks * 4).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "position stream offsets table longer than the stream",
-            )
-        })?;
+        let (num_blocks, index_start, total) = Self::parse_layout(bytes.as_slice())?;
+        // Freshly encoded streams keep every interior block full, retaining
+        // the original O(1) cursor-to-block calculation. Only concatenated
+        // streams with partial interior source tails need the index search.
+        let canonical_blocks = num_blocks == 0
+            || Self::index_entry(bytes.as_slice(), index_start, num_blocks - 1).1
+                == (num_blocks as u64 - 1) * POSITION_STREAM_BLOCK as u64;
         Ok(Self {
             bytes,
             num_blocks,
-            offsets_start,
+            index_start,
             total,
+            canonical_blocks,
         })
+    }
+
+    fn parse_layout(raw: &[u8]) -> io::Result<(usize, usize, u64)> {
+        if !Self::is_stream(raw) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "current position stream footer missing",
+            ));
+        }
+        let footer_start = raw.len() - FOOTER;
+        let num_blocks =
+            u32::from_le_bytes(raw[footer_start..footer_start + 4].try_into().unwrap()) as usize;
+        let total =
+            u64::from_le_bytes(raw[footer_start + 4..footer_start + 12].try_into().unwrap());
+        let index_len = num_blocks.checked_mul(INDEX_ENTRY).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "position block index overflows")
+        })?;
+        let index_start = footer_start.checked_sub(index_len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "position block index longer than the stream",
+            )
+        })?;
+        Ok((num_blocks, index_start, total))
     }
 
     pub fn total_positions(&self) -> u64 {
@@ -188,39 +208,85 @@ impl PositionStream {
         self.num_blocks
     }
 
-    fn block_range(&self, idx: usize) -> Option<(usize, usize)> {
+    #[inline]
+    fn index_entry(raw: &[u8], index_start: usize, idx: usize) -> (usize, u64) {
+        let p = index_start + idx * INDEX_ENTRY;
+        (
+            u32::from_le_bytes(raw[p..p + 4].try_into().unwrap()) as usize,
+            u64::from_le_bytes(raw[p + 4..p + 12].try_into().unwrap()),
+        )
+    }
+
+    fn block_range(&self, idx: usize) -> Option<(usize, usize, u64)> {
         if idx >= self.num_blocks {
             return None;
         }
         let raw = self.bytes.as_slice();
-        let read_offset = |i: usize| {
-            let p = self.offsets_start + i * 4;
-            u32::from_le_bytes(raw[p..p + 4].try_into().unwrap()) as usize
-        };
-        let start = read_offset(idx);
+        let (start, value_start) = Self::index_entry(raw, self.index_start, idx);
         let end = if idx + 1 < self.num_blocks {
-            read_offset(idx + 1)
+            Self::index_entry(raw, self.index_start, idx + 1).0
         } else {
-            self.offsets_start
+            self.index_start
         };
-        (start <= end && end <= self.offsets_start).then_some((start, end))
+        (start <= end && end <= self.index_start).then_some((start, end, value_start))
+    }
+
+    fn block_count(raw: &[u8]) -> Option<usize> {
+        if raw.len() < BLOCK_HEADER {
+            return None;
+        }
+        let count = u16::from_le_bytes(raw[0..2].try_into().unwrap()) as usize;
+        if count == 0 || count > POSITION_STREAM_BLOCK {
+            return None;
+        }
+        let bytes_per_value = match raw[2] {
+            0 => 0,
+            8 => 1,
+            16 => 2,
+            32 => 4,
+            _ => return None,
+        };
+        (raw.len() == BLOCK_HEADER + count * bytes_per_value).then_some(count)
+    }
+
+    fn locate_value(&self, cursor: u64) -> Option<(usize, usize)> {
+        if cursor >= self.total || self.num_blocks == 0 {
+            return None;
+        }
+        if self.canonical_blocks {
+            let idx = usize::try_from(cursor / POSITION_STREAM_BLOCK as u64).ok()?;
+            return Some((idx, (cursor % POSITION_STREAM_BLOCK as u64) as usize));
+        }
+        let raw = self.bytes.as_slice();
+        let mut low = 0usize;
+        let mut high = self.num_blocks;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let value_start = Self::index_entry(raw, self.index_start, mid).1;
+            if value_start <= cursor {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        let idx = low.checked_sub(1)?;
+        let (start, end, value_start) = self.block_range(idx)?;
+        let count = Self::block_count(&raw[start..end])?;
+        let in_block = usize::try_from(cursor.checked_sub(value_start)?).ok()?;
+        (in_block < count).then_some((idx, in_block))
     }
 
     /// Decode block `idx` (raw delta values) into `out`.
     pub fn decode_block(&self, idx: usize, out: &mut Vec<u32>) -> bool {
-        let Some((start, end)) = self.block_range(idx) else {
+        let Some((start, end, _)) = self.block_range(idx) else {
             return false;
         };
         let raw = &self.bytes.as_slice()[start..end];
-        if raw.len() < BLOCK_HEADER {
+        let Some(count) = Self::block_count(raw) else {
             return false;
-        }
-        let count = u16::from_le_bytes(raw[0..2].try_into().unwrap()) as usize;
+        };
         let width = simd::RoundedBitWidth::from_u8(raw[2]);
         let needed = BLOCK_HEADER + count * width.bytes_per_value();
-        if raw.len() < needed || count > POSITION_STREAM_BLOCK {
-            return false;
-        }
         out.clear();
         out.resize(count, 0);
         simd::unpack_rounded(&raw[BLOCK_HEADER..needed], width, out, count);
@@ -241,12 +307,17 @@ impl PositionStream {
         if tf == 0 {
             return true;
         }
-        if cursor + tf as u64 > self.total {
+        if cursor
+            .checked_add(tf as u64)
+            .is_none_or(|end| end > self.total)
+        {
             return false;
         }
-        let mut idx = (cursor / POSITION_STREAM_BLOCK as u64) as usize;
-        let mut in_block = (cursor % POSITION_STREAM_BLOCK as u64) as usize;
+        let Some((mut idx, mut in_block)) = self.locate_value(cursor) else {
+            return false;
+        };
         let mut remaining = tf as usize;
+        let mut next_cursor = cursor;
         let mut prev = 0u32;
         out.reserve(remaining);
         while remaining > 0 {
@@ -259,10 +330,138 @@ impl PositionStream {
                 out.push(prev);
             }
             remaining -= take;
+            next_cursor += take as u64;
             in_block = 0;
             idx += 1;
+            if remaining > 0
+                && self
+                    .block_range(idx)
+                    .is_none_or(|(_, _, value_start)| value_start != next_cursor)
+            {
+                return false;
+            }
         }
         true
+    }
+
+    /// Concatenate current-format streams by copying encoded blocks verbatim.
+    /// Only the compact block index and footer are rebuilt.
+    pub fn concatenate_streaming<W: Write>(
+        sources: &[&[u8]],
+        writer: &mut W,
+    ) -> crate::Result<(u64, u64)> {
+        let layouts: Vec<_> = sources
+            .iter()
+            .map(|raw| Self::parse_layout(raw))
+            .collect::<io::Result<_>>()?;
+
+        // The common single-source/zero-offset merge can preserve the entire
+        // stream, including its already valid index and footer.
+        if sources.len() == 1 {
+            let raw = sources[0];
+            let total = layouts[0].2;
+            Self::validate_blocks(raw, total)?;
+            writer.write_all(raw)?;
+            return Ok((total, raw.len() as u64));
+        }
+
+        let total_blocks: usize = layouts.iter().map(|(blocks, _, _)| *blocks).sum();
+        let total_blocks_u32 = u32::try_from(total_blocks).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "position stream has more than u32::MAX blocks",
+            )
+        })?;
+        let mut out_index = Vec::with_capacity(total_blocks * INDEX_ENTRY);
+        let mut data_written = 0u64;
+        let mut total_positions = 0u64;
+
+        for (raw, &(num_blocks, index_start, source_total)) in sources.iter().zip(&layouts) {
+            let mut expected_start = 0u64;
+            for idx in 0..num_blocks {
+                let (start, value_start) = Self::index_entry(raw, index_start, idx);
+                let end = if idx + 1 < num_blocks {
+                    Self::index_entry(raw, index_start, idx + 1).0
+                } else {
+                    index_start
+                };
+                if start > end || end > index_start || value_start != expected_start {
+                    return Err(crate::Error::Corruption(
+                        "invalid position block index during merge".into(),
+                    ));
+                }
+                let block = &raw[start..end];
+                let count = Self::block_count(block).ok_or_else(|| {
+                    crate::Error::Corruption("invalid position block during merge".into())
+                })?;
+                if data_written > u32::MAX as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "position stream exceeds u32::MAX bytes during merge",
+                    )
+                    .into());
+                }
+                out_index.write_u32::<LittleEndian>(data_written as u32)?;
+                out_index.write_u64::<LittleEndian>(
+                    total_positions.checked_add(value_start).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "position count overflows u64 during merge",
+                        )
+                    })?,
+                )?;
+                writer.write_all(block)?;
+                data_written += block.len() as u64;
+                expected_start += count as u64;
+            }
+            if expected_start != source_total {
+                return Err(crate::Error::Corruption(
+                    "position stream total does not match its blocks".into(),
+                ));
+            }
+            total_positions = total_positions.checked_add(source_total).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "position count overflows u64 during merge",
+                )
+            })?;
+        }
+
+        writer.write_all(&out_index)?;
+        writer.write_u32::<LittleEndian>(total_blocks_u32)?;
+        writer.write_u64::<LittleEndian>(total_positions)?;
+        writer.write_u32::<LittleEndian>(MAGIC)?;
+        let bytes_written = data_written + out_index.len() as u64 + FOOTER as u64;
+        Ok((total_positions, bytes_written))
+    }
+
+    fn validate_blocks(raw: &[u8], expected_total: u64) -> io::Result<()> {
+        let (num_blocks, index_start, _) = Self::parse_layout(raw)?;
+        let mut total = 0u64;
+        for idx in 0..num_blocks {
+            let (start, value_start) = Self::index_entry(raw, index_start, idx);
+            let end = if idx + 1 < num_blocks {
+                Self::index_entry(raw, index_start, idx + 1).0
+            } else {
+                index_start
+            };
+            if start > end || end > index_start || value_start != total {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid position block index",
+                ));
+            }
+            total += Self::block_count(&raw[start..end]).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid position block")
+            })? as u64;
+        }
+        if total != expected_total {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "position stream total does not match its blocks",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -350,6 +549,7 @@ mod tests {
         assert_eq!(total, docs.iter().map(|d| d.len() as u64).sum::<u64>());
         assert!(PositionStream::is_stream(&buf));
         let stream = PositionStream::open(OwnedBytes::new(buf)).unwrap();
+        assert!(stream.canonical_blocks);
         assert_eq!(stream.total_positions(), total);
         assert_eq!(stream.num_blocks(), total.div_ceil(128) as usize);
         let expected: Vec<Vec<u32>> = docs
@@ -387,6 +587,85 @@ mod tests {
         let all: Vec<Vec<u32>> = a.iter().chain(&b).cloned().collect();
         let (direct, _) = encode(&all);
         assert_eq!(merged, direct);
+    }
+
+    #[test]
+    fn streaming_concatenation_copies_non_aligned_blocks_verbatim() {
+        // Both sources end with partial blocks. A merged stream therefore has
+        // an interior short block and exercises the v3 logical-start index.
+        let a: Vec<Vec<u32>> = (0..43)
+            .map(|doc| {
+                (0..doc % 5 + 1)
+                    .map(|position| doc + position * 7)
+                    .collect()
+            })
+            .collect();
+        let b: Vec<Vec<u32>> = (0..51)
+            .map(|doc| {
+                (0..doc % 4 + 1)
+                    .map(|position| doc * 2 + position)
+                    .collect()
+            })
+            .collect();
+        let (encoded_a, total_a) = encode(&a);
+        let (encoded_b, total_b) = encode(&b);
+        assert_ne!(total_a % POSITION_STREAM_BLOCK as u64, 0);
+        assert_ne!(total_b % POSITION_STREAM_BLOCK as u64, 0);
+
+        let source_blocks = |raw: &[u8]| {
+            let stream = PositionStream::open(OwnedBytes::new(raw.to_vec())).unwrap();
+            (0..stream.num_blocks())
+                .map(|idx| {
+                    let (start, end, _) = stream.block_range(idx).unwrap();
+                    raw[start..end].to_vec()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_blocks: Vec<Vec<u8>> = source_blocks(&encoded_a)
+            .into_iter()
+            .chain(source_blocks(&encoded_b))
+            .collect();
+
+        let mut merged = Vec::new();
+        let (total, written) = PositionStream::concatenate_streaming(
+            &[encoded_a.as_slice(), encoded_b.as_slice()],
+            &mut merged,
+        )
+        .unwrap();
+        assert_eq!(total, total_a + total_b);
+        assert_eq!(written as usize, merged.len());
+
+        let stream = PositionStream::open(OwnedBytes::new(merged.clone())).unwrap();
+        assert!(!stream.canonical_blocks);
+        let actual_blocks: Vec<Vec<u8>> = (0..stream.num_blocks())
+            .map(|idx| {
+                let (start, end, _) = stream.block_range(idx).unwrap();
+                merged[start..end].to_vec()
+            })
+            .collect();
+        assert_eq!(actual_blocks, expected_blocks, "encoded blocks changed");
+        assert_eq!(stream.num_blocks(), expected_blocks.len());
+
+        let all: Vec<Vec<u32>> = a.iter().chain(&b).cloned().collect();
+        let expected: Vec<Vec<u32>> = all
+            .iter()
+            .map(|positions| {
+                let mut positions = positions.clone();
+                positions.sort_unstable();
+                positions
+            })
+            .collect();
+        assert_eq!(read_all(&stream, &all), expected);
+    }
+
+    #[test]
+    fn single_source_streaming_concatenation_is_an_exact_copy() {
+        let (encoded, total) = encode(&[(0..137).collect()]);
+        let mut copied = Vec::new();
+        let result =
+            PositionStream::concatenate_streaming(&[encoded.as_slice()], &mut copied).unwrap();
+        assert_eq!(result, (total, encoded.len() as u64));
+        assert_eq!(copied, encoded);
     }
 
     /// Size of the two formats on a synthetic "content" term: run with
