@@ -53,7 +53,16 @@ panic marks the generation failed, the other workers drain their queues, every
 successful sibling output is abandoned through the same tracked cleanup path,
 and no partial generation is published. A timeout leaves the writer paused on
 the same generation so a late worker cannot acknowledge the next commit by
-mistake; the caller retries commit.
+mistake; core returns `CommitFlushTimeout` and the caller retries commit.
+
+The server acquires an owned writer guard before starting `Commit` and moves
+it into a task that outlives the RPC. That task retries only worker-flush
+timeouts, observing the same finite queued generation at five-minute intervals;
+it does not spin, admit another generation, or restart failed builds. A client
+deadline/disconnect cancels the waiter, not the accepted commit. Reader reload
+is included in the owned operation. Build/publication failures are logged and
+returned, not retried indefinitely. Concurrent commits wait for the same writer
+lock, and cancellation before acquiring that lock starts no operation.
 
 Once a prepared indexing commit starts, an owned finalizer—not the requesting
 RPC—holds its segment guards. It completes metadata publication, refreshes the
@@ -70,6 +79,14 @@ Tokio cannot cancel a `spawn_blocking` closure after it has started. Dropping or
 aborting only its async wrapper while deleting an index would let filesystem
 writes continue into a removed directory. Hermes therefore drains blocking
 merge/reorder work instead of pretending to cancel it.
+
+Process shutdown first rejects new registry requests and stops optimizer scans.
+It waits for accepted commits to release their owned writer guards before
+closing segment-build admission and stopping writers/managers. Manager shutdown
+signals BP cancellation before joining the optimizer supervisor. This preserves
+pending commit flushes without waiting for an uncancelled full BP pass. Forced
+process termination is still outside the guarantee; deployments must allow
+adequate termination grace and drain/commit ingestion before restarting.
 
 Index deletion follows this order:
 
