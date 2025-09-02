@@ -198,15 +198,30 @@ This prevents an implicit corpus-sized scoring heap on a legacy backend.
 ## Client example
 
 ```python
-result = await client.search("documents", query={"fusion": {
-    "queries": [
-        {"name": "body", "scope": "chunk", "query": {
-            "match": {"field": "content", "text": "hemoglobin"}}},
-        {"name": "title", "scope": "document", "score_only": True, "query": {
-            "match": {"field": "title", "text": "hemoglobin"}}},
-    ],
-    "candidate_depth": 100,
-}}, limit=100, l1={"weights": {"body": 1.0, "title": 0.2}}, score_export={})
+result = await client.search(
+    "documents",
+    query={
+        "fusion": {
+            "queries": [
+                {
+                    "name": "body",
+                    "scope": "chunk",
+                    "query": {"match": {"field": "content", "text": "hemoglobin"}},
+                },
+                {
+                    "name": "title",
+                    "scope": "document",
+                    "score_only": True,
+                    "query": {"match": {"field": "title", "text": "hemoglobin"}},
+                },
+            ],
+            "candidate_depth": 100,
+        }
+    },
+    limit=100,
+    l1={"weights": {"body": 1.0, "title": 0.2}},
+    score_export={},
+)
 ```
 
 Omit `l1` and keep `score_export={}` to collect the complete bounded union for
