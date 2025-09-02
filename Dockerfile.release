@@ -1,0 +1,54 @@
+# syntax=docker/dockerfile:1
+
+# Build both production binaries together so Cargo compiles their shared
+# dependency graph only once.
+FROM rust:1.98.0-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY hermes-broker ./hermes-broker
+COPY hermes-core ./hermes-core
+COPY hermes-llm ./hermes-llm
+COPY hermes-mal ./hermes-mal
+COPY hermes-mal-python ./hermes-mal-python
+COPY hermes-tokenizer ./hermes-tokenizer
+COPY hermes-train ./hermes-train
+COPY hermes-server ./hermes-server
+COPY hermes-tool ./hermes-tool
+COPY hermes-wasm ./hermes-wasm
+COPY hermes-proto ./hermes-proto
+
+# Layer caching alone is ineffective after a version bump changes the
+# manifests. These cache mounts let Cargo reuse downloaded crates and compiled
+# dependencies while the output copies remain normal image layers.
+RUN --mount=type=cache,id=hermes-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=hermes-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=hermes-cargo-target,target=/app/target,sharing=locked \
+    cargo build --locked --release \
+        -p hermes-server --bin hermes-server \
+        -p hermes-broker --bin hermes-broker \
+    && install -Dm755 target/release/hermes-server /out/hermes-server \
+    && install -Dm755 target/release/hermes-broker /out/hermes-broker
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+EXPOSE 50051
+
+COPY --from=builder /out/hermes-server /usr/local/bin/hermes-server
+COPY --from=builder /out/hermes-broker /usr/local/bin/hermes-broker
+
+# Run the server by default. Supplying `hermes-broker` as the container command
+# starts the broker from this same image.
+CMD ["hermes-server"]

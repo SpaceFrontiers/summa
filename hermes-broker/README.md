@@ -46,3 +46,15 @@ cargo test -p hermes-broker                      # unit + mock-backend integrati
 cargo build -p hermes-server --bin hermes-server # e2e prerequisite
 cargo test -p hermes-broker --test e2e_real_server -- --ignored
 ```
+
+## Container image
+
+The published Hermes image contains both the server and broker binaries. It
+starts `hermes-server` by default; select the broker with a command override:
+
+```bash
+docker run --rm -p 50051:50051 \
+  ghcr.io/spacefrontiers/hermes/hermes-server:latest \
+  hermes-broker --discovery static \
+  --backend "id=local,addr=10.0.0.10:50051,shard=0"
+```

@@ -362,8 +362,13 @@ Or pull from GitHub Container Registry:
 
 ```bash
 docker pull ghcr.io/spacefrontiers/hermes/hermes-server:latest
-docker run -p 50051:50051 -v ./data:/data ghcr.io/spacefrontiers/hermes/hermes-server:latest --data-dir /data
+docker run -p 50051:50051 -v ./data:/data \
+  ghcr.io/spacefrontiers/hermes/hermes-server:latest \
+  hermes-server --data-dir /data
 ```
+
+The published image also contains `hermes-broker`. Override the command to run
+it instead of the default server process.
 
 ## License
 
