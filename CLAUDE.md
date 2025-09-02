@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Shared engineering rules and the focused core/server harness live in
+[`AGENTS.md`](AGENTS.md) and [the search system contract](docs/search-system-contract.md).
+Read them before changing the search stack; keep system rules there to avoid drift.
+
 ## Workflow Rules
 
 - When asked to "commit", "commit and push", or "push" — do it immediately. Do NOT continue making additional changes, running tests, or doing further work unless explicitly asked.
@@ -169,7 +173,8 @@ Key constraint: WASM has no threads, no filesystem, no `SystemTime`. All native-
 - **`fst-index`**: FST block index support (included in both `native` and `wasm`)
 - **`wasm`**: WASM-compatible build — sequential builders, in-memory store, simple interner
 - **`http`**: HTTP directory with reqwest (works on both native and WASM)
-- **`sync`**: Alias for `native`
+- **`sync`**: Enables synchronous scoring and depends on `native`. Native
+  without sync remains a supported async execution boundary.
 
 ### Schema Definition Language (SDL)
 

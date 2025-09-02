@@ -24,28 +24,28 @@ arrays touched by every ANN route.
 
 ## Residency of per-query structures today
 
-| Structure       | "meta" part                              | Residency                | "data" part | Residency                                    |
-| --------------- | ---------------------------------------- | ------------------------ | ----------- | -------------------------------------------- |
-| Sparse MaxScore | `DimensionTable` (SoA Vecs)              | heap (de-facto pinned)   | block data  | evictable mmap                               |
-|                 | skip section (`skip_bytes`)              | **pinnable**             |             |                                              |
-| BMP             | `block_data_starts`, E row offsets, H, doc maps | **pinnable**       | block data  | evictable (MADV_RANDOM + WILLNEED prefetch)  |
-|                 | 4-bit block grid D and superblock grid E | never pinned (see below) |             |                                              |
-| Dense flat      | header + doc-id map                      | **pinnable**             | raw vectors | evictable (+ RANDOM/prefetch for ANN fields) |
-| ANN             | global routing/centroids/PQ tables and per-segment run directory | **pinnable** | quantized codes and IDs | evictable (clustered: MADV_RANDOM + selected-run WILLNEED; flat TQ: sequential) |
+| Structure       | "meta" part                                                      | Residency                | "data" part             | Residency                                                                       |
+| --------------- | ---------------------------------------------------------------- | ------------------------ | ----------------------- | ------------------------------------------------------------------------------- |
+| Sparse MaxScore | `DimensionTable` (SoA Vecs)                                      | heap (de-facto pinned)   | block data              | evictable mmap                                                                  |
+|                 | skip section (`skip_bytes`)                                      | **pinnable**             |                         |                                                                                 |
+| BMP             | `block_data_starts`, E row offsets, H, doc maps                  | **pinnable**             | block data              | evictable (MADV_RANDOM + WILLNEED prefetch)                                     |
+|                 | 4-bit block grid D and superblock grid E                         | never pinned (see below) |                         |                                                                                 |
+| Dense flat      | header + doc-id map                                              | **pinnable**             | raw vectors             | evictable (+ RANDOM/prefetch for ANN fields)                                    |
+| ANN             | global routing/centroids/PQ tables and per-segment run directory | **pinnable**             | quantized codes and IDs | evictable (clustered: MADV_RANDOM + selected-run WILLNEED; flat TQ: sequential) |
 
 Sizes for a representative 18.2M-vector segment at block size 32
 (568,750 blocks, 71,094 superblocks, 278 coarse groups, SPLADE
 dims ≈ 105,879):
 
-| Structure                                      | Dense upper size | Pin priority                                      |
-| ---------------------------------------------- | ---------------- | ------------------------------------------------- |
-| BMP `block_data_starts`                        | ~4.34 MiB        | 2 (every scored block does an offset lookup)      |
-| Sparse skip sections                           | workload-specific | 3 (every posting traversal)                      |
-| BMP doc maps (6 B/padded vector)               | ~104.14 MiB      | 4 (only competitive candidates resolve through it) |
-| E row-offset table                             | ~0.81 MiB        | 5 (selected E groups need one row lookup)         |
-| Coarse H grid (`dims × ceil(groups / 2)`)      | ~14.04 MiB       | 5 (every query dimension sweeps its H row)        |
-| Superblock E grid (`dims × ceil(SBs / 2)`)     | ~3.50 GiB        | **never**                                         |
-| Block D grid (`dims × ceil(blocks / 2)`)       | ~28.04 GiB       | **never**                                         |
+| Structure                                  | Dense upper size  | Pin priority                                       |
+| ------------------------------------------ | ----------------- | -------------------------------------------------- |
+| BMP `block_data_starts`                    | ~4.34 MiB         | 2 (every scored block does an offset lookup)       |
+| Sparse skip sections                       | workload-specific | 3 (every posting traversal)                        |
+| BMP doc maps (6 B/padded vector)           | ~104.14 MiB       | 4 (only competitive candidates resolve through it) |
+| E row-offset table                         | ~0.81 MiB         | 5 (selected E groups need one row lookup)          |
+| Coarse H grid (`dims × ceil(groups / 2)`)  | ~14.04 MiB        | 5 (every query dimension sweeps its H row)         |
+| Superblock E grid (`dims × ceil(SBs / 2)`) | ~3.50 GiB         | **never**                                          |
+| Block D grid (`dims × ceil(blocks / 2)`)   | ~28.04 GiB        | **never**                                          |
 
 D and E are meta-shaped but data-sized, so their payloads stay evictable.
 Global LSP scans the small H level, then touches only selected independently
@@ -83,8 +83,9 @@ pinning the corpus-sized D/E payloads.
 
 ## Phase 2 (implemented): cold-IO merge writes — see `docs/cold-io.md`
 
-Bulk reads that bypass the page cache entirely (merges, cold posting/vector
-scans) so they can never evict warm pages. Requires a direct-I/O read variant
-in the `Directory` layer. The merge-side `MADV_SEQUENTIAL`/`MADV_DONTNEED`
-discipline already approximates most of the benefit; revisit only if Phase 1
-plus the existing madvise work leaves measurable eviction churn.
+Implemented cold output uses write-behind writeback/cache-drop on Linux and
+`F_NOCACHE` on macOS. Selected byte-identical ranges can use kernel-assisted
+copying; other reads remain buffered/mmap-backed with advisory prefetch and
+release. This reduces cache pollution; it is not a general direct-I/O read path
+or a guarantee that bulk reads cannot evict warm pages. Revisit direct reads
+only if pinning plus the existing advice leaves measurable eviction churn.

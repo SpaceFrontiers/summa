@@ -58,6 +58,12 @@ async fn test_pin_metadata_copy_mode_preserves_search() {
         .await
         .unwrap();
 
+    let field = schema.get_field("sparse").unwrap();
+    let query = SparseVectorQuery::new(field, vec![(3, 1.0), (10, 1.0)]);
+    let before = crate::query::search_segment_with_count(&reader, &query, 10)
+        .await
+        .unwrap();
+
     // Generous budget: everything pinnable gets pinned
     reader.apply_pin_policy(&PinPolicy {
         budget_bytes: 64 * 1024 * 1024,
@@ -94,13 +100,22 @@ async fn test_pin_metadata_copy_mode_preserves_search() {
     );
 
     // Search still works on the heap-copied metadata
-    let field = schema.get_field("sparse").unwrap();
-    let query = SparseVectorQuery::new(field, vec![(3, 1.0), (10, 1.0)]);
-    let results = crate::query::search_segment_with_count(&reader, &query, 10)
+    let after = crate::query::search_segment_with_count(&reader, &query, 10)
         .await
-        .unwrap()
-        .0;
-    assert!(!results.is_empty(), "search must survive pinning");
+        .unwrap();
+    assert!(!before.0.is_empty(), "fixture must have competitive hits");
+    assert_eq!(before.1, after.1, "pinning must preserve scored count");
+    let hits = |results: Vec<crate::query::SearchResult>| {
+        results
+            .into_iter()
+            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        hits(before.0),
+        hits(after.0),
+        "pinning must preserve exact ranking and scores"
+    );
 }
 
 /// Budget exhaustion is respected and reported (fail-loud accounting).

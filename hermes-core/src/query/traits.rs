@@ -82,8 +82,8 @@ pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + 'a>;
 /// Compact bitset indexed by doc_id. O(1) lookup, ~2.25 MB for 18M docs.
 ///
 /// Built from posting lists or predicate scans. Used by BMP filtered queries
-/// for fast per-slot predicate evaluation (~2ns per lookup vs ~30-40ns for
-/// a fast-field closure).
+/// to avoid repeated fast-field decoding during per-slot predicate evaluation.
+/// Lookup cost depends on residency and the caller's dispatch, not just this type.
 pub struct DocBitset {
     pub(crate) bits: Vec<u64>,
 }

@@ -40,6 +40,11 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
+      - name: Search system ownership contracts
+        run: |
+          python3 scripts/check_search.py contracts
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Require official accelerator repositories
         shell: bash
         run: |

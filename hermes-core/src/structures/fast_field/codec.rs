@@ -849,11 +849,11 @@ pub fn serialize_auto(values: &[u64], writer: &mut dyn Write) -> io::Result<u64>
     best.serialize(values, writer)
 }
 
-/// Batch-read `count` consecutive values starting at `start_index` from bitpacked data.
+/// Batch-read `out.len()` consecutive values starting at `start_index` from bitpacked data.
 ///
 /// `data` starts right after the codec_id byte (at min_value).
-/// Uses direct array access for byte-aligned bpv (8, 16, 32, 64) which the
-/// compiler auto-vectorizes to SIMD on aarch64 (NEON) and x86_64 (SSE/AVX).
+/// Byte-aligned bpv (8, 16, 32, 64) use fixed-width chunks with upfront range
+/// checks to enable auto-vectorization; inspect the target/profile's codegen.
 /// For arbitrary bpv, uses a tight scalar loop with the u64 fast-path.
 pub fn bitpacked_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
     let min_value = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -867,36 +867,19 @@ pub fn bitpacked_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
     let packed = &data[9..];
 
     match bpv {
-        // Byte-aligned fast paths — compiler auto-vectorizes these loops
+        // Prove the whole byte range once so the inner loop has no per-value
+        // input bounds checks. Generic decode closures inline into each width.
         8 => {
-            for (i, v) in out.iter_mut().enumerate() {
-                let idx = start_index + i;
-                *v = (packed[idx] as u64).wrapping_add(min_value);
-            }
+            decode_byte_aligned_batch::<1>(packed, start_index, out, min_value, |v| u64::from(v[0]))
         }
-        16 => {
-            for (i, v) in out.iter_mut().enumerate() {
-                let idx = start_index + i;
-                let byte_off = idx * 2;
-                let raw = u16::from_le_bytes([packed[byte_off], packed[byte_off + 1]]);
-                *v = (raw as u64).wrapping_add(min_value);
-            }
-        }
-        32 => {
-            for (i, v) in out.iter_mut().enumerate() {
-                let idx = start_index + i;
-                let byte_off = idx * 4;
-                let raw = u32::from_le_bytes(packed[byte_off..byte_off + 4].try_into().unwrap());
-                *v = (raw as u64).wrapping_add(min_value);
-            }
-        }
+        16 => decode_byte_aligned_batch::<2>(packed, start_index, out, min_value, |v| {
+            u64::from(u16::from_le_bytes(v))
+        }),
+        32 => decode_byte_aligned_batch::<4>(packed, start_index, out, min_value, |v| {
+            u64::from(u32::from_le_bytes(v))
+        }),
         64 => {
-            for (i, v) in out.iter_mut().enumerate() {
-                let idx = start_index + i;
-                let byte_off = idx * 8;
-                let raw = u64::from_le_bytes(packed[byte_off..byte_off + 8].try_into().unwrap());
-                *v = raw.wrapping_add(min_value);
-            }
+            decode_byte_aligned_batch::<8>(packed, start_index, out, min_value, u64::from_le_bytes)
         }
         // Arbitrary bpv — tight scalar loop using u64 fast-path read
         _ => {
@@ -904,6 +887,31 @@ pub fn bitpacked_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
                 *v = super::bitpack_read(packed, bpv, start_index + i).wrapping_add(min_value);
             }
         }
+    }
+}
+
+/// Select exactly one input chunk per output before entering the decode loop.
+/// The upfront slice checks also prevent zip from silently accepting short data.
+#[inline]
+fn decode_byte_aligned_batch<const WIDTH: usize>(
+    packed: &[u8],
+    start: usize,
+    out: &mut [u64],
+    min: u64,
+    decode: impl Fn([u8; WIDTH]) -> u64,
+) {
+    if out.is_empty() {
+        return;
+    }
+    let byte_start = start.checked_mul(WIDTH).expect("bitpacked start overflow");
+    let byte_len = out
+        .len()
+        .checked_mul(WIDTH)
+        .expect("bitpacked length overflow");
+    let bytes = &packed[byte_start..][..byte_len];
+    let (chunks, _) = bytes.as_chunks::<WIDTH>();
+    for (value, &chunk) in out.iter_mut().zip(chunks) {
+        *value = decode(chunk).wrapping_add(min);
     }
 }
 
@@ -1214,6 +1222,52 @@ mod tests {
         // Arbitrary bpv (e.g. 13 bits)
         let values: Vec<u64> = (0..100).map(|i| 999 + (i * 37) % 8000).collect();
         roundtrip_batch(&values);
+    }
+
+    #[test]
+    fn byte_aligned_batches_preserve_offsets_tails_and_wrapping_values() {
+        for bpv in [8u8, 16, 32, 64] {
+            let min = u64::MAX - 11;
+            let mut data = min.to_le_bytes().to_vec();
+            data.push(bpv);
+            let mut expected = Vec::new();
+            for i in 0..521u64 {
+                let raw = i.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - bpv);
+                data.extend_from_slice(&raw.to_le_bytes()[..usize::from(bpv / 8)]);
+                expected.push(raw.wrapping_add(min));
+            }
+            for start in [0, 1, 3, 255, 256, 519, 521] {
+                for len in [0, 1, 2, 7, 16, 255, 256, 257] {
+                    if start + len > expected.len() {
+                        continue;
+                    }
+                    let mut out = vec![0; len];
+                    bitpacked_read_batch(&data, start, &mut out);
+                    assert_eq!(
+                        out,
+                        expected[start..start + len],
+                        "bpv={bpv}, start={start}, len={len}"
+                    );
+                }
+            }
+            // Empty output performs no payload access, even with a large start.
+            bitpacked_read_batch(&data, usize::MAX, &mut []);
+        }
+    }
+
+    #[test]
+    fn byte_aligned_batches_reject_truncated_input_instead_of_short_decoding() {
+        for bpv in [8u8, 16, 32, 64] {
+            let mut data = 0u64.to_le_bytes().to_vec();
+            data.push(bpv);
+            data.resize(9 + usize::from(bpv / 8) * 3 - 1, 0);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    bitpacked_read_batch(&data, 0, &mut [0u64; 3]);
+                })
+                .is_err()
+            );
+        }
     }
 
     #[test]
