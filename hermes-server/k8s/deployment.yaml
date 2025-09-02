@@ -20,6 +20,10 @@ spec:
         - name: hermes-server
           image: ghcr.io/spacefrontiers/hermes/hermes-server:latest
           imagePullPolicy: Always
+          # Kubernetes args replace the image CMD, so keep the executable
+          # explicit when supplying server flags below.
+          command:
+            - "hermes-server"
           args:
             - "--addr"
             - "0.0.0.0:50051"
