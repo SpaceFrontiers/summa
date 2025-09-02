@@ -9,6 +9,7 @@ mod lifecycle;
 #[cfg(feature = "native")]
 pub(crate) use lifecycle::write_generation_lookups;
 
+#[cfg(any(feature = "native", test))]
 use std::io::{self, Write};
 
 use crate::directories::OwnedBytes;
@@ -323,13 +324,14 @@ pub(crate) fn write_lookups(
 
 // One format writer serves reorder preparation and streaming merge/copy.
 // Scratch is owned by each source and released before the next field.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), any(feature = "native", test)))]
 type EmitRows<'a> = Box<
     dyn Fn(&mut dyn FnMut(LogicalUnit, u32) -> io::Result<()>) -> io::Result<()> + Send + Sync + 'a,
 >;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", any(feature = "native", test)))]
 type EmitRows<'a> =
     Box<dyn Fn(&mut dyn FnMut(LogicalUnit, u32) -> io::Result<()>) -> io::Result<()> + 'a>;
+#[cfg(any(feature = "native", test))]
 struct StreamSection<'a> {
     field: u32,
     kind: LookupKind,
@@ -337,6 +339,7 @@ struct StreamSection<'a> {
     count: u32,
     emit: EmitRows<'a>,
 }
+#[cfg(any(feature = "native", test))]
 fn write_streamed(
     writer: &mut dyn Write,
     segment: u128,
