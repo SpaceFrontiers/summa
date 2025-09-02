@@ -1617,7 +1617,17 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// `resume_workers()` to give them a new channel.
     ///
     /// `add_document` returns `CommitInProgress` until commit/abort resumes workers.
+    /// On `CommitFlushTimeout`, retry the same generation: workers may still
+    /// be building and must not be resumed or discarded before they finish.
     pub async fn prepare_commit(&mut self) -> Result<PreparedCommit<'_, D>> {
+        self.prepare_commit_with_timeout(std::time::Duration::from_secs(300))
+            .await
+    }
+
+    pub(super) async fn prepare_commit_with_timeout(
+        &mut self,
+        flush_timeout: std::time::Duration,
+    ) -> Result<PreparedCommit<'_, D>> {
         self.ensure_writer_lock()?;
         if self.worker_state.shutdown.load(Ordering::Acquire) {
             return Err(Error::IndexClosed);
@@ -1640,7 +1650,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let index_label = self.schema.index_label().to_owned();
         let all_flushed = tokio::task::spawn_blocking(move || {
             let mut lock = state.flush_mutex.lock();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            let deadline = std::time::Instant::now() + flush_timeout;
             while state.flush_count.load(Ordering::Acquire) < state.num_workers {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
@@ -1666,11 +1676,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             // publish an incomplete set of segments. The caller may retry
             // prepare_commit; it will observe the same generation and collect
             // every completed output once the lagging worker finishes.
-            return Err(Error::Internal(format!(
-                "prepare_commit timed out: {}/{} workers flushed; writer remains paused, retry commit",
-                self.worker_state.flush_count.load(Ordering::Acquire),
-                self.worker_state.num_workers
-            )));
+            return Err(Error::CommitFlushTimeout {
+                flushed_workers: self.worker_state.flush_count.load(Ordering::Acquire),
+                total_workers: self.worker_state.num_workers,
+            });
         }
 
         let cycle_error = { self.worker_state.cycle_error.lock().take() };

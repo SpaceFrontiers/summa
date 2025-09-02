@@ -1,5 +1,9 @@
 FROM rust:1.98.0
 
+# Bootstrap from the published base until official 1.98.1 image tags exist.
+RUN rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy \
+    && rustup default 1.98.1
+
 # System deps
 RUN apt-get update && apt-get install -y \
     clang \

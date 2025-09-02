@@ -26,6 +26,7 @@ pub fn hermes_error_to_status(e: hermes_core::Error) -> Status {
         hermes_core::Error::QueueFull | hermes_core::Error::CommitInProgress => {
             Status::resource_exhausted(e.to_string())
         }
+        hermes_core::Error::CommitFlushTimeout { .. } => Status::deadline_exceeded(e.to_string()),
 
         // Precondition failures
         hermes_core::Error::IndexClosed => Status::failed_precondition(e.to_string()),

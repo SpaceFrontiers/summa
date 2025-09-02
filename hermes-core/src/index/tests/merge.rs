@@ -2,6 +2,114 @@ use crate::directories::{Directory, RamDirectory};
 use crate::dsl::{Document, SchemaBuilder};
 use crate::index::{Index, IndexConfig, IndexWriter};
 
+#[tokio::test]
+async fn timed_out_commit_retries_the_same_generation_then_resumes_ingestion() {
+    use crate::Error;
+    use crate::tokenizer::{SimpleTokenizer, Token, Tokenizer};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct GatedTokenizer {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<Mutex<mpsc::Receiver<()>>>,
+    }
+    impl Tokenizer for GatedTokenizer {
+        fn tokenize(&self, text: &str) -> Vec<Token> {
+            if text == "slow" {
+                self.started.notify_one();
+                // Sender drop also releases the worker on assertion failure.
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10));
+            }
+            SimpleTokenizer.tokenize(text)
+        }
+    }
+
+    let mut schema = SchemaBuilder::default();
+    let body = schema.add_text_field("body", true, false);
+    let index = Index::create(
+        RamDirectory::new(),
+        schema.build(),
+        IndexConfig {
+            num_indexing_threads: 2,
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+    let (release, receiver) = mpsc::channel();
+    let started = Arc::new(tokio::sync::Notify::new());
+    writer.set_tokenizer(
+        body,
+        GatedTokenizer {
+            started: started.clone(),
+            release: Arc::new(Mutex::new(receiver)),
+        },
+    );
+    let make_doc = |text: &str| {
+        let mut doc = Document::new();
+        doc.add_text(body, text);
+        doc
+    };
+    writer.add_document(make_doc("slow")).unwrap();
+    writer.add_document(make_doc("fast")).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let error = writer
+            .prepare_commit_with_timeout(Duration::from_millis(20))
+            .await
+            .err()
+            .expect("slow worker must time out");
+        assert!(matches!(
+            error,
+            Error::CommitFlushTimeout {
+                flushed_workers: 0..=1,
+                total_workers: 2
+            }
+        ));
+        assert!(matches!(
+            writer.add_document(make_doc("rejected")),
+            Err(Error::CommitInProgress)
+        ));
+        index.reader().await.unwrap().reload().await.unwrap();
+        assert_eq!(
+            index.num_docs().await.unwrap(),
+            0,
+            "must not publish only the fast worker"
+        );
+    }
+    release.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), writer.commit())
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    index.reader().await.unwrap().reload().await.unwrap();
+    assert_eq!(index.num_docs().await.unwrap(), 2);
+
+    writer.add_document(make_doc("next one")).unwrap();
+    writer.add_document(make_doc("next two")).unwrap();
+    assert!(writer.commit().await.unwrap());
+    index.reader().await.unwrap().reload().await.unwrap();
+    assert_eq!(
+        index.num_docs().await.unwrap(),
+        4,
+        "late workers must not corrupt the next flush count"
+    );
+    assert!(!writer.commit().await.unwrap());
+    writer.shutdown().await.unwrap();
+}
+
 async fn wait_for_no_segment_files(dir: &RamDirectory) {
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {

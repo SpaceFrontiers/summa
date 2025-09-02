@@ -16,6 +16,9 @@ spec:
       labels:
         app.kubernetes.io/name: hermes-server
     spec:
+      # Accepted commits drain and publish even after their RPC disconnects.
+      # Give large flushes time to finish before Kubernetes forces termination.
+      terminationGracePeriodSeconds: 1800
       containers:
         - name: hermes-server
           image: ghcr.io/spacefrontiers/hermes/hermes-server:latest

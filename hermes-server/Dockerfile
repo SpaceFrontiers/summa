@@ -7,6 +7,10 @@
 # needs no nightly features; it builds on stable.
 FROM rust:1.98.0-slim-bookworm AS builder
 
+# Bootstrap from the published base until official 1.98.1 image tags exist.
+RUN rustup toolchain install 1.98.1 --profile minimal \
+    && rustup default 1.98.1
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     protobuf-compiler \

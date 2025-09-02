@@ -822,8 +822,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         )
         .serve_with_shutdown(addr, async move {
             shutdown_signal().await;
-            // Stop core lifecycle admission immediately; BP observes this
-            // cancellation while tonic drains requests.
+            // Stop new requests/optimizer scans immediately. Accepted commits
+            // keep segment-build admission until they release the writer.
             signal_registry.begin_shutdown();
             let _ = signal_shutdown.send(true);
         })
@@ -835,11 +835,14 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let _ = shutdown_tx.send(true);
 
     info!("[shutdown] gRPC server drained; waiting for background work");
+    // Stop managers only after accepted commits release their writer guards.
+    // Do this before joining the optimizer: its BP tasks observe cancellation
+    // from manager shutdown and must not keep us waiting for a full pass.
+    let registry_result = registry.shutdown().await;
     let optimizer_result = match optimizer_handle {
         Some(handle) => handle.await,
         None => Ok(()),
     };
-    let registry_result = registry.shutdown().await;
 
     serve_result?;
     optimizer_result?;
