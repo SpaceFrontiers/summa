@@ -754,7 +754,7 @@ impl<D: Directory + 'static> Searcher<D> {
         if retrieval_depth == 0 {
             return Ok(empty());
         }
-        let crate::query::QueryDecomposition::SparseTerms(infos) = query.decompose() else {
+        let crate::query::QueryDecomposition::SparseTerms(infos) = query.lsp_decomposition() else {
             return Ok(empty());
         };
         let Some(&first) = infos.first() else {

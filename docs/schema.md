@@ -529,8 +529,9 @@ field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.
   disabled by default because candidate and block selection can still lose
 - `query<lsp_gamma: N>` — cap traversal to the global top-N superblocks across
   all physical segments. When omitted, Hermes derives gamma from candidate
-  depth (250/500/1000 for depths 10/100/1000). Set zero for exhaustive
-  traversal.
+  depth (3000 through depth 100, 4000 through depth 1000, then the greater
+  of 4000 and depth). Set zero for exhaustive traversal. Query-language
+  `emb:sparse({...})` searches inherit this field setting, including zero.
 
 See `docs/bmp-grid-compression.md` for current size formulas, LSP/0 behavior,
 merge/reorder invariants, and the Flat-Inv versus Fwd design choice.

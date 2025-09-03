@@ -78,3 +78,20 @@ test("BMP search returns identical scores with optional forward storage", async 
 	expect(baseline.hits).toHaveLength(1);
 	expect((await index.searchStructured(request("inverted"))).hits).toEqual(baseline.hits);
 });
+
+test.each([0, 1])("Sparse query language inherits schema LSP gamma %i", async (gamma) => {
+	await init();
+	const index = await LocalIndex.create(`
+		index sparse_policy {
+			field emb: sparse_vector [indexed<format: bmp, dims: 16, max_weight: 5.0, bmp_block_size: 1, query<lsp_gamma: ${gamma}>>]
+		}
+	`);
+	// Two superblocks: eight weaker documents followed by one winner.
+	await index.addDocuments(Array.from({ length: 9 }, (_, doc) => ({
+		emb: { indices: [0], values: [doc === 8 ? 5.0 : 0.1] },
+	})));
+	await index.commit();
+	const results = await index.search("emb:sparse({0: 1.0})", 9);
+	expect(results.hits).toHaveLength(gamma === 0 ? 9 : 1);
+	expect(results.hits[0].address.doc_id).toBe(8);
+});

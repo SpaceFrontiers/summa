@@ -323,7 +323,7 @@ selection; where possible represent nominations in one Hermes request.
 
 ## Eligibility and bounded nomination
 
-The common filter is represented separately from scoring. BM25 and BMP
+The common filter is represented separately from scoring. BM25, BMP and sparse MaxScore
 collectors receive eligibility before their candidate heaps; filters contribute
 neither scores nor ordinals. Vector ANN retains its existing bounded nomination
 and is checked for eligibility before union, so selective filters may underfill
@@ -335,6 +335,28 @@ materializable text/phrase/fast-field filters use the existing bitset paths.
 Other filters and portable builds use ordinary complete filter scorers only on
 segments of at most 200,000 documents, failing explicitly above that bound.
 This prevents an implicit corpus-sized scoring heap on a legacy backend.
+
+Filter wrappers are opaque to scoring decomposition: flattening a filtered
+branch into unfiltered terms changes its matching set. Query-global BMP LSP
+planning has a separate decomposition hook that may inspect the wrapped sparse
+query without removing its filter during execution. This preserves the one
+query-global superblock budget across segments. An enclosing common filter is
+intersected with Boolean-local eligibility before either collector admits hits.
+
+Filter materialization shares the request deadline, with score thresholds and
+LSP selection cleared. An expired materialization discards its partial bitmap
+and marks the request truncated. Empty intersections stop before later filters
+or scoring payloads are read. These checks reuse the existing bitmap and add
+at most a scan of its words; they introduce no corpus-sized scratch or new
+persistent representation.
+
+Candidate backfill admits BMP bytes using validated forward offsets or distinct
+selected inverted-block ranges before reading or validating their payloads.
+These bytes share a 256 MiB request budget with lazy text payload reads across
+segments, features and query components. This bounds BMP work even when one
+nominated vector contains many retained entries; a candidate-count limit alone
+does not bound those bytes. The admission pass needs constant scratch and does
+not inspect payloads or alter stored values.
 
 ## Client example
 

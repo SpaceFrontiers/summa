@@ -32,20 +32,38 @@ impl std::fmt::Display for FilteredQuery {
         )
     }
 }
-fn intersect(combined: &mut Option<DocBitset>, next: DocBitset) {
+/// Intersect complete filters, returning whether any document remains eligible.
+fn intersect(combined: &mut Option<DocBitset>, next: DocBitset) -> bool {
     if let Some(existing) = combined {
         existing.intersect_with(&next);
     } else {
         *combined = Some(next);
     }
+    combined.as_ref().unwrap().next_set_bit(0).is_some()
 }
-fn enumerate_filter(mut scorer: Box<dyn Scorer + '_>, num_docs: u32) -> DocBitset {
+fn enumerate_filter(
+    mut scorer: Box<dyn Scorer + '_>,
+    num_docs: u32,
+    options: &ScorerOptions,
+) -> Option<DocBitset> {
     let mut bits = DocBitset::new(num_docs);
+    let mut visited = 0usize;
     while scorer.doc() != crate::TERMINATED {
+        if visited.is_multiple_of(1024) && options.stop_if_expired() {
+            return None;
+        }
         bits.set(scorer.doc());
         scorer.advance();
+        visited += 1;
     }
-    bits
+    (!options.stop_if_expired()).then_some(bits)
+}
+fn no_candidates(options: &ScorerOptions) -> bool {
+    options.stop_if_expired()
+        || options
+            .eligibility
+            .as_ref()
+            .is_some_and(|bits| bits.next_set_bit(0).is_none())
 }
 // Native materializable filters stream their matches directly into a bitset.
 // The portable fallback uses ordinary scorers only on bounded segments, never
@@ -86,27 +104,49 @@ impl Query for FilteredQuery {
         let this = self.clone();
         Box::pin(async move {
             this.validate(reader)?;
+            if no_candidates(&options) {
+                return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer>);
+            }
+            let filter_options = ScorerOptions {
+                eligibility: None,
+                collect_positions: false,
+                ..options.without_threshold()
+            };
             let mut combined = None;
             for filter in &this.filters {
-                let bits = match filter.as_doc_bitset(reader) {
+                let bits = match filter_options.doc_bitset(filter.as_ref(), reader) {
                     Some(bits) => bits,
-                    None => enumerate_filter(
-                        filter
-                            .scorer_with_options(
-                                reader,
-                                fallback_limit(reader)?,
-                                ScorerOptions::default(),
-                            )
-                            .await?,
-                        reader.num_docs(),
-                    ),
+                    None => {
+                        if filter_options.stop_if_expired() {
+                            return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer>);
+                        }
+                        let Some(bits) = enumerate_filter(
+                            filter
+                                .scorer_with_options(
+                                    reader,
+                                    fallback_limit(reader)?,
+                                    filter_options.clone(),
+                                )
+                                .await?,
+                            reader.num_docs(),
+                            &filter_options,
+                        ) else {
+                            return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer>);
+                        };
+                        bits
+                    }
                 };
-                intersect(&mut combined, bits);
+                if filter_options.stop_if_expired() || !intersect(&mut combined, bits) {
+                    return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer>);
+                }
             }
             if let (Some(bits), Some(outer)) = (&mut combined, &options.eligibility) {
                 bits.intersect_with(outer);
             }
             options.eligibility = combined.map(Arc::new).or(options.eligibility);
+            if no_candidates(&options) {
+                return Ok(Box::new(super::EmptyScorer) as Box<dyn Scorer>);
+            }
             let bits = options.eligibility.clone();
             let scorer = this
                 .query
@@ -116,6 +156,14 @@ impl Query for FilteredQuery {
         })
     }
     #[cfg(feature = "sync")]
+    fn scorer_sync<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+    ) -> Result<Box<dyn Scorer + 'a>> {
+        self.scorer_sync_with_options(reader, limit, ScorerOptions::with_positions())
+    }
+    #[cfg(feature = "sync")]
     fn scorer_sync_with_options<'a>(
         &self,
         reader: &'a SegmentReader,
@@ -123,25 +171,47 @@ impl Query for FilteredQuery {
         mut options: ScorerOptions,
     ) -> Result<Box<dyn Scorer + 'a>> {
         self.validate(reader)?;
+        if no_candidates(&options) {
+            return Ok(Box::new(super::EmptyScorer));
+        }
+        let filter_options = ScorerOptions {
+            eligibility: None,
+            collect_positions: false,
+            ..options.without_threshold()
+        };
         let mut combined = None;
         for filter in &self.filters {
-            let bits = match filter.as_doc_bitset(reader) {
+            let bits = match filter_options.doc_bitset(filter.as_ref(), reader) {
                 Some(bits) => bits,
-                None => enumerate_filter(
-                    filter.scorer_sync_with_options(
-                        reader,
-                        fallback_limit(reader)?,
-                        ScorerOptions::default(),
-                    )?,
-                    reader.num_docs(),
-                ),
+                None => {
+                    if filter_options.stop_if_expired() {
+                        return Ok(Box::new(super::EmptyScorer));
+                    }
+                    let Some(bits) = enumerate_filter(
+                        filter.scorer_sync_with_options(
+                            reader,
+                            fallback_limit(reader)?,
+                            filter_options.clone(),
+                        )?,
+                        reader.num_docs(),
+                        &filter_options,
+                    ) else {
+                        return Ok(Box::new(super::EmptyScorer));
+                    };
+                    bits
+                }
             };
-            intersect(&mut combined, bits);
+            if filter_options.stop_if_expired() || !intersect(&mut combined, bits) {
+                return Ok(Box::new(super::EmptyScorer));
+            }
         }
         if let (Some(bits), Some(outer)) = (&mut combined, &options.eligibility) {
             bits.intersect_with(outer);
         }
         options.eligibility = combined.map(Arc::new).or(options.eligibility);
+        if no_candidates(&options) {
+            return Ok(Box::new(super::EmptyScorer));
+        }
         let bits = options.eligibility.clone();
         Ok(filtered(
             self.query
@@ -150,7 +220,14 @@ impl Query for FilteredQuery {
         ))
     }
     fn decompose(&self) -> super::QueryDecomposition {
-        self.query.decompose()
+        if self.filters.is_empty() {
+            self.query.decompose()
+        } else {
+            super::QueryDecomposition::Opaque
+        }
+    }
+    fn lsp_decomposition(&self) -> super::QueryDecomposition {
+        self.query.lsp_decomposition()
     }
     fn text_terms(&self, out: &mut Vec<(crate::Field, Vec<u8>)>) {
         self.query.text_terms(out);
@@ -159,3 +236,6 @@ impl Query for FilteredQuery {
         }
     }
 }
+
+#[cfg(all(test, feature = "native"))]
+mod tests;
