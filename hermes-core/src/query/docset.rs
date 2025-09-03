@@ -234,7 +234,7 @@ impl DocSet for AllDocSet {
 
     #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
-        self.current = target;
+        self.current = self.current.max(target);
         self.doc()
     }
 

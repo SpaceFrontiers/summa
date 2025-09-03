@@ -328,11 +328,7 @@ pub fn convert_query(
                 boost: boost_query.boost,
             }))
         }
-        Some(ProtoQueryType::All(_)) => {
-            // Match all - use a boolean query with no clauses that matches everything
-            // For now, return an error as we don't have AllQuery implemented
-            Err("AllQuery not yet implemented".to_string())
-        }
+        Some(ProtoQueryType::All(_)) => Ok(Box::new(hermes_core::query::AllQuery)),
         Some(ProtoQueryType::SparseVector(sv_query)) => {
             let field = schema
                 .get_field(&sv_query.field)
@@ -1467,6 +1463,15 @@ pub fn text_stats_from_proto(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn match_all_is_valid_for_common_exclusion_filters() {
+        let schema = hermes_core::Schema::builder().build();
+        let query = proto::Query {
+            query: Some(ProtoQueryType::All(proto::AllQuery {})),
+        };
+        assert!(convert_query(&query, &schema, None, None, &shape()).is_ok());
+    }
+
     #[tokio::test]
     async fn match_heap_factor_reaches_text_executor_for_one_and_multiple_terms() {
         use hermes_core::directories::RamDirectory;

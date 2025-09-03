@@ -684,6 +684,31 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         })
     }
 
+    /// Open a search index and its sole writer under one lifecycle owner.
+    ///
+    /// The writer lock precedes metadata loading and crash cleanup. Use this
+    /// when opening for mutation; `open` remains a read-only operation.
+    pub async fn open_with_writer(
+        directory: D,
+        config: IndexConfig,
+    ) -> Result<(Self, IndexWriter<D>)> {
+        let search_resources = searcher::SearcherResources::new(
+            config.term_cache_blocks,
+            config.store_cache_budget_bytes,
+            config.num_threads,
+            config.bmp_io_concurrency,
+        )?;
+        let writer = IndexWriter::open(directory, config.clone()).await?;
+        let index = Self {
+            directory: Arc::clone(&writer.directory),
+            config,
+            search_resources,
+            segment_manager: Arc::clone(writer.segment_manager()),
+            cached_reader: tokio::sync::OnceCell::new(),
+        };
+        Ok((index, writer))
+    }
+
     /// Get the schema
     pub fn schema(&self) -> Arc<Schema> {
         self.schema_arc()

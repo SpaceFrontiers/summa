@@ -842,66 +842,76 @@ async fn fusion_exclusion_only_filters_remove_self_before_candidate_selection() 
     let index = registry.get_or_open_index("l1-test").await.unwrap();
     index.reader().await.unwrap().reload().await.unwrap();
     let service = SearchServiceImpl::new(registry, 1, limits());
-    for mode in ["rrf", "linear", "export"] {
-        for (excluded, expected) in [
-            (vec!["self"], Some(1)),
-            (vec!["absent"], Some(0)),
-            (vec!["self", "allowed", "other"], None),
-        ] {
-            let mut request = named_l1_request();
-            request.fields_to_load = vec!["id".into()];
-            request.l1.as_mut().unwrap().weights = HashMap::from([("title".into(), 1.0)]);
-            if mode != "linear" {
-                request.l1 = None;
-            }
-            if mode == "rrf" {
-                request.score_export = None;
-            }
-            let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut()
-            else {
-                unreachable!()
-            };
-            fusion.queries.truncate(1);
-            fusion.candidate_depth = if mode == "rrf" { 0 } else { 1 };
-            fusion.filters = vec![Query {
-                query: Some(query::Query::Boolean(crate::proto::BooleanQuery {
-                    must_not: excluded
-                        .iter()
-                        .map(|value| Query {
-                            query: Some(query::Query::Term(crate::proto::TermQuery {
-                                field: "id".into(),
-                                term: (*value).into(),
-                                ..Default::default()
-                            })),
-                        })
-                        .collect(),
-                    ..Default::default()
-                })),
-            }];
-            let result = service
-                .search(Request::new(request))
-                .await
-                .unwrap()
-                .into_inner();
-            assert_eq!(
-                result.hits.len(),
-                usize::from(expected.is_some()),
-                "{mode}, {excluded:?}"
-            );
-            if let Some(expected) = expected {
+    for explicit_all in [false, true] {
+        for mode in ["rrf", "linear", "export"] {
+            for (excluded, expected) in [
+                (vec!["self"], Some(1)),
+                (vec!["absent"], Some(0)),
+                (vec!["self", "allowed", "other"], None),
+            ] {
+                let mut request = named_l1_request();
+                request.fields_to_load = vec!["id".into()];
+                request.l1.as_mut().unwrap().weights = HashMap::from([("title".into(), 1.0)]);
+                if mode != "linear" {
+                    request.l1 = None;
+                }
+                if mode == "rrf" {
+                    request.score_export = None;
+                }
+                let Some(query::Query::Fusion(fusion)) =
+                    request.query.as_mut().unwrap().query.as_mut()
+                else {
+                    unreachable!()
+                };
+                fusion.queries.truncate(1);
+                fusion.candidate_depth = if mode == "rrf" { 0 } else { 1 };
+                fusion.filters = vec![Query {
+                    query: Some(query::Query::Boolean(crate::proto::BooleanQuery {
+                        must: if explicit_all {
+                            vec![Query {
+                                query: Some(query::Query::All(crate::proto::AllQuery {})),
+                            }]
+                        } else {
+                            vec![]
+                        },
+                        must_not: excluded
+                            .iter()
+                            .map(|value| Query {
+                                query: Some(query::Query::Term(crate::proto::TermQuery {
+                                    field: "id".into(),
+                                    term: (*value).into(),
+                                    ..Default::default()
+                                })),
+                            })
+                            .collect(),
+                        ..Default::default()
+                    })),
+                }];
+                let result = service
+                    .search(Request::new(request))
+                    .await
+                    .unwrap()
+                    .into_inner();
                 assert_eq!(
-                    result.hits[0].address.as_ref().unwrap().doc_id,
-                    expected,
+                    result.hits.len(),
+                    usize::from(expected.is_some()),
                     "{mode}, {excluded:?}"
                 );
-                if mode != "rrf" {
-                    let scores = result.hits[0].candidate_scores.as_ref().unwrap();
+                if let Some(expected) = expected {
                     assert_eq!(
-                        scores.document.len(),
-                        1,
-                        "filters must not become scoring features"
+                        result.hits[0].address.as_ref().unwrap().doc_id,
+                        expected,
+                        "{mode}, {excluded:?}"
                     );
-                    assert!(scores.document["title"] > 0.0);
+                    if mode != "rrf" {
+                        let scores = result.hits[0].candidate_scores.as_ref().unwrap();
+                        assert_eq!(
+                            scores.document.len(),
+                            1,
+                            "filters must not become scoring features"
+                        );
+                        assert!(scores.document["title"] > 0.0);
+                    }
                 }
             }
         }

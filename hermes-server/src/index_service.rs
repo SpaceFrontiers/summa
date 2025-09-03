@@ -435,18 +435,15 @@ impl IndexService for IndexServiceImpl {
         let writer = self.registry.get_writer(&req.index_name).await?;
 
         let reload_index = Arc::clone(&index);
-        writer
-            .write()
-            .await
-            .reorder_with_snapshot_refresh(move || {
-                let index = Arc::clone(&reload_index);
-                async move {
-                    index.reader().await?.reload().await?;
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
+        hermes_core::IndexWriter::reorder_with_shared_writer(&writer, move || {
+            let index = Arc::clone(&reload_index);
+            async move {
+                index.reader().await?.reload().await?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(crate::error::hermes_error_to_status)?;
 
         let reader = index
             .reader()
