@@ -261,10 +261,17 @@ Both options default to false and preserve the requested ranking:
 ```python
 response = await client.search(
     "articles",
-    query={"fusion": {"queries": [
-        {"name": "title", "query": {"match": {"field": "title", "text": "rust"}}},
-        {"name": "body", "query": {"match": {"field": "body", "text": "rust"}}},
-    ]}},
+    query={
+        "fusion": {
+            "queries": [
+                {
+                    "name": "title",
+                    "query": {"match": {"field": "title", "text": "rust"}},
+                },
+                {"name": "body", "query": {"match": {"field": "body", "text": "rust"}}},
+            ]
+        }
+    },
     include_rrf_scores=True,
     tracing=True,
 )
@@ -290,7 +297,7 @@ fail explicitly. See the [scoring and tracing contract](../docs/candidate-rescor
 For a named, scoped L1 query, specify the complete scoring formula:
 
 ```python
-l1={"formula": "0.2 * title + 0.8 * log1p(body) + 3 * rrf"}
+l1 = {"formula": "0.2 * title + 0.8 * log1p(body) + 3 * rrf"}
 ```
 
 `formula` is the only L1 scoring interface. Coefficients, offsets and RRF
