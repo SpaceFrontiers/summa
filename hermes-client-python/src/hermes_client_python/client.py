@@ -19,6 +19,8 @@ from .types import (
     CandidateScores,
     DocAddress,
     Document,
+    FusionCandidate,
+    FusionCandidateList,
     IndexInfo,
     OrdinalScore,
     PassageScores,
@@ -537,6 +539,26 @@ class HermesClient:
             timings=timings,
             ranking_method=response.ranking_method,
             truncated=response.truncated,
+            fusion_candidates=[
+                FusionCandidateList(
+                    query_index=branch.query_index,
+                    candidates=[
+                        FusionCandidate(
+                            address=DocAddress(
+                                segment_id=hit.address.segment_id,
+                                doc_id=hit.address.doc_id,
+                            ),
+                            score=hit.score,
+                            ordinal_scores=[
+                                OrdinalScore(ordinal=score.ordinal, score=score.score)
+                                for score in hit.ordinal_scores
+                            ],
+                        )
+                        for hit in branch.candidates
+                    ],
+                )
+                for branch in response.fusion_candidates
+            ],
         )
 
     async def get_document(
@@ -894,12 +916,14 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
         method = f.get("method", "rrf")
         if method == "rrf":
             pb_method = pb.FusionMethod.FUSION_RRF
+        elif method == "candidates":
+            pb_method = pb.FusionMethod.FUSION_CANDIDATES
         elif method == "normalized_weighted_sum":
             pb_method = pb.FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
         else:
             raise ValueError(
                 f"Unknown fusion method {method!r}: "
-                "expected 'rrf' or 'normalized_weighted_sum'"
+                "expected 'rrf', 'normalized_weighted_sum' or 'candidates'"
             )
         return pb.Query(
             fusion=pb.FusionQuery(

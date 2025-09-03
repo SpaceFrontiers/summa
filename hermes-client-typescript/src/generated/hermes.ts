@@ -15,6 +15,8 @@ export enum FusionMethod {
   FUSION_RRF = 0,
   /** FUSION_NORMALIZED_WEIGHTED_SUM - Min-max normalized weighted score sum */
   FUSION_NORMALIZED_WEIGHTED_SUM = 1,
+  /** FUSION_CANDIDATES - Return complete bounded nomination lists/union for coordinator-side fusion. */
+  FUSION_CANDIDATES = 2,
   UNRECOGNIZED = -1,
 }
 
@@ -26,6 +28,9 @@ export function fusionMethodFromJSON(object: any): FusionMethod {
     case 1:
     case "FUSION_NORMALIZED_WEIGHTED_SUM":
       return FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM;
+    case 2:
+    case "FUSION_CANDIDATES":
+      return FusionMethod.FUSION_CANDIDATES;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -39,6 +44,8 @@ export function fusionMethodToJSON(object: FusionMethod): string {
       return "FUSION_RRF";
     case FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM:
       return "FUSION_NORMALIZED_WEIGHTED_SUM";
+    case FusionMethod.FUSION_CANDIDATES:
+      return "FUSION_CANDIDATES";
     case FusionMethod.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";
@@ -661,6 +668,22 @@ export interface SearchResponse {
   truncated: boolean;
   /** Explicit feature contract: "linear_v1" or "feature_export_v1" for new modes. */
   rankingMethod: string;
+  /**
+   * Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
+   * these lists preserve independent branch scores and nominated ordinals.
+   */
+  fusionCandidates: FusionCandidateList[];
+}
+
+export interface FusionCandidateList {
+  queryIndex: number;
+  candidates: FusionCandidate[];
+}
+
+export interface FusionCandidate {
+  address: DocAddress | undefined;
+  score: number;
+  ordinalScores: OrdinalScore[];
 }
 
 /** Detailed timing breakdown for search phases (all values in microseconds) */
@@ -5636,7 +5659,15 @@ export const DenseVector: MessageFns<DenseVector> = {
 };
 
 function createBaseSearchResponse(): SearchResponse {
-  return { hits: [], totalHits: 0, tookMs: 0, timings: undefined, truncated: false, rankingMethod: "" };
+  return {
+    hits: [],
+    totalHits: 0,
+    tookMs: 0,
+    timings: undefined,
+    truncated: false,
+    rankingMethod: "",
+    fusionCandidates: [],
+  };
 }
 
 export const SearchResponse: MessageFns<SearchResponse> = {
@@ -5658,6 +5689,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     }
     if (message.rankingMethod !== "") {
       writer.uint32(50).string(message.rankingMethod);
+    }
+    for (const v of message.fusionCandidates) {
+      FusionCandidateList.encode(v!, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -5717,6 +5751,14 @@ export const SearchResponse: MessageFns<SearchResponse> = {
           message.rankingMethod = reader.string();
           continue;
         }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.fusionCandidates.push(FusionCandidateList.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5746,6 +5788,11 @@ export const SearchResponse: MessageFns<SearchResponse> = {
         : isSet(object.ranking_method)
         ? globalThis.String(object.ranking_method)
         : "",
+      fusionCandidates: globalThis.Array.isArray(object?.fusionCandidates)
+        ? object.fusionCandidates.map((e: any) => FusionCandidateList.fromJSON(e))
+        : globalThis.Array.isArray(object?.fusion_candidates)
+        ? object.fusion_candidates.map((e: any) => FusionCandidateList.fromJSON(e))
+        : [],
     };
   },
 
@@ -5769,6 +5816,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     if (message.rankingMethod !== "") {
       obj.rankingMethod = message.rankingMethod;
     }
+    if (message.fusionCandidates?.length) {
+      obj.fusionCandidates = message.fusionCandidates.map((e) => FusionCandidateList.toJSON(e));
+    }
     return obj;
   },
 
@@ -5785,6 +5835,187 @@ export const SearchResponse: MessageFns<SearchResponse> = {
       : undefined;
     message.truncated = object.truncated ?? false;
     message.rankingMethod = object.rankingMethod ?? "";
+    message.fusionCandidates = object.fusionCandidates?.map((e) => FusionCandidateList.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseFusionCandidateList(): FusionCandidateList {
+  return { queryIndex: 0, candidates: [] };
+}
+
+export const FusionCandidateList: MessageFns<FusionCandidateList> = {
+  encode(message: FusionCandidateList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.queryIndex !== 0) {
+      writer.uint32(8).uint32(message.queryIndex);
+    }
+    for (const v of message.candidates) {
+      FusionCandidate.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FusionCandidateList {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFusionCandidateList();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.queryIndex = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.candidates.push(FusionCandidate.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): FusionCandidateList {
+    return {
+      queryIndex: isSet(object.queryIndex)
+        ? globalThis.Number(object.queryIndex)
+        : isSet(object.query_index)
+        ? globalThis.Number(object.query_index)
+        : 0,
+      candidates: globalThis.Array.isArray(object?.candidates)
+        ? object.candidates.map((e: any) => FusionCandidate.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: FusionCandidateList): unknown {
+    const obj: any = {};
+    if (message.queryIndex !== 0) {
+      obj.queryIndex = Math.round(message.queryIndex);
+    }
+    if (message.candidates?.length) {
+      obj.candidates = message.candidates.map((e) => FusionCandidate.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<FusionCandidateList>): FusionCandidateList {
+    return FusionCandidateList.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<FusionCandidateList>): FusionCandidateList {
+    const message = createBaseFusionCandidateList();
+    message.queryIndex = object.queryIndex ?? 0;
+    message.candidates = object.candidates?.map((e) => FusionCandidate.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseFusionCandidate(): FusionCandidate {
+  return { address: undefined, score: 0, ordinalScores: [] };
+}
+
+export const FusionCandidate: MessageFns<FusionCandidate> = {
+  encode(message: FusionCandidate, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.address !== undefined) {
+      DocAddress.encode(message.address, writer.uint32(10).fork()).join();
+    }
+    if (message.score !== 0) {
+      writer.uint32(21).float(message.score);
+    }
+    for (const v of message.ordinalScores) {
+      OrdinalScore.encode(v!, writer.uint32(26).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): FusionCandidate {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseFusionCandidate();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.address = DocAddress.decode(reader, reader.uint32());
+          continue;
+        }
+        case 2: {
+          if (tag !== 21) {
+            break;
+          }
+
+          message.score = reader.float();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.ordinalScores.push(OrdinalScore.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): FusionCandidate {
+    return {
+      address: isSet(object.address) ? DocAddress.fromJSON(object.address) : undefined,
+      score: isSet(object.score) ? globalThis.Number(object.score) : 0,
+      ordinalScores: globalThis.Array.isArray(object?.ordinalScores)
+        ? object.ordinalScores.map((e: any) => OrdinalScore.fromJSON(e))
+        : globalThis.Array.isArray(object?.ordinal_scores)
+        ? object.ordinal_scores.map((e: any) => OrdinalScore.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: FusionCandidate): unknown {
+    const obj: any = {};
+    if (message.address !== undefined) {
+      obj.address = DocAddress.toJSON(message.address);
+    }
+    if (message.score !== 0) {
+      obj.score = message.score;
+    }
+    if (message.ordinalScores?.length) {
+      obj.ordinalScores = message.ordinalScores.map((e) => OrdinalScore.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<FusionCandidate>): FusionCandidate {
+    return FusionCandidate.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<FusionCandidate>): FusionCandidate {
+    const message = createBaseFusionCandidate();
+    message.address = (object.address !== undefined && object.address !== null)
+      ? DocAddress.fromPartial(object.address)
+      : undefined;
+    message.score = object.score ?? 0;
+    message.ordinalScores = object.ordinalScores?.map((e) => OrdinalScore.fromPartial(e)) || [];
     return message;
   },
 };

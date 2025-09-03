@@ -116,3 +116,18 @@ test("named scoring branches retain scopes, eligibility and omission of RRF weig
   assert.equal(result.filters[0].phrase.text, "red blood cells");
   assert.equal(result.candidateDepth, 42);
 });
+
+
+test("candidate export preserves method, depth and per-branch wire results", () => {
+  const { SearchResponse } = require("../dist/generated/hermes.js");
+  const query = buildQuery({ fusion: { method: "candidates", candidateDepth: 12,
+    queries: [{ query: { match: { field: "body", text: "hemoglobin" } } }] } });
+  assert.equal(query.fusion.method, FusionMethod.FUSION_CANDIDATES);
+  assert.equal(query.fusion.candidateDepth, 12);
+  const original = SearchResponse.fromPartial({ rankingMethod: "fusion_candidates_v1", fusionCandidates: [
+    { queryIndex: 0, candidates: [{ address: { segmentId: "abc", docId: 2 }, score: -0.5,
+      ordinalScores: [{ ordinal: 7, score: -0.25 }] }] }
+  ] });
+  const decoded = SearchResponse.decode(SearchResponse.encode(original).finish());
+  assert.deepEqual(decoded.fusionCandidates, original.fusionCandidates);
+});

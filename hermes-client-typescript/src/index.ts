@@ -2,6 +2,8 @@ export { HermesClient } from "./client";
 export type { HermesClientOptions } from "./client";
 export type {
   CandidateScores,
+  FusionCandidate,
+  FusionCandidateList,
   PassageScores,
   FeatureTransform,
   L1Ranking,

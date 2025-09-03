@@ -3336,6 +3336,7 @@ dependencies = [
  "clap",
  "env_logger",
  "futures",
+ "hermes-core",
  "k8s-openapi",
  "kube",
  "log",

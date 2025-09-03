@@ -194,6 +194,19 @@ class SearchTimings:
 
 
 @dataclass
+class FusionCandidate:
+    address: DocAddress
+    score: float
+    ordinal_scores: list[OrdinalScore] = field(default_factory=list)
+
+
+@dataclass
+class FusionCandidateList:
+    query_index: int
+    candidates: list[FusionCandidate] = field(default_factory=list)
+
+
+@dataclass
 class SearchResponse:
     """Search response with hits and metadata."""
 
@@ -203,6 +216,7 @@ class SearchResponse:
     timings: SearchTimings | None = None
     ranking_method: str = ""
     truncated: bool = False
+    fusion_candidates: list[FusionCandidateList] = field(default_factory=list)
 
 
 @dataclass

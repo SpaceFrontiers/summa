@@ -162,7 +162,7 @@ export function buildQuery(q: Query): PbQuery {
           scoreOnly: weightedQuery.scoreOnly ?? false,
         })),
         method:
-          fusion.method === "normalized_weighted_sum"
+          fusion.method === "candidates" ? PbFusionMethod.FUSION_CANDIDATES : fusion.method === "normalized_weighted_sum"
             ? PbFusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
             : PbFusionMethod.FUSION_RRF,
         filters: (fusion.filters ?? []).map(buildQuery),

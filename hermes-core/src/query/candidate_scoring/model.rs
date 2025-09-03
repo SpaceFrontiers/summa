@@ -53,6 +53,62 @@ fn is_zero(v: &f64) -> bool {
 }
 
 impl LinearModel {
+    /// Shared shard/coordinator inference. A shard may export only its best
+    /// passage rows for MAX or weighted-top-k; AVG/SUM/softmax require every
+    /// scored row. Document context is broadcast once per passage.
+    pub fn score_candidate(
+        &self,
+        names: &[&str],
+        features: &mut super::CandidateScores,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<f32> {
+        use crate::query::MultiValueCombiner;
+        combiner.validate().map_err(Error::Query)?;
+        if features.document.len() != names.len()
+            || features.passages.len() > features.scored_passages
+        {
+            return Err(Error::Query("L1 candidate feature shape mismatch".into()));
+        }
+        if features.scored_passages == 0 {
+            return self.score(names, &features.document);
+        }
+        let required = match combiner {
+            MultiValueCombiner::Max => 1,
+            MultiValueCombiner::WeightedTopK { k, .. } => k.min(features.scored_passages),
+            _ => features.scored_passages,
+        };
+        if features.passages.len() < required {
+            return Err(Error::Query(
+                "L1 document combiner needs more passage rows than were exported".into(),
+            ));
+        }
+        let mut values = vec![None; names.len()];
+        let mut scores = Vec::with_capacity(features.passages.len());
+        let mut ordinals = std::collections::BTreeSet::new();
+        for row in &mut features.passages {
+            if row.values.len() != names.len() || !ordinals.insert(row.ordinal) {
+                return Err(Error::Query(
+                    "L1 passage feature shape/ordinal mismatch".into(),
+                ));
+            }
+            for ((value, &chunk), &document) in
+                values.iter_mut().zip(&row.values).zip(&features.document)
+            {
+                *value = chunk.or(document);
+            }
+            row.score = self.score(names, &values)?;
+            scores.push((u32::from(row.ordinal), row.score));
+        }
+        // The order on the wire may be score order; physical/export ordering
+        // must not alter strict floating-point reductions.
+        scores.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+        let score = combiner.combine(&scores);
+        if !score.is_finite() {
+            return Err(Error::Query("L1 document score reduction overflow".into()));
+        }
+        Ok(score)
+    }
+
     pub fn validate(&self, names: &[&str]) -> Result<()> {
         if !self.bias.is_finite()
             || self.weights.is_empty()

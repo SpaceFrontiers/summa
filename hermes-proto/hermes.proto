@@ -76,6 +76,8 @@ message Query {
 enum FusionMethod {
   FUSION_RRF = 0;                      // Reciprocal Rank Fusion (rank-based, default)
   FUSION_NORMALIZED_WEIGHTED_SUM = 1;  // Min-max normalized weighted score sum
+  // Return complete bounded nomination lists/union for coordinator-side fusion.
+  FUSION_CANDIDATES = 2;
 }
 
 // Weighted sub-query for hybrid fusion
@@ -425,6 +427,20 @@ message SearchResponse {
   bool truncated = 5;
   // Explicit feature contract: "linear_v1" or "feature_export_v1" for new modes.
   string ranking_method = 6;
+  // Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
+  // these lists preserve independent branch scores and nominated ordinals.
+  repeated FusionCandidateList fusion_candidates = 7;
+}
+
+message FusionCandidateList {
+  uint32 query_index = 1;
+  repeated FusionCandidate candidates = 2;
+}
+
+message FusionCandidate {
+  DocAddress address = 1;
+  float score = 2;
+  repeated OrdinalScore ordinal_scores = 3;
 }
 
 // Detailed timing breakdown for search phases (all values in microseconds)

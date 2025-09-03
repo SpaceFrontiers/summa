@@ -658,6 +658,20 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
             ..Default::default()
         })),
     });
+    // The coordinator asks for branch lists, never already-fused shard ranks.
+    for mock in &mocks {
+        let mut state = mock.state.lock();
+        state.search_response = SearchResponse {
+            ranking_method: "fusion_candidates_v1".into(),
+            fusion_candidates: (0..2)
+                .map(|query_index| FusionCandidateList {
+                    query_index,
+                    candidates: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+    }
     broker_search_client(&broker)
         .await
         .search(hybrid)

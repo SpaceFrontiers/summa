@@ -166,3 +166,47 @@ async def test_named_l1_roundtrip_preserves_zero_negative_missing_and_scope():
     assert raw.document == {"title": 0.0}
     assert raw.passages[0].scores == {"dense": -0.5}
     assert raw.passages[0].l1_score == -0.25
+
+
+@pytest.mark.asyncio
+async def test_candidate_export_roundtrip_preserves_branch_identity_and_negative_passage_score():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient("localhost:50051")
+    client._ensure_connected = lambda: None
+    client._search_stub = AsyncMock()
+    client._search_stub.Search.return_value = pb.SearchResponse(
+        ranking_method="fusion_candidates_v1",
+        fusion_candidates=[
+            pb.FusionCandidateList(
+                query_index=0,
+                candidates=[
+                    pb.FusionCandidate(
+                        address=pb.DocAddress(segment_id="abc", doc_id=2),
+                        score=-0.5,
+                        ordinal_scores=[pb.OrdinalScore(ordinal=7, score=-0.25)],
+                    )
+                ],
+            )
+        ],
+    )
+    result = await client.search(
+        "docs",
+        query={
+            "fusion": {
+                "method": "candidates",
+                "candidate_depth": 12,
+                "queries": [
+                    {"query": {"match": {"field": "body", "text": "hemoglobin"}}}
+                ],
+            }
+        },
+    )
+    sent = client._search_stub.Search.call_args.args[0]
+    assert sent.query.fusion.method == pb.FUSION_CANDIDATES
+    branch = result.fusion_candidates[0]
+    assert branch.query_index == 0
+    assert branch.candidates[0].address.segment_id == "abc"
+    assert branch.candidates[0].score == -0.5
+    assert branch.candidates[0].ordinal_scores[0].ordinal == 7
+    assert branch.candidates[0].ordinal_scores[0].score == -0.25

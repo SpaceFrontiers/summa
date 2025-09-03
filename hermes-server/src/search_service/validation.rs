@@ -354,6 +354,9 @@ fn validate_query_shape<'a>(
                 )?;
             }
             query::Query::Fusion(fusion) => {
+                if crate::proto::FusionMethod::try_from(fusion.method).is_err() {
+                    return Err(Status::invalid_argument("unknown fusion method"));
+                }
                 if crate::proto::MultiValueCombiner::try_from(fusion.combiner).is_err() {
                     return Err(Status::invalid_argument("unknown fusion combiner"));
                 }
@@ -520,6 +523,18 @@ fn validate_search_request_shape(
         {
             return Err(Status::invalid_argument(
                 "score_export passages_per_document exceeds 65536",
+            ));
+        }
+    } else if let Some(query::Query::Fusion(fusion)) = &root.query
+        && fusion.method == FusionMethod::FusionCandidates as i32
+    {
+        if req.offset != 0
+            || req.reranker.is_some()
+            || req.time_budget_ms != 0
+            || fusion.queries.iter().any(|branch| branch.score_only)
+        {
+            return Err(Status::invalid_argument(
+                "candidate export requires offset=0, complete nomination, no reranker and no score_only branches without score_export",
             ));
         }
     } else if let Some(query::Query::Fusion(fusion)) = &root.query

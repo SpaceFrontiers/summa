@@ -437,7 +437,6 @@ impl<D: Directory + 'static> Searcher<D> {
                 }
             }
             let mut passages = passages.into_iter().peekable();
-            let mut combined = vec![None; count];
             for (doc_index, &candidate_index) in candidate_indices.iter().enumerate() {
                 let candidate = &candidates[candidate_index];
                 let document = std::mem::take(&mut doc_values[doc_index]);
@@ -447,35 +446,28 @@ impl<D: Directory + 'static> Searcher<D> {
                     .is_some_and(|((doc, _), _)| *doc == candidate.doc_id)
                 {
                     let ((_, ordinal), values) = passages.next().expect("peeked row");
-                    for j in 0..count {
-                        combined[j] = values[j].or(document[j]);
-                    }
-                    let score = match &plan.model {
-                        Some(model) => model.score(&names, &combined)?,
-                        None => candidate.score,
-                    };
                     rows.push(PassageFeatures {
                         ordinal,
-                        score,
+                        score: candidate.score,
                         values,
                     });
                 }
                 let scored_passages = rows.len();
                 let mut result = candidate.clone();
+                let mut features = CandidateScores {
+                    document,
+                    passages: rows,
+                    scored_passages,
+                };
                 if let Some(model) = &plan.model {
-                    result.score = if rows.is_empty() {
-                        model.score(&names, &document)?
-                    } else {
-                        let values: Vec<_> = rows
-                            .iter()
-                            .map(|row| (u32::from(row.ordinal), row.score))
-                            .collect();
-                        plan.document_combiner.combine(&values)
-                    };
-                    if !result.score.is_finite() {
-                        return Err(Error::Query("L1 document score reduction overflow".into()));
-                    }
+                    result.score =
+                        model.score_candidate(&names, &mut features, plan.document_combiner)?;
                 }
+                let CandidateScores {
+                    document,
+                    passages: mut rows,
+                    ..
+                } = features;
                 if plan.model.is_none() && rows.len() > plan.export_passages {
                     return Err(Error::Query(format!(
                         "feature export would omit {} passages of document {}; increase export_passages or supply l1",

@@ -196,6 +196,12 @@ pub fn fuse_ranked_lists_chunked(
             continue;
         }
 
+        // A branch gets one vote per logical passage, even when a Boolean
+        // query returns that ordinal under several fields. Keep its strongest
+        // raw score before assigning ranks; duplicates must not shift ranks.
+        chunks.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+        chunks.dedup_by_key(|entry| entry.0);
+
         // Rank chunks within this list by chunk score (desc); deterministic
         // tiebreak on the key.
         chunks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -432,6 +438,23 @@ mod tests {
             segment_id: 1,
             positions,
         }
+    }
+
+    #[test]
+    fn one_branch_cannot_vote_twice_for_the_same_passage_across_fields() {
+        let mut duplicate = chunked(1, &[(0, 10.0)]);
+        duplicate
+            .positions
+            .push((1, vec![ScoredPosition::new(0, 9.0)]));
+        let unique = chunked(2, &[(0, 11.0)]);
+        let fused = fuse_ranked_lists_chunked(
+            vec![(vec![unique, duplicate], 1.0)],
+            FusionMethod::Rrf { k: 60.0 },
+            MultiValueCombiner::Max,
+            10,
+        );
+        assert_eq!(fused[0].doc_id, 2);
+        assert_eq!(fused[1].score, 1.0 / 62.0);
     }
 
     /// The multilingual/short-query regression: a doc that is rank 1 in the

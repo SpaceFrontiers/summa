@@ -39,6 +39,16 @@ export interface SearchTimings {
   candidateScoringUs?: number;
 }
 
+export interface FusionCandidate {
+  address: DocAddress;
+  score: number;
+  ordinalScores: OrdinalScore[];
+}
+export interface FusionCandidateList {
+  queryIndex: number;
+  candidates: FusionCandidate[];
+}
+
 /** Search response with hits and metadata. */
 export interface SearchResponse {
   hits: SearchHit[];
@@ -46,6 +56,7 @@ export interface SearchResponse {
   tookMs: number;
   timings?: SearchTimings;
   rankingMethod?: string;
+  fusionCandidates?: FusionCandidateList[];
   truncated?: boolean;
 }
 
@@ -212,7 +223,7 @@ export interface FusionQuery {
   candidateDepth?: number;
   queries: WeightedQuery[];
   /** Fusion method (default: "rrf") */
-  method?: "rrf" | "normalized_weighted_sum";
+  method?: "rrf" | "normalized_weighted_sum" | "candidates";
   /** RRF rank constant (default: 60) */
   rrfK?: number;
   /**

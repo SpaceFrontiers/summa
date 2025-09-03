@@ -215,6 +215,14 @@ impl SegmentReader {
                     !self.sparse_indexes.contains_key(&field.0)
                         && !(self.vector_indexes.contains_key(&field.0)
                             && !self.flat_vectors.contains_key(&field.0))
+                        && !(matches!(entry.field_type, FieldType::Text)
+                            && !entry.chunked
+                            && self
+                                .meta
+                                .field_stats
+                                .get(&field.0)
+                                .is_some_and(|stats| stats.total_tokens > 0)
+                            && self.doc_lengths(field).is_none())
                 };
                 (!prepared).then(|| entry.name.clone())
             })

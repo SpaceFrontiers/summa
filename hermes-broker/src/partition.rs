@@ -207,7 +207,7 @@ pub fn merge_batch_responses(
 /// descending (ties by address), `total_hits` summed, timings at their
 /// maximum, `truncated` if any partition truncated. Every partition scored
 /// with the same global statistics, so scores are comparable; rank-fused
-/// (RRF) scores are functions of shard-local ranks and merge the same way.
+/// is coordinated separately in `ranking`; this merger only orders supplied scores.
 pub fn merge_search_responses(
     responses: Vec<SearchResponse>,
     offset: usize,
@@ -219,6 +219,7 @@ pub fn merge_search_responses(
     let mut timings: Option<SearchTimings> = None;
     let mut truncated = false;
     let mut ranking_method: Option<String> = None;
+    let mut fusion_candidates = BTreeMap::<u32, Vec<crate::proto::hermes::FusionCandidate>>::new();
     for response in responses {
         if ranking_method
             .as_ref()
@@ -241,6 +242,12 @@ pub fn merge_search_responses(
             merged.candidate_scoring_us = merged.candidate_scoring_us.max(t.candidate_scoring_us);
         }
         hits.extend(response.hits);
+        for branch in response.fusion_candidates {
+            fusion_candidates
+                .entry(branch.query_index)
+                .or_default()
+                .extend(branch.candidates);
+        }
     }
     hits.sort_by(|a, b| {
         b.score
@@ -248,7 +255,10 @@ pub fn merge_search_responses(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| address_key(a).cmp(&address_key(b)))
     });
-    if ranking_method.as_deref() == Some("feature_export_v1") && (offset != 0 || hits.len() > limit)
+    if matches!(
+        ranking_method.as_deref(),
+        Some("feature_export_v1" | "fusion_candidates_v1")
+    ) && (offset != 0 || hits.len() > limit)
     {
         return Err(Status::invalid_argument(format!(
             "feature export needs offset=0 and limit covering the complete cross-shard union ({} candidates)",
@@ -263,6 +273,15 @@ pub fn merge_search_responses(
         timings,
         truncated,
         ranking_method: ranking_method.unwrap_or_default(),
+        fusion_candidates: fusion_candidates
+            .into_iter()
+            .map(
+                |(query_index, candidates)| crate::proto::hermes::FusionCandidateList {
+                    query_index,
+                    candidates,
+                },
+            )
+            .collect(),
     })
 }
 

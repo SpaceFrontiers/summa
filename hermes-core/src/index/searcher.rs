@@ -1445,6 +1445,24 @@ impl<D: Directory + 'static> Searcher<D> {
         depth: usize,
         stats: Arc<crate::query::GlobalStats>,
     ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        let lists = self
+            .search_candidate_lists(queries, depth, Some(stats))
+            .await?;
+        let total_seen = lists
+            .iter()
+            .fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
+        let union = self.merge_candidate_lists(lists.into_iter().map(|(list, _)| list))?;
+        Ok((union, total_seen))
+    }
+
+    /// Independent nominated lists for coordinator-side global fusion.
+    /// This uses the same bounded parallel retrieval as candidate backfill.
+    pub async fn search_candidate_lists(
+        &self,
+        queries: &[Arc<dyn crate::query::Query>],
+        depth: usize,
+        stats: Option<Arc<crate::query::GlobalStats>>,
+    ) -> Result<Vec<(Vec<crate::query::SearchResult>, u32)>> {
         if queries.is_empty()
             || queries.len() > crate::query::MAX_FUSION_SUB_QUERIES
             || depth == 0
@@ -1473,7 +1491,7 @@ impl<D: Directory + 'static> Searcher<D> {
                                 0,
                                 true,
                                 None,
-                                Some(stats.clone()),
+                                stats.clone(),
                             )?;
                             Ok((results, seen))
                         })
@@ -1488,11 +1506,23 @@ impl<D: Directory + 'static> Searcher<D> {
         let lists = self
             .search_candidate_branches_async(queries, depth, stats)
             .await?;
+        Ok(lists)
+    }
+
+    pub fn merge_candidate_lists(
+        &self,
+        lists: impl IntoIterator<Item = Vec<crate::query::SearchResult>>,
+    ) -> Result<Vec<crate::query::SearchResult>> {
         let mut union = std::collections::BTreeMap::new();
-        let mut total_seen = 0u32;
         let mut positions = 0usize;
-        for (list, seen) in lists {
-            total_seen = total_seen.saturating_add(seen);
+        let mut slots = 0usize;
+        for list in lists {
+            slots = slots.saturating_add(list.len());
+            if slots > crate::query::MAX_FUSION_CANDIDATE_SLOTS {
+                return Err(crate::Error::Query(
+                    "candidate union document budget exceeded".into(),
+                ));
+            }
             for mut result in list {
                 positions = positions
                     .saturating_add(result.positions.iter().map(|(_, p)| p.len()).sum::<usize>());
@@ -1514,20 +1544,20 @@ impl<D: Directory + 'static> Searcher<D> {
                 }
             }
         }
-        Ok((union.into_values().collect(), total_seen))
+        Ok(union.into_values().collect())
     }
 
     async fn search_candidate_branches_async(
         &self,
         queries: &[Arc<dyn crate::query::Query>],
         depth: usize,
-        stats: Arc<crate::query::GlobalStats>,
+        stats: Option<Arc<crate::query::GlobalStats>>,
     ) -> Result<Vec<(Vec<crate::query::SearchResult>, u32)>> {
         futures::future::try_join_all(queries.iter().map(|query| {
             let stats = stats.clone();
             async move {
                 let (results, seen, _) = self
-                    .search_with_positions_budgeted_stats(query.as_ref(), depth, None, Some(stats))
+                    .search_with_positions_budgeted_stats(query.as_ref(), depth, None, stats)
                     .await?;
                 Ok((results, seen))
             }

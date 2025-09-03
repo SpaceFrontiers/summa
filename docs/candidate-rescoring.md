@@ -92,6 +92,44 @@ scale; trained parameters are derived from training data only. This permits
 negative raw scores and yields comparable scores across shards. Validate
 finite inputs, scales, weights, transformed values and final reductions.
 
+## Broker ownership of global selection
+
+The broker is the coordinator for a logical index, including single-shard routes.
+Each shard nominates at `candidate_depth` per branch; this depth is intentionally
+not divided by partition count. Shards backfill the bounded union and apply the
+request's fixed L1 model. They retain at least `offset + limit` documents each,
+which is sufficient for exact global top-K under the identical pointwise model
+and document combiner. The broker reapplies the shared core formula, verifies
+agreement and selects the global page. This reduces transfer without dropping
+a possible global winner from the nominated pool.
+
+MAX requires only the best passage feature row for each retained document;
+weighted-top-k needs its top-k rows. AVG/SUM require all scored rows to reproduce
+the document reduction. The shard export is widened to meet that requirement
+before the broker reapplies the formula, then reduced to the caller's requested
+export bound. Global BM25 statistics and fixed transforms remain mandatory.
+No component normalizes against its own page or shard. Combined transport is
+bounded to 64 MiB, divided across concurrently decoded shard responses, and
+coordinator feature matrices are independently bounded to two million values.
+
+Top-level RRF without the legacy vector reranker also runs at the broker: it globally merges each branch's nominated list
+before calculating rank contributions. It does not merge shard-local RRF scores.
+The transport uses `fusion.method = CANDIDATES` to return a bounded document
+union and per-branch candidate scores/ordinals without fusion; `score_export`
+additionally requests complete cross-vertical feature backfill. Raw feature-only
+collection continues to return the complete union rather than ranking it.
+
+The full per-shard nomination pools contribute to selection. A shared fixed
+linear formula and exact shard-local top-K would be mathematically sufficient
+for the same global top-K; moving the formula alone is not a quality claim.
+Central ownership preserves the expanded pool for subsequent models and gives
+RRF the correct global ranks. Broker CPU, combined rows, response bytes and
+in-flight shard work must be bounded independently of each shard's limits.
+Missing or incompatible shard exports fail the request instead of returning a
+partially ranked pool. The same core inference and fusion implementations are used on each path.
+Legacy nested fusion and fusion with the vector reranker retain their previous
+shard execution; their results do not advertise `global_rrf_v1`.
+
 ## Combiners and learned fusion
 
 Combiners retain their existing ownership. A vector query's combiner reduces

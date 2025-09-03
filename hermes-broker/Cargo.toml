@@ -16,6 +16,7 @@ name = "hermes-broker"
 path = "src/main.rs"
 
 [dependencies]
+hermes-core = { workspace = true }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
 tokio = { workspace = true, features = ["macros", "signal", "time"] }

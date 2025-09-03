@@ -1,9 +1,55 @@
 //! RPC conversion and orchestration for core-owned candidate scoring.
 use crate::proto;
 use hermes_core::query::{CandidateFeature, CandidateScoringPlan, LinearModel, ScoreScope};
+use prost::Message;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tonic::Status;
+
+/// Compact branch scores reference one hydrated union, avoiding repeated
+/// stored fields when a document was nominated by several branches.
+pub(super) fn export_nomination_lists(
+    lists: &[(Vec<hermes_core::query::SearchResult>, u32)],
+    budget: &mut super::response::SearchResponseBudget,
+) -> Result<Vec<proto::FusionCandidateList>, Status> {
+    let mut exported = Vec::with_capacity(lists.len());
+    for (query_index, (list, _)) in lists.iter().enumerate() {
+        let mut candidates = Vec::with_capacity(list.len());
+        for hit in list {
+            // Preserve raw branch positions. Canonical core fusion owns
+            // deduplication and score reduction across fields.
+            let scores: Vec<_> = hit
+                .positions
+                .iter()
+                .flat_map(|(_, positions)| {
+                    positions
+                        .iter()
+                        .map(|position| (position.position, position.score))
+                })
+                .collect();
+            budget.reserve_retained(96usize.saturating_add(scores.len().saturating_mul(16)))?;
+            let candidate = proto::FusionCandidate {
+                address: Some(proto::DocAddress {
+                    segment_id: format!("{:032x}", hit.segment_id),
+                    doc_id: hit.doc_id,
+                }),
+                score: hit.score,
+                ordinal_scores: scores
+                    .into_iter()
+                    .map(|(ordinal, score)| proto::OrdinalScore { ordinal, score })
+                    .collect(),
+            };
+            // Account for actual encoding as well as retained Rust allocations.
+            budget.reserve_retained(candidate.encoded_len())?;
+            candidates.push(candidate);
+        }
+        exported.push(proto::FusionCandidateList {
+            query_index: query_index as u32,
+            candidates,
+        });
+    }
+    Ok(exported)
+}
 
 pub(super) fn linear_model(model: &proto::L1Ranking) -> LinearModel {
     LinearModel {

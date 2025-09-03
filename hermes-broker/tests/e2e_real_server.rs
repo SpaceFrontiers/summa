@@ -387,6 +387,7 @@ async fn partitioned_fusion_collects_text_stats_from_real_servers() {
         .into_inner();
     // Fusion total_hits sums the contributing ranked-list counts; hits are
     // de-duplicated by document address in the fused result.
+    assert_eq!(response.ranking_method, "global_rrf_v1");
     assert_eq!(response.total_hits, 3);
     assert_eq!(response.hits.len(), 2);
 

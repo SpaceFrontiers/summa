@@ -129,6 +129,7 @@ impl SearchService for SearchServiceImpl {
         let mut candidate_scoring_us = 0;
         let mut ranking_method = String::new();
         let mut feature_exports = HashMap::new();
+        let mut fusion_candidates = Vec::new();
         let mut response_budget = SearchResponseBudget::with_maximum(self.limits.max_search_response_bytes);
         let (results, total_seen, rerank_config) =
             if req.l1.is_some() || req.score_export.is_some() {
@@ -194,6 +195,21 @@ impl SearchService for SearchServiceImpl {
                     };
                     sub_queries.push((candidate_scoring::with_filters(Arc::from(core), &filters), weight));
                 }
+                if fusion.method == crate::proto::FusionMethod::FusionCandidates as i32 {
+                    let depth = if fusion.candidate_depth == 0 { candidate_limit } else { fusion.candidate_depth as usize };
+                    let queries: Vec<_> = sub_queries.iter().map(|(query, _)| query.clone()).collect();
+                    let stats = req.text_stats.as_ref().map(|stats| Arc::new(text_stats_from_proto(stats, searcher.schema())));
+                    let lists = searcher.search_candidate_lists(&queries, depth, stats).await.map_err(crate::error::hermes_error_to_status)?;
+                    fusion_candidates = candidate_scoring::export_nomination_lists(&lists, &mut response_budget)?;
+                    let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
+                    let candidates = searcher.merge_candidate_lists(lists.into_iter().map(|(list, _)| list)).map_err(crate::error::hermes_error_to_status)?;
+                    if candidates.len() > limit {
+                        return Err(Status::invalid_argument(format!("candidate export needs limit >= complete union ({} documents)", candidates.len())));
+                    }
+                    ranking_method = "fusion_candidates_v1".into();
+                    query_desc = format!("candidate export of {} branches, depth {}", sub_queries.len(), depth);
+                    (candidates, seen, None)
+                } else {
                 let method = match fusion.method() {
                     crate::proto::FusionMethod::FusionRrf => {
                         hermes_core::query::FusionMethod::Rrf {
@@ -204,6 +220,7 @@ impl SearchService for SearchServiceImpl {
                             },
                         }
                     }
+                    crate::proto::FusionMethod::FusionCandidates => unreachable!("candidate export handled separately"),
                     crate::proto::FusionMethod::FusionNormalizedWeightedSum => {
                         hermes_core::query::FusionMethod::NormalizedWeightedSum
                     }
@@ -253,6 +270,7 @@ impl SearchService for SearchServiceImpl {
                     .map_err(crate::error::hermes_error_to_status)?;
                 let rerank_config = rerank_setup.map(|config| (config, limit));
                 (fused, seen, rerank_config)
+                }
             } else {
                 let core_query = convert_query(
                     query,
@@ -463,6 +481,7 @@ impl SearchService for SearchServiceImpl {
             }),
             truncated,
             ranking_method,
+            fusion_candidates,
         }))
             }
         .await;
