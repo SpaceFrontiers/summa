@@ -522,7 +522,7 @@ field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.
   regardless of this setting. Without forward values, L1 backfill requires a
   logically ordered BMP document map; BP-reordered fields require enabling
   storage and explicit reorder/rebuild, or `l1.backfill: false`. Existing files
-  are immutable. See [optional forward storage](bmp-forward-index.md#optional-storage).
+  are immutable. See [optional forward storage](bmp-forward-index.md#configuration-and-scoring).
 - `query<pruning: 0.33>` — retain the highest-weight third of query
   dimensions for BMP candidate generation, matching the LSP/0 zero-shot beta.
   Visited documents are still scored with the bounded full query. This is

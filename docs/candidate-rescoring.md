@@ -238,7 +238,7 @@ explicit Reorder before their missing cells can be backfilled. BMP storage is op
 candidates by binary search and score their query-term postings in selected
 blocks. BP-reordered BMP maps need this setting enabled and explicit
 reorder/rebuild to regain backfill capability. Disabling storage does not affect
-full-text or sparse MaxScore backfill. See [optional forward storage](bmp-forward-index.md#optional-storage).
+full-text or sparse MaxScore backfill. See [optional forward storage](bmp-forward-index.md#configuration-and-scoring).
 `GetIndexInfo.unprepared_candidate_fields`
 reports these fields and ANN fields without stored flat vectors. Disabling
 backfill, or supplying every needed organic cell, requires no address probes
