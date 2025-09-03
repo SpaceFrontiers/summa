@@ -1,6 +1,6 @@
 {
   "name": "hermes-client-typescript",
-  "version": "1.8.123",
+  "version": "1.8.124",
   "description": "TypeScript client for Hermes search server",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
