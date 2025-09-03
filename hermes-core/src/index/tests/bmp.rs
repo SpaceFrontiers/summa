@@ -3129,7 +3129,7 @@ async fn test_blockwise_reorder_preserves_sb_grid_scale() {
 #[tokio::test]
 async fn test_bmp_block_posting_overflow_256() {
     // 256 docs × 301 dims each → 77,056 postings in block 0 (> u16::MAX).
-    // The V19 adaptive payload exceeds its 15-bit narrow-offset range, forcing
+    // The adaptive payload exceeds its 15-bit narrow-offset range, forcing
     // the u32-wide fallback. Needle dims sort after the shared dense mass and
     // exercise terms near the end of that wide payload.
     let config = SparseVectorConfig {

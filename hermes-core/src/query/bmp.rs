@@ -2015,8 +2015,8 @@ fn score_forward_units(
 
 /// Exact candidate probes use the very same integer query quantization and
 /// dequantization as exhaustive BMP retrieval. Nomination/LSP never enters
-/// this path. Targets are sorted forward rows in V20 and real physical slots
-/// in V19, as resolved by the owning candidate-address reader.
+/// this path. Targets are sorted forward rows when stored and real physical slots
+/// without forward storage, as resolved by the owning candidate-address reader.
 pub(crate) fn score_bmp_candidates(
     index: &BmpIndex,
     terms: &[(u32, f32)],

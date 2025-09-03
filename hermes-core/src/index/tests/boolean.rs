@@ -1289,3 +1289,62 @@ async fn test_prefix_query_matches_prefix_of_smallest_term() {
         .unwrap();
     assert!(none.hits.is_empty());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exclusion_only_boolean_filters_match_the_remaining_documents() {
+    use crate::query::{FilteredQuery, Query};
+    use std::sync::Arc;
+
+    let (index, content, _, _) = create_boolean_test_index().await;
+    let exclude_self = BooleanQuery::new().must_not(TermQuery::text(content, "doc0"));
+    let result = index.search(&exclude_self, 100).await.unwrap();
+    assert_eq!(result.hits.len(), 99);
+    assert!(result.hits.iter().all(|hit| hit.address.doc_id != 0));
+    assert!(
+        index
+            .search(&BooleanQuery::new(), 100)
+            .await
+            .unwrap()
+            .hits
+            .is_empty()
+    );
+
+    let filter = FilteredQuery::new(
+        Arc::new(PrefixQuery::new(content, "doc")),
+        vec![Arc::new(exclude_self.clone())],
+    );
+    let result = index.search(&filter, 1).await.unwrap();
+    assert_eq!(result.hits.len(), 1);
+    assert_ne!(result.hits[0].address.doc_id, 0);
+
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let segment = &searcher.segment_readers()[0];
+    assert_eq!(exclude_self.count_estimate(segment).await.unwrap(), 100);
+    // Drive the async stream explicitly even in a sync-enabled build.
+    let mut scorer = exclude_self.scorer(segment, 100).await.unwrap();
+    let mut docs = Vec::new();
+    while scorer.doc() != crate::TERMINATED {
+        docs.push(scorer.doc());
+        scorer.advance();
+    }
+    assert_eq!(docs, (1..100).collect::<Vec<_>>());
+    assert_eq!(scorer.seek(crate::TERMINATED), crate::TERMINATED);
+    assert_eq!(scorer.advance(), crate::TERMINATED);
+
+    #[cfg(feature = "sync")]
+    {
+        let bits = exclude_self
+            .as_doc_bitset(segment)
+            .expect("exclusions must materialize without a corpus-sized top-k fallback");
+        assert_eq!(bits.count(), 99);
+        assert!(!bits.contains(0));
+        assert_eq!(bits.next_set_bit(100), None);
+        let no_match = BooleanQuery::new().must_not(TermQuery::text(content, "absent"));
+        let bits = no_match
+            .as_doc_bitset(segment)
+            .expect("an absent exclusion is a complete filter");
+        assert_eq!(bits.count(), 100);
+        assert_eq!(bits.next_set_bit(100), None);
+    }
+}

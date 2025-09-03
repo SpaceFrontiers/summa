@@ -1,4 +1,4 @@
-//! Adaptive per-block payload codec for BMP V19.
+//! Adaptive per-block payload codec for BMP.
 //!
 //! A block keeps sorted `u32` dimensions, but adapts the rest of its header
 //! and payload to the data:
@@ -774,10 +774,10 @@ mod tests {
                 }
             }
             let bytes = encode(32, &dimensions, &counts, &maxima, &postings);
-            let v18_bytes = 8 + 9 * num_terms + postings.len();
+            let flat_bound = 8 + 9 * num_terms + postings.len();
             assert!(
-                bytes.len() <= v18_bytes,
-                "terms={num_terms}: V19={} > V18={v18_bytes}",
+                bytes.len() <= flat_bound,
+                "terms={num_terms}: adaptive={} > flat bound={flat_bound}",
                 bytes.len(),
             );
         }

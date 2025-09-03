@@ -122,6 +122,18 @@ impl DocBitset {
         }
     }
 
+    /// The segment's document universe, with padding bits left clear.
+    pub(crate) fn all(num_docs: u32) -> Self {
+        let mut result = Self::new(num_docs);
+        result.bits.fill(u64::MAX);
+        if !num_docs.is_multiple_of(64)
+            && let Some(last) = result.bits.last_mut()
+        {
+            *last = (1u64 << (num_docs % 64)) - 1;
+        }
+        result
+    }
+
     /// Set bit for `doc_id`.
     #[inline]
     pub fn set(&mut self, doc_id: u32) {
@@ -536,6 +548,14 @@ impl Query for Box<dyn Query> {
 
 /// Empty scorer for terms that don't exist
 pub struct EmptyScorer;
+
+// A document universe is a neutral required cursor for exclusion-only Boolean
+// queries. It adds neither a relevance score nor matched positions.
+impl Scorer for super::AllDocSet {
+    fn score(&self) -> Score {
+        0.0
+    }
+}
 
 impl super::docset::DocSet for EmptyScorer {
     fn doc(&self) -> DocId {

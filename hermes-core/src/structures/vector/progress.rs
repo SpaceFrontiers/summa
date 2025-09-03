@@ -175,13 +175,18 @@ mod tests {
 
     static CAPTURED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
-    struct CaptureLogger;
+    struct CaptureLogger {
+        thread: std::thread::ThreadId,
+    }
 
     impl log::Log for CaptureLogger {
         fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
+            std::thread::current().id() == self.thread
         }
         fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
             CAPTURED
                 .get_or_init(Default::default)
                 .lock()
@@ -195,7 +200,9 @@ mod tests {
     /// retrains at once and their output interleaves.
     #[test]
     fn training_progress_lines_carry_the_index_name() {
-        let _ = log::set_boxed_logger(Box::new(CaptureLogger));
+        let _ = log::set_boxed_logger(Box::new(CaptureLogger {
+            thread: std::thread::current().id(),
+        }));
         log::set_max_level(log::LevelFilter::Info);
 
         let phase = PhaseProgress::start(

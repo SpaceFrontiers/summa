@@ -1,6 +1,6 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V19/V20 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **current format, zero-copy**.
 //!
-//! V19 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
+//! BMP uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
 //! Data-first layout: block data (Section B) appears before block_data_starts
 //! (Section A). The reader derives the Section A offset from
@@ -86,9 +86,9 @@ pub struct BmpDimStats {
     pub top_dims: Vec<(u32, u64)>,
 }
 
-/// BMP V19/V20 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP index for a single sparse field — fully zero-copy mmap-backed.
 ///
-/// V19 format with Recursive Graph Bisection (BP) document ordering.
+/// Adaptive blocks with Recursive Graph Bisection (BP) document ordering.
 ///
 /// All data sections are `OwnedBytes` slices into the same underlying mmap Arc.
 /// No heap allocation — the superblock grid is persisted on disk and loaded as
@@ -175,14 +175,14 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V19 or V20 blob from the given file handle.
+    /// Parse a current BMP blob from the given file handle.
     ///
     /// Reads the footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
-    /// V19 data-first layout: Section B (per-block interleaved data) first,
+    /// Data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries), grids, doc_map.
-    /// V20 appends logical forward values before the shared footer.
+    /// The forward-storage section precedes the footer.
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -190,7 +190,7 @@ impl BmpIndex {
         total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC, BMP_BLOB_MAGIC_V19};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 
         if blob_len < BMP_BLOB_FOOTER_SIZE as u64 {
             return Err(crate::Error::Corruption(
@@ -223,11 +223,11 @@ impl BmpIndex {
         let grid_bits_raw = u32::from_le_bytes(fb[72..76].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[76..80].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC && magic != BMP_BLOB_MAGIC_V19 {
+        if magic != BMP_BLOB_MAGIC {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP9 {:#x} or BMPA {:#x}); rebuild \
-                 the index with this version.",
-                magic, BMP_BLOB_MAGIC_V19, BMP_BLOB_MAGIC
+                "Unsupported BMP blob magic: {:#x} (expected BMPA {:#x}); migrate or rebuild \
+                 the index with a compatible Hermes release.",
+                magic, BMP_BLOB_MAGIC
             )));
         }
         let grid_bits: u8 = match grid_bits_raw {
@@ -243,12 +243,43 @@ impl BmpIndex {
 
         // Handle empty index
         if num_blocks == 0 {
-            if num_virtual_docs != 0 || num_real_docs != 0 {
+            if blob_len
+                != (BMP_BLOB_FOOTER_SIZE + crate::segment::bmp_forward::TRAILER_BYTES) as u64
+            {
+                return Err(crate::Error::Corruption(
+                    "empty BMP index must contain only the storage trailer and footer".into(),
+                ));
+            }
+            if num_virtual_docs != 0
+                || num_real_docs != 0
+                || total_terms != 0
+                || total_postings != 0
+                || grid_offset != 0
+                || sb_grid_offset != 0
+                || coarse_grid_offset != 0
+                || doc_map_offset != 0
+            {
                 return Err(crate::Error::Corruption(format!(
                     "empty BMP index has non-zero document counts (virtual={}, real={})",
                     num_virtual_docs, num_real_docs
                 )));
             }
+            if !(1..=256).contains(&bmp_block_size)
+                || !max_weight_scale.is_finite()
+                || max_weight_scale <= 0.0
+            {
+                return Err(crate::Error::Corruption(
+                    "invalid empty BMP block size or scale".into(),
+                ));
+            }
+            let forward = crate::segment::bmp_forward::BmpForward::parse_optional(
+                handle
+                    .read_bytes_range_sync(blob_offset..footer_start)
+                    .map_err(crate::Error::Io)?,
+                0,
+                total_docs,
+                dims,
+            )?;
             return Ok(Self {
                 bmp_block_size,
                 num_blocks,
@@ -263,7 +294,7 @@ impl BmpIndex {
                 num_real_docs,
                 single_valued: true,
                 logically_ordered: true,
-                forward: None,
+                forward,
                 block_data_starts_bytes: OwnedBytes::empty(),
                 block_data_bytes: OwnedBytes::empty(),
                 block_grid: CompressedGrid::empty(),
@@ -389,25 +420,19 @@ impl BmpIndex {
         let dm_ords_end = dm_ids_end.checked_add(dm_ords_len).ok_or_else(|| {
             crate::Error::Corruption("BMP ordinal map end overflows usize".into())
         })?;
-        if dm_ords_end > data_len_usize
-            || (magic == BMP_BLOB_MAGIC_V19 && dm_ords_end != data_len_usize)
-        {
+        if dm_ords_end > data_len_usize {
             return Err(crate::Error::Corruption(format!(
                 "BMP data length mismatch: sections end at {}, blob data ends at {}",
                 dm_ords_end, data_len_usize
             )));
         }
 
-        let forward = if magic == BMP_BLOB_MAGIC {
-            Some(crate::segment::bmp_forward::BmpForward::parse(
-                blob.slice(dm_ords_end..data_len_usize),
-                num_real_docs,
-                total_docs,
-                dims,
-            )?)
-        } else {
-            None
-        };
+        let forward = crate::segment::bmp_forward::BmpForward::parse_optional(
+            blob.slice(dm_ords_end..data_len_usize),
+            num_real_docs,
+            total_docs,
+            dims,
+        )?;
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
         let block_grid = CompressedGrid::parse(
@@ -1348,7 +1373,7 @@ mod safety_tests {
     #[test]
     fn rewrite_validation_rejects_out_of_range_local_slot() {
         let mut blob = test_blob();
-        // One-term narrow V19 header: count(4) + dim(4) + offsets(4) + max(1).
+        // One-term narrow adaptive header: count(4) + dim(4) + offsets(4) + max(1).
         blob[13] = 64;
         let index = parse(blob).unwrap();
         let error = index.validate_block_for_rewrite(0).unwrap_err();

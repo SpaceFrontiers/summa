@@ -222,11 +222,11 @@ BM25/phrase frequency and length-normalization code and dense/binary SIMD
 kernels. Sparse scoring probes the stored quantized impacts for every retained
 query dimension, even when that dimension did not nominate the candidate.
 
-Dense flat storage already supports logical document/ordinal lookup. V20 BMP
+Dense flat storage already supports logical document/ordinal lookup. Current BMP
 uses quantized forward vectors inside `.sparse`; CHNK V3 uses addressed chunk
 metadata inside `.chunks`. Ordered legacy maps can be searched directly;
-reordered V19 BMP and V1/V2 text maps require explicit Reorder before their
-missing cells can be backfilled. BMP storage is optional per field via
+Unordered BMP maps without forward storage and unordered text maps require
+explicit Reorder before their missing cells can be backfilled. BMP storage is optional per field via
 `bmp_forward_index` (default true). With it disabled, ordered BMP maps locate
 candidates by binary search and score their query-term postings in selected
 blocks. BP-reordered BMP maps need this setting enabled and explicit
@@ -378,5 +378,15 @@ The serving contract is `candidate_scoring_version = 2`, with response markers
 including defaults, and rejects old or mixed ranking markers. RRF candidate
 export retains `fusion_candidates_v1`; global RRF retains `global_rrf_v1`.
 Deploy server and broker support together before activating L1; there is no
-mixed-version fallback to rank fusion. Stored V20 BMP and CHNK V3 generations
+mixed-version fallback to rank fusion. Current BMP and CHNK V3 generations
 require readers that understand these formats.
+
+### Exclusion-only common filters
+
+A nonempty Boolean `must_not` list with no positive clauses denotes every
+segment document except the excluded matches. An entirely empty Boolean still
+matches nothing. Fusion applies this eligibility before each branch selects
+its candidates; exclusions create neither scores nor passage ordinals. Native
+indexed terms materialize the complement in the bounded document bitmap,
+including when an excluded term is absent. The async/portable scorer streams
+the same complement without an all-document result heap.

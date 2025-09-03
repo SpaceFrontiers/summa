@@ -812,3 +812,98 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
     assert!(info.unprepared_candidate_fields.is_empty());
     registry.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fusion_exclusion_only_filters_remove_self_before_candidate_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));
+    let mut schema = hermes_core::Schema::builder();
+    let title = schema.add_text_field_with_tokenizer("title", true, false, "simple");
+    let id = schema.add_text_field_with_tokenizer("id", true, true, "simple");
+    registry
+        .create_index("l1-test", schema.build())
+        .await
+        .unwrap();
+    let writer = registry.get_writer("l1-test").await.unwrap();
+    {
+        let mut writer = writer.write().await;
+        for (identity, text) in [
+            ("self", "candidate candidate candidate"),
+            ("allowed", "candidate candidate"),
+            ("other", "candidate"),
+        ] {
+            let mut document = hermes_core::Document::new();
+            document.add_text(id, identity);
+            document.add_text(title, text);
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    let index = registry.get_or_open_index("l1-test").await.unwrap();
+    index.reader().await.unwrap().reload().await.unwrap();
+    let service = SearchServiceImpl::new(registry, 1, limits());
+    for mode in ["rrf", "linear", "export"] {
+        for (excluded, expected) in [
+            (vec!["self"], Some(1)),
+            (vec!["absent"], Some(0)),
+            (vec!["self", "allowed", "other"], None),
+        ] {
+            let mut request = named_l1_request();
+            request.fields_to_load = vec!["id".into()];
+            request.l1.as_mut().unwrap().weights = HashMap::from([("title".into(), 1.0)]);
+            if mode != "linear" {
+                request.l1 = None;
+            }
+            if mode == "rrf" {
+                request.score_export = None;
+            }
+            let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut()
+            else {
+                unreachable!()
+            };
+            fusion.queries.truncate(1);
+            fusion.candidate_depth = if mode == "rrf" { 0 } else { 1 };
+            fusion.filters = vec![Query {
+                query: Some(query::Query::Boolean(crate::proto::BooleanQuery {
+                    must_not: excluded
+                        .iter()
+                        .map(|value| Query {
+                            query: Some(query::Query::Term(crate::proto::TermQuery {
+                                field: "id".into(),
+                                term: (*value).into(),
+                                ..Default::default()
+                            })),
+                        })
+                        .collect(),
+                    ..Default::default()
+                })),
+            }];
+            let result = service
+                .search(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                result.hits.len(),
+                usize::from(expected.is_some()),
+                "{mode}, {excluded:?}"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(
+                    result.hits[0].address.as_ref().unwrap().doc_id,
+                    expected,
+                    "{mode}, {excluded:?}"
+                );
+                if mode != "rrf" {
+                    let scores = result.hits[0].candidate_scores.as_ref().unwrap();
+                    assert_eq!(
+                        scores.document.len(),
+                        1,
+                        "filters must not become scoring features"
+                    );
+                    assert!(scores.document["title"] > 0.0);
+                }
+            }
+        }
+    }
+}

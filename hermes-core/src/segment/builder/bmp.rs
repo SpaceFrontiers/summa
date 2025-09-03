@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V20 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **current format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -22,7 +22,7 @@
 //! Forward output adds O(dimensions) cursors and 8-byte/vector offsets while
 //! borrowing the same input; see the format design for the full cost model.
 //!
-//! ## BMP V20 Blob Layout (data-first, block-interleaved)
+//! ## BMP Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -42,7 +42,7 @@
 //!   term_max_impacts: [packed-u4 × num_terms]          conservative maxima
 //!   payload: sparse [(u8, u8)] or dense [u8; block_size] per term
 //!
-//! BMP V20 Footer (80 bytes; same offsets as V19):
+//! BMP footer (80 bytes):
 //!   total_terms: u64              //  0- 7  (stats only)
 //!   total_postings: u64           //  8-15  (stats only)
 //!   grid_offset: u64              // 16-23  (byte offset of Section D)
@@ -102,7 +102,7 @@ use crate::segment::bmp_grid::{
 use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V20 blob from per-dimension postings.
+/// Build a BMP blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
@@ -316,7 +316,6 @@ pub(crate) fn build_bmp_blob(
     let mut total_terms: u64 = 0;
     let mut total_postings: u64 = 0;
     let mut cumulative_bytes: u64 = 0;
-    let mut legacy_block_bytes: u64 = 0;
     let mut dense_terms: u64 = 0;
     let mut wide_blocks: u64 = 0;
     let mut last_block_filled: i64 = -1;
@@ -422,10 +421,6 @@ pub(crate) fn build_bmp_blob(
             )?;
             dense_terms = dense_terms.saturating_add(encoding.dense_terms as u64);
             wide_blocks += u64::from(encoding.wide_offsets);
-            legacy_block_bytes = legacy_block_bytes.saturating_add(
-                8u64.saturating_add((blk_dim_ids.len() as u64).saturating_mul(9))
-                    .saturating_add(blk_postings.len() as u64),
-            );
 
             writer.write_all(&blk_buf)?;
             cumulative_bytes += blk_buf.len() as u64;
@@ -443,10 +438,9 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V{} vectors={} padded={} blocks={} dims={} \
-         terms={} postings={} grid_entries={} section_b={} legacy_v18_section_b={} \
-         adaptive_ratio={:.3} dense_terms={} ({:.2}%) wide_blocks={}",
-        if store_forward { 20 } else { 19 },
+        "[bmp_build] vectors={} padded={} blocks={} dims={} \
+         terms={} postings={} grid_entries={} section_b={} \
+         dense_terms={} ({:.2}%) wide_blocks={} forward_storage={}",
         num_real_docs,
         num_virtual_docs,
         num_blocks,
@@ -455,11 +449,10 @@ pub(crate) fn build_bmp_blob(
         total_postings,
         grid_entries.len(),
         crate::format_bytes(cumulative_bytes),
-        crate::format_bytes(legacy_block_bytes),
-        cumulative_bytes as f64 / legacy_block_bytes.max(1) as f64,
         dense_terms,
         dense_terms as f64 * 100.0 / total_terms.max(1) as f64,
         wide_blocks,
+        store_forward,
     );
 
     // Release inverted traversal state. Forward output still borrows dim_vecs.
@@ -530,10 +523,12 @@ pub(crate) fn build_bmp_blob(
             max_weight_scale,
             writer,
         )?;
+    } else {
+        bytes_written += crate::segment::bmp_forward::write_disabled(writer)?;
     }
     drop(vid_pairs);
 
-    // V20 with forward values; V19 when storage is disabled.
+    // One current envelope, with an explicit optional-storage section.
     write_bmp_footer(
         writer,
         total_terms,
@@ -549,7 +544,6 @@ pub(crate) fn build_bmp_blob(
         doc_map_offset,
         num_real_docs as u32,
         grid_bits,
-        store_forward,
     )?;
     bytes_written += BMP_BLOB_FOOTER_SIZE as u64;
 
@@ -649,7 +643,6 @@ pub(crate) fn write_bmp_footer(
     doc_map_offset: u64,
     num_real_docs: u32,
     grid_bits: u8,
-    has_forward: bool,
 ) -> std::io::Result<()> {
     writer.write_u64::<LittleEndian>(total_terms)?; //  0- 7
     writer.write_u64::<LittleEndian>(total_postings)?; //  8-15
@@ -664,11 +657,7 @@ pub(crate) fn write_bmp_footer(
     writer.write_u64::<LittleEndian>(doc_map_offset)?; // 60-67
     writer.write_u32::<LittleEndian>(num_real_docs)?; // 68-71
     writer.write_u32::<LittleEndian>(grid_bits as u32)?; // 72-75
-    writer.write_u32::<LittleEndian>(if has_forward {
-        BMP_BLOB_MAGIC
-    } else {
-        crate::segment::format::BMP_BLOB_MAGIC_V19
-    })?; // 76-79
+    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC)?; // 76-79
     Ok(())
 }
 
@@ -1671,7 +1660,6 @@ mod tests {
             66,
             77,
             4,
-            true,
         )
         .unwrap();
 

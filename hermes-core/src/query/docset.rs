@@ -226,7 +226,9 @@ impl DocSet for AllDocSet {
 
     #[inline]
     fn advance(&mut self) -> DocId {
-        self.current += 1;
+        if self.current < self.num_docs {
+            self.current += 1;
+        }
         self.doc()
     }
 
