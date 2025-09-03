@@ -210,7 +210,7 @@ export interface SparseVectorQuery {
   text: string;
   /** How to combine scores for multi-value fields */
   combiner: MultiValueCombiner;
-  /** Approximate search factor (1.0 = exact, 0.8 = ~20% faster) */
+  /** Approximate search factor (1 = exact, 0.8 prunes more; 0 = use default) */
   heapFactor: number;
   /** Temperature for LogSumExp (default: 1.5) */
   combinerTemperature: number;
@@ -318,8 +318,8 @@ export interface MatchQuery {
   proximityWindow: number;
   /**
    * Approximate MaxScore: scale the pruning threshold by 1/heap_factor
-   * (0 or 1 = exact, rank-safe; 1.5 prunes more aggressively at some
-   * recall cost). Same semantics as SparseVectorQuery.heap_factor.
+   * (0/unset or 1 = exact, rank-safe; 0.8 prunes more aggressively at some
+   * recall cost). Must be finite and in [0, 1], like SparseVectorQuery.heap_factor.
    */
   heapFactor: number;
   /**

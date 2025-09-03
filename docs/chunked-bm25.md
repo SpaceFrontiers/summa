@@ -69,6 +69,58 @@ and which of it Hermes applies.
 
 ## Measure
 
+### Execution follow-up (2026-09-05)
+
+The deployed latency review identifies execution work, not a reason to change
+BM25 defaults or replace phrase bonuses with approximate proximity scores.
+The following execution changes are implemented (not yet deployed):
+
+- Text and sparse use one `heap_factor` convention: `0 < factor < 1` raises
+  the pruning threshold to `threshold / factor`; 1 is exact. The Match RPC's
+  unset/zero value selects 1; non-finite, negative and above-one wire values
+  are rejected. There is no compatibility translation for former text values
+  above 1. Native builders/executors use the same internal factor floor as
+  sparse (0.01).
+- Carry a deadline-only context into nested scorers: never reuse an outer
+  score floor in a component's different score space. Check during phrase
+  construction/intersection and single-term execution, not only collection.
+  Phrase bitset materialization carries the same context and never returns a
+  partial negative filter. An already-expired query does not begin scoring;
+  cancelled chunked phrase construction skips its final all-hit fold.
+  Deadline truncation is cooperative, not preemption of outstanding I/O.
+- Keep one decoded position block (128 u32 values) per phrase term, bound to
+  that term's immutable stream. Match ascending position lists with monotone
+  cursors; preserve offset gaps, repeated terms, slop and phrase frequency.
+  Chunk-to-document folding remains reorder-safe; a chunk map is NOT generally
+  document-ID sorted, so streaming by assumed document order is invalid.
+- Floor list/block/group length minima by the same segment-local nominal
+  length used in scoring. Cache only the last block/group bound per term.
+
+These changes leave persisted bytes and scoring formulas unchanged. Phrase
+folding must still expose all matches when used as a mandatory constraint;
+bounded candidate rescoring is a separate, opt-in ranking policy. Same-build fixtures,
+score-bit comparisons, budget regressions and measured evidence belong in
+
+### Lazy phrase folding (implemented 2026-09-05)
+
+At chunk-map open, verify document-ID monotonicity once with a sequential
+column scan, retaining only a boolean. This is derived metadata: no on-disk
+format or merge writer changes. For verified ordered maps, fold the phrase
+stream one document at a time using the existing Max combiner and preserving
+ordinal encounter order. Scratch holds one document's matching ordinals plus
+one matching-chunk lookahead, not all corpus hits. Seek translates a document
+target into a chunk lower bound with binary search. No top-k cutoff may hide
+mandatory matches. Cancellation must discard any partially folded document.
+
+Reordered maps keep the eager, stable grouping path; they never enter the
+ordered streaming implementation. Tests compare both paths against the existing
+fold's doc IDs, score bits and ordinals, including seeks and cancelled
+construction. Ordered maps add one sequential scan of four bytes per chunk at
+open and retain one boolean. Query folding retains at most one document's
+matching ordinals, not a corpus-sized result vector. Broad phrase queries avoid
+all-hit sorting and allocations, but still perform positional verification.
+See the same-fixture measurements in the performance review.
+
 ## Primary references
 
 - James P. Callan, [“Passage-Level Evidence in Document Retrieval”](https://www.sigmod.org/publications/dblp/db/conf/sigir/Callan94.html), SIGIR 1994.

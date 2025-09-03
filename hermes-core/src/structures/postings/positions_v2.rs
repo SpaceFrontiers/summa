@@ -153,6 +153,14 @@ pub struct PositionStream {
     canonical_blocks: bool,
 }
 
+#[derive(Default)]
+struct PositionBlockCache {
+    index: Option<usize>,
+    values: Vec<u32>,
+    #[cfg(test)]
+    decodes: usize,
+}
+
 impl PositionStream {
     /// Whether `raw` ends with a current position-stream footer.
     pub fn is_stream(raw: &[u8]) -> bool {
@@ -294,13 +302,29 @@ impl PositionStream {
     }
 
     /// Positions of one document: the `tf` values starting at `cursor`,
-    /// delta-decoded into absolute positions. `scratch` holds one decoded
-    /// block between calls.
+    /// delta-decoded into absolute positions. `scratch` reuses allocation;
+    /// sequential consumers should use a term-bound `TermPositionCursor`.
     pub fn read_into(
         &self,
         cursor: u64,
         tf: u32,
         scratch: &mut Vec<u32>,
+        out: &mut Vec<u32>,
+    ) -> bool {
+        let mut cache = PositionBlockCache {
+            values: std::mem::take(scratch),
+            ..Default::default()
+        };
+        let found = self.read_cached(cursor, tf, &mut cache, out);
+        *scratch = cache.values;
+        found
+    }
+
+    fn read_cached(
+        &self,
+        cursor: u64,
+        tf: u32,
+        cache: &mut PositionBlockCache,
         out: &mut Vec<u32>,
     ) -> bool {
         out.clear();
@@ -321,11 +345,22 @@ impl PositionStream {
         let mut prev = 0u32;
         out.reserve(remaining);
         while remaining > 0 {
-            if !self.decode_block(idx, scratch) || scratch.len() <= in_block {
+            if cache.index != Some(idx) {
+                cache.index = None;
+                if !self.decode_block(idx, &mut cache.values) {
+                    return false;
+                }
+                cache.index = Some(idx);
+                #[cfg(test)]
+                {
+                    cache.decodes += 1;
+                }
+            }
+            if cache.values.len() <= in_block {
                 return false;
             }
-            let take = remaining.min(scratch.len() - in_block);
-            for &delta in &scratch[in_block..in_block + take] {
+            let take = remaining.min(cache.values.len() - in_block);
+            for &delta in &cache.values[in_block..in_block + take] {
                 prev = prev.wrapping_add(delta);
                 out.push(prev);
             }
@@ -474,7 +509,35 @@ pub enum TermPositions {
     Stream(PositionStream),
 }
 
+/// Query-local cursor bound to one immutable term stream. At most one decoded
+/// block (128 u32 values) is retained; seeking backwards safely replaces it.
+pub(crate) struct TermPositionCursor {
+    positions: TermPositions,
+    cache: PositionBlockCache,
+}
+
+impl TermPositionCursor {
+    pub(crate) fn read_into(
+        &mut self,
+        doc: DocId,
+        cursor: u64,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> bool {
+        match &self.positions {
+            TermPositions::Legacy(list) => list.get_positions_into(doc, out),
+            TermPositions::Stream(stream) => stream.read_cached(cursor, tf, &mut self.cache, out),
+        }
+    }
+}
+
 impl TermPositions {
+    pub(crate) fn into_cursor(self) -> TermPositionCursor {
+        TermPositionCursor {
+            positions: self,
+            cache: PositionBlockCache::default(),
+        }
+    }
     pub fn open(bytes: OwnedBytes) -> io::Result<Self> {
         if PositionStream::is_stream(bytes.as_slice()) {
             Ok(TermPositions::Stream(PositionStream::open(bytes)?))
@@ -512,6 +575,66 @@ impl TermPositions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn term_cursor_reuses_blocks_and_isolates_terms_and_backward_seeks() {
+        let docs: Vec<Vec<u32>> = (0..200).map(|i| vec![i, i + 3]).collect();
+        let (bytes, _) = encode(&docs);
+        let mut cursor = TermPositions::open(OwnedBytes::new(bytes.clone()))
+            .unwrap()
+            .into_cursor();
+        let mut out = Vec::new();
+        for (id, expected) in docs.iter().enumerate() {
+            assert!(cursor.read_into(id as u32, id as u64 * 2, 2, &mut out));
+            assert_eq!(&out, expected);
+        }
+        assert_eq!(
+            cursor.cache.decodes,
+            400usize.div_ceil(POSITION_STREAM_BLOCK)
+        );
+        assert!(cursor.read_into(0, 0, 2, &mut out));
+        assert_eq!(out, docs[0]);
+        let decodes = cursor.cache.decodes;
+        assert!(cursor.read_into(1, 2, 2, &mut out));
+        assert_eq!(cursor.cache.decodes, decodes);
+        let (other_bytes, _) = encode(&[vec![99, 100]]);
+        let mut other = TermPositions::open(OwnedBytes::new(other_bytes))
+            .unwrap()
+            .into_cursor();
+        assert!(other.read_into(0, 0, 2, &mut out));
+        assert_eq!(out, vec![99, 100]);
+        assert!(!cursor.read_into(0, u64::MAX, 2, &mut out));
+        assert!(cursor.read_into(0, 0, 0, &mut out));
+        assert!(out.is_empty());
+        let TermPositions::Stream(stream) = cursor.positions else {
+            unreachable!()
+        };
+        assert_eq!(
+            stream.bytes.as_slice(),
+            bytes,
+            "reading must not modify encoded blocks"
+        );
+    }
+
+    #[test]
+    fn term_cursor_handles_copied_short_blocks_and_cross_block_documents() {
+        let first = vec![vec![1, 4, 9]; 13];
+        let second = vec![vec![10, 20, 30]; 80];
+        let (a, _) = encode(&first);
+        let (b, _) = encode(&second);
+        let mut merged = Vec::new();
+        PositionStream::concatenate_streaming(&[&a, &b], &mut merged).unwrap();
+        let mut cursor = TermPositions::open(OwnedBytes::new(merged))
+            .unwrap()
+            .into_cursor();
+        let mut out = Vec::new();
+        for (doc, expected) in first.iter().chain(&second).enumerate() {
+            assert!(cursor.read_into(doc as u32, doc as u64 * 3, 3, &mut out));
+            assert_eq!(&out, expected);
+        }
+        assert_eq!(cursor.cache.decodes, 3);
+        assert!(cursor.cache.values.capacity() <= POSITION_STREAM_BLOCK);
+    }
 
     fn encode(docs: &[Vec<u32>]) -> (Vec<u8>, u64) {
         let mut buf = Vec::new();

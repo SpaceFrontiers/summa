@@ -189,6 +189,17 @@ pub fn convert_query(
             }
         }
         Some(ProtoQueryType::Match(match_query)) => {
+            if !match_query.heap_factor.is_finite()
+                || !(0.0..=1.0).contains(&match_query.heap_factor)
+            {
+                return Err("MatchQuery heap_factor must be finite and between 0 and 1".into());
+            }
+            // Protobuf zero/unset selects the exact default, like sparse.
+            let heap_factor = if match_query.heap_factor == 0.0 {
+                1.0
+            } else {
+                match_query.heap_factor
+            };
             // Trailing `*` → PrefixQuery (no tokenization, raw lowercased prefix)
             if let Some(prefix) = match_query.text.strip_suffix('*') {
                 let field = schema
@@ -247,8 +258,9 @@ pub fn convert_query(
                 }
             };
 
-            if distinct.len() == 1 {
-                // Single token - use TermQuery directly
+            if distinct.len() == 1 && heap_factor == 1.0 {
+                // Exact single token: keep the direct path. Tuned text must
+                // reach the text executor even when tokenization leaves one term.
                 let (token, count) = &distinct[0];
                 return Ok(term_clause(token, *count));
             }
@@ -264,8 +276,8 @@ pub fn convert_query(
                     match_query.proximity_window,
                 ));
             }
-            if match_query.heap_factor > 1.0 {
-                query = query.with_text_heap_factor(match_query.heap_factor);
+            if heap_factor < 1.0 {
+                query = query.with_text_heap_factor(heap_factor);
             }
             if match_query.max_terms > 0 {
                 query = query.with_max_terms(match_query.max_terms as usize);
@@ -1434,6 +1446,92 @@ pub fn text_stats_from_proto(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn match_heap_factor_reaches_text_executor_for_one_and_multiple_terms() {
+        use hermes_core::directories::RamDirectory;
+        use hermes_core::index::{Index, IndexConfig, IndexWriter};
+        for chunked in [false, true] {
+            let mut builder = hermes_core::SchemaBuilder::default();
+            let body = builder.add_text_field_with_tokenizer("body", true, false, "simple");
+            builder.set_chunked(body, chunked);
+            let schema = builder.build();
+            let dir = RamDirectory::new();
+            let config = IndexConfig {
+                num_indexing_threads: 1,
+                ..Default::default()
+            };
+            let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+                .await
+                .unwrap();
+            for id in 0..512 {
+                let text = if id < 128 {
+                    "machine learning padding padding padding padding"
+                } else {
+                    "machine learning machine learning machine learning"
+                };
+                let mut doc = hermes_core::Document::new();
+                doc.add_text(body, text);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+            let index = Index::open(dir, config).await.unwrap();
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            for text in ["machine", "machine learning"] {
+                let mut rankings = Vec::new();
+                for factor in [1.0, 0.01, 0.0] {
+                    let query = convert_query(
+                        &proto::Query {
+                            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                                field: "body".into(),
+                                text: text.into(),
+                                heap_factor: factor,
+                                ..Default::default()
+                            })),
+                        },
+                        &schema,
+                        None,
+                        None,
+                        &shape(),
+                    )
+                    .unwrap();
+                    let (hits, _) = searcher
+                        .search_with_count(query.as_ref(), 10)
+                        .await
+                        .unwrap();
+                    rankings.push(hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>());
+                }
+                assert_ne!(rankings[0], rankings[1], "chunked={chunked}, text={text}");
+                assert_eq!(
+                    rankings[0], rankings[2],
+                    "zero must select the exact default"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn match_heap_factor_rejects_old_and_invalid_wire_values() {
+        let schema = stemmed_text_schema();
+        for factor in [-1.0, 1.5, f32::INFINITY, f32::NAN] {
+            let result = convert_query(
+                &proto::Query {
+                    query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                        field: "body".into(),
+                        text: "running foxes".into(),
+                        heap_factor: factor,
+                        ..Default::default()
+                    })),
+                },
+                &schema,
+                None,
+                None,
+                &shape(),
+            );
+            assert!(result.is_err(), "must reject {factor}");
+        }
+    }
+
     #[test]
     fn match_query_deduplicates_repeated_tokens() {
         let mut builder = hermes_core::SchemaBuilder::default();
@@ -2050,7 +2148,7 @@ mod tests {
                     tokenizer_hint: String::new(),
                     proximity_weight: 0.0,
                     proximity_window: 0,
-                    heap_factor: 1.5,
+                    heap_factor: 0.6,
                     max_terms: 2,
                 })),
             },
@@ -2061,7 +2159,7 @@ mod tests {
         )
         .unwrap()
         .to_string();
-        assert!(tuned.contains("~heap(1.5)"), "{tuned}");
+        assert!(tuned.contains("~heap(0.6)"), "{tuned}");
         assert!(tuned.contains("~max_terms(2)"), "{tuned}");
         let off = convert_query(
             &match_proto("body", "running foxes", ""),

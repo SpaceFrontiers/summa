@@ -117,7 +117,7 @@ message SparseVectorQuery {
   repeated float values = 3;     // Pre-computed token values
   string text = 4;               // Raw text (tokenized server-side if tokenizer configured)
   MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
-  float heap_factor = 6;         // Approximate search factor (1.0 = exact, 0.8 = ~20% faster)
+  float heap_factor = 6;         // Approximate search factor (1 = exact, 0.8 prunes more; 0 = use default)
   float combiner_temperature = 7;   // Temperature for LogSumExp (default: 1.5)
   uint32 combiner_top_k = 8;        // K for WeightedTopK (default: 5)
   float combiner_decay = 9;         // Decay for WeightedTopK (default: 0.7)
@@ -200,8 +200,8 @@ message MatchQuery {
   // Unordered window size; 0 = 8.
   uint32 proximity_window = 5;
   // Approximate MaxScore: scale the pruning threshold by 1/heap_factor
-  // (0 or 1 = exact, rank-safe; 1.5 prunes more aggressively at some
-  // recall cost). Same semantics as SparseVectorQuery.heap_factor.
+  // (0/unset or 1 = exact, rank-safe; 0.8 prunes more aggressively at some
+  // recall cost). Must be finite and in [0, 1], like SparseVectorQuery.heap_factor.
   float heap_factor = 6;
   // Long queries: keep only the `max_terms` rarest (highest idf) tokens for
   // scoring; 0 = all tokens. Approximate.

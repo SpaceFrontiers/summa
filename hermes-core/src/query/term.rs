@@ -103,13 +103,17 @@ fn compute_term_idf(
 //   $($aw)*          – .await  (present for async, absent for sync)
 macro_rules! term_plan {
     ($field:expr, $term:expr, $global_stats:expr, $reader:expr, $limit:expr,
-     $load_positions:expr, $get_postings_fn:ident, $get_positions_fn:ident
+     $load_positions:expr, $budget:expr, $get_postings_fn:ident, $get_positions_fn:ident
      $(, $aw:tt)*) => {{
         let field: Field = $field;
         let term: &[u8] = $term;
         let global_stats: Option<&Arc<GlobalStats>> = $global_stats;
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
+        let budget: Option<&super::SharedThreshold> = $budget;
+        if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
+            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+        }
 
         // Non-indexed fields → fast-field-only path
         let is_indexed = reader.schema().get_field_entry(field).is_none_or(|e| e.indexed);
@@ -137,7 +141,7 @@ macro_rules! term_plan {
                     None,
                     None,
                     1.0,
-                    None,
+                    budget,
                 )
             }
             Some(posting_list) => {
@@ -152,6 +156,7 @@ macro_rules! term_plan {
 
                 let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0)
                     .with_params(super::Bm25Params::for_field(reader.schema(), field));
+                scorer.budget = budget.filter(|b| b.deadline().is_some()).cloned();
                 if let Some(lengths) = reader.doc_lengths(field) {
                     scorer = scorer.with_doc_lengths(lengths.clone());
                 }
@@ -198,6 +203,7 @@ impl Query for TermQuery {
                 reader,
                 limit,
                 load_positions,
+                options.shared_threshold.as_ref(),
                 get_postings,
                 get_positions,
                 await
@@ -243,6 +249,7 @@ impl Query for TermQuery {
             reader,
             limit,
             options.collect_positions,
+            options.shared_threshold.as_ref(),
             get_postings_sync,
             get_positions_sync
         )
@@ -308,6 +315,7 @@ impl Query for TermQuery {
 }
 
 struct TermScorer {
+    budget: Option<super::SharedThreshold>,
     iterator: crate::structures::BlockPostingIterator<'static>,
     idf: f32,
     /// Average field length for this field
@@ -332,6 +340,7 @@ impl TermScorer {
         field_boost: f32,
     ) -> Self {
         Self {
+            budget: None,
             iterator: posting_list.into_iterator(),
             idf,
             avg_field_len,
@@ -368,14 +377,27 @@ impl TermScorer {
 
 impl super::docset::DocSet for TermScorer {
     fn doc(&self) -> DocId {
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(super::SharedThreshold::stop_if_expired)
+        {
+            return TERMINATED;
+        }
         self.iterator.doc()
     }
 
     fn advance(&mut self) -> DocId {
+        if self.doc() == TERMINATED {
+            return TERMINATED;
+        }
         self.iterator.advance()
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
+        if self.doc() == TERMINATED {
+            return TERMINATED;
+        }
         self.iterator.seek(target)
     }
 

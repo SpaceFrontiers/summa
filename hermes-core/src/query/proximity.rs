@@ -105,13 +105,12 @@ pub(crate) fn rescore_sync(
         let list = reader.get_postings_sync(field, term)?;
         let positions = reader.get_positions_sync(field, term)?;
         cursors.push(match (list, positions) {
-            (Some(list), Some(positions)) => Some((list.into_iterator(), positions)),
+            (Some(list), Some(positions)) => Some((list.into_iterator(), positions.into_cursor())),
             _ => None,
         });
     }
     let mut order: Vec<usize> = (0..hits.len()).collect();
     order.sort_unstable_by_key(|&i| hits[i].doc_id);
-    let mut scratch: Vec<u32> = Vec::new();
     let mut bufs: Vec<Vec<u32>> = vec![Vec::new(); terms.len()];
     let avg = avg_len.max(1.0);
     for i in order {
@@ -122,13 +121,7 @@ pub(crate) fn rescore_sync(
                 && it.doc() != TERMINATED
                 && it.seek(doc) == doc
             {
-                positions.positions_into(
-                    doc,
-                    it.position_cursor(),
-                    it.term_freq(),
-                    &mut scratch,
-                    &mut bufs[t],
-                );
+                positions.read_into(doc, it.position_cursor(), it.term_freq(), &mut bufs[t]);
             }
         }
         let len = lengths

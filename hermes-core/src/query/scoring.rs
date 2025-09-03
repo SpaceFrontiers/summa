@@ -353,6 +353,26 @@ impl SharedThreshold {
         self.deadline
     }
 
+    /// Keep cancellation/observability, but isolate a component's score space.
+    pub(crate) fn budget_only(&self) -> Self {
+        Self {
+            floor: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            k: usize::MAX,
+            deadline: self.deadline,
+            truncated: self.truncated.clone(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn stop_if_expired(&self) -> bool {
+        if self.expired() {
+            self.mark_truncated();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Whether the deadline has passed.
     #[inline]
     pub fn expired(&self) -> bool {
@@ -518,6 +538,9 @@ enum CursorVariant<'a> {
         /// list stores one and scoring uses real lengths (a `tf`-as-length
         /// score is not bounded by a real-length bound).
         length_bounds: bool,
+        length_floor: u32,
+        block_bound: CachedScoreBound,
+        group_bound: CachedScoreBound,
         /// Average length used by the bounds (matches the scoring average).
         avg_len: f32,
         /// Per-field k1/b, used by the block and group bounds.
@@ -534,6 +557,30 @@ enum CursorVariant<'a> {
         skip_start: usize,
         block_data_offset: u64,
     },
+}
+
+/// One query-local memoized bound, not a corpus-sized table. Atomic packing
+/// keeps shared read access Sync without a lock or separate key/value races.
+struct CachedScoreBound(std::sync::atomic::AtomicU64);
+
+impl CachedScoreBound {
+    fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(u64::MAX))
+    }
+
+    fn get_or_compute(&self, key: usize, compute: impl FnOnce() -> f32) -> f32 {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Posting block counts are bounded by the u32 posting-id space.
+        let key = key as u64;
+        let entry = self.0.load(Relaxed);
+        if entry >> 32 == key {
+            return f32::from_bits(entry as u32);
+        }
+        let score = compute();
+        self.0
+            .store((key << 32) | u64::from(score.to_bits()), Relaxed);
+        score
+    }
 }
 
 // ── TermCursor async/sync macros ──────────────────────────────────────────
@@ -651,10 +698,17 @@ impl<'a> TermCursor<'a> {
         let max_tf = posting_list.max_tf() as f32;
         let safe_avg = avg_field_len.max(1.0);
         let length_bounds = lengths.is_some() && posting_list.min_len().is_some();
+        let length_floor = match lengths {
+            Some(LengthSource::Chunks(map)) => map.length_floor(),
+            _ => 0,
+        };
         let max_score = match posting_list.min_len() {
-            Some(min_len) if length_bounds => {
-                params.upper_bound_with_len(max_tf.max(1.0), idf, min_len as f32, safe_avg)
-            }
+            Some(min_len) if length_bounds => params.upper_bound_with_len(
+                max_tf.max(1.0),
+                idf,
+                min_len.max(length_floor) as f32,
+                safe_avg,
+            ),
             _ => params.upper_bound(max_tf.max(1.0), idf),
         };
         let num_blocks = posting_list.num_blocks();
@@ -680,6 +734,9 @@ impl<'a> TermCursor<'a> {
                 denom_len_coeff: params.k1 * params.b / safe_avg,
                 lengths,
                 length_bounds,
+                length_floor,
+                block_bound: CachedScoreBound::new(),
+                group_bound: CachedScoreBound::new(),
                 avg_len: safe_avg,
                 params,
                 tfs: Vec::with_capacity(128),
@@ -857,21 +914,23 @@ impl<'a> TermCursor<'a> {
                 list,
                 idf,
                 length_bounds,
+                length_floor,
+                block_bound,
                 avg_len,
                 params,
                 ..
-            } => {
+            } => block_bound.get_or_compute(idx, || {
                 let (max_tf, min_len) = list.block_bounds(idx).unwrap_or((0, None));
                 match min_len {
                     Some(min_len) if *length_bounds => params.upper_bound_with_len(
                         (max_tf as f32).max(1.0),
                         *idf,
-                        min_len as f32,
+                        min_len.max(*length_floor) as f32,
                         *avg_len,
                     ),
                     _ => params.upper_bound((max_tf as f32).max(1.0), *idf),
                 }
-            }
+            }),
             CursorVariant::Sparse { .. } => self.max_score,
         }
     }
@@ -883,21 +942,25 @@ impl<'a> TermCursor<'a> {
                 list,
                 idf,
                 length_bounds,
+                length_floor,
+                group_bound,
                 avg_len,
                 params,
                 ..
             } => {
                 let (max_tf, min_len) = list.group_bounds(idx)?;
-                Some(if *length_bounds {
-                    params.upper_bound_with_len(
-                        (max_tf as f32).max(1.0),
-                        *idf,
-                        min_len as f32,
-                        *avg_len,
-                    )
-                } else {
-                    params.upper_bound((max_tf as f32).max(1.0), *idf)
-                })
+                Some(group_bound.get_or_compute(list.next_group_block(idx), || {
+                    if *length_bounds {
+                        params.upper_bound_with_len(
+                            (max_tf as f32).max(1.0),
+                            *idf,
+                            min_len.max(*length_floor) as f32,
+                            *avg_len,
+                        )
+                    } else {
+                        params.upper_bound((max_tf as f32).max(1.0), *idf)
+                    }
+                }))
             }
             CursorVariant::Sparse { .. } => None,
         }
@@ -1802,6 +1865,13 @@ impl<'a> MaxScoreExecutor<'a> {
     /// approximate `heap_factor` mode scales the threshold as in the
     /// document-at-a-time loop.
     pub(crate) fn execute_windowed(&mut self) -> crate::Result<Vec<ScoredDoc>> {
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(SharedThreshold::stop_if_expired)
+        {
+            return Ok(Vec::new());
+        }
         let n = self.cursors.len();
         for cursor in &mut self.cursors {
             cursor.ensure_block_loaded_sync()?;
@@ -2305,6 +2375,118 @@ mod tests {
             .filter(|hit| exact.iter().any(|e| e.doc_id == hit.doc_id))
             .count();
         assert!(overlap >= 25, "overlap {overlap} of 50");
+    }
+
+    #[test]
+    fn text_heap_factor_below_one_actually_changes_pruning() {
+        let params = super::super::Bm25Params::default();
+        let corpus = random_corpus(7, 20_000, 6);
+        let lengths = crate::segment::chunk_map::DocLengths::from_lengths(&corpus.lengths);
+        let lists = build_lists(&corpus, Some(&lengths));
+        let mut exact = MaxScoreExecutor::text(
+            lists.clone(),
+            lengths.avg_len(),
+            50,
+            Some(&lengths),
+            params,
+            1.0,
+        );
+        let mut approximate =
+            MaxScoreExecutor::text(lists, lengths.avg_len(), 50, Some(&lengths), params, 0.01);
+        let exact = exact.execute_windowed().unwrap();
+        let approximate = approximate.execute_windowed().unwrap();
+        assert_ne!(
+            exact.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            approximate.iter().map(|hit| hit.doc_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn text_and_sparse_factors_have_identical_conventions() {
+        for factor in [0.0, 0.01, 0.5, 1.0] {
+            let text = MaxScoreExecutor::text(
+                Vec::new(),
+                1.0,
+                1,
+                None,
+                super::super::Bm25Params::default(),
+                factor,
+            );
+            let sparse = MaxScoreExecutor::new(Vec::new(), 1, factor);
+            assert_eq!(text.inv_heap_factor, sparse.inv_heap_factor);
+            assert_eq!(text.inv_heap_factor, factor.clamp(0.01, 1.0).recip());
+        }
+    }
+
+    #[test]
+    fn chunk_bounds_use_the_same_length_floor_as_scoring() {
+        use crate::segment::chunk_map::{ChunkMapBuilder, read_chunk_maps, write_chunk_maps};
+        use crate::structures::{BlockPostingList, PostingList};
+        let mut chunks = ChunkMapBuilder::default();
+        let mut postings = PostingList::new();
+        for id in 0..2048 {
+            chunks
+                .push(id / 4, (id % 4) as u16, if id % 4 == 0 { 1 } else { 200 })
+                .unwrap();
+            postings.push(id, 1);
+        }
+        let mut bytes = Vec::new();
+        write_chunk_maps(&mut bytes, &[(0, &chunks)], &[]).unwrap();
+        let maps = read_chunk_maps(crate::directories::OwnedBytes::new(bytes)).unwrap();
+        let map = &maps.chunk_maps[&0];
+        let list =
+            BlockPostingList::from_posting_list_with(&postings, false, Some(&|id| map.length(id)))
+                .unwrap();
+        assert_eq!(list.min_len(), Some(1));
+        let params = super::super::Bm25Params::default();
+        let cursor = TermCursor::text_with_params(
+            list,
+            2.0,
+            map.avg_len(),
+            Some(LengthSource::Chunks(map)),
+            params,
+        );
+        let expected = params.upper_bound_with_len(1.0, 2.0, 200.0, map.avg_len());
+        assert_eq!(cursor.max_score.to_bits(), expected.to_bits());
+        for block in 0..cursor.num_blocks {
+            assert_eq!(cursor.text_block_bound(block).to_bits(), expected.to_bits());
+            assert_eq!(
+                cursor.text_group_bound(block).unwrap().to_bits(),
+                expected.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn nested_scorers_keep_deadline_but_not_outer_score_floor() {
+        let shared = SharedThreshold::for_limit(10).with_deadline(Some(std::time::Instant::now()));
+        shared.raise(100.0);
+        let options = super::super::ScorerOptions {
+            shared_threshold: Some(shared.clone()),
+            initial_threshold: 100.0,
+            ..Default::default()
+        }
+        .without_threshold();
+        assert_eq!(options.initial_threshold, 0.0);
+        let nested = options.shared_threshold.unwrap();
+        assert_eq!(nested.get(), 0.0);
+        assert!(!nested.covers(10));
+        assert!(nested.stop_if_expired());
+        assert!(shared.truncated());
+        nested.raise(200.0);
+        assert_eq!(shared.get(), 100.0);
+    }
+
+    #[test]
+    fn score_bound_cache_reuses_only_its_last_key() {
+        let cache = CachedScoreBound::new();
+        assert_eq!(cache.get_or_compute(0, || 1.5), 1.5);
+        assert_eq!(
+            cache.get_or_compute(0, || panic!("recomputed active bound")),
+            1.5
+        );
+        assert_eq!(cache.get_or_compute(1, || 2.5), 2.5);
+        assert_eq!(cache.get_or_compute(0, || 3.5), 3.5);
     }
 
     #[test]

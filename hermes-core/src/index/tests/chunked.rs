@@ -71,6 +71,186 @@ async fn open(dir: RamDirectory) -> Index<RamDirectory> {
 }
 
 #[tokio::test]
+async fn expired_budget_stops_chunked_term_and_phrase_construction() {
+    use crate::query::{Query, ScorerOptions, SharedThreshold};
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    writer
+        .add_document(doc(&f, "article", &["machine learning"]))
+        .unwrap();
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let segment = &searcher.segment_readers()[0];
+    let queries: Vec<Box<dyn Query>> = vec![
+        Box::new(TermQuery::text(f.content, "machine")),
+        Box::new(PhraseQuery::text(f.content, "machine learning")),
+        Box::new(
+            BooleanQuery::new()
+                .should(PhraseQuery::text(f.content, "machine learning"))
+                .should(TermQuery::text(f.content, "learning")),
+        ),
+    ];
+    for query in queries {
+        let shared = SharedThreshold::for_limit(1).with_deadline(Some(std::time::Instant::now()));
+        let options = ScorerOptions {
+            shared_threshold: Some(shared.clone()),
+            ..Default::default()
+        };
+        let scorer = query
+            .scorer_with_options(segment, 1, options.clone())
+            .await
+            .unwrap();
+        assert_eq!(scorer.doc(), crate::structures::TERMINATED, "{query}");
+        assert!(shared.truncated(), "{query}");
+        #[cfg(feature = "sync")]
+        {
+            let scorer = query.scorer_sync_with_options(segment, 1, options).unwrap();
+            assert_eq!(scorer.doc(), crate::structures::TERMINATED, "{query}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn generous_phrase_budgets_preserve_scores_ordinals_and_negative_filters() {
+    use crate::query::{BoostQuery, Query};
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    for i in 0..100 {
+        let chunks = match i % 3 {
+            0 => ["machine learning machine learning", "machine"],
+            1 => ["machine padding learning", "learning machine"],
+            _ => ["machine learning", "padding machine learning"],
+        };
+        writer.add_document(doc(&f, "article", &chunks)).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let phrase = || PhraseQuery::text(f.content, "machine learning");
+    let term = || TermQuery::text(f.content, "machine");
+    let queries: Vec<Box<dyn Query>> = vec![
+        Box::new(phrase()),
+        Box::new(
+            BooleanQuery::new()
+                .must(phrase())
+                .should(term())
+                .should(TermQuery::text(f.content, "learning")),
+        ),
+        Box::new(BooleanQuery::new().should(term()).must_not(phrase())),
+        Box::new(
+            BooleanQuery::new()
+                .should(term())
+                .should(BoostQuery::new(phrase(), 2.0)),
+        ),
+    ];
+    for query in queries {
+        let (exact, _) = searcher
+            .search_with_positions(query.as_ref(), 40)
+            .await
+            .unwrap();
+        let (budgeted, _, truncated) = searcher
+            .search_with_positions_budgeted(
+                query.as_ref(),
+                40,
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+            )
+            .await
+            .unwrap();
+        assert!(!truncated);
+        let signature = |hits: Vec<SearchResult>| {
+            hits.into_iter()
+                .map(|hit| {
+                    (
+                        hit.doc_id,
+                        hit.score.to_bits(),
+                        hit.positions
+                            .into_iter()
+                            .map(|(field, positions)| {
+                                (
+                                    field,
+                                    positions
+                                        .into_iter()
+                                        .map(|p| (p.position, p.score.to_bits()))
+                                        .collect::<Vec<_>>(),
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(signature(exact), signature(budgeted), "{query}");
+    }
+}
+
+#[tokio::test]
+async fn ordered_chunked_phrase_is_a_lazy_seekable_document_stream() {
+    use crate::query::{Query, ScorerOptions};
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        writer
+            .add_document(doc(
+                &f,
+                "article",
+                &["alpha beta", "padding", "alpha beta alpha beta"],
+            ))
+            .unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let phrase = PhraseQuery::text(f.content, "alpha beta");
+    let mut scorer = phrase
+        .scorer_with_options(
+            &searcher.segment_readers()[0],
+            1,
+            ScorerOptions::with_positions(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        scorer.precomputed_top_k(1, true).is_none(),
+        "construction must not materialize an all-hit ranked vector"
+    );
+    assert_eq!(scorer.doc(), 0);
+    assert_eq!(
+        scorer.seek(90),
+        90,
+        "a mandatory phrase must expose matches beyond top-k"
+    );
+    assert_eq!(
+        scorer.matched_positions().unwrap()[0]
+            .1
+            .iter()
+            .map(|p| p.position)
+            .collect::<Vec<_>>(),
+        vec![0, 2]
+    );
+    assert_eq!(scorer.seek(80), 90, "seeks cannot move backwards");
+    assert_eq!(scorer.advance(), 91);
+    assert_eq!(
+        scorer.seek(crate::structures::TERMINATED),
+        crate::structures::TERMINATED
+    );
+    assert_eq!(scorer.advance(), crate::structures::TERMINATED);
+    assert_eq!(scorer.score(), 0.0);
+}
+
+#[tokio::test]
 async fn chunked_match_scores_chunks_and_reports_ordinals() {
     let f = chunked_schema();
     let dir = RamDirectory::new();
