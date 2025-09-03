@@ -3,6 +3,10 @@
 Status: opt-in Hermes implementation, 2026-09-05. Search API training and
 activation are separate. Existing retrieval defaults remain unchanged.
 
+**Handoff update:** the user rejected the new inverse lookup maps described
+below. They remain in this branch for review; their removal/replacement is
+unfinished. The Reorder/preparation guidance below is superseded by the
+
 ## Objective and invariants
 
 L0 retrieval cheaply nominates candidates from lexical, sparse, dense/binary,
