@@ -354,6 +354,9 @@ fn validate_query_shape<'a>(
                 )?;
             }
             query::Query::Fusion(fusion) => {
+                if crate::proto::MultiValueCombiner::try_from(fusion.combiner).is_err() {
+                    return Err(Status::invalid_argument("unknown fusion combiner"));
+                }
                 if depth != 1 {
                     return Err(Status::invalid_argument(
                         "FusionQuery is only supported at the top level",
@@ -491,7 +494,6 @@ fn validate_search_request_shape(
                 .validate(&names)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
             if fusion.method != FusionMethod::FusionRrf as i32
-                || !matches!(fusion.combiner, 0 | 1)
                 || fusion.rrf_k != 0.0
                 || fusion.queries.iter().any(|q| q.weight != 0.0)
                 || req.reranker.as_ref().is_some_and(|r| r.rrf_k != 0.0)

@@ -73,7 +73,8 @@ impl Query for BinaryDenseVectorQuery {
         Ok(crate::query::CandidateQuery::new(
             self.field,
             crate::query::candidate_scoring::ScoreComponent::Binary(self.vector.clone()),
-        ))
+        )
+        .with_combiner(self.combiner))
     }
 
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {

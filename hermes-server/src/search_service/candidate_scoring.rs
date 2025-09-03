@@ -64,6 +64,10 @@ pub(super) fn scoring_plan(
         }
     });
     let plan = CandidateScoringPlan {
+        document_combiner: match fusion.combiner {
+            0 => hermes_core::query::MultiValueCombiner::Max,
+            value => crate::converters::convert_fusion_combiner(value),
+        },
         features,
         model: req.l1.as_ref().map(linear_model),
         export_passages,

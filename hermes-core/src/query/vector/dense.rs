@@ -114,7 +114,8 @@ impl Query for DenseVectorQuery {
         Ok(crate::query::CandidateQuery::new(
             self.field,
             crate::query::candidate_scoring::ScoreComponent::Dense(self.vector.clone()),
-        ))
+        )
+        .with_combiner(self.combiner))
     }
 
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {

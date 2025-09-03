@@ -74,7 +74,7 @@ For a candidate passage c of document d:
 ```
 passage_score(d,c) = bias + sum_i w_i * transform_i(raw_chunk_i(d,c))
                           + sum_j v_j * transform_j(raw_document_j(d))
-document_score(d) = max over candidate passages c of passage_score(d,c)
+document_score(d) = fusion.combiner({passage_score(d,c) for nominated c})
 ```
 
 A document-only candidate has an explicit document row, with no invented chunk
@@ -82,7 +82,7 @@ ordinal. Missing feature values have a presence bit and contribute zero; a
 valid nonmatching lexical/sparse feature has score zero and is distinguished
 from an unavailable field. Dense negatives remain valid values. Document
 features are computed once and broadcast as context, not summed repeatedly
-across chunks. Documents with many weak chunks cannot win by chunk count.
+across chunks. The default MAX reduction does not reward chunk count. SUM remains an explicit count-sensitive policy.
 Returned ordinal scores are the same final passage scores used for selection.
 
 Normalization is fixed in the model artifact, never local min/max over the
@@ -91,6 +91,34 @@ signed log1p for unbounded lexical/sparse scores, and a configured affine
 scale; trained parameters are derived from training data only. This permits
 negative raw scores and yields comparable scores across shards. Validate
 finite inputs, scales, weights, transformed values and final reductions.
+
+## Combiners and learned fusion
+
+Combiners retain their existing ownership. A vector query's combiner reduces
+its stored field values to one document feature; a chunk feature is the raw
+score of that ordinal and needs no within-field reduction. Text branches use
+MAX over chunked values, or their one ordinary document value. Backfill evaluates
+all stored values for a document-scoped feature, including present nonmatches
+with zero scores. Retrieval's approximate or limited nomination may have seen
+only a subset of those values; nomination scores are not the backfill contract.
+Boost and SHOULD composition preserve their expression order: boosting a reduced
+document feature differs from reducing negatively boosted passage scores.
+
+L1 combines named features at each passage. The existing `fusion.combiner` then
+reduces those final passage predictions to a document score **before** top-K or
+response passage truncation. Unset/0 retains fusion's existing MAX default;
+MAX, AVG, SUM and normalized WEIGHTED_TOP_K retain their existing meanings and
+parameters. The legacy fusion field cannot distinguish an explicit softmax enum
+zero from unset; its existing MAX interpretation is unchanged. Vector branches
+continue to support parameterized softmax and weighted-top-k normally.
+
+The Search API answer profile chooses MAX because its document teacher is the
+best answer passage. This is a profile choice, not an engine restriction. The
+artifact must bind nomination combiners, document-feature combiners and the
+final document reduction along with the feature queries. Training and serving
+must use the same reductions and the same nominated-passage population. For
+example, average over the exported top three is not average over the complete
+scored union. Raw exports retain all required rows for offline evaluation.
 
 ## Passage nomination and diagnostics
 

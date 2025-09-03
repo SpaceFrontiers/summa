@@ -111,6 +111,7 @@ async fn dense_only_candidate_gets_exact_bm25_phrase_sparse_and_negative_dense_f
         }),
         export_passages: 10,
         all_passages: true,
+        document_combiner: crate::query::MultiValueCombiner::Max,
     };
     let scored = searcher
         .score_candidates(&candidates, &plan, None)
@@ -159,6 +160,97 @@ async fn dense_only_candidate_gets_exact_bm25_phrase_sparse_and_negative_dense_f
         irrelevant.values
     );
     assert_eq!(passage_scores[0].result.score, irrelevant.score);
+
+    // Document feature reduction belongs to the query, while final passage
+    // reduction belongs to fusion. Neither may be replaced with MAX or run
+    // after the response truncates its passage rows.
+    let raw_dense = vec![
+        (0, irrelevant.values[3].unwrap()),
+        (1, matching.values[3].unwrap()),
+    ];
+    for combiner in [
+        MultiValueCombiner::Max,
+        MultiValueCombiner::Avg,
+        MultiValueCombiner::Sum,
+        MultiValueCombiner::LogSumExp { temperature: 0.7 },
+        MultiValueCombiner::WeightedTopK { k: 2, decay: 0.4 },
+    ] {
+        let mut document_plan = plan.clone();
+        document_plan.features = vec![CandidateFeature {
+            name: "dense".into(),
+            scope: ScoreScope::Document,
+            query: DenseVectorQuery::new(dense, vec![1.0, 0.0])
+                .with_combiner(combiner)
+                .candidate_query()
+                .unwrap()
+                .boosted(-2.0)
+                .unwrap(),
+        }];
+        document_plan.model = Some(LinearModel {
+            weights: std::collections::BTreeMap::from([("dense".into(), 1.0)]),
+            ..Default::default()
+        });
+        let actual = searcher
+            .score_candidates(&candidates, &document_plan, None)
+            .await
+            .unwrap();
+        let expected = -2.0 * combiner.combine(&raw_dense);
+        assert!(
+            (actual[0].features.document[0].unwrap() - expected).abs() < 1e-6,
+            "{combiner:?}"
+        );
+        assert!((actual[0].result.score - expected).abs() < 1e-6);
+        assert!(actual[0].features.passages.is_empty());
+
+        let mut passage_plan = plan.clone();
+        passage_plan.model = Some(LinearModel {
+            weights: std::collections::BTreeMap::from([("dense".into(), 1.0)]),
+            bias: -2.0,
+            ..Default::default()
+        });
+        passage_plan.document_combiner = combiner;
+        passage_plan.export_passages = 1;
+        let actual = searcher
+            .score_candidates(&candidates, &passage_plan, None)
+            .await
+            .unwrap();
+        let predicted: Vec<_> = raw_dense
+            .iter()
+            .map(|&(ordinal, score)| (ordinal, score - 2.0))
+            .collect();
+        assert!(
+            (actual[0].result.score - combiner.combine(&predicted)).abs() < 1e-6,
+            "{combiner:?}"
+        );
+        assert_eq!(actual[0].features.scored_passages, 2);
+        assert_eq!(actual[0].features.passages.len(), 1);
+    }
+    let mut composition = plan.clone();
+    composition.features = vec![CandidateFeature {
+        name: "dense".into(),
+        scope: ScoreScope::Document,
+        query: CandidateQuery::sum([
+            DenseVectorQuery::new(dense, vec![1.0, 0.0])
+                .with_combiner(MultiValueCombiner::Max)
+                .candidate_query(),
+            DenseVectorQuery::new(dense, vec![-1.0, 0.0])
+                .with_combiner(MultiValueCombiner::Max)
+                .candidate_query(),
+        ])
+        .unwrap(),
+    }];
+    composition.model = Some(LinearModel {
+        weights: std::collections::BTreeMap::from([("dense".into(), 1.0)]),
+        ..Default::default()
+    });
+    let actual = searcher
+        .score_candidates(&candidates, &composition, None)
+        .await
+        .unwrap();
+    assert!(
+        (actual[0].result.score - (raw_dense[1].1 - raw_dense[0].1)).abs() < 1e-6,
+        "sum of separately reduced vector queries must preserve expression order"
+    );
 
     // A document-only candidate must remain an explicit document row.
     let missing_candidate = crate::query::SearchResult {
@@ -236,6 +328,7 @@ async fn absent_text_in_an_entire_segment_is_missing_not_zero_or_unsupported() {
         }),
         export_passages: 1,
         all_passages: false,
+        document_combiner: crate::query::MultiValueCombiner::Max,
     };
     let scored = searcher
         .score_candidates(&candidates, &plan, None)

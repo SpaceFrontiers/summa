@@ -505,7 +505,8 @@ impl Query for SparseVectorQuery {
                     .map(|info| (info.dim_id, info.weight))
                     .collect(),
             ),
-        ))
+        )
+        .with_combiner(self.combiner))
     }
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         self.scorer_with_options(reader, limit, crate::query::ScorerOptions::with_positions())

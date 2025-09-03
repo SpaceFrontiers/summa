@@ -4,11 +4,11 @@ mod execution;
 mod model;
 pub use model::{FeatureTransform, LinearModel};
 
-use super::{PhraseQuery, QueryDecomposition};
+use super::{MultiValueCombiner, PhraseQuery, QueryDecomposition};
 use crate::{Error, Field, Result};
 
 /// Explicit alignment contract: fields declared Chunk share logical ordinals.
-/// A document feature is reduced once with MAX and broadcast to its passages.
+/// A document feature is reduced by its query and broadcast to its passages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScoreScope {
     Document,
@@ -31,6 +31,62 @@ pub(crate) enum ScoreComponent {
 pub struct CandidateQuery {
     pub(crate) field: Field,
     pub(crate) components: Vec<(ScoreComponent, f32)>,
+    document: DocumentExpression,
+}
+
+/// Keep expression order for document features. In particular MAX(a)+MAX(b)
+/// and -MAX(a) cannot be flattened into MAX(a+b) and MAX(-a).
+#[derive(Clone, Debug)]
+enum DocumentExpression {
+    Component(usize, MultiValueCombiner),
+    Sum(Vec<Self>),
+    Boost(Box<Self>, f32),
+}
+impl DocumentExpression {
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Component(_, combiner) => combiner.validate().map_err(Error::Query),
+            Self::Sum(children) => children.iter().try_for_each(Self::validate),
+            Self::Boost(child, boost) => {
+                if !boost.is_finite() {
+                    return Err(Error::Query("L1 query boost must be finite".into()));
+                }
+                child.validate()
+            }
+        }
+    }
+    fn rebase(&mut self, offset: usize) {
+        match self {
+            Self::Component(index, _) => *index += offset,
+            Self::Sum(children) => children.iter_mut().for_each(|child| child.rebase(offset)),
+            Self::Boost(child, _) => child.rebase(offset),
+        }
+    }
+    fn score(&self, components: &[Vec<f32>], locations: &[(u32, usize)]) -> Result<f32> {
+        let value = match self {
+            Self::Component(index, combiner) => {
+                let values: Vec<_> = locations
+                    .iter()
+                    .map(|&(ordinal, position)| (ordinal, components[*index][position]))
+                    .collect();
+                combiner.combine(&values)
+            }
+            Self::Sum(children) => {
+                let mut value = 0.0;
+                for child in children {
+                    value += child.score(components, locations)?;
+                }
+                value
+            }
+            Self::Boost(child, boost) => child.score(components, locations)? * boost,
+        };
+        if !value.is_finite() {
+            return Err(Error::Query(
+                "L1 document feature reduction overflow".into(),
+            ));
+        }
+        Ok(value)
+    }
 }
 impl CandidateQuery {
     pub fn field(&self) -> Field {
@@ -40,7 +96,12 @@ impl CandidateQuery {
         Self {
             field,
             components: vec![(component, 1.0)],
+            document: DocumentExpression::Component(0, MultiValueCombiner::Max),
         }
+    }
+    pub(crate) fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
+        self.document = DocumentExpression::Component(0, combiner);
+        self
     }
     pub(crate) fn from_decomposition(decomposition: QueryDecomposition) -> Result<Self> {
         match decomposition {
@@ -48,12 +109,15 @@ impl CandidateQuery {
             QueryDecomposition::SparseTerms(infos) if !infos.is_empty() => {
                 let field = infos[0].field;
                 if infos.iter().any(|info| info.field != field) { return Err(Error::Query("L1 branch mixes sparse fields".into())); }
-                Ok(Self::new(field, ScoreComponent::Sparse(infos.into_iter().map(|info| (info.dim_id, info.weight)).collect())))
+                let combiner = infos[0].combiner;
+                if infos.iter().any(|info| info.combiner != combiner) { return Err(Error::Query("L1 sparse composition mixes document combiners".into())); }
+                Ok(Self::new(field, ScoreComponent::Sparse(infos.into_iter().map(|info| (info.dim_id, info.weight)).collect())).with_combiner(combiner))
             }
             _ => Err(Error::Query("query cannot be backfilled as an L1 score; use text/phrase/vector scoring branches and the common fusion filter for eligibility".into())),
         }
     }
     pub(crate) fn boosted(mut self, weight: f32) -> Result<Self> {
+        self.document = DocumentExpression::Boost(Box::new(self.document), weight);
         for (_, boost) in &mut self.components {
             *boost *= weight;
             if !boost.is_finite() {
@@ -65,12 +129,22 @@ impl CandidateQuery {
     pub(crate) fn sum(queries: impl IntoIterator<Item = Result<Self>>) -> Result<Self> {
         let mut result: Option<Self> = None;
         for query in queries {
-            let query = query?;
+            let mut query = query?;
             if let Some(current) = &mut result {
                 if current.field != query.field {
                     return Err(Error::Query("L1 scoring branch must use one field; name separate branches for separate fields".into()));
                 }
+                query.document.rebase(current.components.len());
                 current.components.extend(query.components);
+                let previous =
+                    std::mem::replace(&mut current.document, DocumentExpression::Sum(Vec::new()));
+                current.document = match previous {
+                    DocumentExpression::Sum(mut children) => {
+                        children.push(query.document);
+                        DocumentExpression::Sum(children)
+                    }
+                    previous => DocumentExpression::Sum(vec![previous, query.document]),
+                };
             } else {
                 result = Some(query);
             }
@@ -110,6 +184,8 @@ pub struct CandidateScoringPlan {
     /// Diagnostics may request every stored passage. Search normally scores
     /// only the union of nominated passage ordinals, plus document context.
     pub all_passages: bool,
+    /// Reduce all final passage predictions before export truncation/top-K.
+    pub document_combiner: MultiValueCombiner,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

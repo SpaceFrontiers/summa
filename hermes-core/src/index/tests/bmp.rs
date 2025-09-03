@@ -1852,6 +1852,7 @@ async fn test_bmp_reorder_multi_field() {
             }),
             export_passages: 1,
             all_passages: true,
+            document_combiner: crate::query::MultiValueCombiner::Max,
         };
         let backfilled = searcher
             .score_candidates(&results, &plan, None)

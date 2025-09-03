@@ -12,6 +12,7 @@ const MAX_VECTOR_BYTES: usize = 1024 * 1024 * 1024;
 
 impl CandidateScoringPlan {
     pub fn validate(&self, schema: &crate::Schema) -> Result<()> {
+        self.document_combiner.validate().map_err(Error::Query)?;
         if self.features.is_empty()
             || self.features.len() > MAX_FEATURES
             || self.export_passages == 0
@@ -21,6 +22,7 @@ impl CandidateScoringPlan {
         }
         let mut names = BTreeSet::new();
         for feature in &self.features {
+            feature.query.document.validate()?;
             if feature.name.is_empty()
                 || feature.name.len() > 128
                 || !feature
@@ -137,8 +139,10 @@ async fn score_field<D: Directory + 'static>(
     query: &CandidateQuery,
     targets: &[u32],
     stats: &Arc<GlobalStats>,
-) -> Result<Vec<f32>> {
+    document_scope: bool,
+) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
     let mut result = vec![0.0; targets.len()];
+    let mut components = Vec::new();
     for (component, boost) in &query.components {
         let values = match component {
             ScoreComponent::Text(terms) => {
@@ -197,14 +201,17 @@ async fn score_field<D: Directory + 'static>(
                 .await?
             }
         };
-        for (total, value) in result.iter_mut().zip(values) {
+        for (total, value) in result.iter_mut().zip(&values) {
             *total += value * boost;
             if !total.is_finite() {
                 return Err(Error::Query("L1 feature score overflow".into()));
             }
         }
+        if document_scope {
+            components.push(values);
+        }
     }
-    Ok(result)
+    Ok((result, components))
 }
 
 impl<D: Directory + 'static> Searcher<D> {
@@ -302,6 +309,12 @@ impl<D: Directory + 'static> Searcher<D> {
                 .iter()
                 .map(|&i| candidates[i].doc_id)
                 .collect();
+            matrix_values = matrix_values
+                .checked_add(documents.len().saturating_mul(count))
+                .ok_or_else(|| Error::Query("L1 feature matrix size overflow".into()))?;
+            if matrix_values > MAX_FEATURE_VALUES {
+                return Err(Error::Query("L1 feature matrix budget exceeded".into()));
+            }
             let mut doc_values = vec![vec![None; count]; documents.len()];
             let mut passages: BTreeMap<(u32, u16), Vec<Option<f32>>> = BTreeMap::new();
             let chunk_fields: BTreeSet<u32> = plan
@@ -376,15 +389,37 @@ impl<D: Directory + 'static> Searcher<D> {
                 locations.sort_unstable_by_key(|location| location.physical);
                 let targets: Vec<u32> =
                     locations.iter().map(|location| location.physical).collect();
-                let scores = score_field(self, reader, &feature.query, &targets, &stats).await?;
-                for (location, score) in locations.into_iter().zip(scores) {
-                    if feature.scope == ScoreScope::Document {
+                let document_scope = feature.scope == ScoreScope::Document;
+                let (scores, components) = score_field(
+                    self,
+                    reader,
+                    &feature.query,
+                    &targets,
+                    &stats,
+                    document_scope,
+                )
+                .await?;
+                if document_scope {
+                    let mut groups: BTreeMap<u32, Vec<(u32, usize)>> = BTreeMap::new();
+                    for (position, location) in locations.iter().enumerate() {
+                        groups
+                            .entry(location.doc)
+                            .or_default()
+                            .push((u32::from(location.ordinal), position));
+                    }
+                    for (doc, mut locations) in groups {
+                        // Physical reordering must not alter floating-point reductions.
+                        locations.sort_unstable_by_key(|&(ordinal, _)| ordinal);
                         let doc_index = documents
-                            .binary_search(&location.doc)
+                            .binary_search(&doc)
                             .expect("resolved selected doc");
-                        let value: &mut Option<f32> = &mut doc_values[doc_index][feature_index];
-                        *value = Some(value.map_or(score, |v| v.max(score)));
-                    } else {
+                        doc_values[doc_index][feature_index] =
+                            Some(feature.query.document.score(&components, &locations)?);
+                    }
+                    continue;
+                }
+                for (location, score) in locations.into_iter().zip(scores) {
+                    {
                         let values = match passages.entry((location.doc, location.ordinal)) {
                             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -426,6 +461,21 @@ impl<D: Directory + 'static> Searcher<D> {
                     });
                 }
                 let scored_passages = rows.len();
+                let mut result = candidate.clone();
+                if let Some(model) = &plan.model {
+                    result.score = if rows.is_empty() {
+                        model.score(&names, &document)?
+                    } else {
+                        let values: Vec<_> = rows
+                            .iter()
+                            .map(|row| (u32::from(row.ordinal), row.score))
+                            .collect();
+                        plan.document_combiner.combine(&values)
+                    };
+                    if !result.score.is_finite() {
+                        return Err(Error::Query("L1 document score reduction overflow".into()));
+                    }
+                }
                 if plan.model.is_none() && rows.len() > plan.export_passages {
                     return Err(Error::Query(format!(
                         "feature export would omit {} passages of document {}; increase export_passages or supply l1",
@@ -438,13 +488,6 @@ impl<D: Directory + 'static> Searcher<D> {
                         .total_cmp(&a.score)
                         .then_with(|| a.ordinal.cmp(&b.ordinal))
                 });
-                let mut result = candidate.clone();
-                if let Some(model) = &plan.model {
-                    result.score = match rows.first() {
-                        Some(row) => row.score,
-                        None => model.score(&names, &document)?,
-                    };
-                }
                 rows.truncate(plan.export_passages);
                 // A document-only feature never creates an ordinal-zero row.
                 if plan.model.is_some() {

@@ -680,6 +680,30 @@ fn l1_missing_coefficients_are_zero_but_ambiguous_branches_and_rank_fusion_optio
     assert!(validate_search_budget(&bad, &limits()).is_err());
 }
 
+#[test]
+fn l1_keeps_existing_fusion_combiners_and_rejects_unknown_values() {
+    for combiner in 0..=4 {
+        let mut request = named_l1_request();
+        let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut()
+        else {
+            unreachable!()
+        };
+        fusion.combiner = combiner;
+        validate_search_budget(&request, &limits()).unwrap();
+    }
+    let mut request = named_l1_request();
+    let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut() else {
+        unreachable!()
+    };
+    fusion.combiner = 900;
+    assert!(
+        validate_search_budget(&request, &limits())
+            .unwrap_err()
+            .message()
+            .contains("unknown fusion combiner")
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases() {
     let temp = tempfile::tempdir().unwrap();
