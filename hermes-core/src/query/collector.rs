@@ -752,12 +752,31 @@ pub async fn collect_segment_with_limit_seeded<C: Collector>(
 
 /// Drive a scorer through a collector (shared by async and sync paths).
 fn drive_scorer<C: Collector>(scorer: &mut dyn super::Scorer, collector: &mut C) {
+    drive_scorer_budgeted(scorer, collector, None);
+}
+
+fn drive_scorer_budgeted<C: Collector>(
+    scorer: &mut dyn super::Scorer,
+    collector: &mut C,
+    budget: Option<&super::SharedThreshold>,
+) {
     let needs_positions = collector.needs_positions();
     let mut doc = scorer.doc();
     while doc != TERMINATED {
+        // Check after advance/seek too: an expired negative verifier must
+        // never turn an incomplete exclusion check into a collected hit.
+        if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
+            break;
+        }
         let score = scorer.score();
+        if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
+            break;
+        }
         if needs_positions && collector.would_collect(doc, score) {
             let positions = scorer.matched_positions().unwrap_or_default();
+            if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
+                break;
+            }
             collector.collect_owned(doc, score, positions);
         } else {
             collector.collect(doc, score, &[]);
@@ -892,7 +911,7 @@ pub(crate) fn search_segment_shared_sync_planned(
     let options = super::ScorerOptions {
         collect_positions,
         initial_threshold: shared_threshold.get(),
-        shared_threshold: Some(shared_threshold),
+        shared_threshold: Some(shared_threshold.clone()),
         lsp_plan,
         global_stats,
     };
@@ -901,6 +920,7 @@ pub(crate) fn search_segment_shared_sync_planned(
         scorer.as_mut(),
         segment_limit,
         collect_positions,
+        Some(&shared_threshold),
     ))
 }
 
@@ -913,6 +933,7 @@ fn top_k_from_scorer(
     scorer: &mut dyn super::Scorer,
     segment_limit: usize,
     collect_positions: bool,
+    budget: Option<&super::SharedThreshold>,
 ) -> (Vec<SearchResult>, u32) {
     if let Some(ranked) = scorer.precomputed_top_k(segment_limit, collect_positions) {
         return ranked;
@@ -922,7 +943,7 @@ fn top_k_from_scorer(
     } else {
         TopKCollector::new(segment_limit)
     };
-    drive_scorer(scorer, &mut collector);
+    drive_scorer_budgeted(scorer, &mut collector, budget);
     collector.into_results_with_count()
 }
 
@@ -985,7 +1006,7 @@ pub(crate) async fn search_segment_shared_planned(
     let options = super::ScorerOptions {
         collect_positions,
         initial_threshold: shared_threshold.get(),
-        shared_threshold: Some(shared_threshold),
+        shared_threshold: Some(shared_threshold.clone()),
         lsp_plan,
         global_stats,
     };
@@ -996,6 +1017,7 @@ pub(crate) async fn search_segment_shared_planned(
         scorer.as_mut(),
         segment_limit,
         collect_positions,
+        Some(&shared_threshold),
     ))
 }
 

@@ -120,7 +120,7 @@ pub(super) fn finish_text_maxscore<'a>(
     }
     executor = executor.with_budget(budget.cloned());
     // An approximate pass neither consumes nor publishes the exact floor.
-    let exact = heap_factor <= 1.0;
+    let exact = heap_factor == 1.0;
     let initial = shared_threshold.get();
     if initial > 0.0 && proximity.is_none() && exact {
         executor.seed_threshold(initial);
@@ -658,7 +658,11 @@ pub(super) fn build_combined_bitset(
     must: &[std::sync::Arc<dyn super::Query>],
     must_not: &[std::sync::Arc<dyn super::Query>],
     reader: &crate::segment::SegmentReader,
+    options: &super::ScorerOptions,
 ) -> Option<super::DocBitset> {
+    if options.stop_if_expired() {
+        return None;
+    }
     if must.is_empty() && must_not.is_empty() {
         return None;
     }
@@ -688,7 +692,7 @@ pub(super) fn build_combined_bitset(
         match result {
             None => {
                 // Seed: materialize the narrowest clause.
-                let bs = q.as_doc_bitset(reader)?;
+                let bs = options.doc_bitset(q.as_ref(), reader)?;
                 acc_count = bs.count() as u64;
                 result = Some(bs);
             }
@@ -701,7 +705,7 @@ pub(super) fn build_combined_bitset(
                     probed = true;
                 }
                 if !probed {
-                    let bs = q.as_doc_bitset(reader)?;
+                    let bs = options.doc_bitset(q.as_ref(), reader)?;
                     acc.intersect_with(&bs);
                 }
                 acc_count = acc.count() as u64;
@@ -725,7 +729,7 @@ pub(super) fn build_combined_bitset(
         match result {
             None => {
                 // No MUST clauses — start with all-ones, then subtract
-                let bs = q.as_doc_bitset(reader)?;
+                let bs = options.doc_bitset(q.as_ref(), reader)?;
                 let mut all = super::DocBitset::new(num_docs);
                 all.bits.fill(u64::MAX);
                 // Clear bits beyond num_docs
@@ -750,7 +754,7 @@ pub(super) fn build_combined_bitset(
                     probed = true;
                 }
                 if !probed {
-                    let bs = q.as_doc_bitset(reader)?;
+                    let bs = options.doc_bitset(q.as_ref(), reader)?;
                     acc.subtract(&bs);
                 }
                 acc_count = acc.count() as u64;
@@ -758,7 +762,11 @@ pub(super) fn build_combined_bitset(
         }
     }
 
-    result
+    if options.stop_if_expired() {
+        None
+    } else {
+        result
+    }
 }
 
 // ── Result scorers ───────────────────────────────────────────────────────

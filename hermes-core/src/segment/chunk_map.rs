@@ -19,8 +19,8 @@
 //! Virtual ids are assigned in indexing order, and documents are indexed in
 //! doc-id order, so `doc_ids` starts out non-decreasing. A reorder pass on a
 //! field with the `reorder` attribute permutes the virtual ids (BP over the
-//! field's postings, `segment/text_reorder.rs`); no query path depends on the
-//! order. Merges concatenate sections and add the document offset to
+//! field's postings, `segment/text_reorder.rs`). Readers verify doc-id order
+//! at open before enabling ordered query paths. Merges concatenate sections and add the document offset to
 //! `doc_ids`; ordinals and lengths are copied verbatim.
 //!
 //! A doc-length section stores the token count of the field in every
@@ -238,6 +238,8 @@ pub struct ChunkMap {
     /// this segment. BM25 floors every chunk length at this value so a short
     /// tail chunk is not rewarded for being short (`docs/chunked-bm25.md`).
     length_floor: u32,
+    /// Derived once at open; never persisted or assumed from schema flags.
+    doc_ids_monotonic: bool,
 }
 
 /// 90th-percentile of a little-endian `u16` length column (0 when empty).
@@ -263,6 +265,26 @@ fn nominal_chunk_length(lengths: &[u8]) -> u32 {
 }
 
 impl ChunkMap {
+    pub(crate) fn is_doc_ordered(&self) -> bool {
+        self.doc_ids_monotonic
+    }
+
+    /// First virtual id owned by a document at or after `target`.
+    /// Only valid for a verified doc-ordered map; num_chunks means exhausted.
+    pub(crate) fn lower_bound_doc(&self, target: DocId) -> u32 {
+        debug_assert!(self.is_doc_ordered());
+        let (mut lo, mut hi) = (0, self.num_chunks);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.doc_id(mid) < target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     /// Number of chunks (virtual ids) in this segment.
     #[inline]
     pub fn num_chunks(&self) -> u32 {
@@ -415,6 +437,11 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                 let ordinals = bytes.slice(offset + n * 4..offset + n * 6);
                 let lengths = bytes.slice(offset + n * 6..end);
                 let length_floor = nominal_chunk_length(lengths.as_slice());
+                let doc_ids_monotonic = doc_ids
+                    .as_slice()
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .is_sorted();
                 file.chunk_maps.insert(
                     field_id,
                     ChunkMap {
@@ -424,6 +451,7 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                         num_chunks: count,
                         total_tokens,
                         length_floor,
+                        doc_ids_monotonic,
                     },
                 );
             }

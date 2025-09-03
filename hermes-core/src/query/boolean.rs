@@ -28,8 +28,8 @@ pub struct BooleanQuery {
     /// Proximity rescoring of the text MaxScore result (SHOULD terms in
     /// query order); `None` = off.
     proximity: Option<super::ProximityConfig>,
-    /// Approximate text MaxScore: threshold scaled by `1 / heap_factor`
-    /// (> 1 prunes beyond rank safety). 1.0 = exact.
+    /// Approximate text MaxScore: threshold divided by `heap_factor`
+    /// (< 1 prunes beyond rank safety, like sparse). 1.0 = exact.
     text_heap_factor: f32,
     /// Keep only the rarest `max_terms` SHOULD text terms of a field group
     /// (0 = all): long-query cap.
@@ -84,7 +84,7 @@ impl std::fmt::Display for BooleanQuery {
         if let Some(proximity) = &self.proximity {
             write!(f, " ~proximity({}, {})", proximity.weight, proximity.window)?;
         }
-        if self.text_heap_factor > 1.0 {
+        if self.text_heap_factor < 1.0 {
             write!(f, " ~heap({})", self.text_heap_factor)?;
         }
         if self.max_terms > 0 {
@@ -142,10 +142,12 @@ impl BooleanQuery {
         self
     }
 
-    /// Approximate text MaxScore (threshold × `1 / heap_factor`); values
-    /// at or below 1 keep the exact, rank-safe traversal.
+    /// Approximate text MaxScore (threshold / `heap_factor`), like sparse.
+    /// 1 is exact; [0, 1) prunes more aggressively, with an effective 0.01
+    /// floor. Non-finite values and values outside [0, 1] fail construction
+    /// of the scorer. RPC zero/unset is normalized to 1 by the adapter.
     pub fn with_text_heap_factor(mut self, heap_factor: f32) -> Self {
-        self.text_heap_factor = if heap_factor > 1.0 { heap_factor } else { 1.0 };
+        self.text_heap_factor = heap_factor;
         self
     }
 
@@ -224,6 +226,14 @@ macro_rules! boolean_plan {
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
         let scorer_options: super::ScorerOptions = $scorer_options;
+        if !$text_tuning.0.is_finite() || !(0.0..=1.0).contains(&$text_tuning.0) {
+            return Err(crate::Error::Query(
+                "Text heap_factor must be finite and between 0 and 1".into(),
+            ));
+        }
+        if scorer_options.stop_if_expired() {
+            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+        }
 
         // Cap SHOULD clauses to MAX_QUERY_TERMS, but only count queries that need
         // posting-list cursors. Fast-field predicates (O(1) per doc) are exempt.
@@ -272,13 +282,14 @@ macro_rules! boolean_plan {
             if must.len() == 1 && should.is_empty() {
                 return must[0].$scorer_fn(reader, limit, scorer_options) $(.  $aw)* ;
             }
-            if should.len() == 1 && must.is_empty() {
+            if should.len() == 1 && must.is_empty() && $text_tuning.0 == 1.0 {
                 return should[0].$scorer_fn(reader, limit, scorer_options) $(. $aw)* ;
             }
         }
 
         // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
-        if must.is_empty() && must_not.is_empty() && should.len() >= 2 {
+        if must.is_empty() && must_not.is_empty()
+            && (should.len() >= 2 || (should.len() == 1 && $text_tuning.0 < 1.0)) {
             // 2a. Text MaxScore (single-field, all term queries)
             if let Some((mut infos, text_field, avg_field_len, num_docs)) =
                 prepare_text_maxscore(should, reader, global_stats)
@@ -459,7 +470,7 @@ macro_rules! boolean_plan {
                     || (!matches!(
                         query.decompose(),
                         super::QueryDecomposition::TextTerm(_)
-                    ) && query.as_doc_bitset(reader).is_some())
+                    ) && scorer_options.doc_bitset(query.as_ref(), reader).is_some())
             })
                 && let Some(groups) = text_groups
                 && (groups.len() == 1
@@ -467,8 +478,11 @@ macro_rules! boolean_plan {
                         && groups
                             .iter()
                             .all(|(field, _)| !reader.is_chunked_field(*field))))
-                && let Some(bitset) = build_combined_bitset(must, must_not, reader)
+                && let Some(bitset) = build_combined_bitset(must, must_not, reader, &scorer_options)
             {
+                if scorer_options.stop_if_expired() {
+                    return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+                }
                 let bitset = std::sync::Arc::new(bitset);
                 let single_field = groups.len() == 1;
 
@@ -526,7 +540,7 @@ macro_rules! boolean_plan {
                     .with_metric_labels(reader.schema().index_label(), "<multiple>")
                     .with_predicate(predicate)
                     .with_budget(scorer_options.shared_threshold.clone());
-                    if $text_tuning.0 <= 1.0 && scorer_options.initial_threshold > 0.0 {
+                    if $text_tuning.0 == 1.0 && scorer_options.initial_threshold > 0.0 {
                         executor.seed_threshold(scorer_options.initial_threshold);
                     }
                     let results = executor.execute_sync()?;
@@ -651,7 +665,7 @@ macro_rules! boolean_plan {
                     log::debug!("BooleanQuery planner 3a: MUST clause → predicate ({})", q);
                     predicates.push(pred);
                 } else if bitset_predicates_allowed {
-                    if let Some(bitset) = q.as_doc_bitset(reader) {
+                    if let Some(bitset) = scorer_options.doc_bitset(q.as_ref(), reader) {
                         log::debug!("BooleanQuery planner 3a: MUST clause → bitset predicate ({})", q);
                         predicates.push(Box::new(move |doc_id| bitset.contains(doc_id)));
                     } else {
@@ -675,7 +689,7 @@ macro_rules! boolean_plan {
                         Box::new(move |doc_id| !pred(doc_id));
                     predicates.push(negated);
                 } else if bitset_predicates_allowed {
-                    if let Some(bitset) = q.as_doc_bitset(reader) {
+                    if let Some(bitset) = scorer_options.doc_bitset(q.as_ref(), reader) {
                         log::debug!("BooleanQuery planner 3a: MUST_NOT clause → bitset predicate ({})", q);
                         predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
                     } else {
@@ -691,6 +705,9 @@ macro_rules! boolean_plan {
             }
 
             // 3b. Fast path: pure predicates + sparse SHOULD → BMP or MaxScore w/ predicate
+            if scorer_options.stop_if_expired() {
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+            }
             if must_verifiers.is_empty()
                 && must_not_verifiers.is_empty()
                 && !predicates.is_empty()
@@ -700,7 +717,10 @@ macro_rules! boolean_plan {
                 if let Some(infos) = sparse_infos {
                     // Try BMP with bitset first: build compact bitset from MUST/MUST_NOT
                     // posting lists (O(M) for term queries) for fast per-slot lookup.
-                    let bitset_result = build_combined_bitset(must, must_not, reader);
+                    let bitset_result = build_combined_bitset(must, must_not, reader, &scorer_options);
+                    if scorer_options.stop_if_expired() {
+                        return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+                    }
                     if let Some(ref bitset) = bitset_result {
                         let bitset_pred = |doc_id: crate::DocId| bitset.contains(doc_id);
                         if let Some((raw, info)) =
@@ -748,7 +768,7 @@ macro_rules! boolean_plan {
                     for q in must {
                         if let Some(pred) = q.as_doc_predicate(reader) {
                             predicates.push(pred);
-                        } else if let Some(bitset) = q.as_doc_bitset(reader) {
+                        } else if let Some(bitset) = scorer_options.doc_bitset(q.as_ref(), reader) {
                             predicates.push(Box::new(move |doc_id| bitset.contains(doc_id)));
                         }
                     }
@@ -757,7 +777,7 @@ macro_rules! boolean_plan {
                             let negated: super::DocPredicate<'_> =
                                 Box::new(move |doc_id| !pred(doc_id));
                             predicates.push(negated);
-                        } else if let Some(bitset) = q.as_doc_bitset(reader) {
+                        } else if let Some(bitset) = scorer_options.doc_bitset(q.as_ref(), reader) {
                             predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
                         }
                     }
@@ -994,7 +1014,13 @@ impl Query for BooleanQuery {
     }
 
     fn should_children(&self) -> Option<&[Arc<dyn Query>]> {
-        if self.must.is_empty() && self.must_not.is_empty() && !self.should.is_empty() {
+        if self.must.is_empty()
+            && self.must_not.is_empty()
+            && !self.should.is_empty()
+            && self.proximity.is_none()
+            && self.text_heap_factor == 1.0
+            && self.max_terms == 0
+        {
             Some(&self.should)
         } else {
             None
@@ -1002,6 +1028,17 @@ impl Query for BooleanQuery {
     }
 
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
+        self.as_doc_bitset_with_options(reader, &super::ScorerOptions::default())
+    }
+
+    fn as_doc_bitset_with_options(
+        &self,
+        reader: &SegmentReader,
+        options: &super::ScorerOptions,
+    ) -> Option<super::DocBitset> {
+        if options.stop_if_expired() {
+            return None;
+        }
         if self.must.is_empty() && self.should.is_empty() {
             return None;
         }
@@ -1011,7 +1048,7 @@ impl Query for BooleanQuery {
         // MUST clauses: intersect bitsets (AND)
         let mut result: Option<super::DocBitset> = None;
         for q in &self.must {
-            let bs = q.as_doc_bitset(reader)?;
+            let bs = options.doc_bitset(q.as_ref(), reader)?;
             match result {
                 None => result = Some(bs),
                 Some(ref mut acc) => acc.intersect_with(&bs),
@@ -1022,7 +1059,7 @@ impl Query for BooleanQuery {
         if !self.should.is_empty() {
             let mut should_union = super::DocBitset::new(num_docs);
             for q in &self.should {
-                let bs = q.as_doc_bitset(reader)?;
+                let bs = options.doc_bitset(q.as_ref(), reader)?;
                 should_union.union_with(&bs);
             }
             match result {
@@ -1041,13 +1078,17 @@ impl Query for BooleanQuery {
         if let Some(ref mut acc) = result {
             for q in &self.must_not {
                 {
-                    let bs = q.as_doc_bitset(reader)?;
+                    let bs = options.doc_bitset(q.as_ref(), reader)?;
                     acc.subtract(&bs);
                 }
             }
         }
 
-        result
+        if options.stop_if_expired() {
+            None
+        } else {
+            result
+        }
     }
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {

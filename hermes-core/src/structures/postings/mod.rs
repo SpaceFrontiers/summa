@@ -46,6 +46,7 @@ pub use positions::{
     MAX_ELEMENT_ORDINAL, MAX_TOKEN_POSITION, PositionPostingIterator, PositionPostingList,
     PostingWithPositions, decode_element_ordinal, decode_token_position, encode_position,
 };
+pub(crate) use positions_v2::TermPositionCursor;
 pub use positions_v2::{
     POSITION_STREAM_BLOCK, PositionStream, PositionStreamEncoder, TermPositions,
 };

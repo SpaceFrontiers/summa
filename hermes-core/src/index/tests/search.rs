@@ -1277,7 +1277,7 @@ async fn text_maxscore_honours_max_terms_and_heap_factor() {
         .should(TermQuery::text(body, "rare"));
     let exact = ids(index.search(&full, 30).await.unwrap());
     let approx = ids(index
-        .search(&full.clone().with_text_heap_factor(1.5), 30)
+        .search(&full.clone().with_text_heap_factor(0.6), 30)
         .await
         .unwrap());
     assert!(!approx.is_empty());
@@ -1347,7 +1347,10 @@ async fn text_maxscore_stops_at_the_deadline() {
         .unwrap();
     assert!(truncated, "an expired deadline must flag the response");
     assert!(partial.len() <= 10);
-    assert!(!partial.is_empty(), "best-so-far results are returned");
+    assert!(
+        partial.is_empty(),
+        "an already-expired query must not start scoring"
+    );
     // Best-so-far stays a valid ranking: scores are exact and descending.
     assert!(partial.windows(2).all(|w| w[0].score >= w[1].score));
 }

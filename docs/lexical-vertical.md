@@ -244,10 +244,12 @@ Metadata format version 6 is a clean rebuild boundary for this layout.
 - **Phrase as a scoring clause.** Still open: a `PhraseQuery` in SHOULD is a
   verifier; its block bound would be the minimum of its terms' bounds.
 - **Approximate and anytime modes** (implemented 2026-09-03).
-  `MatchQuery.heap_factor` (> 1) reuses the sparse threshold scaling for the
+  `MatchQuery.heap_factor` (0 < factor < 1) uses the sparse threshold scaling for the
   text executors: the collector's floor is divided by the factor, so
   candidates that cannot beat `threshold / heap_factor` are skipped and the
-  result is a subset of the exact top-k with exact scores. An approximate
+  retained candidates have exact scores, but exact top-k recall is not guaranteed.
+  Zero/unset or 1 selects exact search; non-finite, negative and >1 RPC values
+  are rejected (contract unified on 2026-09-05, without legacy translation). An approximate
   pass neither seeds from nor publishes to the segment-shared threshold, so
   it can never lower an exact clause's floor. `SearchRequest.time_budget_ms`
   is the anytime knob: the deadline travels on `SharedThreshold`, every text

@@ -60,10 +60,30 @@ impl ScorerOptions {
         Self {
             collect_positions: self.collect_positions,
             initial_threshold: 0.0,
-            shared_threshold: None,
+            shared_threshold: self
+                .shared_threshold
+                .as_ref()
+                .filter(|shared| shared.deadline().is_some())
+                .map(super::SharedThreshold::budget_only),
             lsp_plan: None,
             global_stats: self.global_stats.clone(),
         }
+    }
+
+    pub(crate) fn stop_if_expired(&self) -> bool {
+        self.shared_threshold
+            .as_ref()
+            .is_some_and(super::SharedThreshold::stop_if_expired)
+    }
+
+    /// Materialization uses the same budget as scoring. Implementations must
+    /// never return a partial bitset (especially for MUST_NOT).
+    pub(crate) fn doc_bitset(
+        &self,
+        query: &dyn Query,
+        reader: &SegmentReader,
+    ) -> Option<DocBitset> {
+        query.as_doc_bitset_with_options(reader, self)
     }
 }
 
@@ -357,6 +377,15 @@ macro_rules! define_query_traits {
                 None
             }
 
+            /// Budget-aware materialization. `None` means unsupported or
+            /// cancelled; cancellation must flag the shared budget, and a
+            /// partial bitset must never escape as a complete filter.
+            fn as_doc_bitset_with_options(&self, reader: &SegmentReader, options: &ScorerOptions) -> Option<DocBitset> {
+                if options.stop_if_expired() { return None; }
+                let bitset = self.as_doc_bitset(reader);
+                if options.stop_if_expired() { None } else { bitset }
+            }
+
             /// Cheap estimate of how many docs this filter clause matches in
             /// the segment. Used by the boolean planner to order MUST/MUST_NOT
             /// evaluation: the narrowest clause is materialized first and wider
@@ -418,6 +447,13 @@ define_query_traits!(Send + Sync);
 define_query_traits!();
 
 impl Query for Box<dyn Query> {
+    fn as_doc_bitset_with_options(
+        &self,
+        reader: &SegmentReader,
+        options: &ScorerOptions,
+    ) -> Option<DocBitset> {
+        (**self).as_doc_bitset_with_options(reader, options)
+    }
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         (**self).scorer(reader, limit)
     }
