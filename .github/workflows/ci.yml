@@ -77,6 +77,11 @@ jobs:
       - name: Hermes Core native-without-sync boundary
         run: cargo check -p hermes-core --no-default-features --features native --all-targets
 
+      - name: Broker minimal-core boundary
+        # Workspace feature unification enables native writers; the broker
+        # alone only needs portable scoring and must compile independently.
+        run: cargo check --locked -p hermes-broker --all-targets
+
       - name: CUDA training compile boundary
         run: cargo check -p hermes-train --features cuda --all-targets
 
