@@ -1437,6 +1437,143 @@ impl<D: Directory + 'static> Searcher<D> {
         Ok((fused, total_seen))
     }
 
+    /// Retrieve independent branches and retain the complete bounded document
+    /// union. No rank fusion or cross-branch top-k runs before feature scoring.
+    pub async fn search_candidate_union(
+        &self,
+        queries: &[Arc<dyn crate::query::Query>],
+        depth: usize,
+        stats: Arc<crate::query::GlobalStats>,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32)> {
+        let lists = self
+            .search_candidate_lists(queries, depth, Some(stats))
+            .await?;
+        let total_seen = lists
+            .iter()
+            .fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
+        let union = self.merge_candidate_lists(lists.into_iter().map(|(list, _)| list))?;
+        Ok((union, total_seen))
+    }
+
+    /// Independent nominated lists for coordinator-side global fusion.
+    /// This uses the same bounded parallel retrieval as candidate backfill.
+    pub async fn search_candidate_lists(
+        &self,
+        queries: &[Arc<dyn crate::query::Query>],
+        depth: usize,
+        stats: Option<Arc<crate::query::GlobalStats>>,
+    ) -> Result<Vec<(Vec<crate::query::SearchResult>, u32)>> {
+        if queries.is_empty()
+            || queries.len() > crate::query::MAX_FUSION_SUB_QUERIES
+            || depth == 0
+            || depth
+                .checked_mul(queries.len())
+                .is_none_or(|slots| slots > crate::query::MAX_FUSION_CANDIDATE_SLOTS)
+        {
+            return Err(crate::Error::Query(
+                "invalid candidate union branch/depth budget".into(),
+            ));
+        }
+        #[cfg(feature = "sync")]
+        let lists = if !self.segments.is_empty()
+            && tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread
+        {
+            use rayon::prelude::*;
+            tokio::task::block_in_place(|| {
+                self.install_search_cpu(|| {
+                    queries
+                        .par_iter()
+                        .map(|query| {
+                            let (results, seen, _) = self.search_internal_sync_budgeted(
+                                query.as_ref(),
+                                depth,
+                                0,
+                                true,
+                                None,
+                                stats.clone(),
+                            )?;
+                            Ok((results, seen))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+            })?
+        } else {
+            self.search_candidate_branches_async(queries, depth, stats)
+                .await?
+        };
+        #[cfg(not(feature = "sync"))]
+        let lists = self
+            .search_candidate_branches_async(queries, depth, stats)
+            .await?;
+        Ok(lists)
+    }
+
+    pub fn merge_candidate_lists<
+        T: Into<crate::query::SearchResult> + std::borrow::Borrow<crate::query::SearchResult>,
+    >(
+        &self,
+        lists: impl IntoIterator<Item = impl IntoIterator<Item = T>>,
+    ) -> Result<Vec<crate::query::SearchResult>> {
+        let mut union = std::collections::BTreeMap::new();
+        let mut positions = 0usize;
+        let mut slots = 0usize;
+        for list in lists {
+            for result in list {
+                slots = slots.saturating_add(1);
+                if slots > crate::query::MAX_FUSION_CANDIDATE_SLOTS {
+                    return Err(crate::Error::Query(
+                        "candidate union document budget exceeded".into(),
+                    ));
+                }
+                let borrowed = result.borrow();
+                positions = positions.saturating_add(
+                    borrowed
+                        .positions
+                        .iter()
+                        .map(|(_, p)| p.len())
+                        .sum::<usize>(),
+                );
+                if positions > crate::query::MAX_FUSION_CHUNK_SLOTS {
+                    return Err(crate::Error::Query(
+                        "candidate union ordinal budget exceeded".into(),
+                    ));
+                }
+                // Nomination magnitudes are intentionally not a mixed-vertical
+                // score. Export requests get features; linear supplies rank.
+                let mut result: crate::query::SearchResult = result.into();
+                result.score = 0.0;
+                match union.entry((result.segment_id, result.doc_id)) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(result);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().positions.extend(result.positions);
+                    }
+                }
+            }
+        }
+        Ok(union.into_values().collect())
+    }
+
+    async fn search_candidate_branches_async(
+        &self,
+        queries: &[Arc<dyn crate::query::Query>],
+        depth: usize,
+        stats: Option<Arc<crate::query::GlobalStats>>,
+    ) -> Result<Vec<(Vec<crate::query::SearchResult>, u32)>> {
+        futures::future::try_join_all(queries.iter().map(|query| {
+            let stats = stats.clone();
+            async move {
+                let (results, seen, _) = self
+                    .search_with_positions_budgeted_stats(query.as_ref(), depth, None, stats)
+                    .await?;
+                Ok((results, seen))
+            }
+        }))
+        .await
+    }
+
     /// Two-stage search: L1 retrieval + L2 dense vector reranking
     ///
     /// Runs the query to get `l1_limit` candidates, then reranks by exact

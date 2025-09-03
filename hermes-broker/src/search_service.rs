@@ -1,11 +1,12 @@
 //! SearchService routing: reads go to a routable replica of the shard
-//! hosting the index and are forwarded verbatim.
+//! hosting the index. Pointwise queries are forwarded; top-level fusion is
+//! coordinated using the core-owned scoring and fusion algorithms.
 //!
 //! A partitioned index fans reads out: `Search` first collects the text
 //! statistics of the query's terms from every partition and sends the sum
 //! back with each partition's request (so BM25 scores are comparable across
-//! partitions), then merges the per-partition windows by score
-//! (`partition::merge_search_responses`). `GetDocument` asks every
+//! partitions), then uses `ranking` for global fusion/L1 selection or
+//! `partition::merge_search_responses` for comparable pointwise scores. `GetDocument` asks every
 //! partition, `GetIndexInfo` and `GetTextStats` aggregate.
 
 use std::sync::Arc;
@@ -115,20 +116,12 @@ impl BrokerSearchService {
         Ok(permits)
     }
 
-    async fn search_partitioned(
+    async fn attach_text_stats(
         &self,
-        mut req: SearchRequest,
+        req: &mut SearchRequest,
         timeout: Option<std::time::Duration>,
         route: &Route,
-    ) -> Result<SearchResponse, Status> {
-        let offset = req.offset;
-        let limit = req.limit;
-        let window = offset.saturating_add(limit);
-        if window > MAX_PARTITION_WINDOW {
-            return Err(Status::invalid_argument(format!(
-                "offset + limit = {window} exceeds the {MAX_PARTITION_WINDOW} window a partitioned index can merge"
-            )));
-        }
+    ) -> Result<(), Status> {
         // Shared BM25 statistics: every partition scores with the sum.
         if req.text_stats.is_none()
             && let Some(query) = req.query.as_ref().and_then(partition::text_stats_query)
@@ -144,18 +137,130 @@ impl BrokerSearchService {
                 get_text_stats,
                 "get_text_stats"
             )?;
-            req.text_stats = Some(partition::merge_text_stats(
-                stats.into_iter().filter_map(|s| s.stats).collect(),
-            ));
+            let stats = stats
+                .into_iter()
+                .map(|response| {
+                    response.stats.ok_or_else(|| {
+                        Status::failed_precondition("a shard omitted requested BM25 statistics")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            req.text_stats = Some(partition::merge_text_stats(stats));
         }
+        Ok(())
+    }
+
+    async fn search_coordinated(
+        &self,
+        req: SearchRequest,
+        timeout: Option<std::time::Duration>,
+        route: &Route,
+        permits: Vec<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<SearchResponse, Status> {
+        let started = Instant::now();
+        let mut plan = crate::ranking::CoordinatorPlan::new(req, route.targets().len())?;
+        self.attach_text_stats(&mut plan.shard_request, timeout, route)
+            .await?;
+        let remaining = || {
+            timeout
+                .map(|budget| {
+                    budget
+                        .checked_sub(started.elapsed())
+                        .filter(|duration| !duration.is_zero())
+                        .ok_or_else(|| {
+                            Status::deadline_exceeded("coordinator search deadline expired")
+                        })
+                })
+                .transpose()
+        };
+        let rpc_timeout = remaining()?;
+        // Bound the sum of concurrently decoded responses, including compressed
+        // transports. No unbounded per-shard allowance is multiplied by fan-out.
+        let decode_limit = crate::ranking::MAX_TRANSFER_BYTES / route.targets().len();
+        let calls = route.targets().iter().map(|target| {
+            let mut outbound = Request::new(plan.shard_request.clone());
+            let index_name = plan.shard_request.index_name.clone();
+            if let Some(timeout) = rpc_timeout {
+                outbound.set_timeout(timeout);
+            }
+            let mut client = target
+                .channels
+                .search
+                .clone()
+                .max_decoding_message_size(decode_limit);
+            async move {
+                let call_started = Instant::now();
+                let result = client.search(outbound).await;
+                let code = result
+                    .as_ref()
+                    .map(|_| tonic::Code::Ok)
+                    .unwrap_or_else(|status| status.code());
+                record_backend(&target.backend_id, "search", call_started, code);
+                result
+                    .map(|response| response.into_inner())
+                    .map_err(|status| {
+                        if route.is_partitioned() {
+                            partition::partition_failure(&index_name, &target.shard, status)
+                        } else {
+                            status
+                        }
+                    })
+            }
+        });
+        let responses = futures::future::try_join_all(calls).await?;
+        let timeout = remaining()?;
+        let selection = tokio::task::spawn_blocking(move || {
+            // Cancellation must not release admission while ranking still runs.
+            let _permits = permits;
+            let scoring_started = Instant::now();
+            let mut response = plan.finish(responses)?;
+            let timings = response.timings.get_or_insert_with(Default::default);
+            timings.candidate_scoring_us = timings
+                .candidate_scoring_us
+                .saturating_add(scoring_started.elapsed().as_micros() as u64);
+            timings.total_us = started.elapsed().as_micros() as u64;
+            response.took_ms = timings.total_us / 1000;
+            Ok::<_, Status>(response)
+        });
+        let selected = if let Some(timeout) = timeout {
+            tokio::time::timeout(timeout, selection)
+                .await
+                .map_err(|_| Status::deadline_exceeded("coordinator ranking deadline expired"))?
+        } else {
+            selection.await
+        };
+        selected.map_err(|_| Status::internal("coordinator ranking worker failed"))?
+    }
+
+    async fn search_partitioned(
+        &self,
+        mut req: SearchRequest,
+        timeout: Option<std::time::Duration>,
+        route: &Route,
+    ) -> Result<SearchResponse, Status> {
+        let offset = req.offset;
+        let limit = req.limit;
+        let window = offset.saturating_add(limit);
+        if window > MAX_PARTITION_WINDOW {
+            return Err(Status::invalid_argument(format!(
+                "offset + limit = {window} exceeds the {MAX_PARTITION_WINDOW} window a partitioned index can merge"
+            )));
+        }
+        self.attach_text_stats(&mut req, timeout, route).await?;
         req.offset = 0;
         req.limit = window;
+        let expected_method = crate::ranking::expected_export_method(&req);
         let responses = forward_read!(self, req, timeout, route, search, "search")?;
-        Ok(partition::merge_search_responses(
-            responses,
-            offset as usize,
-            limit as usize,
-        ))
+        if expected_method.is_some_and(|expected| {
+            responses
+                .iter()
+                .any(|response| response.ranking_method != expected)
+        }) {
+            return Err(Status::failed_precondition(
+                "a shard does not support the requested candidate scoring contract; complete the Hermes rollout",
+            ));
+        }
+        partition::merge_search_responses(responses, offset as usize, limit as usize)
     }
 }
 
@@ -173,9 +278,14 @@ impl SearchService for BrokerSearchService {
 
         let result: Result<SearchResponse, Status> = async {
             let route = self.ctx.read_route(&req.index_name)?;
-            let _permits = self.admit(&index_name, &route)?;
+            let permits = self.admit(&index_name, &route)?;
+            if crate::ranking::handles(&req) {
+                return self.search_coordinated(req, timeout, &route, permits).await;
+            }
+            let _permits = permits;
             match &route {
                 Route::Single(target) => {
+                    let expected_method = crate::ranking::expected_export_method(&req);
                     let mut outbound = Request::new(req);
                     if let Some(t) = timeout {
                         outbound.set_timeout(t);
@@ -187,7 +297,17 @@ impl SearchService for BrokerSearchService {
                         .map(|_| tonic::Code::Ok)
                         .unwrap_or_else(|s| s.code());
                     record_backend(&target.backend_id, "search", call_started, code);
-                    result.map(|r| r.into_inner())
+                    result.and_then(|r| {
+                        let response = r.into_inner();
+                        if expected_method
+                            .is_some_and(|expected| response.ranking_method != expected)
+                        {
+                            return Err(Status::failed_precondition(
+                                "backend lacks requested candidate scoring contract",
+                            ));
+                        }
+                        Ok(response)
+                    })
                 }
                 Route::Partitioned(_) => self.search_partitioned(req, timeout, &route).await,
             }

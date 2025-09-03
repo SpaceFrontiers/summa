@@ -103,3 +103,131 @@ async def test_index_document_delegates_timeout_to_batch_path():
     client.index_documents.assert_awaited_once_with(
         "articles", [{"title": "Hermes"}], timeout=0.25
     )
+
+
+@pytest.mark.asyncio
+async def test_named_l1_roundtrip_preserves_zero_negative_missing_and_scope():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient("localhost:50051")
+    client._ensure_connected = lambda: None
+    client._search_stub = AsyncMock()
+    client._search_stub.Search.return_value = pb.SearchResponse(
+        ranking_method="linear_v2",
+        hits=[
+            pb.SearchHit(
+                score=-0.25,
+                candidate_scores=pb.CandidateScores(
+                    document={"title": 0.0},
+                    passages=[
+                        pb.PassageScores(
+                            ordinal=7, scores={"dense": -0.5}, l1_score=-0.25
+                        )
+                    ],
+                    scored_passages=1,
+                ),
+            )
+        ],
+    )
+    result = await client.search(
+        "docs",
+        query={
+            "fusion": {
+                "queries": [
+                    {
+                        "name": "dense",
+                        "scope": "chunk",
+                        "query": {"dense_vector": {"field": "dense", "vector": [1.0]}},
+                    },
+                    {
+                        "name": "title",
+                        "scope": "document",
+                        "score_only": True,
+                        "query": {"match": {"field": "title", "text": "hemoglobin"}},
+                    },
+                ],
+                "candidate_depth": 2,
+                "filters": [{"phrase": {"field": "body", "text": "red blood cells"}}],
+            }
+        },
+        l1={
+            "weights": {"dense": 0.5},
+            "backfill": False,
+            "missing_values": {"dense": -0.75},
+        },
+        score_export={},
+    )
+    sent = client._search_stub.Search.call_args.args[0]
+    assert sent.query.fusion.queries[0].weight == 0.0
+    assert sent.query.fusion.queries[0].scope == pb.SCORE_SCOPE_CHUNK
+    assert sent.query.fusion.queries[1].score_only
+    assert sent.query.fusion.candidate_depth == 2
+    assert sent.query.fusion.filters[0].phrase.text == "red blood cells"
+    assert sent.l1.weights["dense"] == 0.5
+    assert sent.l1.HasField("backfill")
+    assert not sent.l1.backfill
+    assert sent.l1.missing_values["dense"] == -0.75
+    assert sent.HasField("score_export")
+    assert result.ranking_method == "linear_v2"
+    raw = result.hits[0].candidate_scores
+    assert raw.document == {"title": 0.0}
+    assert raw.passages[0].scores == {"dense": -0.5}
+    assert raw.passages[0].l1_score == -0.25
+
+
+@pytest.mark.asyncio
+async def test_candidate_export_roundtrip_preserves_branch_identity_and_negative_passage_score():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient("localhost:50051")
+    client._ensure_connected = lambda: None
+    client._search_stub = AsyncMock()
+    client._search_stub.Search.return_value = pb.SearchResponse(
+        ranking_method="fusion_candidates_v1",
+        fusion_candidates=[
+            pb.FusionCandidateList(
+                query_index=0,
+                candidates=[
+                    pb.FusionCandidate(
+                        address=pb.DocAddress(segment_id="abc", doc_id=2),
+                        score=-0.5,
+                        ordinal_scores=[pb.OrdinalScore(ordinal=7, score=-0.25)],
+                    )
+                ],
+            )
+        ],
+    )
+    result = await client.search(
+        "docs",
+        query={
+            "fusion": {
+                "method": "candidates",
+                "candidate_depth": 12,
+                "queries": [
+                    {"query": {"match": {"field": "body", "text": "hemoglobin"}}}
+                ],
+            }
+        },
+    )
+    sent = client._search_stub.Search.call_args.args[0]
+    assert sent.query.fusion.method == pb.FUSION_CANDIDATES
+    branch = result.fusion_candidates[0]
+    assert branch.query_index == 0
+    assert branch.candidates[0].address.segment_id == "abc"
+    assert branch.candidates[0].score == -0.5
+    assert branch.candidates[0].ordinal_scores[0].ordinal == 7
+    assert branch.candidates[0].ordinal_scores[0].score == -0.25
+
+
+@pytest.mark.asyncio
+async def test_linear_request_rejects_a_backend_with_legacy_ranking_semantics():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient("localhost:50051")
+    client._ensure_connected = lambda: None
+    client._search_stub = AsyncMock()
+    client._search_stub.Search.return_value = pb.SearchResponse(
+        ranking_method="linear_v1"
+    )
+    with pytest.raises(RuntimeError, match="linear_v2"):
+        await client.search("docs", query={"all": {}}, l1={"weights": {"dense": 1}})

@@ -1,6 +1,7 @@
 //! Async segment reader with lazy loading
 
 pub(crate) mod bmp;
+pub(crate) mod candidate_lookup;
 pub(crate) mod loader;
 mod types;
 
@@ -81,6 +82,8 @@ impl SegmentMemoryStats {
             .saturating_add(self.dense_file_backed_bytes)
     }
 }
+
+pub(crate) use types::SparseProbeBudget;
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -2433,6 +2436,19 @@ impl SegmentReader {
             dense_pinned_metadata_bytes,
             dense_pin_intended_bytes,
         }
+    }
+
+    /// Document frequency from dictionary metadata, without posting payload I/O.
+    /// Async counterpart of `text_doc_freq_sync` for portable statistics.
+    pub(crate) async fn text_doc_freq(&self, field: Field, term: &[u8]) -> Result<u32> {
+        let mut key = Vec::with_capacity(4 + term.len());
+        key.extend_from_slice(&field.0.to_le_bytes());
+        key.extend_from_slice(term);
+        Ok(self
+            .term_dict
+            .get(&key)
+            .await?
+            .map_or(0, |info| info.doc_freq()))
     }
 
     /// Get posting list for a term (async - loads on demand)

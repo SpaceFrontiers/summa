@@ -754,6 +754,8 @@ impl SegmentMerger {
             field_stats: merged_field_stats,
         };
 
+        self.ensure_not_cancelled()?;
+
         // Durable: replace_segments deletes the fsynced source segments right
         // after publishing this output, so a non-durable .meta could be the
         // only copy of the merged documents across a power failure.

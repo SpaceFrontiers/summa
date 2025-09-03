@@ -216,6 +216,8 @@ mod tests {
                 },
             )]),
             ordinal_scores: Vec::new(),
+
+            ..Default::default()
         };
         let mut encoded = SearchResponseBudget::with_maximum(64);
         let err = encoded.reserve_hit(&hit).unwrap_err();

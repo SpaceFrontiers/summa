@@ -76,12 +76,19 @@ message Query {
 enum FusionMethod {
   FUSION_RRF = 0;                      // Reciprocal Rank Fusion (rank-based, default)
   FUSION_NORMALIZED_WEIGHTED_SUM = 1;  // Min-max normalized weighted score sum
+  // Return complete bounded nomination lists/union for coordinator-side fusion.
+  FUSION_CANDIDATES = 2;
 }
 
 // Weighted sub-query for hybrid fusion
 message WeightedQuery {
   Query query = 1;
-  float weight = 2;  // Contribution scale; 0 or unset = 1.0
+  float weight = 2;  // Legacy RRF/NWS contribution; 0 or unset = 1.0
+  // Required, unique feature identity when l1 or score_export is supplied.
+  string name = 3;
+  ScoreScope scope = 4;
+  // Backfill this branch without using it to nominate candidates (L1/export only).
+  bool score_only = 5;
 }
 
 // Union fusion of independently-executed sub-queries (e.g. sparse + dense
@@ -98,6 +105,50 @@ message FusionQuery {
   // compound, and results carry per-chunk ordinal_scores.
   // Unset (0) = MAX (recommended; LogSumExp is unsuitable at RRF magnitudes).
   MultiValueCombiner combiner = 5;
+  // Common document eligibility for every branch. Does not create an L1 feature.
+  repeated Query filters = 6;
+  // Independent per-branch nomination depth (L1/export only). 0 uses
+  // candidate_limit. The complete union survives until linear ranking/export.
+  uint32 candidate_depth = 7;
+}
+
+// Scope is explicit: document features never become body ordinal zero.
+enum ScoreScope {
+  SCORE_SCOPE_UNSPECIFIED = 0;
+  SCORE_SCOPE_DOCUMENT = 1;
+  SCORE_SCOPE_CHUNK = 2;
+}
+
+// Fixed preprocessing trained offline, never derived from a shard/result page.
+message FeatureTransform {
+  bool signed_log1p = 1;
+  optional double scale = 2; // Unset = 1; finite and positive.
+  double offset = 3;
+}
+
+// Direct linear ranking instead of RRF. Keys name FusionQuery.queries branches.
+// Omitted weights contribute zero but those branches can still nominate.
+// Unknown names, non-finite coefficients and all-zero models are errors.
+message L1Ranking {
+  map<string, double> weights = 1;
+  double bias = 2;
+  map<string, FeatureTransform> transforms = 3;
+  // Default true: evaluate only scores missing from named retrieval branches.
+  // False preserves absent scores as missing; real zero/negative scores remain.
+  optional bool backfill = 4;
+  // Learned raw-score defaults by branch, applied before that branch's transform.
+  // Unspecified missing values contribute nothing. Raw exports remain missing.
+  map<string, double> missing_values = 5;
+}
+
+message ScoreExport {
+  // Maximum raw passage rows per hit; 0 = all (65536). With l1, exported rows
+  // are the best passages after complete scoring. Without l1, exceeding this
+  // bound fails instead of silently omitting features the caller needs to rank.
+  uint32 passages_per_document = 1;
+  // Diagnostics: score every stored passage of nominated documents. Default
+  // false scores the union of nominated passages only, plus document context.
+  bool all_passages = 2;
 }
 
 // How to combine scores for multi-valued documents
@@ -266,6 +317,11 @@ message SearchRequest {
   // replace the backend's own statistics for the listed fields and terms;
   // unset = the backend aggregates over its own segments.
   TextStats text_stats = 9;
+  // Requires named, scoped fusion branches. No RRF runs before/after this model.
+  L1Ranking l1 = 10;
+  // With no l1, exports the complete candidate union for external inference.
+  // Export-only requests require offset=0 and a limit covering the whole union.
+  ScoreExport score_export = 11;
 }
 
 message GetTextStatsRequest {
@@ -313,6 +369,22 @@ message SearchHit {
   float score = 2;
   map<string, FieldValueList> fields = 3;
   repeated OrdinalScore ordinal_scores = 4;  // Per-ordinal scores for multi-value fields
+  CandidateScores candidate_scores = 5; // Present only when score_export is requested.
+}
+
+message CandidateScores {
+  // Branch name -> raw score. Absent key means unavailable indexed data;
+  // a valid nonmatch is explicitly 0. Negative dense scores are preserved.
+  map<string, float> document = 1;
+  repeated PassageScores passages = 2;
+  // Before limiting exported rows; L1 selected from all of these passages.
+  uint32 scored_passages = 3;
+}
+message PassageScores {
+  uint32 ordinal = 1;
+  map<string, float> scores = 2;
+  // Final formula score when l1 is present, otherwise no ranking score.
+  optional float l1_score = 3;
 }
 
 // List of field values — supports multi-value fields (e.g. multiple URIs per document)
@@ -359,6 +431,22 @@ message SearchResponse {
   // True when `time_budget_ms` expired before every candidate was scored;
   // the hits are then the best-so-far, not the exact top-k.
   bool truncated = 5;
+  // Explicit feature contract: "linear_v2" or "feature_export_v2" for new modes.
+  string ranking_method = 6;
+  // Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
+  // these lists preserve independent branch scores and nominated ordinals.
+  repeated FusionCandidateList fusion_candidates = 7;
+}
+
+message FusionCandidateList {
+  uint32 query_index = 1;
+  repeated FusionCandidate candidates = 2;
+}
+
+message FusionCandidate {
+  DocAddress address = 1;
+  float score = 2;
+  repeated OrdinalScore ordinal_scores = 3;
 }
 
 // Detailed timing breakdown for search phases (all values in microseconds)
@@ -367,6 +455,7 @@ message SearchTimings {
   uint64 rerank_us = 2;       // L2 reranking (dense vector rescoring)
   uint64 load_us = 3;         // Document field loading from store
   uint64 total_us = 4;        // Wall-clock total (includes overhead)
+  uint64 candidate_scoring_us = 5; // Missing-only feature backfill and linear selection.
 }
 
 // Get document request/response
@@ -397,6 +486,8 @@ message GetIndexInfoResponse {
   // Per text field: how it is tokenized, so clients pick query forms
   // without parsing the schema SDL.
   repeated TextFieldInfo text_fields = 7;
+  uint32 candidate_scoring_version = 8; // 2 preserves organic scores, supports optional backfill and learned missing defaults.
+  repeated string unprepared_candidate_fields = 9; // Fields requiring lookup preparation/migration.
 }
 
 // Tokenization facts of one text field.

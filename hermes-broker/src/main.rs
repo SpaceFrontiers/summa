@@ -17,6 +17,7 @@ mod partition;
 mod placement;
 mod poller;
 mod proto;
+mod ranking;
 mod routes;
 mod search_service;
 mod topology;

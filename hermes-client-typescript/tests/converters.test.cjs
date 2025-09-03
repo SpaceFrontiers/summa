@@ -99,3 +99,74 @@ test("sparse query conversion preserves optional LSP gamma presence", () => {
   });
   assert.equal(exhaustive.sparseVector.lspGamma, 0);
 });
+
+test("named scoring branches retain scopes, eligibility and omission of RRF weights", () => {
+  const { ScoreScope } = require("../dist/generated/hermes.js");
+  const result = buildQuery({ fusion: {
+    queries: [{ name: "body", scope: "chunk", query: { match: { field: "body", text: "hemoglobin" } } },
+              { name: "title", scope: "document", scoreOnly: true, query: { match: { field: "title", text: "hemoglobin" } } }],
+    candidateDepth: 42,
+    filters: [{ phrase: { field: "body", text: "red blood cells" } }],
+  } }).fusion;
+  assert.equal(result.queries[0].weight, 0);
+  assert.equal(result.queries[0].name, "body");
+  assert.equal(result.queries[0].scope, ScoreScope.SCORE_SCOPE_CHUNK);
+  assert.equal(result.queries[1].scope, ScoreScope.SCORE_SCOPE_DOCUMENT);
+  assert.equal(result.queries[1].scoreOnly, true);
+  assert.equal(result.filters[0].phrase.text, "red blood cells");
+  assert.equal(result.candidateDepth, 42);
+});
+
+
+test("candidate export preserves method, depth and per-branch wire results", () => {
+  const { SearchResponse } = require("../dist/generated/hermes.js");
+  const query = buildQuery({ fusion: { method: "candidates", candidateDepth: 12,
+    queries: [{ query: { match: { field: "body", text: "hemoglobin" } } }] } });
+  assert.equal(query.fusion.method, FusionMethod.FUSION_CANDIDATES);
+  assert.equal(query.fusion.candidateDepth, 12);
+  const original = SearchResponse.fromPartial({ rankingMethod: "fusion_candidates_v1", fusionCandidates: [
+    { queryIndex: 0, candidates: [{ address: { segmentId: "abc", docId: 2 }, score: -0.5,
+      ordinalScores: [{ ordinal: 7, score: -0.25 }] }] }
+  ] });
+  const decoded = SearchResponse.decode(SearchResponse.encode(original).finish());
+  assert.deepEqual(decoded.fusionCandidates, original.fusionCandidates);
+});
+
+
+test("linear options preserve explicit disabled backfill and learned defaults", () => {
+  const { SearchRequest } = require("../dist/generated/hermes.js");
+  for (const backfill of [undefined, false, true]) {
+    const request = SearchRequest.fromPartial({ l1: {
+      weights: { dense: 2 }, backfill, missingValues: { dense: -0.75 },
+    } });
+    const decoded = SearchRequest.decode(SearchRequest.encode(request).finish());
+    assert.equal(decoded.l1.backfill, backfill);
+    assert.deepEqual(decoded.l1.missingValues, { dense: -0.75 });
+  }
+});
+
+test("client search forwards disabled backfill and learned missing defaults", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { SearchResponse } = require("../dist/generated/hermes.js");
+  const client = new HermesClient();
+  client.indexClient = {};
+  let sent;
+  client.searchClient = { search: async (request) => {
+    sent = request;
+    return SearchResponse.fromPartial({ rankingMethod: "linear_v2" });
+  } };
+  await client.search("docs", { query: { all: {} },
+    l1: { weights: { dense: 1 }, backfill: false, missingValues: { dense: -0.75 } },
+  });
+  assert.equal(sent.l1.backfill, false);
+  assert.deepEqual(sent.l1.missingValues, { dense: -0.75 });
+});
+
+test("linear client request rejects a backend with legacy ranking semantics", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { SearchResponse } = require("../dist/generated/hermes.js");
+  const client = new HermesClient();
+  client.indexClient = {};
+  client.searchClient = { search: async () => SearchResponse.fromPartial({ rankingMethod: "linear_v1" }) };
+  await assert.rejects(client.search("docs", { query: { all: {} }, l1: { weights: { dense: 1 } } }), /linear_v2/);
+});

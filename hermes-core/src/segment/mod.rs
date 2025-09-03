@@ -9,11 +9,15 @@ pub(crate) mod ann_build;
 mod ann_disk;
 pub use ann_disk::AnnHealth;
 pub(crate) mod bmp_adaptive;
+pub(crate) mod bmp_forward;
 pub(crate) mod bmp_grid;
 #[cfg(any(feature = "native", feature = "wasm"))]
 mod builder;
+#[cfg(all(test, feature = "native"))]
+pub(crate) use builder::bmp::build_bmp_blob;
 pub mod chunk_map;
 pub(crate) mod format;
+pub(crate) mod logical_address;
 #[cfg(feature = "native")]
 mod merger;
 pub(crate) mod reader;

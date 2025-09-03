@@ -146,6 +146,9 @@ pub fn text_stats_query(query: &Query) -> Option<Query> {
                 }
             }
             Some(query::Query::Fusion(fusion)) => {
+                for filter in &fusion.filters {
+                    collect(filter, leaves);
+                }
                 for weighted in &fusion.queries {
                     if let Some(inner) = weighted.query.as_ref() {
                         collect(inner, leaves);
@@ -203,19 +206,30 @@ pub fn merge_batch_responses(
 /// Merge per-partition search responses for `offset`/`limit`: hits by score
 /// descending (ties by address), `total_hits` summed, timings at their
 /// maximum, `truncated` if any partition truncated. Every partition scored
-/// with the same global statistics, so scores are comparable; rank-fused
-/// (RRF) scores are functions of shard-local ranks and merge the same way.
+/// with the same global statistics, so scores are comparable. Rank fusion
+/// is coordinated separately in `ranking`; this merger only orders supplied scores.
 pub fn merge_search_responses(
     responses: Vec<SearchResponse>,
     offset: usize,
     limit: usize,
-) -> SearchResponse {
+) -> Result<SearchResponse, Status> {
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut total_hits: u64 = 0;
     let mut took_ms: u64 = 0;
     let mut timings: Option<SearchTimings> = None;
     let mut truncated = false;
+    let mut ranking_method: Option<String> = None;
+    let mut fusion_candidates = BTreeMap::<u32, Vec<crate::proto::hermes::FusionCandidate>>::new();
     for response in responses {
+        if ranking_method
+            .as_ref()
+            .is_some_and(|method| method != &response.ranking_method)
+        {
+            return Err(Status::failed_precondition(
+                "shards returned incompatible ranking methods; complete the Hermes rollout",
+            ));
+        }
+        ranking_method = Some(response.ranking_method);
         total_hits = total_hits.saturating_add(response.total_hits);
         took_ms = took_ms.max(response.took_ms);
         truncated |= response.truncated;
@@ -225,8 +239,15 @@ pub fn merge_search_responses(
             merged.rerank_us = merged.rerank_us.max(t.rerank_us);
             merged.load_us = merged.load_us.max(t.load_us);
             merged.total_us = merged.total_us.max(t.total_us);
+            merged.candidate_scoring_us = merged.candidate_scoring_us.max(t.candidate_scoring_us);
         }
         hits.extend(response.hits);
+        for branch in response.fusion_candidates {
+            fusion_candidates
+                .entry(branch.query_index)
+                .or_default()
+                .extend(branch.candidates);
+        }
     }
     hits.sort_by(|a, b| {
         b.score
@@ -234,20 +255,40 @@ pub fn merge_search_responses(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| address_key(a).cmp(&address_key(b)))
     });
+    if matches!(
+        ranking_method.as_deref(),
+        Some("feature_export_v2" | "fusion_candidates_v1")
+    ) && (offset != 0 || hits.len() > limit)
+    {
+        return Err(Status::invalid_argument(format!(
+            "feature export needs offset=0 and limit covering the complete cross-shard union ({} candidates)",
+            hits.len()
+        )));
+    }
     let hits: Vec<SearchHit> = hits.into_iter().skip(offset).take(limit).collect();
-    SearchResponse {
+    Ok(SearchResponse {
         hits,
         total_hits,
         took_ms,
         timings,
         truncated,
-    }
+        ranking_method: ranking_method.unwrap_or_default(),
+        fusion_candidates: fusion_candidates
+            .into_iter()
+            .map(
+                |(query_index, candidates)| crate::proto::hermes::FusionCandidateList {
+                    query_index,
+                    candidates,
+                },
+            )
+            .collect(),
+    })
 }
 
-fn address_key(hit: &SearchHit) -> (String, u32) {
+fn address_key(hit: &SearchHit) -> (&str, u32) {
     hit.address
         .as_ref()
-        .map(|a| (a.segment_id.clone(), a.doc_id))
+        .map(|a| (a.segment_id.as_str(), a.doc_id))
         .unwrap_or_default()
 }
 
@@ -307,6 +348,12 @@ pub fn merge_index_info(parts: Vec<GetIndexInfoResponse>) -> GetIndexInfoRespons
         .map(|v| (v.field_name.clone(), v))
         .collect();
     for part in iter {
+        merged.candidate_scoring_version = merged
+            .candidate_scoring_version
+            .min(part.candidate_scoring_version);
+        merged
+            .unprepared_candidate_fields
+            .extend(part.unprepared_candidate_fields);
         merged.num_docs = merged.num_docs.saturating_add(part.num_docs);
         merged.num_segments = merged.num_segments.saturating_add(part.num_segments);
         merged.memory_stats = match (merged.memory_stats.take(), part.memory_stats) {
@@ -332,6 +379,8 @@ pub fn merge_index_info(parts: Vec<GetIndexInfoResponse>) -> GetIndexInfoRespons
             }
         }
     }
+    merged.unprepared_candidate_fields.sort();
+    merged.unprepared_candidate_fields.dedup();
     merged.vector_stats = vectors.into_values().collect();
     merged
 }
@@ -443,6 +492,8 @@ mod tests {
                             ..Default::default()
                         }))),
                         weight: 1.0,
+
+                        ..Default::default()
                     },
                     WeightedQuery {
                         query: Some(Query {
@@ -461,6 +512,8 @@ mod tests {
                             })),
                         }),
                         weight: 0.8,
+
+                        ..Default::default()
                     },
                 ],
                 ..Default::default()
@@ -561,6 +614,8 @@ mod tests {
                 ..Default::default()
             }),
             truncated: false,
+
+            ..Default::default()
         };
         let b = SearchResponse {
             hits: vec![hit("b", 1, 0.7), hit("b", 2, 0.5)],
@@ -571,22 +626,67 @@ mod tests {
                 ..Default::default()
             }),
             truncated: true,
+
+            ..Default::default()
         };
-        let merged = merge_search_responses(vec![a, b], 1, 3);
-        let order: Vec<(String, u32)> = merged.hits.iter().map(address_key).collect();
+        let merged = merge_search_responses(vec![a, b], 1, 3).unwrap();
+        let order: Vec<(&str, u32)> = merged.hits.iter().map(address_key).collect();
         // 0.9(a1) skipped by offset; then 0.7(b1), 0.5(a2 before b2 by address), 0.5(b2)
-        assert_eq!(
-            order,
-            vec![
-                ("b".to_string(), 1),
-                ("a".to_string(), 2),
-                ("b".to_string(), 2)
-            ]
-        );
+        assert_eq!(order, vec![("b", 1), ("a", 2), ("b", 2)]);
         assert_eq!(merged.total_hits, 5);
         assert_eq!(merged.took_ms, 9);
         assert_eq!(merged.timings.unwrap().search_us, 300);
         assert!(merged.truncated);
+    }
+
+    #[test]
+    fn linear_shard_scores_and_features_merge_directly_and_reject_mixed_versions() {
+        let mut a = hit("a", 1, -2.0);
+        a.candidate_scores = Some(crate::proto::hermes::CandidateScores {
+            document: std::collections::HashMap::from([("dense".into(), -2.0)]),
+            ..Default::default()
+        });
+        let first = SearchResponse {
+            ranking_method: "linear_v2".into(),
+            hits: vec![a],
+            ..Default::default()
+        };
+        let second = SearchResponse {
+            ranking_method: "linear_v2".into(),
+            hits: vec![hit("b", 1, -1.0)],
+            ..Default::default()
+        };
+        let merged = merge_search_responses(vec![first.clone(), second], 0, 2).unwrap();
+        assert_eq!(merged.ranking_method, "linear_v2");
+        assert_eq!(merged.hits[0].score, -1.0);
+        assert_eq!(
+            merged.hits[1].candidate_scores.as_ref().unwrap().document["dense"],
+            -2.0
+        );
+        assert_eq!(
+            merge_search_responses(vec![first, SearchResponse::default()], 0, 10)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
+
+    #[test]
+    fn feature_export_never_discards_the_cross_shard_union() {
+        let response = |segment| SearchResponse {
+            ranking_method: "feature_export_v2".into(),
+            hits: vec![hit(segment, 1, 0.0)],
+            ..Default::default()
+        };
+        assert!(merge_search_responses(vec![response("a"), response("b")], 0, 1).is_err());
+        assert!(merge_search_responses(vec![response("a")], 1, 10).is_err());
+        assert_eq!(
+            merge_search_responses(vec![response("a"), response("b")], 0, 2)
+                .unwrap()
+                .hits
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -627,6 +727,8 @@ mod tests {
                 avg_terms_per_vector: 2.0,
             }],
             text_fields: vec![],
+
+            ..Default::default()
         };
         let merged = merge_index_info(vec![info(5, 2), info(7, 3)]);
         assert_eq!(merged.num_docs, 12);

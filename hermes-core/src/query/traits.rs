@@ -22,6 +22,8 @@ pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 
 /// load their own internal data.
 #[derive(Debug, Clone, Default)]
 pub struct ScorerOptions {
+    /// Eligibility pushed into candidate collectors; never a scoring feature.
+    pub(crate) eligibility: Option<std::sync::Arc<DocBitset>>,
     pub collect_positions: bool,
     /// Initial top-k score floor to seed into MaxScore/BMP pruning. Used to
     /// carry the running k-th score across the segments of one query so later
@@ -45,6 +47,7 @@ pub struct ScorerOptions {
 impl ScorerOptions {
     pub const fn with_positions() -> Self {
         Self {
+            eligibility: None,
             collect_positions: true,
             initial_threshold: 0.0,
             shared_threshold: None,
@@ -58,6 +61,7 @@ impl ScorerOptions {
     /// space.
     pub fn without_threshold(&self) -> Self {
         Self {
+            eligibility: self.eligibility.clone(),
             collect_positions: self.collect_positions,
             initial_threshold: 0.0,
             shared_threshold: self
@@ -104,6 +108,7 @@ pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + 'a>;
 /// Built from posting lists or predicate scans. Used by BMP filtered queries
 /// to avoid repeated fast-field decoding during per-slot predicate evaluation.
 /// Lookup cost depends on residency and the caller's dispatch, not just this type.
+#[derive(Debug)]
 pub struct DocBitset {
     pub(crate) bits: Vec<u64>,
 }
@@ -342,6 +347,12 @@ macro_rules! define_query_traits {
                 QueryDecomposition::Opaque
             }
 
+            /// Exact scoring plan for a named L1 branch. Unsupported queries
+            /// reject explicitly rather than returning truncated retrieval scores.
+            fn candidate_query(&self) -> Result<super::CandidateQuery> {
+                super::CandidateQuery::from_decomposition(self.decompose())
+            }
+
             /// Append every `(field, term)` this query scores with BM25 to
             /// `out`. The searcher aggregates their document frequencies
             /// across segments before scoring (see `ScorerOptions::global_stats`).
@@ -469,6 +480,10 @@ impl Query for Box<dyn Query> {
         options: ScorerOptions,
     ) -> ScorerFuture<'a> {
         (**self).scorer_with_options(reader, limit, options)
+    }
+
+    fn candidate_query(&self) -> Result<super::CandidateQuery> {
+        (**self).candidate_query()
     }
 
     fn text_terms(&self, out: &mut Vec<(crate::dsl::Field, Vec<u8>)>) {

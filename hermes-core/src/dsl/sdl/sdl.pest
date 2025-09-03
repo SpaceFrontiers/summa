@@ -144,7 +144,7 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | bmp_block_size_kwarg | bmp_grid_bits_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | sparse_max_weight_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | bm25_k1_kwarg | bm25_b_kwarg | index_type_spec }
+index_config_param = { index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | bmp_block_size_kwarg | bmp_grid_bits_kwarg | bmp_forward_index_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | sparse_max_weight_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | bm25_k1_kwarg | bm25_b_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -177,6 +177,8 @@ block_size_spec = @{ ASCII_DIGIT+ }
 // Uniform across all segments of the field. Larger values reduce compressed
 // grid cells but coarsen pruning (docs/bmp-grid-compression.md).
 bmp_block_size_kwarg = { "bmp_block_size" ~ ":" ~ block_size_spec }
+bmp_forward_index_kwarg = { "bmp_forward_index" ~ ":" ~ boolean_spec }
+boolean_spec = { "true" | "false" }
 // Bits per BMP block-grid cell: 4 (default) or 2. Two caps local D payload
 // widths at two bits (bounds are ceil-quantized — exactness is unchanged).
 bmp_grid_bits_kwarg = { "bmp_grid_bits" ~ ":" ~ bits_spec }

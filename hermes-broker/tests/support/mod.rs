@@ -174,6 +174,8 @@ impl SearchService for MockBackend {
             memory_stats: None,
             vector_stats: vec![],
             text_fields: vec![],
+
+            ..Default::default()
         }))
     }
 }
@@ -457,6 +459,8 @@ pub fn rich_search_response() -> SearchResponse {
                         score: 0.25,
                     },
                 ],
+
+                ..Default::default()
             },
             SearchHit {
                 address: Some(DocAddress {
@@ -466,6 +470,8 @@ pub fn rich_search_response() -> SearchResponse {
                 score: 0.75,
                 fields: Default::default(),
                 ordinal_scores: vec![],
+
+                ..Default::default()
             },
         ],
         total_hits: 1234,
@@ -475,7 +481,11 @@ pub fn rich_search_response() -> SearchResponse {
             rerank_us: 200,
             load_us: 300,
             total_us: 700,
+
+            ..Default::default()
         }),
+
+        ..Default::default()
     }
 }
 
@@ -492,5 +502,7 @@ pub fn simple_search_request(index_name: &str) -> SearchRequest {
         fields_to_load: vec!["id".to_string()],
         reranker: None,
         candidate_limit: 0,
+
+        ..Default::default()
     }
 }

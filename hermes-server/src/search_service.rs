@@ -15,6 +15,7 @@ use crate::proto::search_service_server::SearchService;
 use crate::proto::*;
 use crate::registry::IndexRegistry;
 
+mod candidate_scoring;
 mod response;
 #[cfg(test)]
 mod tests;
@@ -97,7 +98,7 @@ impl SearchService for SearchServiceImpl {
             .map_err(crate::error::hermes_error_to_status)?;
 
         let query = req
-            .query
+            .query.as_ref()
             .ok_or_else(|| Status::invalid_argument("Query is required"))?;
 
         // Rank enough results to cover the requested page, then apply the
@@ -125,11 +126,56 @@ impl SearchService for SearchServiceImpl {
         let deadline = (req.time_budget_ms > 0)
             .then(|| Instant::now() + std::time::Duration::from_millis(req.time_budget_ms));
         let mut truncated = false;
+        let mut candidate_scoring_us = 0;
+        let mut ranking_method = String::new();
+        let mut feature_exports = HashMap::new();
+        let mut fusion_candidates = Vec::new();
+        let mut response_budget = SearchResponseBudget::with_maximum(self.limits.max_search_response_bytes);
         let (results, total_seen, rerank_config) =
-            if let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query {
+            if req.l1.is_some() || req.score_export.is_some() {
+                let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query else { unreachable!("validated fusion scoring request") };
+                let queries: Vec<Arc<dyn hermes_core::query::Query>> = fusion.queries.iter().map(|branch| {
+                    convert_query(branch.query.as_ref().expect("validated branch"), searcher.schema(), Some(searcher.global_stats()), Some(index.directory().root()), &self.limits.shape)
+                        .map(Arc::from).map_err(|e| Status::invalid_argument(format!("Invalid scoring branch: {e}")))
+                }).collect::<Result<_, _>>()?;
+                let plan = candidate_scoring::scoring_plan(fusion, &queries, &req, searcher.schema())?;
+                let stats = match req.text_stats.as_ref() {
+                    Some(stats) => Arc::new(text_stats_from_proto(stats, searcher.schema())),
+                    None => searcher.candidate_text_stats(&plan).await.map_err(crate::error::hermes_error_to_status)?,
+                };
+                let filters = candidate_scoring::convert_filters(fusion, searcher.schema(), Some(searcher.global_stats()), Some(index.directory().root()), &self.limits.shape)?;
+                let nominations: Vec<_> = fusion.queries.iter().zip(&queries).filter(|(branch, _)| !branch.score_only)
+                    .map(|(_, query)| candidate_scoring::with_filters(query.clone(), &filters)).collect();
+                let depth = if fusion.candidate_depth == 0 { candidate_limit } else { fusion.candidate_depth as usize };
+                let lists = searcher.search_candidate_lists(&nominations, depth, Some(stats.clone())).await.map_err(crate::error::hermes_error_to_status)?;
+                let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
+                let candidates = searcher.merge_candidate_lists(lists.iter().map(|(list, _)| list.as_slice())).map_err(crate::error::hermes_error_to_status)?;
+                let retrieved: Vec<_> = fusion.queries.iter().enumerate().filter(|(_, branch)| !branch.score_only)
+                    .zip(&lists).map(|((feature, _), (list, _))| (feature, list.as_slice())).collect();
+                if req.l1.is_none() && candidates.len() > limit {
+                    return Err(Status::invalid_argument(format!("feature export needs limit >= complete candidate union ({} documents)", candidates.len())));
+                }
+                let t_scoring = Instant::now();
+                let mut scored = searcher.score_candidates_with_retrieved(&candidates, &plan, Some(stats), &retrieved).await.map_err(crate::error::hermes_error_to_status)?;
+                candidate_scoring_us = t_scoring.elapsed().as_micros() as u64;
+                let fused_limit = if rerank_setup.is_some() { candidate_limit } else { limit };
+                scored.truncate(fused_limit);
+                let mut results = Vec::with_capacity(scored.len());
+                for candidate in scored {
+                    if req.score_export.is_some() {
+                        response_budget.reserve_retained(candidate_scoring::retained_raw_score_bytes(&candidate.features, &plan)?)?;
+                        feature_exports.insert((candidate.result.segment_id, candidate.result.doc_id), candidate_scoring::export_scores(candidate.features, &plan));
+                    }
+                    results.push(candidate.result);
+                }
+                ranking_method = if req.l1.is_some() { "linear_v2" } else { "feature_export_v2" }.into();
+                query_desc = format!("{}: {} branches, depth {}, union {}", ranking_method, queries.len(), depth, candidates.len());
+                (results, seen, rerank_setup.map(|config| (config, limit)))
+            } else if let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query {
                 // Fusion: run each sub-query independently and fuse the ranked
                 // lists (union). Handled here rather than in convert_query
                 // because fusion is a searcher-level operation.
+                let filters = candidate_scoring::convert_filters(fusion, searcher.schema(), Some(searcher.global_stats()), Some(index.directory().root()), &self.limits.shape)?;
                 let mut sub_queries = Vec::with_capacity(fusion.queries.len());
                 for weighted in &fusion.queries {
                     let sub = weighted
@@ -151,8 +197,23 @@ impl SearchService for SearchServiceImpl {
                     } else {
                         1.0
                     };
-                    sub_queries.push((core, weight));
+                    sub_queries.push((candidate_scoring::with_filters(Arc::from(core), &filters), weight));
                 }
+                if fusion.method == crate::proto::FusionMethod::FusionCandidates as i32 {
+                    let depth = if fusion.candidate_depth == 0 { candidate_limit } else { fusion.candidate_depth as usize };
+                    let queries: Vec<_> = sub_queries.iter().map(|(query, _)| query.clone()).collect();
+                    let stats = req.text_stats.as_ref().map(|stats| Arc::new(text_stats_from_proto(stats, searcher.schema())));
+                    let lists = searcher.search_candidate_lists(&queries, depth, stats).await.map_err(crate::error::hermes_error_to_status)?;
+                    fusion_candidates = candidate_scoring::export_nomination_lists(&lists, &mut response_budget)?;
+                    let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
+                    let candidates = searcher.merge_candidate_lists(lists.into_iter().map(|(list, _)| list)).map_err(crate::error::hermes_error_to_status)?;
+                    if candidates.len() > limit {
+                        return Err(Status::invalid_argument(format!("candidate export needs limit >= complete union ({} documents)", candidates.len())));
+                    }
+                    ranking_method = "fusion_candidates_v1".into();
+                    query_desc = format!("candidate export of {} branches, depth {}", sub_queries.len(), depth);
+                    (candidates, seen, None)
+                } else {
                 let method = match fusion.method() {
                     crate::proto::FusionMethod::FusionRrf => {
                         hermes_core::query::FusionMethod::Rrf {
@@ -163,6 +224,7 @@ impl SearchService for SearchServiceImpl {
                             },
                         }
                     }
+                    crate::proto::FusionMethod::FusionCandidates => unreachable!("candidate export handled separately"),
                     crate::proto::FusionMethod::FusionNormalizedWeightedSum => {
                         hermes_core::query::FusionMethod::NormalizedWeightedSum
                     }
@@ -212,9 +274,10 @@ impl SearchService for SearchServiceImpl {
                     .map_err(crate::error::hermes_error_to_status)?;
                 let rerank_config = rerank_setup.map(|config| (config, limit));
                 (fused, seen, rerank_config)
+                }
             } else {
                 let core_query = convert_query(
-                    &query,
+                    query,
                     searcher.schema(),
                     Some(searcher.global_stats()),
                     Some(index.directory().root()),
@@ -263,7 +326,7 @@ impl SearchService for SearchServiceImpl {
                     (results, seen, None)
                 }
             };
-        let search_us = t_search.elapsed().as_micros() as u64;
+        let search_us = (t_search.elapsed().as_micros() as u64).saturating_sub(candidate_scoring_us);
 
         // ── Phase 2: L2 reranking (optional) ────────────────────────────────
         let t_rerank = Instant::now();
@@ -319,13 +382,11 @@ impl SearchService for SearchServiceImpl {
             }
         }
 
-        let mut response_budget =
-            SearchResponseBudget::with_maximum(self.limits.max_search_response_bytes);
         let mut hits = Vec::with_capacity(results.len());
         for result in results {
             // Convert ordinal scores before hydration so their retained memory
             // is charged before reading potentially large stored fields.
-            let ordinal_scores: Vec<OrdinalScore> = result
+            let mut ordinal_scores: Vec<OrdinalScore> = result
                 .positions
                 .iter()
                 .flat_map(|(_, scored_positions)| {
@@ -335,6 +396,10 @@ impl SearchService for SearchServiceImpl {
                     })
                 })
                 .collect();
+            if req.l1.is_some() {
+                ordinal_scores.sort_unstable_by_key(|row| row.ordinal);
+                ordinal_scores.dedup_by_key(|row| row.ordinal);
+            }
             response_budget.reserve_retained(retained_hit_base_bytes(ordinal_scores.len())?)?;
 
             // Allocate map buckets only for fields that actually have values.
@@ -382,6 +447,7 @@ impl SearchService for SearchServiceImpl {
                 score: result.score,
                 fields,
                 ordinal_scores,
+                candidate_scores: feature_exports.remove(&(result.segment_id, result.doc_id)),
             };
             response_budget.reserve_hit(&hit)?;
             hits.push(hit);
@@ -415,8 +481,11 @@ impl SearchService for SearchServiceImpl {
                 rerank_us,
                 load_us,
                 total_us,
+                candidate_scoring_us,
             }),
             truncated,
+            ranking_method,
+            fusion_candidates,
         }))
             }
         .await;
@@ -639,6 +708,14 @@ impl SearchService for SearchServiceImpl {
             memory_stats: Some(memory_stats),
             vector_stats,
             text_fields,
+            candidate_scoring_version: 2,
+            unprepared_candidate_fields: searcher
+                .segment_readers()
+                .iter()
+                .flat_map(|reader| reader.unprepared_candidate_fields())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect(),
         }))
     }
 }

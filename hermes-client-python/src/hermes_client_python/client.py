@@ -16,10 +16,14 @@ from grpc import aio
 from . import hermes_pb2 as pb
 from . import hermes_pb2_grpc as pb_grpc
 from .types import (
+    CandidateScores,
     DocAddress,
     Document,
+    FusionCandidate,
+    FusionCandidateList,
     IndexInfo,
     OrdinalScore,
+    PassageScores,
     SearchHit,
     SearchResponse,
     SearchTimings,
@@ -214,6 +218,8 @@ class HermesClient:
             num_docs=response.num_docs,
             num_segments=response.num_segments,
             schema=response.schema,
+            candidate_scoring_version=response.candidate_scoring_version,
+            unprepared_candidate_fields=list(response.unprepared_candidate_fields),
             vector_stats=vector_stats,
         )
 
@@ -385,6 +391,8 @@ class HermesClient:
         fields_to_load: list[str] | None = None,
         reranker: dict[str, Any] | None = None,
         candidate_limit: int = 0,
+        l1: dict[str, Any] | None = None,
+        score_export: dict[str, Any] | None = None,
         timeout: float | None = None,
     ) -> SearchResponse:
         """Search for documents.
@@ -473,11 +481,21 @@ class HermesClient:
             fields_to_load=fields_to_load or [],
             reranker=pb_reranker,
             candidate_limit=candidate_limit,
+            l1=pb.L1Ranking(**l1) if l1 is not None else None,
+            score_export=pb.ScoreExport(**score_export)
+            if score_export is not None
+            else None,
         )
 
         response = await self._search_stub.Search(
             request, timeout=self._deadline(timeout)
         )
+
+        if l1 is not None and response.ranking_method != "linear_v2":
+            raise RuntimeError(
+                "L1 requires a backend with linear_v2 ranking semantics; "
+                f"received {response.ranking_method!r}"
+            )
 
         hits = [
             SearchHit(
@@ -487,6 +505,20 @@ class HermesClient:
                 ),
                 score=hit.score,
                 fields={k: _from_field_value_list(v) for k, v in hit.fields.items()},
+                candidate_scores=CandidateScores(
+                    document=dict(hit.candidate_scores.document),
+                    passages=[
+                        PassageScores(
+                            ordinal=row.ordinal,
+                            scores=dict(row.scores),
+                            l1_score=row.l1_score if row.HasField("l1_score") else None,
+                        )
+                        for row in hit.candidate_scores.passages
+                    ],
+                    scored_passages=hit.candidate_scores.scored_passages,
+                )
+                if hit.HasField("candidate_scores")
+                else None,
                 ordinal_scores=[
                     OrdinalScore(ordinal=os.ordinal, score=os.score)
                     for os in hit.ordinal_scores
@@ -503,6 +535,7 @@ class HermesClient:
                 rerank_us=t.rerank_us,
                 load_us=t.load_us,
                 total_us=t.total_us,
+                candidate_scoring_us=t.candidate_scoring_us,
             )
 
         return SearchResponse(
@@ -510,6 +543,28 @@ class HermesClient:
             total_hits=response.total_hits,
             took_ms=response.took_ms,
             timings=timings,
+            ranking_method=response.ranking_method,
+            truncated=response.truncated,
+            fusion_candidates=[
+                FusionCandidateList(
+                    query_index=branch.query_index,
+                    candidates=[
+                        FusionCandidate(
+                            address=DocAddress(
+                                segment_id=hit.address.segment_id,
+                                doc_id=hit.address.doc_id,
+                            ),
+                            score=hit.score,
+                            ordinal_scores=[
+                                OrdinalScore(ordinal=score.ordinal, score=score.score)
+                                for score in hit.ordinal_scores
+                            ],
+                        )
+                        for hit in branch.candidates
+                    ],
+                )
+                for branch in response.fusion_candidates
+            ],
         )
 
     async def get_document(
@@ -867,22 +922,33 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
         method = f.get("method", "rrf")
         if method == "rrf":
             pb_method = pb.FusionMethod.FUSION_RRF
+        elif method == "candidates":
+            pb_method = pb.FusionMethod.FUSION_CANDIDATES
         elif method == "normalized_weighted_sum":
             pb_method = pb.FusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
         else:
             raise ValueError(
                 f"Unknown fusion method {method!r}: "
-                "expected 'rrf' or 'normalized_weighted_sum'"
+                "expected 'rrf', 'normalized_weighted_sum' or 'candidates'"
             )
         return pb.Query(
             fusion=pb.FusionQuery(
                 queries=[
                     pb.WeightedQuery(
                         query=_build_query(wq["query"]),
-                        weight=wq.get("weight", 1.0),
+                        weight=wq.get("weight", 0.0 if wq.get("name") else 1.0),
+                        name=wq.get("name", ""),
+                        scope={
+                            None: pb.SCORE_SCOPE_UNSPECIFIED,
+                            "document": pb.SCORE_SCOPE_DOCUMENT,
+                            "chunk": pb.SCORE_SCOPE_CHUNK,
+                        }[wq.get("scope")],
+                        score_only=wq.get("score_only", False),
                     )
                     for wq in f["queries"]
                 ],
+                filters=[_build_query(q) for q in f.get("filters", [])],
+                candidate_depth=f.get("candidate_depth", 0),
                 method=pb_method,
                 rrf_k=f.get("rrf_k", 0),
                 # Chunk combiner; unset -> MAX server-side (chunk-level fusion)

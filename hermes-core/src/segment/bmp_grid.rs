@@ -1497,7 +1497,10 @@ pub(crate) fn pack_group(
     Ok(output_len)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "native", feature = "wasm", test)
+))]
 #[target_feature(enable = "bmi2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn pack_group_bmi2(

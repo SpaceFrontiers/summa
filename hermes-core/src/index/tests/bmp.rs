@@ -1776,7 +1776,7 @@ async fn test_bmp_reorder_skips_field_without_reorder_attribute() {
 /// BMP reorder with multi-field: build index with 2 BMP sparse fields,
 /// call writer.reorder(), verify both fields return correct results.
 #[tokio::test]
-async fn test_bmp_reorder_multi_field() {
+async fn test_bmp_reorder_multi_field_scores_without_inverse_sidecars() {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let sparse_a = sb.add_sparse_vector_field_with_config("sparse_a", true, true, bmp_config());
@@ -1797,8 +1797,18 @@ async fn test_bmp_reorder_multi_field() {
     for i in 0..NUM_DOCS {
         let mut doc = Document::new();
         doc.add_text(title, format!("doc{}", i));
-        doc.add_sparse_vector(sparse_a, vec![(i as u32, 1.0), (9999, 0.1)]);
-        doc.add_sparse_vector(sparse_b, vec![(1000 + i as u32, 1.0), (19999, 0.1)]);
+        doc.add_sparse_vector(
+            sparse_a,
+            vec![(i as u32, 1.0), (9999, 0.1), (10000 + (i % 17) as u32, 1.0)],
+        );
+        doc.add_sparse_vector(
+            sparse_b,
+            vec![
+                (1000 + i as u32, 1.0),
+                (19999, 0.1),
+                (20000 + (i % 19) as u32, 1.0),
+            ],
+        );
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
@@ -1829,6 +1839,55 @@ async fn test_bmp_reorder_multi_field() {
             ));
             continue;
         }
+        use crate::query::{
+            CandidateFeature, CandidateScoringPlan, LinearModel, Query, ScoreScope,
+        };
+        let other = SparseVectorQuery::new(sparse_b, vec![(1000 + i as u32, 1.0)]);
+        let plan = CandidateScoringPlan {
+            backfill: true,
+            features: vec![
+                CandidateFeature {
+                    name: "a".into(),
+                    scope: ScoreScope::Document,
+                    query: query.candidate_query().unwrap(),
+                },
+                CandidateFeature {
+                    name: "b".into(),
+                    scope: ScoreScope::Document,
+                    query: other.candidate_query().unwrap(),
+                },
+            ],
+            model: Some(LinearModel {
+                weights: std::collections::BTreeMap::from([("b".into(), 1.0)]),
+                ..Default::default()
+            }),
+            export_passages: 1,
+            all_passages: true,
+            document_combiner: crate::query::MultiValueCombiner::Max,
+        };
+        let backfilled = searcher
+            .score_candidates(&results, &plan, None)
+            .await
+            .unwrap();
+        assert!(
+            !crate::directories::Directory::exists(
+                &dir,
+                &std::path::PathBuf::from(format!("seg_{:032x}.lookup", results[0].segment_id)),
+            )
+            .await
+            .unwrap(),
+            "BMP scoring must use its forward values, without an inverse sidecar"
+        );
+        let expected = searcher.search(&other, 5).await.unwrap();
+        assert_eq!(
+            backfilled[0].result.score, expected[0].score,
+            "field-local BMP reorders must backfill the same document"
+        );
+        assert!(
+            backfilled[0].features.passages.is_empty(),
+            "document vectors are not body ordinal zero"
+        );
+        assert!(backfilled[0].features.document.iter().all(Option::is_some));
         let doc = searcher
             .doc(results[0].segment_id, results[0].doc_id)
             .await
@@ -3246,7 +3305,8 @@ async fn test_bmp_corrupt_block_posting_and_docmap_entry_are_counted_not_silentl
     blob[posting_offset] = 255;
 
     // (3) Virtual doc 5 (block 0): document-map id beyond the segment.
-    let dm_ids_start = data_len - bmp.num_virtual_docs as usize * 6;
+    let dm_ids_start =
+        u64::from_le_bytes(blob[data_len + 60..data_len + 68].try_into().unwrap()) as usize;
     blob[dm_ids_start + 5 * 4..dm_ids_start + 6 * 4].copy_from_slice(&(DOCS + 1000).to_le_bytes());
 
     let (results, stats) = run(blob);
@@ -3872,4 +3932,133 @@ async fn test_bmp_force_merge_works_on_lazy_fs_directory() {
         vec!["a", "c", "b"],
         "post-merge lazy-directory search"
     );
+}
+
+#[tokio::test]
+async fn test_bmp_forward_storage_can_be_disabled_without_changing_search_scores() {
+    let mut builder = SchemaBuilder::default();
+    let sparse = builder.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        false,
+        SparseVectorConfig {
+            bmp_forward_index: false,
+            dims: Some(32),
+            ..bmp_config()
+        },
+    );
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), builder.build(), config.clone())
+        .await
+        .unwrap();
+    for doc_id in 0..73 {
+        let mut doc = Document::new();
+        doc.add_sparse_vector(sparse, vec![(0, 0.1 + doc_id as f32 * 0.01), (1, 0.5)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    let bmp = readers[0].bmp_index(sparse).unwrap();
+    assert!(
+        bmp.forward().is_none(),
+        "disabled storage still wrote forward values"
+    );
+    assert!(bmp.logically_ordered());
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let results = searcher
+        .search(&SparseVectorQuery::new(sparse, vec![(0, 1.0)]), 1)
+        .await
+        .unwrap();
+    assert_eq!(results[0].doc_id, 72);
+}
+
+#[tokio::test]
+async fn test_bmp_forward_storage_stays_disabled_through_merge_and_standalone_bp() {
+    for merge_reorder in [false, true] {
+        let mut schema = SchemaBuilder::default();
+        let sparse = schema.add_sparse_vector_field_with_config(
+            "sparse",
+            true,
+            false,
+            SparseVectorConfig {
+                bmp_forward_index: false,
+                dims: Some(32),
+                max_weight: Some(5.0),
+                bmp_block_size: 8,
+                ..bmp_config()
+            },
+        );
+        schema.set_reorder(sparse, true);
+        schema.set_reorder_on_merge(merge_reorder);
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        };
+        let mut writer = IndexWriter::create(dir.clone(), schema.build(), config.clone())
+            .await
+            .unwrap();
+        for batch in 0..2 {
+            for id in 0..73 {
+                let mut doc = Document::new();
+                doc.add_sparse_vector(
+                    sparse,
+                    vec![
+                        (0, 0.1 + (id + batch) as f32 * 0.02),
+                        (1 + (id * 17) % 31, 0.7),
+                    ],
+                );
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+        }
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let before = index.segment_readers().await.unwrap();
+        assert_eq!(before.len(), 2);
+        let block_bytes = |readers: &[std::sync::Arc<crate::segment::SegmentReader>]| {
+            let mut blocks = Vec::new();
+            for reader in readers {
+                let bmp = reader.bmp_index(sparse).unwrap();
+                assert!(bmp.forward().is_none());
+                let bytes = bmp.read_raw_blob().unwrap();
+                blocks.extend((0..bmp.num_blocks).map(|block| {
+                    let (start, end) = bmp.block_data_range(block);
+                    bytes.as_slice()[start as usize..end as usize].to_vec()
+                }));
+            }
+            blocks.sort();
+            blocks
+        };
+        let original_blocks = block_bytes(&before);
+        writer.force_merge().await.unwrap();
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let after = index.segment_readers().await.unwrap();
+        assert_eq!(after.len(), 1);
+        let merged_blocks = block_bytes(&after);
+        if !merge_reorder {
+            assert_eq!(original_blocks, merged_blocks);
+        }
+        let reopened = &after[0]
+            .schema()
+            .get_field_entry(sparse)
+            .unwrap()
+            .sparse_vector_config;
+        assert!(!reopened.as_ref().unwrap().bmp_forward_index);
+        writer.reorder().await.unwrap();
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let readers = index.segment_readers().await.unwrap();
+        assert!(readers[0].bmp_index(sparse).unwrap().forward().is_none());
+        let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+        assert_eq!(
+            searcher
+                .search(&SparseVectorQuery::new(sparse, vec![(0, 1.0)]), 200)
+                .await
+                .unwrap()
+                .len(),
+            146
+        );
+    }
 }

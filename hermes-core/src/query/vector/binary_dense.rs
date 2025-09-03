@@ -69,6 +69,14 @@ impl BinaryDenseVectorQuery {
 }
 
 impl Query for BinaryDenseVectorQuery {
+    fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
+        Ok(crate::query::CandidateQuery::new(
+            self.field,
+            crate::query::candidate_scoring::ScoreComponent::Binary(self.vector.clone()),
+        )
+        .with_combiner(self.combiner))
+    }
+
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let vector = self.shared_vector();

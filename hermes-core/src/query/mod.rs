@@ -21,9 +21,12 @@ mod bm25;
 pub(crate) mod bmp;
 mod boolean;
 mod boost;
+pub mod candidate_scoring;
 mod collector;
 pub mod docset;
+mod filtered;
 mod fusion;
+pub use filtered::FilteredQuery;
 mod global_stats;
 mod phrase;
 mod planner;
@@ -55,3 +58,8 @@ pub use scoring::*;
 pub use term::*;
 pub use traits::*;
 pub use vector::*;
+
+pub use candidate_scoring::{
+    CandidateFeature, CandidateQuery, CandidateScores, CandidateScoringPlan, FeatureTransform,
+    LinearModel, PassageFeatures, ScoreScope, ScoredCandidate,
+};

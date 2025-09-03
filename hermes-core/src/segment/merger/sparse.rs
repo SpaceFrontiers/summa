@@ -113,6 +113,7 @@ impl SegmentMerger {
                     .collect();
                 let has_bmp_data = bmp_indexes.iter().any(|bi| bi.is_some());
                 if has_bmp_data {
+                    let store_forward = sparse_config.as_ref().is_none_or(|c| c.bmp_forward_index);
                     let total_vectors_bmp: u32 = bmp_indexes
                         .iter()
                         .filter_map(|bi| bi.map(|idx| idx.total_vectors))
@@ -235,6 +236,7 @@ impl SegmentMerger {
                                 // SegmentMerger::granularity).
                                 granularity,
                                 scratch_path,
+                                store_forward,
                                 writer,
                                 field_tocs,
                                 pool,
@@ -261,6 +263,7 @@ impl SegmentMerger {
                             max_weight_scale,
                             total_vectors_bmp,
                             &scratch_path,
+                            store_forward,
                             &mut writer,
                             &mut field_tocs,
                             self.cancellation.as_deref(),
@@ -635,6 +638,7 @@ fn merge_bmp_field(
     max_weight_scale: f32,
     total_vectors: u32,
     scratch_path: &std::path::Path,
+    store_forward: bool,
     writer: &mut OffsetWriter,
     field_tocs: &mut Vec<SparseFieldToc>,
     cancellation: Option<&std::sync::atomic::AtomicBool>,
@@ -657,6 +661,9 @@ fn merge_bmp_field(
 
     if sources.is_empty() {
         return Ok(());
+    }
+    if store_forward {
+        crate::segment::bmp_forward::validate_copy_sources(&sources)?;
     }
     debug_assert_eq!(sources.len(), source_paths.len());
     // Validation and every following phase are exhaustive sequential scans.
@@ -893,7 +900,16 @@ fn merge_bmp_field(
         )?;
     }
 
-    // ── Phase 6: Write V19 footer ───────────────────────────────────────
+    let has_forward = store_forward
+        && crate::segment::bmp_forward::write_forward_sources(
+            &sources,
+            &source_paths,
+            writer,
+            None,
+            cancellation,
+        )?;
+
+    // ── Phase 6: Write versioned footer ───────────────────────────────────────
     write_bmp_footer(
         writer,
         total_terms,
@@ -909,6 +925,7 @@ fn merge_bmp_field(
         doc_map_offset,
         num_real_docs_total,
         grid_bits,
+        has_forward,
     )
     .map_err(crate::Error::Io)?;
 
@@ -1555,6 +1572,140 @@ fn write_merged_superblock_grids<'a>(
 mod sparse_source_validation_tests {
     use super::*;
     use crate::directories::OwnedBytes;
+
+    #[tokio::test]
+    async fn disabled_forward_storage_mixed_merge_copies_inverted_blocks() {
+        use crate::directories::{Directory, DirectoryWriter, FileHandle, RamDirectory};
+        let fixture = |docs, store_forward| {
+            let mut postings = rustc_hash::FxHashMap::default();
+            for doc in 0..docs {
+                postings
+                    .entry(doc % 16)
+                    .or_insert_with(Vec::new)
+                    .push((doc, 0, 1.0));
+                postings
+                    .entry(31)
+                    .or_insert_with(Vec::new)
+                    .push((doc, 0, 0.1));
+            }
+            let mut bytes = Vec::new();
+            crate::segment::builder::bmp::build_bmp_blob(
+                postings,
+                32,
+                4,
+                0.0,
+                None,
+                32,
+                5.0,
+                0,
+                store_forward,
+                &mut bytes,
+            )
+            .unwrap();
+            let len = bytes.len() as u64;
+            BmpIndex::parse(
+                FileHandle::from_bytes(OwnedBytes::new(bytes)),
+                0,
+                len,
+                docs,
+                docs,
+            )
+            .unwrap()
+        };
+        let a = fixture(17, true);
+        let b = fixture(33, false);
+        let dir = RamDirectory::new();
+        let path = std::path::Path::new("mixed.sparse");
+        let mut writer = OffsetWriter::new(dir.streaming_writer_cold(path).await.unwrap());
+        let scratch = tempfile::tempdir().unwrap();
+        let mut tocs = Vec::new();
+        // Retaining forward storage cannot silently discard a source's capability.
+        let error = merge_bmp_field(
+            &[Some(&a), Some(&b)],
+            &[0, 17],
+            &[None, None],
+            0,
+            "mixed",
+            32,
+            32,
+            4,
+            5.0,
+            50,
+            &scratch.path().join("merge"),
+            true,
+            &mut writer,
+            &mut tocs,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("explicitly reorder"), "{error}");
+        assert_eq!(writer.offset(), 0);
+        assert!(tocs.is_empty());
+        merge_bmp_field(
+            &[Some(&a), Some(&b)],
+            &[0, 17],
+            &[None, None],
+            0,
+            "mixed",
+            32,
+            32,
+            4,
+            5.0,
+            50,
+            &scratch.path().join("merge"),
+            false,
+            &mut writer,
+            &mut tocs,
+            None,
+        )
+        .unwrap();
+        writer.finish().unwrap();
+        let bytes = dir
+            .open_read(path)
+            .await
+            .unwrap()
+            .read_bytes()
+            .await
+            .unwrap();
+        let len = bytes.len() as u64;
+        let result = BmpIndex::parse(FileHandle::from_bytes(bytes), 0, len, 50, 50).unwrap();
+        assert!(result.forward().is_none());
+        let expected: Vec<_> = [&a, &b]
+            .into_iter()
+            .flat_map(|source| {
+                source.block_data_slice()[..source.block_data_sentinel() as usize]
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(
+            &result.block_data_slice()[..result.block_data_sentinel() as usize],
+            expected
+        );
+        for (source, doc_base, slot_base, docs) in [(&a, 0, 0, 17), (&b, 17, 32, 33)] {
+            let query = [(31, 0.3), (0, 1.0)];
+            let before = crate::query::bmp::score_bmp_candidates(
+                source,
+                &query,
+                &(0..docs).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let after = crate::query::bmp::score_bmp_candidates(
+                &result,
+                &query,
+                &(slot_base..slot_base + docs).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            assert_eq!(before.len(), after.len());
+            for (doc, (score, merged_score)) in before.into_iter().zip(after).enumerate() {
+                assert_eq!(score.to_bits(), merged_score.to_bits());
+                assert_eq!(
+                    result.virtual_to_doc(slot_base + doc as u32),
+                    (doc_base + doc as u32, 0)
+                );
+            }
+        }
+    }
 
     fn raw_source(offset: u64) -> DimRawData {
         let mut block = vec![0u8; SPARSE_BLOCK_HEADER_SIZE];

@@ -10,6 +10,7 @@ import {
   FieldValue as PbFieldValue,
   FieldValueList as PbFieldValueList,
   FusionMethod as PbFusionMethod,
+  ScoreScope,
   MultiValueCombiner,
   Query as PbQuery,
   Reranker as PbReranker,
@@ -155,12 +156,17 @@ export function buildQuery(q: Query): PbQuery {
       fusion: {
         queries: fusion.queries.map((weightedQuery) => ({
           query: buildQuery(weightedQuery.query),
-          weight: weightedQuery.weight ?? 1.0,
+          weight: weightedQuery.weight ?? (weightedQuery.name ? 0 : 1),
+          name: weightedQuery.name ?? "",
+          scope: weightedQuery.scope === "chunk" ? ScoreScope.SCORE_SCOPE_CHUNK : weightedQuery.scope === "document" ? ScoreScope.SCORE_SCOPE_DOCUMENT : ScoreScope.SCORE_SCOPE_UNSPECIFIED,
+          scoreOnly: weightedQuery.scoreOnly ?? false,
         })),
         method:
-          fusion.method === "normalized_weighted_sum"
+          fusion.method === "candidates" ? PbFusionMethod.FUSION_CANDIDATES : fusion.method === "normalized_weighted_sum"
             ? PbFusionMethod.FUSION_NORMALIZED_WEIGHTED_SUM
             : PbFusionMethod.FUSION_RRF,
+        filters: (fusion.filters ?? []).map(buildQuery),
+        candidateDepth: fusion.candidateDepth ?? 0,
         rrfK: fusion.rrfK ?? 0,
         combiner: combinerToProto(fusion.combiner),
       },

@@ -48,6 +48,8 @@ async fn pass_through_is_identical() {
         total_hits: brokered.total_hits,
         took_ms: brokered.took_ms,
         timings: brokered.timings,
+
+        ..Default::default()
     };
     assert_eq!(
         hit_free_of_maps.encode_to_vec(),
@@ -572,6 +574,8 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
             took_ms: 5,
             timings: None,
             truncated: false,
+
+            ..Default::default()
         };
     }
 
@@ -635,6 +639,8 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
                         })),
                     }),
                     weight: 1.0,
+
+                    ..Default::default()
                 },
                 WeightedQuery {
                     query: Some(Query {
@@ -645,11 +651,27 @@ async fn partitioned_search_merges_by_score_with_shared_stats() {
                         })),
                     }),
                     weight: 1.0,
+
+                    ..Default::default()
                 },
             ],
             ..Default::default()
         })),
     });
+    // The coordinator asks for branch lists, never already-fused shard ranks.
+    for mock in &mocks {
+        let mut state = mock.state.lock();
+        state.search_response = SearchResponse {
+            ranking_method: "fusion_candidates_v1".into(),
+            fusion_candidates: (0..2)
+                .map(|query_index| FusionCandidateList {
+                    query_index,
+                    candidates: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+    }
     broker_search_client(&broker)
         .await
         .search(hybrid)

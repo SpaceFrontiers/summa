@@ -7,9 +7,10 @@
 //! length normalisation. See `docs/chunked-text-fields.md`.
 //!
 //! ```text
-//! [magic "CHNK"][version u32 = 2][num_sections u32]
+//! [magic "CHNK"][version u32 = 3][num_sections u32]
 //! TOC × num_sections: [field_id u32][kind u32][count u32][total_tokens u64][data_offset u64]
 //! kind 0 (chunk map):   doc_ids u32 × n | ordinals u16 × n | lengths u16 × n
+//! kind 2 (addressed map): kind 0 columns | logical-order physical slots u32 × n
 //! kind 1 (doc lengths): lengths u16 × num_docs        (norms of a plain text field)
 //! ```
 //!
@@ -36,12 +37,13 @@ use crate::DocId;
 use crate::directories::OwnedBytes;
 
 const MAGIC: u32 = 0x4B4E_4843; // "CHNK"
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const HEADER_SIZE: usize = 12;
 const TOC_ENTRY_SIZE_V1: usize = 24;
 const TOC_ENTRY_SIZE: usize = 28;
 const KIND_CHUNK_MAP: u32 = 0;
 const KIND_DOC_LENGTHS: u32 = 1;
+const KIND_ADDRESSED_CHUNK_MAP: u32 = 2;
 
 /// Token count stored per chunk; longer chunks saturate.
 pub const MAX_CHUNK_LENGTH: u32 = u16::MAX as u32;
@@ -56,6 +58,21 @@ pub struct ChunkMapBuilder {
 }
 
 impl ChunkMapBuilder {
+    #[cfg(feature = "native")]
+    pub(crate) fn with_capacity(count: usize) -> Self {
+        Self {
+            doc_ids: Vec::with_capacity(count),
+            ordinals: Vec::with_capacity(count),
+            lengths: Vec::with_capacity(count),
+            total_tokens: 0,
+        }
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn set_total_tokens(&mut self, total: u64) {
+        self.total_tokens = total;
+    }
+
     /// Number of chunks so far (the next virtual id).
     pub fn len(&self) -> usize {
         self.doc_ids.len()
@@ -85,8 +102,18 @@ impl ChunkMapBuilder {
         self.doc_ids.capacity() * 4 + self.ordinals.capacity() * 2 + self.lengths.capacity() * 2
     }
 
+    fn logically_ordered(&self) -> bool {
+        self.doc_ids.iter().zip(&self.ordinals).is_sorted()
+            && self
+                .doc_ids
+                .iter()
+                .zip(&self.ordinals)
+                .zip(self.doc_ids.iter().zip(&self.ordinals).skip(1))
+                .all(|(a, b)| a != b)
+    }
+
     fn section_bytes(&self) -> u64 {
-        self.doc_ids.len() as u64 * 8
+        self.doc_ids.len() as u64 * if self.logically_ordered() { 8 } else { 12 }
     }
 
     /// Token count of virtual id `vid` (saturated at `MAX_CHUNK_LENGTH`).
@@ -123,7 +150,11 @@ pub fn write_chunk_maps<W: Write + ?Sized>(
     writer.write_u32::<LittleEndian>(sections as u32)?;
     for (field_id, map) in fields {
         writer.write_u32::<LittleEndian>(*field_id)?;
-        writer.write_u32::<LittleEndian>(KIND_CHUNK_MAP)?;
+        writer.write_u32::<LittleEndian>(if map.logically_ordered() {
+            KIND_CHUNK_MAP
+        } else {
+            KIND_ADDRESSED_CHUNK_MAP
+        })?;
         writer.write_u32::<LittleEndian>(map.len() as u32)?;
         writer.write_u64::<LittleEndian>(map.total_tokens)?;
         writer.write_u64::<LittleEndian>(offset)?;
@@ -146,6 +177,24 @@ pub fn write_chunk_maps<W: Write + ?Sized>(
         }
         for length in &map.lengths {
             writer.write_u16::<LittleEndian>(*length)?;
+        }
+        if !map.logically_ordered() {
+            let mut slots: Vec<u32> = (0..map.len() as u32).collect();
+            slots.sort_unstable_by_key(|&slot| {
+                (map.doc_ids[slot as usize], map.ordinals[slot as usize])
+            });
+            let mut previous = None;
+            for slot in slots {
+                let key = (map.doc_ids[slot as usize], map.ordinals[slot as usize]);
+                if previous == Some(key) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "duplicate logical text chunk",
+                    ));
+                }
+                previous = Some(key);
+                writer.write_u32::<LittleEndian>(slot)?;
+            }
         }
     }
     for column in norms {
@@ -238,6 +287,8 @@ pub struct ChunkMap {
     /// this segment. BM25 floors every chunk length at this value so a short
     /// tail chunk is not rewarded for being short (`docs/chunked-bm25.md`).
     length_floor: u32,
+    logically_ordered: bool,
+    logical_slots: Option<OwnedBytes>,
     /// Derived once at open; never persisted or assumed from schema flags.
     doc_ids_monotonic: bool,
 }
@@ -265,6 +316,37 @@ fn nominal_chunk_length(lengths: &[u8]) -> u32 {
 }
 
 impl ChunkMap {
+    pub(crate) fn has_logical_addressing(&self) -> bool {
+        self.logically_ordered || self.logical_slots.is_some()
+    }
+
+    fn logical_slot(&self, index: u32) -> u32 {
+        self.logical_slots.as_ref().map_or(index, |slots| {
+            let offset = index as usize * 4;
+            u32::from_le_bytes(slots.as_slice()[offset..offset + 4].try_into().unwrap())
+        })
+    }
+
+    pub(crate) fn slots_for_document(&self, doc: DocId) -> impl Iterator<Item = (u16, u32)> + '_ {
+        super::logical_address::ordered_document_slots(self.num_chunks, doc, |index| {
+            let (doc, ordinal) = self.resolve(self.logical_slot(index));
+            Some(super::logical_address::LogicalUnit { doc, ordinal })
+        })
+        .map(|(ordinal, index)| (ordinal, self.logical_slot(index)))
+    }
+
+    pub(crate) fn slot_for_unit(&self, unit: super::logical_address::LogicalUnit) -> Option<u32> {
+        super::logical_address::ordered_slot_for_unit(self.num_chunks, unit, |index| {
+            let (doc, ordinal) = self.resolve(self.logical_slot(index));
+            Some(super::logical_address::LogicalUnit { doc, ordinal })
+        })
+        .map(|index| self.logical_slot(index))
+    }
+
+    pub(crate) fn logically_ordered(&self) -> bool {
+        self.logically_ordered
+    }
+
     pub(crate) fn is_doc_ordered(&self) -> bool {
         self.doc_ids_monotonic
     }
@@ -384,7 +466,7 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
     let version = cursor.read_u32::<LittleEndian>()?;
     let entry_size = match version {
         1 => TOC_ENTRY_SIZE_V1,
-        VERSION => TOC_ENTRY_SIZE,
+        2 | VERSION => TOC_ENTRY_SIZE,
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -393,13 +475,18 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
         }
     };
     let num_sections = cursor.read_u32::<LittleEndian>()? as usize;
-    if data.len() < HEADER_SIZE + entry_size * num_sections {
+    let overflow = || io::Error::new(io::ErrorKind::InvalidData, "chunk map size overflow");
+    let toc_end = num_sections
+        .checked_mul(entry_size)
+        .and_then(|n| HEADER_SIZE.checked_add(n))
+        .ok_or_else(overflow)?;
+    if data.len() < toc_end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "chunk map table of contents truncated",
         ));
     }
-    let overflow = || io::Error::new(io::ErrorKind::InvalidData, "chunk map size overflow");
+    let mut expected_offset = toc_end;
     let mut file = ChunkMapFile::default();
     for _ in 0..num_sections {
         let field_id = cursor.read_u32::<LittleEndian>()?;
@@ -410,10 +497,20 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
         };
         let count = cursor.read_u32::<LittleEndian>()?;
         let total_tokens = cursor.read_u64::<LittleEndian>()?;
-        let offset = cursor.read_u64::<LittleEndian>()? as usize;
+        let offset = usize::try_from(cursor.read_u64::<LittleEndian>()?).map_err(|_| overflow())?;
+        if offset != expected_offset
+            || file.chunk_maps.contains_key(&field_id)
+            || file.doc_lengths.contains_key(&field_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk map has overlapping sections, gaps or duplicate fields",
+            ));
+        }
         let n = count as usize;
         let bytes_per_entry = match kind {
             KIND_CHUNK_MAP => 8,
+            KIND_ADDRESSED_CHUNK_MAP if version >= 3 => 12,
             KIND_DOC_LENGTHS => 2,
             other => {
                 return Err(io::Error::new(
@@ -431,29 +528,70 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                 format!("chunk map section of field {field_id} exceeds file length"),
             ));
         }
+        expected_offset = end;
         match kind {
-            KIND_CHUNK_MAP => {
+            KIND_CHUNK_MAP | KIND_ADDRESSED_CHUNK_MAP => {
                 let doc_ids = bytes.slice(offset..offset + n * 4);
                 let ordinals = bytes.slice(offset + n * 4..offset + n * 6);
-                let lengths = bytes.slice(offset + n * 6..end);
+                let lengths = bytes.slice(offset + n * 6..offset + n * 8);
+                let logical_slots =
+                    (kind == KIND_ADDRESSED_CHUNK_MAP).then(|| bytes.slice(offset + n * 8..end));
                 let length_floor = nominal_chunk_length(lengths.as_slice());
+                let logically_ordered = super::logical_address::logically_ordered(
+                    doc_ids
+                        .as_slice()
+                        .chunks_exact(4)
+                        .zip(ordinals.as_slice().chunks_exact(2))
+                        .map(|(doc, ordinal)| {
+                            Some(super::logical_address::LogicalUnit {
+                                doc: u32::from_le_bytes(doc.try_into().unwrap()),
+                                ordinal: u16::from_le_bytes(ordinal.try_into().unwrap()),
+                            })
+                        }),
+                );
                 let doc_ids_monotonic = doc_ids
                     .as_slice()
                     .chunks_exact(4)
                     .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .is_sorted();
-                file.chunk_maps.insert(
-                    field_id,
-                    ChunkMap {
-                        doc_ids,
-                        ordinals,
-                        lengths,
-                        num_chunks: count,
-                        total_tokens,
-                        length_floor,
-                        doc_ids_monotonic,
-                    },
-                );
+                let map = ChunkMap {
+                    doc_ids,
+                    ordinals,
+                    lengths,
+                    num_chunks: count,
+                    total_tokens,
+                    length_floor,
+                    logically_ordered,
+                    logical_slots,
+                    doc_ids_monotonic,
+                };
+                if version >= 3 && kind == KIND_CHUNK_MAP && !map.logically_ordered {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "V3 chunk map requires logical ordering or an addressed section",
+                    ));
+                }
+                if let Some(slots) = &map.logical_slots {
+                    let mut previous = None;
+                    for raw in slots.as_slice().chunks_exact(4) {
+                        let slot = u32::from_le_bytes(raw.try_into().unwrap());
+                        if slot >= count {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "text logical slot out of range",
+                            ));
+                        }
+                        let key = map.resolve(slot);
+                        if previous.is_some_and(|p| p >= key) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "text logical slots are not a sorted unique permutation",
+                            ));
+                        }
+                        previous = Some(key);
+                    }
+                }
+                file.chunk_maps.insert(field_id, map);
             }
             _ => {
                 file.doc_lengths.insert(
@@ -466,6 +604,12 @@ pub fn read_chunk_maps(bytes: OwnedBytes) -> io::Result<ChunkMapFile> {
                 );
             }
         }
+    }
+    if expected_offset != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing chunk map data",
+        ));
     }
     Ok(file)
 }
@@ -500,10 +644,35 @@ pub fn write_merged_chunk_maps<W: Write + ?Sized>(
         .iter()
         .filter(|(_, sources)| sources.iter().any(|s| s.map.num_chunks() > 0))
         .collect();
+    // Never silently discard addressing on a prepared source. Pure legacy
+    // maps can still copy-merge in their original version until explicit reorder.
+    let mut legacy = false;
+    let mut addressed = false;
+    for (_, sources) in &live {
+        let needs_migration = sources.iter().any(|s| !s.map.has_logical_addressing());
+        if needs_migration
+            && sources
+                .iter()
+                .any(|s| s.map.num_chunks() > 0 && s.map.has_logical_addressing())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "cannot merge prepared and unprepared text chunk maps; explicitly reorder legacy segments first",
+            ));
+        }
+        legacy |= needs_migration;
+        addressed |= !needs_migration && sources.iter().any(|s| !s.map.logically_ordered());
+    }
+    if legacy && addressed {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "legacy text chunks require explicit reorder before merging with V3 addressed fields",
+        ));
+    }
     let sections = live.len() + norms.len();
     let mut offset = (HEADER_SIZE + TOC_ENTRY_SIZE * sections) as u64;
     writer.write_u32::<LittleEndian>(MAGIC)?;
-    writer.write_u32::<LittleEndian>(VERSION)?;
+    writer.write_u32::<LittleEndian>(if legacy { 2 } else { VERSION })?;
     writer.write_u32::<LittleEndian>(sections as u32)?;
     for (field_id, sources) in &live {
         let mut num_chunks = 0u64;
@@ -519,11 +688,26 @@ pub fn write_merged_chunk_maps<W: Write + ?Sized>(
             )
         })?;
         writer.write_u32::<LittleEndian>(*field_id)?;
-        writer.write_u32::<LittleEndian>(KIND_CHUNK_MAP)?;
+        writer.write_u32::<LittleEndian>(
+            if sources.iter().all(|s| s.map.has_logical_addressing())
+                && sources.iter().any(|s| !s.map.logically_ordered())
+            {
+                KIND_ADDRESSED_CHUNK_MAP
+            } else {
+                KIND_CHUNK_MAP
+            },
+        )?;
         writer.write_u32::<LittleEndian>(num_chunks)?;
         writer.write_u64::<LittleEndian>(total_tokens)?;
         writer.write_u64::<LittleEndian>(offset)?;
-        offset += u64::from(num_chunks) * 8;
+        offset += u64::from(num_chunks)
+            * if sources.iter().all(|s| s.map.has_logical_addressing())
+                && sources.iter().any(|s| !s.map.logically_ordered())
+            {
+                12
+            } else {
+                8
+            };
     }
     for (field_id, sources) in norms {
         let num_docs: u64 = sources.iter().map(|s| u64::from(s.num_docs)).sum();
@@ -544,32 +728,44 @@ pub fn write_merged_chunk_maps<W: Write + ?Sized>(
         writer.write_u64::<LittleEndian>(offset)?;
         offset += u64::from(num_docs) * 2;
     }
-    let mut patched: Vec<u8> = Vec::new();
+    let mut patched = Vec::with_capacity(64 * 1024);
     for (_, sources) in &live {
         for source in sources {
             if source.doc_offset == 0 {
                 writer.write_all(source.map.doc_id_bytes())?;
                 continue;
             }
-            patched.clear();
-            patched.reserve(source.map.doc_id_bytes().len());
-            for chunk in source.map.doc_id_bytes().chunks_exact(4) {
-                let doc = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                let remapped = doc.checked_add(source.doc_offset).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "document id overflow while merging chunk maps",
-                    )
-                })?;
-                patched.extend_from_slice(&remapped.to_le_bytes());
+            for batch in source.map.doc_id_bytes().chunks(64 * 1024) {
+                patched.clear();
+                for chunk in batch.chunks_exact(4) {
+                    let doc = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    let remapped = doc.checked_add(source.doc_offset).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "document id overflow while merging chunk maps",
+                        )
+                    })?;
+                    patched.extend_from_slice(&remapped.to_le_bytes());
+                }
+                writer.write_all(&patched)?;
             }
-            writer.write_all(&patched)?;
         }
         for source in sources {
             writer.write_all(source.map.ordinal_bytes())?;
         }
         for source in sources {
             writer.write_all(source.map.length_bytes())?;
+        }
+        let addressed = sources.iter().all(|s| s.map.has_logical_addressing())
+            && sources.iter().any(|s| !s.map.logically_ordered());
+        if addressed {
+            let mut base = 0u32;
+            for source in sources {
+                for i in 0..source.map.num_chunks() {
+                    writer.write_u32::<LittleEndian>(source.map.logical_slot(i) + base)?;
+                }
+                base += source.map.num_chunks();
+            }
         }
     }
     let zeros = [0u8; 2 * 1024];
@@ -785,5 +981,129 @@ mod tests {
         let map = &file.chunk_maps[&9];
         assert_eq!(map.resolve(1), (2, 0));
         assert_eq!(map.length(1), 4);
+    }
+
+    #[test]
+    fn addressed_chunk_maps_copy_and_remap_slots_without_losing_missing_ordinals() {
+        let source = build(&[(2, 7, 11), (0, 3, 12), (2, 1, 13)]);
+        let mut bytes = Vec::new();
+        write_chunk_maps(&mut bytes, &[(1, &source)], &[]).unwrap();
+        let file = read_chunk_maps(OwnedBytes::new(bytes)).unwrap();
+        let map = &file.chunk_maps[&1];
+        assert_eq!(
+            map.slot_for_unit(super::super::logical_address::LogicalUnit { doc: 2, ordinal: 7 }),
+            Some(0)
+        );
+        assert_eq!(
+            map.slot_for_unit(super::super::logical_address::LogicalUnit { doc: 2, ordinal: 0 }),
+            None
+        );
+        let mut merged = Vec::new();
+        write_merged_chunk_maps(
+            &mut merged,
+            &[(
+                1,
+                vec![
+                    ChunkMapSource { map, doc_offset: 0 },
+                    ChunkMapSource { map, doc_offset: 4 },
+                ],
+            )],
+            &[],
+        )
+        .unwrap();
+        let file = read_chunk_maps(OwnedBytes::new(merged)).unwrap();
+        let result = &file.chunk_maps[&1];
+        assert_eq!(
+            result.ordinal_bytes(),
+            [map.ordinal_bytes(), map.ordinal_bytes()].concat()
+        );
+        assert_eq!(
+            result.length_bytes(),
+            [map.length_bytes(), map.length_bytes()].concat()
+        );
+        assert_eq!(
+            result.slot_for_unit(super::super::logical_address::LogicalUnit { doc: 6, ordinal: 7 }),
+            Some(3)
+        );
+        assert_eq!(
+            result.slot_for_unit(super::super::logical_address::LogicalUnit { doc: 4, ordinal: 3 }),
+            Some(4)
+        );
+        assert_eq!(
+            result.slot_for_unit(super::super::logical_address::LogicalUnit { doc: 6, ordinal: 1 }),
+            Some(5)
+        );
+        assert_eq!(
+            result.slot_for_unit(super::super::logical_address::LogicalUnit { doc: 5, ordinal: 0 }),
+            None
+        );
+    }
+
+    #[test]
+    fn chunk_map_versions_preserve_legacy_capability_and_reject_corrupt_addressing() {
+        let source = build(&[(2, 0, 11), (0, 0, 12)]);
+        let mut bytes = Vec::new();
+        write_chunk_maps(&mut bytes, &[(1, &source)], &[]).unwrap();
+        let mut invalid = bytes.clone();
+        let end = invalid.len();
+        invalid[end - 4..].copy_from_slice(&1u32.to_le_bytes());
+        assert!(
+            read_chunk_maps(OwnedBytes::new(invalid)).is_err(),
+            "duplicate slots"
+        );
+        let mut legacy = bytes.clone();
+        legacy.truncate(legacy.len() - 8);
+        legacy[16..20].copy_from_slice(&KIND_CHUNK_MAP.to_le_bytes());
+        assert!(
+            read_chunk_maps(OwnedBytes::new(legacy.clone())).is_err(),
+            "V3 ordered kind must be ordered"
+        );
+        legacy[4..8].copy_from_slice(&2u32.to_le_bytes());
+        let old = read_chunk_maps(OwnedBytes::new(legacy)).unwrap();
+        let old_map = &old.chunk_maps[&1];
+        assert!(!old_map.has_logical_addressing());
+        let mut merged = Vec::new();
+        write_merged_chunk_maps(
+            &mut merged,
+            &[(
+                1,
+                vec![ChunkMapSource {
+                    map: old_map,
+                    doc_offset: 0,
+                }],
+            )],
+            &[],
+        )
+        .unwrap();
+        assert!(
+            !read_chunk_maps(OwnedBytes::new(merged)).unwrap().chunk_maps[&1]
+                .has_logical_addressing()
+        );
+        let current = read_chunk_maps(OwnedBytes::new(bytes)).unwrap();
+        let mut output = Vec::new();
+        assert!(
+            write_merged_chunk_maps(
+                &mut output,
+                &[(
+                    1,
+                    vec![
+                        ChunkMapSource {
+                            map: old_map,
+                            doc_offset: 0
+                        },
+                        ChunkMapSource {
+                            map: &current.chunk_maps[&1],
+                            doc_offset: 3
+                        },
+                    ]
+                )],
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            output.is_empty(),
+            "reject incompatible sources before writing"
+        );
     }
 }

@@ -133,53 +133,6 @@ impl PhraseQuery {
     }
 }
 
-/// Phrase over a chunked field: match and score every chunk (posting ids are
-/// virtual chunk ids, positions restart per chunk so a phrase never spans two
-/// chunks), then fold the chunk hits into documents with per-ordinal scores.
-///
-/// The scorer intersects the term postings and verifies positions in each
-/// conjunction candidate; only actual phrase hits enter the document fold.
-fn build_chunked_phrase_scorer<'a>(
-    term_data: Vec<(BlockPostingList, TermPositions)>,
-    offsets: &[u32],
-    slop: u32,
-    reader: &SegmentReader,
-    field: Field,
-    budget: Option<super::SharedThreshold>,
-) -> crate::Result<Box<dyn Scorer + 'a>> {
-    let Some(chunk_map) = reader.chunk_map(field) else {
-        return Err(crate::Error::Corruption(format!(
-            "chunked text field '{}' has postings but segment {:016x} carries no chunk map",
-            reader.schema().get_field_name(field).unwrap_or("?"),
-            reader.meta().id,
-        )));
-    };
-    let num_chunks = chunk_map.num_chunks() as f32;
-    let idf: f32 = term_data
-        .iter()
-        .map(|(p, _)| super::bm25_idf(p.doc_count() as f32, num_chunks))
-        .sum();
-    let (postings, positions): (Vec<_>, Vec<_>) = term_data.into_iter().unzip();
-    let scorer = PhraseScorer::new(
-        postings,
-        positions,
-        offsets,
-        slop,
-        idf,
-        chunk_map.avg_len(),
-        budget.clone(),
-    )
-    .with_lengths(Lengths::Chunks(chunk_map.clone()))
-    .with_params(super::Bm25Params::for_field(reader.schema(), field));
-
-    Ok(fold_chunked_phrase_scorer(
-        scorer,
-        chunk_map.clone(),
-        field.0,
-        budget,
-    ))
-}
-
 /// Ordered maps need only one document's ordinals and one matching-chunk
 /// lookahead. Reordered maps retain the stable, all-document aggregation.
 fn fold_chunked_phrase_scorer<'a, S: Scorer + 'a>(
@@ -332,39 +285,120 @@ impl<S: Scorer> Scorer for ChunkedPhraseScorer<S> {
     }
 }
 
-/// Build a PhraseScorer from already-fetched term data.
-fn build_phrase_scorer<'a>(
+/// Build the shared positional scorer without walking beyond the candidate set.
+#[allow(clippy::too_many_arguments)]
+fn prepare_phrase_scorer(
+    reader: &SegmentReader,
+    field: Field,
+    terms: &[Vec<u8>],
     term_data: Vec<(BlockPostingList, TermPositions)>,
     offsets: &[u32],
     slop: u32,
+    stats: Option<&Arc<GlobalStats>>,
+    budget: Option<super::SharedThreshold>,
+) -> crate::Result<PhraseScorer> {
+    let mut avg_len = reader.avg_field_len(field);
+    let mut idf = 0.0;
+    for ((postings, _), term) in term_data.iter().zip(terms) {
+        let (term_idf, length) =
+            super::term::compute_term_idf(postings, field, reader, stats, term);
+        idf += term_idf;
+        avg_len = length;
+    }
+    let (postings, positions) = term_data.into_iter().unzip();
+    let mut scorer =
+        PhraseScorer::unpositioned(postings, positions, offsets, slop, idf, avg_len, budget)
+            .with_params(super::Bm25Params::for_field(reader.schema(), field));
+    if reader.is_chunked_field(field) {
+        let map = reader.chunk_map(field).ok_or_else(|| {
+            crate::Error::Corruption("chunked phrase has postings without a chunk map".into())
+        })?;
+        scorer = scorer.with_lengths(Lengths::Chunks(map.clone()));
+    } else if let Some(lengths) = reader.doc_lengths(field) {
+        scorer = scorer.with_lengths(Lengths::Docs(lengths.clone()));
+    }
+    Ok(scorer)
+}
+
+/// Ordinary retrieval enumerates phrase matches; point scoring below parks
+/// these same cursors only on nominated targets and shares frequency/scoring.
+fn finish_phrase_scorer<'a>(
+    mut scorer: PhraseScorer,
     reader: &SegmentReader,
     field: Field,
     budget: Option<super::SharedThreshold>,
-) -> Box<dyn Scorer + 'a> {
-    let idf: f32 = term_data
-        .iter()
-        .map(|(p, _)| {
-            let num_docs = reader.num_docs() as f32;
-            let doc_freq = p.doc_count() as f32;
-            super::bm25_idf(doc_freq, num_docs)
-        })
-        .sum();
-    let avg_field_len = reader.avg_field_len(field);
-    let (postings, positions): (Vec<_>, Vec<_>) = term_data.into_iter().unzip();
-    let mut scorer = PhraseScorer::new(
-        postings,
-        positions,
-        offsets,
-        slop,
-        idf,
-        avg_field_len,
-        budget,
-    )
-    .with_params(super::Bm25Params::for_field(reader.schema(), field));
-    if let Some(lengths) = reader.doc_lengths(field) {
-        scorer = scorer.with_lengths(Lengths::Docs(lengths.clone()));
+) -> crate::Result<Box<dyn Scorer + 'a>> {
+    scorer.find_next_phrase_match();
+    if let Some(map) = reader.chunk_map(field) {
+        Ok(fold_chunked_phrase_scorer(
+            scorer,
+            map.clone(),
+            field.0,
+            budget,
+        ))
+    } else {
+        Ok(Box::new(scorer))
     }
-    Box::new(scorer)
+}
+
+pub(super) async fn score_phrase_candidates(
+    reader: &SegmentReader,
+    query: &PhraseQuery,
+    targets: &[u32],
+    stats: Option<&Arc<GlobalStats>>,
+) -> crate::Result<Vec<f32>> {
+    let stats = query.global_stats.as_ref().or(stats);
+    if query.terms.len() == 1 {
+        return super::term::score_term_candidates(
+            reader,
+            query.field,
+            &[(query.terms[0].clone(), 1.0)],
+            targets,
+            stats,
+        )
+        .await;
+    }
+    let mut scores = vec![0.0; targets.len()];
+    if query.terms.is_empty() {
+        return Ok(scores);
+    }
+    if !reader.has_positions(query.field) {
+        return Err(crate::Error::Query(
+            "phrase score backfill requires positions".into(),
+        ));
+    }
+    let mut data = Vec::with_capacity(query.terms.len());
+    for term in &query.terms {
+        let (p, pos) = futures::join!(
+            reader.get_postings(query.field, term),
+            reader.get_positions(query.field, term)
+        );
+        match (p?, pos?) {
+            (Some(p), Some(pos)) => data.push((p, pos)),
+            _ => return Ok(scores),
+        }
+    }
+    let mut scorer = prepare_phrase_scorer(
+        reader,
+        query.field,
+        &query.terms,
+        data,
+        &query.offsets,
+        query.slop,
+        stats,
+        None,
+    )?;
+    for (index, &target) in targets.iter().enumerate() {
+        let mut matches = true;
+        for cursor in &mut scorer.posting_iters {
+            matches &= cursor.seek(target) == target;
+        }
+        if matches && scorer.check_phrase_positions(target) {
+            scorer.current_doc = target;
+            scores[index] = scorer.score();
+        }
+    }
+    Ok(scores)
 }
 
 // ── Shared early-return checks for phrase scorer ─────────────────────────
@@ -392,6 +426,13 @@ macro_rules! phrase_early_returns {
 }
 
 impl Query for PhraseQuery {
+    fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
+        Ok(super::CandidateQuery::new(
+            self.field,
+            super::candidate_scoring::ScoreComponent::Phrase(self.clone()),
+        ))
+    }
+
     fn text_terms(&self, out: &mut Vec<(Field, Vec<u8>)>) {
         for term in &self.terms {
             out.push((self.field, term.clone()));
@@ -412,6 +453,10 @@ impl Query for PhraseQuery {
         let terms = self.terms.clone();
         let offsets = self.offsets.clone();
         let slop = self.slop;
+        let stats = self
+            .global_stats
+            .clone()
+            .or_else(|| options.global_stats.clone());
 
         Box::pin(async move {
             phrase_early_returns!(
@@ -437,24 +482,17 @@ impl Query for PhraseQuery {
                 }
             }
 
-            if reader.is_chunked_field(field) {
-                return build_chunked_phrase_scorer(
-                    term_data,
-                    &offsets,
-                    slop,
-                    reader,
-                    field,
-                    options.shared_threshold,
-                );
-            }
-            Ok(build_phrase_scorer(
+            let scorer = prepare_phrase_scorer(
+                reader,
+                field,
+                &terms,
                 term_data,
                 &offsets,
                 slop,
-                reader,
-                field,
-                options.shared_threshold,
-            ))
+                stats.as_ref(),
+                options.shared_threshold.clone(),
+            )?;
+            finish_phrase_scorer(scorer, reader, field, options.shared_threshold)
         })
     }
 
@@ -505,24 +543,17 @@ impl Query for PhraseQuery {
             }
         }
 
-        if reader.is_chunked_field(self.field) {
-            return build_chunked_phrase_scorer(
-                term_data,
-                &self.offsets,
-                self.slop,
-                reader,
-                self.field,
-                options.shared_threshold,
-            );
-        }
-        Ok(build_phrase_scorer(
+        let scorer = prepare_phrase_scorer(
+            reader,
+            self.field,
+            &self.terms,
             term_data,
             &self.offsets,
             self.slop,
-            reader,
-            self.field,
-            options.shared_threshold,
-        ))
+            self.global_stats.as_ref().or(options.global_stats.as_ref()),
+            options.shared_threshold.clone(),
+        )?;
+        finish_phrase_scorer(scorer, reader, self.field, options.shared_threshold)
     }
 
     /// Every document containing the phrase, as a bitset (documents, also
@@ -665,7 +696,7 @@ struct PhraseScorer {
 
 impl PhraseScorer {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn unpositioned(
         posting_lists: Vec<BlockPostingList>,
         position_lists: Vec<TermPositions>,
         offsets: &[u32],
@@ -686,7 +717,7 @@ impl PhraseScorer {
         let deltas: Vec<u32> = (0..num_terms)
             .map(|i| offsets.get(i).map_or(i as u32, |o| o - first))
             .collect();
-        let mut scorer = Self {
+        Self {
             budget: budget.filter(|b| b.deadline().is_some()),
             posting_iters,
             position_lists: position_lists
@@ -703,10 +734,7 @@ impl PhraseScorer {
             avg_field_len,
             lengths: None,
             position_bufs: (0..num_terms).map(|_| Vec::new()).collect(),
-        };
-
-        scorer.find_next_phrase_match();
-        scorer
+        }
     }
 
     /// Score with the real length of each scoring unit.
@@ -1084,7 +1112,8 @@ mod tests {
             positions
                 .push(TermPositions::open(crate::directories::OwnedBytes::new(bytes)).unwrap());
         }
-        let mut scorer = PhraseScorer::new(lists, positions, &[0, 1], 0, 1.0, 2.0, None);
+        let mut scorer = PhraseScorer::unpositioned(lists, positions, &[0, 1], 0, 1.0, 2.0, None);
+        scorer.find_next_phrase_match();
         assert_eq!(scorer.doc(), 0);
         let budget = super::super::SharedThreshold::for_limit(10)
             .with_deadline(Some(std::time::Instant::now()));

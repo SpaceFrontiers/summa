@@ -293,6 +293,7 @@ struct IndexConfig {
     block_size: Option<usize>,
     bmp_block_size: Option<u32>,
     bmp_grid_bits: Option<u8>,
+    bmp_forward_index: Option<bool>,
     pruning: Option<f32>,
     min_terms: Option<usize>,
     doc_mass: Option<f32>,
@@ -540,6 +541,9 @@ fn parse_single_index_config_param(
                     128
                 }));
             }
+        }
+        Rule::bmp_forward_index_kwarg => {
+            config.bmp_forward_index = p.into_inner().next().map(|v| v.as_str() == "true");
         }
         Rule::bmp_grid_bits_kwarg => {
             // bmp_grid_bits_kwarg = { "bmp_grid_bits" ~ ":" ~ bits_spec }
@@ -1228,6 +1232,13 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
             );
         }
         config.bmp_block_size = adjusted;
+    }
+    if let Some(enabled) = idx_cfg.bmp_forward_index {
+        if config.format != SparseFormat::Bmp {
+            log::warn!("bmp_forward_index applies only to BMP sparse fields; ignoring this option");
+        } else {
+            config.bmp_forward_index = enabled;
+        }
     }
     if let Some(bits) = idx_cfg.bmp_grid_bits {
         if bits == 2 || bits == 4 {
@@ -2152,6 +2163,26 @@ mod tests {
             config2.bmp_block_size,
             SparseVectorConfig::DEFAULT_BMP_BLOCK_SIZE
         );
+    }
+
+    #[test]
+    fn bmp_forward_storage_is_optional_and_survives_schema_serialization() {
+        let input = "index example { field a: sparse_vector [indexed<format: bmp, bmp_forward_index: false>] field b: sparse_vector [indexed<format: bmp>] }";
+        let schema = parse_sdl(input).unwrap()[0].to_schema();
+        let json = serde_json::to_value(&schema).unwrap();
+        let restored: crate::Schema = serde_json::from_value(json).unwrap();
+        let enabled = |name| {
+            restored
+                .get_field_entry(restored.get_field(name).unwrap())
+                .unwrap()
+                .sparse_vector_config
+                .as_ref()
+                .unwrap()
+                .bmp_forward_index
+        };
+        assert!(!enabled("a"));
+        assert!(enabled("b"));
+        assert!(parse_sdl(&input.replace("false", "auto")).is_err());
     }
 
     /// Regression: `bmp_grid_bits` parsed but was never applied to the field

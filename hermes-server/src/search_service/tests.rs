@@ -116,6 +116,8 @@ fn fusion_request(sub_queries: usize, candidate_limit: u32) -> SearchRequest {
                     .map(|_| WeightedQuery {
                         query: Some(all_query()),
                         weight: 1.0,
+
+                        ..Default::default()
                     })
                     .collect(),
                 ..Default::default()
@@ -566,4 +568,247 @@ fn metrics_use_only_canonical_schema_labels() {
     assert_eq!(canonical_metric_index_label(&schema), UNKNOWN_INDEX_LABEL);
     schema.set_index_name("known-index");
     assert_eq!(canonical_metric_index_label(&schema), "known-index");
+}
+
+fn named_l1_request() -> SearchRequest {
+    SearchRequest {
+        index_name: "l1-test".into(),
+        limit: 1,
+        query: Some(Query {
+            query: Some(query::Query::Fusion(FusionQuery {
+                queries: vec![
+                    WeightedQuery {
+                        name: "title".into(),
+                        scope: ScoreScope::Document as i32,
+                        query: Some(Query {
+                            query: Some(query::Query::Match(MatchQuery {
+                                field: "title".into(),
+                                text: "candidate".into(),
+                                ..Default::default()
+                            })),
+                        }),
+                        ..Default::default()
+                    },
+                    WeightedQuery {
+                        name: "body".into(),
+                        scope: ScoreScope::Chunk as i32,
+                        query: Some(Query {
+                            query: Some(query::Query::Match(MatchQuery {
+                                field: "body".into(),
+                                text: "hemoglobin".into(),
+                                ..Default::default()
+                            })),
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                filters: vec![Query {
+                    query: Some(query::Query::Phrase(crate::proto::PhraseQuery {
+                        field: "body".into(),
+                        text: "red blood cells".into(),
+                        ..Default::default()
+                    })),
+                }],
+                candidate_depth: 1,
+                ..Default::default()
+            })),
+        }),
+        l1: Some(L1Ranking {
+            weights: HashMap::from([("body".into(), 1.0)]),
+            ..Default::default()
+        }),
+        score_export: Some(ScoreExport::default()),
+        fields_to_load: vec!["title".into()],
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn l1_invalid_branch_weights_fail_before_opening_index_or_acquiring_capacity() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SearchServiceImpl::new(
+        Arc::new(IndexRegistry::new(temp.path().into(), Default::default())),
+        1,
+        limits(),
+    );
+    let _permit = try_acquire_search_permit(&service.search_permits).unwrap();
+    let mut request = named_l1_request();
+    request
+        .l1
+        .as_mut()
+        .unwrap()
+        .weights
+        .insert("missing_branch".into(), 0.2);
+    let error = service.search(Request::new(request)).await.unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("unknown query branch"));
+}
+
+#[test]
+fn l1_disabled_backfill_rejects_all_passages_before_admission() {
+    let mut request = named_l1_request();
+    request.l1.as_mut().unwrap().backfill = Some(false);
+    request.score_export.as_mut().unwrap().all_passages = true;
+    assert!(
+        validate_search_budget(&request, &limits())
+            .unwrap_err()
+            .message()
+            .contains("all_passages diagnostics require backfill")
+    );
+}
+
+#[test]
+fn l1_missing_coefficients_are_zero_but_ambiguous_branches_and_rank_fusion_options_fail() {
+    let request = named_l1_request();
+    validate_search_budget(&request, &limits()).unwrap();
+    let mut bad = request.clone();
+    bad.l1.as_mut().unwrap().weights.clear();
+    assert!(validate_search_budget(&bad, &limits()).is_err());
+    let mut bad = request.clone();
+    bad.l1
+        .as_mut()
+        .unwrap()
+        .weights
+        .insert("body".into(), f64::NAN);
+    assert!(validate_search_budget(&bad, &limits()).is_err());
+    let mut bad = request.clone();
+    let Some(query::Query::Fusion(fusion)) = bad.query.as_mut().unwrap().query.as_mut() else {
+        unreachable!()
+    };
+    fusion.queries[0].name = "body".into();
+    assert!(validate_search_budget(&bad, &limits()).is_err());
+    let mut bad = request.clone();
+    let Some(query::Query::Fusion(fusion)) = bad.query.as_mut().unwrap().query.as_mut() else {
+        unreachable!()
+    };
+    fusion.rrf_k = 60.0;
+    assert!(validate_search_budget(&bad, &limits()).is_err());
+    let mut bad = request;
+    let Some(query::Query::Fusion(fusion)) = bad.query.as_mut().unwrap().query.as_mut() else {
+        unreachable!()
+    };
+    for branch in &mut fusion.queries {
+        branch.score_only = true;
+    }
+    assert!(validate_search_budget(&bad, &limits()).is_err());
+}
+
+#[test]
+fn l1_keeps_existing_fusion_combiners_and_rejects_unknown_values() {
+    for combiner in 0..=4 {
+        let mut request = named_l1_request();
+        let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut()
+        else {
+            unreachable!()
+        };
+        fusion.combiner = combiner;
+        validate_search_budget(&request, &limits()).unwrap();
+    }
+    let mut request = named_l1_request();
+    let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut() else {
+        unreachable!()
+    };
+    fusion.combiner = 900;
+    assert!(
+        validate_search_budget(&request, &limits())
+            .unwrap_err()
+            .message()
+            .contains("unknown fusion combiner")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));
+    let mut schema = hermes_core::Schema::builder();
+    let title = schema.add_text_field_with_tokenizer("title", true, true, "simple");
+    let body = schema.add_text_field_with_tokenizer("body", true, false, "simple");
+    schema.set_chunked(body, true);
+    schema.set_positions(body, hermes_core::dsl::PositionMode::TokenPosition);
+    registry
+        .create_index("l1-test", schema.build())
+        .await
+        .unwrap();
+    let writer = registry.get_writer("l1-test").await.unwrap();
+    {
+        let mut writer = writer.write().await;
+        for (heading, text) in [
+            (
+                "candidate candidate candidate",
+                "red blood cells general medicine",
+            ),
+            ("candidate", "red blood cells hemoglobin hemoglobin"),
+            ("candidate", "hemoglobin hemoglobin hemoglobin hemoglobin"),
+        ] {
+            let mut document = hermes_core::Document::new();
+            document.add_text(title, heading);
+            document.add_text(body, text);
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    let index = registry.get_or_open_index("l1-test").await.unwrap();
+    index.reader().await.unwrap().reload().await.unwrap();
+    let service = SearchServiceImpl::new(registry.clone(), 1, limits());
+    let ranked = service
+        .search(Request::new(named_l1_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ranked.ranking_method, "linear_v2");
+    assert_eq!(ranked.hits.len(), 1);
+    assert_eq!(
+        ranked.hits[0].address.as_ref().unwrap().doc_id,
+        1,
+        "the model selects from the whole union; the quote-less document remains excluded"
+    );
+    let raw = ranked.hits[0].candidate_scores.as_ref().unwrap();
+    assert!(
+        raw.document["title"] > 0.0,
+        "title score is backfilled although title top-1 nominated another doc"
+    );
+    assert_eq!(raw.passages[0].scores["body"], ranked.hits[0].score);
+    assert_eq!(raw.passages[0].l1_score, Some(ranked.hits[0].score));
+    let mut export = named_l1_request();
+    export.l1 = None;
+    export.limit = 10;
+    export.score_export.as_mut().unwrap().all_passages = true;
+    let all = service
+        .search(Request::new(export))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(all.ranking_method, "feature_export_v2");
+    assert_eq!(all.hits.len(), 2);
+    let other = all
+        .hits
+        .iter()
+        .find(|hit| hit.address.as_ref().unwrap().doc_id == 0)
+        .unwrap();
+    assert_eq!(
+        other.candidate_scores.as_ref().unwrap().passages[0].scores["body"],
+        0.0,
+        "a valid nonmatch is exported as zero"
+    );
+    let mut too_small = named_l1_request();
+    too_small.l1 = None;
+    assert_eq!(
+        service
+            .search(Request::new(too_small))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    let info = service
+        .get_index_info(Request::new(GetIndexInfoRequest {
+            index_name: "l1-test".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.candidate_scoring_version, 2);
+    assert!(info.unprepared_candidate_fields.is_empty());
+    registry.shutdown().await.unwrap();
 }

@@ -38,6 +38,10 @@ impl BoostQuery {
 }
 
 impl Query for BoostQuery {
+    fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
+        self.inner.candidate_query()?.boosted(self.boost)
+    }
+
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
     }

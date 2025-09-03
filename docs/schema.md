@@ -516,6 +516,13 @@ field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.
   Two-bit bounds are ceil-quantized and remain rank-safe, but are looser. They
   cap compressed D payload widths at two bits; the exact saving is
   workload-dependent.
+- `bmp_forward_index` (boolean; default `true`) — store quantized vectors for
+  L1 candidate backfill and BP reads. Set `false` to omit this additional storage
+  from ingestion, merge and BP output. Ordinary BMP search uses inverted postings
+  regardless of this setting. Without forward values, L1 backfill requires a
+  logically ordered BMP document map; BP-reordered fields require enabling
+  storage and explicit reorder/rebuild, or `l1.backfill: false`. Existing files
+  are immutable. See [optional forward storage](bmp-forward-index.md#optional-storage).
 - `query<pruning: 0.33>` — retain the highest-weight third of query
   dimensions for BMP candidate generation, matching the LSP/0 zero-shot beta.
   Visited documents are still scored with the bounded full query. This is

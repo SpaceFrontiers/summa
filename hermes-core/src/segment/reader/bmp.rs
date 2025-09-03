@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index reader for sparse vectors — **V19 zero-copy**.
+//! BMP (Block-Max Pruning) index reader for sparse vectors — **V19/V20 zero-copy**.
 //!
 //! V19 uses fixed `dims` (vocabulary size) and dim_id directly in per-block data.
 //! Grid is indexed by dim_id as row index (no Section C dim_ids array).
@@ -86,7 +86,7 @@ pub struct BmpDimStats {
     pub top_dims: Vec<(u32, u64)>,
 }
 
-/// BMP V19 index for a single sparse field — fully zero-copy mmap-backed.
+/// BMP V19/V20 index for a single sparse field — fully zero-copy mmap-backed.
 ///
 /// V19 format with Recursive Graph Bisection (BP) document ordering.
 ///
@@ -128,6 +128,8 @@ pub struct BmpIndex {
     /// True when every stored vector is ordinal zero. This is derived from
     /// the physical document map rather than trusting schema declarations.
     single_valued: bool,
+    logically_ordered: bool,
+    forward: Option<crate::segment::bmp_forward::BmpForward>,
 
     // ── Zero-copy OwnedBytes sections (keeps backing store alive) ────
     /// Section A: block_data_starts[block_id] = byte offset into block_data_bytes
@@ -173,13 +175,14 @@ pub struct BmpIndex {
 // inherits Send+Sync automatically through its fields.
 
 impl BmpIndex {
-    /// Parse a BMP V19 blob from the given file handle.
+    /// Parse a BMP V19 or V20 blob from the given file handle.
     ///
     /// Reads the footer, then acquires the entire blob as a single
     /// `OwnedBytes` and slices it into zero-copy sections.
     ///
     /// V19 data-first layout: Section B (per-block interleaved data) first,
     /// then Section A (block_data_starts with u64 entries), grids, doc_map.
+    /// V20 appends logical forward values before the shared footer.
     pub fn parse(
         handle: FileHandle,
         blob_offset: u64,
@@ -187,11 +190,11 @@ impl BmpIndex {
         total_docs: u32,
         total_vectors: u32,
     ) -> crate::Result<Self> {
-        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
+        use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC, BMP_BLOB_MAGIC_V19};
 
         if blob_len < BMP_BLOB_FOOTER_SIZE as u64 {
             return Err(crate::Error::Corruption(
-                "BMP blob too small for V19 footer".into(),
+                "BMP blob too small for versioned footer".into(),
             ));
         }
 
@@ -220,11 +223,11 @@ impl BmpIndex {
         let grid_bits_raw = u32::from_le_bytes(fb[72..76].try_into().unwrap());
         let magic = u32::from_le_bytes(fb[76..80].try_into().unwrap());
 
-        if magic != BMP_BLOB_MAGIC {
+        if magic != BMP_BLOB_MAGIC && magic != BMP_BLOB_MAGIC_V19 {
             return Err(crate::Error::Corruption(format!(
-                "Invalid BMP blob magic: {:#x} (expected BMP9 {:#x}); rebuild \
+                "Invalid BMP blob magic: {:#x} (expected BMP9 {:#x} or BMPA {:#x}); rebuild \
                  the index with this version.",
-                magic, BMP_BLOB_MAGIC
+                magic, BMP_BLOB_MAGIC_V19, BMP_BLOB_MAGIC
             )));
         }
         let grid_bits: u8 = match grid_bits_raw {
@@ -259,6 +262,8 @@ impl BmpIndex {
                 grid_bits,
                 num_real_docs,
                 single_valued: true,
+                logically_ordered: true,
+                forward: None,
                 block_data_starts_bytes: OwnedBytes::empty(),
                 block_data_bytes: OwnedBytes::empty(),
                 block_grid: CompressedGrid::empty(),
@@ -384,12 +389,25 @@ impl BmpIndex {
         let dm_ords_end = dm_ids_end.checked_add(dm_ords_len).ok_or_else(|| {
             crate::Error::Corruption("BMP ordinal map end overflows usize".into())
         })?;
-        if dm_ords_end != data_len_usize {
+        if dm_ords_end > data_len_usize
+            || (magic == BMP_BLOB_MAGIC_V19 && dm_ords_end != data_len_usize)
+        {
             return Err(crate::Error::Corruption(format!(
                 "BMP data length mismatch: sections end at {}, blob data ends at {}",
                 dm_ords_end, data_len_usize
             )));
         }
+
+        let forward = if magic == BMP_BLOB_MAGIC {
+            Some(crate::segment::bmp_forward::BmpForward::parse(
+                blob.slice(dm_ords_end..data_len_usize),
+                num_real_docs,
+                total_docs,
+                dims,
+            )?)
+        } else {
+            None
+        };
 
         // Slice into sections (all zero-copy — just offset adjustments on same Arc)
         let block_grid = CompressedGrid::parse(
@@ -415,6 +433,19 @@ impl BmpIndex {
         )?;
         let doc_map_ids_bytes = blob.slice(dm_start..dm_ids_end);
         let doc_map_ordinals_bytes = blob.slice(dm_ids_end..dm_ords_end);
+        let logically_ordered = crate::segment::logical_address::logically_ordered(
+            doc_map_ids_bytes
+                .as_slice()
+                .chunks_exact(4)
+                .zip(doc_map_ordinals_bytes.as_slice().chunks_exact(2))
+                .map(|(doc, ordinal)| {
+                    let doc = u32::from_le_bytes(doc.try_into().unwrap());
+                    (doc != u32::MAX).then(|| crate::segment::logical_address::LogicalUnit {
+                        doc,
+                        ordinal: u16::from_le_bytes(ordinal.try_into().unwrap()),
+                    })
+                }),
+        );
         let single_valued = doc_map_ordinals_bytes
             .as_slice()
             .chunks_exact(2)
@@ -465,9 +496,10 @@ impl BmpIndex {
         }
 
         log::debug!(
-            "BMP V19 index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
+            "BMP V{} index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
-             block_grid={}, superblock_grid={}, coarse_grid={}, single_valued={}, block_data={}, doc_map={}",
+             block_grid={}, superblock_grid={}, coarse_grid={}, single_valued={}, block_data={}, doc_map={}, forward={}",
+            if magic == BMP_BLOB_MAGIC { 20 } else { 19 },
             num_blocks,
             num_superblocks,
             num_coarse_groups,
@@ -483,6 +515,7 @@ impl BmpIndex {
             single_valued,
             crate::format_bytes(bds_start as u64),
             crate::format_bytes(u64::from(num_virtual_docs) * 6),
+            crate::format_bytes(forward.as_ref().map_or(0, |f| f.encoded_bytes()) as u64),
         );
 
         Ok(Self {
@@ -498,6 +531,8 @@ impl BmpIndex {
             grid_bits,
             num_real_docs,
             single_valued,
+            logically_ordered,
+            forward,
             block_data_starts_bytes,
             block_data_bytes,
             block_grid,
@@ -514,7 +549,7 @@ impl BmpIndex {
         })
     }
 
-    /// Read the entire raw V19 blob (including footer) from the source file.
+    /// Read the entire raw BMP blob (including footer) from the source file.
     ///
     /// Used by reorder paths (native-only) to copy a field byte-identically
     /// when its `reorder` schema attribute is unset.
@@ -522,6 +557,25 @@ impl BmpIndex {
     pub(crate) fn read_raw_blob(&self) -> std::io::Result<OwnedBytes> {
         self.source
             .read_bytes_range_sync(self.blob_offset..self.blob_offset + self.blob_len)
+    }
+
+    pub(crate) fn logically_ordered(&self) -> bool {
+        self.logically_ordered
+    }
+
+    pub(crate) fn ordered_slots_for_document(
+        &self,
+        doc: u32,
+    ) -> impl Iterator<Item = (u16, u32)> + '_ {
+        crate::segment::logical_address::ordered_document_slots(
+            self.num_virtual_docs,
+            doc,
+            |slot| {
+                let (doc, ordinal) = self.virtual_to_doc(slot);
+                (doc != u32::MAX)
+                    .then_some(crate::segment::logical_address::LogicalUnit { doc, ordinal })
+            },
+        )
     }
 
     /// Convert a compact virtual_id to (doc_id, ordinal) via table lookup.
@@ -929,6 +983,20 @@ impl BmpIndex {
         self.single_valued
     }
 
+    pub(crate) fn forward(&self) -> Option<&crate::segment::bmp_forward::BmpForward> {
+        self.forward.as_ref()
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn forward_payload_file_range(&self) -> std::ops::Range<u64> {
+        let start = self.blob_offset + self.doc_map_offset + u64::from(self.num_virtual_docs) * 6;
+        let bytes = self
+            .forward
+            .as_ref()
+            .map_or(0, |forward| forward.payload_bytes());
+        start..start + bytes as u64
+    }
+
     /// Estimated heap retained by this index. All corpus-sized sections are
     /// file-backed `OwnedBytes` slices and therefore excluded.
     pub fn estimated_heap_bytes(&self) -> usize {
@@ -1110,6 +1178,9 @@ impl BmpIndex {
     /// Only effective on mmap-backed data. No-op for heap (Vec) or non-native.
     #[cfg(feature = "native")]
     pub fn madvise_sequential(&self) {
+        if let Some(forward) = &self.forward {
+            forward.advise(libc::MADV_SEQUENTIAL);
+        }
         Self::madvise_owned(&self.block_data_bytes, libc::MADV_SEQUENTIAL);
         Self::madvise_owned(&self.block_data_starts_bytes, libc::MADV_SEQUENTIAL);
         self.block_grid.madvise_rows(libc::MADV_SEQUENTIAL);
@@ -1123,6 +1194,9 @@ impl BmpIndex {
     /// Keeps block_data_starts — needed for Phase 2 recomputation.
     #[cfg(feature = "native")]
     pub fn madvise_dontneed_block_data(&self) {
+        if let Some(forward) = &self.forward {
+            forward.advise(libc::MADV_DONTNEED);
+        }
         Self::madvise_owned(&self.block_data_bytes, libc::MADV_DONTNEED);
     }
 
@@ -1131,6 +1205,9 @@ impl BmpIndex {
     /// serving queries while and after being merged, until swapped out.
     #[cfg(feature = "native")]
     pub fn madvise_random_query(&self) {
+        if let Some(forward) = &self.forward {
+            forward.advise(libc::MADV_RANDOM);
+        }
         Self::madvise_owned(&self.block_data_bytes, libc::MADV_RANDOM);
         self.block_grid.madvise_rows(libc::MADV_RANDOM);
         self.superblock_grid.madvise_rows(libc::MADV_RANDOM);
@@ -1220,7 +1297,7 @@ mod safety_tests {
         postings.insert(3, vec![(0, 0, 1.0), (1, 0, 0.5)]);
         let mut blob = Vec::new();
         crate::segment::builder::bmp::build_bmp_blob(
-            postings, 64, 4, 0.0, None, 16, 5.0, 0, &mut blob,
+            postings, 64, 4, 0.0, None, 16, 5.0, 0, true, &mut blob,
         )
         .unwrap();
         blob
@@ -1261,7 +1338,7 @@ mod safety_tests {
         postings.insert(3, vec![(0, 0, 1.0), (0, 1, 0.8), (1, 0, 0.5)]);
         let mut blob = Vec::new();
         crate::segment::builder::bmp::build_bmp_blob(
-            postings, 64, 4, 0.0, None, 16, 5.0, 0, &mut blob,
+            postings, 64, 4, 0.0, None, 16, 5.0, 0, true, &mut blob,
         )
         .unwrap();
         let multi = parse(blob).unwrap();

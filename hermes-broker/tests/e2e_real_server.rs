@@ -250,6 +250,8 @@ async fn broker_routes_real_hermes_servers() {
             fields_to_load: vec!["id".to_string(), "title".to_string()],
             reranker: None,
             candidate_limit: 0,
+
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -291,6 +293,8 @@ async fn broker_routes_real_hermes_servers() {
             fields_to_load: vec![],
             reranker: None,
             candidate_limit: 0,
+
+            ..Default::default()
         })
         .await
         .unwrap()
@@ -360,10 +364,14 @@ async fn partitioned_fusion_collects_text_stats_from_real_servers() {
                         WeightedQuery {
                             query: Some(match_query("quantum")),
                             weight: 1.0,
+
+                            ..Default::default()
                         },
                         WeightedQuery {
                             query: Some(match_query("document")),
                             weight: 1.0,
+
+                            ..Default::default()
                         },
                     ],
                     rrf_k: 60.0,
@@ -379,6 +387,110 @@ async fn partitioned_fusion_collects_text_stats_from_real_servers() {
         .into_inner();
     // Fusion total_hits sums the contributing ranked-list counts; hits are
     // de-duplicated by document address in the fused result.
+    assert_eq!(response.ranking_method, "global_rrf_v1");
     assert_eq!(response.total_hits, 3);
     assert_eq!(response.hits.len(), 2);
+
+    let request = SearchRequest {
+        index_name: index_name.into(),
+        limit: 10,
+        query: Some(Query {
+            query: Some(query::Query::Fusion(FusionQuery {
+                queries: vec![
+                    WeightedQuery {
+                        name: "topic".into(),
+                        scope: ScoreScope::Document as i32,
+                        query: Some(match_query("quantum")),
+                        ..Default::default()
+                    },
+                    WeightedQuery {
+                        name: "specific".into(),
+                        scope: ScoreScope::Document as i32,
+                        query: Some(match_query("document")),
+                        score_only: true,
+                        ..Default::default()
+                    },
+                ],
+                candidate_depth: 10,
+                ..Default::default()
+            })),
+        }),
+        l1: Some(L1Ranking {
+            weights: std::collections::HashMap::from([
+                ("topic".into(), 1.0),
+                ("specific".into(), 10.0),
+            ]),
+            ..Default::default()
+        }),
+        score_export: Some(ScoreExport::default()),
+        fields_to_load: vec!["id".into()],
+        ..Default::default()
+    };
+    let ranked = broker_search_client(&broker)
+        .await
+        .search(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(ranked.ranking_method, "linear_v2");
+    assert_eq!(ranked.hits.len(), 2);
+    let id = &ranked.hits[0].fields["id"].values[0].value;
+    assert_eq!(id, &Some(field_value::Value::Text("doc-2".into())));
+    for hit in &ranked.hits {
+        let raw = hit.candidate_scores.as_ref().unwrap();
+        assert!(
+            (hit.score - (raw.document["topic"] + 10.0 * raw.document["specific"])).abs() < 1e-5
+        );
+        assert!(raw.passages.is_empty());
+    }
+    let a = &ranked.hits[0].candidate_scores.as_ref().unwrap().document;
+    let b = &ranked.hits[1].candidate_scores.as_ref().unwrap().document;
+    assert!(
+        (a["topic"] - b["topic"]).abs() < 1e-6,
+        "the same term and length use shared cross-shard statistics"
+    );
+    assert_eq!(
+        b["specific"], 0.0,
+        "score-only backfill distinguishes a valid nonmatch"
+    );
+    let mut no_backfill = request.clone();
+    let model = no_backfill.l1.as_mut().unwrap();
+    model.backfill = Some(false);
+    model.missing_values.insert("specific".into(), -0.75);
+    let missing = broker_search_client(&broker)
+        .await
+        .search(no_backfill)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(missing.ranking_method, "linear_v2");
+    assert_eq!(missing.hits.len(), ranked.hits.len());
+    for hit in &missing.hits {
+        let raw = hit.candidate_scores.as_ref().unwrap();
+        assert!(
+            !raw.document.contains_key("specific"),
+            "imputation must not hide raw missing values"
+        );
+        assert_eq!(hit.score, (f64::from(raw.document["topic"]) - 7.5) as f32);
+        let original = ranked
+            .hits
+            .iter()
+            .find(|h| h.address == hit.address)
+            .unwrap();
+        assert_eq!(
+            raw.document["topic"],
+            original.candidate_scores.as_ref().unwrap().document["topic"],
+            "organic scores are preserved across backfill settings"
+        );
+    }
+    let mut export = request;
+    export.l1 = None;
+    let raw = broker_search_client(&broker)
+        .await
+        .search(export)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(raw.ranking_method, "feature_export_v2");
+    assert_eq!(raw.hits.len(), 2);
 }

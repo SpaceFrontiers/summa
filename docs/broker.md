@@ -132,14 +132,21 @@ Reads:
   text terms (skipped for queries without BM25 terms or when the caller
   already supplied `text_stats`), sums them, and sends the sum as
   `SearchRequest.text_stats` so every partition scores with corpus-wide
-  document frequencies and lengths. Each partition is then queried with
-  `offset=0, limit=offset+limit` (`candidate_limit` forwards unchanged;
-  windows above the server's 10 000 cap are rejected) and the responses
-  merge by score descending, ties by `(segment_id, doc_id)` (segment ids
-  are UUIDv7-like, collision-safe across shards). Rank-fused (RRF) and
-  dense scores are functions of shard-local ranks or corpus-independent
-  and merge the same way. `total_hits` = saturating sum, timings = maximum,
-  `truncated` = any. Admission takes one permit per partition backend.
+  document frequencies and lengths. Plain pointwise searches query partitions
+  with `offset=0, limit=offset+limit` and merge by score descending, ties by
+  `(segment_id, doc_id)`. Top-level fusion without the legacy vector reranker
+  exports the per-branch shard nomination lists and computes global RRF (or
+  normalized weighted sum) using core fusion at the broker. L1 applies the same
+  core model on shards and broker, retaining sufficient passage rows for the
+  requested combiner. `linear_v2` preserves organic scores and supports optional
+  missing-only backfill plus learned raw missing defaults; defaults never fill
+  raw export maps. See [candidate scoring](candidate-rescoring.md) for
+  transport bounds and mixed-version checks. Legacy fusion nested inside
+  another query or combined with the vector reranker retains its existing
+  shard execution; it does not claim global RRF candidate selection.
+  `total_hits` = saturating sum, timings = maximum plus coordinator work,
+  `truncated` = any (incomplete candidate exports are rejected). Admission
+  takes one permit per partition backend and retains it through coordinator CPU work.
 - `GetDocument` asks every partition; the one holding the segment answers.
 - `GetIndexInfo` sums document/segment/memory counts and per-field stats;
   `GetTextStats` merges like the search prepass.
