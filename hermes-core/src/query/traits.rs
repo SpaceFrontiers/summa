@@ -359,6 +359,14 @@ macro_rules! define_query_traits {
                 QueryDecomposition::Opaque
             }
 
+            /// Sparse terms for query-global BMP superblock planning only.
+            /// Unlike scoring decomposition, this never replaces a query's
+            /// scorer. A filter wrapper may expose its inner sparse query here
+            /// while remaining opaque to Boolean scoring optimizations.
+            fn lsp_decomposition(&self) -> QueryDecomposition {
+                self.decompose()
+            }
+
             /// Exact scoring plan for a named L1 branch. Unsupported queries
             /// reject explicitly rather than returning truncated retrieval scores.
             fn candidate_query(&self) -> Result<super::CandidateQuery> {
@@ -504,6 +512,10 @@ impl Query for Box<dyn Query> {
 
     fn decompose(&self) -> QueryDecomposition {
         (**self).decompose()
+    }
+
+    fn lsp_decomposition(&self) -> QueryDecomposition {
+        (**self).lsp_decomposition()
     }
 
     fn is_filter(&self) -> bool {

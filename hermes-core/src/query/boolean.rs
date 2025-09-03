@@ -349,7 +349,7 @@ macro_rules! boolean_plan {
                     return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
                 }
                 if let Some((executor, info)) =
-                    build_sparse_maxscore_executor(&infos, reader, limit, None)
+                    build_sparse_maxscore_executor(&infos, reader, limit, None, &scorer_options)
                 {
                     let raw = executor.$execute_fn() $(. $aw)* ?;
                     return Ok(combine_sparse_results(raw, info.combiner, info.field, limit));
@@ -753,7 +753,7 @@ macro_rules! boolean_plan {
                     }
                     // Try MaxScore with predicate
                     if let Some((executor, info)) =
-                        build_sparse_maxscore_executor(&infos, reader, limit, Some(combined))
+                        build_sparse_maxscore_executor(&infos, reader, limit, Some(combined), &scorer_options)
                     {
                         log::debug!(
                             "BooleanQuery planner: predicate-aware sparse MaxScore, {} dims",
@@ -1017,6 +1017,13 @@ impl Query for BooleanQuery {
     }
 
     fn decompose(&self) -> super::QueryDecomposition {
+        if !self.must.is_empty() || !self.must_not.is_empty() {
+            return super::QueryDecomposition::Opaque;
+        }
+        self.lsp_decomposition()
+    }
+
+    fn lsp_decomposition(&self) -> super::QueryDecomposition {
         // LSP/0 selection depends only on the sparse scoring clauses. Pure
         // filters may remove documents but cannot increase their score, so a
         // query-global superblock plan remains valid and must be shared across

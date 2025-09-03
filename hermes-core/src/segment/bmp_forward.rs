@@ -142,14 +142,22 @@ impl BmpForward {
             .map(|(key, i)| (key.ordinal, i))
     }
 
-    /// Validate only the selected vector's payload, before returning its view.
-    pub(crate) fn vector(&self, index: u32) -> Result<ForwardVector<'_>> {
+    fn vector_range(&self, index: u32) -> Result<std::ops::Range<usize>> {
         if index >= self.len() {
             return Err(corrupt("vector index out of bounds"));
         }
-        let start = self.offset(index) as usize;
-        let end = self.offset(index + 1) as usize;
-        let vector = ForwardVector(&self.payload.as_slice()[start..end]);
+        Ok(self.offset(index) as usize..self.offset(index + 1) as usize)
+    }
+
+    /// Directory-only admission: do not fault or validate payload before its
+    /// bytes have been charged to the candidate scoring request.
+    pub(crate) fn vector_byte_len(&self, index: u32) -> Result<u64> {
+        Ok(self.vector_range(index)?.len() as u64)
+    }
+
+    /// Validate only the selected vector's payload, before returning its view.
+    pub(crate) fn vector(&self, index: u32) -> Result<ForwardVector<'_>> {
+        let vector = ForwardVector(&self.payload.as_slice()[self.vector_range(index)?]);
         let mut previous = None;
         for (dimension, impact) in vector.iter() {
             if dimension >= self.dims || impact == 0 || previous.is_some_and(|p| p > dimension) {

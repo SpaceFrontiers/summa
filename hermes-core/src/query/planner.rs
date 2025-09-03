@@ -444,6 +444,7 @@ pub(crate) fn build_sparse_maxscore_executor<'a>(
     reader: &'a SegmentReader,
     limit: usize,
     predicate: Option<DocPredicate<'a>>,
+    options: &super::ScorerOptions,
 ) -> Option<(MaxScoreExecutor<'a>, SparseTermQueryInfo)> {
     let field = infos[0].field;
     let si = reader.sparse_index(field)?;
@@ -465,7 +466,16 @@ pub(crate) fn build_sparse_maxscore_executor<'a>(
             .with_metric_labels(
                 reader.schema().index_label(),
                 reader.schema().get_field_name(field).unwrap_or("?"),
-            );
+            )
+            .with_budget(options.shared_threshold.clone());
+    let predicate = if let Some(filter) = &options.eligibility {
+        let filter = filter.clone();
+        Some(Box::new(move |doc| {
+            filter.contains(doc) && predicate.as_ref().is_none_or(|predicate| predicate(doc))
+        }) as DocPredicate<'a>)
+    } else {
+        predicate
+    };
     if let Some(pred) = predicate {
         executor = executor.with_predicate(pred);
     }
@@ -507,7 +517,17 @@ pub(crate) fn build_sparse_bmp_results_filtered(
     predicate: &dyn Fn(crate::DocId) -> bool,
     options: &super::ScorerOptions,
 ) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
-    build_sparse_bmp_results_inner(infos, reader, limit, Some(predicate), options)
+    if let Some(filter) = &options.eligibility {
+        build_sparse_bmp_results_inner(
+            infos,
+            reader,
+            limit,
+            Some(&|doc| filter.contains(doc) && predicate(doc)),
+            options,
+        )
+    } else {
+        build_sparse_bmp_results_inner(infos, reader, limit, Some(predicate), options)
+    }
 }
 
 fn build_sparse_bmp_results_inner(
@@ -773,6 +793,9 @@ pub(super) fn build_combined_bitset(
         }
     }
 
+    if let (Some(result), Some(eligibility)) = (&mut result, &options.eligibility) {
+        result.intersect_with(eligibility);
+    }
     if options.stop_if_expired() {
         None
     } else {

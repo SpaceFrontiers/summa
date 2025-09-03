@@ -521,10 +521,9 @@ impl BmpIndex {
         }
 
         log::debug!(
-            "BMP V{} index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
+            "BMPA index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
              block_grid={}, superblock_grid={}, coarse_grid={}, single_valued={}, block_data={}, doc_map={}, forward={}",
-            if magic == BMP_BLOB_MAGIC { 20 } else { 19 },
             num_blocks,
             num_superblocks,
             num_coarse_groups,

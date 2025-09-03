@@ -328,6 +328,40 @@ impl SegmentReader {
 }
 
 impl SegmentReader {
+    /// Admit the selected BMP payload using metadata alone. Forward records
+    /// are variable-sized; counting candidates does not bound their read work.
+    pub(crate) fn reserve_candidate_bmp_reads(
+        &self,
+        field: Field,
+        targets: &[u32],
+        remaining: &mut u64,
+    ) -> Result<()> {
+        let bmp = self
+            .bmp_index(field)
+            .ok_or_else(|| Error::Corruption("L1 BMP locations lack a BMP index".into()))?;
+        let mut previous_block = None;
+        for &target in targets {
+            let bytes = if let Some(forward) = bmp.forward() {
+                forward.vector_byte_len(target)?
+            } else {
+                if target >= bmp.num_virtual_docs {
+                    return Err(Error::Corruption("BMP candidate slot out of bounds".into()));
+                }
+                let block = target / bmp.bmp_block_size;
+                if previous_block == Some(block) {
+                    continue;
+                }
+                previous_block = Some(block);
+                let (start, end) = bmp.block_data_range(block);
+                end - start
+            };
+            *remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                Error::Query("L1 text/BMP payload read budget exceeded (256 MiB)".into())
+            })?;
+        }
+        Ok(())
+    }
+
     /// Existing text readers return zero-copy views on mmap/RAM but materialize
     /// ranges on lazy backends. Admit those ranges before invoking the reader.
     pub(crate) async fn reserve_candidate_text_reads(

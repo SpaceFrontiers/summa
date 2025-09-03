@@ -12,13 +12,14 @@ const MAX_VECTOR_BYTES: usize = 1024 * 1024 * 1024;
 
 struct CandidateProbeBudget {
     sparse: crate::segment::reader::SparseProbeBudget,
-    text_remaining: u64,
+    payload_remaining: u64,
 }
+
 impl Default for CandidateProbeBudget {
     fn default() -> Self {
         Self {
             sparse: Default::default(),
-            text_remaining: 256 * 1024 * 1024,
+            payload_remaining: 256 * 1024 * 1024,
         }
     }
 }
@@ -173,7 +174,7 @@ async fn score_field<D: Directory + 'static>(
                             query.field,
                             term,
                             false,
-                            &mut budget.text_remaining,
+                            &mut budget.payload_remaining,
                         )
                         .await?;
                 }
@@ -193,7 +194,7 @@ async fn score_field<D: Directory + 'static>(
                             query.field,
                             term,
                             phrase.terms.len() > 1,
-                            &mut budget.text_remaining,
+                            &mut budget.payload_remaining,
                         )
                         .await?;
                 }
@@ -202,6 +203,11 @@ async fn score_field<D: Directory + 'static>(
             }
             ScoreComponent::Sparse(terms) => {
                 if let Some(index) = reader.bmp_index(query.field) {
+                    reader.reserve_candidate_bmp_reads(
+                        query.field,
+                        targets,
+                        &mut budget.payload_remaining,
+                    )?;
                     searcher.install_search_cpu(|| {
                         crate::query::bmp::score_bmp_candidates(index, terms, targets)
                     })?
@@ -696,5 +702,75 @@ impl<D: Directory + 'static> Searcher<D> {
             crate::query::compare_search_results_desc(&a.result, &b.result)
         });
         Ok(output)
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    use crate::query::{Query, SparseVectorQuery};
+    use crate::structures::{SparseFormat, SparseVectorConfig};
+    use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
+
+    #[tokio::test]
+    async fn bmp_backfill_admits_payload_bytes_before_scoring_with_or_without_forward_storage() {
+        let mut schema = Schema::builder();
+        let fields: Vec<_> = [true, false]
+            .into_iter()
+            .map(|forward| {
+                schema.add_sparse_vector_field_with_config(
+                    &format!("sparse_{forward}"),
+                    true,
+                    false,
+                    SparseVectorConfig {
+                        format: SparseFormat::Bmp,
+                        dims: Some(16),
+                        bmp_forward_index: forward,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let directory = RamDirectory::new();
+        let config = IndexConfig::default();
+        let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+            .await
+            .unwrap();
+        let mut document = Document::new();
+        for &field in &fields {
+            document.add_sparse_vector(field, vec![(0, 1.0)]);
+        }
+        writer.add_document(document).unwrap();
+        writer.commit().await.unwrap();
+        let index = Index::open(directory, config).await.unwrap();
+        let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+        let reader = &searcher.segment_readers()[0];
+        let stats = Arc::new(GlobalStatsBuilder::new().build(0));
+        for field in fields {
+            let query = SparseVectorQuery::new(field, vec![(0, 1.0)])
+                .candidate_query()
+                .unwrap();
+            let locations = reader
+                .candidate_locations(field, &[0], 1, &mut Default::default())
+                .await
+                .unwrap();
+            let mut budget = CandidateProbeBudget {
+                payload_remaining: 0,
+                ..Default::default()
+            };
+            let error = score_field(
+                &searcher,
+                reader,
+                &query,
+                &locations,
+                &stats,
+                false,
+                &mut budget,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(error, Error::Query(_)), "{error}");
+            assert!(error.to_string().contains("payload read budget"), "{error}");
+        }
     }
 }

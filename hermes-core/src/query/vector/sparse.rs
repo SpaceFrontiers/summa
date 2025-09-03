@@ -541,9 +541,9 @@ impl Query for SparseVectorQuery {
             }
 
             // Fall back to MaxScore execution
-            if let Some((executor, info)) =
-                crate::query::planner::build_sparse_maxscore_executor(infos, reader, limit, None)
-            {
+            if let Some((executor, info)) = crate::query::planner::build_sparse_maxscore_executor(
+                infos, reader, limit, None, &options,
+            ) {
                 let raw = executor.execute().await?;
                 return Ok(crate::query::planner::combine_sparse_results(
                     raw,
@@ -593,9 +593,9 @@ impl Query for SparseVectorQuery {
         }
 
         // Fall back to MaxScore execution
-        if let Some((executor, info)) =
-            crate::query::planner::build_sparse_maxscore_executor(infos, reader, limit, None)
-        {
+        if let Some((executor, info)) = crate::query::planner::build_sparse_maxscore_executor(
+            infos, reader, limit, None, &options,
+        ) {
             let raw = executor.execute_sync()?;
             return Ok(crate::query::planner::combine_sparse_results(
                 raw,
