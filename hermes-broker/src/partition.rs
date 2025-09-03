@@ -219,6 +219,7 @@ pub fn merge_search_responses(
     let mut timings: Option<SearchTimings> = None;
     let mut truncated = false;
     let mut ranking_method: Option<String> = None;
+    let mut trace: Option<crate::proto::hermes::SearchTrace> = None;
     let mut fusion_candidates = BTreeMap::<u32, Vec<crate::proto::hermes::FusionCandidate>>::new();
     for response in responses {
         if ranking_method
@@ -240,6 +241,12 @@ pub fn merge_search_responses(
             merged.load_us = merged.load_us.max(t.load_us);
             merged.total_us = merged.total_us.max(t.total_us);
             merged.candidate_scoring_us = merged.candidate_scoring_us.max(t.candidate_scoring_us);
+        }
+        if let Some(part) = response.trace {
+            trace
+                .get_or_insert_with(Default::default)
+                .shards
+                .extend(part.shards);
         }
         hits.extend(response.hits);
         for branch in response.fusion_candidates {
@@ -273,6 +280,7 @@ pub fn merge_search_responses(
         timings,
         truncated,
         ranking_method: ranking_method.unwrap_or_default(),
+        trace,
         fusion_candidates: fusion_candidates
             .into_iter()
             .map(
@@ -647,17 +655,17 @@ mod tests {
             ..Default::default()
         });
         let first = SearchResponse {
-            ranking_method: "linear_v2".into(),
+            ranking_method: "formula_v1".into(),
             hits: vec![a],
             ..Default::default()
         };
         let second = SearchResponse {
-            ranking_method: "linear_v2".into(),
+            ranking_method: "formula_v1".into(),
             hits: vec![hit("b", 1, -1.0)],
             ..Default::default()
         };
         let merged = merge_search_responses(vec![first.clone(), second], 0, 2).unwrap();
-        assert_eq!(merged.ranking_method, "linear_v2");
+        assert_eq!(merged.ranking_method, "formula_v1");
         assert_eq!(merged.hits[0].score, -1.0);
         assert_eq!(
             merged.hits[1].candidate_scores.as_ref().unwrap().document["dense"],

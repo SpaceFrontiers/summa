@@ -407,7 +407,7 @@ fn validate_search_request_shape(
     req: &SearchRequest,
     root: &Query,
     shape: &QueryShapeLimits,
-) -> Result<(), Status> {
+) -> Result<(usize, Option<hermes_core::query::RankingModel>), Status> {
     validate_index_name_shape(&req.index_name, shape)?;
     if req.fields_to_load.len() > shape.max_fields_to_load {
         return Err(Status::invalid_argument(format!(
@@ -436,6 +436,22 @@ fn validate_search_request_shape(
         )));
     }
 
+    if req.include_rrf_scores
+        && (!matches!(root.query, Some(query::Query::Fusion(_))) || req.time_budget_ms != 0)
+    {
+        return Err(Status::invalid_argument(
+            "RRF diagnostics require top-level fusion and complete nomination without time_budget_ms",
+        ));
+    }
+    if (req.include_rrf_scores || req.tracing)
+        && let Some(query::Query::Fusion(fusion)) = &root.query
+        && fusion.queries.iter().any(|branch| branch.name.len() > 128)
+    {
+        return Err(Status::invalid_argument(
+            "diagnostic branch names exceed 128 bytes",
+        ));
+    }
+    let mut ranking_model = None;
     let scoring = req.l1.is_some() || req.score_export.is_some();
     if scoring {
         let Some(query::Query::Fusion(fusion)) = &root.query else {
@@ -486,28 +502,14 @@ fn validate_search_request_shape(
                     "all_passages diagnostics require backfill",
                 ));
             }
-            if model.weights.len() > MAX_FUSION_SUB_QUERIES
-                || model.transforms.len() > MAX_FUSION_SUB_QUERIES
-                || model.missing_values.len() > MAX_FUSION_SUB_QUERIES
+            if model.missing_values.len() > MAX_FUSION_SUB_QUERIES
+                || model.missing_values.keys().any(|name| name.len() > 128)
             {
                 return Err(Status::invalid_argument(
-                    "l1 coefficient count exceeds branch limit",
+                    "l1 missing defaults exceed branch/name limits",
                 ));
             }
-            if model
-                .weights
-                .keys()
-                .chain(model.transforms.keys())
-                .chain(model.missing_values.keys())
-                .any(|name| name.len() > 128)
-            {
-                return Err(Status::invalid_argument(
-                    "l1 coefficient name exceeds 128 bytes",
-                ));
-            }
-            super::candidate_scoring::linear_model(model)
-                .validate(&names)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            ranking_model = Some(super::candidate_scoring::ranking_model(model, &names)?);
             if fusion.method != FusionMethod::FusionRrf as i32
                 || fusion.rrf_k != 0.0
                 || fusion.queries.iter().any(|q| q.weight != 0.0)
@@ -575,11 +577,12 @@ fn validate_search_request_shape(
         )?;
     }
 
-    Ok(())
+    Ok((budget.nodes, ranking_model))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(super) struct SearchBudget {
+    pub(super) model: Option<hermes_core::query::RankingModel>,
     /// Number of results returned to the caller.
     pub(super) final_limit: usize,
     /// Number of leading results skipped for pagination.
@@ -588,6 +591,8 @@ pub(super) struct SearchBudget {
     pub(super) search_limit: usize,
     /// Single first-stage pool used by every collector and retrieval mode.
     pub(super) candidate_limit: usize,
+    /// Query clones in an optional trace, including decoded node overhead.
+    pub(super) trace_query_bytes: usize,
 }
 
 fn bounded_limit(name: &str, value: u32, default: usize, max: usize) -> Result<usize, Status> {
@@ -618,7 +623,16 @@ pub(super) fn validate_search_budget(
         .query
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("Query is required"))?;
-    validate_search_request_shape(req, query, &limits.shape)?;
+    let (nodes, model) = validate_search_request_shape(req, query, &limits.shape)?;
+    let trace_query_bytes = if req.tracing {
+        // Sparse packed indices can occupy four bytes in memory per wire byte;
+        // tiny/empty query nodes need an independent container allowance.
+        nodes
+            .saturating_mul(std::mem::size_of::<Query>().saturating_mul(4))
+            .saturating_add(prost::Message::encoded_len(query).saturating_mul(4))
+    } else {
+        0
+    };
     let final_limit = bounded_limit(
         "SearchRequest.limit",
         req.limit,
@@ -701,9 +715,11 @@ pub(super) fn validate_search_budget(
     }
 
     Ok(SearchBudget {
+        model,
         final_limit,
         offset,
         search_limit,
         candidate_limit,
+        trace_query_bytes,
     })
 }

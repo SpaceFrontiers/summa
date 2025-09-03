@@ -130,7 +130,9 @@ impl SearchService for SearchServiceImpl {
         let mut ranking_method = String::new();
         let mut feature_exports = HashMap::new();
         let mut fusion_candidates = Vec::new();
+        let mut nomination_lists = Vec::new();
         let mut response_budget = SearchResponseBudget::with_maximum(self.limits.max_search_response_bytes);
+        response_budget.reserve_retained(budget.trace_query_bytes)?;
         let (results, total_seen, rerank_config) =
             if req.l1.is_some() || req.score_export.is_some() {
                 let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query else { unreachable!("validated fusion scoring request") };
@@ -138,7 +140,7 @@ impl SearchService for SearchServiceImpl {
                     convert_query(branch.query.as_ref().expect("validated branch"), searcher.schema(), Some(searcher.global_stats()), Some(index.directory().root()), &self.limits.shape)
                         .map(Arc::from).map_err(|e| Status::invalid_argument(format!("Invalid scoring branch: {e}")))
                 }).collect::<Result<_, _>>()?;
-                let plan = candidate_scoring::scoring_plan(fusion, &queries, &req, searcher.schema())?;
+                let plan = candidate_scoring::scoring_plan(fusion, &queries, &req, searcher.schema(), budget.model.clone())?;
                 let stats = match req.text_stats.as_ref() {
                     Some(stats) => Arc::new(text_stats_from_proto(stats, searcher.schema())),
                     None => searcher.candidate_text_stats(&plan).await.map_err(crate::error::hermes_error_to_status)?,
@@ -156,7 +158,9 @@ impl SearchService for SearchServiceImpl {
                     return Err(Status::invalid_argument(format!("feature export needs limit >= complete candidate union ({} documents)", candidates.len())));
                 }
                 let t_scoring = Instant::now();
-                let mut scored = searcher.score_candidates_with_retrieved(&candidates, &plan, Some(stats), &retrieved).await.map_err(crate::error::hermes_error_to_status)?;
+                let needs_rrf = plan.model.as_ref().is_some_and(hermes_core::query::RankingModel::needs_rrf);
+                let rrf = needs_rrf.then(|| candidate_scoring::rrf_scores(&searcher, &req, fusion, &lists, &candidates)).transpose()?;
+                let mut scored = searcher.score_candidates_with_retrieved_and_rrf(&candidates, &plan, Some(stats), &retrieved, rrf.as_deref()).await.map_err(crate::error::hermes_error_to_status)?;
                 candidate_scoring_us = t_scoring.elapsed().as_micros() as u64;
                 let fused_limit = if rerank_setup.is_some() { candidate_limit } else { limit };
                 scored.truncate(fused_limit);
@@ -168,7 +172,8 @@ impl SearchService for SearchServiceImpl {
                     }
                     results.push(candidate.result);
                 }
-                ranking_method = if req.l1.is_some() { "linear_v2" } else { "feature_export_v2" }.into();
+                if req.include_rrf_scores || req.tracing { nomination_lists = lists; }
+                ranking_method = if req.l1.is_some() { "formula_v1" } else { "feature_export_v2" }.into();
                 query_desc = format!("{}: {} branches, depth {}, union {}", ranking_method, queries.len(), depth, candidates.len());
                 (results, seen, rerank_setup.map(|config| (config, limit)))
             } else if let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query {
@@ -204,9 +209,10 @@ impl SearchService for SearchServiceImpl {
                     let queries: Vec<_> = sub_queries.iter().map(|(query, _)| query.clone()).collect();
                     let stats = req.text_stats.as_ref().map(|stats| Arc::new(text_stats_from_proto(stats, searcher.schema())));
                     let lists = searcher.search_candidate_lists(&queries, depth, stats).await.map_err(crate::error::hermes_error_to_status)?;
-                    fusion_candidates = candidate_scoring::export_nomination_lists(&lists, &mut response_budget)?;
+                    if !req.tracing { fusion_candidates = candidate_scoring::export_nomination_lists(&lists, &mut response_budget)?; }
                     let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
-                    let candidates = searcher.merge_candidate_lists(lists.into_iter().map(|(list, _)| list)).map_err(crate::error::hermes_error_to_status)?;
+                    let candidates = searcher.merge_candidate_lists(lists.iter().map(|(list, _)| list.as_slice())).map_err(crate::error::hermes_error_to_status)?;
+                    if req.include_rrf_scores || req.tracing { nomination_lists = lists; }
                     if candidates.len() > limit {
                         return Err(Status::invalid_argument(format!("candidate export needs limit >= complete union ({} documents)", candidates.len())));
                     }
@@ -262,7 +268,15 @@ impl SearchService for SearchServiceImpl {
                     .iter()
                     .map(|(query, weight)| (query.as_ref(), *weight))
                     .collect();
-                let (fused, seen) = searcher
+                let (fused, seen) = if req.include_rrf_scores || req.tracing {
+                    let queries: Vec<_> = sub_queries.iter().map(|(query, _)| query.clone()).collect();
+                    let lists = searcher.search_candidate_lists(&queries, candidate_limit, None).await.map_err(crate::error::hermes_error_to_status)?;
+                    let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
+                    let borrowed: Vec<_> = lists.iter().zip(&sub_queries).map(|((list, _), (_, weight))| (list.as_slice(), *weight)).collect();
+                    let fused = searcher.fuse_candidate_lists(&borrowed, method, combiner, fused_limit).map_err(crate::error::hermes_error_to_status)?;
+                    nomination_lists = lists;
+                    (fused, seen)
+                } else { searcher
                     .search_fused_with_count(
                         &query_refs,
                         candidate_limit,
@@ -271,7 +285,7 @@ impl SearchService for SearchServiceImpl {
                         combiner,
                     )
                     .await
-                    .map_err(crate::error::hermes_error_to_status)?;
+                    .map_err(crate::error::hermes_error_to_status)? };
                 let rerank_config = rerank_setup.map(|config| (config, limit));
                 (fused, seen, rerank_config)
                 }
@@ -328,6 +342,10 @@ impl SearchService for SearchServiceImpl {
             };
         let search_us = (t_search.elapsed().as_micros() as u64).saturating_sub(candidate_scoring_us);
 
+        let mut trace = if req.tracing {
+            Some(candidate_scoring::export_trace(&req, &nomination_lists, &results, total_seen, candidate_limit, (&ranking_method, truncated), &mut response_budget)?)
+        } else { None };
+
         // ── Phase 2: L2 reranking (optional) ────────────────────────────────
         let t_rerank = Instant::now();
         let results = if let Some((config, final_limit)) = rerank_config {
@@ -343,6 +361,23 @@ impl SearchService for SearchServiceImpl {
             .take(budget.final_limit)
             .collect();
         let rerank_us = t_rerank.elapsed().as_micros() as u64;
+
+        if let Some(trace) = &mut trace {
+            trace.shards[0].selected = candidate_scoring::export_candidates(&results, &mut response_budget)?;
+        }
+        let mut rrf_exports = if req.include_rrf_scores {
+            let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query else { unreachable!("validated RRF fusion") };
+            if fusion_candidates.is_empty() && !req.tracing {
+                fusion_candidates = candidate_scoring::export_nomination_lists(&nomination_lists, &mut response_budget)?;
+                for (export, (index, _)) in fusion_candidates.iter_mut().zip(fusion.queries.iter().enumerate().filter(|(_, branch)| !branch.score_only)) {
+                    export.query_index = index as u32;
+                }
+            }
+            let start = Instant::now();
+            let scores = candidate_scoring::rrf_scores(&searcher, &req, fusion, &nomination_lists, &results)?;
+            candidate_scoring_us = candidate_scoring_us.saturating_add(start.elapsed().as_micros() as u64);
+            candidate_scoring::export_rrf_scores(scores, fusion, &mut response_budget)?.into_iter()
+        } else { Vec::new().into_iter() };
 
         // ── Phase 3: Document field loading ─────────────────────────────────
         let t_load = Instant::now();
@@ -439,7 +474,10 @@ impl SearchService for SearchServiceImpl {
                 }
             }
 
+            let rrf = rrf_exports.next();
             let hit = SearchHit {
+                rrf_score: rrf.as_ref().map(|(score, _)| *score),
+                rrf_contributions: rrf.map(|(_, votes)| votes).unwrap_or_default(),
                 address: Some(DocAddress {
                     segment_id: format!("{:032x}", result.segment_id),
                     doc_id: result.doc_id,
@@ -472,7 +510,7 @@ impl SearchService for SearchServiceImpl {
         }
 
         // total_seen = number of documents that were actually scored across all segments
-        Ok(Response::new(SearchResponse {
+        let response = SearchResponse {
             hits,
             total_hits: total_seen as u64,
             took_ms,
@@ -486,7 +524,10 @@ impl SearchService for SearchServiceImpl {
             truncated,
             ranking_method,
             fusion_candidates,
-        }))
+            trace,
+        };
+        response_budget.check_response(&response)?;
+        Ok(Response::new(response))
             }
         .await;
         let status = if result.is_ok() { "ok" } else { "error" };
@@ -708,7 +749,7 @@ impl SearchService for SearchServiceImpl {
             memory_stats: Some(memory_stats),
             vector_stats,
             text_fields,
-            candidate_scoring_version: 2,
+            candidate_scoring_version: 3,
             unprepared_candidate_fields: searcher
                 .segment_readers()
                 .iter()

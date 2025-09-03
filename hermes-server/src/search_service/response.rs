@@ -41,6 +41,8 @@ pub(super) struct SearchResponseBudget {
     retained_bytes: usize,
     encoded_bytes: usize,
     maximum: usize,
+    candidate_slots: usize,
+    candidate_ordinals: usize,
 }
 
 impl SearchResponseBudget {
@@ -49,6 +51,8 @@ impl SearchResponseBudget {
             retained_bytes: 0,
             encoded_bytes: 0,
             maximum,
+            candidate_slots: 0,
+            candidate_ordinals: 0,
         }
     }
 
@@ -80,6 +84,27 @@ impl SearchResponseBudget {
             .and_then(|bytes| bytes.checked_add(1))
             .ok_or_else(|| Status::invalid_argument("Search response encoded size overflowed"))?;
         Self::reserve(&mut self.encoded_bytes, framed, self.maximum)
+    }
+
+    pub(super) fn check_response(&self, response: &SearchResponse) -> Result<(), Status> {
+        Self::reserve(&mut 0, prost::Message::encoded_len(response), self.maximum)
+    }
+
+    pub(super) fn reserve_candidate_rows(
+        &mut self,
+        hits: usize,
+        ordinals: usize,
+    ) -> Result<(), Status> {
+        self.candidate_slots = self.candidate_slots.saturating_add(hits);
+        self.candidate_ordinals = self.candidate_ordinals.saturating_add(ordinals);
+        if self.candidate_slots > hermes_core::query::MAX_FUSION_CANDIDATE_SLOTS
+            || self.candidate_ordinals > hermes_core::query::MAX_FUSION_CHUNK_SLOTS
+        {
+            return Err(Status::invalid_argument(
+                "nomination/trace response candidate or ordinal budget exceeded",
+            ));
+        }
+        Ok(())
     }
 }
 

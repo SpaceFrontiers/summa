@@ -172,6 +172,15 @@ class CandidateScores:
 
 
 @dataclass
+class RrfContribution:
+    query_index: int
+    query_name: str
+    rank: int
+    score: float
+    ordinal: int | None = None
+
+
+@dataclass
 class SearchHit:
     """A single search result."""
 
@@ -180,6 +189,8 @@ class SearchHit:
     fields: dict[str, Any] = field(default_factory=dict)
     ordinal_scores: list[OrdinalScore] = field(default_factory=list)
     candidate_scores: CandidateScores | None = None
+    rrf_score: float | None = None
+    rrf_contributions: list[RrfContribution] = field(default_factory=list)
 
 
 @dataclass
@@ -207,6 +218,35 @@ class FusionCandidateList:
 
 
 @dataclass
+class QueryTrace:
+    query_index: int
+    query_name: str
+    query: dict[str, Any]
+    scope: int
+    score_only: bool
+    candidate_depth: int
+    total_seen: int
+    candidates: list[FusionCandidate] = field(default_factory=list)
+
+
+@dataclass
+class ShardSearchTrace:
+    shard_id: str
+    backend_id: str
+    index_name: str
+    queries: list[QueryTrace]
+    selected: list[FusionCandidate]
+    ranking_method: str
+    truncated: bool
+    filters: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class SearchTrace:
+    shards: list[ShardSearchTrace] = field(default_factory=list)
+
+
+@dataclass
 class SearchResponse:
     """Search response with hits and metadata."""
 
@@ -217,6 +257,7 @@ class SearchResponse:
     ranking_method: str = ""
     truncated: bool = False
     fusion_candidates: list[FusionCandidateList] = field(default_factory=list)
+    trace: SearchTrace | None = None
 
 
 @dataclass

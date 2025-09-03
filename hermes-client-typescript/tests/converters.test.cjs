@@ -133,11 +133,11 @@ test("candidate export preserves method, depth and per-branch wire results", () 
 });
 
 
-test("linear options preserve explicit disabled backfill and learned defaults", () => {
+test("formula options preserve explicit disabled backfill and learned defaults", () => {
   const { SearchRequest } = require("../dist/generated/hermes.js");
   for (const backfill of [undefined, false, true]) {
     const request = SearchRequest.fromPartial({ l1: {
-      weights: { dense: 2 }, backfill, missingValues: { dense: -0.75 },
+      formula: "2 * dense", backfill, missingValues: { dense: -0.75 },
     } });
     const decoded = SearchRequest.decode(SearchRequest.encode(request).finish());
     assert.equal(decoded.l1.backfill, backfill);
@@ -153,20 +153,77 @@ test("client search forwards disabled backfill and learned missing defaults", as
   let sent;
   client.searchClient = { search: async (request) => {
     sent = request;
-    return SearchResponse.fromPartial({ rankingMethod: "linear_v2" });
+    return SearchResponse.fromPartial({ rankingMethod: "formula_v1" });
   } };
   await client.search("docs", { query: { all: {} },
-    l1: { weights: { dense: 1 }, backfill: false, missingValues: { dense: -0.75 } },
+    l1: { formula: "dense", backfill: false, missingValues: { dense: -0.75 } },
   });
   assert.equal(sent.l1.backfill, false);
   assert.deepEqual(sent.l1.missingValues, { dense: -0.75 });
 });
 
-test("linear client request rejects a backend with legacy ranking semantics", async () => {
+test("formula client request rejects a backend with legacy ranking semantics", async () => {
   const { HermesClient } = require("../dist/client.js");
   const { SearchResponse } = require("../dist/generated/hermes.js");
   const client = new HermesClient();
   client.indexClient = {};
   client.searchClient = { search: async () => SearchResponse.fromPartial({ rankingMethod: "linear_v1" }) };
-  await assert.rejects(client.search("docs", { query: { all: {} }, l1: { weights: { dense: 1 } } }), /linear_v2/);
+  await assert.rejects(client.search("docs", { query: { all: {} }, l1: { formula: "dense" } }), /formula_v1/);
+});
+
+
+test("RRF and trace preserve zero presence and discarded nominations through client and wire", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { SearchResponse, SearchRequest } = require("../dist/generated/hermes.js");
+  const client = new HermesClient();
+  client.indexClient = {};
+  let sent;
+  let wire = SearchResponse.fromPartial({ hits: [{ score: -3, rrfScore: 0, rrfContributions: [
+    { queryIndex: 0, queryName: "title", rank: 1, score: 0 },
+    { queryIndex: 1, queryName: "body", rank: 2, score: 0, ordinal: 0 },
+  ] }], trace: { shards: [{ shardId: "s", backendId: "b", queries: [{ queryName: "body",
+    query: { term: { field: "body", term: "rust" } }, candidateDepth: 2, totalSeen: 100,
+    candidates: [{ address: { segmentId: "abc", docId: 9 }, score: -0.5 }],
+  }], filters: [{ all: {} }] }] } });
+  client.searchClient = { search: async (request) => {
+    sent = SearchRequest.decode(SearchRequest.encode(SearchRequest.fromPartial(request)).finish());
+    return SearchResponse.decode(SearchResponse.encode(wire).finish());
+  } };
+  const result = await client.search("docs", { query: { all: {} }, includeRrfScores: true, tracing: true });
+  assert.equal(sent.includeRrfScores, true);
+  assert.equal(sent.tracing, true);
+  assert.equal(result.hits[0].score, -3);
+  assert.equal(result.hits[0].rrfScore, 0);
+  assert.deepEqual(result.hits[0].rrfContributions.map(v => v.ordinal), [undefined, 0]);
+  assert.deepEqual(result.trace, wire.trace);
+  wire = SearchResponse.fromPartial({ hits: [{}] });
+  const plain = await client.search("docs", { query: { all: {} } });
+  assert.equal(sent.tracing, false);
+  assert.equal(sent.includeRrfScores, false);
+  assert.equal(plain.trace, undefined);
+  assert.equal(plain.hits[0].rrfScore, undefined);
+  await assert.rejects(client.search("docs", { query: { all: {} }, tracing: true }), /trace/);
+  await assert.rejects(client.search("docs", { query: { all: {} }, includeRrfScores: true }), /RRF/);
+});
+
+
+test("symbolic formula roundtrips and legacy coefficients are rejected", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { SearchResponse, SearchRequest } = require("../dist/generated/hermes.js");
+  const client = new HermesClient();
+  client.indexClient = {};
+  let sent;
+  let rankingMethod = "formula_v1";
+  client.searchClient = { search: async request => {
+    sent = SearchRequest.decode(SearchRequest.encode(SearchRequest.fromPartial(request)).finish());
+    return SearchResponse.fromPartial({ rankingMethod });
+  } };
+  const formula = "log1p(title) - 1000 * rrf";
+  await client.search("docs", { query: { all: {} }, l1: { formula } });
+  assert.equal(sent.l1.formula, formula);
+  for (const legacy of ["weights", "bias", "transforms", "rrfWeight"]) {
+    await assert.rejects(client.search("docs", { query: { all: {} }, l1: { formula, [legacy]: {} } }), /only formula/);
+  }
+  rankingMethod = "linear_v2";
+  await assert.rejects(client.search("docs", { query: { all: {} }, l1: { formula } }), /formula_v1/);
 });

@@ -1,9 +1,10 @@
 //! Named scores over a bounded candidate union: preserve organic retrieval
-//! values, optionally backfill missing cells, and apply the shared linear model.
+//! values, optionally backfill missing cells, and apply the compiled formula.
 mod execution;
+mod formula;
 mod model;
 mod retrieved;
-pub use model::{FeatureTransform, LinearModel};
+pub use formula::RankingModel;
 
 use super::{MultiValueCombiner, PhraseQuery, QueryDecomposition};
 use crate::{Error, Field, Result};
@@ -180,7 +181,7 @@ pub struct CandidateScoringPlan {
     /// Probe only cells missing from retrieval. False preserves missing values.
     pub backfill: bool,
     /// None exports raw features; Some ranks directly with this model.
-    pub model: Option<LinearModel>,
+    pub model: Option<RankingModel>,
     /// Bounds only response feature rows; every candidate passage is scored
     /// before top passages are selected. This does not change indexed chunks.
     pub export_passages: usize,

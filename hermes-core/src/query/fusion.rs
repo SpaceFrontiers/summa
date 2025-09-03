@@ -18,6 +18,9 @@
 //!     .await?;
 //! ```
 
+mod rrf_scores;
+pub use rrf_scores::*;
+
 use rustc_hash::FxHashMap;
 
 use super::vector::MultiValueCombiner;
@@ -138,6 +141,37 @@ pub fn fuse_ranked_lists(
     results
 }
 
+type ChunkKey = (u128, u32, u32);
+
+/// Shared rank preparation for fusion and its optional response diagnostics.
+fn ranked_chunks(list: &[SearchResult], chunks: &mut Vec<(ChunkKey, f32)>) {
+    chunks.clear();
+    for result in list {
+        let mut had_positions = false;
+        for (_field_id, scored_positions) in &result.positions {
+            for sp in scored_positions {
+                had_positions = true;
+                chunks.push(((result.segment_id, result.doc_id, sp.position), sp.score));
+            }
+        }
+        if !had_positions {
+            // No per-chunk detail (text query / positions not collected):
+            // the whole doc is one pseudo-chunk at ordinal 0.
+            chunks.push(((result.segment_id, result.doc_id, 0), result.score));
+        }
+    }
+
+    // A branch gets one vote per logical passage, even when a Boolean
+    // query returns that ordinal under several fields. Keep its strongest
+    // raw score before assigning ranks; duplicates must not shift ranks.
+    chunks.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
+    chunks.dedup_by_key(|entry| entry.0);
+
+    // Rank chunks within this list by chunk score (desc); deterministic
+    // tiebreak on the key.
+    chunks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+}
+
 /// Fuse multiple ranked result lists at **chunk granularity**.
 ///
 /// Sub-query results are exploded into per-chunk entries keyed by
@@ -165,8 +199,15 @@ pub fn fuse_ranked_lists_chunked(
     combiner: MultiValueCombiner,
     limit: usize,
 ) -> Vec<SearchResult> {
-    type ChunkKey = (u128, u32, u32); // (segment, doc, ordinal)
+    fuse_ranked_lists_chunked_impl(lists, method, combiner, limit)
+}
 
+fn fuse_ranked_lists_chunked_impl<L: AsRef<[SearchResult]>>(
+    lists: impl IntoIterator<Item = (L, f32)>,
+    method: FusionMethod,
+    combiner: MultiValueCombiner,
+    limit: usize,
+) -> Vec<SearchResult> {
     // Every (chunk key, list index, contribution) triple. Sorting this once
     // by (key, list index) replaces two hash maps (per-chunk fusion and
     // per-document grouping) with one sort plus two nested run-length
@@ -177,34 +218,10 @@ pub fn fuse_ranked_lists_chunked(
     let mut chunks: Vec<(ChunkKey, f32)> = Vec::new();
 
     for (list_index, (list, weight)) in lists.into_iter().enumerate() {
-        chunks.clear();
-        for result in &list {
-            let mut had_positions = false;
-            for (_field_id, scored_positions) in &result.positions {
-                for sp in scored_positions {
-                    had_positions = true;
-                    chunks.push(((result.segment_id, result.doc_id, sp.position), sp.score));
-                }
-            }
-            if !had_positions {
-                // No per-chunk detail (text query / positions not collected):
-                // the whole doc is one pseudo-chunk at ordinal 0.
-                chunks.push(((result.segment_id, result.doc_id, 0), result.score));
-            }
-        }
+        ranked_chunks(list.as_ref(), &mut chunks);
         if chunks.is_empty() {
             continue;
         }
-
-        // A branch gets one vote per logical passage, even when a Boolean
-        // query returns that ordinal under several fields. Keep its strongest
-        // raw score before assigning ranks; duplicates must not shift ranks.
-        chunks.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.total_cmp(&a.1)));
-        chunks.dedup_by_key(|entry| entry.0);
-
-        // Rank chunks within this list by chunk score (desc); deterministic
-        // tiebreak on the key.
-        chunks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
         // Min-max bounds for score-based fusion
         let (min_score, inv_range) = match method {
@@ -290,6 +307,36 @@ pub fn try_fuse_ranked_lists_chunked(
     combiner: MultiValueCombiner,
     limit: usize,
 ) -> Result<Vec<SearchResult>, String> {
+    let borrowed: Vec<_> = lists
+        .iter()
+        .map(|(list, weight)| (list.as_slice(), *weight))
+        .collect();
+    validate_fusion_lists(&borrowed, method, combiner)?;
+    Ok(fuse_ranked_lists_chunked(lists, method, combiner, limit))
+}
+
+/// Fuse borrowed nomination lists so diagnostics can reuse them without cloning
+/// documents or positions. Bounds and scoring match the owning entry point.
+pub fn try_fuse_ranked_lists_chunked_borrowed(
+    lists: &[(&[SearchResult], f32)],
+    method: FusionMethod,
+    combiner: MultiValueCombiner,
+    limit: usize,
+) -> Result<Vec<SearchResult>, String> {
+    validate_fusion_lists(lists, method, combiner)?;
+    Ok(fuse_ranked_lists_chunked_impl(
+        lists.iter().copied(),
+        method,
+        combiner,
+        limit,
+    ))
+}
+
+fn validate_fusion_lists(
+    lists: &[(&[SearchResult], f32)],
+    method: FusionMethod,
+    combiner: MultiValueCombiner,
+) -> Result<(), String> {
     if lists.is_empty() {
         return Err("fusion requires at least one ranked list".to_string());
     }
@@ -309,8 +356,8 @@ pub fn try_fuse_ranked_lists_chunked(
 
     let mut candidates = 0usize;
     let mut chunks = 0usize;
-    for (list_index, (list, weight)) in lists.iter().enumerate() {
-        if !weight.is_finite() || *weight < 0.0 {
+    for (list_index, &(list, weight)) in lists.iter().enumerate() {
+        if !weight.is_finite() || weight < 0.0 {
             return Err(format!(
                 "fusion list weight at index {list_index} must be finite and non-negative, \
                  got {weight}"
@@ -344,7 +391,7 @@ pub fn try_fuse_ranked_lists_chunked(
         }
     }
 
-    Ok(fuse_ranked_lists_chunked(lists, method, combiner, limit))
+    Ok(())
 }
 
 #[cfg(test)]

@@ -356,7 +356,27 @@ impl<D: Directory + 'static> Searcher<D> {
         stats: Option<Arc<GlobalStats>>,
         retrieved: &[(usize, &[SearchResult])],
     ) -> Result<Vec<ScoredCandidate>> {
+        self.score_candidates_with_retrieved_and_rrf(candidates, plan, stats, retrieved, None)
+            .await
+    }
+
+    /// Supply organic RRF features to the same L1 scorer before any top-k.
+    pub async fn score_candidates_with_retrieved_and_rrf(
+        &self,
+        candidates: &[SearchResult],
+        plan: &CandidateScoringPlan,
+        stats: Option<Arc<GlobalStats>>,
+        retrieved: &[(usize, &[SearchResult])],
+        rrf: Option<&[crate::query::RrfScore]>,
+    ) -> Result<Vec<ScoredCandidate>> {
         plan.validate(self.schema())?;
+        if rrf.is_some_and(|scores| scores.len() != candidates.len() || plan.model.is_none())
+            || (plan.model.as_ref().is_some_and(RankingModel::needs_rrf) && rrf.is_none())
+        {
+            return Err(Error::Query(
+                "invalid or missing RRF L1 candidate features".into(),
+            ));
+        }
         if candidates.len() > crate::query::MAX_FUSION_CANDIDATE_SLOTS {
             return Err(Error::Query(
                 "candidate scoring document budget exceeded".into(),
@@ -645,8 +665,12 @@ impl<D: Directory + 'static> Searcher<D> {
                     scored_passages,
                 };
                 if let Some(model) = &plan.model {
-                    result.score =
-                        model.score_candidate(&names, &mut features, plan.document_combiner)?;
+                    result.score = model.score_candidate(
+                        &names,
+                        &mut features,
+                        plan.document_combiner,
+                        rrf.map(|scores| &scores[candidate_index]),
+                    )?;
                 }
                 let CandidateScores {
                     document,

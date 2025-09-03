@@ -326,3 +326,36 @@ Browser JS
     └── IndexRegistry (multi-index management)
             └── Map<name, RemoteIndex>
 ```
+
+## Structured search diagnostics
+
+`searchStructured` accepts `includeRrfScores` for fusion queries and `tracing`
+for any supported structured query. Both default to false:
+
+```js
+const response = await index.searchStructured({
+  query: {
+    fusion: {
+      queries: [
+        { name: "title", query: { match: { field: "title", text: "rust" } } },
+        { name: "body", query: { match: { field: "body", text: "rust" } } },
+      ],
+    },
+  },
+  limit: 10,
+  includeRrfScores: true,
+  tracing: true,
+});
+console.log(response.hits[0].rrf_score, response.hits[0].rrf_contributions);
+console.log(response.trace.shards[0].queries);
+```
+
+Responses use snake_case, matching other WASM search results. RRF attribution
+uses complete bounded branch lists before pagination and leaves `score`
+unchanged. The local trace includes each branch's query tree, raw candidate
+scores/ordinals and selected addresses, without hydrating discarded documents.
+It contains one local shard with empty broker/backend IDs. The trace observes
+the configured retrieval depth and does not run Boolean clauses independently.
+The diagnostic window is capped at 10,000; candidate/ordinal bounds and a 64 MiB
+JSON response limit reject oversized exports. WASM supports its existing RRF and
+weighted-sum fusion modes; server L1/reranker features remain server APIs.

@@ -1,5 +1,5 @@
-import type { CandidateScores, L1Ranking } from "./generated/hermes";
-export type { CandidateScores, FeatureTransform, L1Ranking, PassageScores } from "./generated/hermes";
+import type { CandidateScores, L1Ranking, RrfContribution, SearchTrace } from "./generated/hermes";
+export type { CandidateScores, L1Ranking, PassageScores, RrfContribution, SearchTrace, ShardSearchTrace, QueryTrace } from "./generated/hermes";
 // =============================================================================
 // Response types
 // =============================================================================
@@ -28,6 +28,8 @@ export interface SearchHit {
   fields: Record<string, any>;
   ordinalScores: OrdinalScore[];
   candidateScores?: CandidateScores;
+  rrfScore?: number;
+  rrfContributions?: RrfContribution[];
 }
 
 /** Detailed timing breakdown for search phases (all values in microseconds). */
@@ -57,6 +59,7 @@ export interface SearchResponse {
   timings?: SearchTimings;
   rankingMethod?: string;
   fusionCandidates?: FusionCandidateList[];
+  trace?: SearchTrace;
   truncated?: boolean;
 }
 
@@ -274,7 +277,11 @@ export interface Reranker {
 // =============================================================================
 
 export interface SearchRequest {
-  l1?: Pick<L1Ranking, "weights"> & Partial<Omit<L1Ranking, "weights">>;
+  /** Add organic RRF score and branch contributions without changing ranking. */
+  includeRrfScores?: boolean;
+  /** Preserve per-shard nomination/selection trace. Default false. */
+  tracing?: boolean;
+  l1?: Pick<L1Ranking, "formula"> & Partial<Omit<L1Ranking, "formula">>;
   scoreExport?: { passagesPerDocument?: number; allPassages?: boolean };
   query: Query;
   limit?: number;

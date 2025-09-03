@@ -108,7 +108,7 @@ message FusionQuery {
   // Common document eligibility for every branch. Does not create an L1 feature.
   repeated Query filters = 6;
   // Independent per-branch nomination depth (L1/export only). 0 uses
-  // candidate_limit. The complete union survives until linear ranking/export.
+  // candidate_limit. The complete union survives until L1 ranking/export.
   uint32 candidate_depth = 7;
 }
 
@@ -120,25 +120,17 @@ enum ScoreScope {
 }
 
 // Fixed preprocessing trained offline, never derived from a shard/result page.
-message FeatureTransform {
-  bool signed_log1p = 1;
-  optional double scale = 2; // Unset = 1; finite and positive.
-  double offset = 3;
-}
-
-// Direct linear ranking instead of RRF. Keys name FusionQuery.queries branches.
-// Omitted weights contribute zero but those branches can still nominate.
-// Unknown names, non-finite coefficients and all-zero models are errors.
+// The only L1 scoring contract: a compiled symbolic formula over branch scores.
 message L1Ranking {
-  map<string, double> weights = 1;
-  double bias = 2;
-  map<string, FeatureTransform> transforms = 3;
-  // Default true: evaluate only scores missing from named retrieval branches.
-  // False preserves absent scores as missing; real zero/negative scores remain.
+  reserved 1, 2, 3, 6;
+  reserved "weights", "bias", "transforms", "rrf_weight";
+  // Omitted=true: backfill only missing raw cells. False uses organic values.
   optional bool backfill = 4;
-  // Learned raw-score defaults by branch, applied before that branch's transform.
-  // Unspecified missing values contribute nothing. Raw exports remain missing.
+  // Raw defaults for missing formula variables; omitted variables use zero.
   map<string, double> missing_values = 5;
+  // Required, nonempty expression over named raw scores and reserved `rrf`.
+  // Runs before passage/document selection. Requires formula_v1.
+  string formula = 7;
 }
 
 message ScoreExport {
@@ -317,11 +309,17 @@ message SearchRequest {
   // replace the backend's own statistics for the listed fields and terms;
   // unset = the backend aggregates over its own segments.
   TextStats text_stats = 9;
-  // Requires named, scoped fusion branches. No RRF runs before/after this model.
+  // Requires named, scoped fusion branches. The formula may reference the RRF feature.
   L1Ranking l1 = 10;
   // With no l1, exports the complete candidate union for external inference.
   // Export-only requests require offset=0 and a limit covering the whole union.
   ScoreExport score_export = 11;
+  // Return RRF diagnostics alongside the requested ranking score. Requires
+  // top-level fusion and complete nomination; does not change ranking.
+  bool include_rrf_scores = 12;
+  // Preserve bounded per-shard nomination and selection traces. Default false;
+  // does not rerun subqueries or change retrieval/ranking budgets.
+  bool tracing = 13;
 }
 
 message GetTextStatsRequest {
@@ -370,6 +368,18 @@ message SearchHit {
   map<string, FieldValueList> fields = 3;
   repeated OrdinalScore ordinal_scores = 4;  // Per-ordinal scores for multi-value fields
   CandidateScores candidate_scores = 5; // Present only when score_export is requested.
+  optional float rrf_score = 6; // Present when include_rrf_scores is requested.
+  repeated RrfContribution rrf_contributions = 7;
+}
+
+// One organic nomination vote. Document context has no ordinal; chunk votes
+// are combined per ordinal before the document's fusion combiner is applied.
+message RrfContribution {
+  uint32 query_index = 1;
+  string query_name = 2; // Empty for unnamed legacy branches.
+  uint32 rank = 3; // One-based rank in the complete merged nomination list.
+  float score = 4; // Branch weight / (k + rank).
+  optional uint32 ordinal = 5;
 }
 
 message CandidateScores {
@@ -431,11 +441,39 @@ message SearchResponse {
   // True when `time_budget_ms` expired before every candidate was scored;
   // the hits are then the best-so-far, not the exact top-k.
   bool truncated = 5;
-  // Explicit feature contract: "linear_v2" or "feature_export_v2" for new modes.
+  // Feature contracts: "formula_v1" or "feature_export_v2".
   string ranking_method = 6;
   // Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
   // these lists preserve independent branch scores and nominated ordinals.
   repeated FusionCandidateList fusion_candidates = 7;
+  SearchTrace trace = 8; // Present only when tracing is requested.
+}
+
+message SearchTrace {
+  repeated ShardSearchTrace shards = 1;
+}
+
+message ShardSearchTrace {
+  string shard_id = 1; // Populated by the broker; empty on direct server calls.
+  string backend_id = 2;
+  string index_name = 3;
+  repeated QueryTrace queries = 4;
+  repeated FusionCandidate selected = 5; // Shard results before broker selection.
+  string ranking_method = 6;
+  bool truncated = 7;
+  repeated Query filters = 8; // Common fusion filters applied during nomination.
+}
+
+message QueryTrace {
+  uint32 query_index = 1;
+  string query_name = 2;
+  Query query = 3; // Original branch/root expression, including nested clauses.
+  ScoreScope scope = 4;
+  bool score_only = 5;
+  uint32 candidate_depth = 6;
+  uint32 total_seen = 7;
+  // All organic nominations within the requested depth, before fusion/L1/L2.
+  repeated FusionCandidate candidates = 8;
 }
 
 message FusionCandidateList {
@@ -455,7 +493,7 @@ message SearchTimings {
   uint64 rerank_us = 2;       // L2 reranking (dense vector rescoring)
   uint64 load_us = 3;         // Document field loading from store
   uint64 total_us = 4;        // Wall-clock total (includes overhead)
-  uint64 candidate_scoring_us = 5; // Missing-only feature backfill and linear selection.
+  uint64 candidate_scoring_us = 5; // Missing-only feature backfill and formula selection.
 }
 
 // Get document request/response
@@ -486,7 +524,7 @@ message GetIndexInfoResponse {
   // Per text field: how it is tokenized, so clients pick query forms
   // without parsing the schema SDL.
   repeated TextFieldInfo text_fields = 7;
-  uint32 candidate_scoring_version = 8; // 2 preserves organic scores, supports optional backfill and learned missing defaults.
+  uint32 candidate_scoring_version = 8; // 3 requires symbolic L1 formula; preserves organic scores, optional backfill and raw defaults.
   repeated string unprepared_candidate_fields = 9; // Fields requiring lookup preparation/migration.
 }
 

@@ -750,7 +750,7 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
             let (results, _) = searcher.search_with_positions(&**query, 50).await.unwrap();
             if i < 2 {
                 use crate::query::{
-                    CandidateFeature, CandidateScoringPlan, LinearModel, ScoreScope,
+                    CandidateFeature, CandidateScoringPlan, RankingModel, ScoreScope,
                 };
                 let plan = CandidateScoringPlan {
                     backfill: true,
@@ -759,10 +759,9 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
                         scope: ScoreScope::Chunk,
                         query: query.candidate_query().unwrap(),
                     }],
-                    model: Some(LinearModel {
-                        weights: std::collections::BTreeMap::from([("text".into(), 1.0)]),
-                        ..Default::default()
-                    }),
+                    model: Some(
+                        RankingModel::compile("text", &["text"], &Default::default()).unwrap(),
+                    ),
                     export_passages: 10,
                     all_passages: true,
                     document_combiner: crate::query::MultiValueCombiner::Max,

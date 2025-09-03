@@ -1840,7 +1840,7 @@ async fn test_bmp_reorder_multi_field_scores_without_inverse_sidecars() {
             continue;
         }
         use crate::query::{
-            CandidateFeature, CandidateScoringPlan, LinearModel, Query, ScoreScope,
+            CandidateFeature, CandidateScoringPlan, Query, RankingModel, ScoreScope,
         };
         let other = SparseVectorQuery::new(sparse_b, vec![(1000 + i as u32, 1.0)]);
         let plan = CandidateScoringPlan {
@@ -1857,10 +1857,7 @@ async fn test_bmp_reorder_multi_field_scores_without_inverse_sidecars() {
                     query: other.candidate_query().unwrap(),
                 },
             ],
-            model: Some(LinearModel {
-                weights: std::collections::BTreeMap::from([("b".into(), 1.0)]),
-                ..Default::default()
-            }),
+            model: Some(RankingModel::compile("b", &["a", "b"], &Default::default()).unwrap()),
             export_passages: 1,
             all_passages: true,
             document_combiner: crate::query::MultiValueCombiner::Max,

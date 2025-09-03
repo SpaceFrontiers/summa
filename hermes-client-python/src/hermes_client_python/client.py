@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import grpc
+from google.protobuf.json_format import MessageToDict
 from grpc import aio
 
 from . import hermes_pb2 as pb
@@ -24,9 +25,13 @@ from .types import (
     IndexInfo,
     OrdinalScore,
     PassageScores,
+    QueryTrace,
+    RrfContribution,
     SearchHit,
     SearchResponse,
     SearchTimings,
+    SearchTrace,
+    ShardSearchTrace,
     VectorFieldStats,
 )
 
@@ -393,6 +398,8 @@ class HermesClient:
         candidate_limit: int = 0,
         l1: dict[str, Any] | None = None,
         score_export: dict[str, Any] | None = None,
+        include_rrf_scores: bool = False,
+        tracing: bool = False,
         timeout: float | None = None,
     ) -> SearchResponse:
         """Search for documents.
@@ -415,6 +422,10 @@ class HermesClient:
             reranker: Reranker dict matching proto Reranker message
             candidate_limit: Shared first-stage candidate pool. Zero uses the
                 result window; explicit values are capped at 2x that window.
+            include_rrf_scores: Add independent RRF scores and per-branch votes
+                to fusion hits, preserving the requested ranking. Default false.
+            tracing: Preserve every shard's bounded branch nominations, query
+                provenance and selected results in response.trace. Default false.
 
         Returns:
             SearchResponse with hits
@@ -482,6 +493,8 @@ class HermesClient:
             reranker=pb_reranker,
             candidate_limit=candidate_limit,
             l1=pb.L1Ranking(**l1) if l1 is not None else None,
+            include_rrf_scores=include_rrf_scores,
+            tracing=tracing,
             score_export=pb.ScoreExport(**score_export)
             if score_export is not None
             else None,
@@ -491,10 +504,20 @@ class HermesClient:
             request, timeout=self._deadline(timeout)
         )
 
-        if l1 is not None and response.ranking_method != "linear_v2":
+        expected_l1 = "formula_v1"
+        if l1 is not None and response.ranking_method != expected_l1:
             raise RuntimeError(
-                "L1 requires a backend with linear_v2 ranking semantics; "
+                f"L1 requires a backend with {expected_l1} ranking semantics; "
                 f"received {response.ranking_method!r}"
+            )
+
+        if tracing and not response.HasField("trace"):
+            raise RuntimeError("Backend omitted requested search trace; upgrade Hermes")
+        if include_rrf_scores and any(
+            not hit.HasField("rrf_score") for hit in response.hits
+        ):
+            raise RuntimeError(
+                "Backend omitted requested RRF diagnostics; upgrade Hermes"
             )
 
         hits = [
@@ -504,6 +527,17 @@ class HermesClient:
                     doc_id=hit.address.doc_id,
                 ),
                 score=hit.score,
+                rrf_score=hit.rrf_score if hit.HasField("rrf_score") else None,
+                rrf_contributions=[
+                    RrfContribution(
+                        query_index=vote.query_index,
+                        query_name=vote.query_name,
+                        rank=vote.rank,
+                        score=vote.score,
+                        ordinal=vote.ordinal if vote.HasField("ordinal") else None,
+                    )
+                    for vote in hit.rrf_contributions
+                ],
                 fields={k: _from_field_value_list(v) for k, v in hit.fields.items()},
                 candidate_scores=CandidateScores(
                     document=dict(hit.candidate_scores.document),
@@ -541,6 +575,9 @@ class HermesClient:
         return SearchResponse(
             hits=hits,
             total_hits=response.total_hits,
+            trace=_from_search_trace(response.trace)
+            if response.HasField("trace")
+            else None,
             took_ms=response.took_ms,
             timings=timings,
             ranking_method=response.ranking_method,
@@ -988,4 +1025,54 @@ def _build_reranker(r: dict[str, Any]) -> pb.Reranker:
         matryoshka_dims=r.get("matryoshka_dims", 0),
         binary_vector=r.get("binary_vector", b""),
         rrf_k=r.get("rrf_k", 0),
+    )
+
+
+def _from_trace_candidate(candidate: pb.FusionCandidate) -> FusionCandidate:
+    return FusionCandidate(
+        address=DocAddress(candidate.address.segment_id, candidate.address.doc_id),
+        score=candidate.score,
+        ordinal_scores=[
+            OrdinalScore(row.ordinal, row.score) for row in candidate.ordinal_scores
+        ],
+    )
+
+
+def _from_search_trace(trace: pb.SearchTrace) -> SearchTrace:
+    return SearchTrace(
+        shards=[
+            ShardSearchTrace(
+                shard_id=shard.shard_id,
+                backend_id=shard.backend_id,
+                index_name=shard.index_name,
+                ranking_method=shard.ranking_method,
+                truncated=shard.truncated,
+                filters=[
+                    MessageToDict(query, preserving_proto_field_name=True)
+                    for query in shard.filters
+                ],
+                selected=[
+                    _from_trace_candidate(candidate) for candidate in shard.selected
+                ],
+                queries=[
+                    QueryTrace(
+                        query_index=branch.query_index,
+                        query_name=branch.query_name,
+                        query=MessageToDict(
+                            branch.query, preserving_proto_field_name=True
+                        ),
+                        scope=branch.scope,
+                        score_only=branch.score_only,
+                        candidate_depth=branch.candidate_depth,
+                        total_seen=branch.total_seen,
+                        candidates=[
+                            _from_trace_candidate(candidate)
+                            for candidate in branch.candidates
+                        ],
+                    )
+                    for branch in shard.queries
+                ],
+            )
+            for shard in trace.shards
+        ]
     )
