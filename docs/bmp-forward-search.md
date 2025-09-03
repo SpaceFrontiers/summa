@@ -5,7 +5,7 @@ removed from production BMP search after the whole-query measurements below.
 There is no search query option or automatic dispatch to forward values.
 Ordinary BMP search always uses its inverted block scorer. Stored forward values
 are used by L1 candidate backfill and BP whenever available; see
-[optional storage](bmp-forward-index.md#optional-storage).
+[optional storage](bmp-forward-index.md#configuration-and-scoring).
 
 The prototype preserved the existing H/E/D traversal and collector and tried
 forward completion only for small survivor sets after phase one. Its best warm
