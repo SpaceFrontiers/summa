@@ -831,9 +831,12 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
         BinaryIndexType, DenseVectorQuantization, FieldType, IvfRoutingMode, PositionMode,
         VectorIndexType,
     };
-    use hermes_core::structures::{IndexSize, WeightQuantization};
+    use hermes_core::structures::{IndexSize, SparseFormat, WeightQuantization};
 
     let mut lines = vec!["index _ {".to_string()];
+    if schema.reorder_on_merge() {
+        lines.push("    reorder_on_merge: true".into());
+    }
     for (_, entry) in schema.fields() {
         // --- type name + optional type-level config ---
         let mut type_part = match entry.field_type {
@@ -984,6 +987,20 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
 
             // Sparse vector index params
             if let Some(ref cfg) = entry.sparse_vector_config {
+                if cfg.format == SparseFormat::Bmp {
+                    idx_params.push("format: bmp".into());
+                    idx_params.push(format!("bmp_block_size: {}", cfg.bmp_block_size));
+                    idx_params.push(format!("bmp_grid_bits: {}", cfg.bmp_grid_bits));
+                }
+                if let Some(dims) = cfg.dims {
+                    idx_params.push(format!("dims: {dims}"));
+                }
+                if let Some(max_weight) = cfg.max_weight {
+                    idx_params.push(format!("max_weight: {max_weight}"));
+                }
+                if let Some(doc_mass) = cfg.doc_mass {
+                    idx_params.push(format!("doc_mass: {doc_mass}"));
+                }
                 let quant = match cfg.weight_quantization {
                     WeightQuantization::Float32 => None,
                     WeightQuantization::Float16 => Some("float16"),
@@ -1061,6 +1078,9 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
 
         if entry.primary_key {
             attrs.push("primary".to_string());
+        }
+        if entry.reorder {
+            attrs.push("reorder".into());
         }
 
         if attrs.is_empty() {
@@ -2170,6 +2190,38 @@ mod tests {
         )
         .unwrap();
         assert!(!off.to_string().contains("~proximity"), "{off}");
+    }
+
+    #[test]
+    fn index_info_schema_preserves_bmp_storage_and_reordering() {
+        let input = r#"
+            index documents {
+                reorder_on_merge: true
+                field sparse: sparse_vector<u32> [indexed<format: bmp, dims: 105879,
+                    max_weight: 5.0, bmp_block_size: 64, bmp_grid_bits: 2,
+                    quantization: uint8, doc_mass: 0.9,
+                    query<lsp_gamma: 64>>, reorder]
+            }
+        "#;
+        let schema = hermes_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        let reparsed = hermes_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let original = schema
+            .get_field_entry(schema.get_field("sparse").unwrap())
+            .unwrap();
+        let reported = reparsed
+            .get_field_entry(reparsed.get_field("sparse").unwrap())
+            .unwrap();
+        assert_eq!(
+            original.sparse_vector_config, reported.sparse_vector_config,
+            "{rendered}"
+        );
+        assert_eq!(original.reorder, reported.reorder, "{rendered}");
+        assert_eq!(
+            schema.reorder_on_merge(),
+            reparsed.reorder_on_merge(),
+            "{rendered}"
+        );
     }
 
     #[test]
