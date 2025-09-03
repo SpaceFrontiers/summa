@@ -2,7 +2,7 @@
 
 use super::SegmentReader;
 use crate::dsl::{Field, FieldType};
-use crate::segment::ordinal_lookup::{LookupKind, OrdinalLookup};
+
 use crate::{DocId, Error, Result};
 
 #[derive(Clone, Copy, Debug)]
@@ -15,45 +15,15 @@ pub(crate) struct CandidateLocation {
 }
 
 impl SegmentReader {
-    pub(crate) fn prepared_lookup(
-        &self,
-        field: Field,
-        kind: LookupKind,
-        slots: u32,
-    ) -> Result<&OrdinalLookup> {
-        let lookup = self.ordinal_lookups.get().and_then(|lookups| {
-            lookups.binary_search_by_key(&field.0, OrdinalLookup::field).ok().map(|i| &lookups[i])
-        }).ok_or_else(|| Error::Query(format!(
-            "candidate scoring field {} in segment {:032x} has a reordered map without an ordinal lookup; prepare candidate-scoring lookups before using L1",
-            field.0, self.meta.id,
-        )))?;
-        let expected_count = match kind {
-            LookupKind::ChunkedText => self.chunk_map(field).map_or(0, |map| map.num_chunks()),
-            LookupKind::SparseBmp => self
-                .bmp_indexes
-                .get(&field.0)
-                .map_or(0, |bmp| bmp.num_real_docs()),
-        };
-        if lookup.kind() != kind
-            || lookup.physical_slots() != slots
-            || lookup.len() != expected_count as usize
-        {
-            return Err(Error::Corruption(format!(
-                "candidate lookup for field {} does not match its physical source",
-                field.0,
-            )));
-        }
-        Ok(lookup)
-    }
-
     /// Resolve every stored value of the selected documents in one field.
     /// The caller controls the expansion budget; no field silently truncates
     /// a long document or invents a body ordinal for document context.
-    pub(crate) fn candidate_locations(
+    pub(crate) async fn candidate_locations(
         &self,
         field: Field,
         documents: &[DocId],
         max_locations: usize,
+        budget: &mut super::SparseProbeBudget,
     ) -> Result<Vec<CandidateLocation>> {
         if documents.iter().any(|&doc| doc >= self.num_docs())
             || !documents.windows(2).all(|pair| pair[0] < pair[1])
@@ -61,6 +31,9 @@ impl SegmentReader {
             return Err(Error::Query(
                 "candidate documents must be valid, unique and sorted".into(),
             ));
+        }
+        if documents.is_empty() {
+            return Ok(Vec::new());
         }
         let entry = self
             .schema
@@ -85,51 +58,41 @@ impl SegmentReader {
                 let Some(map) = self.chunk_map(field) else {
                     return Ok(locations);
                 };
+                if !map.has_logical_addressing() {
+                    return Err(Error::Query("legacy reordered text needs explicit Reorder to upgrade its chunk map for L1".into()));
+                }
                 for &doc in documents {
-                    if map.logically_ordered() {
-                        for (ordinal, physical) in map.ordered_slots_for_document(doc) {
-                            push(doc, ordinal, physical)?;
-                        }
-                    } else {
-                        let lookup =
-                            self.prepared_lookup(field, LookupKind::ChunkedText, map.num_chunks())?;
-                        for (ordinal, physical) in lookup.for_document(doc) {
-                            if map.resolve(physical) != (doc, ordinal) {
-                                return Err(Error::Corruption(
-                                    "text lookup points to another logical chunk".into(),
-                                ));
-                            }
-                            push(doc, ordinal, physical)?;
-                        }
+                    for (ordinal, physical) in map.slots_for_document(doc) {
+                        push(doc, ordinal, physical)?;
                     }
                 }
             }
             FieldType::SparseVector => {
                 let Some(bmp) = self.bmp_indexes.get(&field.0) else {
                     if self.sparse_indexes.contains_key(&field.0) {
-                        return Err(Error::Query("candidate address lookup requires a BMP sparse field; legacy sparse scoring must use posting probes".into()));
+                        return self
+                            .maxscore_candidate_locations(
+                                field,
+                                documents,
+                                None,
+                                max_locations,
+                                budget,
+                            )
+                            .await;
                     }
                     return Ok(locations);
                 };
                 for &doc in documents {
-                    if bmp.logically_ordered() {
+                    if let Some(forward) = bmp.forward() {
+                        for (ordinal, physical) in forward.for_document(doc) {
+                            push(doc, ordinal, physical)?;
+                        }
+                    } else if bmp.logically_ordered() {
                         for (ordinal, physical) in bmp.ordered_slots_for_document(doc) {
                             push(doc, ordinal, physical)?;
                         }
                     } else {
-                        let lookup = self.prepared_lookup(
-                            field,
-                            LookupKind::SparseBmp,
-                            bmp.num_virtual_docs,
-                        )?;
-                        for (ordinal, physical) in lookup.for_document(doc) {
-                            if bmp.virtual_to_doc(physical) != (doc, ordinal) {
-                                return Err(Error::Corruption(
-                                    "sparse lookup points to another logical chunk".into(),
-                                ));
-                            }
-                            push(doc, ordinal, physical)?;
-                        }
+                        return Err(Error::Query("reordered BMP backfill requires forward values; enable bmp_forward_index and explicitly reorder/rebuild, or disable L1 backfill".into()));
                     }
                 }
             }
@@ -202,19 +165,12 @@ impl SegmentReader {
             .fields()
             .filter_map(|(field, entry)| {
                 let prepared = if let Some(map) = self.chunk_map(field) {
-                    map.logically_ordered()
-                        || self
-                            .prepared_lookup(field, LookupKind::ChunkedText, map.num_chunks())
-                            .is_ok()
+                    map.has_logical_addressing()
                 } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
-                    bmp.logically_ordered()
-                        || self
-                            .prepared_lookup(field, LookupKind::SparseBmp, bmp.num_virtual_docs)
-                            .is_ok()
+                    bmp.forward().is_some() || bmp.logically_ordered()
                 } else {
-                    !self.sparse_indexes.contains_key(&field.0)
-                        && !(self.vector_indexes.contains_key(&field.0)
-                            && !self.flat_vectors.contains_key(&field.0))
+                    !(self.vector_indexes.contains_key(&field.0)
+                        && !self.flat_vectors.contains_key(&field.0))
                         && !(matches!(entry.field_type, FieldType::Text)
                             && !entry.chunked
                             && self
@@ -233,33 +189,46 @@ impl SegmentReader {
 impl SegmentReader {
     /// Resolve only nominated logical passages. Lookup costs depend on the
     /// candidate set, not on the number of chunks in a book.
-    pub(crate) fn candidate_passage_locations(
+    pub(crate) async fn candidate_passage_locations(
         &self,
         field: Field,
-        targets: &[crate::segment::ordinal_lookup::LogicalUnit],
+        targets: &[crate::segment::logical_address::LogicalUnit],
+        budget: &mut super::SparseProbeBudget,
     ) -> Result<Vec<CandidateLocation>> {
-        use crate::segment::ordinal_lookup::{LogicalUnit, ordered_slot_for_unit};
+        use crate::segment::logical_address::{LogicalUnit, ordered_slot_for_unit};
+        if self.sparse_indexes.contains_key(&field.0) {
+            let mut documents: Vec<_> = targets.iter().map(|t| t.doc).collect();
+            documents.dedup();
+            return self
+                .maxscore_candidate_locations(
+                    field,
+                    &documents,
+                    Some(targets),
+                    targets.len(),
+                    budget,
+                )
+                .await;
+        }
         let mut locations = Vec::with_capacity(targets.len());
         for &target in targets {
             let physical = if let Some(map) = self.chunk_map(field) {
-                if map.logically_ordered() {
-                    ordered_slot_for_unit(map.num_chunks(), target, |physical| {
-                        let (doc, ordinal) = map.resolve(physical);
-                        Some(LogicalUnit { doc, ordinal })
-                    })
-                } else {
-                    self.prepared_lookup(field, LookupKind::ChunkedText, map.num_chunks())?
-                        .for_unit(target)
+                if !map.has_logical_addressing() {
+                    return Err(Error::Query("legacy reordered text needs explicit Reorder to upgrade its chunk map for L1".into()));
                 }
+                map.slot_for_unit(target)
             } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
-                if bmp.logically_ordered() {
+                if let Some(forward) = bmp.forward() {
+                    forward.find(target)
+                } else if bmp.logically_ordered() {
                     ordered_slot_for_unit(bmp.num_virtual_docs, target, |physical| {
                         let (doc, ordinal) = bmp.virtual_to_doc(physical);
                         (doc != u32::MAX).then_some(LogicalUnit { doc, ordinal })
                     })
                 } else {
-                    self.prepared_lookup(field, LookupKind::SparseBmp, bmp.num_virtual_docs)?
-                        .for_unit(target)
+                    return Err(Error::Query(
+                        "reordered BMP backfill requires forward values; enable bmp_forward_index and explicitly reorder/rebuild, or disable L1 backfill"
+                            .into(),
+                    ));
                 }
             } else if let Some(flat) = self.flat_vectors.get(&field.0) {
                 let (start, count) = flat.flat_indexes_for_doc_range(target.doc);
@@ -281,8 +250,6 @@ impl SegmentReader {
                 } else {
                     None
                 }
-            } else if self.sparse_indexes.contains_key(&field.0) {
-                return Err(Error::Query("candidate scoring requires BMP sparse storage; migrate this legacy MaxScore field".into()));
             } else if self.vector_indexes.contains_key(&field.0) {
                 return Err(Error::Query(
                     "candidate scoring needs stored flat vectors".into(),
@@ -294,7 +261,12 @@ impl SegmentReader {
                 let actual = if let Some(map) = self.chunk_map(field) {
                     map.resolve(physical)
                 } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
-                    bmp.virtual_to_doc(physical)
+                    if let Some(forward) = bmp.forward() {
+                        let key = forward.key(physical);
+                        (key.doc, key.ordinal)
+                    } else {
+                        bmp.virtual_to_doc(physical)
+                    }
                 } else {
                     self.flat_vectors[&field.0].get_doc_id(physical as usize)
                 };
@@ -311,5 +283,131 @@ impl SegmentReader {
             }
         }
         Ok(locations)
+    }
+}
+
+impl SegmentReader {
+    async fn maxscore_candidate_locations(
+        &self,
+        field: Field,
+        documents: &[DocId],
+        targets: Option<&[crate::segment::logical_address::LogicalUnit]>,
+        limit: usize,
+        budget: &mut super::SparseProbeBudget,
+    ) -> Result<Vec<CandidateLocation>> {
+        use crate::segment::logical_address::LogicalUnit;
+        let index = &self.sparse_indexes[&field.0];
+        let mut units = std::collections::BTreeSet::new();
+        index
+            .probe_candidates(documents, None, budget, |doc, ordinal, _| {
+                let key = LogicalUnit { doc, ordinal };
+                if targets.is_some_and(|targets| targets.binary_search(&key).is_err()) {
+                    return Ok(());
+                }
+                if !units.contains(&key) {
+                    if units.len() == limit {
+                        return Err(Error::Query(
+                            "L1 sparse field-value expansion budget exceeded".into(),
+                        ));
+                    }
+                    units.insert(key);
+                }
+                Ok(())
+            })
+            .await?;
+        Ok(units
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| CandidateLocation {
+                doc: key.doc,
+                ordinal: key.ordinal,
+                physical: i as u32,
+            })
+            .collect())
+    }
+}
+
+impl SegmentReader {
+    /// Existing text readers return zero-copy views on mmap/RAM but materialize
+    /// ranges on lazy backends. Admit those ranges before invoking the reader.
+    pub(crate) async fn reserve_candidate_text_reads(
+        &self,
+        field: Field,
+        term: &[u8],
+        positions: bool,
+        remaining: &mut u64,
+    ) -> Result<()> {
+        let lazy_postings = !self.postings_handle.is_sync();
+        let lazy_positions =
+            positions && self.positions_handle.as_ref().is_some_and(|h| !h.is_sync());
+        if !lazy_postings && !lazy_positions {
+            return Ok(());
+        }
+        let mut key = Vec::with_capacity(4 + term.len());
+        key.extend_from_slice(&field.0.to_le_bytes());
+        key.extend_from_slice(term);
+        let Some(info) = self.term_dict.get(&key).await? else {
+            return Ok(());
+        };
+        let posting_bytes = if lazy_postings {
+            info.external_info().map_or(0, |(_, bytes)| bytes)
+        } else {
+            0
+        };
+        let position_bytes = if lazy_positions {
+            info.position_info().map_or(0, |(_, bytes)| bytes)
+        } else {
+            0
+        };
+        *remaining = posting_bytes
+            .checked_add(position_bytes)
+            .and_then(|bytes| remaining.checked_sub(bytes))
+            .ok_or_else(|| Error::Query("L1 lazy text read budget exceeded (256 MiB)".into()))?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn lazy_text_backfill_is_admitted_before_any_payload_read() {
+        use crate::directories::{FileHandle, RamDirectory};
+        use crate::{Document, Index, IndexConfig, IndexWriter, Schema};
+        let mut schema = Schema::builder();
+        let field = schema.add_text_field_with_tokenizer("body", true, false, "simple");
+        let schema = std::sync::Arc::new(schema.build());
+        let dir = RamDirectory::new();
+        let config = IndexConfig::default();
+        let mut writer = IndexWriter::create(dir.clone(), (*schema).clone(), config.clone())
+            .await
+            .unwrap();
+        for _ in 0..256 {
+            let mut doc = Document::new();
+            doc.add_text(field, "common term");
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let index = Index::open(dir.clone(), config).await.unwrap();
+        let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+        let id = crate::segment::SegmentId(searcher.segment_readers()[0].meta().id);
+        let mut reader = SegmentReader::open(&dir, id, schema, 4).await.unwrap();
+        reader.postings_handle = FileHandle::lazy(
+            reader.postings_handle.len(),
+            std::sync::Arc::new(|_| Box::pin(async { panic!("payload I/O before admission") })),
+        );
+        let error = reader
+            .reserve_candidate_text_reads(field, b"common", false, &mut 0)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("text read budget"));
+        reader
+            .reserve_candidate_text_reads(field, b"absent", false, &mut 0)
+            .await
+            .unwrap();
+        // Statistics precede scoring admission, so they must read only the
+        // dictionary even when a common term has an external posting list.
+        assert_eq!(reader.text_doc_freq(field, b"common").await.unwrap(), 256);
+        assert_eq!(reader.text_doc_freq(field, b"absent").await.unwrap(), 0);
     }
 }

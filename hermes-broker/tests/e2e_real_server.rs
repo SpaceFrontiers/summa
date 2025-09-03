@@ -432,7 +432,7 @@ async fn partitioned_fusion_collects_text_stats_from_real_servers() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(ranked.ranking_method, "linear_v1");
+    assert_eq!(ranked.ranking_method, "linear_v2");
     assert_eq!(ranked.hits.len(), 2);
     let id = &ranked.hits[0].fields["id"].values[0].value;
     assert_eq!(id, &Some(field_value::Value::Text("doc-2".into())));
@@ -453,6 +453,36 @@ async fn partitioned_fusion_collects_text_stats_from_real_servers() {
         b["specific"], 0.0,
         "score-only backfill distinguishes a valid nonmatch"
     );
+    let mut no_backfill = request.clone();
+    let model = no_backfill.l1.as_mut().unwrap();
+    model.backfill = Some(false);
+    model.missing_values.insert("specific".into(), -0.75);
+    let missing = broker_search_client(&broker)
+        .await
+        .search(no_backfill)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(missing.ranking_method, "linear_v2");
+    assert_eq!(missing.hits.len(), ranked.hits.len());
+    for hit in &missing.hits {
+        let raw = hit.candidate_scores.as_ref().unwrap();
+        assert!(
+            !raw.document.contains_key("specific"),
+            "imputation must not hide raw missing values"
+        );
+        assert_eq!(hit.score, (f64::from(raw.document["topic"]) - 7.5) as f32);
+        let original = ranked
+            .hits
+            .iter()
+            .find(|h| h.address == hit.address)
+            .unwrap();
+        assert_eq!(
+            raw.document["topic"],
+            original.candidate_scores.as_ref().unwrap().document["topic"],
+            "organic scores are preserved across backfill settings"
+        );
+    }
     let mut export = request;
     export.l1 = None;
     let raw = broker_search_client(&broker)
@@ -461,6 +491,6 @@ async fn partitioned_fusion_collects_text_stats_from_real_servers() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(raw.ranking_method, "feature_export_v1");
+    assert_eq!(raw.ranking_method, "feature_export_v2");
     assert_eq!(raw.hits.len(), 2);
 }

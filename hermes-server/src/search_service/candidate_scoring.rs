@@ -53,6 +53,11 @@ pub(super) fn export_nomination_lists(
 
 pub(super) fn linear_model(model: &proto::L1Ranking) -> LinearModel {
     LinearModel {
+        missing_values: model
+            .missing_values
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
         weights: model.weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
         bias: model.bias,
         transforms: model
@@ -110,6 +115,7 @@ pub(super) fn scoring_plan(
         }
     });
     let plan = CandidateScoringPlan {
+        backfill: req.l1.as_ref().and_then(|l1| l1.backfill).unwrap_or(true),
         document_combiner: match fusion.combiner {
             0 => hermes_core::query::MultiValueCombiner::Max,
             value => crate::converters::convert_fusion_combiner(value),

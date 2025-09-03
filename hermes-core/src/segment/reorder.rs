@@ -414,6 +414,19 @@ fn source_job_route_maps(
     Ok((output_blocks, output_slots))
 }
 
+fn forward_route_vector<'a>(
+    source: &'a crate::segment::BmpIndex,
+    route: &RecordRoute,
+) -> Result<super::bmp_forward::ForwardVector<'a>> {
+    let forward = source.forward().expect("forward route source");
+    let (doc, ordinal) =
+        source.virtual_to_doc(route.old_block * source.bmp_block_size + u32::from(route.old_slot));
+    let index = forward
+        .find(super::logical_address::LogicalUnit { doc, ordinal })
+        .ok_or_else(|| crate::Error::Corruption("BMP route missing from forward values".into()))?;
+    forward.vector(index)
+}
+
 fn count_source_job_postings(
     sources: &[(crate::segment::BmpIndex, u32)],
     job: &SourceBlockJob,
@@ -421,6 +434,17 @@ fn count_source_job_postings(
 ) -> Result<usize> {
     let (output_blocks, _) = source_job_route_maps(job, routes)?;
     let source = &sources[job.source as usize].0;
+    if source.forward().is_some() {
+        let mut count = 0usize;
+        for route in &routes[job.route_start as usize..job.route_end as usize] {
+            count = count
+                .checked_add(forward_route_vector(source, route)?.len())
+                .ok_or_else(|| {
+                    crate::Error::Internal("BMP routed posting count overflow".into())
+                })?;
+        }
+        return Ok(count);
+    }
     let mut count = 0usize;
     for (_, _, postings) in source.iter_block_terms(job.old_block) {
         for posting in postings {
@@ -442,6 +466,27 @@ fn fill_source_job_postings(
 ) -> Result<()> {
     let (output_blocks, output_slots) = source_job_route_maps(job, routes)?;
     let source = &sources[job.source as usize].0;
+    if source.forward().is_some() {
+        let mut cursor = 0usize;
+        for route in &routes[job.route_start as usize..job.route_end as usize] {
+            for (dimension, impact) in forward_route_vector(source, route)?.iter() {
+                let destination = output
+                    .get_mut(cursor)
+                    .ok_or_else(|| crate::Error::Internal("BMP forward count changed".into()))?;
+                *destination = RoutedPosting {
+                    out_local: route.out_local,
+                    dimension,
+                    slot: route.new_slot,
+                    impact,
+                };
+                cursor += 1;
+            }
+        }
+        if cursor != output.len() {
+            return Err(crate::Error::Internal("BMP forward count changed".into()));
+        }
+        return Ok(());
+    }
     let mut cursor = 0usize;
     for (dimension, _, postings) in source.iter_block_terms(job.old_block) {
         for posting in postings {
@@ -989,6 +1034,10 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     )
     .await?;
     let rewrite_text = !text_plans.is_empty();
+    let upgrade_chunks = reader
+        .chunk_maps()
+        .values()
+        .any(|m| !m.has_logical_addressing());
     let copy_start = std::time::Instant::now();
     let text_file = |path: &Path| {
         path == src_files.term_dict.as_path()
@@ -1024,7 +1073,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         if cancellation_requested(cancellation.as_deref()) {
             return Err(crate::Error::IndexClosed);
         }
-        if rewrite_text && text_file(src) {
+        if (rewrite_text && text_file(src)) || (upgrade_chunks && src == &src_files.chunks) {
             continue;
         }
         clone_segment_file(
@@ -1050,6 +1099,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
             schema,
             &text_plans,
             (optimization, posting_codec),
+            memory_budget,
             cancellation.as_deref(),
         )
         .await?;
@@ -1057,6 +1107,18 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     } else {
         true
     };
+    if upgrade_chunks && !rewrite_text {
+        super::text_reorder::write_reordered_chunk_maps(
+            dir,
+            &reader,
+            &dst_files,
+            schema,
+            &[],
+            memory_budget,
+            cancellation.as_deref(),
+        )
+        .await?;
+    }
     // Rebuild sparse file with reordered BMP data
     let bp_converged = reorder_sparse_file(
         dir,
@@ -1077,15 +1139,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         num_docs: src_meta.num_docs,
         field_stats: src_meta.field_stats.clone(),
     };
-    super::ordinal_lookup::write_generation_lookups(
-        dir,
-        schema,
-        &meta,
-        &[&reader],
-        (rewrite_text, true),
-        memory_budget,
-    )
-    .await?;
+
     // Durable: the reordered segment replaces its fsynced source, so a
     // non-durable .meta could be the only copy across a power failure.
     dir.write_durable(&dst_files.meta, &meta.serialize()?)
@@ -1177,15 +1231,7 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
         num_docs: src_meta.num_docs,
         field_stats: src_meta.field_stats.clone(),
     };
-    super::ordinal_lookup::write_generation_lookups(
-        dir,
-        target_schema,
-        &meta,
-        &[&reader],
-        (false, false),
-        0,
-    )
-    .await?;
+
     dir.write_durable(&dst_files.meta, &meta.serialize()?)
         .await?;
 
@@ -1429,6 +1475,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                     .and_then(|c| c.max_weight)
                     .unwrap_or(bmp_idx.max_weight_scale);
                 let total_vectors = bmp_idx.total_vectors;
+                let store_forward = sparse_config.as_ref().is_none_or(|c| c.bmp_forward_index);
 
                 // One field owns the output writer and BP working set at a
                 // time. The field itself still uses the bounded Rayon pool.
@@ -1456,6 +1503,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
                         field_cancellation,
                         granularity,
                         scratch_path,
+                        store_forward,
                         writer,
                         field_tocs,
                         pool,
@@ -1545,6 +1593,7 @@ fn reorder_bmp_field_blockwise(
     cancellation: Option<&std::sync::atomic::AtomicBool>,
     scratch_path: PathBuf,
     source_pages: &crate::segment::reader::bmp::BmpScanPageGuard<'_>,
+    store_forward: bool,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
@@ -1798,6 +1847,17 @@ fn reorder_bmp_field_blockwise(
     )?;
     let doc_maps_elapsed = doc_maps_start.elapsed();
 
+    drop(permuted_blocks);
+    let forward_sources: Vec<_> = sources.iter().map(|(bmp, offset)| (bmp, *offset)).collect();
+    let has_forward = store_forward
+        && crate::segment::bmp_forward::write_forward_sources(
+            &forward_sources,
+            &[],
+            &mut writer,
+            Some(memory_budget),
+            cancellation,
+        )?;
+
     // Footer
     write_bmp_footer(
         &mut writer,
@@ -1814,6 +1874,7 @@ fn reorder_bmp_field_blockwise(
         doc_map_offset,
         num_real_docs,
         grid_bits,
+        has_forward,
     )
     .map_err(crate::Error::Io)?;
 
@@ -1981,6 +2042,7 @@ pub(crate) fn reorder_bmp_field(
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     granularity: BpGranularity,
     scratch_path: PathBuf,
+    store_forward: bool,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
@@ -2104,6 +2166,7 @@ pub(crate) fn reorder_bmp_field(
             cancellation.as_deref(),
             scratch_path,
             &source_pages,
+            store_forward,
             writer,
             field_tocs,
             rayon_pool,
@@ -2153,6 +2216,7 @@ pub(crate) fn reorder_bmp_field(
             cancellation.as_deref(),
             scratch_path,
             &source_pages,
+            store_forward,
             writer,
             field_tocs,
             rayon_pool,
@@ -2253,7 +2317,7 @@ pub(crate) fn reorder_bmp_field(
             pool.install(build_forward)
         } else {
             build_forward()
-        };
+        }?;
 
         log::info!(
             "[reorder_bmp] index={} field {}: forward index built in {:.1}ms ({} terms, {} postings)",
@@ -2609,7 +2673,21 @@ pub(crate) fn reorder_bmp_field(
     )?;
     let doc_maps_elapsed = doc_maps_start.elapsed();
 
-    // V19 footer.
+    drop(perm);
+    drop(real_to_virtual);
+    drop(encoded_block);
+    drop(block_encode_scratch);
+    let forward_sources: Vec<_> = sources.iter().map(|(bmp, offset)| (bmp, *offset)).collect();
+    let has_forward = store_forward
+        && crate::segment::bmp_forward::write_forward_sources(
+            &forward_sources,
+            &[],
+            &mut writer,
+            Some(memory_budget),
+            cancellation.as_deref(),
+        )?;
+
+    // Versioned footer.
     write_bmp_footer(
         &mut writer,
         total_terms,
@@ -2625,6 +2703,7 @@ pub(crate) fn reorder_bmp_field(
         doc_map_offset,
         num_real_docs as u32,
         grid_bits,
+        has_forward,
     )
     .map_err(crate::Error::Io)?;
 

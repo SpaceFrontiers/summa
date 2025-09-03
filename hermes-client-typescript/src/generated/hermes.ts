@@ -272,6 +272,18 @@ export interface L1Ranking {
   weights: { [key: string]: number };
   bias: number;
   transforms: { [key: string]: FeatureTransform };
+  /**
+   * Default true: evaluate only scores missing from named retrieval branches.
+   * False preserves absent scores as missing; real zero/negative scores remain.
+   */
+  backfill?:
+    | boolean
+    | undefined;
+  /**
+   * Learned raw-score defaults by branch, applied before that branch's transform.
+   * Unspecified missing values contribute nothing. Raw exports remain missing.
+   */
+  missingValues: { [key: string]: number };
 }
 
 export interface L1Ranking_WeightsEntry {
@@ -282,6 +294,11 @@ export interface L1Ranking_WeightsEntry {
 export interface L1Ranking_TransformsEntry {
   key: string;
   value: FeatureTransform | undefined;
+}
+
+export interface L1Ranking_MissingValuesEntry {
+  key: string;
+  value: number;
 }
 
 export interface ScoreExport {
@@ -666,7 +683,7 @@ export interface SearchResponse {
    * the hits are then the best-so-far, not the exact top-k.
    */
   truncated: boolean;
-  /** Explicit feature contract: "linear_v1" or "feature_export_v1" for new modes. */
+  /** Explicit feature contract: "linear_v2" or "feature_export_v2" for new modes. */
   rankingMethod: string;
   /**
    * Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
@@ -696,7 +713,7 @@ export interface SearchTimings {
   loadUs: number;
   /** Wall-clock total (includes overhead) */
   totalUs: number;
-  /** Complete feature backfill and linear selection. */
+  /** Missing-only feature backfill and linear selection. */
   candidateScoringUs: number;
 }
 
@@ -737,7 +754,7 @@ export interface GetIndexInfoResponse {
    * without parsing the schema SDL.
    */
   textFields: TextFieldInfo[];
-  /** 1 supports named branches and l1. */
+  /** 2 preserves organic scores, supports optional backfill and learned missing defaults. */
   candidateScoringVersion: number;
   /** Fields requiring lookup preparation/migration. */
   unpreparedCandidateFields: string[];
@@ -1598,7 +1615,7 @@ export const FeatureTransform: MessageFns<FeatureTransform> = {
 };
 
 function createBaseL1Ranking(): L1Ranking {
-  return { weights: {}, bias: 0, transforms: {} };
+  return { weights: {}, bias: 0, transforms: {}, backfill: undefined, missingValues: {} };
 }
 
 export const L1Ranking: MessageFns<L1Ranking> = {
@@ -1611,6 +1628,12 @@ export const L1Ranking: MessageFns<L1Ranking> = {
     }
     globalThis.Object.entries(message.transforms).forEach(([key, value]: [string, FeatureTransform]) => {
       L1Ranking_TransformsEntry.encode({ key: key as any, value }, writer.uint32(26).fork()).join();
+    });
+    if (message.backfill !== undefined) {
+      writer.uint32(32).bool(message.backfill);
+    }
+    globalThis.Object.entries(message.missingValues).forEach(([key, value]: [string, number]) => {
+      L1Ranking_MissingValuesEntry.encode({ key: key as any, value }, writer.uint32(42).fork()).join();
     });
     return writer;
   },
@@ -1652,6 +1675,25 @@ export const L1Ranking: MessageFns<L1Ranking> = {
           }
           continue;
         }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.backfill = reader.bool();
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          const entry5 = L1Ranking_MissingValuesEntry.decode(reader, reader.uint32());
+          if (entry5.value !== undefined) {
+            message.missingValues[entry5.key] = entry5.value;
+          }
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1677,6 +1719,24 @@ export const L1Ranking: MessageFns<L1Ranking> = {
         ? (globalThis.Object.entries(object.transforms) as [string, any][]).reduce(
           (acc: { [key: string]: FeatureTransform }, [key, value]: [string, any]) => {
             acc[key] = FeatureTransform.fromJSON(value);
+            return acc;
+          },
+          {},
+        )
+        : {},
+      backfill: isSet(object.backfill) ? globalThis.Boolean(object.backfill) : undefined,
+      missingValues: isObject(object.missingValues)
+        ? (globalThis.Object.entries(object.missingValues) as [string, any][]).reduce(
+          (acc: { [key: string]: number }, [key, value]: [string, any]) => {
+            acc[key] = globalThis.Number(value);
+            return acc;
+          },
+          {},
+        )
+        : isObject(object.missing_values)
+        ? (globalThis.Object.entries(object.missing_values) as [string, any][]).reduce(
+          (acc: { [key: string]: number }, [key, value]: [string, any]) => {
+            acc[key] = globalThis.Number(value);
             return acc;
           },
           {},
@@ -1708,6 +1768,18 @@ export const L1Ranking: MessageFns<L1Ranking> = {
         });
       }
     }
+    if (message.backfill !== undefined) {
+      obj.backfill = message.backfill;
+    }
+    if (message.missingValues) {
+      const entries = globalThis.Object.entries(message.missingValues) as [string, number][];
+      if (entries.length > 0) {
+        obj.missingValues = {};
+        entries.forEach(([k, v]) => {
+          obj.missingValues[k] = v;
+        });
+      }
+    }
     return obj;
   },
 
@@ -1730,6 +1802,16 @@ export const L1Ranking: MessageFns<L1Ranking> = {
       (acc: { [key: string]: FeatureTransform }, [key, value]: [string, FeatureTransform]) => {
         if (value !== undefined) {
           acc[key] = FeatureTransform.fromPartial(value);
+        }
+        return acc;
+      },
+      {},
+    );
+    message.backfill = object.backfill ?? undefined;
+    message.missingValues = (globalThis.Object.entries(object.missingValues ?? {}) as [string, number][]).reduce(
+      (acc: { [key: string]: number }, [key, value]: [string, number]) => {
+        if (value !== undefined) {
+          acc[key] = globalThis.Number(value);
         }
         return acc;
       },
@@ -1889,6 +1971,82 @@ export const L1Ranking_TransformsEntry: MessageFns<L1Ranking_TransformsEntry> = 
     message.value = (object.value !== undefined && object.value !== null)
       ? FeatureTransform.fromPartial(object.value)
       : undefined;
+    return message;
+  },
+};
+
+function createBaseL1Ranking_MissingValuesEntry(): L1Ranking_MissingValuesEntry {
+  return { key: "", value: 0 };
+}
+
+export const L1Ranking_MissingValuesEntry: MessageFns<L1Ranking_MissingValuesEntry> = {
+  encode(message: L1Ranking_MissingValuesEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.key !== "") {
+      writer.uint32(10).string(message.key);
+    }
+    if (message.value !== 0) {
+      writer.uint32(17).double(message.value);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): L1Ranking_MissingValuesEntry {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseL1Ranking_MissingValuesEntry();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.key = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 17) {
+            break;
+          }
+
+          message.value = reader.double();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): L1Ranking_MissingValuesEntry {
+    return {
+      key: isSet(object.key) ? globalThis.String(object.key) : "",
+      value: isSet(object.value) ? globalThis.Number(object.value) : 0,
+    };
+  },
+
+  toJSON(message: L1Ranking_MissingValuesEntry): unknown {
+    const obj: any = {};
+    if (message.key !== "") {
+      obj.key = message.key;
+    }
+    if (message.value !== 0) {
+      obj.value = message.value;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<L1Ranking_MissingValuesEntry>): L1Ranking_MissingValuesEntry {
+    return L1Ranking_MissingValuesEntry.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<L1Ranking_MissingValuesEntry>): L1Ranking_MissingValuesEntry {
+    const message = createBaseL1Ranking_MissingValuesEntry();
+    message.key = object.key ?? "";
+    message.value = object.value ?? 0;
     return message;
   },
 };

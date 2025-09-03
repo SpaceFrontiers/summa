@@ -49,8 +49,6 @@ pub struct SegmentMemoryStats {
     pub sparse_file_backed_bytes: u64,
     /// Logical `.vectors` file bytes retained by the reader.
     pub dense_file_backed_bytes: u64,
-    /// Immutable inverse-ordinal metadata, mapped and evictable.
-    pub ordinal_lookup_file_backed_bytes: u64,
     /// Hot metadata bytes actually pinned (mlock/heap-copy) at open
     pub pinned_metadata_bytes: u64,
     /// Hot metadata bytes eligible for pinning (gap vs pinned = budget
@@ -82,9 +80,10 @@ impl SegmentMemoryStats {
         self.term_bloom_file_bytes
             .saturating_add(self.sparse_file_backed_bytes)
             .saturating_add(self.dense_file_backed_bytes)
-            .saturating_add(self.ordinal_lookup_file_backed_bytes)
     }
 }
+
+pub(crate) use types::SparseProbeBudget;
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -1903,8 +1902,6 @@ fn binary_scann_probe_clusters(
 /// - Document store: only index loaded, blocks loaded on-demand via HTTP range requests
 pub struct SegmentReader {
     meta: SegmentMeta,
-    ordinal_lookups: std::sync::OnceLock<Vec<super::ordinal_lookup::OrdinalLookup>>,
-    ordinal_lookup_file_backed_bytes: u64,
     /// Term dictionary with lazy block loading
     term_dict: Arc<AsyncSSTableReader<TermInfo>>,
     /// Postings file handle - fetches ranges on demand
@@ -2072,24 +2069,9 @@ impl SegmentReader {
             log::debug!("{}", parts.join(", "));
         }
 
-        let ordinal_lookups = std::sync::OnceLock::new();
-        let mut ordinal_lookup_file_backed_bytes = 0;
-        match dir.open_read(&files.ordinal_lookup).await {
-            Ok(handle) => {
-                let bytes = handle.read_bytes().await?;
-                ordinal_lookup_file_backed_bytes = bytes.len() as u64;
-                let parsed = super::ordinal_lookup::read_lookups(bytes, meta.id, meta.num_docs)?;
-                let _ = ordinal_lookups.set(parsed);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-
         #[allow(unused_mut)]
         let mut reader = Self {
             meta,
-            ordinal_lookups,
-            ordinal_lookup_file_backed_bytes,
             term_dict: Arc::new(term_dict),
             postings_handle,
             store: Arc::new(store),
@@ -2447,7 +2429,6 @@ impl SegmentReader {
             term_bloom_file_bytes: term_dict_stats.bloom_filter_size as u64,
             sparse_file_backed_bytes: self.sparse_file_backed_bytes,
             dense_file_backed_bytes: self.dense_file_backed_bytes,
-            ordinal_lookup_file_backed_bytes: self.ordinal_lookup_file_backed_bytes,
             pinned_metadata_bytes,
             pin_intended_bytes,
             sparse_pinned_metadata_bytes,
@@ -2455,6 +2436,19 @@ impl SegmentReader {
             dense_pinned_metadata_bytes,
             dense_pin_intended_bytes,
         }
+    }
+
+    /// Document frequency from dictionary metadata, without posting payload I/O.
+    /// Async counterpart of `text_doc_freq_sync` for portable statistics.
+    pub(crate) async fn text_doc_freq(&self, field: Field, term: &[u8]) -> Result<u32> {
+        let mut key = Vec::with_capacity(4 + term.len());
+        key.extend_from_slice(&field.0.to_le_bytes());
+        key.extend_from_slice(term);
+        Ok(self
+            .term_dict
+            .get(&key)
+            .await?
+            .map_or(0, |info| info.doc_freq()))
     }
 
     /// Get posting list for a term (async - loads on demand)

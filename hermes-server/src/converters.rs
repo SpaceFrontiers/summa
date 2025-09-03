@@ -991,6 +991,7 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     idx_params.push("format: bmp".into());
                     idx_params.push(format!("bmp_block_size: {}", cfg.bmp_block_size));
                     idx_params.push(format!("bmp_grid_bits: {}", cfg.bmp_grid_bits));
+                    idx_params.push(format!("bmp_forward_index: {}", cfg.bmp_forward_index));
                 }
                 if let Some(dims) = cfg.dims {
                     idx_params.push(format!("dims: {dims}"));
@@ -2198,7 +2199,7 @@ mod tests {
             index documents {
                 reorder_on_merge: true
                 field sparse: sparse_vector<u32> [indexed<format: bmp, dims: 105879,
-                    max_weight: 5.0, bmp_block_size: 64, bmp_grid_bits: 2,
+                    max_weight: 5.0, bmp_block_size: 64, bmp_grid_bits: 2, bmp_forward_index: false,
                     quantization: uint8, doc_mass: 0.9,
                     query<lsp_gamma: 64>>, reorder]
             }

@@ -133,6 +133,12 @@ message L1Ranking {
   map<string, double> weights = 1;
   double bias = 2;
   map<string, FeatureTransform> transforms = 3;
+  // Default true: evaluate only scores missing from named retrieval branches.
+  // False preserves absent scores as missing; real zero/negative scores remain.
+  optional bool backfill = 4;
+  // Learned raw-score defaults by branch, applied before that branch's transform.
+  // Unspecified missing values contribute nothing. Raw exports remain missing.
+  map<string, double> missing_values = 5;
 }
 
 message ScoreExport {
@@ -425,7 +431,7 @@ message SearchResponse {
   // True when `time_budget_ms` expired before every candidate was scored;
   // the hits are then the best-so-far, not the exact top-k.
   bool truncated = 5;
-  // Explicit feature contract: "linear_v1" or "feature_export_v1" for new modes.
+  // Explicit feature contract: "linear_v2" or "feature_export_v2" for new modes.
   string ranking_method = 6;
   // Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
   // these lists preserve independent branch scores and nominated ordinals.
@@ -449,7 +455,7 @@ message SearchTimings {
   uint64 rerank_us = 2;       // L2 reranking (dense vector rescoring)
   uint64 load_us = 3;         // Document field loading from store
   uint64 total_us = 4;        // Wall-clock total (includes overhead)
-  uint64 candidate_scoring_us = 5; // Complete feature backfill and linear selection.
+  uint64 candidate_scoring_us = 5; // Missing-only feature backfill and linear selection.
 }
 
 // Get document request/response
@@ -480,7 +486,7 @@ message GetIndexInfoResponse {
   // Per text field: how it is tokenized, so clients pick query forms
   // without parsing the schema SDL.
   repeated TextFieldInfo text_fields = 7;
-  uint32 candidate_scoring_version = 8; // 1 supports named branches and l1.
+  uint32 candidate_scoring_version = 8; // 2 preserves organic scores, supports optional backfill and learned missing defaults.
   repeated string unprepared_candidate_fields = 9; // Fields requiring lookup preparation/migration.
 }
 

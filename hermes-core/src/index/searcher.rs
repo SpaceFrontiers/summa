@@ -1509,23 +1509,31 @@ impl<D: Directory + 'static> Searcher<D> {
         Ok(lists)
     }
 
-    pub fn merge_candidate_lists(
+    pub fn merge_candidate_lists<
+        T: Into<crate::query::SearchResult> + std::borrow::Borrow<crate::query::SearchResult>,
+    >(
         &self,
-        lists: impl IntoIterator<Item = Vec<crate::query::SearchResult>>,
+        lists: impl IntoIterator<Item = impl IntoIterator<Item = T>>,
     ) -> Result<Vec<crate::query::SearchResult>> {
         let mut union = std::collections::BTreeMap::new();
         let mut positions = 0usize;
         let mut slots = 0usize;
         for list in lists {
-            slots = slots.saturating_add(list.len());
-            if slots > crate::query::MAX_FUSION_CANDIDATE_SLOTS {
-                return Err(crate::Error::Query(
-                    "candidate union document budget exceeded".into(),
-                ));
-            }
-            for mut result in list {
-                positions = positions
-                    .saturating_add(result.positions.iter().map(|(_, p)| p.len()).sum::<usize>());
+            for result in list {
+                slots = slots.saturating_add(1);
+                if slots > crate::query::MAX_FUSION_CANDIDATE_SLOTS {
+                    return Err(crate::Error::Query(
+                        "candidate union document budget exceeded".into(),
+                    ));
+                }
+                let borrowed = result.borrow();
+                positions = positions.saturating_add(
+                    borrowed
+                        .positions
+                        .iter()
+                        .map(|(_, p)| p.len())
+                        .sum::<usize>(),
+                );
                 if positions > crate::query::MAX_FUSION_CHUNK_SLOTS {
                     return Err(crate::Error::Query(
                         "candidate union ordinal budget exceeded".into(),
@@ -1533,6 +1541,7 @@ impl<D: Directory + 'static> Searcher<D> {
                 }
                 // Nomination magnitudes are intentionally not a mixed-vertical
                 // score. Export requests get features; linear supplies rank.
+                let mut result: crate::query::SearchResult = result.into();
                 result.score = 0.0;
                 match union.entry((result.segment_id, result.doc_id)) {
                     std::collections::btree_map::Entry::Vacant(entry) => {

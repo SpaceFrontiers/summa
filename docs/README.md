@@ -40,6 +40,8 @@ directory. Package READMEs below document each executable or library.
 - [FastScan layout v2 for float ScaNN leaves](fast-scan-layout-v2.md)
 - [TurboQuant (TQ) — training-free dense ANN codec](turboquant-quantization.md)
 - [Unified Dense IVF Architecture](unified-vector-quantization.md)
+- [Forward values in BMP search passes: research and experiment](bmp-forward-search.md)
+- [BMP forward values and format compatibility](bmp-forward-index.md)
 - [BMP LSP/0 and Maximum-Grid Compression](bmp-grid-compression.md)
 - [Algebraic float reductions](algebraic-float-reductions.md)
 - [Seismic: research assessment (2026-07-09)](seismic-research.md)

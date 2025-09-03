@@ -35,9 +35,9 @@ pub fn handles(request: &proto::SearchRequest) -> bool {
 
 pub fn expected_export_method(request: &proto::SearchRequest) -> Option<&'static str> {
     if request.l1.is_some() {
-        Some("linear_v1")
+        Some("linear_v2")
     } else if request.score_export.is_some() {
-        Some("feature_export_v1")
+        Some("feature_export_v2")
     } else if matches!(request.query.as_ref().and_then(|q| q.query.as_ref()),
         Some(proto::query::Query::Fusion(fusion)) if fusion.method == proto::FusionMethod::FusionCandidates as i32)
     {
@@ -129,7 +129,12 @@ impl CoordinatorPlan {
             .collect();
         let scopes = fusion.queries.iter().map(|branch| branch.scope).collect();
         let model = request.l1.as_ref().map(|model| -> Result<_, Status> {
-            if model.weights.len() > 16 || model.transforms.len() > 16 {
+            if model.backfill == Some(false)
+                && request.score_export.as_ref().is_some_and(|export| export.all_passages)
+            {
+                return Err(invalid("all_passages diagnostics require backfill"));
+            }
+            if model.weights.len() > 16 || model.transforms.len() > 16 || model.missing_values.len() > 16 {
                 return Err(invalid("linear model exceeds the 16-branch bound"));
             }
             if method != proto::FusionMethod::FusionRrf || fusion.rrf_k != 0.0 || fusion.queries.iter().any(|q| q.weight != 0.0) {
@@ -140,7 +145,7 @@ impl CoordinatorPlan {
                 || fusion.queries.iter().any(|q| !matches!(proto::ScoreScope::try_from(q.scope), Ok(proto::ScoreScope::Document | proto::ScoreScope::Chunk))) {
                 return Err(invalid("linear branches need unique names and explicit document/chunk scope"));
             }
-            let model = LinearModel { weights: model.weights.iter().map(|(name, &weight)| (name.clone(), weight)).collect(), bias: model.bias,
+            let model = LinearModel { missing_values: model.missing_values.iter().map(|(name, &value)| (name.clone(), value)).collect(), weights: model.weights.iter().map(|(name, &weight)| (name.clone(), weight)).collect(), bias: model.bias,
                 transforms: model.transforms.iter().map(|(name, t)| (name.clone(), FeatureTransform { signed_log1p: t.signed_log1p, scale: t.scale.unwrap_or(1.0), offset: t.offset })).collect() };
             model.validate(&names.iter().map(String::as_str).collect::<Vec<_>>()).map_err(|e| invalid(e.to_string()))?;
             Ok(model)
@@ -254,7 +259,7 @@ impl CoordinatorPlan {
                 ));
             }
             let expected = if self.model.is_some() {
-                "linear_v1"
+                "linear_v2"
             } else {
                 "fusion_candidates_v1"
             };
@@ -587,7 +592,7 @@ mod tests {
                 hits.truncate(12);
                 proto::SearchResponse {
                     hits,
-                    ranking_method: "linear_v1".into(),
+                    ranking_method: "linear_v2".into(),
                     ..Default::default()
                 }
             })
@@ -649,7 +654,7 @@ mod tests {
         let plan = CoordinatorPlan::new(request(true), 1).unwrap();
         assert!(plan.finish(vec![proto::SearchResponse::default()]).is_err());
         let mut response = proto::SearchResponse {
-            ranking_method: "linear_v1".into(),
+            ranking_method: "linear_v2".into(),
             hits: vec![proto::SearchHit {
                 address: address(1, 1),
                 score: 123.0,
@@ -667,6 +672,22 @@ mod tests {
                 .unwrap_err()
                 .message()
                 .contains("inference disagree")
+        );
+    }
+
+    #[test]
+    fn disabled_backfill_rejects_all_passage_expansion_before_dispatch() {
+        let mut req = request(true);
+        req.l1.as_mut().unwrap().backfill = Some(false);
+        req.score_export = Some(proto::ScoreExport {
+            all_passages: true,
+            ..Default::default()
+        });
+        let error = CoordinatorPlan::new(req, 1).err().expect("invalid policy");
+        assert!(
+            error
+                .message()
+                .contains("all_passages diagnostics require backfill")
         );
     }
 

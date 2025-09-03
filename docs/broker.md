@@ -138,7 +138,9 @@ Reads:
   exports the per-branch shard nomination lists and computes global RRF (or
   normalized weighted sum) using core fusion at the broker. L1 applies the same
   core model on shards and broker, retaining sufficient passage rows for the
-  requested combiner. See [candidate scoring](candidate-rescoring.md) for
+  requested combiner. `linear_v2` preserves organic scores and supports optional
+  missing-only backfill plus learned raw missing defaults; defaults never fill
+  raw export maps. See [candidate scoring](candidate-rescoring.md) for
   transport bounds and mixed-version checks. Legacy fusion nested inside
   another query or combined with the vector reranker retains its existing
   shard execution; it does not claim global RRF candidate selection.

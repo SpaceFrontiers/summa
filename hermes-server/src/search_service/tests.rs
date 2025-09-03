@@ -645,6 +645,19 @@ async fn l1_invalid_branch_weights_fail_before_opening_index_or_acquiring_capaci
 }
 
 #[test]
+fn l1_disabled_backfill_rejects_all_passages_before_admission() {
+    let mut request = named_l1_request();
+    request.l1.as_mut().unwrap().backfill = Some(false);
+    request.score_export.as_mut().unwrap().all_passages = true;
+    assert!(
+        validate_search_budget(&request, &limits())
+            .unwrap_err()
+            .message()
+            .contains("all_passages diagnostics require backfill")
+    );
+}
+
+#[test]
 fn l1_missing_coefficients_are_zero_but_ambiguous_branches_and_rank_fusion_options_fail() {
     let request = named_l1_request();
     validate_search_budget(&request, &limits()).unwrap();
@@ -743,7 +756,7 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(ranked.ranking_method, "linear_v1");
+    assert_eq!(ranked.ranking_method, "linear_v2");
     assert_eq!(ranked.hits.len(), 1);
     assert_eq!(
         ranked.hits[0].address.as_ref().unwrap().doc_id,
@@ -766,7 +779,7 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(all.ranking_method, "feature_export_v1");
+    assert_eq!(all.ranking_method, "feature_export_v2");
     assert_eq!(all.hits.len(), 2);
     let other = all
         .hits
@@ -795,7 +808,7 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(info.candidate_scoring_version, 1);
+    assert_eq!(info.candidate_scoring_version, 2);
     assert!(info.unprepared_candidate_fields.is_empty());
     registry.shutdown().await.unwrap();
 }

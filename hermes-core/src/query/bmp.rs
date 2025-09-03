@@ -20,9 +20,9 @@
 //!
 //! ## Performance
 //!
-//! All block data is pre-decoded at index load time. Query execution touches
-//! only flat contiguous arrays — no file I/O, no parsing, no heap allocation
-//! in the hot path.
+//! Compact hierarchy metadata is available at index open. Selected block
+//! payloads remain evictable and are decoded on demand. Native execution reuses
+//! bounded thread-local scratch; lazy backends admit bounded read windows.
 //!
 //! - **LSP/0 top-γ**: strict SBMax order with safe superblock-level pruning
 //! - **Integer scoring**: u32 accumulators with u16 quantized query weights (~20% faster)
@@ -1990,9 +1990,33 @@ fn compute_block_ubs_and_presence(
     Ok(blocks_with_query_terms)
 }
 
+/// Quantized candidate scoring over selected forward vectors, preserving the
+/// full query weights and additive duplicate dimensions.
+fn score_forward_units(
+    vector: crate::segment::bmp_forward::ForwardVector<'_>,
+    query_by_dim_u16: &[(u32, u16)],
+) -> crate::Result<u32> {
+    let mut query = query_by_dim_u16;
+    let mut units = 0u32;
+    for (dimension, impact) in vector.iter() {
+        while query.first().is_some_and(|&(dim, _)| dim < dimension) {
+            query = &query[1..];
+        }
+        // Retain every already-quantized query contribution, including repeated
+        // dimensions. Keep the cursor here for duplicate document entries too.
+        for &(_, weight) in query.iter().take_while(|&&(dim, _)| dim == dimension) {
+            units = units
+                .checked_add(u32::from(impact) * u32::from(weight))
+                .ok_or_else(|| crate::Error::Query("BMP candidate score overflow".into()))?;
+        }
+    }
+    Ok(units)
+}
+
 /// Exact candidate probes use the very same integer query quantization and
 /// dequantization as exhaustive BMP retrieval. Nomination/LSP never enters
-/// this path. Targets must be real physical slots in ascending order.
+/// this path. Targets are sorted forward rows in V20 and real physical slots
+/// in V19, as resolved by the owning candidate-address reader.
 pub(crate) fn score_bmp_candidates(
     index: &BmpIndex,
     terms: &[(u32, f32)],
@@ -2004,6 +2028,14 @@ pub(crate) fn score_bmp_candidates(
         return Ok(scores);
     };
     let dequant = prepared.dequant_for(index)?;
+    if let Some(forward) = index.forward() {
+        for (score, &target) in scores.iter_mut().zip(targets) {
+            let vector = forward.vector(target)?;
+            let units = score_forward_units(vector, &prepared.query_by_dim_u16)?;
+            *score = units as f32 * dequant;
+        }
+        return Ok(scores);
+    }
     let mut start = 0;
     while start < targets.len() {
         let block_id = targets[start] / index.bmp_block_size;
@@ -2035,15 +2067,26 @@ pub(crate) fn score_bmp_candidates(
                 AdaptivePostings::Dense(impacts) => {
                     for &target in &targets[start..end] {
                         let slot = (target % index.bmp_block_size) as usize;
-                        units[slot] += u32::from(impacts[slot]) * u32::from(weight);
+                        units[slot] = units[slot]
+                            .checked_add(u32::from(impacts[slot]) * u32::from(weight))
+                            .ok_or_else(|| {
+                                crate::Error::Query("BMP candidate score overflow".into())
+                            })?;
                     }
                 }
                 AdaptivePostings::Sparse(postings) => {
                     for &target in &targets[start..end] {
                         let slot = (target % index.bmp_block_size) as u8;
-                        if let Ok(p) = postings.binary_search_by_key(&slot, |p| p.local_slot) {
-                            units[slot as usize] +=
-                                u32::from(postings[p].impact) * u32::from(weight);
+                        let start = postings.partition_point(|p| p.local_slot < slot);
+                        for posting in postings[start..]
+                            .iter()
+                            .take_while(|p| p.local_slot == slot)
+                        {
+                            units[slot as usize] = units[slot as usize]
+                                .checked_add(u32::from(posting.impact) * u32::from(weight))
+                                .ok_or_else(|| {
+                                    crate::Error::Query("BMP candidate score overflow".into())
+                                })?;
                         }
                     }
                 }
@@ -2478,3 +2521,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "native"))]
+#[path = "bmp_forward_experiment.rs"]
+mod forward_experiment;
+
+#[cfg(all(test, feature = "native"))]
+#[path = "bmp_forward_lookup_experiment.rs"]
+mod forward_lookup_experiment;

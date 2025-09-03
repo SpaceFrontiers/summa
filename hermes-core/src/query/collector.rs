@@ -1025,6 +1025,13 @@ pub(crate) async fn search_segment_shared_planned(
     ))
 }
 
+// Borrowed candidate lists clone only after their retained-output budget is checked.
+impl From<&SearchResult> for SearchResult {
+    fn from(value: &SearchResult) -> Self {
+        value.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

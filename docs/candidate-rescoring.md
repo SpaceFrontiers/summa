@@ -3,15 +3,31 @@
 Status: opt-in Hermes implementation, 2026-09-05. Search API training and
 activation are separate. Existing retrieval defaults remain unchanged.
 
-**Handoff update:** the user rejected the new inverse lookup maps described
-below. They remain in this branch for review; their removal/replacement is
-unfinished. The Reorder/preparation guidance below is superseded by the
+Logical addressing belongs to [BMP forward values](bmp-forward-index.md) and
+the existing text chunk map. There are no `.lookup` sidecars. The historical
+handoff describes the superseded draft implementation.
+
+For reordered text, CHNK version 3 adds a kind-2 chunk section: the existing
+physical document/ordinal/length columns followed by one `u32` physical slot
+per logical-order row. This shares existing keys and lengths (4 additional
+bytes/chunk) rather than duplicating logical keys in another file. Ordered
+sections retain kind 0 with no extra bytes. Build/reorder constructs this
+permutation; merge streams it with physical-slot base remapping. Legacy reordered
+maps require explicit reorder, while ordered V1/V2 maps remain directly usable.
+This is an addressing index of the existing chunk metadata, not a text scorer or
+a separately published derived sidecar. Normal merge never sorts corpus-sized
+metadata; all patch buffers are bounded. V3 rejects an unordered kind-0 section.
+Pure legacy unordered maps retain V2 on ordinary merge; mixing them with
+prepared maps fails with explicit Reorder guidance. Reorder upgrades legacy
+chunk maps even when no BP permutation is planned, retaining token totals.
+Its map columns, largest logical-slot permutation, length columns and retained
+BP plans are admitted against the existing reorder memory budget.
 
 ## Objective and invariants
 
 L0 retrieval cheaply nominates candidates from lexical, sparse, dense/binary,
-and document-profile queries. L1 must evaluate the same feature queries for
-every nominated item, regardless of which L0 branch found it. The resulting
+and document-profile queries. L1 combines named branch scores for every nominated item, preserving organic
+retrieval scores and optionally filling missing cells with the same queries. The resulting
 bounded top-K document/passage set feeds an external cross-encoder (L2).
 An absent L0 hit is not evidence of a zero score in another vertical.
 
@@ -22,7 +38,7 @@ Cross-field chunk alignment is an explicit caller contract, not inferred from
 field names. Hermes preserves existing missing/multi-value semantics.
 
 Filters and required quoted phrases define eligibility at L0 and remain hard
-constraints. Feature weights cannot relax them. Exact candidate scores use
+constraints. Feature weights cannot relax them. Backfilled candidate scores use
 all retained scoring terms, without ANN nomination, LSP selection, heap-floor
 pruning, or top-k truncation of the feature query. Scores remain exact with
 respect to the stored representation (including sparse/vector quantization).
@@ -30,7 +46,7 @@ respect to the stored representation (including sparse/vector quantization).
 ## Ranking modes
 
 - RRF: existing rank-only fusion, kept for compatibility and paired baselines.
-- Linear: bounded L0 union, complete raw feature backfill, fixed linear model,
+- Linear: bounded L0 union, optional missing-only backfill, fixed linear model,
   direct top-K. No RRF runs before or after the formula.
 - Export: bounded L0 union plus raw features for caller-side model inference.
 
@@ -40,7 +56,25 @@ RRF when a backend lacks capabilities.
 
 ## Candidate and score model
 
-Updated ownership decision: Hermes backfills raw feature scores, applies an
+L1 preserves scores returned organically
+by each named retrieval branch. `l1.backfill` is optional and defaults to true;
+it evaluates only missing branch/document or branch/passage cells. Setting it
+to false performs no feature probes and leaves absent cells unavailable. Raw
+maps omit unavailable keys, while actual zero and negative scores remain
+present. `l1.missing_values` maps feature names to learned **raw** defaults.
+Only missing cells use these defaults, before the feature transform and weight.
+Without a configured default a missing cell contributes nothing, including no
+transform offset. The exported raw map still omits an imputed feature; it never
+pretends that a learned constant is an observed score. Defaults must be finite
+and reference a feature with a coefficient. A real zero or negative value
+always wins over its missing default.
+Document-scoped retrieval scores retain their query's retrieval combiner;
+backfilled document scores reduce all retained stored values. Approximate L0
+scores are not relabeled as exhaustive scores or silently recomputed. Diagnostic
+`all_passages` requires backfill. Training must bind the backfill policy along
+with nomination settings because it changes the available feature population.
+
+Hermes fills missing raw feature scores when requested, applies an
 optional portable linear model to the full nominated union before truncation, and returns the raw features. Search API owns query intent,
 training and model selection, and may apply a richer linear/CatBoost model
 across separate query calls. The same versioned transforms and coefficients
@@ -50,8 +84,9 @@ Each fusion branch has a unique `name`, an explicit `document`/`chunk` scope,
 and the existing `Query` object. `l1.weights` references those branch names,
 not schema field names or array indexes. The branch itself supplies the field,
 tokenization, phrase offsets and vector; there is no separately maintained
-scoring query that can drift from retrieval. A `score_only` branch computes a
-feature without nominating candidates. A common `fusion.filters` applies hard
+scoring query that can drift from retrieval. A `score_only` branch supplies a
+feature without nominating candidates; with backfill disabled its scores remain
+missing and the model may substitute its learned default. A common `fusion.filters` applies hard
 eligibility identically to every nomination branch; filters never become
 features or independent votes. Initial L1 branches support one-field scoring
 queries and SHOULD/Boost compositions; unsupported eligibility expressions
@@ -76,13 +111,16 @@ add votes. Query/feature names and preprocessing form a versioned contract.
 For a candidate passage c of document d:
 
 ```
-passage_score(d,c) = bias + sum_i w_i * transform_i(raw_chunk_i(d,c))
-                          + sum_j v_j * transform_j(raw_document_j(d))
+effective_i = observed_i if present else learned_missing_i
+contribution_i = w_i * transform_i(effective_i) if available else 0
+passage_score(d,c) = bias + sum(chunk contributions at c)
+                          + sum(document contributions at d)
 document_score(d) = fusion.combiner({passage_score(d,c) for nominated c})
 ```
 
 A document-only candidate has an explicit document row, with no invented chunk
-ordinal. Missing feature values have a presence bit and contribute zero; a
+ordinal. Missing feature values have a presence bit and use the configured
+raw default (or contribute nothing if none is configured); a
 valid nonmatching lexical/sparse feature has score zero and is distinguished
 from an unavailable field. Dense negatives remain valid values. Document
 features are computed once and broadcast as context, not summed repeatedly
@@ -90,7 +128,7 @@ across chunks. The default MAX reduction does not reward chunk count. SUM remain
 Returned ordinal scores are the same final passage scores used for selection.
 
 Normalization is fixed in the model artifact, never local min/max over the
-current shard or result page. Initial supported transforms should be identity,
+current shard or result page. Supported transforms are identity,
 signed log1p for unbounded lexical/sparse scores, and a configured affine
 scale; trained parameters are derived from training data only. This permits
 negative raw scores and yields comparable scores across shards. Validate
@@ -100,7 +138,7 @@ finite inputs, scales, weights, transformed values and final reductions.
 
 The broker is the coordinator for a logical index, including single-shard routes.
 Each shard nominates at `candidate_depth` per branch; this depth is intentionally
-not divided by partition count. Shards backfill the bounded union and apply the
+not divided by partition count. Shards preserve organic scores, optionally backfill the bounded union and apply the
 request's fixed L1 model. They retain at least `offset + limit` documents each,
 which is sufficient for exact global top-K under the identical pointwise model
 and document combiner. The broker reapplies the shared core formula, verifies
@@ -120,7 +158,7 @@ Top-level RRF without the legacy vector reranker also runs at the broker: it glo
 before calculating rank contributions. It does not merge shard-local RRF scores.
 The transport uses `fusion.method = CANDIDATES` to return a bounded document
 union and per-branch candidate scores/ordinals without fusion; `score_export`
-additionally requests complete cross-vertical feature backfill. Raw feature-only
+additionally requests missing cross-vertical feature backfill. Raw feature-only
 collection continues to return the complete union rather than ranking it.
 
 The full per-shard nomination pools contribute to selection. A shared fixed
@@ -142,7 +180,8 @@ score of that ordinal and needs no within-field reduction. Text branches use
 MAX over chunked values, or their one ordinary document value. Backfill evaluates
 all stored values for a document-scoped feature, including present nonmatches
 with zero scores. Retrieval's approximate or limited nomination may have seen
-only a subset of those values; nomination scores are not the backfill contract.
+only a subset of those values; organic scores retain that retrieval behavior. They are never overwritten by
+a backfill pass. Training must match this serving policy.
 Boost and SHOULD composition preserve their expression order: boosting a reduced
 document feature differs from reducing negatively boosted passage scores.
 
@@ -183,20 +222,43 @@ BM25/phrase frequency and length-normalization code and dense/binary SIMD
 kernels. Sparse scoring probes the stored quantized impacts for every retained
 query dimension, even when that dimension did not nominate the candidate.
 
-Dense flat storage already supports logical document/ordinal lookup. BMP and
-chunked text currently store primarily the reverse mapping (physical to
-logical); a naive candidate pass would scan corpus-sized maps, or rerun full
-retrieval, on every request. Neither is the intended steady-state cost.
-Ordered maps are searched directly by logical ordinal. Reordered generations
-carry an immutable `.lookup` sidecar with a versioned 32-byte header, 24-byte
-field directory entries and sorted 12-byte `(document, ordinal, physical)` rows.
-It stays file-backed and evictable. Ordinary merge streams/remaps prepared rows;
-explicit Reorder constructs missing inverse maps under the existing reorder
-memory budget. Publication, fsync and cleanup use canonical segment ownership.
-Legacy reordered fields without the sidecar are reported by GetIndexInfo's
-`unprepared_candidate_fields`; run Reorder before using L1 on them. MaxScore
-sparse storage and ANN fields without stored flat vectors cannot be backfilled
-by this version and fail explicitly. No extraction chunk limits change.
+Dense flat storage already supports logical document/ordinal lookup. V20 BMP
+uses quantized forward vectors inside `.sparse`; CHNK V3 uses addressed chunk
+metadata inside `.chunks`. Ordered legacy maps can be searched directly;
+reordered V19 BMP and V1/V2 text maps require explicit Reorder before their
+missing cells can be backfilled. BMP storage is optional per field via
+`bmp_forward_index` (default true). With it disabled, ordered BMP maps locate
+candidates by binary search and score their query-term postings in selected
+blocks. BP-reordered BMP maps need this setting enabled and explicit
+reorder/rebuild to regain backfill capability. Disabling storage does not affect
+full-text or sparse MaxScore backfill. See [optional forward storage](bmp-forward-index.md#optional-storage).
+`GetIndexInfo.unprepared_candidate_fields`
+reports these fields and ANN fields without stored flat vectors. Disabling
+backfill, or supplying every needed organic cell, requires no address probes
+and can use those fields without migration. No extraction limits change.
+
+Candidate BM25 statistics read document frequencies from term-dictionary metadata
+on native, async and WASM paths; gathering statistics never materializes posting
+payloads ahead of scoring admission.
+
+Full-text BM25, text MaxScore and phrase branches use the existing posting/skip
+readers, phrase positions and shared global statistics. Sparse MaxScore fields
+also support backfill: candidate-intersecting blocks in the existing skip index
+establish stored field/ordinal presence, and query dimensions reuse the owning
+quantized block scorer. A present nonmatch is zero; a missing value is absent.
+Presence discovery may visit every active dimension's metadata; it does not
+load complete posting lists. A request-wide budget caps sparse probes at two
+million and encoded sparse reads at 256 MiB, checked before I/O. Exceeding a
+budget is an explicit error. BMP forward lookup avoids this all-dimension
+metadata work and reads only selected stored vectors.
+
+Feature matrices and scored components are capped at two million values;
+exact dense/binary reads are capped at 1 GiB. Nomination retains existing
+candidate/ordinal caps, checked before cloning the union. On lazy remote
+backends, text posting and position reads are admitted together against a
+256 MiB request budget before materializing ranges. Mmap/RAM views do not
+materialize those lists; their existing cursors decode selected blocks only. Raw response hydration
+and broker transport have independent budgets.
 
 Batch candidates by segment, field and physical block. Reuse posting cursors
 and vector buffers, prefetch only selected ranges, and keep scratch bounded by
@@ -221,14 +283,16 @@ Public pagination happens in Search API after model selection; Hermes feature
 export addresses the complete requested candidate window.
 Feature exports, ordinal scores, truncation and timing survive broker merging.
 
-The core `Searcher::score_candidates` interface also supports diagnostics and
+The core `Searcher::score_candidates_with_retrieved` interface accepts borrowed
+named branch lists to preserve organic scores. `Searcher::score_candidates`
+supports diagnostics without organic inputs and
 training over explicitly nominated candidate addresses. Candidate addresses refer to the
 same immutable searcher snapshot; stale/foreign segment identities error
 explicitly. It must never silently change the source set on a retry.
 
 ## Search API and training ownership
 
-Hermes owns exact feature execution, validation, portable linear inference
+Hermes owns feature execution, validation, portable linear inference
 instead of RRF, and raw exports. Search API owns query intent, original quoted
 constraints, document versus passage profiles, training, model selection,
 and any additional model inference across separate query calls. MCP, website and Cybrex inherit that policy. Ordinary Telegram keeps
@@ -289,7 +353,11 @@ result = await client.search(
         }
     },
     limit=100,
-    l1={"weights": {"body": 1.0, "title": 0.2}},
+    l1={
+        "weights": {"body": 1.0, "title": 0.2},
+        "backfill": True,  # Default; only missing cells are scored.
+        "missing_values": {"body": -0.1, "title": 0.25},  # Illustrative raw defaults.
+    },
     score_export={},
 )
 ```
@@ -300,3 +368,15 @@ teacher labeling; set `limit` to cover all branch/shard candidates. Omitting
 An explicitly provided empty export object is meaningful. Omitted coefficients
 are zero. Branch names and scopes survive both Python and TypeScript wrappers,
 as do score zero, negative values, absent fields and the ranking-version marker.
+
+Set `backfill=False` to rank from organic scores and learned defaults only.
+TypeScript uses `backfill` and `missingValues` in `l1`. The protocol preserves
+optional-boolean presence, so omitted and explicit false remain distinct.
+
+The serving contract is `candidate_scoring_version = 2`, with response markers
+`linear_v2` and `feature_export_v2`. Broker inference uses the same model,
+including defaults, and rejects old or mixed ranking markers. RRF candidate
+export retains `fusion_candidates_v1`; global RRF retains `global_rrf_v1`.
+Deploy server and broker support together before activating L1; there is no
+mixed-version fallback to rank fusion. Stored V20 BMP and CHNK V3 generations
+require readers that understand these formats.

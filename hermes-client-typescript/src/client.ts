@@ -285,11 +285,21 @@ export class HermesClient {
         candidateLimit: request.candidateLimit ?? 0,
         timeBudgetMs: request.timeBudgetMs ?? 0,
         textStats: undefined,
-        l1: request.l1 ? { weights: request.l1.weights, bias: request.l1.bias ?? 0, transforms: request.l1.transforms ?? {} } : undefined,
+        l1: request.l1 ? {
+          weights: request.l1.weights,
+          bias: request.l1.bias ?? 0,
+          transforms: request.l1.transforms ?? {},
+          backfill: request.l1.backfill,
+          missingValues: request.l1.missingValues ?? {},
+        } : undefined,
         scoreExport: request.scoreExport ? { passagesPerDocument: request.scoreExport.passagesPerDocument ?? 0, allPassages: request.scoreExport.allPassages ?? false } : undefined,
       },
       this.callOptions(timeoutMs),
     );
+
+    if (request.l1 && response.rankingMethod !== "linear_v2") {
+      throw new Error(`L1 requires a backend with linear_v2 ranking semantics; received ${JSON.stringify(response.rankingMethod)}`);
+    }
 
     const hits: SearchHit[] = response.hits.map((hit) => ({
       address: {

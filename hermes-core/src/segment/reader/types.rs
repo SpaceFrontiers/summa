@@ -1,5 +1,8 @@
 //! Types for segment reader
 
+mod candidate_probes;
+pub(crate) use candidate_probes::SparseProbeBudget;
+
 use std::sync::Arc;
 
 use crate::DocId;

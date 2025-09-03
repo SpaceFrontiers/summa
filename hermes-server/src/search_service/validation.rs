@@ -476,8 +476,19 @@ fn validate_search_request_shape(
             ));
         }
         if let Some(model) = &req.l1 {
+            if model.backfill == Some(false)
+                && req
+                    .score_export
+                    .as_ref()
+                    .is_some_and(|export| export.all_passages)
+            {
+                return Err(Status::invalid_argument(
+                    "all_passages diagnostics require backfill",
+                ));
+            }
             if model.weights.len() > MAX_FUSION_SUB_QUERIES
                 || model.transforms.len() > MAX_FUSION_SUB_QUERIES
+                || model.missing_values.len() > MAX_FUSION_SUB_QUERIES
             {
                 return Err(Status::invalid_argument(
                     "l1 coefficient count exceeds branch limit",
@@ -487,6 +498,7 @@ fn validate_search_request_shape(
                 .weights
                 .keys()
                 .chain(model.transforms.keys())
+                .chain(model.missing_values.keys())
                 .any(|name| name.len() > 128)
             {
                 return Err(Status::invalid_argument(

@@ -1,4 +1,4 @@
-//! BMP (Block-Max Pruning) index builder for sparse vectors — **V19 format**.
+//! BMP (Block-Max Pruning) index builder for sparse vectors — **V20 format**.
 //!
 //! Builds a block-at-a-time (BAAT) index using **compact virtual coordinates**:
 //! sequential IDs are assigned to unique `(doc_id, ordinal)` pairs. A lookup
@@ -18,9 +18,11 @@
 //! block order. Each block's data is serialized and written immediately —
 //! no intermediate arrays for postings, dim_ids, or posting_starts.
 //!
-//! Peak memory: `input + grid_entries + O(num_blocks) block_data_starts`.
+//! Inverted output retains `input + grid_entries + O(num_blocks) block_data_starts`.
+//! Forward output adds O(dimensions) cursors and 8-byte/vector offsets while
+//! borrowing the same input; see the format design for the full cost model.
 //!
-//! ## BMP V19 Blob Layout (data-first, block-interleaved)
+//! ## BMP V20 Blob Layout (data-first, block-interleaved)
 //!
 //! ```text
 //! Section B:  block_data         [per-block interleaved data]   variable-length
@@ -31,6 +33,7 @@
 //! Section H:  compressed coarse grid      [ceil-u4, one cell per 256 superblocks]
 //! Section F:  doc_map_ids        [u32-LE × num_virtual_docs]
 //! Section G:  doc_map_ordinals   [u16-LE × num_virtual_docs]
+//! Forward:    quantized logical vectors + directory (see bmp-forward-index.md)
 //!
 //! Per-block data layout (for non-empty blocks):
 //!   raw_num_terms: u32                                high bit = u32 offsets
@@ -39,7 +42,7 @@
 //!   term_max_impacts: [packed-u4 × num_terms]          conservative maxima
 //!   payload: sparse [(u8, u8)] or dense [u8; block_size] per term
 //!
-//! BMP V19 Footer (80 bytes):
+//! BMP V20 Footer (80 bytes; same offsets as V19):
 //!   total_terms: u64              //  0- 7  (stats only)
 //!   total_postings: u64           //  8-15  (stats only)
 //!   grid_offset: u64              // 16-23  (byte offset of Section D)
@@ -53,7 +56,7 @@
 //!   doc_map_offset: u64           // 60-67  (byte offset of Section F)
 //!   num_real_docs: u32            // 68-71  (actual vector count before padding)
 //!   grid_bits: u32                // 72-75  (2 or 4)
-//!   magic: u32                    // 76-79  (BMP9 = 0x39504D42)
+//!   magic: u32                    // 76-79  (BMPA = 0x41504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -99,12 +102,13 @@ use crate::segment::bmp_grid::{
 use crate::segment::format::{BMP_BLOB_FOOTER_SIZE, BMP_BLOB_MAGIC};
 use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
-/// Build a BMP V19 blob from per-dimension postings.
+/// Build a BMP V20 blob from per-dimension postings.
 ///
 /// **Takes ownership** of the postings HashMap. All per-dim Vecs are moved
 /// out of the HashMap into `dim_vecs` before the K-way merge starts, and
 /// the HashMap shell is dropped immediately. After the merge completes,
-/// `dim_vecs` and `vid_lookup` are explicitly dropped before grid/doc_map write.
+/// `vid_lookup` is dropped before grid/doc_map output. `dim_vecs` stays alive
+/// through forward output; no additional posting-sized representation is built.
 ///
 /// Uses compact virtual IDs: sequential IDs assigned to unique `(doc_id, ordinal)`
 /// pairs, eliminating the sparse `doc_id * num_ordinals + ordinal` space.
@@ -135,6 +139,7 @@ pub(crate) fn build_bmp_blob(
     dims: u32,
     max_weight: f32,
     min_terms: usize,
+    store_forward: bool,
     writer: &mut dyn Write,
 ) -> std::io::Result<u64> {
     if postings.is_empty() {
@@ -199,7 +204,7 @@ pub(crate) fn build_bmp_blob(
     if num_real_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP real document count exceeds the V19 u32 format limit",
+            "BMP real document count exceeds the BMP u32 format limit",
         ));
     }
 
@@ -224,7 +229,7 @@ pub(crate) fn build_bmp_blob(
     if num_virtual_docs > u32::MAX as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "BMP padded document count exceeds the V19 u32 format limit",
+            "BMP padded document count exceeds the BMP u32 format limit",
         ));
     }
 
@@ -438,9 +443,10 @@ pub(crate) fn build_bmp_blob(
     grid_entries.sort_unstable();
 
     log::info!(
-        "[bmp_build] V19 vectors={} padded={} blocks={} dims={} \
+        "[bmp_build] V{} vectors={} padded={} blocks={} dims={} \
          terms={} postings={} grid_entries={} section_b={} legacy_v18_section_b={} \
          adaptive_ratio={:.3} dense_terms={} ({:.2}%) wide_blocks={}",
+        if store_forward { 20 } else { 19 },
         num_real_docs,
         num_virtual_docs,
         num_blocks,
@@ -456,10 +462,11 @@ pub(crate) fn build_bmp_blob(
         wide_blocks,
     );
 
-    // Free K-way merge inputs — reclaims per-dim posting Vecs and vid lookup.
+    // Release inverted traversal state. Forward output still borrows dim_vecs.
     drop(dim_slices); // borrows dim_vecs, must drop first
-    drop(dim_vecs);
     drop(vid_lookup);
+    // Disabled storage releases the ingestion postings before grid output.
+    let forward_postings = store_forward.then_some(dim_vecs);
 
     // ── Write remaining sections ──────────────────────────────────────────
     let mut bytes_written: u64 = cumulative_bytes;
@@ -513,9 +520,20 @@ pub(crate) fn build_bmp_blob(
     }
     bytes_written += num_virtual_docs as u64 * 2;
 
-    drop(vid_pairs); // Free after last use (~6 bytes × num_real_docs)
+    if let Some(postings) = forward_postings {
+        bytes_written += write_forward_postings(
+            &dim_ids,
+            &postings,
+            &vid_pairs,
+            weight_threshold,
+            min_terms,
+            max_weight_scale,
+            writer,
+        )?;
+    }
+    drop(vid_pairs);
 
-    // BMP V19 footer.
+    // V20 with forward values; V19 when storage is disabled.
     write_bmp_footer(
         writer,
         total_terms,
@@ -531,13 +549,90 @@ pub(crate) fn build_bmp_blob(
         doc_map_offset,
         num_real_docs as u32,
         grid_bits,
+        store_forward,
     )?;
     bytes_written += BMP_BLOB_FOOTER_SIZE as u64;
 
     Ok(bytes_written)
 }
 
-/// Write the BMP V19 footer.
+/// Stream the retained quantized values in logical order. The posting lists
+/// already own ingestion data; scratch adds one cursor per dimension and one
+/// u64 offset per vector, never a second materialized posting corpus.
+#[allow(clippy::too_many_arguments)]
+fn write_forward_postings(
+    dims: &[u32],
+    postings: &[Vec<(DocId, u16, f32)>],
+    pairs: &[(DocId, u16)],
+    threshold: f32,
+    min_terms: usize,
+    scale: f32,
+    writer: &mut dyn Write,
+) -> std::io::Result<u64> {
+    let next =
+        |dim: usize, start: usize| {
+            postings[dim].iter().enumerate().skip(start).find_map(
+                |(pos, &(doc, ordinal, weight))| {
+                    let weight = weight.abs();
+                    if postings[dim].len() >= min_terms && weight < threshold {
+                        return None;
+                    }
+                    let impact = quantize_weight(weight, scale);
+                    (impact != 0).then_some(Reverse((doc, ordinal, dim, pos, impact)))
+                },
+            )
+        };
+    let mut heap = BinaryHeap::with_capacity(dims.len());
+    for dim in 0..dims.len() {
+        if let Some(item) = next(dim, 0) {
+            heap.push(item);
+        }
+    }
+    let mut offsets = Vec::with_capacity(pairs.len());
+    let mut previous = None;
+    let mut previous_dim = None;
+    let mut bytes = 0u64;
+    while let Some(Reverse((doc, ordinal, dim, pos, impact))) = heap.pop() {
+        let pair = (doc, ordinal);
+        if previous != Some(pair) {
+            if pairs.get(offsets.len()) != Some(&pair) {
+                return Err(std::io::Error::other(
+                    "BMP forward and inverted logical keys disagree",
+                ));
+            }
+            offsets.push(bytes);
+            previous = Some(pair);
+            previous_dim = None;
+        }
+        if previous_dim.is_some_and(|p| p > dims[dim]) {
+            return Err(std::io::Error::other("unordered BMP forward dimension"));
+        }
+        writer.write_u32::<LittleEndian>(dims[dim])?;
+        writer.write_u8(impact)?;
+        bytes += 5;
+        previous_dim = Some(dims[dim]);
+        if let Some(item) = next(dim, pos + 1) {
+            heap.push(item);
+        }
+    }
+    let directory = crate::segment::bmp_forward::write_directory(
+        writer,
+        pairs
+            .iter()
+            .zip(&offsets)
+            .map(|(&(doc, ordinal), &offset)| {
+                Ok((
+                    crate::segment::logical_address::LogicalUnit { doc, ordinal },
+                    offset,
+                ))
+            }),
+        pairs.len() as u32,
+        bytes,
+    )?;
+    Ok(bytes + directory)
+}
+
+/// Write the versioned BMP footer (inverted section offsets are unchanged).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_bmp_footer(
     writer: &mut dyn Write,
@@ -554,6 +649,7 @@ pub(crate) fn write_bmp_footer(
     doc_map_offset: u64,
     num_real_docs: u32,
     grid_bits: u8,
+    has_forward: bool,
 ) -> std::io::Result<()> {
     writer.write_u64::<LittleEndian>(total_terms)?; //  0- 7
     writer.write_u64::<LittleEndian>(total_postings)?; //  8-15
@@ -568,7 +664,11 @@ pub(crate) fn write_bmp_footer(
     writer.write_u64::<LittleEndian>(doc_map_offset)?; // 60-67
     writer.write_u32::<LittleEndian>(num_real_docs)?; // 68-71
     writer.write_u32::<LittleEndian>(grid_bits as u32)?; // 72-75
-    writer.write_u32::<LittleEndian>(BMP_BLOB_MAGIC)?; // 76-79
+    writer.write_u32::<LittleEndian>(if has_forward {
+        BMP_BLOB_MAGIC
+    } else {
+        crate::segment::format::BMP_BLOB_MAGIC_V19
+    })?; // 76-79
     Ok(())
 }
 
@@ -1571,6 +1671,7 @@ mod tests {
             66,
             77,
             4,
+            true,
         )
         .unwrap();
 
@@ -1589,7 +1690,8 @@ mod tests {
     fn test_build_bmp_blob_empty() {
         let postings = FxHashMap::default();
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size =
+            build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, true, &mut buf).unwrap();
         assert_eq!(size, 0);
         assert!(buf.is_empty());
     }
@@ -1603,7 +1705,8 @@ mod tests {
         postings.insert(1, vec![(0, 0, 0.8)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size =
+            build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, true, &mut buf).unwrap();
         assert!(size > 0);
         assert_eq!(buf.len(), size as usize);
 
@@ -1622,7 +1725,7 @@ mod tests {
         postings.insert(7u32, vec![(1u32, 0u16, 0.5f32)]); // >= dims (4)
 
         let mut buf = Vec::new();
-        let err = build_bmp_blob(postings, 64, 4, 0.0, None, 4, 5.0, 4, &mut buf)
+        let err = build_bmp_blob(postings, 64, 4, 0.0, None, 4, 5.0, 4, true, &mut buf)
             .expect_err("dim_id >= dims must be rejected at build time");
         let msg = err.to_string();
         assert!(msg.contains('7'), "error must name the dim_id: {msg}");
@@ -1639,7 +1742,8 @@ mod tests {
         postings.insert(0u32, vec![(0u32, 0u16, 1.0f32), (0, 1, 0.8), (1, 0, 0.5)]);
 
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size =
+            build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, true, &mut buf).unwrap();
         assert!(size > 0);
 
         // num_virtual_docs should be 64 (padded to block_size)
@@ -1664,7 +1768,8 @@ mod tests {
         // impact(2.0) = round(2.0/5.0*255) = round(102) = 102
         // impact(1.0) = round(1.0/5.0*255) = round(51) = 51
         let mut buf = Vec::new();
-        let size = build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf).unwrap();
+        let size =
+            build_bmp_blob(postings, 64, 4, 0.0, None, 105879, 5.0, 4, true, &mut buf).unwrap();
         assert!(size > 0);
 
         // Verify max_weight_scale in the footer.
@@ -1763,12 +1868,18 @@ mod tests {
 
         // Fixed max_weight=5.0: same scale
         let mut buf_a = Vec::new();
-        build_bmp_blob(postings_a, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_a).unwrap();
+        build_bmp_blob(
+            postings_a, 64, 4, 0.0, None, 105879, 5.0, 4, true, &mut buf_a,
+        )
+        .unwrap();
         let footer_a = buf_a.len() - BMP_BLOB_FOOTER_SIZE;
         let scale_a = f32::from_le_bytes(buf_a[footer_a + 56..footer_a + 60].try_into().unwrap());
 
         let mut buf_b = Vec::new();
-        build_bmp_blob(postings_b, 64, 4, 0.0, None, 105879, 5.0, 4, &mut buf_b).unwrap();
+        build_bmp_blob(
+            postings_b, 64, 4, 0.0, None, 105879, 5.0, 4, true, &mut buf_b,
+        )
+        .unwrap();
         let footer_b = buf_b.len() - BMP_BLOB_FOOTER_SIZE;
         let scale_b = f32::from_le_bytes(buf_b[footer_b + 56..footer_b + 60].try_into().unwrap());
         assert_eq!(

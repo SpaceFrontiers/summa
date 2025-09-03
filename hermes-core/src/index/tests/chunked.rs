@@ -753,6 +753,7 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
                     CandidateFeature, CandidateScoringPlan, LinearModel, ScoreScope,
                 };
                 let plan = CandidateScoringPlan {
+                    backfill: true,
                     features: vec![CandidateFeature {
                         name: "text".into(),
                         scope: ScoreScope::Chunk,

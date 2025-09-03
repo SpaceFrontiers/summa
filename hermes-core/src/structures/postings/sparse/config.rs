@@ -254,6 +254,10 @@ pub struct SparseVectorConfig {
     /// (`bmp_grid_bits: 2`) at index creation.
     #[serde(default = "default_bmp_grid_bits")]
     pub bmp_grid_bits: u8,
+    /// Store quantized forward values in BMP blobs for L1 and BP (default true).
+    /// False emits V19 without the additional payload; normal BMP search is inverted.
+    #[serde(default = "default_bmp_forward_index", skip_serializing_if = "is_true")]
+    pub bmp_forward_index: bool,
     /// Static pruning: fraction of postings to keep per inverted list (SEISMIC-style)
     /// Lists are sorted by weight descending and truncated to top fraction.
     ///
@@ -314,6 +318,14 @@ fn default_bmp_grid_bits() -> u8 {
     SparseVectorConfig::DEFAULT_BMP_GRID_BITS
 }
 
+fn default_bmp_forward_index() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 fn default_min_terms() -> usize {
     4
 }
@@ -329,6 +341,7 @@ impl Default for SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
+            bmp_forward_index: default_bmp_forward_index(),
             pruning: None,
             query_config: None,
 
@@ -361,6 +374,7 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
+            bmp_forward_index: default_bmp_forward_index(),
             pruning: None,
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -395,6 +409,7 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
+            bmp_forward_index: default_bmp_forward_index(),
             pruning: None,
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -431,6 +446,7 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
+            bmp_forward_index: default_bmp_forward_index(),
             pruning: Some(0.15), // Keep top 15% per dimension
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -462,6 +478,7 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
+            bmp_forward_index: default_bmp_forward_index(),
             pruning: None,
             query_config: None,
 
@@ -490,6 +507,7 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
+            bmp_forward_index: default_bmp_forward_index(),
             pruning: None, // No posting list pruning
             query_config: Some(SparseQueryConfig {
                 tokenizer: None,
@@ -566,6 +584,7 @@ impl SparseVectorConfig {
             block_size: 128,
             bmp_block_size: default_bmp_block_size(),
             bmp_grid_bits: default_bmp_grid_bits(),
+            bmp_forward_index: default_bmp_forward_index(),
             pruning: None,
             query_config: None,
 

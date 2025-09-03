@@ -1,7 +1,8 @@
-//! Complete cross-vertical scores over a bounded candidate union, independent
-//! of retrieval nomination. Linear ranking and RRF are alternative policies.
+//! Named scores over a bounded candidate union: preserve organic retrieval
+//! values, optionally backfill missing cells, and apply the shared linear model.
 mod execution;
 mod model;
+mod retrieved;
 pub use model::{FeatureTransform, LinearModel};
 
 use super::{MultiValueCombiner, PhraseQuery, QueryDecomposition};
@@ -176,6 +177,8 @@ pub struct CandidateFeature {
 #[derive(Clone, Debug)]
 pub struct CandidateScoringPlan {
     pub features: Vec<CandidateFeature>,
+    /// Probe only cells missing from retrieval. False preserves missing values.
+    pub backfill: bool,
     /// None exports raw features; Some ranks directly with this model.
     pub model: Option<LinearModel>,
     /// Bounds only response feature rows; every candidate passage is scored

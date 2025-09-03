@@ -10,9 +10,27 @@ const MAX_FEATURES: usize = crate::query::MAX_FUSION_SUB_QUERIES;
 const MAX_FEATURE_VALUES: usize = 2_000_000;
 const MAX_VECTOR_BYTES: usize = 1024 * 1024 * 1024;
 
+struct CandidateProbeBudget {
+    sparse: crate::segment::reader::SparseProbeBudget,
+    text_remaining: u64,
+}
+impl Default for CandidateProbeBudget {
+    fn default() -> Self {
+        Self {
+            sparse: Default::default(),
+            text_remaining: 256 * 1024 * 1024,
+        }
+    }
+}
+
 impl CandidateScoringPlan {
     pub fn validate(&self, schema: &crate::Schema) -> Result<()> {
         self.document_combiner.validate().map_err(Error::Query)?;
+        if self.all_passages && !self.backfill {
+            return Err(Error::Query(
+                "all_passages diagnostics require backfill".into(),
+            ));
+        }
         if self.features.is_empty()
             || self.features.len() > MAX_FEATURES
             || self.export_passages == 0
@@ -137,15 +155,28 @@ async fn score_field<D: Directory + 'static>(
     searcher: &Searcher<D>,
     reader: &SegmentReader,
     query: &CandidateQuery,
-    targets: &[u32],
+    locations: &[crate::segment::reader::candidate_lookup::CandidateLocation],
     stats: &Arc<GlobalStats>,
     document_scope: bool,
+    budget: &mut CandidateProbeBudget,
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+    let targets: Vec<u32> = locations.iter().map(|location| location.physical).collect();
+    let targets = targets.as_slice();
     let mut result = vec![0.0; targets.len()];
     let mut components = Vec::new();
     for (component, boost) in &query.components {
         let values = match component {
             ScoreComponent::Text(terms) => {
+                for (term, _) in terms {
+                    reader
+                        .reserve_candidate_text_reads(
+                            query.field,
+                            term,
+                            false,
+                            &mut budget.text_remaining,
+                        )
+                        .await?;
+                }
                 crate::query::term::score_term_candidates(
                     reader,
                     query.field,
@@ -156,16 +187,57 @@ async fn score_field<D: Directory + 'static>(
                 .await?
             }
             ScoreComponent::Phrase(phrase) => {
+                for term in &phrase.terms {
+                    reader
+                        .reserve_candidate_text_reads(
+                            query.field,
+                            term,
+                            phrase.terms.len() > 1,
+                            &mut budget.text_remaining,
+                        )
+                        .await?;
+                }
                 crate::query::phrase::score_phrase_candidates(reader, phrase, targets, Some(stats))
                     .await?
             }
             ScoreComponent::Sparse(terms) => {
-                let index = reader
-                    .bmp_index(query.field)
-                    .ok_or_else(|| Error::Query("L1 sparse feature requires BMP storage".into()))?;
-                searcher.install_search_cpu(|| {
-                    crate::query::bmp::score_bmp_candidates(index, terms, targets)
-                })?
+                if let Some(index) = reader.bmp_index(query.field) {
+                    searcher.install_search_cpu(|| {
+                        crate::query::bmp::score_bmp_candidates(index, terms, targets)
+                    })?
+                } else {
+                    let index = reader.sparse_index(query.field).ok_or_else(|| {
+                        Error::Corruption("L1 sparse locations lack a sparse index".into())
+                    })?;
+                    let mut documents: Vec<_> = locations.iter().map(|l| l.doc).collect();
+                    documents.dedup();
+                    let mut scores = vec![0.0f32; locations.len()];
+                    for &(dimension, weight) in terms {
+                        index
+                            .probe_candidates(
+                                &documents,
+                                Some((dimension, weight)),
+                                &mut budget.sparse,
+                                |doc, ordinal, value| {
+                                    if let Ok(i) = locations
+                                        .binary_search_by_key(&(doc, ordinal), |l| {
+                                            (l.doc, l.ordinal)
+                                        })
+                                    {
+                                        scores[i] += value;
+                                        if !scores[i].is_finite() {
+                                            return Err(Error::Query(
+                                                "L1 sparse score overflow".into(),
+                                            ));
+                                        }
+                                    }
+                                    Ok(())
+                                },
+                            )
+                            .await?;
+                    }
+                    scores
+                }
             }
             ScoreComponent::Dense(vector) => {
                 let flat = reader.flat_vectors().get(&query.field.0).ok_or_else(|| {
@@ -245,10 +317,7 @@ impl<D: Directory + 'static> Searcher<D> {
                 builder.set_avg_field_len(field, (total_length / corpus_size.max(1) as f64) as f32);
             }
             for reader in self.segment_readers() {
-                let count = reader
-                    .get_postings(field, &term)
-                    .await?
-                    .map_or(0, |p| p.doc_count());
+                let count = reader.text_doc_freq(field, &term).await?;
                 builder.add_text_df(
                     field,
                     String::from_utf8_lossy(&term).into_owned(),
@@ -267,6 +336,19 @@ impl<D: Directory + 'static> Searcher<D> {
         candidates: &[SearchResult],
         plan: &CandidateScoringPlan,
         stats: Option<Arc<GlobalStats>>,
+    ) -> Result<Vec<ScoredCandidate>> {
+        self.score_candidates_with_retrieved(candidates, plan, stats, &[])
+            .await
+    }
+
+    /// Preserve scores from named retrieval branches, then optionally probe
+    /// only missing logical cells. Branch indices refer to `plan.features`.
+    pub async fn score_candidates_with_retrieved(
+        &self,
+        candidates: &[SearchResult],
+        plan: &CandidateScoringPlan,
+        stats: Option<Arc<GlobalStats>>,
+        retrieved: &[(usize, &[SearchResult])],
     ) -> Result<Vec<ScoredCandidate>> {
         plan.validate(self.schema())?;
         if candidates.len() > crate::query::MAX_FUSION_CANDIDATE_SLOTS {
@@ -292,9 +374,14 @@ impl<D: Directory + 'static> Searcher<D> {
             }
             groups.entry(segment).or_default().push(i);
         }
-        let stats = match stats {
-            Some(stats) => stats,
-            None => self.candidate_text_stats(plan).await?,
+        let organic = super::retrieved::RetrievedScores::new(retrieved, plan, &addresses)?;
+        let stats = if plan.backfill {
+            Some(match stats {
+                Some(stats) => stats,
+                None => self.candidate_text_stats(plan).await?,
+            })
+        } else {
+            None
         };
         let names: Vec<&str> = plan.features.iter().map(|f| f.name.as_str()).collect();
         let count = names.len();
@@ -302,6 +389,7 @@ impl<D: Directory + 'static> Searcher<D> {
         let mut scored_values = 0usize;
         let mut vector_bytes = 0usize;
         let mut matrix_values = 0usize;
+        let mut probe_budget = CandidateProbeBudget::default();
         for (segment, mut candidate_indices) in groups {
             let reader = &self.segment_readers()[segment];
             candidate_indices.sort_unstable_by_key(|&i| candidates[i].doc_id);
@@ -324,14 +412,14 @@ impl<D: Directory + 'static> Searcher<D> {
                 .map(|feature| feature.query.field.0)
                 .collect();
             let mut nominated = Vec::new();
-            if !plan.all_passages {
+            if !plan.all_passages && retrieved.is_empty() {
                 for &i in &candidate_indices {
                     for (field, positions) in &candidates[i].positions {
                         if !chunk_fields.contains(field) {
                             continue;
                         }
                         for position in positions {
-                            nominated.push(crate::segment::ordinal_lookup::LogicalUnit {
+                            nominated.push(crate::segment::logical_address::LogicalUnit {
                                 doc: candidates[i].doc_id,
                                 ordinal: u16::try_from(position.position).map_err(|_| {
                                     Error::Query("invalid nominated passage ordinal".into())
@@ -346,16 +434,108 @@ impl<D: Directory + 'static> Searcher<D> {
                 nominated.sort_unstable();
                 nominated.dedup();
             }
+            // Seed the matrix with organic scores, retaining real zero and
+            // negative values. Scope determines whether a hit nominates a passage.
             for (feature_index, feature) in plan.features.iter().enumerate() {
+                for (doc_index, &candidate_index) in candidate_indices.iter().enumerate() {
+                    let candidate = &candidates[candidate_index];
+                    let Some(hit) =
+                        organic.get(feature_index, candidate.segment_id, candidate.doc_id)
+                    else {
+                        continue;
+                    };
+                    if feature.scope == ScoreScope::Document {
+                        doc_values[doc_index][feature_index] = Some(hit.score);
+                    } else {
+                        for (field, positions) in &hit.positions {
+                            if *field != feature.query.field.0 {
+                                continue;
+                            }
+                            for position in positions {
+                                let key = (hit.doc_id, position.position as u16);
+                                if let std::collections::btree_map::Entry::Vacant(entry) =
+                                    passages.entry(key)
+                                {
+                                    matrix_values = matrix_values.saturating_add(count);
+                                    if matrix_values > MAX_FEATURE_VALUES {
+                                        return Err(Error::Query(
+                                            "L1 feature matrix budget exceeded".into(),
+                                        ));
+                                    }
+                                    entry.insert(vec![None; count]);
+                                }
+                                let value = &mut passages.get_mut(&key).expect("inserted passage")
+                                    [feature_index];
+                                if value.is_some() {
+                                    return Err(Error::Query(
+                                        "duplicate organic L1 passage score".into(),
+                                    ));
+                                }
+                                *value = Some(position.score);
+                            }
+                        }
+                    }
+                }
+            }
+            nominated.extend(passages.keys().map(|&(doc, ordinal)| {
+                crate::segment::logical_address::LogicalUnit { doc, ordinal }
+            }));
+            nominated.sort_unstable();
+            nominated.dedup();
+            for key in &nominated {
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    passages.entry((key.doc, key.ordinal))
+                {
+                    matrix_values = matrix_values.saturating_add(count);
+                    if matrix_values > MAX_FEATURE_VALUES {
+                        return Err(Error::Query("L1 feature matrix budget exceeded".into()));
+                    }
+                    entry.insert(vec![None; count]);
+                }
+            }
+            for (feature_index, feature) in plan.features.iter().enumerate() {
+                if !plan.backfill {
+                    continue;
+                }
+                let missing_documents: Vec<_> = documents
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &doc)| {
+                        (feature.scope == ScoreScope::Chunk
+                            || doc_values[i][feature_index].is_none())
+                        .then_some(doc)
+                    })
+                    .collect();
+                let missing_passages: Vec<_> = nominated
+                    .iter()
+                    .copied()
+                    .filter(|key| passages[&(key.doc, key.ordinal)][feature_index].is_none())
+                    .collect();
                 let mut locations = if feature.scope == ScoreScope::Chunk && !plan.all_passages {
-                    reader.candidate_passage_locations(feature.query.field, &nominated)?
+                    reader
+                        .candidate_passage_locations(
+                            feature.query.field,
+                            &missing_passages,
+                            &mut probe_budget.sparse,
+                        )
+                        .await?
                 } else {
-                    reader.candidate_locations(
-                        feature.query.field,
-                        &documents,
-                        MAX_FEATURE_VALUES.saturating_sub(scored_values),
-                    )?
+                    reader
+                        .candidate_locations(
+                            feature.query.field,
+                            &missing_documents,
+                            MAX_FEATURE_VALUES.saturating_sub(scored_values),
+                            &mut probe_budget.sparse,
+                        )
+                        .await?
                 };
+                if feature.scope == ScoreScope::Chunk {
+                    locations.retain(|location| {
+                        passages
+                            .get(&(location.doc, location.ordinal))
+                            .is_none_or(|row| row[feature_index].is_none())
+                    });
+                }
                 if locations.len() > MAX_FEATURE_VALUES.saturating_sub(scored_values) {
                     return Err(Error::Query("L1 scored-value budget exceeded".into()));
                 }
@@ -387,16 +567,15 @@ impl<D: Directory + 'static> Searcher<D> {
                     }
                 }
                 locations.sort_unstable_by_key(|location| location.physical);
-                let targets: Vec<u32> =
-                    locations.iter().map(|location| location.physical).collect();
                 let document_scope = feature.scope == ScoreScope::Document;
                 let (scores, components) = score_field(
                     self,
                     reader,
                     &feature.query,
-                    &targets,
-                    &stats,
+                    &locations,
+                    stats.as_ref().expect("backfill statistics"),
                     document_scope,
+                    &mut probe_budget,
                 )
                 .await?;
                 if document_scope {

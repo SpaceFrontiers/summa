@@ -257,7 +257,7 @@ pub fn merge_search_responses(
     });
     if matches!(
         ranking_method.as_deref(),
-        Some("feature_export_v1" | "fusion_candidates_v1")
+        Some("feature_export_v2" | "fusion_candidates_v1")
     ) && (offset != 0 || hits.len() > limit)
     {
         return Err(Status::invalid_argument(format!(
@@ -285,10 +285,10 @@ pub fn merge_search_responses(
     })
 }
 
-fn address_key(hit: &SearchHit) -> (String, u32) {
+fn address_key(hit: &SearchHit) -> (&str, u32) {
     hit.address
         .as_ref()
-        .map(|a| (a.segment_id.clone(), a.doc_id))
+        .map(|a| (a.segment_id.as_str(), a.doc_id))
         .unwrap_or_default()
 }
 
@@ -630,16 +630,9 @@ mod tests {
             ..Default::default()
         };
         let merged = merge_search_responses(vec![a, b], 1, 3).unwrap();
-        let order: Vec<(String, u32)> = merged.hits.iter().map(address_key).collect();
+        let order: Vec<(&str, u32)> = merged.hits.iter().map(address_key).collect();
         // 0.9(a1) skipped by offset; then 0.7(b1), 0.5(a2 before b2 by address), 0.5(b2)
-        assert_eq!(
-            order,
-            vec![
-                ("b".to_string(), 1),
-                ("a".to_string(), 2),
-                ("b".to_string(), 2)
-            ]
-        );
+        assert_eq!(order, vec![("b", 1), ("a", 2), ("b", 2)]);
         assert_eq!(merged.total_hits, 5);
         assert_eq!(merged.took_ms, 9);
         assert_eq!(merged.timings.unwrap().search_us, 300);
@@ -654,17 +647,17 @@ mod tests {
             ..Default::default()
         });
         let first = SearchResponse {
-            ranking_method: "linear_v1".into(),
+            ranking_method: "linear_v2".into(),
             hits: vec![a],
             ..Default::default()
         };
         let second = SearchResponse {
-            ranking_method: "linear_v1".into(),
+            ranking_method: "linear_v2".into(),
             hits: vec![hit("b", 1, -1.0)],
             ..Default::default()
         };
         let merged = merge_search_responses(vec![first.clone(), second], 0, 2).unwrap();
-        assert_eq!(merged.ranking_method, "linear_v1");
+        assert_eq!(merged.ranking_method, "linear_v2");
         assert_eq!(merged.hits[0].score, -1.0);
         assert_eq!(
             merged.hits[1].candidate_scores.as_ref().unwrap().document["dense"],
@@ -681,7 +674,7 @@ mod tests {
     #[test]
     fn feature_export_never_discards_the_cross_shard_union() {
         let response = |segment| SearchResponse {
-            ranking_method: "feature_export_v1".into(),
+            ranking_method: "feature_export_v2".into(),
             hits: vec![hit(segment, 1, 0.0)],
             ..Default::default()
         };

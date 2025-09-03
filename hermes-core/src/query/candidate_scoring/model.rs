@@ -25,8 +25,7 @@ impl Default for FeatureTransform {
     }
 }
 impl FeatureTransform {
-    fn apply(&self, value: f32) -> f64 {
-        let raw = f64::from(value);
+    fn apply(&self, raw: f64) -> f64 {
         let raw = if self.signed_log1p {
             raw.signum() * raw.abs().ln_1p()
         } else {
@@ -38,11 +37,15 @@ impl FeatureTransform {
 
 /// Linear coefficients reference names on the actual nomination/scoring queries.
 /// Missing coefficients mean zero, never a default weight. No page/shard-derived
-/// normalization is applied. A missing value contributes zero before transforms.
+/// normalization is applied. Missing cells use the learned raw default before
+/// transforms, or contribute nothing when no default is supplied.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinearModel {
     pub weights: BTreeMap<String, f64>,
+    /// Learned raw defaults applied only to missing cells, before transforms.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub missing_values: BTreeMap<String, f64>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub bias: f64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -143,6 +146,13 @@ impl LinearModel {
                 )));
             }
         }
+        for (name, value) in &self.missing_values {
+            if !self.weights.contains_key(name) || !value.is_finite() {
+                return Err(Error::Query(format!(
+                    "l1 missing value '{name}' needs a coefficient and finite raw default"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -154,7 +164,12 @@ impl LinearModel {
         }
         let mut score = self.bias;
         for (&name, &value) in names.iter().zip(values) {
-            let Some(value) = value else { continue };
+            let Some(value) = value
+                .map(f64::from)
+                .or_else(|| self.missing_values.get(name).copied())
+            else {
+                continue;
+            };
             if !value.is_finite() {
                 return Err(Error::Query(format!(
                     "non-finite score for branch '{name}'"
@@ -164,10 +179,7 @@ impl LinearModel {
             if weight == 0.0 {
                 continue;
             }
-            let transformed = self
-                .transforms
-                .get(name)
-                .map_or(f64::from(value), |t| t.apply(value));
+            let transformed = self.transforms.get(name).map_or(value, |t| t.apply(value));
             score += weight * transformed;
         }
         let score = score as f32;
@@ -191,9 +203,43 @@ mod tests {
         model.weights.insert("dense".into(), 0.0);
         assert!(model.validate(&["dense"]).is_err());
     }
+
+    #[test]
+    fn learned_missing_defaults_are_transformed_without_mutating_observed_values() {
+        let mut model = LinearModel {
+            weights: BTreeMap::from([("dense".into(), -2.0)]),
+            missing_values: BTreeMap::from([("dense".into(), -3.0)]),
+            bias: 0.5,
+            transforms: BTreeMap::from([(
+                "dense".into(),
+                FeatureTransform {
+                    signed_log1p: true,
+                    scale: 2.0,
+                    offset: 1.0,
+                },
+            )]),
+        };
+        model.validate(&["dense"]).unwrap();
+        let values = [None];
+        assert_eq!(
+            model.score(&["dense"], &values).unwrap(),
+            (0.5 - 2.0 * (-3.0f64.ln_1p() * 2.0 + 1.0)) as f32
+        );
+        assert_eq!(values, [None]);
+        assert_eq!(model.score(&["dense"], &[Some(0.0)]).unwrap(), -1.5);
+        assert_eq!(
+            model.score(&["dense"], &[Some(-1.0)]).unwrap(),
+            (0.5 - 2.0 * (-1.0f64.ln_1p() * 2.0 + 1.0)) as f32
+        );
+        model.missing_values.insert("dense".into(), f64::INFINITY);
+        assert!(model.validate(&["dense"]).is_err());
+        model.missing_values = BTreeMap::from([("typo".into(), 1.0)]);
+        assert!(model.validate(&["dense"]).is_err());
+    }
     #[test]
     fn missing_values_skip_affine_offsets_while_real_zeros_and_negatives_are_valid() {
         let model = LinearModel {
+            missing_values: BTreeMap::new(),
             weights: BTreeMap::from([("dense".into(), 2.0)]),
             bias: 0.5,
             transforms: BTreeMap::from([(

@@ -131,3 +131,42 @@ test("candidate export preserves method, depth and per-branch wire results", () 
   const decoded = SearchResponse.decode(SearchResponse.encode(original).finish());
   assert.deepEqual(decoded.fusionCandidates, original.fusionCandidates);
 });
+
+
+test("linear options preserve explicit disabled backfill and learned defaults", () => {
+  const { SearchRequest } = require("../dist/generated/hermes.js");
+  for (const backfill of [undefined, false, true]) {
+    const request = SearchRequest.fromPartial({ l1: {
+      weights: { dense: 2 }, backfill, missingValues: { dense: -0.75 },
+    } });
+    const decoded = SearchRequest.decode(SearchRequest.encode(request).finish());
+    assert.equal(decoded.l1.backfill, backfill);
+    assert.deepEqual(decoded.l1.missingValues, { dense: -0.75 });
+  }
+});
+
+test("client search forwards disabled backfill and learned missing defaults", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { SearchResponse } = require("../dist/generated/hermes.js");
+  const client = new HermesClient();
+  client.indexClient = {};
+  let sent;
+  client.searchClient = { search: async (request) => {
+    sent = request;
+    return SearchResponse.fromPartial({ rankingMethod: "linear_v2" });
+  } };
+  await client.search("docs", { query: { all: {} },
+    l1: { weights: { dense: 1 }, backfill: false, missingValues: { dense: -0.75 } },
+  });
+  assert.equal(sent.l1.backfill, false);
+  assert.deepEqual(sent.l1.missingValues, { dense: -0.75 });
+});
+
+test("linear client request rejects a backend with legacy ranking semantics", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { SearchResponse } = require("../dist/generated/hermes.js");
+  const client = new HermesClient();
+  client.indexClient = {};
+  client.searchClient = { search: async () => SearchResponse.fromPartial({ rankingMethod: "linear_v1" }) };
+  await assert.rejects(client.search("docs", { query: { all: {} }, l1: { weights: { dense: 1 } } }), /linear_v2/);
+});

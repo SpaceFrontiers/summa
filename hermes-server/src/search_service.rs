@@ -147,12 +147,16 @@ impl SearchService for SearchServiceImpl {
                 let nominations: Vec<_> = fusion.queries.iter().zip(&queries).filter(|(branch, _)| !branch.score_only)
                     .map(|(_, query)| candidate_scoring::with_filters(query.clone(), &filters)).collect();
                 let depth = if fusion.candidate_depth == 0 { candidate_limit } else { fusion.candidate_depth as usize };
-                let (candidates, seen) = searcher.search_candidate_union(&nominations, depth, stats.clone()).await.map_err(crate::error::hermes_error_to_status)?;
+                let lists = searcher.search_candidate_lists(&nominations, depth, Some(stats.clone())).await.map_err(crate::error::hermes_error_to_status)?;
+                let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
+                let candidates = searcher.merge_candidate_lists(lists.iter().map(|(list, _)| list.as_slice())).map_err(crate::error::hermes_error_to_status)?;
+                let retrieved: Vec<_> = fusion.queries.iter().enumerate().filter(|(_, branch)| !branch.score_only)
+                    .zip(&lists).map(|((feature, _), (list, _))| (feature, list.as_slice())).collect();
                 if req.l1.is_none() && candidates.len() > limit {
                     return Err(Status::invalid_argument(format!("feature export needs limit >= complete candidate union ({} documents)", candidates.len())));
                 }
                 let t_scoring = Instant::now();
-                let mut scored = searcher.score_candidates(&candidates, &plan, Some(stats)).await.map_err(crate::error::hermes_error_to_status)?;
+                let mut scored = searcher.score_candidates_with_retrieved(&candidates, &plan, Some(stats), &retrieved).await.map_err(crate::error::hermes_error_to_status)?;
                 candidate_scoring_us = t_scoring.elapsed().as_micros() as u64;
                 let fused_limit = if rerank_setup.is_some() { candidate_limit } else { limit };
                 scored.truncate(fused_limit);
@@ -164,7 +168,7 @@ impl SearchService for SearchServiceImpl {
                     }
                     results.push(candidate.result);
                 }
-                ranking_method = if req.l1.is_some() { "linear_v1" } else { "feature_export_v1" }.into();
+                ranking_method = if req.l1.is_some() { "linear_v2" } else { "feature_export_v2" }.into();
                 query_desc = format!("{}: {} branches, depth {}, union {}", ranking_method, queries.len(), depth, candidates.len());
                 (results, seen, rerank_setup.map(|config| (config, limit)))
             } else if let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query {
@@ -704,7 +708,7 @@ impl SearchService for SearchServiceImpl {
             memory_stats: Some(memory_stats),
             vector_stats,
             text_fields,
-            candidate_scoring_version: 1,
+            candidate_scoring_version: 2,
             unprepared_candidate_fields: searcher
                 .segment_readers()
                 .iter()

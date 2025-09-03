@@ -491,6 +491,12 @@ class HermesClient:
             request, timeout=self._deadline(timeout)
         )
 
+        if l1 is not None and response.ranking_method != "linear_v2":
+            raise RuntimeError(
+                "L1 requires a backend with linear_v2 ranking semantics; "
+                f"received {response.ranking_method!r}"
+            )
+
         hits = [
             SearchHit(
                 address=DocAddress(

@@ -128,6 +128,7 @@ pub(super) fn build_sparse_streaming(
                     dims,
                     max_weight,
                     min_terms,
+                    sparse_config.is_none_or(|config| config.bmp_forward_index),
                     writer,
                 )
                 .map_err(crate::Error::Io)?;

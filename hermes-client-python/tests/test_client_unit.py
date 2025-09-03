@@ -113,7 +113,7 @@ async def test_named_l1_roundtrip_preserves_zero_negative_missing_and_scope():
     client._ensure_connected = lambda: None
     client._search_stub = AsyncMock()
     client._search_stub.Search.return_value = pb.SearchResponse(
-        ranking_method="linear_v1",
+        ranking_method="linear_v2",
         hits=[
             pb.SearchHit(
                 score=-0.25,
@@ -150,7 +150,11 @@ async def test_named_l1_roundtrip_preserves_zero_negative_missing_and_scope():
                 "filters": [{"phrase": {"field": "body", "text": "red blood cells"}}],
             }
         },
-        l1={"weights": {"dense": 0.5}},
+        l1={
+            "weights": {"dense": 0.5},
+            "backfill": False,
+            "missing_values": {"dense": -0.75},
+        },
         score_export={},
     )
     sent = client._search_stub.Search.call_args.args[0]
@@ -160,8 +164,11 @@ async def test_named_l1_roundtrip_preserves_zero_negative_missing_and_scope():
     assert sent.query.fusion.candidate_depth == 2
     assert sent.query.fusion.filters[0].phrase.text == "red blood cells"
     assert sent.l1.weights["dense"] == 0.5
+    assert sent.l1.HasField("backfill")
+    assert not sent.l1.backfill
+    assert sent.l1.missing_values["dense"] == -0.75
     assert sent.HasField("score_export")
-    assert result.ranking_method == "linear_v1"
+    assert result.ranking_method == "linear_v2"
     raw = result.hits[0].candidate_scores
     assert raw.document == {"title": 0.0}
     assert raw.passages[0].scores == {"dense": -0.5}
@@ -210,3 +217,17 @@ async def test_candidate_export_roundtrip_preserves_branch_identity_and_negative
     assert branch.candidates[0].score == -0.5
     assert branch.candidates[0].ordinal_scores[0].ordinal == 7
     assert branch.candidates[0].ordinal_scores[0].score == -0.25
+
+
+@pytest.mark.asyncio
+async def test_linear_request_rejects_a_backend_with_legacy_ranking_semantics():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient("localhost:50051")
+    client._ensure_connected = lambda: None
+    client._search_stub = AsyncMock()
+    client._search_stub.Search.return_value = pb.SearchResponse(
+        ranking_method="linear_v1"
+    )
+    with pytest.raises(RuntimeError, match="linear_v2"):
+        await client.search("docs", query={"all": {}}, l1={"weights": {"dense": 1}})

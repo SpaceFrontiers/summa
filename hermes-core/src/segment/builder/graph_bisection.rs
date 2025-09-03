@@ -575,6 +575,42 @@ fn build_block_jobs(
     jobs
 }
 
+fn visit_bmp_job(
+    job: &BlockJob,
+    bmps: &[&crate::segment::reader::bmp::BmpIndex],
+    vid_maps: &[(Vec<u32>, Vec<u32>)],
+    forward_views: &[Option<crate::segment::bmp_forward::ValidatedForward<'_>>],
+    mut visit: impl FnMut(u32, u32),
+) {
+    let bmp = bmps[job.src as usize];
+    let (v2r, r2v) = &vid_maps[job.src as usize];
+    if let Some(view) = &forward_views[job.src as usize] {
+        let forward = bmp.forward().expect("validated forward source");
+        for real in job.real_start..job.real_start + job.real_len {
+            let (doc, ordinal) = bmp.virtual_to_doc(r2v[real as usize]);
+            let index = forward
+                .find(crate::segment::logical_address::LogicalUnit { doc, ordinal })
+                .expect("validated forward key");
+            for (dim, _) in view.vector(index).iter() {
+                visit(real, dim);
+            }
+        }
+    } else {
+        for (dim, _, postings) in bmp.iter_block_terms(job.block_id) {
+            for posting in postings {
+                let vid = job.block_id as usize * bmp.bmp_block_size as usize
+                    + posting.local_slot as usize;
+                if let Some(&real) = v2r.get(vid)
+                    && real != u32::MAX
+                    && posting.impact > 0
+                {
+                    visit(real, dim);
+                }
+            }
+        }
+    }
+}
+
 /// Build forward index from BmpIndex sources (single or multi-source).
 ///
 /// Documents are identified by dense *real* indices assigned sequentially
@@ -599,13 +635,13 @@ pub(crate) fn build_forward_index_from_bmps(
         .iter()
         .map(|bmp| build_vid_maps(bmp))
         .collect::<crate::Result<_>>()?;
-    Ok(build_forward_index_from_bmps_with_maps(
+    build_forward_index_from_bmps_with_maps(
         bmps,
         &vid_maps,
         min_doc_freq,
         max_doc_freq,
         memory_budget_bytes,
-    ))
+    )
 }
 
 /// Variant for reorder callers that already need the virtual/real maps during
@@ -617,19 +653,19 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     min_doc_freq: usize,
     max_doc_freq: usize,
     memory_budget_bytes: usize,
-) -> ForwardIndex {
+) -> crate::Result<ForwardIndex> {
     debug_assert_eq!(bmps.len(), vid_maps.len());
     let total_docs: usize = vid_maps.iter().map(|(_, r2v)| r2v.len()).sum();
 
     if total_docs == 0 {
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited: false,
-        };
+        });
     }
 
     // Job list: one entry per (source, block). Real ids are assigned in
@@ -637,6 +673,27 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     // contiguous real-id range — every phase below can process blocks in
     // parallel, writing disjoint slices.
     let jobs = build_block_jobs(bmps, vid_maps);
+    let forward_views = bmps
+        .iter()
+        .zip(vid_maps)
+        .map(|(bmp, (_, r2v))| {
+            let Some(forward) = bmp.forward() else {
+                return Ok(None);
+            };
+            for &vid in r2v {
+                let (doc, ordinal) = bmp.virtual_to_doc(vid);
+                if forward
+                    .find(crate::segment::logical_address::LogicalUnit { doc, ordinal })
+                    .is_none()
+                {
+                    return Err(crate::Error::Corruption(
+                        "BMP physical vector missing from forward values".into(),
+                    ));
+                }
+            }
+            forward.validate_payload().map(Some)
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
 
     // Phase 1: count document frequencies in bounded worker-local tables.
     // Shared atomics made popular dimensions a cache-coherence bottleneck;
@@ -656,51 +713,39 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             crate::format_bytes(memory_budget_bytes as u64),
             crate::format_bytes(frequency_bytes as u64),
         );
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited: true,
-        };
+        });
     }
     let Some(dim_df) = count_frequencies_bounded(
         &jobs,
         max_dims,
         memory_budget_bytes.saturating_sub(jobs_bytes),
         |job, counts| {
-            let bmp = bmps[job.src as usize];
-            let (v2r, _) = &vid_maps[job.src as usize];
-            let block_size = bmp.bmp_block_size as usize;
-            for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
-                let mut frequency = 0u32;
-                for posting in postings {
-                    let vid = job.block_id as usize * block_size + posting.local_slot as usize;
-                    if v2r.get(vid).is_some_and(|&real| real != u32::MAX) && posting.impact > 0 {
-                        frequency = frequency.saturating_add(1);
-                    }
+            visit_bmp_job(job, bmps, vid_maps, &forward_views, |_, dim| {
+                if let Some(total) = counts.get_mut(dim as usize) {
+                    *total = total.saturating_add(1);
                 }
-                if frequency > 0
-                    && let Some(total) = counts.get_mut(dim_id as usize)
-                {
-                    *total = total.saturating_add(frequency);
-                }
-            }
+            });
         },
     ) else {
         log::warn!(
             "[reorder] memory budget {} cannot hold a bounded dimension-frequency table; using identity order",
             crate::format_bytes(memory_budget_bytes as u64),
         );
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited: true,
-        };
+        });
     };
 
     // Retain the lowest-frequency candidates in a bounded heap while the
@@ -742,14 +787,14 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         // signal. Avoid allocating per-document counts and u64 offsets only
         // to discover that the terms array is empty, especially when the
         // configured budget is below the fixed document scratch cost.
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited,
-        };
+        });
     }
 
     let mut term_remap = vec![u32::MAX; max_dims];
@@ -772,23 +817,11 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     // Phase 2: count terms per doc (filtered) — per-block disjoint slices
     let mut counts = vec![0u32; total_docs];
     let fill_block_counts = |job: &BlockJob, out: &mut [u32]| {
-        let bmp = bmps[job.src as usize];
-        let (v2r, _) = &vid_maps[job.src as usize];
-        let block_size = bmp.bmp_block_size as usize;
-        for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
-            if term_remap.get(dim_id as usize).copied().unwrap_or(u32::MAX) == u32::MAX {
-                continue;
+        visit_bmp_job(job, bmps, vid_maps, &forward_views, |real, dim| {
+            if term_remap.get(dim as usize).copied().unwrap_or(u32::MAX) != u32::MAX {
+                out[(real - job.real_start) as usize] += 1;
             }
-            for p in postings {
-                let vid = job.block_id as usize * block_size + p.local_slot as usize;
-                let Some(&real) = v2r.get(vid) else {
-                    continue;
-                };
-                if real != u32::MAX && p.impact > 0 {
-                    out[(real - job.real_start) as usize] += 1;
-                }
-            }
-        }
+        });
     };
     {
         let mut slices: Vec<(&BlockJob, &mut [u32])> = Vec::with_capacity(jobs.len());
@@ -817,32 +850,18 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     // terms range covering its real docs; per-doc write cursors are local.
     let mut terms = vec![0u32; total];
     let fill_block_terms = |job: &BlockJob, global_real_start: usize, out: &mut [u32]| {
-        let bmp = bmps[job.src as usize];
-        let (v2r, _) = &vid_maps[job.src as usize];
-        let block_size = bmp.bmp_block_size as usize;
-        // local_slot is u8, so a block never holds more than 256 real docs
-        assert!(job.real_len as usize <= 256, "BMP block exceeds 256 docs");
         let mut cursor = [0u32; 256];
         let base = offsets[global_real_start] as usize;
-        for (dim_id, _, postings) in bmp.iter_block_terms(job.block_id) {
-            let compact = term_remap.get(dim_id as usize).copied().unwrap_or(u32::MAX);
-            if compact == u32::MAX {
-                continue;
+        visit_bmp_job(job, bmps, vid_maps, &forward_views, |real, dim| {
+            let compact = term_remap.get(dim as usize).copied().unwrap_or(u32::MAX);
+            if compact != u32::MAX {
+                let local = (real - job.real_start) as usize;
+                let pos =
+                    offsets[global_real_start + local] as usize - base + cursor[local] as usize;
+                out[pos] = compact;
+                cursor[local] += 1;
             }
-            for p in postings {
-                let vid = job.block_id as usize * block_size + p.local_slot as usize;
-                let Some(&real) = v2r.get(vid) else {
-                    continue;
-                };
-                if real != u32::MAX && p.impact > 0 {
-                    let local = (real - job.real_start) as usize;
-                    let pos =
-                        offsets[global_real_start + local] as usize - base + cursor[local] as usize;
-                    out[pos] = compact;
-                    cursor[local] += 1;
-                }
-            }
-        }
+        });
     };
     {
         let mut slices: Vec<(&BlockJob, usize, &mut [u32])> = Vec::with_capacity(jobs.len());
@@ -866,7 +885,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         }
     }
 
-    ForwardIndex {
+    Ok(ForwardIndex {
         terms,
         offsets,
         num_terms: num_active_terms,
@@ -878,7 +897,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             parallel_bisect_lanes,
         ),
         budget_limited,
-    }
+    })
 }
 
 /// Build a forward index over BLOCKS (one entity per block, its terms = the

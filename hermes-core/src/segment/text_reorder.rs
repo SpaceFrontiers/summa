@@ -279,6 +279,7 @@ async fn plan_field(
 
 /// Rewrite the term dictionary, postings, positions and chunk maps of a
 /// segment with the planned fields' virtual ids permuted.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
     dir: &D,
     reader: &SegmentReader,
@@ -286,8 +287,10 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
     schema: &Arc<Schema>,
     plans: &[TextReorderPlan],
     posting_config: (crate::structures::IndexOptimization, PostingCodec),
+    memory_budget: usize,
     cancellation: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
+    check_chunk_map_budget(reader, schema, plans, memory_budget)?;
     let (optimization, posting_codec) = posting_config;
     let started = std::time::Instant::now();
     let by_field: FxHashMap<u32, &TextReorderPlan> =
@@ -374,11 +377,87 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
         let _ = dir.delete(&dst_files.positions).await;
     }
 
+    drop(new_lengths);
+    drop(buf);
+    write_reordered_chunk_maps(
+        dir,
+        reader,
+        dst_files,
+        schema,
+        plans,
+        memory_budget,
+        cancellation,
+    )
+    .await?;
+
+    log::info!(
+        "[reorder_text] index={} rewrote {} terms ({} reordered) in {:.1}s",
+        schema.index_label(),
+        terms,
+        reordered_terms,
+        started.elapsed().as_secs_f64(),
+    );
+    Ok(())
+}
+// Admit the chunk-map writer's peak scratch, including retained BP plans.
+// Existing physical columns copy once; only one logical-slot permutation is sorted.
+fn check_chunk_map_budget(
+    reader: &SegmentReader,
+    schema: &Schema,
+    plans: &[TextReorderPlan],
+    memory_budget: usize,
+) -> Result<()> {
+    let map_bytes: usize = reader
+        .chunk_maps()
+        .values()
+        .map(|m| m.num_chunks() as usize * 8)
+        .sum();
+    let slot_bytes = reader
+        .chunk_maps()
+        .values()
+        .map(|m| m.num_chunks() as usize * 4)
+        .max()
+        .unwrap_or(0);
+    let norm_bytes: usize = schema
+        .fields()
+        .filter_map(|(field, _)| reader.doc_lengths(field))
+        .map(|m| m.num_docs() as usize * 2)
+        .sum();
+    let plan_bytes: usize = plans
+        .iter()
+        .map(|p| (p.order.capacity() + p.inverse.capacity()) * 4)
+        .sum();
+    let required = map_bytes
+        .saturating_add(slot_bytes)
+        .saturating_add(norm_bytes)
+        .saturating_add(plan_bytes);
+    if required > memory_budget {
+        return Err(crate::Error::Schema(format!(
+            "text logical addressing needs {required} bytes of reorder scratch; increase bp-memory-budget-mb"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) async fn write_reordered_chunk_maps<D: Directory + DirectoryWriter>(
+    dir: &D,
+    reader: &SegmentReader,
+    dst_files: &SegmentFiles,
+    schema: &Arc<Schema>,
+    plans: &[TextReorderPlan],
+    memory_budget: usize,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    check_chunk_map_budget(reader, schema, plans, memory_budget)?;
+    let by_field: FxHashMap<u32, &TextReorderPlan> = plans.iter().map(|p| (p.field.0, p)).collect();
     // Chunk maps and length columns: planned fields in the new order, the
     // rest verbatim.
     let mut chunk_fields: Vec<(u32, ChunkMapBuilder)> = Vec::new();
     for (field_id, map) in reader.chunk_maps() {
-        let mut builder = ChunkMapBuilder::default();
+        if cancellation.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(crate::Error::IndexClosed);
+        }
+        let mut builder = ChunkMapBuilder::with_capacity(map.num_chunks() as usize);
         match by_field.get(field_id) {
             Some(plan) => {
                 for &old in &plan.order {
@@ -393,6 +472,7 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
                 }
             }
         }
+        builder.set_total_tokens(map.total_tokens());
         chunk_fields.push((*field_id, builder));
     }
     chunk_fields.sort_by_key(|(field_id, _)| *field_id);
@@ -428,13 +508,6 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
         writer.finish()?;
     }
 
-    log::info!(
-        "[reorder_text] index={} rewrote {} terms ({} reordered) in {:.1}s",
-        schema.index_label(),
-        terms,
-        reordered_terms,
-        started.elapsed().as_secs_f64(),
-    );
     Ok(())
 }
 
