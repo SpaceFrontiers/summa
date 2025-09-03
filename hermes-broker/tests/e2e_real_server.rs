@@ -304,7 +304,7 @@ async fn broker_routes_real_hermes_servers() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the hermes-server binary; see module docs"]
-async fn partitioned_fusion_collects_text_stats_from_real_servers() {
+async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
     let server_a = spawn_server();
     let server_b = spawn_server();
     wait_server_ready(&server_a.addr).await;
@@ -481,6 +481,47 @@ async fn partitioned_fusion_collects_text_stats_from_real_servers() {
             raw.document["topic"],
             original.candidate_scores.as_ref().unwrap().document["topic"],
             "organic scores are preserved across backfill settings"
+        );
+    }
+    for (excluded, expected) in [("doc-1", "doc-2"), ("doc-2", "doc-1"), ("absent", "doc-2")] {
+        let mut filtered = request.clone();
+        filtered.limit = 1;
+        let Some(query::Query::Fusion(fusion)) = filtered.query.as_mut().unwrap().query.as_mut()
+        else {
+            unreachable!()
+        };
+        fusion.candidate_depth = 1;
+        fusion.filters = vec![Query {
+            query: Some(query::Query::Boolean(BooleanQuery {
+                must_not: vec![Query {
+                    query: Some(query::Query::Term(TermQuery {
+                        field: "id".into(),
+                        term: excluded.into(),
+                        ..Default::default()
+                    })),
+                }],
+                ..Default::default()
+            })),
+        }];
+        let result = broker_search_client(&broker)
+            .await
+            .search(filtered)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(
+            result.hits[0].fields["id"].values[0].value,
+            Some(field_value::Value::Text(expected.into()))
+        );
+        assert_eq!(
+            result.hits[0]
+                .candidate_scores
+                .as_ref()
+                .unwrap()
+                .document
+                .len(),
+            2
         );
     }
     let mut export = request;

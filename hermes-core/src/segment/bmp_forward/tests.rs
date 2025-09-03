@@ -60,14 +60,15 @@ fn parse(bytes: Vec<u8>, docs: u32, vectors: u32) -> BmpIndex {
     .unwrap()
 }
 
-fn legacy(source: &BmpIndex, docs: u32) -> BmpIndex {
+fn without_forward(source: &BmpIndex, docs: u32) -> BmpIndex {
     let mut bytes = source.read_raw_blob().unwrap().to_vec();
     let footer = bytes.len() - crate::segment::format::BMP_BLOB_FOOTER_SIZE;
     let start = u64::from_le_bytes(bytes[footer + 60..footer + 68].try_into().unwrap()) as usize
         + source.num_virtual_docs as usize * 6;
     bytes.drain(start..footer);
-    let end = bytes.len();
-    bytes[end - 4..].copy_from_slice(&crate::segment::format::BMP_BLOB_MAGIC_V19.to_le_bytes());
+    let mut marker = Vec::new();
+    write_disabled(&mut marker).unwrap();
+    bytes.splice(start..start, marker);
     parse(bytes, docs, source.total_vectors)
 }
 
@@ -97,6 +98,37 @@ fn forward_values(source: &BmpForward) -> BTreeMap<(u32, u16, u32), u32> {
 }
 
 #[test]
+fn disabled_forward_storage_keeps_the_current_bmp_envelope() {
+    let source = fixture_with_storage(137, true, false);
+    let bytes = source.read_raw_blob().unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap()),
+        crate::segment::format::BMP_BLOB_MAGIC,
+    );
+    assert!(source.forward().is_none());
+}
+
+#[test]
+fn current_bmp_reader_rejects_a_legacy_envelope() {
+    let current = fixture(137);
+    let old = without_forward(&current, 137);
+    let mut bytes = old.read_raw_blob().unwrap().to_vec();
+    let footer = bytes.len() - crate::segment::format::BMP_BLOB_FOOTER_SIZE;
+    bytes.drain(footer - TRAILER_BYTES..footer);
+    let end = bytes.len();
+    bytes[end - 4..].copy_from_slice(&0x39504d42u32.to_le_bytes());
+    let bytes = OwnedBytes::new(bytes);
+    let result = BmpIndex::parse(
+        FileHandle::from_bytes(bytes.clone()),
+        0,
+        bytes.len() as u64,
+        137,
+        old.total_vectors,
+    );
+    assert!(result.is_err(), "legacy BMP must require offline migration");
+}
+
+#[test]
 fn forward_values_preserve_quantized_postings_duplicates_and_real_ordinals() {
     let bmp = fixture(137);
     let forward = bmp.forward().unwrap();
@@ -113,9 +145,9 @@ fn forward_values_preserve_quantized_postings_duplicates_and_real_ordinals() {
 }
 
 #[test]
-fn legacy_and_forward_candidate_scores_sum_all_duplicate_dimension_impacts() {
+fn inverted_and_forward_candidate_scores_sum_all_duplicate_dimension_impacts() {
     let current = fixture(137);
-    let old = legacy(&current, 137);
+    let old = without_forward(&current, 137);
     let query = [(0, 1.0), (31, 0.3)];
     let forward = crate::query::bmp::score_bmp_candidates(&current, &query, &[0]).unwrap();
     let inverted = crate::query::bmp::score_bmp_candidates(&old, &query, &[0]).unwrap();
@@ -125,7 +157,7 @@ fn legacy_and_forward_candidate_scores_sum_all_duplicate_dimension_impacts() {
 #[test]
 fn forward_candidate_scores_preserve_repeated_query_dimensions() {
     let current = fixture(137);
-    let old = legacy(&current, 137);
+    let old = without_forward(&current, 137);
     // Both the query and the document repeat dimension zero. Quantization is
     // per query entry, so combining raw query weights would change the score.
     let query = [(0, 1.0), (0, 0.3), (31, 0.2)];
@@ -144,7 +176,9 @@ async fn forward_merge_copies_payload_and_remaps_only_directory_with_document_ga
             .await
             .unwrap(),
     );
-    assert!(write_forward_sources(&[(&a, 0), (&b, 25)], &[], &mut writer, None, None).unwrap());
+    assert!(
+        write_forward_sources(&[(&a, 0), (&b, 25)], &[], &mut writer, None, None, true).unwrap()
+    );
     writer.finish().unwrap();
     let bytes = dir
         .open_read(Path::new("forward"))
@@ -175,9 +209,9 @@ async fn forward_merge_copies_payload_and_remaps_only_directory_with_document_ga
 }
 
 #[tokio::test]
-async fn legacy_migration_is_explicit_budgeted_and_preserves_forward_bytes() {
+async fn enabling_forward_storage_is_explicit_budgeted_and_preserves_forward_bytes() {
     let current = fixture(137);
-    let old = legacy(&current, 137);
+    let old = without_forward(&current, 137);
     assert!(old.forward().is_none());
     assert_eq!(inverted_values(&old), inverted_values(&current));
     let dir = RamDirectory::new();
@@ -186,25 +220,66 @@ async fn legacy_migration_is_explicit_budgeted_and_preserves_forward_bytes() {
             .await
             .unwrap(),
     );
-    assert!(!write_forward_sources(&[(&old, 0)], &[], &mut writer, None, None).unwrap());
-    assert_eq!(writer.offset(), 0);
+    assert!(!write_forward_sources(&[(&old, 0)], &[], &mut writer, None, None, true).unwrap());
+    assert_eq!(writer.offset(), TRAILER_BYTES as u64);
+    writer.finish().unwrap();
+    let disabled = dir
+        .open_read(Path::new("forward"))
+        .await
+        .unwrap()
+        .read_bytes()
+        .await
+        .unwrap();
     assert!(
-        write_forward_sources(&[(&old, 0), (&current, 137)], &[], &mut writer, None, None).is_err()
+        BmpForward::parse_optional(disabled, current.num_real_docs(), 137, 32)
+            .unwrap()
+            .is_none()
     );
-    assert!(write_forward_sources(&[(&old, 0)], &[], &mut writer, Some(1), None).is_err());
+    let mut writer = OffsetWriter::new(
+        dir.streaming_writer_cold(Path::new("materialized"))
+            .await
+            .unwrap(),
+    );
+    assert!(
+        write_forward_sources(
+            &[(&old, 0), (&current, 137)],
+            &[],
+            &mut writer,
+            None,
+            None,
+            true
+        )
+        .is_err()
+    );
+    assert!(write_forward_sources(&[(&old, 0)], &[], &mut writer, Some(1), None, true).is_err());
     assert_eq!(writer.offset(), 0);
     let cancel = std::sync::atomic::AtomicBool::new(true);
     assert!(matches!(
-        write_forward_sources(&[(&current, 0)], &[], &mut writer, None, Some(&cancel)),
+        write_forward_sources(
+            &[(&current, 0)],
+            &[],
+            &mut writer,
+            None,
+            Some(&cancel),
+            true
+        ),
         Err(Error::IndexClosed)
     ));
     assert_eq!(writer.offset(), 0);
     assert!(
-        write_forward_sources(&[(&old, 0)], &[], &mut writer, Some(1024 * 1024), None).unwrap()
+        write_forward_sources(
+            &[(&old, 0)],
+            &[],
+            &mut writer,
+            Some(1024 * 1024),
+            None,
+            true
+        )
+        .unwrap()
     );
     writer.finish().unwrap();
     let bytes = dir
-        .open_read(Path::new("forward"))
+        .open_read(Path::new("materialized"))
         .await
         .unwrap()
         .read_bytes()
@@ -229,7 +304,7 @@ async fn record_and_block_bp_copy_forward_bytes_and_preserve_quantized_values() 
     for granularity in [BpGranularity::Records, BpGranularity::Blocks] {
         for old in [false, true] {
             let input = if old {
-                legacy(&source, 513)
+                without_forward(&source, 513)
             } else {
                 source.clone()
             };
@@ -405,7 +480,8 @@ fn forward_copy_propagates_partial_writer_failure_and_mid_payload_cancellation()
         fail_after: 7,
         cancel: None,
     }));
-    let error = write_forward_sources(&[(&source, 0)], &[], &mut writer, None, None).unwrap_err();
+    let error =
+        write_forward_sources(&[(&source, 0)], &[], &mut writer, None, None, true).unwrap_err();
     assert!(
         error
             .to_string()
@@ -419,7 +495,7 @@ fn forward_copy_propagates_partial_writer_failure_and_mid_payload_cancellation()
         cancel: Some(cancel.clone()),
     }));
     assert!(matches!(
-        write_forward_sources(&[(&source, 0)], &[], &mut writer, None, Some(&cancel)),
+        write_forward_sources(&[(&source, 0)], &[], &mut writer, None, Some(&cancel), true),
         Err(Error::IndexClosed)
     ));
     assert!(writer.offset() > 0);
@@ -430,12 +506,12 @@ fn forward_copy_propagates_partial_writer_failure_and_mid_payload_cancellation()
 }
 
 #[tokio::test]
-async fn forward_duplicate_impacts_survive_copy_merge_and_legacy_upgrade() {
+async fn forward_duplicate_impacts_survive_copy_merge_and_storage_enablement() {
     for duplicate in [false, true] {
         let a = fixture_with_duplicates(17, false);
         let b = fixture_with_duplicates(17, duplicate);
         for migrate in [false, true] {
-            let old = legacy(&b, 17);
+            let old = without_forward(&b, 17);
             let source = if migrate { &old } else { &b };
             let dir = RamDirectory::new();
             let mut writer = OffsetWriter::new(
@@ -449,6 +525,7 @@ async fn forward_duplicate_impacts_survive_copy_merge_and_legacy_upgrade() {
                 &mut writer,
                 migrate.then_some(1024 * 1024),
                 None,
+                true,
             )
             .unwrap();
             writer.finish().unwrap();
@@ -480,7 +557,7 @@ async fn forward_duplicate_impacts_survive_copy_merge_and_legacy_upgrade() {
 async fn bp_can_omit_forward_storage_without_changing_inverted_values() {
     use crate::segment::reorder::{BpGranularity, reorder_bmp_field};
     let current = fixture(137);
-    let old = legacy(&current, 137);
+    let old = without_forward(&current, 137);
     for source in [&current, &old] {
         for granularity in [BpGranularity::Records, BpGranularity::Blocks] {
             let dir = RamDirectory::new();
@@ -552,10 +629,104 @@ fn disabling_forward_storage_preserves_every_inverted_byte() {
     assert!(disabled.forward().is_none());
     assert_eq!(
         disabled.read_raw_blob().unwrap().as_slice(),
-        legacy(&enabled, 137).read_raw_blob().unwrap().as_slice()
+        without_forward(&enabled, 137)
+            .read_raw_blob()
+            .unwrap()
+            .as_slice()
     );
     assert_eq!(
         enabled.read_raw_blob().unwrap().len() - disabled.read_raw_blob().unwrap().len(),
-        enabled.forward().unwrap().encoded_bytes()
+        enabled.forward().unwrap().encoded_bytes() - TRAILER_BYTES
     );
+}
+
+#[test]
+fn optional_storage_rejects_missing_markers_unknown_flags_and_hidden_payloads() {
+    let source = fixture_with_storage(137, true, false);
+    let bytes = source.read_raw_blob().unwrap().to_vec();
+    let trailer = bytes.len() - crate::segment::format::BMP_BLOB_FOOTER_SIZE - TRAILER_BYTES;
+    let reject = |bytes: Vec<u8>| {
+        let len = bytes.len() as u64;
+        assert!(
+            BmpIndex::parse(
+                FileHandle::from_bytes(OwnedBytes::new(bytes)),
+                0,
+                len,
+                137,
+                source.total_vectors
+            )
+            .is_err()
+        );
+    };
+    for (offset, value) in [(0, 1u32), (4, 2), (4, 3), (8, 5)] {
+        let mut corrupt = bytes.clone();
+        corrupt[trailer + offset..trailer + offset + 4].copy_from_slice(&value.to_le_bytes());
+        reject(corrupt);
+    }
+    let mut absent = bytes.clone();
+    absent.drain(trailer..trailer + TRAILER_BYTES);
+    reject(absent);
+    let mut hidden = bytes;
+    hidden.insert(trailer, 0);
+    reject(hidden);
+
+    let enabled = fixture(137);
+    let mut payload = enabled.read_raw_blob().unwrap().to_vec();
+    let flags = payload.len() - crate::segment::format::BMP_BLOB_FOOTER_SIZE - TRAILER_BYTES + 4;
+    payload[flags..flags + 4].copy_from_slice(&STORAGE_DISABLED.to_le_bytes());
+    reject(payload);
+}
+
+#[test]
+fn empty_bmp_blobs_validate_their_storage_section_and_footer() {
+    let mut bytes = Vec::new();
+    write_disabled(&mut bytes).unwrap();
+    crate::segment::builder::bmp::write_bmp_footer(
+        &mut bytes, 0, 0, 0, 0, 0, 0, 32, 32, 0, 5.0, 0, 0, 4,
+    )
+    .unwrap();
+    let read = |bytes: Vec<u8>| {
+        let len = bytes.len() as u64;
+        BmpIndex::parse(
+            FileHandle::from_bytes(OwnedBytes::new(bytes)),
+            0,
+            len,
+            137,
+            0,
+        )
+    };
+    let empty = read(bytes.clone()).unwrap();
+    assert_eq!(empty.num_blocks, 0);
+    assert!(empty.forward().is_none());
+    for offset in [
+        4,
+        TRAILER_BYTES,
+        TRAILER_BYTES + 8,
+        TRAILER_BYTES + 16,
+        TRAILER_BYTES + 52,
+    ] {
+        let mut corrupt = bytes.clone();
+        corrupt[offset] = 2;
+        assert!(read(corrupt).is_err());
+    }
+    let mut missing_section = bytes.clone();
+    missing_section.drain(..TRAILER_BYTES);
+    assert!(read(missing_section).is_err());
+    let mut hidden_payload = bytes.clone();
+    hidden_payload.insert(0, 0);
+    assert!(read(hidden_payload).is_err());
+    bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
+    let empty = read(bytes).unwrap();
+    assert_eq!(empty.forward().unwrap().len(), 0);
+}
+
+#[test]
+fn enabled_forward_storage_keeps_the_published_bytes() {
+    let source = fixture(137);
+    let bytes = source.read_raw_blob().unwrap();
+    let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    });
+    assert_eq!(bytes.len(), 12_713);
+    assert_eq!(hash, 0x5ccfbcdae3690623);
 }

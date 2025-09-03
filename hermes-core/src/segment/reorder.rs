@@ -1629,7 +1629,7 @@ fn reorder_bmp_field_blockwise(
     }
     if num_blocks_total > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V19 u32 format limit".into(),
+            "reordered BMP block count exceeds the BMP u32 format limit".into(),
         ));
     }
     let num_virtual_docs = num_blocks_total
@@ -1637,7 +1637,7 @@ fn reorder_bmp_field_blockwise(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V19 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the BMP u32 format limit".into(),
             )
         })?;
 
@@ -1833,7 +1833,7 @@ fn reorder_bmp_field_blockwise(
             .checked_add(b.num_real_docs())
             .ok_or_else(|| {
                 crate::Error::Internal(
-                    "reordered BMP real-document count exceeds the V19 u32 format limit".into(),
+                    "reordered BMP real-document count exceeds the BMP u32 format limit".into(),
                 )
             })?;
     }
@@ -1849,14 +1849,14 @@ fn reorder_bmp_field_blockwise(
 
     drop(permuted_blocks);
     let forward_sources: Vec<_> = sources.iter().map(|(bmp, offset)| (bmp, *offset)).collect();
-    let has_forward = store_forward
-        && crate::segment::bmp_forward::write_forward_sources(
-            &forward_sources,
-            &[],
-            &mut writer,
-            Some(memory_budget),
-            cancellation,
-        )?;
+    crate::segment::bmp_forward::write_forward_sources(
+        &forward_sources,
+        &[],
+        &mut writer,
+        Some(memory_budget),
+        cancellation,
+        store_forward,
+    )?;
 
     // Footer
     write_bmp_footer(
@@ -1874,7 +1874,6 @@ fn reorder_bmp_field_blockwise(
         doc_map_offset,
         num_real_docs,
         grid_bits,
-        has_forward,
     )
     .map_err(crate::Error::Io)?;
 
@@ -2261,7 +2260,7 @@ pub(crate) fn reorder_bmp_field(
     }
     if num_real_docs > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP real-document count exceeds the V19 u32 format limit".into(),
+            "reordered BMP real-document count exceeds the BMP u32 format limit".into(),
         ));
     }
 
@@ -2396,7 +2395,7 @@ pub(crate) fn reorder_bmp_field(
     let new_num_blocks = num_real_docs.div_ceil(effective_block_size);
     if new_num_blocks > u32::MAX as usize {
         return Err(crate::Error::Internal(
-            "reordered BMP block count exceeds the V19 u32 format limit".into(),
+            "reordered BMP block count exceeds the BMP u32 format limit".into(),
         ));
     }
     let new_num_virtual_docs = new_num_blocks
@@ -2404,7 +2403,7 @@ pub(crate) fn reorder_bmp_field(
         .filter(|&count| count <= u32::MAX as usize)
         .ok_or_else(|| {
             crate::Error::Internal(
-                "reordered BMP virtual-document count exceeds the V19 u32 format limit".into(),
+                "reordered BMP virtual-document count exceeds the BMP u32 format limit".into(),
             )
         })?;
 
@@ -2678,14 +2677,14 @@ pub(crate) fn reorder_bmp_field(
     drop(encoded_block);
     drop(block_encode_scratch);
     let forward_sources: Vec<_> = sources.iter().map(|(bmp, offset)| (bmp, *offset)).collect();
-    let has_forward = store_forward
-        && crate::segment::bmp_forward::write_forward_sources(
-            &forward_sources,
-            &[],
-            &mut writer,
-            Some(memory_budget),
-            cancellation.as_deref(),
-        )?;
+    crate::segment::bmp_forward::write_forward_sources(
+        &forward_sources,
+        &[],
+        &mut writer,
+        Some(memory_budget),
+        cancellation.as_deref(),
+        store_forward,
+    )?;
 
     // Versioned footer.
     write_bmp_footer(
@@ -2703,7 +2702,6 @@ pub(crate) fn reorder_bmp_field(
         doc_map_offset,
         num_real_docs as u32,
         grid_bits,
-        has_forward,
     )
     .map_err(crate::Error::Io)?;
 

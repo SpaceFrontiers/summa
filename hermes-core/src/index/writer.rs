@@ -1756,6 +1756,28 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .await
     }
 
+    /// Reorder behind a shared writer without holding its lock during
+    /// maintenance admission or segment rewriting. The retained Arc keeps
+    /// the single-writer file lock alive until the operation finishes.
+    pub async fn reorder_with_shared_writer<F, Fut>(
+        writer: &Arc<tokio::sync::RwLock<Self>>,
+        refresh_external: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let segment_manager = {
+            let mut writer = writer.write().await;
+            writer.commit().await?;
+            Arc::clone(&writer.segment_manager)
+        };
+        segment_manager
+            .reorder_segments_with_snapshot_refresh(refresh_external)
+            .await?;
+        writer.read().await.persist_replacement_snapshot().await
+    }
+
     /// Reorder while refreshing an external reader after each durable segment
     /// replacement, so retired sources are released during a long pass.
     pub async fn reorder_with_snapshot_refresh<F, Fut>(&mut self, refresh_external: F) -> Result<()>

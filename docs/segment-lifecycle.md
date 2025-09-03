@@ -92,7 +92,10 @@ Index deletion follows this order:
 
 1. Acquire the per-index registry lease and create `.deleting`, serializing
    against open/create.
-2. Stop accepting new lifecycle claims.
+2. Stop accepting new lifecycle claims and signal maintenance cancellation,
+   before waiting for issued handles. A Reorder can hold an index handle while
+   waiting for shared BP capacity; waiting for that handle first prevents the
+   cancellation that would release it.
 3. Drain search and writer handles already issued by the registry.
 4. Signal and join indexing OS threads.
 5. Drop unpublished prepared segments and cached readers/writer handles.
@@ -104,6 +107,21 @@ installed, so client cancellation does not abandon a live writer. If the
 process exits during step 7, the `.deleting` marker causes the remaining
 directory to be removed on the next server startup.
 
+An evicted index's marker is checked before waiting for its open/delete lease,
+and again after acquiring the lease. A request that obtained an index handle
+just before deletion must fail its later writer lookup promptly; it cannot wait
+for deletion while retaining a handle that deletion needs to drain.
+
+Manual Reorder commits the admitted indexing generation while holding the
+writer lock, then releases that lock before waiting for maintenance capacity or
+rewriting segments. Core retains the shared writer handle and uses the existing
+segment claims, publication, snapshot refresh and primary-key refresh path.
+Manual BP uses the same bounded CPU pool as background maintenance.
+Concurrent ingestion can publish new segments while the bounded maintenance
+snapshot is processed. Deletion still drains the operation before unlinking its
+files; neither a client timeout nor cancellation is evidence that blocking work
+has stopped.
+
 ## Orphans versus corruption
 
 An orphan is a segment ID absent from metadata, active operations, and the
@@ -111,6 +129,13 @@ reader/deletion tracker. Exclusive writer open and the background optimizer may
 sweep it. The sweep deletes every discovered path belonging to that ID,
 including unknown legacy or partial suffixes, and safely ignores malformed
 names. Read-only `Index::open` does not mutate the directory.
+
+Registry open uses core's locked writer opener: it acquires the OS single-writer
+lock before reading metadata or sweeping crash leftovers. The returned index
+and writer share that same segment manager, so there is no stale pre-lock
+metadata snapshot or second lifecycle owner.
+Its per-name mutex serializes callers within one server process; it cannot prove
+that another process has stopped producing files in the same directory.
 
 A missing file for a **metadata-live** segment is not an orphan. Normal cleanup
 must never make the metadata internally consistent by silently dropping its

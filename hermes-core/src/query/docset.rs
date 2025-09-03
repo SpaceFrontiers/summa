@@ -226,13 +226,15 @@ impl DocSet for AllDocSet {
 
     #[inline]
     fn advance(&mut self) -> DocId {
-        self.current += 1;
+        if self.current < self.num_docs {
+            self.current += 1;
+        }
         self.doc()
     }
 
     #[inline]
     fn seek(&mut self, target: DocId) -> DocId {
-        self.current = target;
+        self.current = self.current.max(target);
         self.doc()
     }
 

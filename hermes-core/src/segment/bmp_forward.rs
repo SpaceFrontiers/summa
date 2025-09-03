@@ -7,7 +7,8 @@ use crate::directories::OwnedBytes;
 use crate::{Error, Result};
 
 const ROW_BYTES: usize = 16;
-const TRAILER_BYTES: usize = 16;
+pub(super) const TRAILER_BYTES: usize = 16;
+const STORAGE_DISABLED: u32 = 1;
 
 #[derive(Clone)]
 pub(crate) struct BmpForward {
@@ -21,6 +22,26 @@ fn corrupt(message: &str) -> Error {
 }
 
 impl BmpForward {
+    pub(crate) fn parse_optional(
+        bytes: OwnedBytes,
+        count: u32,
+        docs: u32,
+        dims: u32,
+    ) -> Result<Option<Self>> {
+        let trailer = bytes
+            .len()
+            .checked_sub(TRAILER_BYTES)
+            .ok_or_else(|| corrupt("missing storage trailer"))?;
+        let flags = u32::from_le_bytes(bytes[trailer + 4..trailer + 8].try_into().unwrap());
+        if flags == STORAGE_DISABLED {
+            if bytes.len() != TRAILER_BYTES || bytes[..4] != [0; 4] || bytes[8..] != [0; 8] {
+                return Err(corrupt("disabled storage has a payload or vector count"));
+            }
+            return Ok(None);
+        }
+        Self::parse(bytes, count, docs, dims).map(Some)
+    }
+
     pub(crate) fn parse(bytes: OwnedBytes, count: u32, docs: u32, dims: u32) -> Result<Self> {
         let trailer = bytes
             .len()
@@ -160,6 +181,15 @@ impl BmpForward {
         self.rows.madvise(advice);
         self.payload.madvise(advice);
     }
+}
+
+#[cfg(any(feature = "native", feature = "wasm", test))]
+pub(crate) fn write_disabled(writer: &mut dyn std::io::Write) -> std::io::Result<u64> {
+    use byteorder::{LittleEndian, WriteBytesExt};
+    writer.write_u32::<LittleEndian>(0)?;
+    writer.write_u32::<LittleEndian>(STORAGE_DISABLED)?;
+    writer.write_u64::<LittleEndian>(0)?;
+    Ok(TRAILER_BYTES as u64)
 }
 
 /// A background scan validates once before BP's repeated infallible passes.

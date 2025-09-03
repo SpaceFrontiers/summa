@@ -1,4 +1,4 @@
-//! Representation-preserving merge/reorder, with explicit budgeted V19 upgrade.
+//! Representation-preserving merge/reorder and budgeted forward-storage enablement.
 use super::*;
 use crate::segment::{BmpIndex, OffsetWriter};
 use std::io::Write;
@@ -16,35 +16,39 @@ struct SourcePlan<'a> {
     bmp: &'a BmpIndex,
     doc_offset: u32,
     payload_offset: u64,
-    /// Only the explicit V19 migration constructs a physical permutation.
-    legacy_slots: Vec<u32>,
-    legacy_offsets: Vec<u64>,
+    /// Only explicitly enabling absent forward storage constructs a physical permutation.
+    missing_slots: Vec<u32>,
+    missing_offsets: Vec<u64>,
 }
 
 pub(crate) fn validate_copy_sources(sources: &[(&BmpIndex, u32)]) -> Result<bool> {
-    let legacy = sources
+    let absent = sources
         .iter()
         .filter(|(bmp, _)| bmp.forward().is_none())
         .count();
-    if legacy != 0 && legacy != sources.len() {
-        return Err(Error::Schema("cannot copy-merge BMP V19 and V20; explicitly reorder the V19 segments to add forward values first".into()));
+    if absent != 0 && absent != sources.len() {
+        return Err(Error::Schema("cannot copy-merge BMP sources with and without forward values; explicitly reorder with a uniform forward-storage policy first".into()));
     }
-    Ok(legacy == 0)
+    Ok(absent == 0)
 }
 
-/// Returns whether a V20 section was written. Ordinary all-V19 merge remains
-/// V19. Mixed ordinary merges refuse to rebuild or discard a forward section.
+/// Writes the current-format storage section and reports whether values exist.
+/// Copy-only merges never materialize absent values; disabled output has an
+/// explicit marker, and mixed presence requires an explicit storage transition.
 pub(crate) fn write_forward_sources(
     sources: &[(&BmpIndex, u32)],
     paths: &[Option<&std::path::Path>],
     writer: &mut OffsetWriter,
-    upgrade_budget: Option<usize>,
+    materialize_budget: Option<usize>,
     cancellation: Option<&AtomicBool>,
+    store_forward: bool,
 ) -> Result<bool> {
-    if upgrade_budget.is_none() && !validate_copy_sources(sources)? {
+    cancelled(cancellation)?;
+    if !store_forward || (materialize_budget.is_none() && !validate_copy_sources(sources)?) {
+        write_disabled(writer)?;
         return Ok(false);
     }
-    let mut remaining = upgrade_budget.unwrap_or(0);
+    let mut remaining = materialize_budget.unwrap_or(0);
     let mut plans = Vec::with_capacity(sources.len());
     let mut count = 0u32;
     let mut previous_last = None;
@@ -58,15 +62,15 @@ pub(crate) fn write_forward_sources(
         if bmp.forward().is_none() {
             let bytes = (bmp.num_real_docs() as usize)
                 .checked_mul(12)
-                .ok_or_else(|| corrupt("migration directory size overflow"))?;
+                .ok_or_else(|| corrupt("forward directory size overflow"))?;
             remaining = remaining.checked_sub(bytes).ok_or_else(|| Error::Schema(
-                "BMP V19 forward migration exceeds the reorder memory budget; increase bp-memory-budget-mb".into()))?;
+                "BMP forward materialization exceeds the reorder memory budget; increase bp-memory-budget-mb".into()))?;
             slots = Vec::with_capacity(bmp.num_real_docs() as usize);
             bmp.visit_real_slots_for_rewrite(|slot| slots.push(slot as u32))?;
             slots.sort_unstable_by_key(|&slot| bmp.virtual_to_doc(slot));
             offsets = Vec::with_capacity(slots.len());
             log::info!(
-                "[bmp_forward] migrating {} V19 vectors; directory scratch={} bytes",
+                "[bmp_forward] materializing {} vectors; directory scratch={} bytes",
                 slots.len(),
                 bytes
             );
@@ -100,8 +104,8 @@ pub(crate) fn write_forward_sources(
             bmp,
             doc_offset,
             payload_offset: 0,
-            legacy_slots: slots,
-            legacy_offsets: offsets,
+            missing_slots: slots,
+            missing_offsets: offsets,
         });
     }
     let start = writer.offset();
@@ -118,11 +122,11 @@ pub(crate) fn write_forward_sources(
                 "BMP forward payload",
             )?;
         } else {
-            // An explicit one-time migration probes source blocks in logical
+            // Explicit storage enablement probes source blocks in logical
             // order. Only its directory is buffered; payload streams directly.
-            for &slot in &plan.legacy_slots {
+            for &slot in &plan.missing_slots {
                 cancelled(cancellation)?;
-                plan.legacy_offsets
+                plan.missing_offsets
                     .push(writer.offset() - start - plan.payload_offset);
                 let block_id = slot / plan.bmp.bmp_block_size;
                 plan.bmp.validate_block_for_rewrite(block_id)?;
@@ -138,7 +142,7 @@ pub(crate) fn write_forward_sources(
                     }
                 }
                 if !found {
-                    return Err(corrupt("real legacy vector has no postings"));
+                    return Err(corrupt("real vector has no postings"));
                 }
             }
         }
@@ -155,10 +159,10 @@ pub(crate) fn write_forward_sources(
             let (key, offset) = if let Some(forward) = plan.bmp.forward() {
                 (forward.key(i), forward.offset(i))
             } else {
-                let (doc, ordinal) = plan.bmp.virtual_to_doc(plan.legacy_slots[i as usize]);
+                let (doc, ordinal) = plan.bmp.virtual_to_doc(plan.missing_slots[i as usize]);
                 (
                     LogicalUnit { doc, ordinal },
-                    plan.legacy_offsets[i as usize],
+                    plan.missing_offsets[i as usize],
                 )
             };
             Ok((

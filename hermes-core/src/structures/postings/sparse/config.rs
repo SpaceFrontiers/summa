@@ -255,7 +255,7 @@ pub struct SparseVectorConfig {
     #[serde(default = "default_bmp_grid_bits")]
     pub bmp_grid_bits: u8,
     /// Store quantized forward values in BMP blobs for L1 and BP (default true).
-    /// False emits V19 without the additional payload; normal BMP search is inverted.
+    /// False emits a disabled-storage marker; normal BMP search is inverted.
     #[serde(default = "default_bmp_forward_index", skip_serializing_if = "is_true")]
     pub bmp_forward_index: bool,
     /// Static pruning: fraction of postings to keep per inverted list (SEISMIC-style)

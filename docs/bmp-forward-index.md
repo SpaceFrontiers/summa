@@ -1,38 +1,43 @@
 # BMP forward values and candidate scoring
 
-Status: implemented, 2026-09-05. L1 remains opt-in.
+Status: current-format implementation complete. Deploy against rebuilt indexes
+or indexes whose BMP blobs already use the current envelope. L1 remains opt-in.
 
-BMP owns both sparse retrieval and exact stored sparse values. L1 must score a
-logical `(document, ordinal)` without an inverse physical-ID sidecar or a scan
-of the corpus. BP should read these same values when building its graph and
-rewriting records. The quantized impacts, pruning and query quantization remain
-identical to inverted BMP scoring; this is not a second sparse scoring model.
+BMP owns sparse retrieval and exact stored sparse values. L1 addresses a logical
+`(document, ordinal)` without an inverse physical-ID sidecar or a corpus scan.
+BP reads the same values when building its graph and rewriting records. The
+quantized impacts, pruning and query quantization match inverted BMP scoring.
 
-## V20 representation
+## One representation with optional storage
 
-The V19 block payload, offset table, grids and physical document maps keep their
-encodings. V20 appends a forward section before the existing 80-byte footer and
-uses magic `BMPA`. The section contains:
+Every BMP blob uses the current `BMPA` envelope: adaptive inverted blocks, their
+offset table, compressed pruning grids, physical document maps, a forward-storage
+section, and the 80-byte footer. Forward storage changes that section, never the
+format version. Already-published forward-enabled bytes remain unchanged.
+
+An enabled section contains:
 
 - Quantized vector payload in ascending `(document, ordinal)` order. Each entry
-  is dimension `u32 LE` followed by impact `u8`, with nondecreasing dims. Repeated dimensions retain every impact, preserving
-  the existing additive posting semantics.
+  is dimension `u32 LE` followed by impact `u8`, with nondecreasing dimensions.
+  Repeated dimensions retain every impact, preserving additive posting semantics.
 - A sorted directory: document `u32`, ordinal `u16`, reserved zero `u16`, and
   payload-relative byte offset `u64` per vector.
-- A 16-byte trailer: vector count `u32`, reserved zero `u32`, payload bytes `u64`.
-  Unknown reserved bits are rejected. The payload length terminates the final
-  vector. The retired search prototype's uniqueness certificate is not part of
-  this format; experimental blobs carrying it must be rebuilt.
+- A 16-byte trailer: vector count `u32`, flags `u32 = 0`, payload bytes `u64`.
+  The payload length terminates the final vector.
 
-Space overhead is 5 bytes per retained posting, 16 bytes per vector, and 16
-bytes per field. The forward section is file-backed and evictable; opening
-validates compact directory bounds/order and scoring validates selected payloads.
-Neither forward directory nor payload is pinned; both remain evictable. Lookup uses binary search;
-scoring visits only nominated vectors and intersects sorted query dimensions.
+A disabled section consists of exactly one 16-byte trailer: zero vector count,
+flags `u32 = 1`, and zero payload length. Unknown flags, missing trailers, hidden
+payloads, invalid counts and invalid empty blobs are errors. Older BMP envelopes
+are rejected before payload access. Hermes 1.8.125 can migrate old offline
+indexes before they are opened by a current-format-only server.
 
-## Build, merge, reorder and compatibility
+Enabled storage costs 5 bytes per retained posting, 16 bytes per vector, and 16
+bytes per field. Disabled storage costs 16 bytes per field. The directory and
+payload stay file-backed and evictable; neither is pinned. Opening validates
+compact directory bounds and order; scoring validates the selected vectors.
+Lookup uses binary search and intersects only nominated vectors with query terms.
 
-### Optional storage
+## Configuration and scoring
 
 The per-field `bmp_forward_index` setting defaults to `true`. In SDL:
 
@@ -40,57 +45,60 @@ The per-field `bmp_forward_index` setting defaults to `true`. In SDL:
 field sparse: sparse_vector [indexed<format: bmp, dims: 105879, bmp_forward_index: false>]
 ```
 
-With storage disabled, ingestion emits the existing V19 representation and skips
-forward-payload construction. Ordinary merges and both BP granularities omit the
-forward section, including when their sources contain it. The inverted payload
-and scoring semantics are preserved. Existing forward values may still accelerate
-BP's graph/rewrite reads; disabled storage never triggers a legacy forward upgrade.
-BP still builds its bounded transient graph from inverted postings when needed.
-This option changes replacement output, not immutable live source files. A field
-excluded from an explicit reorder remains a byte-identical copy, as before.
+The setting is persisted in schema JSON and reported in server SDL. With storage
+disabled, ingestion, ordinary merges and both BP granularities omit the values
+and write the disabled marker. A field excluded from explicit reorder remains
+a byte-identical copy. A setting changes replacement output, not immutable live
+source files.
 
-The setting is persisted in schema JSON and reported in server SDL. BMP search
-always uses inverted scoring and has no forward-completion option. L1 candidate
-backfill and BP use stored forward values whenever present, without a dispatch
-heuristic or separate enable switch.
-Enabling storage for existing V19 data requires explicit reorder/rebuild; ordinary
-merge never synthesizes forward values. With storage enabled, mixed V19/V20 copy
-merges still require an explicit upgrade. With storage disabled, both source
-versions can copy their compatible inverted representations into V19 output.
+BMP search always scores inverted blocks. L1 backfill and record BP use stored
+forward values whenever present, without a heuristic or another enable switch.
+When values are absent, BP builds its bounded transient graph from inverted
+postings. L1 can locate candidates in a logically ordered document map and probe
+only their blocks and query terms. An unordered map without forward values
+cannot backfill missing scores; it fails with actionable guidance. It never
+turns an unsupported lookup into a missing-value default.
 
-L1 can backfill V19 by locating candidates in a logically ordered document map,
-then probing only their blocks and query terms. After BP makes that map unordered,
-missing-score backfill requires stored forward values; it fails with actionable
-guidance rather than scanning the corpus or substituting a missing default for
-an unsupported lookup. `backfill: false` still uses organic scores and learned
-missing defaults. Full-text and sparse MaxScore backfill use their own postings
-readers and are unaffected by this BMP-only storage option.
+`backfill: false` still uses organic scores and learned missing defaults.
+Full-text and sparse MaxScore backfill use their own postings readers and are
+unaffected by this BMP storage option.
+
+## Build, merge and option transitions
 
 Ingestion emits the same retained quantized entries as the inverted builder.
-It keeps the already-admitted per-dimension input until forward output, uses a
-k-way cursor heap over dimensions and an 8-byte offset per retained vector,
-and does not build another posting-sized heap representation. Peak accounting
-includes input postings plus grids during inverted output, then input postings
-plus offsets during forward output. This increases input lifetime, not its size.
-Ordinary V20 merge concatenates payload bytes and streams directory entries,
-adjusting document IDs and byte offsets with bounded scratch. BP changes only
-physical inverted order, so existing forward payloads also copy through record
-and block reorder without decoding or re-quantizing them.
+It retains the already-admitted per-dimension input through forward output,
+uses a k-way cursor heap over dimensions and an 8-byte offset per retained
+vector, and never builds another posting-sized heap representation. Peak
+accounting includes input postings plus grids during inverted output, then
+input postings plus offsets during forward output.
 
-V19 remains readable for retrieval. With forward storage enabled, explicit reorder can construct its missing
-forward values under the existing reorder memory budget, using a sorted bounded
-physical permutation and existing block decoders. This migration is allowed to
-decode; ordinary merge is not. All-legacy ordinary merges preserve V19, and with
-storage enabled mixed V19/V20 ordinary merges fail with migration guidance instead of discarding
-capability or reconstructing values implicitly. Unknown versions fail loudly.
+Ordinary merge concatenates existing forward payload bytes and streams directory
+entries, adjusting only document IDs and byte offsets with bounded scratch. BP
+changes physical inverted order, so both record and block reorder also copy
+existing forward payloads without decoding or re-quantizing them.
+
+Copy-only merge never materializes absent values. With storage enabled, mixed
+presence requires explicit reorder with a uniform storage policy. With storage
+disabled, compatible inverted representations can be copied regardless of the
+source's storage setting. All-absent copy inputs retain the disabled marker.
+
+Explicitly enabling storage later uses the same current envelope. Reorder can
+materialize its absent values under the existing memory budget, using a sorted
+physical permutation and block decoders. It admits 12 bytes per real vector of
+directory scratch and streams payload output. Existing forward payloads always
+use the copy path. There is no older-format reader, writer or merge dispatch.
+
 Generation claims, cold output, fsync, publication and cleanup remain owned by
-the existing sparse segment lifecycle. No new sidecar or preparation RPC exists.
+the existing sparse segment lifecycle. No sidecar or second preparation protocol
+is introduced.
 
 ## Validation and cost evidence
 
-Required evidence: quantized forward/inverted score equality, missing values and
-ordinals, payload byte identity across merge and both BP modes, V19 reopen and
-explicit migration, incompatible/corrupt input rejection, cancellation and
-writer failure. Compare BP graph and record rewrite against the existing path.
-Measure storage bytes, build and merge working memory, candidate scoring and BP
-with the same fixtures/compiler before claiming a speedup. Record results in
+Regression coverage includes enabled byte identity, old-envelope rejection,
+strict optional/empty-section validation, quantized forward/inverted equality,
+missing values and ordinals, copy merge and both BP modes, bounded option
+transitions, cancellation and partial writer failure. Sync, native async and
+WASM use the same format gate.
+
+Compare BP graph and record rewrite against the inverted path with the same
+fixture, compiler and machine. Storage, working memory and scoring evidence are

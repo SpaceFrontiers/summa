@@ -3559,7 +3559,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         for seg_id in segment_ids {
             match self
-                .reorder_single_segment(&seg_id, None, crate::segment::BpBudget::full())
+                .reorder_single_segment(
+                    &seg_id,
+                    Some(self.background_cpu_pool()),
+                    crate::segment::BpBudget::full(),
+                )
                 .await
             {
                 Ok(true) => refresh_snapshots().await?,

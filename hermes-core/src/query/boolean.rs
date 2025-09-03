@@ -891,6 +891,10 @@ macro_rules! boolean_plan {
 
         // ── 4. Standard BooleanScorer fallback ───────────────────────────
         let mut must_scorers = Vec::with_capacity(must.len());
+        if must.is_empty() && should.is_empty() && !must_not.is_empty() {
+            must_scorers.push(Box::new(super::AllDocSet::new(reader.num_docs()))
+                as Box<dyn Scorer + '_>);
+        }
         for q in must {
             must_scorers.push(q.$scorer_fn(
                 reader, limit, scorer_options.without_threshold()
@@ -1052,14 +1056,15 @@ impl Query for BooleanQuery {
         if options.stop_if_expired() {
             return None;
         }
-        if self.must.is_empty() && self.should.is_empty() {
+        if self.must.is_empty() && self.should.is_empty() && self.must_not.is_empty() {
             return None;
         }
 
         let num_docs = reader.num_docs();
 
         // MUST clauses: intersect bitsets (AND)
-        let mut result: Option<super::DocBitset> = None;
+        let mut result = (self.must.is_empty() && self.should.is_empty())
+            .then(|| super::DocBitset::all(num_docs));
         for q in &self.must {
             let bs = options.doc_bitset(q.as_ref(), reader)?;
             match result {
@@ -1106,7 +1111,7 @@ impl Query for BooleanQuery {
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
         // Need at least some clauses
-        if self.must.is_empty() && self.should.is_empty() {
+        if self.must.is_empty() && self.should.is_empty() && self.must_not.is_empty() {
             return None;
         }
 
@@ -1146,6 +1151,7 @@ impl Query for BooleanQuery {
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         let must = self.must.clone();
         let should = self.should.clone();
+        let has_exclusions = !self.must_not.is_empty();
 
         Box::pin(async move {
             if !must.is_empty() {
@@ -1163,6 +1169,8 @@ impl Query for BooleanQuery {
                     sum = sum.saturating_add(q.count_estimate(reader).await?);
                 }
                 Ok(sum)
+            } else if has_exclusions {
+                Ok(reader.num_docs())
             } else {
                 Ok(0)
             }

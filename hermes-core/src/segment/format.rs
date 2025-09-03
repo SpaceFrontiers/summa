@@ -92,22 +92,14 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Legacy BMP V19 blob footer magic ("BMP9" in LE).
-///
-/// V19 keeps V18's LSP/0 pruning hierarchy and replaces each block's flat
-/// header/payload with adaptive u16/u32 byte offsets, packed-u4 term maxima,
-/// and per-term sparse-pair or dense-impact encoding.
-///
-/// Every grid retains independently addressable, locally bit-packed 256-cell
-/// groups. Packed block-header maxima reconstruct conservative u8
-/// representatives that re-quantize to exactly the persisted u4/u2 cells.
-/// V20 reuses this inverted encoding and adds logical forward values. V19
-/// remains readable; older encodings require a rebuild. See docs/bmp-forward-index.md.
-pub const BMP_BLOB_MAGIC_V19: u32 = 0x39504D42;
-/// V20 appends quantized forward values; all V19 inverted sections are unchanged.
+/// Current BMP blob footer magic ("BMPA" in LE). Adaptive inverted blocks,
+/// compressed pruning grids and physical document maps are followed by the
+/// mandatory optional-storage section (forward values or a disabled marker).
+/// Older BMP envelopes are rejected; enabling/disabling storage never changes
+/// the envelope version.
 pub const BMP_BLOB_MAGIC: u32 = 0x41504D42;
 
-/// BMP V19/V20 blob footer size.
+/// BMP blob footer size.
 pub const BMP_BLOB_FOOTER_SIZE: usize = 80;
 
 /// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
@@ -144,7 +136,7 @@ pub struct SparseFieldToc {
 impl SparseFieldToc {
     /// Build the sentinel TOC entry used by the self-contained BMP blob.
     pub(crate) fn bmp(field_id: u32, total_vectors: u32, blob_offset: u64, blob_len: u64) -> Self {
-        // V19 always stores u32 dimensions and u8 impacts regardless of the
+        // BMP always stores u32 dimensions and u8 impacts regardless of the
         // generic sparse schema knobs. Persist the physical representation,
         // not a misleading caller-supplied MaxScore descriptor.
         let config = crate::structures::SparseVectorConfig {

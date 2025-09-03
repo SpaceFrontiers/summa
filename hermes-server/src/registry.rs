@@ -34,7 +34,7 @@ impl IndexDeleteLease {
     ///
     /// Once the registry entry is evicted and `.deleting` is visible, no new
     /// raw handle can be issued. Wait for previously issued search/writer Arcs
-    /// before shutting down lifecycle work and unlinking the directory.
+    /// before draining lifecycle work and unlinking the directory.
     pub async fn complete(mut self) -> Result<(), Status> {
         if let Some(handle) = self.handle.take() {
             let mut next_log = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -219,6 +219,17 @@ impl IndexRegistry {
             return Ok(Arc::clone(&h.index));
         }
 
+        let index_path = self.data_dir.join(name);
+        // Deletion installs this marker before evicting the cached handle.
+        // A caller may still hold that handle while requesting its writer;
+        // waiting for the delete lease would deadlock its issued-handle drain.
+        if index_path.join(".deleting").exists() {
+            return Err(Status::not_found(format!(
+                "Index '{}' is being deleted",
+                name
+            )));
+        }
+
         // Get or create per-index open lock
         let lock = self.open_lock(name);
 
@@ -232,37 +243,20 @@ impl IndexRegistry {
         }
 
         // Open from disk
-        let index_path = self.data_dir.join(name);
         if !index_path.exists() || index_path.join(".deleting").exists() {
             return Err(Status::not_found(format!("Index '{}' not found", name)));
         }
 
         let dir = MmapDirectory::new(&index_path);
-        let index = Index::open(dir, self.config.clone())
+        // Core acquires the OS writer lock before loading the metadata used
+        // for cleanup. The registry mutex only serializes this process.
+        let (index, mut w) = Index::open_with_writer(dir, self.config.clone())
             .await
             .map_err(crate::error::hermes_error_to_status)?;
-
-        // This registry lock guarantees there is no second server-side
-        // producer for the index while crash leftovers are swept. Keep this
-        // out of the read-only core `Index::open` API: opening a search handle
-        // must not delete files owned by an independently opened writer.
-        let swept = index
-            .segment_manager()
-            .cleanup_orphan_segments()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
-        if swept > 0 {
-            warn!(
-                "[segment_cleanup] swept {} crash-leftover segment(s) while opening '{}'",
-                swept, name
-            );
-        }
-
-        let index = Arc::new(index);
-        let mut w = index.writer();
         w.init_primary_key_dedup()
             .await
             .map_err(crate::error::hermes_error_to_status)?;
+        let index = Arc::new(index);
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         Self::precache_idf_files(&index);
@@ -426,6 +420,12 @@ impl IndexRegistry {
         }
 
         let handle = self.handles.write().remove(name);
+        if let Some(handle) = &handle {
+            // Maintenance can retain issued handles while waiting for BP
+            // capacity or doing blocking work. Cancel it before the handle
+            // drain; waiting first prevents the signal that releases it.
+            handle.index.segment_manager().begin_shutdown();
+        }
         Ok(IndexDeleteLease {
             index_path,
             handle,
@@ -615,6 +615,141 @@ impl IndexRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn opening_registry_acquires_writer_lock_before_reading_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned");
+        let mut owner = IndexWriter::create(
+            MmapDirectory::new(&path),
+            hermes_core::SchemaBuilder::default().build(),
+            IndexConfig::default(),
+        )
+        .await
+        .unwrap();
+        // Poison the metadata read to distinguish it from writer admission.
+        // Cleanup may only capture its metadata after owning the writer lock.
+        let metadata_path = path.join("metadata.json");
+        let metadata = std::fs::read(&metadata_path).unwrap();
+        std::fs::write(&metadata_path, b"unreadable metadata").unwrap();
+        let registry = IndexRegistry::new(root.path().into(), Default::default());
+        let error = registry.get_or_open_index("owned").await.err().unwrap();
+        std::fs::write(&metadata_path, metadata).unwrap();
+        owner.shutdown().await.unwrap();
+        assert!(
+            error.message().contains("single-writer lock"),
+            "read metadata before acquiring exclusive ownership: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_registry_does_not_sweep_files_owned_by_another_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owned");
+        std::fs::create_dir_all(&path).unwrap();
+        let mut owner = IndexWriter::create(
+            MmapDirectory::new(&path),
+            hermes_core::SchemaBuilder::default().build(),
+            IndexConfig {
+                num_indexing_threads: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        // A file under the other producer's exclusive lock need not be in
+        // metadata yet. A second process cannot infer that it is an orphan.
+        let in_flight = path.join(format!("seg_{}.store", SegmentId::new().to_hex()));
+        std::fs::write(&in_flight, b"unpublished output").unwrap();
+        let registry = IndexRegistry::new(root.path().into(), Default::default());
+        let result = registry.get_or_open_index("owned").await;
+        let preserved = in_flight.exists();
+        owner.shutdown().await.unwrap();
+        assert!(result.is_err(), "a second writer must be rejected");
+        assert!(
+            preserved,
+            "registry swept output before acquiring the writer lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_cancels_maintenance_before_waiting_for_issued_writer_handles() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = IndexRegistry::new(
+            root.path().into(),
+            IndexConfig {
+                num_indexing_threads: 1,
+                ..Default::default()
+            },
+        );
+        registry
+            .create_index("deleting", hermes_core::SchemaBuilder::default().build())
+            .await
+            .unwrap();
+        let index = registry.get_or_open_index("deleting").await.unwrap();
+        let writer = registry.get_writer("deleting").await.unwrap();
+        let held_writer = writer.write().await;
+        let lease = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            registry.begin_delete("deleting"),
+        )
+        .await
+        .expect("delete admission must not wait for the maintenance writer lock")
+        .unwrap();
+
+        let result = index
+            .segment_manager()
+            .reorder_single_segment(
+                &SegmentId::new().to_hex(),
+                None,
+                hermes_core::segment::BpBudget::full(),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(hermes_core::Error::IndexClosed)),
+            "maintenance still accepted work after deletion started: {result:?}"
+        );
+        let completion = tokio::spawn(lease.complete());
+        tokio::task::yield_now().await;
+        assert!(!completion.is_finished());
+        assert!(root.path().join("deleting").exists());
+        drop(held_writer);
+        drop(writer);
+        drop(index);
+        tokio::time::timeout(std::time::Duration::from_secs(2), completion)
+            .await
+            .expect("deletion did not finish after issued handles were released")
+            .unwrap()
+            .unwrap();
+        assert!(!root.path().join("deleting").exists());
+    }
+
+    #[tokio::test]
+    async fn deleting_index_rejects_reopen_without_waiting_for_its_existing_handle() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = IndexRegistry::new(root.path().into(), Default::default());
+        registry
+            .create_index("deleting", hermes_core::SchemaBuilder::default().build())
+            .await
+            .unwrap();
+        let issued = registry.get_or_open_index("deleting").await.unwrap();
+        let lease = registry.begin_delete("deleting").await.unwrap();
+        // A handler or optimizer can fetch the index just before eviction,
+        // then ask for its writer. Waiting for the delete lease here while
+        // retaining `issued` would deadlock against deletion's handle drain.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            registry.get_writer("deleting"),
+        )
+        .await;
+        drop(issued);
+        lease.complete().await.unwrap();
+        let error = result
+            .expect("writer lookup waited for deletion while retaining an issued handle")
+            .err()
+            .expect("a deleting index must not reopen");
+        assert_eq!(error.code(), tonic::Code::NotFound);
+    }
 
     #[tokio::test]
     async fn delete_waits_for_previously_issued_index_handle() {
