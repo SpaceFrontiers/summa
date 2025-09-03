@@ -22,6 +22,7 @@ const PARALLEL_BP_MIN_ENTITIES: usize = 1_048_576;
 const MIN_RELATIVE_OBJECTIVE_IMPROVEMENT: f64 = 1e-6;
 const MIN_OBJECTIVE_ITERATIONS: usize = 4;
 const OBJECTIVE_STALL_ITERATIONS: usize = 2;
+const LOG_TABLE_SIZE: usize = 4096;
 
 fn term_degree_bytes(num_terms: usize) -> usize {
     let bitmap_words = num_terms.div_ceil(64);
@@ -214,6 +215,20 @@ fn parallel_bisect_lanes(
     affordable_nodes.min(worker_limit)
 }
 
+/// Spend only spare graph memory on gain caching. In particular, this must
+/// not change candidate selection or the number of degree lanes admitted by
+/// the existing policy. Tight budgets keep the direct arithmetic path.
+fn gain_cache_fits(budget: usize, non_degree_bytes: usize, terms: usize, lanes: usize) -> bool {
+    let required = terms
+        .checked_mul(std::mem::size_of::<[f32; 2]>())
+        .and_then(|cache| cache.checked_add(term_degree_bytes(terms)))
+        .and_then(|lane| lane.checked_add(std::mem::size_of::<TermDegrees>()))
+        .and_then(|lane| lane.checked_mul(lanes))
+        .and_then(|all_lanes| all_lanes.checked_add(non_degree_bytes))
+        .and_then(|graph| graph.checked_add(LOG_TABLE_SIZE * std::mem::size_of::<f32>()));
+    terms > 0 && required.is_some_and(|bytes| bytes <= budget)
+}
+
 /// Per-partition left/right term degrees with direct compact-term indexing.
 ///
 /// Recursive BP used to zero two `num_terms`-long vectors at every node. At
@@ -225,6 +240,9 @@ struct TermDegrees {
     values: Vec<std::mem::MaybeUninit<[u32; 2]>>,
     initialized: Vec<u64>,
     touched_words: Vec<u32>,
+    /// Optional, budgeted scratch. Refreshed for active terms before scoring,
+    /// reused across all refinements and partitions on this lane.
+    gain_cache: Vec<[f32; 2]>,
 }
 
 impl TermDegrees {
@@ -236,6 +254,7 @@ impl TermDegrees {
             values,
             initialized: vec![0; bitmap_words],
             touched_words: Vec::with_capacity(bitmap_words),
+            gain_cache: Vec::new(),
         }
     }
 
@@ -276,6 +295,42 @@ impl TermDegrees {
         // SAFETY: an initialized bit is published only after the slot write;
         // scoring reads degrees after construction, with no concurrent writes.
         unsafe { *self.values[term].assume_init_ref() }
+    }
+
+    fn refresh_gain_cache(&mut self, log_table: &[f32]) {
+        if self.gain_cache.is_empty() {
+            return;
+        }
+        for &word_idx in &self.touched_words {
+            let word_idx = word_idx as usize;
+            let mut pending = self.initialized[word_idx];
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                let term = word_idx * 64 + bit;
+                // SAFETY: pending contains only initialized degree slots.
+                let [left, right] = unsafe { *self.values[term].assume_init_ref() };
+                // Preserve both subtraction operations, division, and final
+                // sign exactly. Combining the logs/penalty or reassociating
+                // the document reduction would change median ties.
+                self.gain_cache[term] = [
+                    if left == 0 {
+                        0.0
+                    } else {
+                        fast_log2_lookup(right as usize + 2, log_table)
+                            - fast_log2_lookup(left as usize, log_table)
+                            - std::f32::consts::LOG2_E / (1.0 + right as f32)
+                    },
+                    if right == 0 {
+                        0.0
+                    } else {
+                        -(fast_log2_lookup(left as usize + 2, log_table)
+                            - fast_log2_lookup(right as usize, log_table)
+                            - std::f32::consts::LOG2_E / (1.0 + left as f32))
+                    },
+                ];
+                pending &= pending - 1;
+            }
+        }
     }
 
     fn merge_from(&mut self, other: &Self) {
@@ -379,6 +434,7 @@ pub(crate) struct ForwardIndex {
     /// allowed by the memory budget. Recursion divides this allowance between
     /// children without rounding non-power-of-two worker pools down.
     parallel_bisect_lanes: usize,
+    cache_gains: bool,
     /// True when the configured memory limit forced graph signal to be
     /// discarded. Callers must not report the resulting order as fully
     /// converged: a later pass with a larger budget may still improve it.
@@ -415,6 +471,10 @@ impl ForwardIndex {
             offsets,
             num_terms,
             parallel_bisect_lanes: lanes.max(1),
+            // The text caller retains additional plans/construction buffers
+            // outside this graph's accounting. It cannot safely admit the
+            // optional cache until it supplies a complete remaining budget.
+            cache_gains: false,
             budget_limited,
         }
     }
@@ -567,6 +627,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: false,
         };
     }
@@ -600,6 +661,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: true,
         };
     }
@@ -636,6 +698,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: true,
         };
     };
@@ -684,6 +747,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited,
         };
     }
@@ -807,6 +871,12 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         offsets,
         num_terms: num_active_terms,
         parallel_bisect_lanes,
+        cache_gains: gain_cache_fits(
+            memory_budget_bytes,
+            non_degree_bytes,
+            num_active_terms,
+            parallel_bisect_lanes,
+        ),
         budget_limited,
     }
 }
@@ -829,6 +899,7 @@ pub(crate) fn build_forward_index_from_blocks(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: false,
         };
     }
@@ -860,6 +931,7 @@ pub(crate) fn build_forward_index_from_blocks(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: true,
         };
     }
@@ -883,6 +955,7 @@ pub(crate) fn build_forward_index_from_blocks(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: true,
         };
     };
@@ -918,6 +991,7 @@ pub(crate) fn build_forward_index_from_blocks(
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited,
         };
     }
@@ -993,6 +1067,12 @@ pub(crate) fn build_forward_index_from_blocks(
         offsets,
         num_terms,
         parallel_bisect_lanes,
+        cache_gains: gain_cache_fits(
+            memory_budget_bytes,
+            non_degree_bytes,
+            num_terms,
+            parallel_bisect_lanes,
+        ),
         budget_limited,
     }
 }
@@ -1827,16 +1907,17 @@ pub(crate) fn graph_bisection_with_progress(
     let degree_lanes = fwd.parallel_bisect_lanes.max(1);
     #[cfg(not(feature = "native"))]
     let degree_lanes = 1usize;
-    let log_table = build_log_table(4096);
+    let log_table = build_log_table(LOG_TABLE_SIZE);
     let progress = BpProgress::new(progress_label, n, fwd.total_postings(), depth, degree_lanes);
 
     log::debug!(
-        "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}, time_budget={:?}",
+        "BP graph_bisection: n={}, min_partition={}, max_iters={}, depth=~{}, time_budget={:?}, gain_cache={}",
         n,
         effective_min_partition,
         max_iters,
         depth,
         budget.time_budget,
+        fwd.cache_gains,
     );
 
     #[cfg(feature = "native")]
@@ -1883,7 +1964,13 @@ pub(crate) fn graph_bisection_with_progress(
         let mut partitioned = vec![0u32; n];
         let mut ranked = vec![0usize; n];
         let mut degree_workspaces: Vec<TermDegrees> = (0..degree_lanes)
-            .map(|_| TermDegrees::new(fwd.num_terms))
+            .map(|_| {
+                let mut lane = TermDegrees::new(fwd.num_terms);
+                if fwd.cache_gains {
+                    lane.gain_cache = vec![[0.0; 2]; fwd.num_terms];
+                }
+                lane
+            })
             .collect();
         bisect_level_synchronized(
             &mut docs,
@@ -2327,7 +2414,7 @@ fn bisect_partition(
             docs,
             context.fwd,
             mid,
-            &degree_workspaces[0],
+            &mut degree_workspaces[0],
             context.log_table,
             gains,
             allow_inner_parallelism,
@@ -2468,13 +2555,28 @@ fn compute_gains(
     docs: &[u32],
     fwd: &ForwardIndex,
     mid: usize,
-    degrees: &TermDegrees,
+    degrees: &mut TermDegrees,
     log_table: &[f32],
     gains: &mut [f32],
     allow_inner_parallelism: bool,
 ) {
-    #[cfg(not(feature = "native"))]
-    let _ = allow_inner_parallelism;
+    degrees.refresh_gain_cache(log_table);
+    debug_assert_eq!(docs.len(), gains.len());
+    if !degrees.gain_cache.is_empty() {
+        // Dispatch once per refinement, keeping this small gather/reduction
+        // callback separate from the logarithmic fallback. This avoids its
+        // branch and large spill frame in sequential and Rayon leaf workers.
+        let cache = degrees.gain_cache.as_slice();
+        fill_gains(gains, allow_inner_parallelism, |i| {
+            let side = usize::from(i >= mid);
+            let mut gain = 0.0f32;
+            for &term in fwd.doc_terms(docs[i] as usize) {
+                gain += cache[term as usize][side];
+            }
+            gain
+        });
+        return;
+    }
 
     // Single coherent key: HIGH = belongs in the RIGHT half.
     // Left docs get +approx_one(from=left, to=right) — a misplaced left doc
@@ -2503,22 +2605,33 @@ fn compute_gains(
         g
     };
 
+    fill_gains(gains, allow_inner_parallelism, gain_for_doc);
+}
+
+fn fill_gains(
+    gains: &mut [f32],
+    allow_inner_parallelism: bool,
+    gain_for_doc: impl Fn(usize) -> f32 + FrequencyParallelSafe,
+) {
+    #[cfg(not(feature = "native"))]
+    let _ = allow_inner_parallelism;
+
     #[cfg(feature = "native")]
     {
-        if allow_inner_parallelism && docs.len() > 4096 {
+        if allow_inner_parallelism && gains.len() > 4096 {
             gains
                 .par_iter_mut()
                 .enumerate()
                 .for_each(|(i, gain)| *gain = gain_for_doc(i));
         } else {
-            for (i, gain) in gains.iter_mut().enumerate().take(docs.len()) {
+            for (i, gain) in gains.iter_mut().enumerate() {
                 *gain = gain_for_doc(i);
             }
         }
     }
     #[cfg(not(feature = "native"))]
     {
-        for (i, gain) in gains.iter_mut().enumerate().take(docs.len()) {
+        for (i, gain) in gains.iter_mut().enumerate() {
             *gain = gain_for_doc(i);
         }
     }
@@ -2545,6 +2658,9 @@ fn fast_log2_lookup(val: usize, table: &[f32]) -> f32 {
         (val as f32).log2()
     }
 }
+
+#[cfg(test)]
+mod gain_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2706,6 +2822,7 @@ mod tests {
             offsets,
             num_terms: TERMS,
             parallel_bisect_lanes: 4,
+            cache_gains: false,
             budget_limited: false,
         };
         let docs: Vec<u32> = (0..N as u32)
@@ -2802,6 +2919,7 @@ mod tests {
             offsets,
             num_terms,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: false,
         }
     }
@@ -2864,6 +2982,7 @@ mod tests {
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
+            cache_gains: false,
             budget_limited: false,
         };
         let (perm, _) = graph_bisection(&fwd, 4, 20, BpBudget::full());

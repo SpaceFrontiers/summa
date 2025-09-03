@@ -205,3 +205,28 @@ cheaper gain-cooling stop because a serial full-vocabulary objective scan costs
 more there than the posting passes it can avoid. Long passes log progress every
 30 seconds and export aggregate depth, partition, iteration, entity-pass, swap,
 duration, and stop-reason metrics.
+
+## Gain arithmetic review (2026-09-05)
+
+Before this pass, the gain loop recomputed two logarithms and a division per posting.
+Within a refinement, each term has only two possible signed contributions,
+one for each source half. Document term order and strict floating-point
+operation order determine gain bits, median ties, and persisted permutations;
+reassociation of this reduction is therefore not an admissible SIMD shortcut.
+
+The implemented optimization caches those two contributions once
+per active term per refinement, then gathers and sums them in the original
+document term order. It reuses the cache across partitions on each admitted
+degree lane and charges `8 × vocabulary × lanes` bytes plus vector descriptors
+against remaining graph scratch allowance before allocation. Cache admission
+does not drop extra dimensions or reduce the existing degree-lane count; when
+it does not fit, the kernel retains direct computation. This changes expensive
+arithmetic from posting-proportional to active-term-proportional while leaving CSR traversal,
+selection, stopping rules, formats, and rewrite ownership unchanged.
+
+Same-fixture timings, exact gain/permutation bytes, memory accounting, assembly
+and validation are recorded in the
+allowance without changing dimension selection or degree-lane admission. It
+does not fix the text adapter's older incomplete memory accounting; that
+adapter retains direct gain computation until its complete remaining budget
+can be supplied.
