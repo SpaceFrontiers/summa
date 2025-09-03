@@ -206,7 +206,7 @@ pub fn merge_batch_responses(
 /// Merge per-partition search responses for `offset`/`limit`: hits by score
 /// descending (ties by address), `total_hits` summed, timings at their
 /// maximum, `truncated` if any partition truncated. Every partition scored
-/// with the same global statistics, so scores are comparable; rank-fused
+/// with the same global statistics, so scores are comparable. Rank fusion
 /// is coordinated separately in `ranking`; this merger only orders supplied scores.
 pub fn merge_search_responses(
     responses: Vec<SearchResponse>,

@@ -22,6 +22,7 @@ pub struct CoordinatorPlan {
     scopes: Vec<i32>,
     output_passages: usize,
     window: usize,
+    shards: usize,
 }
 
 pub fn handles(request: &proto::SearchRequest) -> bool {
@@ -231,6 +232,7 @@ impl CoordinatorPlan {
             scopes,
             output_passages,
             window,
+            shards,
         })
     }
 
@@ -238,6 +240,11 @@ impl CoordinatorPlan {
         &self,
         mut responses: Vec<proto::SearchResponse>,
     ) -> Result<proto::SearchResponse, Status> {
+        if responses.len() != self.shards {
+            return Err(incompatible(
+                "coordinator did not receive every shard response",
+            ));
+        }
         let mut bytes = 0usize;
         for response in &responses {
             bytes = bytes.saturating_add(response.encoded_len());
@@ -354,8 +361,11 @@ impl CoordinatorPlan {
         let mut hits = BTreeMap::new();
         let mut metadata = Vec::new();
         for mut response in responses {
+            let mut local_addresses = BTreeSet::new();
             for hit in response.hits.drain(..) {
-                if hits.insert(key(hit.address.as_ref())?, hit).is_some() {
+                let address = key(hit.address.as_ref())?;
+                local_addresses.insert(address);
+                if hits.insert(address, hit).is_some() {
                     return Err(incompatible("duplicate candidate address across shards"));
                 }
             }
@@ -371,7 +381,7 @@ impl CoordinatorPlan {
                     if !branch_addresses.insert((segment_id, doc_id)) {
                         return Err(incompatible("duplicate candidate address within a branch"));
                     }
-                    if !hits.contains_key(&(segment_id, doc_id))
+                    if !local_addresses.contains(&(segment_id, doc_id))
                         || !candidate.score.is_finite()
                         || candidate
                             .ordinal_scores
@@ -636,7 +646,7 @@ mod tests {
 
     #[test]
     fn linear_mixed_versions_missing_features_and_disagreement_fail_loudly() {
-        let plan = CoordinatorPlan::new(request(true), 2).unwrap();
+        let plan = CoordinatorPlan::new(request(true), 1).unwrap();
         assert!(plan.finish(vec![proto::SearchResponse::default()]).is_err());
         let mut response = proto::SearchResponse {
             ranking_method: "linear_v1".into(),

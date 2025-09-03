@@ -1,11 +1,12 @@
 //! SearchService routing: reads go to a routable replica of the shard
-//! hosting the index and are forwarded verbatim.
+//! hosting the index. Pointwise queries are forwarded; top-level fusion is
+//! coordinated using the core-owned scoring and fusion algorithms.
 //!
 //! A partitioned index fans reads out: `Search` first collects the text
 //! statistics of the query's terms from every partition and sends the sum
 //! back with each partition's request (so BM25 scores are comparable across
-//! partitions), then merges the per-partition windows by score
-//! (`partition::merge_search_responses`). `GetDocument` asks every
+//! partitions), then uses `ranking` for global fusion/L1 selection or
+//! `partition::merge_search_responses` for comparable pointwise scores. `GetDocument` asks every
 //! partition, `GetIndexInfo` and `GetTextStats` aggregate.
 
 use std::sync::Arc;
@@ -136,9 +137,15 @@ impl BrokerSearchService {
                 get_text_stats,
                 "get_text_stats"
             )?;
-            req.text_stats = Some(partition::merge_text_stats(
-                stats.into_iter().filter_map(|s| s.stats).collect(),
-            ));
+            let stats = stats
+                .into_iter()
+                .map(|response| {
+                    response.stats.ok_or_else(|| {
+                        Status::failed_precondition("a shard omitted requested BM25 statistics")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            req.text_stats = Some(partition::merge_text_stats(stats));
         }
         Ok(())
     }
