@@ -177,6 +177,7 @@ impl BrokerSearchService {
         // Bound the sum of concurrently decoded responses, including compressed
         // transports. No unbounded per-shard allowance is multiplied by fan-out.
         let decode_limit = crate::ranking::MAX_TRANSFER_BYTES / route.targets().len();
+        let tracing = plan.shard_request.tracing;
         let calls = route.targets().iter().map(|target| {
             let mut outbound = Request::new(plan.shard_request.clone());
             let index_name = plan.shard_request.index_name.clone();
@@ -197,7 +198,16 @@ impl BrokerSearchService {
                     .unwrap_or_else(|status| status.code());
                 record_backend(&target.backend_id, "search", call_started, code);
                 result
-                    .map(|response| response.into_inner())
+                    .and_then(|response| {
+                        let mut response = response.into_inner();
+                        crate::ranking::stamp_trace(
+                            &mut response,
+                            &target.shard,
+                            &target.backend_id,
+                            tracing,
+                        )?;
+                        Ok(response)
+                    })
                     .map_err(|status| {
                         if route.is_partitioned() {
                             partition::partition_failure(&index_name, &target.shard, status)

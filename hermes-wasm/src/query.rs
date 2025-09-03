@@ -32,6 +32,8 @@
 //! } }
 //! ```
 
+mod diagnostics;
+
 use hermes_core::query::{
     BooleanQuery, DenseVectorQuery, PhraseQuery, PrefixQuery, Query, SparseVectorQuery, TermQuery,
 };
@@ -41,7 +43,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
 /// Top-level query object deserialized from JS.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsQuery {
     #[serde(default)]
@@ -62,7 +64,7 @@ pub(crate) struct JsQuery {
     fusion: Option<JsFusionQuery>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsTermQuery {
     field: String,
@@ -71,7 +73,7 @@ pub(crate) struct JsTermQuery {
     tokenizer_hint: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsMatchQuery {
     field: String,
@@ -80,7 +82,7 @@ pub(crate) struct JsMatchQuery {
     tokenizer_hint: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsPhraseQuery {
     field: String,
@@ -91,7 +93,7 @@ pub(crate) struct JsPhraseQuery {
     tokenizer_hint: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsBooleanQuery {
     #[serde(default)]
@@ -102,13 +104,13 @@ pub(crate) struct JsBooleanQuery {
     must_not: Vec<JsQuery>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(crate) struct JsPrefixQuery {
     field: String,
     value: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsSparseVectorQuery {
     field: String,
@@ -118,7 +120,7 @@ pub(crate) struct JsSparseVectorQuery {
     heap_factor: Option<f32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsDenseVectorQuery {
     field: String,
@@ -129,7 +131,7 @@ pub(crate) struct JsDenseVectorQuery {
     rerank_factor: Option<f32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsFusionQuery {
     queries: Vec<JsWeightedQuery>,
@@ -142,15 +144,17 @@ pub(crate) struct JsFusionQuery {
     fetch_limit: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub(crate) struct JsWeightedQuery {
+    #[serde(default)]
+    name: String,
     query: JsQuery,
     #[serde(default)]
     weight: Option<f32>,
 }
 
 /// Search request with optional parameters.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JsSearchRequest {
     pub query: JsQuery,
@@ -160,6 +164,10 @@ pub(crate) struct JsSearchRequest {
     pub offset: usize,
     #[serde(default)]
     pub fields_to_load: Option<Vec<String>>,
+    #[serde(default)]
+    pub include_rrf_scores: bool,
+    #[serde(default)]
+    pub tracing: bool,
 }
 
 fn default_limit() -> usize {
@@ -168,13 +176,19 @@ fn default_limit() -> usize {
 
 /// Typed response structs (avoid serde_json::json! intermediate allocations).
 #[derive(Serialize)]
-pub(crate) struct StructuredSearchResponse {
-    hits: Vec<StructuredHit>,
+pub(crate) struct StructuredSearchResponse<'a> {
+    hits: Vec<StructuredHit<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace: Option<diagnostics::SearchTrace<'a>>,
     total_hits: usize,
 }
 
 #[derive(Serialize)]
-pub(crate) struct StructuredHit {
+pub(crate) struct StructuredHit<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rrf_score: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rrf_contributions: Vec<diagnostics::RrfContribution<'a>>,
     address: HitAddress,
     score: f32,
     doc: Option<serde_json::Value>,
@@ -194,6 +208,17 @@ pub(crate) async fn execute_structured_search<D: Directory>(
     let req: JsSearchRequest = serde_wasm_bindgen::from_value(request)
         .map_err(|e| JsValue::from_str(&format!("Invalid search request: {}", e)))?;
 
+    let diagnostics = req.tracing || req.include_rrf_scores;
+    let window = req.limit.saturating_add(req.offset);
+    if diagnostics && window > 10_000 {
+        return Err(JsValue::from_str("diagnostic result window exceeds 10000"));
+    }
+    if req.include_rrf_scores && req.query.fusion.is_none() {
+        return Err(JsValue::from_str("includeRrfScores requires fusion"));
+    }
+    let mut nomination_lists = Vec::new();
+    let mut trace = None;
+    let mut budget = diagnostics::Budget::default();
     let field_ids = req
         .fields_to_load
         .as_ref()
@@ -203,6 +228,21 @@ pub(crate) async fn execute_structured_search<D: Directory>(
     // Fusion: run each sub-query independently and fuse the ranked lists
     // (union). Handled here because fusion is a searcher-level operation.
     let results = if let Some(ref fusion) = req.query.fusion {
+        if fusion.queries.is_empty()
+            || fusion.queries.len() > hermes_core::query::MAX_FUSION_SUB_QUERIES
+        {
+            return Err(JsValue::from_str("fusion requires 1..16 branches"));
+        }
+        if fusion.queries.iter().any(|branch| {
+            !branch.weight.unwrap_or(1.0).is_finite()
+                || branch.weight.unwrap_or(1.0) < 0.0
+                || (diagnostics && branch.name.len() > 128)
+        }) || fusion.rrf_k.is_some_and(|k| !k.is_finite() || k < 0.0)
+        {
+            return Err(JsValue::from_str(
+                "invalid fusion weights, rank constant or branch name",
+            ));
+        }
         let mut sub_queries = Vec::with_capacity(fusion.queries.len());
         for weighted in &fusion.queries {
             if weighted.query.fusion.is_some() {
@@ -240,29 +280,113 @@ pub(crate) async fn execute_structured_search<D: Directory>(
         }
         let refs: Vec<(&dyn Query, f32)> =
             sub_queries.iter().map(|(q, w)| (q.as_ref(), *w)).collect();
-        let mut fused = searcher
-            .search_fused(
-                &refs,
-                fetch_limit,
-                fused_limit,
-                method,
-                hermes_core::query::MultiValueCombiner::Max,
-            )
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
+        let mut fused = if diagnostics {
+            let queries: Vec<std::sync::Arc<dyn Query>> =
+                sub_queries.into_iter().map(|(q, _)| q.into()).collect();
+            nomination_lists = searcher
+                .search_candidate_lists(&queries, fetch_limit, None)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Search error: {e}")))?;
+            let lists: Vec<_> = nomination_lists
+                .iter()
+                .zip(&fusion.queries)
+                .map(|((hits, _), branch)| (hits.as_slice(), branch.weight.unwrap_or(1.0)))
+                .collect();
+            if req.tracing {
+                trace = Some(diagnostics::fusion_trace(
+                    searcher.schema().index_label(),
+                    fusion,
+                    &nomination_lists,
+                    fetch_limit,
+                    &mut budget,
+                )?);
+            }
+            searcher
+                .fuse_candidate_lists(
+                    &lists,
+                    method,
+                    hermes_core::query::MultiValueCombiner::Max,
+                    fused_limit,
+                )
+                .map_err(|e| JsValue::from_str(&format!("Search error: {e}")))?
+        } else {
+            searcher
+                .search_fused(
+                    &refs,
+                    fetch_limit,
+                    fused_limit,
+                    method,
+                    hermes_core::query::MultiValueCombiner::Max,
+                )
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Search error: {e}")))?
+        };
         if req.offset > 0 {
             fused.drain(..req.offset.min(fused.len()));
         }
         fused
     } else {
         let query = convert_query(&req.query, searcher.schema(), searcher.tokenizers())?;
-        let (results, _) = searcher
-            .search_with_offset_and_count(query.as_ref(), req.limit, req.offset)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Search error: {}", e)))?;
-        results
+        if req.tracing {
+            let (mut results, seen) = searcher
+                .search_with_count(query.as_ref(), window)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Search error: {e}")))?;
+            trace = Some(diagnostics::root_trace(
+                searcher.schema().index_label(),
+                &req.query,
+                &results,
+                seen,
+                window,
+                &mut budget,
+            )?);
+            results.drain(..req.offset.min(results.len()));
+            results
+        } else {
+            searcher
+                .search_with_offset_and_count(query.as_ref(), req.limit, req.offset)
+                .await
+                .map_err(|e| JsValue::from_str(&format!("Search error: {e}")))?
+                .0
+        }
     };
 
+    if let Some(trace) = &mut trace {
+        trace.shards[0].selected = budget.candidates(&results)?;
+    }
+    let rrf = if req.include_rrf_scores {
+        let fusion = req.query.fusion.as_ref().expect("validated fusion");
+        let lists: Vec<_> = nomination_lists
+            .iter()
+            .zip(&fusion.queries)
+            .enumerate()
+            .map(
+                |(query_index, ((hits, _), branch))| hermes_core::query::RrfRankedList {
+                    query_index,
+                    scope: None,
+                    weight: branch.weight.unwrap_or(1.0),
+                    hits,
+                },
+            )
+            .collect();
+        let selected: Vec<_> = results
+            .iter()
+            .map(|hit| (hit.segment_id, hit.doc_id))
+            .collect();
+        Some(
+            searcher
+                .rrf_scores_for_hits(
+                    &lists,
+                    &selected,
+                    fusion.rrf_k.unwrap_or(hermes_core::query::DEFAULT_RRF_K),
+                    hermes_core::query::MultiValueCombiner::Max,
+                )
+                .map_err(|e| JsValue::from_str(&e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let mut scores = rrf.unwrap_or_default().into_iter();
     let mut hits = Vec::with_capacity(results.len());
     for result in &results {
         let address = hermes_core::query::DocAddress::new(result.segment_id, result.doc_id);
@@ -270,7 +394,21 @@ pub(crate) async fn execute_structured_search<D: Directory>(
             .get_document_with_fields(&address, field_ids.as_ref())
             .await
             .map_err(|e| JsValue::from_str(&format!("Get document error: {}", e)))?;
+        let score = scores.next();
+        let rrf_score = score.as_ref().map(|score| score.score);
+        let rrf_contributions = score.map_or_else(Vec::new, |score| {
+            score
+                .contributions
+                .into_iter()
+                .map(|vote| diagnostics::RrfContribution {
+                    query_name: &req.query.fusion.as_ref().unwrap().queries[vote.query_index].name,
+                    vote,
+                })
+                .collect()
+        });
         hits.push(StructuredHit {
+            rrf_score,
+            rrf_contributions,
             address: HitAddress {
                 segment_id: format!("{:032x}", result.segment_id),
                 doc_id: result.doc_id,
@@ -281,10 +419,14 @@ pub(crate) async fn execute_structured_search<D: Directory>(
     }
 
     let response = StructuredSearchResponse {
+        trace,
         hits,
         total_hits: results.len(),
     };
 
+    if diagnostics {
+        diagnostics::check_encoded_size(&response)?;
+    }
     response
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))

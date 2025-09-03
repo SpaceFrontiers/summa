@@ -1,6 +1,6 @@
-# Candidate rescoring for linear L1 ranking
+# Candidate rescoring for L1 ranking
 
-Status: opt-in Hermes implementation, 2026-09-05. Search API training and
+Status: opt-in Hermes implementation, 2026-09-06. Search API training and
 activation are separate. Existing retrieval defaults remain unchanged.
 
 Logical addressing belongs to [BMP forward values](bmp-forward-index.md) and
@@ -46,13 +46,139 @@ respect to the stored representation (including sparse/vector quantization).
 ## Ranking modes
 
 - RRF: existing rank-only fusion, kept for compatibility and paired baselines.
-- Linear: bounded L0 union, optional missing-only backfill, fixed linear model,
-  direct top-K. No RRF runs before or after the formula.
+- L1: bounded L0 union, optional missing-only backfill, a compiled symbolic
+  formula and direct top-K. This is the only L1 scoring interface.
 - Export: bounded L0 union plus raw features for caller-side model inference.
 
-RRF and linear are mutually exclusive ranking policies. Formula weights are
+Legacy fusion and L1 are separate ranking policies. Formula weights are
 not RRF branch weights. A model-bearing request cannot silently enter legacy
 RRF when a backend lacks capabilities.
+
+### Symbolic L1 formulas
+
+`l1.formula` replaces coefficient maps, bias, transforms and `rrf_weight` with
+one expression, for example `0.4 * ln(1 + bm25) + 0.6 * dense + 100 * rrf`.
+The old coefficient fields are removed and their protobuf tags/names reserved; `backfill` and
+`missing_values` remain available. Variables reference named branch raw scores;
+missing cells use the configured raw default, otherwise zero. Observed zero and
+negative values remain observed values. Names containing punctuation or matching
+function/constant names use braces, for example `{body.bm25}` or `{max}`.
+`rrf` is reserved in formula mode and has the passage/context semantics below.
+The complete expression runs before passage selection and document reduction.
+
+The core owns compilation and inference using [exmex](https://docs.rs/exmex/0.21.0/exmex/).
+It supports `+ - * / ^`, parentheses, `abs`, `sqrt`, `exp`, `ln`/`log` (natural),
+`log2`, `log10`, `log1p`, `expm1`, binary `min`/`max`, rounding and trigonometric
+functions. Arbitrary-base logarithms use `ln(x) / ln(base)`. Unary operators bind
+before powers (`-x^2` means `(-x)^2`); use parentheses to make intent explicit.
+Constants include `PI`, `E`, and `TAU`. This is numeric evaluation with no custom
+user functions, I/O, assignments or loops. Non-finite final f64/f32 predictions
+fail the request, including domain errors and overflow; no fallback score is
+substituted. Constant-only invalid expressions fail during validation.
+
+Before index opening or RPC fanout, expressions are limited to 4 KiB, 256 tokens
+and 32 parenthesis levels, with at most 16 branch variables plus `rrf`.
+They compile once per request into an immutable plan; candidate/passages bind
+scores by precomputed indices into a stack array, without parsing or building
+name maps per row. Evaluation scratch is bounded by expression size (the
+library keeps up to 32 operands on the stack). There is no expression cache.
+Formula requests use `formula_v1` and reject older backends explicitly.
+Requests using only removed coefficient fields have no formula and fail.
+
+Without `rrf`, shards apply the same formula and return their local top window.
+With `rrf`, the broker requests the complete bounded union and every scored
+passage, using a constant shard formula to export raw features without evaluating
+a global-rank expression on local ranks. It computes global organic votes and
+applies the requested formula through the same core inference routine before
+selecting passages/documents. This also handles division/logarithms of `rrf`
+without unsafe zero substitution. The existing candidate, feature and response
+budgets apply; incomplete shard evidence is an error.
+
+### Optional RRF diagnostics
+
+`SearchRequest.include_rrf_scores` adds `rrf_score` and `rrf_contributions` to
+each returned fusion hit without changing `score`, result selection or ordering.
+It requires top-level fusion and complete nomination (no scoring time budget).
+The default is false. Each contribution identifies its zero-based `query_index`,
+optional branch name, one-based rank, weighted reciprocal-rank value and optional
+passage ordinal. An absent ordinal is document context, not passage zero.
+
+Diagnostics use the complete bounded **organic nomination lists**, before L1,
+backfill, reranking or pagination. Score-only branches and backfilled cells do
+not vote. In L1/export mode, document branches rank documents and contribute
+context to every nominated passage; chunk branches rank passages. The existing
+fusion combiner reduces final passage RRF scores to `rrf_score`, or the document
+context alone when no passages were nominated. Legacy fusion retains its
+existing chunk-ranking semantics. With MAX or weighted-top-k the contribution
+rows need not sum to the document score: combine their per-passage sums first.
+The rank constant and weights follow fusion configuration (defaults 60 and 1);
+L1/export requests retain their existing unset legacy-option validation,
+so their diagnostic baseline uses those defaults.
+
+The broker computes ranks after merging nomination lists from every shard,
+including candidates discarded by shard-local L1/reranker selection. This does
+not alter the ranking policy: legacy vector reranking still has its existing
+shard execution. Servers include compact `fusion_candidates` when diagnostics
+are requested so the broker can recompute global attribution; the coordinator
+removes that transport payload from its final diagnostic response. Missing or
+incompatible nomination exports fail explicitly instead of exposing local ranks
+as global ones.
+
+Core fusion owns ranking and attribution. Adapters only translate and account
+for the additive optional protobuf fields. The extra work sorts already-retained
+nomination scores; it does not rerun retrieval, backfill or document hydration.
+Scratch and output are bounded by the existing 16-branch, 200,000-candidate and
+500,000-contribution limits, plus response byte budgets. Only returned hits
+retain contribution rows. Oversized exports fail rather than silently dropping
+votes. Python, TypeScript and WASM expose the same optional diagnostics.
+
+### Optional RRF feature in L1
+
+Reference `rrf` directly in `l1.formula`, for example
+`0.2 * title + 0.8 * body + 3 * rrf`. Constants can be positive, negative or zero.
+The expression is evaluated in f64 with checked f32 output **before** passage
+selection and document reduction. For a passage, `rrf` is its organic passage
+votes plus document-context votes. A passage not nominated by a chunk branch
+receives no vote from it. A document with no passage rows uses its document RRF
+score. Thus RRF can change both the best passage and winning document; adding
+it after MAX/SUM/etc. would implement a different formula. Exports and ordinal
+scores contain the final L1 predictions.
+
+L1 RRF uses rank constant 60 and unit branch weights; backfill and score-only
+branches never vote. `include_rrf_scores` independently controls diagnostic
+output. Global RRF invalidates shard-local document and passage top-k pruning,
+so the broker obtains the full bounded union and all scored rows as described
+above. The 10,000-document per-shard export window, aggregate candidate/ordinal,
+feature matrix and transfer byte budgets apply; incomplete/oversized exports fail.
+
+### Retrieval tracing
+
+`SearchRequest.tracing` defaults to false. When true, `SearchResponse.trace`
+contains one entry per responding shard, including backend/shard identity at
+the broker, each requested fusion branch's query tree, name, scope and score-only
+status, nomination depth, total-seen counter and its complete bounded organic
+candidate list with raw scores/ordinals. Common fusion filters are recorded on
+the shard trace. Ordinary searches have one root query
+entry. Score-only branches have no nomination candidates. Each shard also records
+its selected results after its ranking/reranking stage, before broker selection.
+The broker retains all shard traces when it returns the final result page.
+
+Tracing observes actual execution: it does not execute Boolean clauses or
+score-only branches as extra searches, bypass filters, increase retrieval depth,
+scan the corpus or hydrate discarded documents. Approximate traversal and top-k
+pruning can therefore exclude documents before the nomination list; depth,
+total-seen and truncation metadata make that boundary explicit. Nested query
+trees identify the expressions that produced a branch's candidates. Comparing
+nomination lists, shard selections and final hits supports subsequent recall
+analysis without changing serving policy.
+
+Trace candidates carry addresses and scores, not stored document payloads.
+Transport reuses nomination exports when RRF diagnostics and tracing are both
+requested; candidate lists are not serialized twice. The existing candidate,
+ordinal, hydration and combined broker byte limits apply. Requested tracing
+from an older backend fails explicitly if the trace is absent. Default requests
+do not retain trace data. Client types distinguish an absent trace from a
+present trace containing zero candidates.
 
 ## Candidate and score model
 
@@ -75,13 +201,13 @@ scores are not relabeled as exhaustive scores or silently recomputed. Diagnostic
 with nomination settings because it changes the available feature population.
 
 Hermes fills missing raw feature scores when requested, applies an
-optional portable linear model to the full nominated union before truncation, and returns the raw features. Search API owns query intent,
+optional compiled formula to the full nominated union before truncation, and returns the raw features. Search API owns query intent,
 training and model selection, and may apply a richer linear/CatBoost model
 across separate query calls. The same versioned transforms and coefficients
 can execute in Hermes and Search API. Learned weights never replace raw exports.
 
 Each fusion branch has a unique `name`, an explicit `document`/`chunk` scope,
-and the existing `Query` object. `l1.weights` references those branch names,
+and the existing `Query` object. `l1.formula` references those branch names,
 not schema field names or array indexes. The branch itself supplies the field,
 tokenization, phrase offsets and vector; there is no separately maintained
 scoring query that can drift from retrieval. A `score_only` branch supplies a
@@ -99,13 +225,12 @@ common filters never contribute scoring features. Its scorer uses constant
 memory and shares the document-universe cursor with Boolean exclusion. Common
 eligibility uses the existing bounded bitmap, with no storage or wire change.
 
-A branch omitted from weights still nominates and exports its feature, but
-contributes zero. Unknown coefficient/transform names, duplicate or empty branch
-names, all-zero models and non-finite values are errors. A schema field without
-a query branch is neither searched nor scored. Missing candidate field data is
-explicitly unavailable; failure to enter a vertical's top-K does not mean zero.
-`l1` and legacy RRF coefficients are separate contracts. No fallback to RRF is
-permitted for an invalid or unsupported linear request.
+A branch absent from the formula still nominates and exports its feature.
+Unknown variables, duplicate/empty branch names and non-finite predictions are
+errors. Constant formulas, including zero, are valid. A schema field without a
+query branch is neither searched nor scored. Missing candidate field data stays
+explicitly unavailable in raw exports. No fallback to RRF is permitted for an
+invalid or unsupported formula request.
 
 The bounded L0 union survives until Hermes L1 evaluation. Export-only requests
 can return the whole union for external inference. Alternative reformulations
@@ -118,35 +243,31 @@ add votes. Query/feature names and preprocessing form a versioned contract.
 For a candidate passage c of document d:
 
 ```
-effective_i = observed_i if present else learned_missing_i
-contribution_i = w_i * transform_i(effective_i) if available else 0
-passage_score(d,c) = bias + sum(chunk contributions at c)
-                          + sum(document contributions at d)
+effective_i = observed_i if present else missing_values.get(i, 0)
+passage_score(d,c) = formula(chunk features at c, document features at d, rrf(d,c))
 document_score(d) = fusion.combiner({passage_score(d,c) for nominated c})
 ```
 
 A document-only candidate has an explicit document row, with no invented chunk
 ordinal. Missing feature values have a presence bit and use the configured
-raw default (or contribute nothing if none is configured); a
+raw default (or zero if none is configured); a
 valid nonmatching lexical/sparse feature has score zero and is distinguished
 from an unavailable field. Dense negatives remain valid values. Document
 features are computed once and broadcast as context, not summed repeatedly
 across chunks. The default MAX reduction does not reward chunk count. SUM remains an explicit count-sensitive policy.
 Returned ordinal scores are the same final passage scores used for selection.
 
-Normalization is fixed in the model artifact, never local min/max over the
-current shard or result page. Supported transforms are identity,
-signed log1p for unbounded lexical/sparse scores, and a configured affine
-scale; trained parameters are derived from training data only. This permits
-negative raw scores and yields comparable scores across shards. Validate
-finite inputs, scales, weights, transformed values and final reductions.
+Normalization is explicit in the formula, never local min/max over a shard or
+result page. For example, `signum(x) * log1p(abs(x))` expresses signed log1p;
+constants express affine transforms. Trained parameters come from training data
+only. Raw inputs and final formula/document predictions must remain finite.
 
 ## Broker ownership of global selection
 
 The broker is the coordinator for a logical index, including single-shard routes.
 Each shard nominates at `candidate_depth` per branch; this depth is intentionally
 not divided by partition count. Shards preserve organic scores, optionally backfill the bounded union and apply the
-request's fixed L1 model. They retain at least `offset + limit` documents each,
+request's L1 formula when it has no global RRF dependency. They retain at least `offset + limit` documents each,
 which is sufficient for exact global top-K under the identical pointwise model
 and document combiner. The broker reapplies the shared core formula, verifies
 agreement and selects the global page. This reduces transfer without dropping
@@ -156,7 +277,7 @@ MAX requires only the best passage feature row for each retained document;
 weighted-top-k needs its top-k rows. AVG/SUM require all scored rows to reproduce
 the document reduction. The shard export is widened to meet that requirement
 before the broker reapplies the formula, then reduced to the caller's requested
-export bound. Global BM25 statistics and fixed transforms remain mandatory.
+export bound. Global BM25 statistics and identical formulas remain mandatory.
 No component normalizes against its own page or shard. Combined transport is
 bounded to 64 MiB, divided across concurrently decoded shard responses, and
 coordinator feature matrices are independently bounded to two million values.
@@ -168,8 +289,8 @@ union and per-branch candidate scores/ordinals without fusion; `score_export`
 additionally requests missing cross-vertical feature backfill. Raw feature-only
 collection continues to return the complete union rather than ranking it.
 
-The full per-shard nomination pools contribute to selection. A shared fixed
-linear formula and exact shard-local top-K would be mathematically sufficient
+The full per-shard nomination pools contribute to selection. A shared pointwise
+formula without RRF and exact shard-local top-K would be mathematically sufficient
 for the same global top-K; moving the formula alone is not a quality claim.
 Central ownership preserves the expanded pool for subsequent models and gives
 RRF the correct global ranks. Broker CPU, combined rows, response bytes and
@@ -299,7 +420,7 @@ explicitly. It must never silently change the source set on a retry.
 
 ## Search API and training ownership
 
-Hermes owns feature execution, validation, portable linear inference
+Hermes owns feature execution, validation, portable formula inference
 instead of RRF, and raw exports. Search API owns query intent, original quoted
 constraints, document versus passage profiles, training, model selection,
 and any additional model inference across separate query calls. MCP, website and Cybrex inherit that policy. Ordinary Telegram keeps
@@ -383,7 +504,7 @@ result = await client.search(
     },
     limit=100,
     l1={
-        "weights": {"body": 1.0, "title": 0.2},
+        "formula": "body + 0.2 * title",
         "backfill": True,  # Default; only missing cells are scored.
         "missing_values": {"body": -0.1, "title": 0.25},  # Illustrative raw defaults.
     },
@@ -393,17 +514,16 @@ result = await client.search(
 
 Omit `l1` and keep `score_export={}` to collect the complete bounded union for
 teacher labeling; set `limit` to cover all branch/shard candidates. Omitting
-`score_export` avoids raw response maps while retaining the same linear rank.
-An explicitly provided empty export object is meaningful. Omitted coefficients
-are zero. Branch names and scopes survive both Python and TypeScript wrappers,
+`score_export` avoids raw response maps while retaining the same L1 rank.
+An explicitly provided empty export object is meaningful. Missing variable defaults are zero. Branch names and scopes survive both Python and TypeScript wrappers,
 as do score zero, negative values, absent fields and the ranking-version marker.
 
 Set `backfill=False` to rank from organic scores and learned defaults only.
 TypeScript uses `backfill` and `missingValues` in `l1`. The protocol preserves
 optional-boolean presence, so omitted and explicit false remain distinct.
 
-The serving contract is `candidate_scoring_version = 2`, with response markers
-`linear_v2` and `feature_export_v2`. Broker inference uses the same model,
+The serving contract is `candidate_scoring_version = 3`, with response markers
+`formula_v1` and `feature_export_v2`. Broker inference uses the same model,
 including defaults, and rejects old or mixed ranking markers. RRF candidate
 export retains `fusion_candidates_v1`; global RRF retains `global_rrf_v1`.
 Deploy server and broker support together before activating L1; there is no

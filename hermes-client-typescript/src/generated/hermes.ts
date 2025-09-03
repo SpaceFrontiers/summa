@@ -250,50 +250,27 @@ export interface FusionQuery {
   filters: Query[];
   /**
    * Independent per-branch nomination depth (L1/export only). 0 uses
-   * candidate_limit. The complete union survives until linear ranking/export.
+   * candidate_limit. The complete union survives until L1 ranking/export.
    */
   candidateDepth: number;
 }
 
-/** Fixed preprocessing trained offline, never derived from a shard/result page. */
-export interface FeatureTransform {
-  signedLog1p: boolean;
-  /** Unset = 1; finite and positive. */
-  scale?: number | undefined;
-  offset: number;
-}
-
 /**
- * Direct linear ranking instead of RRF. Keys name FusionQuery.queries branches.
- * Omitted weights contribute zero but those branches can still nominate.
- * Unknown names, non-finite coefficients and all-zero models are errors.
+ * Fixed preprocessing trained offline, never derived from a shard/result page.
+ * The only L1 scoring contract: a compiled symbolic formula over branch scores.
  */
 export interface L1Ranking {
-  weights: { [key: string]: number };
-  bias: number;
-  transforms: { [key: string]: FeatureTransform };
-  /**
-   * Default true: evaluate only scores missing from named retrieval branches.
-   * False preserves absent scores as missing; real zero/negative scores remain.
-   */
+  /** Omitted=true: backfill only missing raw cells. False uses organic values. */
   backfill?:
     | boolean
     | undefined;
-  /**
-   * Learned raw-score defaults by branch, applied before that branch's transform.
-   * Unspecified missing values contribute nothing. Raw exports remain missing.
-   */
+  /** Raw defaults for missing formula variables; omitted variables use zero. */
   missingValues: { [key: string]: number };
-}
-
-export interface L1Ranking_WeightsEntry {
-  key: string;
-  value: number;
-}
-
-export interface L1Ranking_TransformsEntry {
-  key: string;
-  value: FeatureTransform | undefined;
+  /**
+   * Required, nonempty expression over named raw scores and reserved `rrf`.
+   * Runs before passage/document selection. Requires formula_v1.
+   */
+  formula: string;
 }
 
 export interface L1Ranking_MissingValuesEntry {
@@ -529,7 +506,7 @@ export interface SearchRequest {
   textStats:
     | TextStats
     | undefined;
-  /** Requires named, scoped fusion branches. No RRF runs before/after this model. */
+  /** Requires named, scoped fusion branches. The formula may reference the RRF feature. */
   l1:
     | L1Ranking
     | undefined;
@@ -537,7 +514,19 @@ export interface SearchRequest {
    * With no l1, exports the complete candidate union for external inference.
    * Export-only requests require offset=0 and a limit covering the whole union.
    */
-  scoreExport: ScoreExport | undefined;
+  scoreExport:
+    | ScoreExport
+    | undefined;
+  /**
+   * Return RRF diagnostics alongside the requested ranking score. Requires
+   * top-level fusion and complete nomination; does not change ranking.
+   */
+  includeRrfScores: boolean;
+  /**
+   * Preserve bounded per-shard nomination and selection traces. Default false;
+   * does not rerun subqueries or change retrieval/ranking budgets.
+   */
+  tracing: boolean;
 }
 
 export interface GetTextStatsRequest {
@@ -593,12 +582,32 @@ export interface SearchHit {
   /** Per-ordinal scores for multi-value fields */
   ordinalScores: OrdinalScore[];
   /** Present only when score_export is requested. */
-  candidateScores: CandidateScores | undefined;
+  candidateScores:
+    | CandidateScores
+    | undefined;
+  /** Present when include_rrf_scores is requested. */
+  rrfScore?: number | undefined;
+  rrfContributions: RrfContribution[];
 }
 
 export interface SearchHit_FieldsEntry {
   key: string;
   value: FieldValueList | undefined;
+}
+
+/**
+ * One organic nomination vote. Document context has no ordinal; chunk votes
+ * are combined per ordinal before the document's fusion combiner is applied.
+ */
+export interface RrfContribution {
+  queryIndex: number;
+  /** Empty for unnamed legacy branches. */
+  queryName: string;
+  /** One-based rank in the complete merged nomination list. */
+  rank: number;
+  /** Branch weight / (k + rank). */
+  score: number;
+  ordinal?: number | undefined;
 }
 
 export interface CandidateScores {
@@ -683,13 +692,46 @@ export interface SearchResponse {
    * the hits are then the best-so-far, not the exact top-k.
    */
   truncated: boolean;
-  /** Explicit feature contract: "linear_v2" or "feature_export_v2" for new modes. */
+  /** Feature contracts: "formula_v1" or "feature_export_v2". */
   rankingMethod: string;
   /**
    * Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
    * these lists preserve independent branch scores and nominated ordinals.
    */
   fusionCandidates: FusionCandidateList[];
+  /** Present only when tracing is requested. */
+  trace: SearchTrace | undefined;
+}
+
+export interface SearchTrace {
+  shards: ShardSearchTrace[];
+}
+
+export interface ShardSearchTrace {
+  /** Populated by the broker; empty on direct server calls. */
+  shardId: string;
+  backendId: string;
+  indexName: string;
+  queries: QueryTrace[];
+  /** Shard results before broker selection. */
+  selected: FusionCandidate[];
+  rankingMethod: string;
+  truncated: boolean;
+  /** Common fusion filters applied during nomination. */
+  filters: Query[];
+}
+
+export interface QueryTrace {
+  queryIndex: number;
+  queryName: string;
+  /** Original branch/root expression, including nested clauses. */
+  query: Query | undefined;
+  scope: ScoreScope;
+  scoreOnly: boolean;
+  candidateDepth: number;
+  totalSeen: number;
+  /** All organic nominations within the requested depth, before fusion/L1/L2. */
+  candidates: FusionCandidate[];
 }
 
 export interface FusionCandidateList {
@@ -713,7 +755,7 @@ export interface SearchTimings {
   loadUs: number;
   /** Wall-clock total (includes overhead) */
   totalUs: number;
-  /** Missing-only feature backfill and linear selection. */
+  /** Missing-only feature backfill and formula selection. */
   candidateScoringUs: number;
 }
 
@@ -754,7 +796,7 @@ export interface GetIndexInfoResponse {
    * without parsing the schema SDL.
    */
   textFields: TextFieldInfo[];
-  /** 2 preserves organic scores, supports optional backfill and learned missing defaults. */
+  /** 3 requires symbolic L1 formula; preserves organic scores, optional backfill and raw defaults. */
   candidateScoringVersion: number;
   /** Fields requiring lookup preparation/migration. */
   unpreparedCandidateFields: string[];
@@ -1518,123 +1560,21 @@ export const FusionQuery: MessageFns<FusionQuery> = {
   },
 };
 
-function createBaseFeatureTransform(): FeatureTransform {
-  return { signedLog1p: false, scale: undefined, offset: 0 };
-}
-
-export const FeatureTransform: MessageFns<FeatureTransform> = {
-  encode(message: FeatureTransform, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.signedLog1p !== false) {
-      writer.uint32(8).bool(message.signedLog1p);
-    }
-    if (message.scale !== undefined) {
-      writer.uint32(17).double(message.scale);
-    }
-    if (message.offset !== 0) {
-      writer.uint32(25).double(message.offset);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): FeatureTransform {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseFeatureTransform();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 8) {
-            break;
-          }
-
-          message.signedLog1p = reader.bool();
-          continue;
-        }
-        case 2: {
-          if (tag !== 17) {
-            break;
-          }
-
-          message.scale = reader.double();
-          continue;
-        }
-        case 3: {
-          if (tag !== 25) {
-            break;
-          }
-
-          message.offset = reader.double();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): FeatureTransform {
-    return {
-      signedLog1p: isSet(object.signedLog1p)
-        ? globalThis.Boolean(object.signedLog1p)
-        : isSet(object.signed_log1p)
-        ? globalThis.Boolean(object.signed_log1p)
-        : false,
-      scale: isSet(object.scale) ? globalThis.Number(object.scale) : undefined,
-      offset: isSet(object.offset) ? globalThis.Number(object.offset) : 0,
-    };
-  },
-
-  toJSON(message: FeatureTransform): unknown {
-    const obj: any = {};
-    if (message.signedLog1p !== false) {
-      obj.signedLog1p = message.signedLog1p;
-    }
-    if (message.scale !== undefined) {
-      obj.scale = message.scale;
-    }
-    if (message.offset !== 0) {
-      obj.offset = message.offset;
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<FeatureTransform>): FeatureTransform {
-    return FeatureTransform.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<FeatureTransform>): FeatureTransform {
-    const message = createBaseFeatureTransform();
-    message.signedLog1p = object.signedLog1p ?? false;
-    message.scale = object.scale ?? undefined;
-    message.offset = object.offset ?? 0;
-    return message;
-  },
-};
-
 function createBaseL1Ranking(): L1Ranking {
-  return { weights: {}, bias: 0, transforms: {}, backfill: undefined, missingValues: {} };
+  return { backfill: undefined, missingValues: {}, formula: "" };
 }
 
 export const L1Ranking: MessageFns<L1Ranking> = {
   encode(message: L1Ranking, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    globalThis.Object.entries(message.weights).forEach(([key, value]: [string, number]) => {
-      L1Ranking_WeightsEntry.encode({ key: key as any, value }, writer.uint32(10).fork()).join();
-    });
-    if (message.bias !== 0) {
-      writer.uint32(17).double(message.bias);
-    }
-    globalThis.Object.entries(message.transforms).forEach(([key, value]: [string, FeatureTransform]) => {
-      L1Ranking_TransformsEntry.encode({ key: key as any, value }, writer.uint32(26).fork()).join();
-    });
     if (message.backfill !== undefined) {
       writer.uint32(32).bool(message.backfill);
     }
     globalThis.Object.entries(message.missingValues).forEach(([key, value]: [string, number]) => {
       L1Ranking_MissingValuesEntry.encode({ key: key as any, value }, writer.uint32(42).fork()).join();
     });
+    if (message.formula !== "") {
+      writer.uint32(58).string(message.formula);
+    }
     return writer;
   },
 
@@ -1645,36 +1585,6 @@ export const L1Ranking: MessageFns<L1Ranking> = {
     while (reader.pos < end) {
       const tag = reader.uint32();
       switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          const entry1 = L1Ranking_WeightsEntry.decode(reader, reader.uint32());
-          if (entry1.value !== undefined) {
-            message.weights[entry1.key] = entry1.value;
-          }
-          continue;
-        }
-        case 2: {
-          if (tag !== 17) {
-            break;
-          }
-
-          message.bias = reader.double();
-          continue;
-        }
-        case 3: {
-          if (tag !== 26) {
-            break;
-          }
-
-          const entry3 = L1Ranking_TransformsEntry.decode(reader, reader.uint32());
-          if (entry3.value !== undefined) {
-            message.transforms[entry3.key] = entry3.value;
-          }
-          continue;
-        }
         case 4: {
           if (tag !== 32) {
             break;
@@ -1694,6 +1604,14 @@ export const L1Ranking: MessageFns<L1Ranking> = {
           }
           continue;
         }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.formula = reader.string();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1705,25 +1623,6 @@ export const L1Ranking: MessageFns<L1Ranking> = {
 
   fromJSON(object: any): L1Ranking {
     return {
-      weights: isObject(object.weights)
-        ? (globalThis.Object.entries(object.weights) as [string, any][]).reduce(
-          (acc: { [key: string]: number }, [key, value]: [string, any]) => {
-            acc[key] = globalThis.Number(value);
-            return acc;
-          },
-          {},
-        )
-        : {},
-      bias: isSet(object.bias) ? globalThis.Number(object.bias) : 0,
-      transforms: isObject(object.transforms)
-        ? (globalThis.Object.entries(object.transforms) as [string, any][]).reduce(
-          (acc: { [key: string]: FeatureTransform }, [key, value]: [string, any]) => {
-            acc[key] = FeatureTransform.fromJSON(value);
-            return acc;
-          },
-          {},
-        )
-        : {},
       backfill: isSet(object.backfill) ? globalThis.Boolean(object.backfill) : undefined,
       missingValues: isObject(object.missingValues)
         ? (globalThis.Object.entries(object.missingValues) as [string, any][]).reduce(
@@ -1742,32 +1641,12 @@ export const L1Ranking: MessageFns<L1Ranking> = {
           {},
         )
         : {},
+      formula: isSet(object.formula) ? globalThis.String(object.formula) : "",
     };
   },
 
   toJSON(message: L1Ranking): unknown {
     const obj: any = {};
-    if (message.weights) {
-      const entries = globalThis.Object.entries(message.weights) as [string, number][];
-      if (entries.length > 0) {
-        obj.weights = {};
-        entries.forEach(([k, v]) => {
-          obj.weights[k] = v;
-        });
-      }
-    }
-    if (message.bias !== 0) {
-      obj.bias = message.bias;
-    }
-    if (message.transforms) {
-      const entries = globalThis.Object.entries(message.transforms) as [string, FeatureTransform][];
-      if (entries.length > 0) {
-        obj.transforms = {};
-        entries.forEach(([k, v]) => {
-          obj.transforms[k] = FeatureTransform.toJSON(v);
-        });
-      }
-    }
     if (message.backfill !== undefined) {
       obj.backfill = message.backfill;
     }
@@ -1780,6 +1659,9 @@ export const L1Ranking: MessageFns<L1Ranking> = {
         });
       }
     }
+    if (message.formula !== "") {
+      obj.formula = message.formula;
+    }
     return obj;
   },
 
@@ -1788,25 +1670,6 @@ export const L1Ranking: MessageFns<L1Ranking> = {
   },
   fromPartial(object: DeepPartial<L1Ranking>): L1Ranking {
     const message = createBaseL1Ranking();
-    message.weights = (globalThis.Object.entries(object.weights ?? {}) as [string, number][]).reduce(
-      (acc: { [key: string]: number }, [key, value]: [string, number]) => {
-        if (value !== undefined) {
-          acc[key] = globalThis.Number(value);
-        }
-        return acc;
-      },
-      {},
-    );
-    message.bias = object.bias ?? 0;
-    message.transforms = (globalThis.Object.entries(object.transforms ?? {}) as [string, FeatureTransform][]).reduce(
-      (acc: { [key: string]: FeatureTransform }, [key, value]: [string, FeatureTransform]) => {
-        if (value !== undefined) {
-          acc[key] = FeatureTransform.fromPartial(value);
-        }
-        return acc;
-      },
-      {},
-    );
     message.backfill = object.backfill ?? undefined;
     message.missingValues = (globalThis.Object.entries(object.missingValues ?? {}) as [string, number][]).reduce(
       (acc: { [key: string]: number }, [key, value]: [string, number]) => {
@@ -1817,160 +1680,7 @@ export const L1Ranking: MessageFns<L1Ranking> = {
       },
       {},
     );
-    return message;
-  },
-};
-
-function createBaseL1Ranking_WeightsEntry(): L1Ranking_WeightsEntry {
-  return { key: "", value: 0 };
-}
-
-export const L1Ranking_WeightsEntry: MessageFns<L1Ranking_WeightsEntry> = {
-  encode(message: L1Ranking_WeightsEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.key !== "") {
-      writer.uint32(10).string(message.key);
-    }
-    if (message.value !== 0) {
-      writer.uint32(17).double(message.value);
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): L1Ranking_WeightsEntry {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseL1Ranking_WeightsEntry();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.key = reader.string();
-          continue;
-        }
-        case 2: {
-          if (tag !== 17) {
-            break;
-          }
-
-          message.value = reader.double();
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): L1Ranking_WeightsEntry {
-    return {
-      key: isSet(object.key) ? globalThis.String(object.key) : "",
-      value: isSet(object.value) ? globalThis.Number(object.value) : 0,
-    };
-  },
-
-  toJSON(message: L1Ranking_WeightsEntry): unknown {
-    const obj: any = {};
-    if (message.key !== "") {
-      obj.key = message.key;
-    }
-    if (message.value !== 0) {
-      obj.value = message.value;
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<L1Ranking_WeightsEntry>): L1Ranking_WeightsEntry {
-    return L1Ranking_WeightsEntry.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<L1Ranking_WeightsEntry>): L1Ranking_WeightsEntry {
-    const message = createBaseL1Ranking_WeightsEntry();
-    message.key = object.key ?? "";
-    message.value = object.value ?? 0;
-    return message;
-  },
-};
-
-function createBaseL1Ranking_TransformsEntry(): L1Ranking_TransformsEntry {
-  return { key: "", value: undefined };
-}
-
-export const L1Ranking_TransformsEntry: MessageFns<L1Ranking_TransformsEntry> = {
-  encode(message: L1Ranking_TransformsEntry, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
-    if (message.key !== "") {
-      writer.uint32(10).string(message.key);
-    }
-    if (message.value !== undefined) {
-      FeatureTransform.encode(message.value, writer.uint32(18).fork()).join();
-    }
-    return writer;
-  },
-
-  decode(input: BinaryReader | Uint8Array, length?: number): L1Ranking_TransformsEntry {
-    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
-    const end = length === undefined ? reader.len : reader.pos + length;
-    const message = createBaseL1Ranking_TransformsEntry();
-    while (reader.pos < end) {
-      const tag = reader.uint32();
-      switch (tag >>> 3) {
-        case 1: {
-          if (tag !== 10) {
-            break;
-          }
-
-          message.key = reader.string();
-          continue;
-        }
-        case 2: {
-          if (tag !== 18) {
-            break;
-          }
-
-          message.value = FeatureTransform.decode(reader, reader.uint32());
-          continue;
-        }
-      }
-      if ((tag & 7) === 4 || tag === 0) {
-        break;
-      }
-      reader.skip(tag & 7);
-    }
-    return message;
-  },
-
-  fromJSON(object: any): L1Ranking_TransformsEntry {
-    return {
-      key: isSet(object.key) ? globalThis.String(object.key) : "",
-      value: isSet(object.value) ? FeatureTransform.fromJSON(object.value) : undefined,
-    };
-  },
-
-  toJSON(message: L1Ranking_TransformsEntry): unknown {
-    const obj: any = {};
-    if (message.key !== "") {
-      obj.key = message.key;
-    }
-    if (message.value !== undefined) {
-      obj.value = FeatureTransform.toJSON(message.value);
-    }
-    return obj;
-  },
-
-  create(base?: DeepPartial<L1Ranking_TransformsEntry>): L1Ranking_TransformsEntry {
-    return L1Ranking_TransformsEntry.fromPartial(base ?? {});
-  },
-  fromPartial(object: DeepPartial<L1Ranking_TransformsEntry>): L1Ranking_TransformsEntry {
-    const message = createBaseL1Ranking_TransformsEntry();
-    message.key = object.key ?? "";
-    message.value = (object.value !== undefined && object.value !== null)
-      ? FeatureTransform.fromPartial(object.value)
-      : undefined;
+    message.formula = object.formula ?? "";
     return message;
   },
 };
@@ -3902,6 +3612,8 @@ function createBaseSearchRequest(): SearchRequest {
     textStats: undefined,
     l1: undefined,
     scoreExport: undefined,
+    includeRrfScores: false,
+    tracing: false,
   };
 }
 
@@ -3939,6 +3651,12 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     }
     if (message.scoreExport !== undefined) {
       ScoreExport.encode(message.scoreExport, writer.uint32(90).fork()).join();
+    }
+    if (message.includeRrfScores !== false) {
+      writer.uint32(96).bool(message.includeRrfScores);
+    }
+    if (message.tracing !== false) {
+      writer.uint32(104).bool(message.tracing);
     }
     return writer;
   },
@@ -4038,6 +3756,22 @@ export const SearchRequest: MessageFns<SearchRequest> = {
           message.scoreExport = ScoreExport.decode(reader, reader.uint32());
           continue;
         }
+        case 12: {
+          if (tag !== 96) {
+            break;
+          }
+
+          message.includeRrfScores = reader.bool();
+          continue;
+        }
+        case 13: {
+          if (tag !== 104) {
+            break;
+          }
+
+          message.tracing = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4084,6 +3818,12 @@ export const SearchRequest: MessageFns<SearchRequest> = {
         : isSet(object.score_export)
         ? ScoreExport.fromJSON(object.score_export)
         : undefined,
+      includeRrfScores: isSet(object.includeRrfScores)
+        ? globalThis.Boolean(object.includeRrfScores)
+        : isSet(object.include_rrf_scores)
+        ? globalThis.Boolean(object.include_rrf_scores)
+        : false,
+      tracing: isSet(object.tracing) ? globalThis.Boolean(object.tracing) : false,
     };
   },
 
@@ -4122,6 +3862,12 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     if (message.scoreExport !== undefined) {
       obj.scoreExport = ScoreExport.toJSON(message.scoreExport);
     }
+    if (message.includeRrfScores !== false) {
+      obj.includeRrfScores = message.includeRrfScores;
+    }
+    if (message.tracing !== false) {
+      obj.tracing = message.tracing;
+    }
     return obj;
   },
 
@@ -4147,6 +3893,8 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     message.scoreExport = (object.scoreExport !== undefined && object.scoreExport !== null)
       ? ScoreExport.fromPartial(object.scoreExport)
       : undefined;
+    message.includeRrfScores = object.includeRrfScores ?? false;
+    message.tracing = object.tracing ?? false;
     return message;
   },
 };
@@ -4652,7 +4400,15 @@ export const DocAddress: MessageFns<DocAddress> = {
 };
 
 function createBaseSearchHit(): SearchHit {
-  return { address: undefined, score: 0, fields: {}, ordinalScores: [], candidateScores: undefined };
+  return {
+    address: undefined,
+    score: 0,
+    fields: {},
+    ordinalScores: [],
+    candidateScores: undefined,
+    rrfScore: undefined,
+    rrfContributions: [],
+  };
 }
 
 export const SearchHit: MessageFns<SearchHit> = {
@@ -4671,6 +4427,12 @@ export const SearchHit: MessageFns<SearchHit> = {
     }
     if (message.candidateScores !== undefined) {
       CandidateScores.encode(message.candidateScores, writer.uint32(42).fork()).join();
+    }
+    if (message.rrfScore !== undefined) {
+      writer.uint32(53).float(message.rrfScore);
+    }
+    for (const v of message.rrfContributions) {
+      RrfContribution.encode(v!, writer.uint32(58).fork()).join();
     }
     return writer;
   },
@@ -4725,6 +4487,22 @@ export const SearchHit: MessageFns<SearchHit> = {
           message.candidateScores = CandidateScores.decode(reader, reader.uint32());
           continue;
         }
+        case 6: {
+          if (tag !== 53) {
+            break;
+          }
+
+          message.rrfScore = reader.float();
+          continue;
+        }
+        case 7: {
+          if (tag !== 58) {
+            break;
+          }
+
+          message.rrfContributions.push(RrfContribution.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4757,6 +4535,16 @@ export const SearchHit: MessageFns<SearchHit> = {
         : isSet(object.candidate_scores)
         ? CandidateScores.fromJSON(object.candidate_scores)
         : undefined,
+      rrfScore: isSet(object.rrfScore)
+        ? globalThis.Number(object.rrfScore)
+        : isSet(object.rrf_score)
+        ? globalThis.Number(object.rrf_score)
+        : undefined,
+      rrfContributions: globalThis.Array.isArray(object?.rrfContributions)
+        ? object.rrfContributions.map((e: any) => RrfContribution.fromJSON(e))
+        : globalThis.Array.isArray(object?.rrf_contributions)
+        ? object.rrf_contributions.map((e: any) => RrfContribution.fromJSON(e))
+        : [],
     };
   },
 
@@ -4783,6 +4571,12 @@ export const SearchHit: MessageFns<SearchHit> = {
     if (message.candidateScores !== undefined) {
       obj.candidateScores = CandidateScores.toJSON(message.candidateScores);
     }
+    if (message.rrfScore !== undefined) {
+      obj.rrfScore = message.rrfScore;
+    }
+    if (message.rrfContributions?.length) {
+      obj.rrfContributions = message.rrfContributions.map((e) => RrfContribution.toJSON(e));
+    }
     return obj;
   },
 
@@ -4808,6 +4602,8 @@ export const SearchHit: MessageFns<SearchHit> = {
     message.candidateScores = (object.candidateScores !== undefined && object.candidateScores !== null)
       ? CandidateScores.fromPartial(object.candidateScores)
       : undefined;
+    message.rrfScore = object.rrfScore ?? undefined;
+    message.rrfContributions = object.rrfContributions?.map((e) => RrfContribution.fromPartial(e)) || [];
     return message;
   },
 };
@@ -4886,6 +4682,138 @@ export const SearchHit_FieldsEntry: MessageFns<SearchHit_FieldsEntry> = {
     message.value = (object.value !== undefined && object.value !== null)
       ? FieldValueList.fromPartial(object.value)
       : undefined;
+    return message;
+  },
+};
+
+function createBaseRrfContribution(): RrfContribution {
+  return { queryIndex: 0, queryName: "", rank: 0, score: 0, ordinal: undefined };
+}
+
+export const RrfContribution: MessageFns<RrfContribution> = {
+  encode(message: RrfContribution, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.queryIndex !== 0) {
+      writer.uint32(8).uint32(message.queryIndex);
+    }
+    if (message.queryName !== "") {
+      writer.uint32(18).string(message.queryName);
+    }
+    if (message.rank !== 0) {
+      writer.uint32(24).uint32(message.rank);
+    }
+    if (message.score !== 0) {
+      writer.uint32(37).float(message.score);
+    }
+    if (message.ordinal !== undefined) {
+      writer.uint32(40).uint32(message.ordinal);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): RrfContribution {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseRrfContribution();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.queryIndex = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.queryName = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.rank = reader.uint32();
+          continue;
+        }
+        case 4: {
+          if (tag !== 37) {
+            break;
+          }
+
+          message.score = reader.float();
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.ordinal = reader.uint32();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): RrfContribution {
+    return {
+      queryIndex: isSet(object.queryIndex)
+        ? globalThis.Number(object.queryIndex)
+        : isSet(object.query_index)
+        ? globalThis.Number(object.query_index)
+        : 0,
+      queryName: isSet(object.queryName)
+        ? globalThis.String(object.queryName)
+        : isSet(object.query_name)
+        ? globalThis.String(object.query_name)
+        : "",
+      rank: isSet(object.rank) ? globalThis.Number(object.rank) : 0,
+      score: isSet(object.score) ? globalThis.Number(object.score) : 0,
+      ordinal: isSet(object.ordinal) ? globalThis.Number(object.ordinal) : undefined,
+    };
+  },
+
+  toJSON(message: RrfContribution): unknown {
+    const obj: any = {};
+    if (message.queryIndex !== 0) {
+      obj.queryIndex = Math.round(message.queryIndex);
+    }
+    if (message.queryName !== "") {
+      obj.queryName = message.queryName;
+    }
+    if (message.rank !== 0) {
+      obj.rank = Math.round(message.rank);
+    }
+    if (message.score !== 0) {
+      obj.score = message.score;
+    }
+    if (message.ordinal !== undefined) {
+      obj.ordinal = Math.round(message.ordinal);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<RrfContribution>): RrfContribution {
+    return RrfContribution.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<RrfContribution>): RrfContribution {
+    const message = createBaseRrfContribution();
+    message.queryIndex = object.queryIndex ?? 0;
+    message.queryName = object.queryName ?? "";
+    message.rank = object.rank ?? 0;
+    message.score = object.score ?? 0;
+    message.ordinal = object.ordinal ?? undefined;
     return message;
   },
 };
@@ -5825,6 +5753,7 @@ function createBaseSearchResponse(): SearchResponse {
     truncated: false,
     rankingMethod: "",
     fusionCandidates: [],
+    trace: undefined,
   };
 }
 
@@ -5850,6 +5779,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     }
     for (const v of message.fusionCandidates) {
       FusionCandidateList.encode(v!, writer.uint32(58).fork()).join();
+    }
+    if (message.trace !== undefined) {
+      SearchTrace.encode(message.trace, writer.uint32(66).fork()).join();
     }
     return writer;
   },
@@ -5917,6 +5849,14 @@ export const SearchResponse: MessageFns<SearchResponse> = {
           message.fusionCandidates.push(FusionCandidateList.decode(reader, reader.uint32()));
           continue;
         }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.trace = SearchTrace.decode(reader, reader.uint32());
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5951,6 +5891,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
         : globalThis.Array.isArray(object?.fusion_candidates)
         ? object.fusion_candidates.map((e: any) => FusionCandidateList.fromJSON(e))
         : [],
+      trace: isSet(object.trace) ? SearchTrace.fromJSON(object.trace) : undefined,
     };
   },
 
@@ -5977,6 +5918,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     if (message.fusionCandidates?.length) {
       obj.fusionCandidates = message.fusionCandidates.map((e) => FusionCandidateList.toJSON(e));
     }
+    if (message.trace !== undefined) {
+      obj.trace = SearchTrace.toJSON(message.trace);
+    }
     return obj;
   },
 
@@ -5994,6 +5938,475 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     message.truncated = object.truncated ?? false;
     message.rankingMethod = object.rankingMethod ?? "";
     message.fusionCandidates = object.fusionCandidates?.map((e) => FusionCandidateList.fromPartial(e)) || [];
+    message.trace = (object.trace !== undefined && object.trace !== null)
+      ? SearchTrace.fromPartial(object.trace)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseSearchTrace(): SearchTrace {
+  return { shards: [] };
+}
+
+export const SearchTrace: MessageFns<SearchTrace> = {
+  encode(message: SearchTrace, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.shards) {
+      ShardSearchTrace.encode(v!, writer.uint32(10).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): SearchTrace {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseSearchTrace();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.shards.push(ShardSearchTrace.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): SearchTrace {
+    return {
+      shards: globalThis.Array.isArray(object?.shards)
+        ? object.shards.map((e: any) => ShardSearchTrace.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: SearchTrace): unknown {
+    const obj: any = {};
+    if (message.shards?.length) {
+      obj.shards = message.shards.map((e) => ShardSearchTrace.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<SearchTrace>): SearchTrace {
+    return SearchTrace.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<SearchTrace>): SearchTrace {
+    const message = createBaseSearchTrace();
+    message.shards = object.shards?.map((e) => ShardSearchTrace.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseShardSearchTrace(): ShardSearchTrace {
+  return {
+    shardId: "",
+    backendId: "",
+    indexName: "",
+    queries: [],
+    selected: [],
+    rankingMethod: "",
+    truncated: false,
+    filters: [],
+  };
+}
+
+export const ShardSearchTrace: MessageFns<ShardSearchTrace> = {
+  encode(message: ShardSearchTrace, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.shardId !== "") {
+      writer.uint32(10).string(message.shardId);
+    }
+    if (message.backendId !== "") {
+      writer.uint32(18).string(message.backendId);
+    }
+    if (message.indexName !== "") {
+      writer.uint32(26).string(message.indexName);
+    }
+    for (const v of message.queries) {
+      QueryTrace.encode(v!, writer.uint32(34).fork()).join();
+    }
+    for (const v of message.selected) {
+      FusionCandidate.encode(v!, writer.uint32(42).fork()).join();
+    }
+    if (message.rankingMethod !== "") {
+      writer.uint32(50).string(message.rankingMethod);
+    }
+    if (message.truncated !== false) {
+      writer.uint32(56).bool(message.truncated);
+    }
+    for (const v of message.filters) {
+      Query.encode(v!, writer.uint32(66).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): ShardSearchTrace {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseShardSearchTrace();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.shardId = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.backendId = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.indexName = reader.string();
+          continue;
+        }
+        case 4: {
+          if (tag !== 34) {
+            break;
+          }
+
+          message.queries.push(QueryTrace.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 5: {
+          if (tag !== 42) {
+            break;
+          }
+
+          message.selected.push(FusionCandidate.decode(reader, reader.uint32()));
+          continue;
+        }
+        case 6: {
+          if (tag !== 50) {
+            break;
+          }
+
+          message.rankingMethod = reader.string();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.truncated = reader.bool();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.filters.push(Query.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): ShardSearchTrace {
+    return {
+      shardId: isSet(object.shardId)
+        ? globalThis.String(object.shardId)
+        : isSet(object.shard_id)
+        ? globalThis.String(object.shard_id)
+        : "",
+      backendId: isSet(object.backendId)
+        ? globalThis.String(object.backendId)
+        : isSet(object.backend_id)
+        ? globalThis.String(object.backend_id)
+        : "",
+      indexName: isSet(object.indexName)
+        ? globalThis.String(object.indexName)
+        : isSet(object.index_name)
+        ? globalThis.String(object.index_name)
+        : "",
+      queries: globalThis.Array.isArray(object?.queries) ? object.queries.map((e: any) => QueryTrace.fromJSON(e)) : [],
+      selected: globalThis.Array.isArray(object?.selected)
+        ? object.selected.map((e: any) => FusionCandidate.fromJSON(e))
+        : [],
+      rankingMethod: isSet(object.rankingMethod)
+        ? globalThis.String(object.rankingMethod)
+        : isSet(object.ranking_method)
+        ? globalThis.String(object.ranking_method)
+        : "",
+      truncated: isSet(object.truncated) ? globalThis.Boolean(object.truncated) : false,
+      filters: globalThis.Array.isArray(object?.filters)
+        ? object.filters.map((e: any) => Query.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: ShardSearchTrace): unknown {
+    const obj: any = {};
+    if (message.shardId !== "") {
+      obj.shardId = message.shardId;
+    }
+    if (message.backendId !== "") {
+      obj.backendId = message.backendId;
+    }
+    if (message.indexName !== "") {
+      obj.indexName = message.indexName;
+    }
+    if (message.queries?.length) {
+      obj.queries = message.queries.map((e) => QueryTrace.toJSON(e));
+    }
+    if (message.selected?.length) {
+      obj.selected = message.selected.map((e) => FusionCandidate.toJSON(e));
+    }
+    if (message.rankingMethod !== "") {
+      obj.rankingMethod = message.rankingMethod;
+    }
+    if (message.truncated !== false) {
+      obj.truncated = message.truncated;
+    }
+    if (message.filters?.length) {
+      obj.filters = message.filters.map((e) => Query.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<ShardSearchTrace>): ShardSearchTrace {
+    return ShardSearchTrace.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<ShardSearchTrace>): ShardSearchTrace {
+    const message = createBaseShardSearchTrace();
+    message.shardId = object.shardId ?? "";
+    message.backendId = object.backendId ?? "";
+    message.indexName = object.indexName ?? "";
+    message.queries = object.queries?.map((e) => QueryTrace.fromPartial(e)) || [];
+    message.selected = object.selected?.map((e) => FusionCandidate.fromPartial(e)) || [];
+    message.rankingMethod = object.rankingMethod ?? "";
+    message.truncated = object.truncated ?? false;
+    message.filters = object.filters?.map((e) => Query.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseQueryTrace(): QueryTrace {
+  return {
+    queryIndex: 0,
+    queryName: "",
+    query: undefined,
+    scope: 0,
+    scoreOnly: false,
+    candidateDepth: 0,
+    totalSeen: 0,
+    candidates: [],
+  };
+}
+
+export const QueryTrace: MessageFns<QueryTrace> = {
+  encode(message: QueryTrace, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.queryIndex !== 0) {
+      writer.uint32(8).uint32(message.queryIndex);
+    }
+    if (message.queryName !== "") {
+      writer.uint32(18).string(message.queryName);
+    }
+    if (message.query !== undefined) {
+      Query.encode(message.query, writer.uint32(26).fork()).join();
+    }
+    if (message.scope !== 0) {
+      writer.uint32(32).int32(message.scope);
+    }
+    if (message.scoreOnly !== false) {
+      writer.uint32(40).bool(message.scoreOnly);
+    }
+    if (message.candidateDepth !== 0) {
+      writer.uint32(48).uint32(message.candidateDepth);
+    }
+    if (message.totalSeen !== 0) {
+      writer.uint32(56).uint32(message.totalSeen);
+    }
+    for (const v of message.candidates) {
+      FusionCandidate.encode(v!, writer.uint32(66).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): QueryTrace {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseQueryTrace();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.queryIndex = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.queryName = reader.string();
+          continue;
+        }
+        case 3: {
+          if (tag !== 26) {
+            break;
+          }
+
+          message.query = Query.decode(reader, reader.uint32());
+          continue;
+        }
+        case 4: {
+          if (tag !== 32) {
+            break;
+          }
+
+          message.scope = reader.int32() as any;
+          continue;
+        }
+        case 5: {
+          if (tag !== 40) {
+            break;
+          }
+
+          message.scoreOnly = reader.bool();
+          continue;
+        }
+        case 6: {
+          if (tag !== 48) {
+            break;
+          }
+
+          message.candidateDepth = reader.uint32();
+          continue;
+        }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.totalSeen = reader.uint32();
+          continue;
+        }
+        case 8: {
+          if (tag !== 66) {
+            break;
+          }
+
+          message.candidates.push(FusionCandidate.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): QueryTrace {
+    return {
+      queryIndex: isSet(object.queryIndex)
+        ? globalThis.Number(object.queryIndex)
+        : isSet(object.query_index)
+        ? globalThis.Number(object.query_index)
+        : 0,
+      queryName: isSet(object.queryName)
+        ? globalThis.String(object.queryName)
+        : isSet(object.query_name)
+        ? globalThis.String(object.query_name)
+        : "",
+      query: isSet(object.query) ? Query.fromJSON(object.query) : undefined,
+      scope: isSet(object.scope) ? scoreScopeFromJSON(object.scope) : 0,
+      scoreOnly: isSet(object.scoreOnly)
+        ? globalThis.Boolean(object.scoreOnly)
+        : isSet(object.score_only)
+        ? globalThis.Boolean(object.score_only)
+        : false,
+      candidateDepth: isSet(object.candidateDepth)
+        ? globalThis.Number(object.candidateDepth)
+        : isSet(object.candidate_depth)
+        ? globalThis.Number(object.candidate_depth)
+        : 0,
+      totalSeen: isSet(object.totalSeen)
+        ? globalThis.Number(object.totalSeen)
+        : isSet(object.total_seen)
+        ? globalThis.Number(object.total_seen)
+        : 0,
+      candidates: globalThis.Array.isArray(object?.candidates)
+        ? object.candidates.map((e: any) => FusionCandidate.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: QueryTrace): unknown {
+    const obj: any = {};
+    if (message.queryIndex !== 0) {
+      obj.queryIndex = Math.round(message.queryIndex);
+    }
+    if (message.queryName !== "") {
+      obj.queryName = message.queryName;
+    }
+    if (message.query !== undefined) {
+      obj.query = Query.toJSON(message.query);
+    }
+    if (message.scope !== 0) {
+      obj.scope = scoreScopeToJSON(message.scope);
+    }
+    if (message.scoreOnly !== false) {
+      obj.scoreOnly = message.scoreOnly;
+    }
+    if (message.candidateDepth !== 0) {
+      obj.candidateDepth = Math.round(message.candidateDepth);
+    }
+    if (message.totalSeen !== 0) {
+      obj.totalSeen = Math.round(message.totalSeen);
+    }
+    if (message.candidates?.length) {
+      obj.candidates = message.candidates.map((e) => FusionCandidate.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<QueryTrace>): QueryTrace {
+    return QueryTrace.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<QueryTrace>): QueryTrace {
+    const message = createBaseQueryTrace();
+    message.queryIndex = object.queryIndex ?? 0;
+    message.queryName = object.queryName ?? "";
+    message.query = (object.query !== undefined && object.query !== null) ? Query.fromPartial(object.query) : undefined;
+    message.scope = object.scope ?? 0;
+    message.scoreOnly = object.scoreOnly ?? false;
+    message.candidateDepth = object.candidateDepth ?? 0;
+    message.totalSeen = object.totalSeen ?? 0;
+    message.candidates = object.candidates?.map((e) => FusionCandidate.fromPartial(e)) || [];
     return message;
   },
 };

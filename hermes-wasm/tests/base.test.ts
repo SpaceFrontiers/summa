@@ -95,3 +95,42 @@ test.each([0, 1])("Sparse query language inherits schema LSP gamma %i", async (g
 	expect(results.hits).toHaveLength(gamma === 0 ? 9 : 1);
 	expect(results.hits[0].address.doc_id).toBe(8);
 });
+
+
+test("Tracing preserves branch candidates before pagination and RRF attribution preserves ranking", async () => {
+    await init();
+    const index = await LocalIndex.create(`index traces {
+        field title: text [indexed, stored]
+        field body: text [indexed, stored]
+    }`);
+    await index.addDocuments([
+        { title: "rust", body: "rust" },
+        { title: "rust rust", body: "other rust" },
+    ]);
+    await index.commit();
+    const query = { fusion: { queries: [
+        { name: "title", query: { term: { field: "title", value: "rust" } }, weight: 0.7 },
+        { name: "body", query: { match: { field: "body", text: "rust" } }, weight: 2 },
+    ], rrfK: 42, fetchLimit: 2 } };
+    const plain = await index.searchStructured({ query, limit: 1 });
+    expect(plain.trace).toBeUndefined();
+    expect(plain.hits[0].rrf_score).toBeUndefined();
+    const traced = await index.searchStructured({ query, limit: 1, includeRrfScores: true, tracing: true });
+    const { rrf_score, rrf_contributions, ...hit } = traced.hits[0];
+    expect(hit).toEqual(plain.hits[0]);
+    expect(rrf_score).toBe(traced.hits[0].score);
+    expect(rrf_contributions.map((vote: any) => vote.query_name)).toEqual(["title", "body"]);
+    expect(traced.trace.shards[0].queries.map((q: any) => q.candidates.length)).toEqual([2, 2]);
+    expect(traced.trace.shards[0].selected).toHaveLength(1);
+    expect(traced.trace.shards[0].queries[0].query.term.field).toBe("title");
+    const page = await index.searchStructured({ query, limit: 1, offset: 1, includeRrfScores: true, tracing: true });
+    expect(page.hits[0].address).not.toEqual(traced.hits[0].address);
+    expect(page.trace.shards[0].queries).toEqual(traced.trace.shards[0].queries);
+    expect(page.hits[0].rrf_contributions.some((vote: any) => vote.rank === 2)).toBe(true);
+    const rootQuery = { boolean: { must: [{ term: { field: "title", value: "rust" } }] } };
+    const root = await index.searchStructured({ query: rootQuery, limit: 1, offset: 1, tracing: true });
+    expect(root.trace.shards[0].queries[0].candidates).toHaveLength(2);
+    expect(root.trace.shards[0].queries[0].query.boolean.must[0].term.field).toBe("title");
+    expect(root.hits).toEqual((await index.searchStructured({ query: rootQuery, limit: 1, offset: 1 })).hits);
+    await expect(index.searchStructured({ query: rootQuery, includeRrfScores: true })).rejects.toContain("requires fusion");
+});

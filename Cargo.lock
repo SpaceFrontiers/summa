@@ -2658,6 +2658,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "exmex"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9a53dccfc387af263e69c1eb53d13a4e9b26a7134ffdd38398a208374cbf851"
+dependencies = [
+ "regex",
+ "smallvec",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3367,6 +3377,7 @@ dependencies = [
  "base64 0.22.1",
  "bincode",
  "byteorder",
+ "exmex",
  "fst",
  "futures",
  "getrandom 0.3.4",

@@ -253,3 +253,56 @@ uv run --group dev python generate_proto.py
 ## License
 
 MIT
+
+## Ranking diagnostics and recall traces
+
+Both options default to false and preserve the requested ranking:
+
+```python
+response = await client.search(
+    "articles",
+    query={"fusion": {"queries": [
+        {"name": "title", "query": {"match": {"field": "title", "text": "rust"}}},
+        {"name": "body", "query": {"match": {"field": "body", "text": "rust"}}},
+    ]}},
+    include_rrf_scores=True,
+    tracing=True,
+)
+for hit in response.hits:
+    print(hit.score, hit.rrf_score, hit.rrf_contributions)
+for shard in response.trace.shards:
+    for branch in shard.queries:
+        print(shard.shard_id, branch.query_name, branch.candidates)
+```
+
+`rrf_score` and per-branch votes use organic nomination ranks merged across all
+shards, independently of L1 or reranker scores. Ranks start at 1. `ordinal=None`
+is document context; ordinal 0 is a real passage. Backfilled and score-only
+features contribute no votes.
+
+The trace retains every shard's bounded branch nominations and selected results,
+including candidates absent from the final page, plus query trees and common
+filters. Candidates contain addresses, raw scores and ordinals; stored fields
+are loaded only for returned hits. Tracing does not expand retrieval depth or
+rerun individual Boolean clauses. Oversized diagnostics and unsupported backends
+fail explicitly. See the [scoring and tracing contract](../docs/candidate-rescoring.md).
+
+For a named, scoped L1 query, specify the complete scoring formula:
+
+```python
+l1={"formula": "0.2 * title + 0.8 * log1p(body) + 3 * rrf"}
+```
+
+`formula` is the only L1 scoring interface. Coefficients, offsets and RRF
+multipliers go in the expression; the former coefficient fields are removed.
+Arithmetic, powers, logarithms, `sqrt`, `abs`, `exp`, `min`/`max` and trigonometry
+are supported. Use `{body.bm25}` for punctuated branch names. `log` and `ln` are
+natural logarithms; `log2` and `log10` select those bases. Missing branch values
+use configured missing defaults, otherwise zero. Backfill remains optional.
+
+The formula runs before passage selection and the document combiner. A formula
+using `rrf` makes the broker obtain the complete bounded candidate and passage
+union before global inference. Exports that exceed budgets fail explicitly.
+Expressions are bounded to 4 KiB, 256 tokens and 32 parenthesis levels. Invalid
+variables, invalid syntax and non-finite predictions fail explicitly. Servers
+and brokers must support `formula_v1` (`candidate_scoring_version=3`).

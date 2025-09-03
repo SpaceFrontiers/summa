@@ -271,6 +271,9 @@ export class HermesClient {
     request: SearchRequest,
     timeoutMs?: number,
   ): Promise<SearchResponse> {
+    if (request.l1 && Object.keys(request.l1).some(key => !["formula", "backfill", "missingValues"].includes(key))) {
+      throw new Error("L1 accepts only formula, backfill and missingValues; put coefficients in formula");
+    }
     this.ensureConnected();
     const response = await this.searchClient!.search(
       {
@@ -285,10 +288,10 @@ export class HermesClient {
         candidateLimit: request.candidateLimit ?? 0,
         timeBudgetMs: request.timeBudgetMs ?? 0,
         textStats: undefined,
+        includeRrfScores: request.includeRrfScores ?? false,
+        tracing: request.tracing ?? false,
         l1: request.l1 ? {
-          weights: request.l1.weights,
-          bias: request.l1.bias ?? 0,
-          transforms: request.l1.transforms ?? {},
+          formula: request.l1.formula,
           backfill: request.l1.backfill,
           missingValues: request.l1.missingValues ?? {},
         } : undefined,
@@ -297,10 +300,17 @@ export class HermesClient {
       this.callOptions(timeoutMs),
     );
 
-    if (request.l1 && response.rankingMethod !== "linear_v2") {
-      throw new Error(`L1 requires a backend with linear_v2 ranking semantics; received ${JSON.stringify(response.rankingMethod)}`);
+    const expectedL1 = "formula_v1";
+    if (request.l1 && response.rankingMethod !== expectedL1) {
+      throw new Error(`L1 requires a backend with ${expectedL1} ranking semantics; received ${JSON.stringify(response.rankingMethod)}`);
     }
 
+    if (request.tracing && !response.trace) {
+      throw new Error("Backend omitted requested search trace; upgrade Hermes");
+    }
+    if (request.includeRrfScores && response.hits.some((hit) => hit.rrfScore === undefined)) {
+      throw new Error("Backend omitted requested RRF diagnostics; upgrade Hermes");
+    }
     const hits: SearchHit[] = response.hits.map((hit) => ({
       address: {
         segmentId: hit.address?.segmentId ?? "",
@@ -308,6 +318,8 @@ export class HermesClient {
       },
       score: hit.score,
       candidateScores: hit.candidateScores,
+      rrfScore: hit.rrfScore,
+      rrfContributions: hit.rrfContributions,
       fields: Object.fromEntries(
         Object.entries(hit.fields).map(([name, value]) => [
           name,
@@ -333,6 +345,7 @@ export class HermesClient {
     return {
       hits,
       totalHits: response.totalHits,
+      trace: response.trace,
       rankingMethod: response.rankingMethod,
       fusionCandidates: response.fusionCandidates.map(branch => ({ queryIndex: branch.queryIndex,
         candidates: branch.candidates.map(hit => ({ address: { segmentId: hit.address?.segmentId ?? "", docId: hit.address?.docId ?? 0 },

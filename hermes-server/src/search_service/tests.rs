@@ -614,7 +614,7 @@ fn named_l1_request() -> SearchRequest {
             })),
         }),
         l1: Some(L1Ranking {
-            weights: HashMap::from([("body".into(), 1.0)]),
+            formula: "body".into(),
             ..Default::default()
         }),
         score_export: Some(ScoreExport::default()),
@@ -624,7 +624,7 @@ fn named_l1_request() -> SearchRequest {
 }
 
 #[tokio::test]
-async fn l1_invalid_branch_weights_fail_before_opening_index_or_acquiring_capacity() {
+async fn l1_invalid_formula_fails_before_opening_index_or_acquiring_capacity() {
     let temp = tempfile::tempdir().unwrap();
     let service = SearchServiceImpl::new(
         Arc::new(IndexRegistry::new(temp.path().into(), Default::default())),
@@ -633,15 +633,19 @@ async fn l1_invalid_branch_weights_fail_before_opening_index_or_acquiring_capaci
     );
     let _permit = try_acquire_search_permit(&service.search_permits).unwrap();
     let mut request = named_l1_request();
-    request
-        .l1
-        .as_mut()
-        .unwrap()
-        .weights
-        .insert("missing_branch".into(), 0.2);
-    let error = service.search(Request::new(request)).await.unwrap_err();
-    assert_eq!(error.code(), Code::InvalidArgument);
-    assert!(error.message().contains("unknown query branch"));
+    for formula in [
+        "body + 0.2 * missing_branch".to_owned(),
+        String::new(),
+        "1/0".to_owned(),
+        format!("{}body{}", "(".repeat(33), ")".repeat(33)),
+    ] {
+        request.l1.as_mut().unwrap().formula = formula;
+        let error = service
+            .search(Request::new(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
 }
 
 #[test]
@@ -658,18 +662,14 @@ fn l1_disabled_backfill_rejects_all_passages_before_admission() {
 }
 
 #[test]
-fn l1_missing_coefficients_are_zero_but_ambiguous_branches_and_rank_fusion_options_fail() {
+fn l1_requires_a_formula_and_rejects_ambiguous_branches_and_rank_fusion_options() {
     let request = named_l1_request();
     validate_search_budget(&request, &limits()).unwrap();
     let mut bad = request.clone();
-    bad.l1.as_mut().unwrap().weights.clear();
+    bad.l1.as_mut().unwrap().formula.clear();
     assert!(validate_search_budget(&bad, &limits()).is_err());
     let mut bad = request.clone();
-    bad.l1
-        .as_mut()
-        .unwrap()
-        .weights
-        .insert("body".into(), f64::NAN);
+    bad.l1.as_mut().unwrap().formula = "sqrt(-1)".into();
     assert!(validate_search_budget(&bad, &limits()).is_err());
     let mut bad = request.clone();
     let Some(query::Query::Fusion(fusion)) = bad.query.as_mut().unwrap().query.as_mut() else {
@@ -717,13 +717,13 @@ fn l1_keeps_existing_fusion_combiners_and_rejects_unknown_values() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases() {
+async fn l1_service_fixture() -> (tempfile::TempDir, Arc<IndexRegistry>, SearchServiceImpl) {
     let temp = tempfile::tempdir().unwrap();
     let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));
     let mut schema = hermes_core::Schema::builder();
     let title = schema.add_text_field_with_tokenizer("title", true, true, "simple");
     let body = schema.add_text_field_with_tokenizer("body", true, false, "simple");
+    let rerank = schema.add_dense_vector_field("rerank", 2, true, false);
     schema.set_chunked(body, true);
     schema.set_positions(body, hermes_core::dsl::PositionMode::TokenPosition);
     registry
@@ -744,6 +744,14 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
             let mut document = hermes_core::Document::new();
             document.add_text(title, heading);
             document.add_text(body, text);
+            document.add_dense_vector(
+                rerank,
+                if heading.contains("candidate candidate") {
+                    vec![1.0, 0.0]
+                } else {
+                    vec![0.0, 1.0]
+                },
+            );
             writer.add_document(document).unwrap();
         }
         writer.commit().await.unwrap();
@@ -751,12 +759,18 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
     let index = registry.get_or_open_index("l1-test").await.unwrap();
     index.reader().await.unwrap().reload().await.unwrap();
     let service = SearchServiceImpl::new(registry.clone(), 1, limits());
+    (temp, registry, service)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases() {
+    let (_temp, registry, service) = l1_service_fixture().await;
     let ranked = service
         .search(Request::new(named_l1_request()))
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(ranked.ranking_method, "linear_v2");
+    assert_eq!(ranked.ranking_method, "formula_v1");
     assert_eq!(ranked.hits.len(), 1);
     assert_eq!(
         ranked.hits[0].address.as_ref().unwrap().doc_id,
@@ -808,7 +822,7 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(info.candidate_scoring_version, 2);
+    assert_eq!(info.candidate_scoring_version, 3);
     assert!(info.unprepared_candidate_fields.is_empty());
     registry.shutdown().await.unwrap();
 }
@@ -851,7 +865,7 @@ async fn fusion_exclusion_only_filters_remove_self_before_candidate_selection() 
             ] {
                 let mut request = named_l1_request();
                 request.fields_to_load = vec!["id".into()];
-                request.l1.as_mut().unwrap().weights = HashMap::from([("title".into(), 1.0)]);
+                request.l1.as_mut().unwrap().formula = "title".into();
                 if mode != "linear" {
                     request.l1 = None;
                 }
@@ -916,4 +930,290 @@ async fn fusion_exclusion_only_filters_remove_self_before_candidate_selection() 
             }
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rrf_diagnostics_preserve_linear_scores_and_exclude_backfilled_votes() {
+    let (_temp, registry, service) = l1_service_fixture().await;
+    let plain = service
+        .search(Request::new(named_l1_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(plain.hits[0].rrf_score.is_none());
+    assert!(plain.hits[0].rrf_contributions.is_empty());
+    let mut request = named_l1_request();
+    request.include_rrf_scores = true;
+    let explained = service
+        .search(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    let hit = &explained.hits[0];
+    assert_eq!(hit.address, plain.hits[0].address);
+    assert_eq!(hit.score.to_bits(), plain.hits[0].score.to_bits());
+    assert_eq!(hit.candidate_scores, plain.hits[0].candidate_scores);
+    assert_eq!(hit.rrf_score, Some(1.0 / 61.0));
+    assert_eq!(hit.rrf_contributions.len(), 1);
+    let vote = &hit.rrf_contributions[0];
+    assert_eq!(
+        (
+            vote.query_index,
+            vote.query_name.as_str(),
+            vote.ordinal,
+            vote.rank
+        ),
+        (1, "body", Some(0), 1)
+    );
+    assert_eq!(vote.score, 1.0 / 61.0);
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracing_keeps_l1_discarded_candidates_and_query_provenance() {
+    let (_temp, registry, service) = l1_service_fixture().await;
+    let plain = service
+        .search(Request::new(named_l1_request()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(plain.trace.is_none());
+    let mut request = named_l1_request();
+    request.tracing = true;
+    let traced = service
+        .search(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(traced.hits, plain.hits);
+    let trace = traced.trace.unwrap();
+    assert_eq!(trace.shards.len(), 1);
+    let shard = &trace.shards[0];
+    assert_eq!(shard.index_name, "l1-test");
+    assert_eq!(shard.queries.len(), 2);
+    let Some(query::Query::Fusion(fusion)) = request.query.as_ref().unwrap().query.as_ref() else {
+        unreachable!()
+    };
+    assert_eq!(shard.filters, fusion.filters);
+    for (i, branch) in shard.queries.iter().enumerate() {
+        assert_eq!(branch.query, fusion.queries[i].query);
+        assert_eq!(branch.candidate_depth, 1);
+        assert_eq!(branch.candidates.len(), 1);
+        assert_eq!(
+            branch.candidates[0].address.as_ref().unwrap().doc_id,
+            i as u32
+        );
+    }
+    assert_eq!(shard.selected.len(), 1);
+    assert_eq!(shard.selected[0].address, plain.hits[0].address);
+    assert!(
+        traced.fusion_candidates.is_empty(),
+        "trace holds nomination data once"
+    );
+    request.include_rrf_scores = true;
+    let both = service
+        .search(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(both.trace, Some(trace));
+    assert!(both.fusion_candidates.is_empty());
+    assert_eq!(both.hits[0].rrf_contributions.len(), 1);
+    registry.shutdown().await.unwrap();
+}
+
+#[test]
+fn rrf_request_rejects_partial_scoring_and_nonfusion_before_admission() {
+    let mut request = named_l1_request();
+    request.include_rrf_scores = true;
+    request.time_budget_ms = 1;
+    assert!(
+        validate_search_budget(&request, &limits())
+            .unwrap_err()
+            .message()
+            .contains("complete")
+    );
+    request.time_budget_ms = 0;
+    request.l1 = None;
+    request.score_export = None;
+    request.query = Some(Query {
+        query: Some(query::Query::All(crate::proto::AllQuery {})),
+    });
+    assert!(
+        validate_search_budget(&request, &limits())
+            .unwrap_err()
+            .message()
+            .contains("fusion")
+    );
+}
+
+#[test]
+fn trace_budget_counts_discarded_candidates_and_encoded_query_metadata() {
+    let mut budget = response::SearchResponseBudget::with_maximum(512);
+    let oversized = vec![
+        hermes_core::query::SearchResult {
+            segment_id: 1,
+            doc_id: 0,
+            score: 1.0,
+            positions: Vec::new()
+        };
+        hermes_core::query::MAX_FUSION_CANDIDATE_SLOTS + 1
+    ];
+    assert!(
+        candidate_scoring::export_candidates(&oversized, &mut budget)
+            .unwrap_err()
+            .message()
+            .contains("candidate")
+    );
+    let response = SearchResponse {
+        trace: Some(SearchTrace {
+            shards: vec![ShardSearchTrace {
+                index_name: "x".repeat(513),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    };
+    assert!(
+        response::SearchResponseBudget::with_maximum(512)
+            .check_response(&response)
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rrf_and_tracing_preserve_reranker_selection_and_pre_rerank_votes() {
+    let (_temp, registry, service) = l1_service_fixture().await;
+    let mut request = named_l1_request();
+    request.l1 = None;
+    request.score_export = None;
+    request.candidate_limit = 2;
+    let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut() else {
+        unreachable!()
+    };
+    fusion.candidate_depth = 0;
+    request.reranker = Some(Reranker {
+        field: "rerank".into(),
+        vector: vec![1.0, 0.0],
+        ..Default::default()
+    });
+    let plain = service
+        .search(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(plain.hits[0].address.as_ref().unwrap().doc_id, 0);
+    request.include_rrf_scores = true;
+    request.tracing = true;
+    let traced = service
+        .search(Request::new(request))
+        .await
+        .unwrap()
+        .into_inner();
+    let hit = &traced.hits[0];
+    assert_eq!(hit.address, plain.hits[0].address);
+    assert_eq!(hit.score.to_bits(), plain.hits[0].score.to_bits());
+    assert_eq!(hit.rrf_score, Some(1.0 / 61.0));
+    assert_eq!(hit.rrf_contributions.len(), 1);
+    assert_eq!(hit.rrf_contributions[0].query_name, "title");
+    let shard = &traced.trace.unwrap().shards[0];
+    assert_eq!(shard.queries[0].candidates.len(), 2);
+    assert_eq!(
+        shard.queries[1].candidates[0]
+            .address
+            .as_ref()
+            .unwrap()
+            .doc_id,
+        1
+    );
+    assert_eq!(shard.selected[0].address, hit.address);
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rrf_in_symbolic_formula_participates_before_passage_selection() {
+    let (_temp, registry, service) = l1_service_fixture().await;
+    let mut request = named_l1_request();
+    request.limit = 2;
+    let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut() else {
+        unreachable!()
+    };
+    fusion.candidate_depth = 2;
+    let base = service
+        .search(Request::new(request.clone()))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(base.hits[0].address.as_ref().unwrap().doc_id, 1);
+    request.include_rrf_scores = true;
+    request.tracing = true;
+    for weight in [0.0, 3.0, -1000.0] {
+        request.l1.as_mut().unwrap().formula = format!("body + {weight} * rrf");
+        let result = service
+            .search(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(result.ranking_method, "formula_v1");
+        assert_eq!(
+            result.hits[0].address.as_ref().unwrap().doc_id,
+            if weight < 0.0 { 0 } else { 1 }
+        );
+        for hit in &result.hits {
+            let original = base
+                .hits
+                .iter()
+                .find(|old| old.address == hit.address)
+                .unwrap();
+            let expected_rrf: f32 = if hit.address.as_ref().unwrap().doc_id == 0 {
+                1.0 / 61.0
+            } else {
+                1.0 / 61.0 + 1.0 / 62.0
+            };
+            assert_eq!(hit.rrf_score, Some(expected_rrf));
+            assert_eq!(
+                hit.score,
+                (f64::from(original.score) + weight * f64::from(expected_rrf)) as f32
+            );
+            let raw = hit.candidate_scores.as_ref().unwrap();
+            let before = original.candidate_scores.as_ref().unwrap();
+            assert_eq!(raw.document, before.document);
+            for row in &raw.passages {
+                let old = before
+                    .passages
+                    .iter()
+                    .find(|old| old.ordinal == row.ordinal)
+                    .unwrap();
+                assert_eq!(row.scores, old.scores);
+                let rrf: f32 = hit
+                    .rrf_contributions
+                    .iter()
+                    .filter(|vote| vote.ordinal.is_none() || vote.ordinal == Some(row.ordinal))
+                    .map(|vote| vote.score)
+                    .sum();
+                assert_eq!(
+                    row.l1_score.unwrap(),
+                    (f64::from(old.l1_score.unwrap()) + weight * f64::from(rrf)) as f32
+                );
+                assert_eq!(
+                    hit.ordinal_scores
+                        .iter()
+                        .find(|score| score.ordinal == row.ordinal)
+                        .unwrap()
+                        .score,
+                    row.l1_score.unwrap()
+                );
+            }
+        }
+    }
+    request.l1.as_mut().unwrap().formula = "1 / 0".into();
+    assert_eq!(
+        service
+            .search(Request::new(request))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+    registry.shutdown().await.unwrap();
 }

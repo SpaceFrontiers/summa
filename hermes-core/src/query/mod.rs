@@ -62,6 +62,6 @@ pub use traits::*;
 pub use vector::*;
 
 pub use candidate_scoring::{
-    CandidateFeature, CandidateQuery, CandidateScores, CandidateScoringPlan, FeatureTransform,
-    LinearModel, PassageFeatures, ScoreScope, ScoredCandidate,
+    CandidateFeature, CandidateQuery, CandidateScores, CandidateScoringPlan, PassageFeatures,
+    RankingModel, ScoreScope, ScoredCandidate,
 };

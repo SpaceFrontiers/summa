@@ -64,22 +64,14 @@ async fn l1_preserves_organic_zero_and_negative_scores_and_backfills_only_missin
                     .unwrap(),
             })
             .collect(),
-        model: Some(LinearModel {
-            weights: std::collections::BTreeMap::from([("x".into(), 2.0), ("y".into(), 1.0)]),
-            missing_values: std::collections::BTreeMap::from([
-                ("x".into(), 0.25),
-                ("y".into(), 0.75),
-            ]),
-            transforms: std::collections::BTreeMap::from([(
-                "x".into(),
-                FeatureTransform {
-                    scale: 3.0,
-                    offset: 1.0,
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        }),
+        model: Some(
+            RankingModel::compile(
+                "2 * (3 * x + 1) + y",
+                &["x", "y"],
+                &std::collections::BTreeMap::from([("x".into(), 0.25), ("y".into(), 0.75)]),
+            )
+            .unwrap(),
+        ),
         export_passages: 1,
         all_passages: false,
         document_combiner: MultiValueCombiner::Max,
@@ -212,14 +204,14 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
                 query: profile_query.candidate_query().unwrap(),
             },
         ],
-        model: Some(LinearModel {
-            weights: std::collections::BTreeMap::from([
-                ("bm25".into(), 1.0),
-                ("dense".into(), 1.0),
-                ("profile".into(), 0.2),
-            ]),
-            ..Default::default()
-        }),
+        model: Some(
+            RankingModel::compile(
+                "bm25 + dense + 0.2 * profile",
+                &["bm25", "phrase", "sparse", "dense", "profile"],
+                &Default::default(),
+            )
+            .unwrap(),
+        ),
         export_passages: 10,
         all_passages: true,
         document_combiner: crate::query::MultiValueCombiner::Max,
@@ -297,10 +289,8 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
                 .boosted(-2.0)
                 .unwrap(),
         }];
-        document_plan.model = Some(LinearModel {
-            weights: std::collections::BTreeMap::from([("dense".into(), 1.0)]),
-            ..Default::default()
-        });
+        document_plan.model =
+            Some(RankingModel::compile("dense", &["dense"], &Default::default()).unwrap());
         let actual = searcher
             .score_candidates(&candidates, &document_plan, None)
             .await
@@ -314,11 +304,14 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
         assert!(actual[0].features.passages.is_empty());
 
         let mut passage_plan = plan.clone();
-        passage_plan.model = Some(LinearModel {
-            weights: std::collections::BTreeMap::from([("dense".into(), 1.0)]),
-            bias: -2.0,
-            ..Default::default()
-        });
+        passage_plan.model = Some(
+            RankingModel::compile(
+                "dense - 2",
+                &["bm25", "phrase", "sparse", "dense", "profile"],
+                &Default::default(),
+            )
+            .unwrap(),
+        );
         passage_plan.document_combiner = combiner;
         passage_plan.export_passages = 1;
         let actual = searcher
@@ -350,10 +343,8 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
         ])
         .unwrap(),
     }];
-    composition.model = Some(LinearModel {
-        weights: std::collections::BTreeMap::from([("dense".into(), 1.0)]),
-        ..Default::default()
-    });
+    composition.model =
+        Some(RankingModel::compile("dense", &["dense"], &Default::default()).unwrap());
     let actual = searcher
         .score_candidates(&candidates, &composition, None)
         .await
@@ -427,17 +418,14 @@ async fn absent_text_in_an_entire_segment_is_missing_not_zero_or_unsupported() {
                 .candidate_query()
                 .unwrap(),
         }],
-        model: Some(LinearModel {
-            weights: std::collections::BTreeMap::from([("profile".into(), 1.0)]),
-            transforms: std::collections::BTreeMap::from([(
-                "profile".into(),
-                FeatureTransform {
-                    offset: 1.0,
-                    ..Default::default()
-                },
-            )]),
-            ..Default::default()
-        }),
+        model: Some(
+            RankingModel::compile(
+                "profile + 1",
+                &["profile"],
+                &std::collections::BTreeMap::from([("profile".into(), -1.0)]),
+            )
+            .unwrap(),
+        ),
         export_passages: 1,
         all_passages: false,
         document_combiner: crate::query::MultiValueCombiner::Max,
@@ -670,11 +658,14 @@ async fn bmp_backfill_without_forward_storage_preserves_missing_zero_and_organic
             scope: ScoreScope::Document,
             query: sparse_query.candidate_query().unwrap(),
         }],
-        model: Some(LinearModel {
-            weights: std::collections::BTreeMap::from([("sparse".into(), 2.0)]),
-            missing_values: std::collections::BTreeMap::from([("sparse".into(), -0.5)]),
-            ..Default::default()
-        }),
+        model: Some(
+            RankingModel::compile(
+                "2 * sparse",
+                &["sparse"],
+                &std::collections::BTreeMap::from([("sparse".into(), -0.5)]),
+            )
+            .unwrap(),
+        ),
         export_passages: 1,
         all_passages: false,
         document_combiner: MultiValueCombiner::Max,

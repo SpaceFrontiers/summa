@@ -1437,6 +1437,32 @@ impl<D: Directory + 'static> Searcher<D> {
         Ok((fused, total_seen))
     }
 
+    /// Fuse retained nomination lists on this searcher's shared CPU pool.
+    pub fn fuse_candidate_lists(
+        &self,
+        lists: &[(&[crate::query::SearchResult], f32)],
+        method: crate::query::FusionMethod,
+        combiner: crate::query::MultiValueCombiner,
+        limit: usize,
+    ) -> Result<Vec<crate::query::SearchResult>> {
+        self.install_search_cpu(|| {
+            crate::query::try_fuse_ranked_lists_chunked_borrowed(lists, method, combiner, limit)
+        })
+        .map_err(crate::Error::Query)
+    }
+
+    /// Attribute organic RRF votes without repeating retrieval or changing L1.
+    pub fn rrf_scores_for_hits(
+        &self,
+        lists: &[crate::query::RrfRankedList<'_>],
+        selected: &[(u128, u32)],
+        k: f32,
+        combiner: crate::query::MultiValueCombiner,
+    ) -> Result<Vec<crate::query::RrfScore>> {
+        self.install_search_cpu(|| crate::query::rrf_scores_for_hits(lists, selected, k, combiner))
+            .map_err(crate::Error::Query)
+    }
+
     /// Retrieve independent branches and retain the complete bounded document
     /// union. No rank fusion or cross-branch top-k runs before feature scoring.
     pub async fn search_candidate_union(
@@ -1491,7 +1517,7 @@ impl<D: Directory + 'static> Searcher<D> {
                                 0,
                                 true,
                                 None,
-                                stats.clone(),
+                                self.query_text_stats(query.as_ref(), stats.clone()),
                             )?;
                             Ok((results, seen))
                         })
@@ -2114,6 +2140,51 @@ mod search_window_tests {
 
 #[cfg(test)]
 mod fusion_parallelism_tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nomination_lists_inherit_the_same_global_bm25_statistics_as_search() {
+        use crate::query::{BooleanQuery, Query, TermQuery};
+        use std::sync::Arc;
+        let directory = crate::directories::RamDirectory::new();
+        let mut builder = crate::Schema::builder();
+        let text = builder.add_text_field("text", true, false);
+        let config = crate::IndexConfig {
+            merge_policy: Box::new(crate::NoMergePolicy),
+            ..Default::default()
+        };
+        let mut writer =
+            crate::IndexWriter::create(directory.clone(), builder.build(), config.clone())
+                .await
+                .unwrap();
+        for segment in [
+            ["needle needle", "needle common", "common common"],
+            ["needle", "common", "common rare rare"],
+        ] {
+            for value in segment {
+                let mut doc = crate::Document::new();
+                doc.add_text(text, value);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+        }
+        let index = crate::Index::open(directory, config).await.unwrap();
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        let query: Arc<dyn Query> = Arc::new(
+            BooleanQuery::new()
+                .should(TermQuery::text(text, "needle"))
+                .should(TermQuery::text(text, "common")),
+        );
+        let expected = searcher
+            .search_with_positions(query.as_ref(), 6)
+            .await
+            .unwrap();
+        let actual = searcher
+            .search_candidate_lists(&[query], 6, None)
+            .await
+            .unwrap();
+        assert_eq!(actual[0], expected);
+    }
+
     #[test]
     fn fusion_runs_subqueries_concurrently() {
         let source = include_str!("searcher.rs");

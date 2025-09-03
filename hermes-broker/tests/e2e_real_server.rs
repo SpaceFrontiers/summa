@@ -379,6 +379,8 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
                 })),
             }),
             limit: 10,
+            include_rrf_scores: true,
+            tracing: true,
             fields_to_load: vec!["id".to_string(), "title".to_string()],
             ..Default::default()
         })
@@ -390,6 +392,36 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
     assert_eq!(response.ranking_method, "global_rrf_v1");
     assert_eq!(response.total_hits, 3);
     assert_eq!(response.hits.len(), 2);
+    assert!(response.fusion_candidates.is_empty());
+    for hit in &response.hits {
+        assert_eq!(hit.rrf_score.unwrap().to_bits(), hit.score.to_bits());
+        assert!(!hit.rrf_contributions.is_empty());
+    }
+    let trace = response.trace.unwrap();
+    assert_eq!(trace.shards.len(), 2);
+    assert_eq!(
+        trace
+            .shards
+            .iter()
+            .map(|s| (s.shard_id.as_str(), s.backend_id.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("0", "a"), ("1", "b")]
+    );
+    assert!(
+        trace
+            .shards
+            .iter()
+            .all(|s| s.index_name == index_name && s.queries.len() == 2)
+    );
+    assert_eq!(
+        trace
+            .shards
+            .iter()
+            .flat_map(|s| &s.queries)
+            .map(|q| q.candidates.len())
+            .sum::<usize>(),
+        3
+    );
 
     let request = SearchRequest {
         index_name: index_name.into(),
@@ -416,10 +448,7 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
             })),
         }),
         l1: Some(L1Ranking {
-            weights: std::collections::HashMap::from([
-                ("topic".into(), 1.0),
-                ("specific".into(), 10.0),
-            ]),
+            formula: "topic + 10 * specific".into(),
             ..Default::default()
         }),
         score_export: Some(ScoreExport::default()),
@@ -432,7 +461,7 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(ranked.ranking_method, "linear_v2");
+    assert_eq!(ranked.ranking_method, "formula_v1");
     assert_eq!(ranked.hits.len(), 2);
     let id = &ranked.hits[0].fields["id"].values[0].value;
     assert_eq!(id, &Some(field_value::Value::Text("doc-2".into())));
@@ -453,6 +482,99 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
         b["specific"], 0.0,
         "score-only backfill distinguishes a valid nonmatch"
     );
+    let mut traced_request = request.clone();
+    traced_request.tracing = true;
+    traced_request.include_rrf_scores = true;
+    let traced = broker_search_client(&broker)
+        .await
+        .search(traced_request)
+        .await
+        .unwrap()
+        .into_inner();
+    for (plain, diagnostic) in ranked.hits.iter().zip(&traced.hits) {
+        let mut stripped = diagnostic.clone();
+        stripped.rrf_score = None;
+        stripped.rrf_contributions.clear();
+        assert_eq!(*plain, stripped);
+        assert_eq!(diagnostic.rrf_contributions.len(), 1);
+        assert_eq!(diagnostic.rrf_contributions[0].query_name, "topic");
+        assert_eq!(diagnostic.rrf_contributions[0].ordinal, None);
+    }
+    let trace = traced.trace.unwrap();
+    assert_eq!(trace.shards.len(), 2);
+    for shard in trace.shards {
+        assert_eq!(shard.queries.len(), 2);
+        assert_eq!(shard.queries[0].candidates.len(), 1);
+        assert!(shard.queries[1].score_only);
+        assert!(shard.queries[1].candidates.is_empty());
+    }
+    let mut rrf_formula = request.clone();
+    rrf_formula.include_rrf_scores = true;
+    rrf_formula.tracing = true;
+    rrf_formula.l1.as_mut().unwrap().formula = "topic + 10 * specific - 1000 * rrf".into();
+    let reranked = broker_search_client(&broker)
+        .await
+        .search(rrf_formula)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(reranked.ranking_method, "formula_v1");
+    for hit in &reranked.hits {
+        let original = ranked
+            .hits
+            .iter()
+            .find(|original| original.address == hit.address)
+            .unwrap();
+        let rrf = hit.rrf_score.unwrap();
+        let raw = &original.candidate_scores.as_ref().unwrap().document;
+        assert_eq!(
+            hit.score,
+            (f64::from(raw["topic"]) + 10.0 * f64::from(raw["specific"]) - 1000.0 * f64::from(rrf))
+                as f32
+        );
+        assert_eq!(hit.candidate_scores, original.candidate_scores);
+        assert_eq!(hit.rrf_contributions[0].query_name, "topic");
+    }
+    assert_eq!(reranked.trace.unwrap().shards.len(), 2);
+    // Nonlinear formulas use the same raw features at shards and broker. In
+    // particular log/division of global RRF must never be evaluated with zero
+    // substituted while shards prepare their complete feature export.
+    for formula in [
+        "sqrt(abs(topic)) + log1p(specific)",
+        "ln(rrf) + specific / rrf",
+    ] {
+        let mut symbolic = request.clone();
+        symbolic.l1.as_mut().unwrap().formula = formula.into();
+        symbolic.include_rrf_scores = true;
+        let response = broker_search_client(&broker)
+            .await
+            .search(symbolic)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.ranking_method, "formula_v1");
+        for hit in &response.hits {
+            let raw = &hit.candidate_scores.as_ref().unwrap().document;
+            let expected = if formula.starts_with("sqrt") {
+                f64::from(raw["topic"]).abs().sqrt() + f64::from(raw["specific"]).ln_1p()
+            } else {
+                let rrf = f64::from(hit.rrf_score.unwrap());
+                rrf.ln() + f64::from(raw["specific"]) / rrf
+            };
+            assert_eq!(hit.score, expected as f32, "{formula}");
+        }
+    }
+    let mut invalid_formula = request.clone();
+    invalid_formula.l1.as_mut().unwrap().formula = "ln(-rrf)".into();
+    assert_eq!(
+        broker_search_client(&broker)
+            .await
+            .search(invalid_formula)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
     let mut no_backfill = request.clone();
     let model = no_backfill.l1.as_mut().unwrap();
     model.backfill = Some(false);
@@ -463,7 +585,7 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(missing.ranking_method, "linear_v2");
+    assert_eq!(missing.ranking_method, "formula_v1");
     assert_eq!(missing.hits.len(), ranked.hits.len());
     for hit in &missing.hits {
         let raw = hit.candidate_scores.as_ref().unwrap();
