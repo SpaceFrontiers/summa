@@ -456,7 +456,10 @@ fn pack_eight_u4(packed: u64, width: usize, mask: u64) -> u32 {
         | ((packed >> (width * 7) & mask) as u32) << 28
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "native", feature = "wasm", test)
+))]
 #[target_feature(enable = "bmi2")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn decode_u8_bmi2(payload: &[u8], start: usize, count: usize, width: u8, output: &mut [u8]) {
