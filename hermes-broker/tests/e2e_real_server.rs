@@ -304,6 +304,166 @@ async fn broker_routes_real_hermes_servers() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs the hermes-server binary; see module docs"]
+async fn broker_ranks_and_exports_long_phrase_features_without_dropping_terms() {
+    let server_a = spawn_server();
+    let server_b = spawn_server();
+    wait_server_ready(&server_a.addr).await;
+    wait_server_ready(&server_b.addr).await;
+    let broker = spawn_broker(
+        &[
+            format!("id=a,addr={},shard=0", server_a.addr),
+            format!("id=b,addr={},shard=1", server_b.addr),
+        ],
+        &["--placement", "docs*=0,1"],
+    );
+    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    let index_name = "docs_long_phrase";
+    let mut index = broker_index_client(&broker).await;
+    index
+        .create_index(CreateIndexRequest {
+            index_name: index_name.into(),
+            schema: format!(
+                "index {index_name} {{
+                    field id: text<raw> [primary, indexed, stored]
+                    field title: text<simple> [indexed<chunked, token_position>]
+                }}"
+            ),
+        })
+        .await
+        .unwrap();
+    wait_for_indexes(&broker, &[index_name], Duration::from_secs(10)).await;
+    let terms: Vec<_> = (0..256).map(|i| format!("term{i}")).collect();
+    let mut wrong_word = terms.clone();
+    wrong_word[64] = "different".into();
+    index
+        .batch_index_documents(BatchIndexDocumentsRequest {
+            index_name: index_name.into(),
+            documents: vec![
+                doc("doc0", &terms.join(" ")),
+                doc("doc1", &terms[..64].join(" ")),
+                doc("doc2", &wrong_word.join(" ")),
+                doc("doc3", &terms[..255].join(" ")),
+            ],
+        })
+        .await
+        .unwrap();
+    index
+        .commit(CommitRequest {
+            index_name: index_name.into(),
+        })
+        .await
+        .unwrap();
+    let mut search = broker_search_client(&broker).await;
+    fn id(hit: &SearchHit) -> &str {
+        match hit.fields["id"].values[0].value.as_ref().unwrap() {
+            field_value::Value::Text(id) => id,
+            _ => panic!("expected a text primary key"),
+        }
+    }
+    for count in [64, 65, 256] {
+        let phrase = Query {
+            query: Some(query::Query::Phrase(PhraseQuery {
+                field: "title".into(),
+                text: terms[..count].join(" "),
+                ..Default::default()
+            })),
+        };
+        let reference = search
+            .search(SearchRequest {
+                index_name: index_name.into(),
+                query: Some(phrase.clone()),
+                limit: 4,
+                fields_to_load: vec!["id".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let mut matching: Vec<_> = reference.hits.iter().map(id).collect();
+        matching.sort_unstable();
+        assert_eq!(
+            matching,
+            match count {
+                64 => vec!["doc0", "doc1", "doc2", "doc3"],
+                65 => vec!["doc0", "doc3"],
+                _ => vec!["doc0"],
+            }
+        );
+        for ranked in [false, true] {
+            let response = search
+                .search(SearchRequest {
+                    index_name: index_name.into(),
+                    limit: 4,
+                    fields_to_load: vec!["id".into()],
+                    query: Some(Query {
+                        query: Some(query::Query::Fusion(FusionQuery {
+                            queries: vec![
+                                WeightedQuery {
+                                    name: "nomination".into(),
+                                    scope: ScoreScope::Chunk as i32,
+                                    query: Some(Query {
+                                        query: Some(query::Query::Term(TermQuery {
+                                            field: "title".into(),
+                                            term: "term0".into(),
+                                            ..Default::default()
+                                        })),
+                                    }),
+                                    ..Default::default()
+                                },
+                                WeightedQuery {
+                                    name: "phrase".into(),
+                                    scope: ScoreScope::Chunk as i32,
+                                    query: Some(phrase.clone()),
+                                    score_only: true,
+                                    ..Default::default()
+                                },
+                            ],
+                            candidate_depth: 4,
+                            ..Default::default()
+                        })),
+                    }),
+                    l1: ranked.then(|| L1Ranking {
+                        formula: "phrase".into(),
+                        ..Default::default()
+                    }),
+                    score_export: Some(ScoreExport {
+                        passages_per_document: 1,
+                        all_passages: !ranked,
+                    }),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{count} terms, ranked={ranked}: {error}"))
+                .into_inner();
+            assert_eq!(
+                response.ranking_method,
+                if ranked {
+                    "formula_v1"
+                } else {
+                    "feature_export_v2"
+                }
+            );
+            assert_eq!(response.hits.len(), 4);
+            for hit in &response.hits {
+                let expected = reference
+                    .hits
+                    .iter()
+                    .find(|other| id(other) == id(hit))
+                    .map_or(0.0, |hit| hit.score);
+                let passages = &hit.candidate_scores.as_ref().unwrap().passages;
+                assert_eq!(passages.len(), 1);
+                assert_eq!(passages[0].ordinal, 0);
+                assert_eq!(passages[0].scores["phrase"].to_bits(), expected.to_bits());
+                if ranked {
+                    assert_eq!(hit.score.to_bits(), expected.to_bits());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the hermes-server binary; see module docs"]
 async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
     let server_a = spawn_server();
     let server_b = spawn_server();

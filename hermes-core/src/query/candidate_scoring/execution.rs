@@ -7,6 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 const MAX_FEATURES: usize = crate::query::MAX_FUSION_SUB_QUERIES;
+// Phrase probing uses dynamic positional cursors. Its separate scratch bound
+// matches the server's default token limit, including for direct core callers.
+const MAX_PHRASE_TERMS: usize = 256;
 const MAX_FEATURE_VALUES: usize = 2_000_000;
 const MAX_VECTOR_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -91,9 +94,15 @@ impl CandidateScoringPlan {
                         }
                     }
                     ScoreComponent::Phrase(query) => {
+                        if query.terms.len() > MAX_PHRASE_TERMS {
+                            return Err(Error::Query(format!(
+                                "L1 phrase feature '{}' has {} terms; maximum is {MAX_PHRASE_TERMS}",
+                                feature.name,
+                                query.terms.len(),
+                            )));
+                        }
                         if entry.field_type != crate::FieldType::Text
                             || query.field != feature.query.field
-                            || query.terms.len() > crate::query::MAX_QUERY_TERMS
                             || query.offsets.len() != query.terms.len()
                             || !query.offsets.windows(2).all(|p| p[0] < p[1])
                             || (query.terms.len() > 1 && entry.positions.is_none())
