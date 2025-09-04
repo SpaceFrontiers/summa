@@ -575,11 +575,22 @@ impl Query for PhraseQuery {
         }
         let mut bitset = super::DocBitset::new(reader.num_docs());
         if self.terms.len() == 1 {
+            // Non-indexed terms may match through a fast column. Preserve the
+            // scorer fallback; absent postings do not prove an empty filter.
+            if reader
+                .schema()
+                .get_field_entry(self.field)
+                .is_some_and(|entry| !entry.indexed)
+            {
+                return None;
+            }
             // A one-term phrase is the term itself; walk its postings and
             // resolve chunk ids to documents where needed.
-            let list = reader
-                .get_postings_sync(self.field, &self.terms[0])
-                .ok()??;
+            let Some(list) = reader.get_postings_sync(self.field, &self.terms[0]).ok()? else {
+                // A supported filter with no matches is not an unsupported
+                // filter: the latter would invoke the bounded scorer fallback.
+                return Some(bitset);
+            };
             let chunk_map = reader.chunk_map(self.field);
             let mut it = list.iterator();
             while it.doc() != TERMINATED {

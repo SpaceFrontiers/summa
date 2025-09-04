@@ -456,6 +456,13 @@ materializable text/phrase/fast-field filters use the existing bitset paths.
 Other filters and portable builds use ordinary complete filter scorers only on
 segments of at most 200,000 documents, failing explicitly above that bound.
 This prevents an implicit corpus-sized scoring heap on a legacy backend.
+For indexed phrase filters, a missing term denotes an empty match set, including
+a one-word phrase. It must materialize an empty bitmap rather than select the
+unsupported-filter fallback. A non-indexed field can still match through a fast
+column, so missing postings alone do not prove that such a filter is empty.
+Posting read failures and expired materialization remain failures or truncation,
+not successful empty filters. This distinction adds no candidate expansion or
+scratch beyond the existing document bitmap.
 
 Filter wrappers are opaque to scoring decomposition: flattening a filtered
 branch into unfiltered terms changes its matching set. Query-global BMP LSP

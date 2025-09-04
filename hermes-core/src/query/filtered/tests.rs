@@ -1,6 +1,6 @@
 use super::*;
 use crate::query::{
-    AllQuery, BooleanQuery, RangeQuery, SparseTermQuery, SparseVectorQuery, TermQuery,
+    AllQuery, BooleanQuery, PhraseQuery, RangeQuery, SparseTermQuery, SparseVectorQuery, TermQuery,
 };
 use crate::structures::{SparseFormat, SparseVectorConfig};
 use crate::{Document, Field, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
@@ -90,6 +90,94 @@ async fn assert_selected(
     let mut actual: Vec<_> = results.hits.iter().map(|hit| hit.address.doc_id).collect();
     actual.sort_unstable();
     assert_eq!(actual, expected, "index search: {query}");
+}
+
+#[cfg(feature = "sync")]
+#[tokio::test]
+async fn missing_one_word_phrase_filters_are_empty_above_the_scorer_fallback_limit() {
+    let mut schema = Schema::builder();
+    let plain = schema.add_text_field_with_tokenizer("plain", true, false, "simple");
+    let chunked = schema.add_text_field_with_tokenizer("chunked", true, false, "simple");
+    schema.set_chunked(chunked, true);
+    let unpopulated = schema.add_text_field_with_tokenizer("unpopulated", true, false, "simple");
+    let directory = RamDirectory::new();
+    let config = IndexConfig {
+        num_indexing_threads: 1,
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    let mut document = Document::new();
+    document.add_text(plain, "present");
+    document.add_text(chunked, "present");
+    writer.add_document(document).unwrap();
+    for _ in 0..crate::query::MAX_FUSION_CANDIDATE_SLOTS {
+        loop {
+            match writer.add_document(Document::new()) {
+                Ok(()) => break,
+                Err(crate::Error::QueueFull) => tokio::task::yield_now().await,
+                Err(error) => panic!("failed to enqueue fixture document: {error}"),
+            }
+        }
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(directory, config).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    assert_eq!(readers.len(), 1);
+    assert_eq!(
+        readers[0].num_docs() as usize,
+        crate::query::MAX_FUSION_CANDIDATE_SLOTS + 1
+    );
+    let filter = |query: Arc<dyn Query>| {
+        FilteredQuery::new(Arc::new(TermQuery::text(plain, "present")), vec![query])
+    };
+    for field in [plain, chunked, unpopulated] {
+        let absent = || PhraseQuery::text(field, "absent");
+        assert_selected(&index, &filter(Arc::new(absent())), 1, &[]).await;
+        let negated = BooleanQuery::new().must(AllQuery).must_not(absent());
+        assert_selected(&index, &filter(Arc::new(negated)), 1, &[0]).await;
+    }
+    for field in [plain, chunked] {
+        let present = || PhraseQuery::text(field, "present");
+        assert_selected(&index, &filter(Arc::new(present())), 1, &[0]).await;
+        let disjunction = BooleanQuery::new()
+            .should(PhraseQuery::text(field, "absent"))
+            .should(present());
+        assert_selected(&index, &filter(Arc::new(disjunction)), 1, &[0]).await;
+    }
+}
+
+#[tokio::test]
+async fn one_word_phrase_filters_preserve_indexed_and_fast_only_field_matches() {
+    let mut schema = Schema::builder();
+    let fast = schema.add_text_field_with_tokenizer("tag", false, false, "raw");
+    schema.set_fast(fast, true);
+    let plain = schema.add_text_field_with_tokenizer("plain", true, false, "simple");
+    let chunked = schema.add_text_field_with_tokenizer("chunked", true, false, "simple");
+    schema.set_chunked(chunked, true);
+    let directory = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    let mut document = Document::new();
+    for field in [fast, plain, chunked] {
+        document.add_text(field, "present");
+    }
+    writer.add_document(document).unwrap();
+    writer.commit().await.unwrap();
+    let index = Index::open(directory, config).await.unwrap();
+    for field in [fast, plain, chunked] {
+        for (text, expected) in [("present", vec![0]), ("absent", vec![])] {
+            let query = FilteredQuery::new(
+                Arc::new(AllQuery),
+                vec![Arc::new(PhraseQuery::text(field, text))],
+            );
+            assert_selected(&index, &query, 1, &expected).await;
+        }
+    }
 }
 
 #[tokio::test]
