@@ -4,6 +4,7 @@
 //! and indexing documents, used by `hermes-tool` and `hermes-server`.
 
 use std::io::BufRead;
+use std::num::NonZeroU32;
 use std::path::Path;
 
 use crate::directories::{Directory, DirectoryWriter, FsDirectory};
@@ -39,12 +40,18 @@ fn default_true() -> bool {
 pub struct SchemaConfig {
     /// List of field definitions
     pub fields: Vec<SchemaFieldConfig>,
+    /// Creation-time cap on retained tokens per L1 phrase (default: 64).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_l1_phrase_terms: Option<NonZeroU32>,
 }
 
 impl SchemaConfig {
     /// Build a Schema from this configuration
     pub fn build(&self) -> Result<Schema> {
         let mut builder = SchemaBuilder::default();
+        if let Some(limit) = self.max_l1_phrase_terms {
+            builder.set_max_l1_phrase_terms(limit);
+        }
 
         for field in &self.fields {
             match field.field_type.as_str() {
@@ -260,6 +267,47 @@ mod tests {
         "#;
         let schema = parse_schema(sdl).unwrap();
         assert!(schema.get_field("text").is_some());
+    }
+
+    #[test]
+    fn creation_schemas_preserve_positive_phrase_limits_and_reject_invalid_values() {
+        assert_eq!(Schema::default().max_l1_phrase_terms(), 64);
+        assert_eq!(SchemaBuilder::default().build().max_l1_phrase_terms(), 64);
+        for value in [None, Some(1), Some(64), Some(65), Some(300), Some(u32::MAX)] {
+            let option = value
+                .map(|value| format!("max_l1_phrase_terms: {value}"))
+                .unwrap_or_default();
+            let mut json = serde_json::json!({"fields": [{"name": "body", "type": "text"}]});
+            if let Some(value) = value {
+                json["max_l1_phrase_terms"] = value.into();
+            }
+            for input in [
+                format!("index documents {{ {option} field body: text }}"),
+                json.to_string(),
+            ] {
+                let schema = parse_schema(&input).unwrap();
+                assert_eq!(schema.max_l1_phrase_terms(), value.unwrap_or(64) as usize);
+                let serialized = serde_json::to_value(&schema).unwrap();
+                assert_eq!(
+                    serialized.get("max_l1_phrase_terms").is_some(),
+                    value.is_some()
+                );
+                let restored: Schema = serde_json::from_value(serialized).unwrap();
+                assert_eq!(restored.max_l1_phrase_terms(), schema.max_l1_phrase_terms());
+            }
+        }
+        for invalid in ["0", "-1", "1.5", "4294967296", "\"64\"", "true"] {
+            for input in [
+                format!("index documents {{ max_l1_phrase_terms: {invalid} field body: text }}"),
+                format!(r#"{{"max_l1_phrase_terms": {invalid}, "fields": []}}"#),
+            ] {
+                assert!(parse_schema(&input).is_err(), "accepted {input}");
+            }
+        }
+        assert!(
+            parse_schema("index documents { max_l1_phrase_terms: 64 max_l1_phrase_terms: 256 }")
+                .is_err()
+        );
     }
 
     #[tokio::test]

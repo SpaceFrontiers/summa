@@ -43,15 +43,37 @@ all retained scoring terms, without ANN nomination, LSP selection, heap-floor
 pruning, or top-k truncation of the feature query. Scores remain exact with
 respect to the stored representation (including sparse/vector quantization).
 
-L1 phrase features accept up to 256 retained tokens per phrase, matching the
-server's default post-tokenization text limit. This is separate from the
-64-term text/sparse nomination cursor limit: phrase probing uses one dynamically
-sized positional cursor per term and evaluates every retained term. Both formula
-ranking and raw feature export use this same validation. Larger phrases fail
-with an explicit term-count limit before statistics or candidate payload reads.
-Per-query read and scored-value budgets still apply; this does not expand
-candidate sets or change nomination limits. A stricter configured server token
-limit continues to reject the request during conversion.
+L1 phrase features use the index-level `max_l1_phrase_terms` setting, supplied
+in the creation schema and persisted under `schema` in `metadata.json`. Its
+default is **64**, including existing metadata with no setting. For example:
+
+```sdl
+index documents {
+    max_l1_phrase_terms: 256
+    field body: text<simple> [indexed<chunked, token_position>]
+}
+```
+
+The setting accepts a positive 32-bit integer and is fixed at creation. The
+core schema owns this policy; SDL, JSON creation schemas, the Rust builder,
+server/broker creation and WASM creation use the same persisted value. Index
+info reports it in the returned SDL, and reopening an index preserves it.
+This is an additive optional JSON metadata field; existing indexes open without
+migration and segment formats are unchanged. Missing values serialize without the field.
+
+Core plan validation for both formula ranking and raw feature export checks
+each phrase against this limit before local statistics or candidate payload
+reads, including empty candidate sets. Oversized phrases fail with the actual
+count and configured maximum;
+terms are never truncated. Phrase probing uses one dynamically sized positional
+cursor per term, so increasing the setting increases per-phrase scratch and
+posting/position probes linearly. The existing 256 MiB shared payload-read and
+scored-value budgets still apply. Operators choose the bound at creation;
+nomination limits and candidate sets do not grow with it.
+
+The separate 64-term text/sparse nomination cursor limit is unchanged. The
+server's `--max-text-query-tokens` request limit (default 256) also still applies
+after tokenization: using a phrase longer than 256 requires raising both limits.
 
 ## Ranking modes
 

@@ -71,6 +71,24 @@ Attributes control how fields are processed and stored:
 
 Index-level options (inside the `index { ... }` block):
 
+`max_l1_phrase_terms` sets the maximum retained tokens in each L1 phrase feature,
+for both formula ranking and feature collection. Set it when creating the index:
+
+```sdl
+index documents {
+    max_l1_phrase_terms: 256  # Default: 64
+    field body: text<simple> [indexed<chunked, token_position>]
+}
+```
+
+It accepts positive 32-bit integers, is persisted in `metadata.json` under
+`schema.max_l1_phrase_terms`, and is included in the schema returned by index
+info. Omission, including in existing metadata, means 64. The JSON creation
+schema accepts the same top-level key alongside `fields`. Rust callers can use
+`SchemaBuilder::set_max_l1_phrase_terms(NonZeroU32::new(256).unwrap())`.
+The server's separate `--max-text-query-tokens` limit still applies (default 256).
+See [candidate rescoring](candidate-rescoring.md) for scoring and memory bounds.
+
 ```sdl
 index articles {
     reorder_on_merge: true   # BP-reorder `reorder`-attributed BMP fields inside merges.

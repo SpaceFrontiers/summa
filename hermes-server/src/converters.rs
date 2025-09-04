@@ -830,6 +830,10 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
     use hermes_core::structures::{IndexSize, SparseFormat, WeightQuantization};
 
     let mut lines = vec!["index _ {".to_string()];
+    lines.push(format!(
+        "    max_l1_phrase_terms: {}",
+        schema.max_l1_phrase_terms()
+    ));
     if schema.reorder_on_merge() {
         lines.push("    reorder_on_merge: true".into());
     }
@@ -2196,6 +2200,27 @@ mod tests {
         )
         .unwrap();
         assert!(!off.to_string().contains("~proximity"), "{off}");
+    }
+
+    #[test]
+    fn index_info_schema_reports_default_and_configured_phrase_limits() {
+        for configured in [None, Some(65), Some(300)] {
+            let mut builder = Schema::builder();
+            if let Some(limit) = configured {
+                builder.set_max_l1_phrase_terms(std::num::NonZeroU32::new(limit).unwrap());
+            }
+            let rendered = schema_to_sdl(&builder.build());
+            let schema = hermes_core::parse_schema(&rendered).unwrap();
+            assert_eq!(
+                schema.max_l1_phrase_terms(),
+                configured.unwrap_or(64) as usize,
+                "{rendered}"
+            );
+            assert!(rendered.contains(&format!(
+                "max_l1_phrase_terms: {}",
+                configured.unwrap_or(64)
+            )));
+        }
     }
 
     #[test]

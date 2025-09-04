@@ -4,7 +4,11 @@
 file = { SOI ~ index_def+ ~ EOI }
 
 // Index definition
-index_def = { "index" ~ identifier ~ "{" ~ (field_def | default_fields_def | query_router_def | reorder_on_merge_def)* ~ "}" }
+index_def = { "index" ~ identifier ~ "{" ~ (field_def | default_fields_def | query_router_def | reorder_on_merge_def | max_l1_phrase_terms_def)* ~ "}" }
+
+// Maximum retained tokens per L1 phrase feature. Absent = 64.
+max_l1_phrase_terms_def = { "max_l1_phrase_terms" ~ ":" ~ max_l1_phrase_terms_spec }
+max_l1_phrase_terms_spec = @{ ASCII_DIGIT+ }
 
 // Index-level option: BP-reorder `reorder`-attributed BMP fields inside merges.
 // Absent = disabled (merges block-copy).

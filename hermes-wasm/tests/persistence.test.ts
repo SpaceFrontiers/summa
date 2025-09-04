@@ -5,6 +5,43 @@ import { InMemoryFS } from "./storage.ts";
 
 const sharedStorage = new InMemoryFS();
 
+test.each([undefined, 256])(
+	"L1 phrase cap %s persists across reopen and commit",
+	async (cap) => {
+		await init();
+		const storage = new InMemoryFS();
+		const defaultSchema =
+			"index documents { field body: text<simple> [indexed<token_position>, stored] }";
+		const schema = cap === undefined
+			? defaultSchema
+			: defaultSchema.replace("{", `{ max_l1_phrase_terms: ${cap}`);
+		const index = await LocalIndex.withStorage(storage, schema);
+		await index.addDocuments([{ body: "first document" }]);
+		await index.commit();
+		const metadata = JSON.parse(
+			new TextDecoder().decode(await storage.get("metadata.json")),
+		);
+		expect(metadata.schema.max_l1_phrase_terms).toBe(cap);
+
+		// Reopen uses metadata even when the supplied creation schema omits the cap.
+		const reopened = await LocalIndex.withStorage(storage, defaultSchema);
+		await reopened.addDocuments([{ body: "second document" }]);
+		await reopened.commit();
+		const reloaded = JSON.parse(
+			new TextDecoder().decode(await storage.get("metadata.json")),
+		);
+		expect(reloaded.schema.max_l1_phrase_terms).toBe(cap);
+		expect((await reopened.search("document", 10)).hits).toHaveLength(2);
+	},
+);
+
+test("Zero L1 phrase caps fail WASM index creation", async () => {
+	await init();
+	await expect(LocalIndex.create(
+		"index documents { max_l1_phrase_terms: 0 field body: text }",
+	)).rejects.toThrow("positive 32-bit integer");
+});
+
 test("Fill the index with the data", async () => {
 	await init();
 

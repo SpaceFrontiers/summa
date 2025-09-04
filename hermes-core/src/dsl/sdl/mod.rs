@@ -43,6 +43,7 @@
 
 use pest::Parser;
 use pest_derive::Parser;
+use std::num::NonZeroU32;
 
 use super::query_field_router::{QueryRouterRule, RoutingMode};
 use super::schema::{DenseVectorQuantization, FieldType, Schema, SchemaBuilder};
@@ -103,6 +104,8 @@ pub struct IndexDef {
     /// BP-reorder `reorder`-attributed BMP fields inside merges
     /// (index-level `reorder_on_merge: true`). Absent = disabled.
     pub reorder_on_merge: bool,
+    /// Creation-time cap on retained tokens per L1 phrase; absent means 64.
+    pub max_l1_phrase_terms: Option<NonZeroU32>,
 }
 
 impl IndexDef {
@@ -214,6 +217,9 @@ impl IndexDef {
         }
 
         builder.set_index_name(self.name.clone());
+        if let Some(limit) = self.max_l1_phrase_terms {
+            builder.set_max_l1_phrase_terms(limit);
+        }
 
         if self.reorder_on_merge {
             if self.fields.iter().any(|f| f.reorder) {
@@ -1489,6 +1495,7 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
     let mut default_fields = Vec::new();
     let mut query_routers = Vec::new();
     let mut reorder_on_merge = false;
+    let mut max_l1_phrase_terms = None;
 
     for item in inner {
         match item.as_rule() {
@@ -1508,6 +1515,17 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
                     .map(|b| b.as_str() == "true")
                     .unwrap_or(false);
                 reorder_on_merge = value;
+            }
+            Rule::max_l1_phrase_terms_def => {
+                if max_l1_phrase_terms.is_some() {
+                    return Err(Error::Schema(
+                        "max_l1_phrase_terms may only be specified once".into(),
+                    ));
+                }
+                let value = item.into_inner().next().unwrap();
+                max_l1_phrase_terms = Some(value.as_str().parse::<NonZeroU32>().map_err(|_| {
+                    Error::Schema("max_l1_phrase_terms must be a positive 32-bit integer".into())
+                })?);
             }
             _ => {}
         }
@@ -1545,6 +1563,7 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
         default_fields,
         query_routers,
         reorder_on_merge,
+        max_l1_phrase_terms,
     })
 }
 
