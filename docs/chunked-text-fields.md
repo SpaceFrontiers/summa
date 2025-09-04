@@ -86,6 +86,17 @@ chunk when the client sends chunk texts in the same order as the vectors.
 Boolean composition with other clauses (filters, other fields) happens at the
 document level on the combined scorer, as it already does for sparse fields.
 
+Boolean filters must reach bounded text scorers before candidate selection,
+including when the body query is a required clause or a nested disjunction.
+The generic Boolean plans collect available document predicates into shared
+eligibility before constructing their children, while retaining the original
+clauses for scoring and verification. This adds one document bitmap (at most
+16 MiB), using selective posting-list materialization where available and a
+predicate scan of the currently eligible documents otherwise; it does not
+increase the chunk candidate budget or materialize all scored body matches.
+An expired scan publishes no partial eligibility. Filters without a document
+predicate continue to use the existing verifier path.
+
 Cross-segment threshold seeding is skipped for chunked MaxScore groups: the
 k-th _chunk_ score of a full heap is not a valid document-level floor after
 `Max` folding.

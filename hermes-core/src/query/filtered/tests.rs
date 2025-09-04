@@ -93,6 +93,19 @@ async fn assert_selected(
 }
 
 #[tokio::test]
+async fn small_limits_filter_required_plain_text_disjunctions_before_top_k() {
+    let (index, text, allowed, _, _) = fixture().await;
+    let query = BooleanQuery::new()
+        .must(RangeQuery::u64(allowed, Some(1), Some(1)))
+        .must(
+            BooleanQuery::new()
+                .should(TermQuery::text(text, "alpha"))
+                .should(TermQuery::text(text, "absent")),
+        );
+    assert_selected(&index, &query, 1, &[10]).await;
+}
+
+#[tokio::test]
 async fn common_filter_survives_nested_boolean_optimization() {
     let (index, text, allowed, bmp, maxscore) = fixture().await;
     let text_query = BooleanQuery::new()

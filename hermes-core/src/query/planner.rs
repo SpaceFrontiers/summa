@@ -658,6 +658,93 @@ pub(super) fn extract_all_sparse_infos(
 
 // ── Predicate helpers ────────────────────────────────────────────────────
 
+/// A generic Boolean plan can still contain bounded text children (chunked
+/// terms and nested disjunctions). Push available document predicates into
+/// those children before constructing their candidate windows. Keep the
+/// original clauses: eligibility must not change their scores or positions.
+pub(super) fn push_down_text_predicates(
+    must: &[Arc<dyn super::Query>],
+    should: &[Arc<dyn super::Query>],
+    must_not: &[Arc<dyn super::Query>],
+    reader: &SegmentReader,
+    options: &mut super::ScorerOptions,
+) -> crate::Result<()> {
+    if must.is_empty() && must_not.is_empty() {
+        return Ok(());
+    }
+    let mut terms = Vec::new();
+    let bounded_text = must.iter().chain(should).any(|query| {
+        terms.clear();
+        query.text_terms(&mut terms);
+        terms.len() > 1
+            || terms
+                .iter()
+                .any(|(field, _)| reader.is_chunked_field(*field))
+    });
+    if !bounded_text {
+        return Ok(());
+    }
+    // Predicate construction may itself materialize a prefix filter. Check
+    // the segment budget before asking any clause to construct one.
+    if reader.num_docs() as usize > super::filtered::MAX_FILTER_BITMAP_DOCS {
+        return Err(crate::Error::Query(
+            "Boolean text filters exceed the 16 MiB bitmap budget".into(),
+        ));
+    }
+    let mut predicates = Vec::new();
+    let mut required_filters = Vec::new();
+    let mut excluded_filters = Vec::new();
+    for (queries, required) in [(must, true), (must_not, false)] {
+        for query in queries {
+            if let Some(predicate) = query.as_doc_predicate(reader) {
+                predicates.push((predicate, required));
+                if required {
+                    required_filters.push(Arc::clone(query));
+                } else {
+                    excluded_filters.push(Arc::clone(query));
+                }
+            }
+        }
+    }
+    if predicates.is_empty() {
+        return Ok(());
+    }
+    // Reuse selective posting-list materialization when the backend supports
+    // it; scanning a whole fast column is the portable/fast-only fallback.
+    if let Some(combined) =
+        build_combined_bitset(&required_filters, &excluded_filters, reader, options)
+    {
+        options.eligibility = Some(Arc::new(combined));
+        return Ok(());
+    }
+    let mut combined = super::DocBitset::new(reader.num_docs());
+    let mut doc = options
+        .eligibility
+        .as_ref()
+        .map_or(Some(0), |bits| bits.next_set_bit(0));
+    let mut visited = 0usize;
+    while let Some(id) = doc.filter(|&id| id < reader.num_docs()) {
+        if visited.is_multiple_of(1024) && options.stop_if_expired() {
+            return Ok(());
+        }
+        if predicates
+            .iter()
+            .all(|(predicate, required)| predicate(id) == *required)
+        {
+            combined.set(id);
+        }
+        visited += 1;
+        doc = options
+            .eligibility
+            .as_ref()
+            .map_or(Some(id + 1), |bits| bits.next_set_bit(id + 1));
+    }
+    if !options.stop_if_expired() {
+        options.eligibility = Some(Arc::new(combined));
+    }
+    Ok(())
+}
+
 /// Chain multiple predicates into a single combined predicate.
 pub(super) fn chain_predicates<'a>(predicates: Vec<DocPredicate<'a>>) -> DocPredicate<'a> {
     if predicates.len() == 1 {

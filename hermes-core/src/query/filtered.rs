@@ -4,6 +4,8 @@ use crate::segment::SegmentReader;
 use crate::{Error, Result};
 use std::sync::Arc;
 
+pub(super) const MAX_FILTER_BITMAP_DOCS: usize = 128 * 1024 * 1024;
+
 #[derive(Clone)]
 pub struct FilteredQuery {
     query: Arc<dyn Query>,
@@ -14,7 +16,7 @@ impl FilteredQuery {
         Self { query, filters }
     }
     fn validate(&self, reader: &SegmentReader) -> Result<()> {
-        if self.filters.len() > 64 || reader.num_docs() as usize > 128 * 1024 * 1024 {
+        if self.filters.len() > 64 || reader.num_docs() as usize > MAX_FILTER_BITMAP_DOCS {
             return Err(Error::Query(
                 "common filter exceeds the 64-clause/16 MiB bitmap budget".into(),
             ));

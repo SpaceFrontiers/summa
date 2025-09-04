@@ -262,6 +262,15 @@ impl Query for TermQuery {
     }
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
+        let entry = reader.schema().get_field_entry(self.field)?;
+        // A fast column exposes the first complete value. Indexed term
+        // membership is equivalent only for single-valued raw text; analyzed
+        // text and later values must keep their posting-list semantics.
+        if entry.indexed
+            && (entry.multi || !matches!(entry.tokenizer.as_deref(), Some("raw" | "raw_ci")))
+        {
+            return None;
+        }
         let fast_field = reader.fast_field(self.field.0)?;
         let term_str = String::from_utf8_lossy(&self.term);
         match fast_field.text_ordinal(&term_str) {

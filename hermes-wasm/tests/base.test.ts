@@ -2,6 +2,28 @@ import { test, expect } from "vitest";
 
 import init, { LocalIndex } from "../pkg/hermes_wasm";
 
+test("Small limits apply filters before required body candidates", async () => {
+	await init();
+	const index = await LocalIndex.create(`index filtered_body {
+		field kind: text<raw> [indexed, fast]
+		field body: text<simple> [indexed<chunked, token_position>]
+	}`);
+	await index.addDocuments([
+		...Array.from({ length: 10 }, () => ({ kind: "article", body: ["machine"] })),
+		{ kind: "book", body: ["machine padding padding padding"] },
+	]);
+	await index.commit();
+	for (const query of [
+		"body:machine AND kind:book",
+		"body:machine AND NOT kind:article",
+		"(body:machine OR body:absent) AND kind:book",
+	]) {
+		const all = await index.search(query, 20);
+		expect(all.hits.map((hit: any) => hit.address.doc_id)).toEqual([10]);
+		expect((await index.search(query, 1)).hits).toEqual(all.hits);
+	}
+});
+
 test("Search in index", async () => {
 	await init();
 

@@ -1313,7 +1313,7 @@ macro_rules! bms_execute_loop {
         let mut groups_skipped = 0u64;
         let mut conjunction_skipped = 0u64;
         let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
-        let _bms_start = std::time::Instant::now();
+        let _bms_start = crate::observe::WallTimer::start();
 
         let inv_heap_factor = $self.inv_heap_factor;
         let mut adjusted_threshold = $self.collector.threshold() * inv_heap_factor - 1e-6;
@@ -1575,7 +1575,7 @@ macro_rules! bms_execute_loop {
             })
             .collect();
 
-        let _bms_elapsed_ms = _bms_start.elapsed().as_millis() as u64;
+        let _bms_elapsed_ms = (_bms_start.secs() * 1000.0) as u64;
         if _bms_elapsed_ms > 500 {
             warn!(
                 "slow MaxScore: {}ms, cursors={}, scored={}, skipped={}, blocks_skipped={}, groups_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
@@ -1888,7 +1888,7 @@ impl<'a> MaxScoreExecutor<'a> {
         let mut windows_skipped = 0u64;
         let mut candidates = 0u64;
         let mut docs_scored = 0u64;
-        let started = std::time::Instant::now();
+        let started = crate::observe::WallTimer::start();
 
         loop {
             windows += 1;
@@ -2050,7 +2050,7 @@ impl<'a> MaxScoreExecutor<'a> {
                 ordinal,
             })
             .collect();
-        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let elapsed_ms = (started.secs() * 1000.0) as u64;
         if elapsed_ms > 500 {
             warn!(
                 "slow windowed MaxScore: {}ms, cursors={}, windows={}, windows_skipped={}, candidates={}, scored={}, returned={}, top_score={:.4}",
