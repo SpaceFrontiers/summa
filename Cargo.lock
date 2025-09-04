@@ -3330,7 +3330,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-broker"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3360,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3411,7 +3411,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "anyhow",
  "axum",
@@ -3445,7 +3445,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "anyhow",
  "pest",
@@ -3457,7 +3457,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3466,7 +3466,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "anyhow",
  "clap",
@@ -3491,7 +3491,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3510,7 +3510,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3562,7 +3562,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.129"
+version = "1.8.130"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
