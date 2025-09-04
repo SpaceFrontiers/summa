@@ -7,6 +7,121 @@ use crate::structures::{SparseFormat, SparseVectorConfig, WeightQuantization};
 use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
 
 #[tokio::test]
+async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
+    let mut schema = Schema::builder();
+    let plain = schema.add_text_field_with_tokenizer("plain", true, false, "simple");
+    let chunked = schema.add_text_field_with_tokenizer("chunked", true, false, "simple");
+    schema.set_chunked(chunked, true);
+    for field in [plain, chunked] {
+        schema.set_positions(field, PositionMode::TokenPosition);
+    }
+    let terms: Vec<_> = (0..256).map(|i| format!("term{i}")).collect();
+    let mut wrong_word = terms.clone();
+    wrong_word[64] = "different".into();
+    let directory = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    for text in [
+        terms.join(" "),
+        terms[..64].join(" "),
+        wrong_word.join(" "),
+        terms[..255].join(" "),
+    ] {
+        let mut document = Document::new();
+        for field in [plain, chunked] {
+            document.add_text(field, &text);
+        }
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(directory, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    for (field, scope) in [(plain, ScoreScope::Document), (chunked, ScoreScope::Chunk)] {
+        let candidates = searcher
+            .search_with_positions(&TermQuery::text(field, "term0"), 4)
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(candidates.len(), 4);
+        for count in [64, 65, 256] {
+            let phrase = PhraseQuery::text(field, &terms[..count].join(" "));
+            let reference = searcher.search_with_positions(&phrase, 4).await.unwrap().0;
+            let mut matching: Vec<_> = reference.iter().map(|hit| hit.doc_id).collect();
+            matching.sort_unstable();
+            assert_eq!(
+                matching,
+                match count {
+                    64 => vec![0, 1, 2, 3],
+                    65 => vec![0, 3],
+                    _ => vec![0],
+                }
+            );
+            for ranked in [false, true] {
+                let plan = CandidateScoringPlan {
+                    features: vec![CandidateFeature {
+                        name: "phrase".into(),
+                        scope,
+                        query: phrase.candidate_query().unwrap(),
+                    }],
+                    backfill: true,
+                    model: ranked.then(|| {
+                        RankingModel::compile("phrase", &["phrase"], &Default::default()).unwrap()
+                    }),
+                    export_passages: 1,
+                    all_passages: !ranked,
+                    document_combiner: MultiValueCombiner::Max,
+                };
+                let scored = searcher
+                    .score_candidates(&candidates, &plan, None)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{count}-term phrase, {scope:?}, ranked={ranked}: {error}")
+                    });
+                for candidate in scored {
+                    let expected = reference
+                        .iter()
+                        .find(|hit| hit.doc_id == candidate.result.doc_id)
+                        .map_or(0.0, |hit| hit.score);
+                    let actual = match scope {
+                        ScoreScope::Document => candidate.features.document[0].unwrap(),
+                        ScoreScope::Chunk => {
+                            assert_eq!(candidate.features.passages.len(), 1);
+                            assert_eq!(candidate.features.passages[0].ordinal, 0);
+                            candidate.features.passages[0].values[0].unwrap()
+                        }
+                    };
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "{count}-term phrase");
+                    if ranked {
+                        assert_eq!(candidate.result.score.to_bits(), expected.to_bits());
+                    }
+                }
+            }
+        }
+    }
+    let oversized = CandidateScoringPlan {
+        features: vec![CandidateFeature {
+            name: "phrase".into(),
+            scope: ScoreScope::Document,
+            query: PhraseQuery::new(plain, vec![b"term0".to_vec(); 257])
+                .candidate_query()
+                .unwrap(),
+        }],
+        backfill: true,
+        model: None,
+        export_passages: 1,
+        all_passages: false,
+        document_combiner: MultiValueCombiner::Max,
+    };
+    let error = searcher
+        .score_candidates(&[], &oversized, None)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("257 terms; maximum is 256"));
+}
+
+#[tokio::test]
 async fn l1_preserves_organic_zero_and_negative_scores_and_backfills_only_missing_cells() {
     let mut schema = Schema::builder();
     let field = schema.add_dense_vector_field_with_config(

@@ -43,6 +43,16 @@ all retained scoring terms, without ANN nomination, LSP selection, heap-floor
 pruning, or top-k truncation of the feature query. Scores remain exact with
 respect to the stored representation (including sparse/vector quantization).
 
+L1 phrase features accept up to 256 retained tokens per phrase, matching the
+server's default post-tokenization text limit. This is separate from the
+64-term text/sparse nomination cursor limit: phrase probing uses one dynamically
+sized positional cursor per term and evaluates every retained term. Both formula
+ranking and raw feature export use this same validation. Larger phrases fail
+with an explicit term-count limit before statistics or candidate payload reads.
+Per-query read and scored-value budgets still apply; this does not expand
+candidate sets or change nomination limits. A stricter configured server token
+limit continues to reject the request during conversion.
+
 ## Ranking modes
 
 - RRF: existing rank-only fusion, kept for compatibility and paired baselines.
