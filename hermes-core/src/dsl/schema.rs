@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 /// Field identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -790,6 +791,11 @@ pub struct Schema {
     /// handles ordering).
     #[serde(default)]
     reorder_on_merge: bool,
+    /// Creation-time cap on retained tokens in each L1 phrase feature.
+    /// Absent (including legacy metadata) means 64. Nonzero u32 keeps the
+    /// serialized range identical on native and WASM targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_l1_phrase_terms: Option<NonZeroU32>,
     /// Index name used as the `index` label on metrics. Set from the SDL
     /// index name at parse time and overridden with the registry name at
     /// server-side index creation. Empty on old metadata → "unknown".
@@ -902,6 +908,13 @@ impl Schema {
         self.reorder_on_merge
     }
 
+    /// Maximum retained tokens per L1 phrase, for ranking and feature export.
+    /// This index policy is independent of nomination and server token limits.
+    pub fn max_l1_phrase_terms(&self) -> usize {
+        self.max_l1_phrase_terms
+            .map_or(64, |limit| limit.get() as usize)
+    }
+
     /// Index name for metric labels ("unknown" when not set — pre-existing
     /// metadata or programmatic schemas without a name).
     pub fn index_label(&self) -> &str {
@@ -954,6 +967,7 @@ pub struct SchemaBuilder {
     default_fields: Vec<String>,
     query_routers: Vec<QueryRouterRule>,
     reorder_on_merge: bool,
+    max_l1_phrase_terms: Option<NonZeroU32>,
     index_name: String,
 }
 
@@ -1271,6 +1285,13 @@ impl SchemaBuilder {
         self.reorder_on_merge = on;
     }
 
+    /// Set the persisted L1 phrase-term cap at index creation (default: 64).
+    /// Higher limits allow more per-phrase cursors and posting/position reads;
+    /// the shared candidate probe budgets and server token limit still apply.
+    pub fn set_max_l1_phrase_terms(&mut self, limit: NonZeroU32) {
+        self.max_l1_phrase_terms = Some(limit);
+    }
+
     /// Set the index name used as the metrics `index` label.
     pub fn set_index_name(&mut self, name: impl Into<String>) {
         self.index_name = name.into();
@@ -1312,6 +1333,7 @@ impl SchemaBuilder {
             default_fields,
             query_routers: self.query_routers,
             reorder_on_merge: self.reorder_on_merge,
+            max_l1_phrase_terms: self.max_l1_phrase_terms,
             index_name: self.index_name,
         }
     }

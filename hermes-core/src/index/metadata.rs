@@ -977,6 +977,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phrase_limits_load_from_legacy_and_configured_metadata_and_reject_corruption() {
+        let directory = crate::directories::RamDirectory::new();
+        let legacy = IndexMetadata::new(test_schema())
+            .serialize_to_bytes()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&legacy).contains("max_l1_phrase_terms"));
+        directory
+            .write(Path::new(INDEX_META_FILENAME), &legacy)
+            .await
+            .unwrap();
+        let loaded = IndexMetadata::load(&directory).await.unwrap();
+        assert_eq!(loaded.schema.max_l1_phrase_terms(), 64);
+        assert_eq!(loaded.serialize_to_bytes().unwrap(), legacy);
+
+        let mut configured: serde_json::Value = serde_json::from_slice(&legacy).unwrap();
+        configured["schema"]["max_l1_phrase_terms"] = 300.into();
+        directory
+            .write(
+                Path::new(INDEX_META_FILENAME),
+                &serde_json::to_vec(&configured).unwrap(),
+            )
+            .await
+            .unwrap();
+        let loaded = IndexMetadata::load(&directory).await.unwrap();
+        assert_eq!(loaded.schema.max_l1_phrase_terms(), 300);
+        loaded.save(&directory).await.unwrap();
+        assert_eq!(
+            IndexMetadata::load(&directory)
+                .await
+                .unwrap()
+                .schema
+                .max_l1_phrase_terms(),
+            300
+        );
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(4294967296u64),
+        ] {
+            configured["schema"]["max_l1_phrase_terms"] = invalid;
+            directory
+                .write(
+                    Path::new(INDEX_META_FILENAME),
+                    &serde_json::to_vec(&configured).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                IndexMetadata::load(&directory).await.is_err(),
+                "must not replace a corrupt cap with the default"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn load_refuses_metadata_stamped_with_a_newer_format_version() {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(test_schema());

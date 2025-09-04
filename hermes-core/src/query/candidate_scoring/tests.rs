@@ -7,15 +7,72 @@ use crate::structures::{SparseFormat, SparseVectorConfig, WeightQuantization};
 use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
 
 #[tokio::test]
+async fn index_creation_configures_phrase_limits_for_ranking_and_collection_after_reopen() {
+    for configured in [None, Some(1), Some(65), Some(300)] {
+        let option = configured
+            .map(|limit| format!("max_l1_phrase_terms: {limit}"))
+            .unwrap_or_default();
+        let schema = crate::parse_schema(&format!(
+            "index documents {{ {option} field body: text<simple> [indexed<token_position>] }}"
+        ))
+        .unwrap();
+        let field = schema.get_field("body").unwrap();
+        let directory = RamDirectory::new();
+        let config = IndexConfig::default();
+        let created = Index::create(directory.clone(), schema, config.clone())
+            .await
+            .unwrap();
+        drop(created);
+        let reopened = Index::open(directory.clone(), config).await.unwrap();
+        let searcher = reopened.reader().await.unwrap().searcher().await.unwrap();
+        let limit = configured.unwrap_or(64);
+        for ranked in [false, true] {
+            for count in [limit, limit + 1] {
+                let plan = CandidateScoringPlan {
+                    features: vec![CandidateFeature {
+                        name: "phrase".into(),
+                        scope: ScoreScope::Document,
+                        query: PhraseQuery::new(field, vec![b"term".to_vec(); count])
+                            .candidate_query()
+                            .unwrap(),
+                    }],
+                    backfill: true,
+                    model: ranked.then(|| {
+                        RankingModel::compile("phrase", &["phrase"], &Default::default()).unwrap()
+                    }),
+                    export_passages: 1,
+                    all_passages: !ranked,
+                    document_combiner: MultiValueCombiner::Max,
+                };
+                let result = searcher.score_candidates(&[], &plan, None).await;
+                if count == limit {
+                    assert!(result.unwrap().is_empty());
+                } else {
+                    let error =
+                        result.expect_err("reject oversized phrases even without candidates");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains(&format!("{count} terms; maximum is {limit}")),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
     let mut schema = Schema::builder();
+    schema.set_max_l1_phrase_terms(std::num::NonZeroU32::new(300).unwrap());
     let plain = schema.add_text_field_with_tokenizer("plain", true, false, "simple");
     let chunked = schema.add_text_field_with_tokenizer("chunked", true, false, "simple");
     schema.set_chunked(chunked, true);
     for field in [plain, chunked] {
         schema.set_positions(field, PositionMode::TokenPosition);
     }
-    let terms: Vec<_> = (0..256).map(|i| format!("term{i}")).collect();
+    let terms: Vec<_> = (0..300).map(|i| format!("term{i}")).collect();
     let mut wrong_word = terms.clone();
     wrong_word[64] = "different".into();
     let directory = RamDirectory::new();
@@ -45,7 +102,7 @@ async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
             .unwrap()
             .0;
         assert_eq!(candidates.len(), 4);
-        for count in [64, 65, 256] {
+        for count in [64, 65, 256, 300] {
             let phrase = PhraseQuery::text(field, &terms[..count].join(" "));
             let reference = searcher.search_with_positions(&phrase, 4).await.unwrap().0;
             let mut matching: Vec<_> = reference.iter().map(|hit| hit.doc_id).collect();
@@ -104,7 +161,7 @@ async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
         features: vec![CandidateFeature {
             name: "phrase".into(),
             scope: ScoreScope::Document,
-            query: PhraseQuery::new(plain, vec![b"term0".to_vec(); 257])
+            query: PhraseQuery::new(plain, vec![b"term0".to_vec(); 301])
                 .candidate_query()
                 .unwrap(),
         }],
@@ -118,7 +175,7 @@ async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
         .score_candidates(&[], &oversized, None)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("257 terms; maximum is 256"));
+    assert!(error.to_string().contains("301 terms; maximum is 300"));
 }
 
 #[tokio::test]
