@@ -71,6 +71,96 @@ async fn open(dir: RamDirectory) -> Index<RamDirectory> {
 }
 
 #[tokio::test]
+async fn small_limits_preserve_required_chunked_text_matches() {
+    use crate::query::{Query, ScorerOptions};
+
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    for _ in 0..10 {
+        writer
+            .add_document(doc(&f, "article", &["machine"]))
+            .unwrap();
+    }
+    writer
+        .add_document(doc(&f, "book", &["machine padding padding padding"]))
+        .unwrap();
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let term = || TermQuery::text(f.content, "machine");
+    let required = || TermQuery::text(f.kind, "book");
+    let queries = [
+        BooleanQuery::new().must(required()).must(term()),
+        BooleanQuery::new()
+            .must(term())
+            .must_not(TermQuery::text(f.kind, "article")),
+        BooleanQuery::new().must(required()).must(
+            BooleanQuery::new()
+                .should(term())
+                .should(TermQuery::text(f.content, "absent")),
+        ),
+    ];
+    for query in queries {
+        let (all, _) = searcher.search_with_positions(&query, 20).await.unwrap();
+        assert_eq!(
+            all.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            vec![10],
+            "{query}"
+        );
+        let (small, _) = searcher.search_with_positions(&query, 1).await.unwrap();
+        assert_eq!(
+            small.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            vec![10],
+            "{query}"
+        );
+        assert_eq!(small[0].score.to_bits(), all[0].score.to_bits());
+        assert_eq!(ordinals(&small[0]), vec![0]);
+
+        let segment = &searcher.segment_readers()[0];
+        let scorer = query
+            .scorer_with_options(segment, 1, ScorerOptions::with_positions())
+            .await
+            .unwrap();
+        assert_eq!(scorer.doc(), 10, "async scorer: {query}");
+        assert_eq!(scorer.score().to_bits(), all[0].score.to_bits());
+        #[cfg(feature = "sync")]
+        {
+            let scorer = query.scorer_sync(segment, 1).unwrap();
+            assert_eq!(scorer.doc(), 10, "sync scorer: {query}");
+            assert_eq!(scorer.score().to_bits(), all[0].score.to_bits());
+        }
+    }
+}
+
+#[tokio::test]
+async fn required_analyzed_fast_text_keeps_posting_match_semantics() {
+    let mut schema = SchemaBuilder::default();
+    let body = schema.add_text_field_with_tokenizer("body", true, false, "simple");
+    schema.set_chunked(body, true);
+    let category = schema.add_text_field_with_tokenizer("category", true, false, "simple");
+    schema.set_fast(category, true);
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), schema.build(), IndexConfig::default())
+        .await
+        .unwrap();
+    let mut document = Document::new();
+    document.add_text(body, "machine");
+    document.add_text(category, "research book");
+    writer.add_document(document).unwrap();
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let query = BooleanQuery::new()
+        .must(TermQuery::text(body, "machine"))
+        .must(TermQuery::text(category, "book"));
+    let results = index.search(&query, 1).await.unwrap();
+    assert_eq!(results.hits.len(), 1);
+    assert_eq!(results.hits[0].address.doc_id, 0);
+}
+
+#[tokio::test]
 async fn expired_budget_stops_chunked_term_and_phrase_construction() {
     use crate::query::{Query, ScorerOptions, SharedThreshold};
     let f = chunked_schema();

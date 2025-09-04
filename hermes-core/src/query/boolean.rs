@@ -225,7 +225,7 @@ macro_rules! boolean_plan {
         let global_stats: Option<&Arc<GlobalStats>> = $global_stats;
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
-        let scorer_options: super::ScorerOptions = $scorer_options;
+        let mut scorer_options: super::ScorerOptions = $scorer_options;
         if !$text_tuning.0.is_finite() || !(0.0..=1.0).contains(&$text_tuning.0) {
             return Err(crate::Error::Query(
                 "Text heap_factor must be finite and between 0 and 1".into(),
@@ -659,6 +659,14 @@ macro_rules! boolean_plan {
             // Priority: as_doc_predicate (fast-field O(1)) > as_doc_bitset
             // (posting-list materialization, O(1) lookup, sparse-SHOULD only)
             // > verifier scorer (seek).
+            super::planner::push_down_text_predicates(
+                must, should, must_not, reader, &mut scorer_options,
+            )?;
+            if scorer_options.stop_if_expired()
+                || scorer_options.eligibility.as_ref()
+                    .is_some_and(|bits| bits.next_set_bit(0).is_none()) {
+                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+            }
             let mut predicates: Vec<super::DocPredicate<'_>> = Vec::new();
             let mut must_verifiers: Vec<Box<dyn super::Scorer + '_>> = Vec::new();
             for q in must {
@@ -890,6 +898,14 @@ macro_rules! boolean_plan {
         }
 
         // ── 4. Standard BooleanScorer fallback ───────────────────────────
+        super::planner::push_down_text_predicates(
+            must, should, must_not, reader, &mut scorer_options,
+        )?;
+        if scorer_options.stop_if_expired()
+            || scorer_options.eligibility.as_ref()
+                .is_some_and(|bits| bits.next_set_bit(0).is_none()) {
+            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+        }
         let mut must_scorers = Vec::with_capacity(must.len());
         if must.is_empty() && should.is_empty() && !must_not.is_empty() {
             must_scorers.push(Box::new(super::AllDocSet::new(reader.num_docs()))
