@@ -828,6 +828,136 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fusion_fast_only_type_filter_preserves_rrf_formula_and_export_matches() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));
+    let mut schema = hermes_core::Schema::builder();
+    let title = schema.add_text_field_with_tokenizer("title", true, false, "simple");
+    let body = schema.add_text_field_with_tokenizer("body", true, false, "simple");
+    schema.set_chunked(body, true);
+    let kind = schema.add_text_field_with_tokenizer("type", false, false, "raw_ci");
+    schema.set_fast(kind, true);
+    let issued = schema.add_i64_field("issued_at", false, false);
+    schema.set_fast(issued, true);
+    registry
+        .create_index("l1-test", schema.build())
+        .await
+        .unwrap();
+    let writer = registry.get_writer("l1-test").await.unwrap();
+    {
+        let mut writer = writer.write().await;
+        for value in [
+            "journal-article",
+            "journal-article",
+            "journal-article",
+            "book",
+        ] {
+            let mut document = hermes_core::Document::new();
+            document.add_text(kind, value);
+            document.add_i64(issued, 2026);
+            document.add_text(
+                title,
+                if value == "book" {
+                    "other"
+                } else {
+                    "candidate"
+                },
+            );
+            document.add_text(
+                body,
+                if value == "book" {
+                    "other"
+                } else {
+                    "hemoglobin"
+                },
+            );
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    let index = registry.get_or_open_index("l1-test").await.unwrap();
+    index.reader().await.unwrap().reload().await.unwrap();
+    let service = SearchServiceImpl::new(registry.clone(), 1, limits());
+    let kind = Query {
+        query: Some(query::Query::Term(crate::proto::TermQuery {
+            field: "type".into(),
+            term: "journal-article".into(),
+            ..Default::default()
+        })),
+    };
+    let date = Query {
+        query: Some(query::Query::Range(crate::proto::RangeQuery {
+            field: "issued_at".into(),
+            min_i64: Some(2025),
+            ..Default::default()
+        })),
+    };
+    let plain = service
+        .search(Request::new(SearchRequest {
+            index_name: "l1-test".into(),
+            query: Some(kind.clone()),
+            limit: 3,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(plain.hits.len(), 3);
+    for mode in ["rrf", "formula", "export", "candidates"] {
+        let mut baseline = None;
+        for filters in [
+            vec![],
+            vec![date.clone()],
+            vec![kind.clone()],
+            vec![date.clone(), kind.clone()],
+        ] {
+            let mut request = named_l1_request();
+            request.limit = 3;
+            request.tracing = true;
+            request.l1.as_mut().unwrap().formula = "title + body".into();
+            if mode != "formula" {
+                request.l1 = None;
+            }
+            if mode == "rrf" || mode == "candidates" {
+                request.score_export = None;
+            }
+            let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut()
+            else {
+                unreachable!()
+            };
+            fusion.filters = filters;
+            fusion.candidate_depth = if mode == "rrf" { 0 } else { 3 };
+            if mode == "candidates" {
+                fusion.method = FusionMethod::FusionCandidates as i32;
+            }
+            let response = service
+                .search(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(response.hits.len(), 3, "{mode}");
+            if let Some(expected) = &baseline {
+                assert_eq!(
+                    &response.hits, expected,
+                    "{mode}: an eligibility-only filter preserves scores and ordinals"
+                );
+            } else {
+                baseline = Some(response.hits.clone());
+            }
+            let trace = response.trace.unwrap();
+            assert!(
+                trace.shards[0]
+                    .queries
+                    .iter()
+                    .all(|q| q.candidates.len() == 3),
+                "{mode}: all branches retain matching candidates"
+            );
+        }
+    }
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fusion_exclusion_only_filters_remove_self_before_candidate_selection() {
     let temp = tempfile::tempdir().unwrap();
     let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));

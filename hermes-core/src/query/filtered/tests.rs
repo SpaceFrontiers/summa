@@ -181,6 +181,114 @@ async fn one_word_phrase_filters_preserve_indexed_and_fast_only_field_matches() 
 }
 
 #[tokio::test]
+async fn fast_only_text_filters_preserve_matches_and_exclusions_before_nomination() {
+    for multi in [false, true] {
+        let mut schema = Schema::builder();
+        let body = schema.add_text_field_with_tokenizer("body", true, false, "simple");
+        schema.set_chunked(body, true);
+        let kind = schema.add_text_field_with_tokenizer("type", false, false, "raw_ci");
+        schema.set_fast(kind, true);
+        schema.set_multi(kind, multi);
+        let directory = RamDirectory::new();
+        let config = IndexConfig::default();
+        let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+            .await
+            .unwrap();
+        for value in [Some("journal-article"), Some("book"), None, Some("")] {
+            let mut document = Document::new();
+            document.add_text(body, "candidate");
+            if let Some(value) = value {
+                document.add_text(kind, value);
+                if multi && value == "book" {
+                    document.add_text(kind, "journal-article");
+                }
+            }
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let index = Index::open(directory, config).await.unwrap();
+        for (term, expected) in [
+            ("journal-article", vec![0]),
+            ("absent", vec![]),
+            ("", vec![3]),
+        ] {
+            let filter = TermQuery::text(kind, term);
+            assert_selected(&index, &filter, 4, &expected).await;
+            let query = FilteredQuery::new(
+                Arc::new(TermQuery::text(body, "candidate")),
+                vec![Arc::new(filter.clone())],
+            );
+            assert_selected(&index, &query, 1, &expected).await;
+            let excluded: Vec<_> = (0..4).filter(|doc| !expected.contains(doc)).collect();
+            let query = FilteredQuery::new(
+                Arc::new(TermQuery::text(body, "candidate")),
+                vec![Arc::new(BooleanQuery::new().must_not(filter))],
+            );
+            assert_selected(&index, &query, 4, &excluded).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn fast_only_text_filters_materialize_above_the_scorer_fallback_limit() {
+    let mut schema = Schema::builder();
+    let single = schema.add_text_field_with_tokenizer("type", false, false, "raw_ci");
+    schema.set_fast(single, true);
+    let directory = RamDirectory::new();
+    let config = IndexConfig {
+        num_indexing_threads: 1,
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    let last = crate::query::MAX_FUSION_CANDIDATE_SLOTS as u32;
+    for doc in 0..=last {
+        let mut document = Document::new();
+        if doc == 0 {
+            document.add_text(single, "book");
+        } else if doc == last {
+            document.add_text(single, "journal-article");
+        }
+        loop {
+            match writer.add_document(document.clone()) {
+                Ok(()) => break,
+                Err(crate::Error::QueueFull) => tokio::task::yield_now().await,
+                Err(error) => panic!("failed to enqueue fixture document: {error}"),
+            }
+        }
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(directory, config).await.unwrap();
+    {
+        let term = TermQuery::text(single, "journal-article");
+        let query = FilteredQuery::new(Arc::new(AllQuery), vec![Arc::new(term.clone())]);
+        assert_selected(&index, &query, 1, &[last]).await;
+        let disjunction = BooleanQuery::new()
+            .should(term)
+            .should(TermQuery::text(single, "book"));
+        let query = FilteredQuery::new(Arc::new(AllQuery), vec![Arc::new(disjunction)]);
+        assert_selected(&index, &query, 2, &[0, last]).await;
+    }
+    let reader = index.segment_readers().await.unwrap();
+    let budget =
+        crate::query::SharedThreshold::new().with_deadline(Some(std::time::Instant::now()));
+    let bits = TermQuery::text(single, "journal-article").as_doc_bitset_with_options(
+        &reader[0],
+        &ScorerOptions {
+            shared_threshold: Some(budget.clone()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        bits.is_none(),
+        "expired scans cannot supply an empty or partial filter"
+    );
+    assert!(budget.truncated());
+}
+
+#[tokio::test]
 async fn small_limits_filter_required_plain_text_disjunctions_before_top_k() {
     let (index, text, allowed, _, _) = fixture().await;
     let query = BooleanQuery::new()
@@ -393,6 +501,43 @@ async fn expired_common_filter_skips_materialization_and_marks_truncation() {
             .doc(),
         crate::TERMINATED
     );
+}
+
+#[test]
+fn filter_enumeration_handles_a_scorer_expiring_between_document_reads() {
+    struct ExpiringScorer(std::sync::atomic::AtomicBool);
+    impl crate::query::docset::DocSet for ExpiringScorer {
+        fn doc(&self) -> u32 {
+            if self.0.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::TERMINATED
+            } else {
+                0
+            }
+        }
+        fn advance(&mut self) -> u32 {
+            crate::TERMINATED
+        }
+        fn seek(&mut self, _target: u32) -> u32 {
+            crate::TERMINATED
+        }
+        fn size_hint(&self) -> u32 {
+            1
+        }
+    }
+    impl Scorer for ExpiringScorer {
+        fn score(&self) -> f32 {
+            1.0
+        }
+    }
+    // A deadline-aware doc() can become TERMINATED without advance(). Never
+    // re-read it as an unchecked bitmap offset after testing the first value.
+    let bits = enumerate_filter(
+        Box::new(ExpiringScorer(std::sync::atomic::AtomicBool::new(false))),
+        1,
+        &ScorerOptions::default(),
+    )
+    .unwrap();
+    assert!(bits.contains(0));
 }
 
 #[cfg(feature = "sync")]
