@@ -28,6 +28,8 @@ use crate::tokenizer::BoxedTokenizer;
 
 use super::IndexConfig;
 
+mod mutations;
+
 /// Default memory budget for WASM (32 MB — conservative for browser).
 const DEFAULT_WASM_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
 
@@ -58,6 +60,12 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pending_segments: Vec<(String, u32)>,
     /// Memory budget per builder (bytes)
     memory_budget: usize,
+    primary_key: Option<super::primary_key::PrimaryKeyIndex>,
+    /// A consumed/poisoned builder cannot be retried without losing replacements.
+    poisoned: bool,
+    publication_pending: bool,
+    /// Claims survive failed/cancelled output writes; cleanup runs on retry/abort.
+    owned_outputs: std::collections::HashSet<String>,
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
@@ -74,7 +82,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
-        Self::reject_primary_key_schema(&schema)?;
         crate::dsl::reject_removed_vector_index_types(&schema)
             .map_err(crate::error::Error::Schema)?;
         let directory = Arc::new(directory);
@@ -82,13 +89,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let metadata = IndexMetadata::new((*schema).clone());
         metadata.save(directory.as_ref()).await?;
 
-        Ok(Self::new_with_parts(
-            directory,
-            schema,
-            config,
-            builder_config,
-            metadata,
-        ))
+        Self::new_with_parts(directory, schema, config, builder_config, metadata).await
     }
 
     /// Open an existing index for writing.
@@ -105,25 +106,21 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ) -> Result<Self> {
         let directory = Arc::new(directory);
         let metadata = IndexMetadata::load(directory.as_ref()).await?;
-        Self::reject_primary_key_schema(&metadata.schema)?;
         let schema = Arc::new(metadata.schema.clone());
 
-        Ok(Self::new_with_parts(
-            directory,
-            schema,
-            config,
-            builder_config,
-            metadata,
-        ))
+        let mut writer =
+            Self::new_with_parts(directory, schema, config, builder_config, metadata).await?;
+        writer.reclaim_orphans().await?;
+        Ok(writer)
     }
 
-    fn new_with_parts(
+    async fn new_with_parts(
         directory: Arc<D>,
         schema: Arc<Schema>,
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
         metadata: IndexMetadata,
-    ) -> Self {
+    ) -> Result<Self> {
         let registry = crate::tokenizer::TokenizerRegistry::new();
         let mut tokenizers = FxHashMap::default();
         for (field, entry) in schema.fields() {
@@ -139,7 +136,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .max_indexing_memory_bytes
             .min(DEFAULT_WASM_MEMORY_BUDGET);
 
-        Self {
+        let mut writer = Self {
             directory,
             schema,
             builder_config,
@@ -148,7 +145,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             metadata,
             pending_segments: Vec::new(),
             memory_budget,
-        }
+            primary_key: None,
+            poisoned: false,
+            publication_pending: false,
+            owned_outputs: Default::default(),
+        };
+        writer.initialize_primary_key().await?;
+        Ok(writer)
     }
 
     /// Get the schema.
@@ -169,25 +172,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Set tokenizer for a field.
     pub fn set_tokenizer<T: crate::tokenizer::Tokenizer>(&mut self, field: Field, tokenizer: T) {
         self.tokenizers.insert(field, Box::new(tokenizer));
-    }
-
-    /// Primary-key deduplication is native-only (`index/primary_key.rs` does
-    /// not exist on the wasm branch), so a `[primary]` schema constraint would
-    /// be silently unenforced here: duplicate keys would be durably committed.
-    /// Fail loud at writer creation instead.
-    fn reject_primary_key_schema(schema: &Schema) -> Result<()> {
-        if let Some(field) = schema.primary_field() {
-            let name = schema
-                .get_field_entry(field)
-                .map(|e| e.name.as_str())
-                .unwrap_or("<unknown>");
-            return Err(crate::Error::Schema(format!(
-                "schema declares primary key field '{name}', but primary-key \
-                 deduplication is not supported by the WASM IndexWriter; remove \
-                 the [primary] attribute from the schema or index natively"
-            )));
-        }
-        Ok(())
     }
 
     fn ensure_builder(&mut self) -> Result<&mut SegmentBuilder> {
@@ -324,9 +308,13 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// All-or-nothing: an invalid document is rejected without mutating any
     /// writer/builder state, so buffered documents stay committable.
     pub async fn add_document(&mut self, doc: Document) -> Result<()> {
-        // Validate before touching the builder — see `validate_document`.
+        self.ensure_healthy()?;
         self.validate_document(&doc)?;
         self.ensure_builder()?;
+        if let Some(pk) = &self.primary_key {
+            pk.check_and_insert(&doc)?;
+        }
+        self.poisoned = true;
         let b = self.builder.as_mut().unwrap();
         if let Err(e) = b.add_document(doc) {
             // Defensive: `validate_document` mirrors every fallible path in
@@ -334,8 +322,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             // If a new fallible path slips through, the builder is poisoned
             // (doc id advanced without a store write) and committing it would
             // fail with a doc-count mismatch, silently losing every buffered
-            // document. Drop the poisoned builder loudly and keep the writer
-            // (and already-flushed pending segments) usable.
+            // document. Drop the poisoned builder loudly. The transaction must be aborted
+            // before this writer can accept or publish further mutations.
             let buffered = self.builder.take().map(|b| b.num_docs()).unwrap_or(0);
             let lost = buffered.saturating_sub(1);
             log::warn!(
@@ -345,9 +333,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             );
             return Err(crate::Error::Internal(format!(
                 "document failed mid-indexing and poisoned the segment builder: {e}; \
-                 {lost} buffered document(s) were discarded — re-add and commit them"
+                 {lost} buffered document(s) were discarded; abort the pending transaction before continuing"
             )));
         }
+
+        self.poisoned = false;
 
         // Check memory budget (with 20% headroom for build overhead)
         let effective_budget = self.memory_budget * 4 / 5;
@@ -369,55 +359,30 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     /// Flush the current builder to a segment on disk.
     async fn flush_builder(&mut self) -> Result<()> {
-        if let Some(builder) = self.builder.take() {
-            if builder.num_docs() > 0 {
-                let segment_id = SegmentId::new();
-                let segment_hex = segment_id.to_hex();
-                let doc_count = builder.num_docs();
+        if let Some(builder) = self.builder.take()
+            && builder.num_docs() > 0
+        {
+            let segment_id = SegmentId::new();
+            let segment_hex = segment_id.to_hex();
+            let doc_count = builder.num_docs();
 
-                log::info!(
-                    "[wasm_writer] index={} building segment: id={} docs={}",
-                    self.schema.index_label(),
-                    segment_hex,
-                    doc_count
-                );
+            log::info!(
+                "[wasm_writer] index={} building segment: id={} docs={}",
+                self.schema.index_label(),
+                segment_hex,
+                doc_count
+            );
 
-                builder
-                    .build(self.directory.as_ref(), segment_id, None)
-                    .await?;
+            self.owned_outputs.insert(segment_hex.clone());
+            self.poisoned = true;
+            builder
+                .build(self.directory.as_ref(), segment_id, None)
+                .await?;
 
-                self.pending_segments.push((segment_hex, doc_count));
-            }
+            self.pending_segments.push((segment_hex, doc_count));
+            self.poisoned = false;
         }
         Ok(())
-    }
-
-    /// Commit all pending documents and register segments in metadata.
-    ///
-    /// Returns `true` if new segments were committed.
-    pub async fn commit(&mut self) -> Result<bool> {
-        self.flush_builder().await?;
-
-        if self.pending_segments.is_empty() {
-            return Ok(false);
-        }
-
-        // Stage the fallible durable save on a clone first: if the save
-        // fails, in-memory metadata and pending_segments are left untouched,
-        // so the caller can retry commit() without stranding the built
-        // segments (durable-before-visible, same invariant as the native
-        // SegmentManager::commit).
-        let mut next = self.metadata.clone();
-        for (seg_hex, num_docs) in &self.pending_segments {
-            next.add_segment(seg_hex.clone(), *num_docs);
-        }
-        next.save(self.directory.as_ref()).await?;
-
-        // The save succeeded — publish the new state in memory.
-        self.metadata = next;
-        self.pending_segments.clear();
-
-        Ok(true)
     }
 
     /// Number of documents in the current (uncommitted) builder.

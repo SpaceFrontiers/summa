@@ -741,9 +741,26 @@ impl SearchService for SearchServiceImpl {
         vector_stats.sort_by(|a, b| a.field_name.cmp(&b.field_name));
 
         let text_fields = text_field_infos(&index.schema());
+        let (physical_num_docs, num_deleted_docs) =
+            searcher
+                .segment_readers()
+                .iter()
+                .fold((0u64, 0u64), |(physical, deleted), segment| {
+                    (
+                        physical + u64::from(segment.num_docs()),
+                        deleted + u64::from(segment.num_docs() - segment.num_live_docs()),
+                    )
+                });
         Ok(Response::new(GetIndexInfoResponse {
             index_name: req.index_name,
             num_docs: searcher.num_docs(),
+            physical_num_docs,
+            num_deleted_docs,
+            deleted_ratio: if physical_num_docs == 0 {
+                0.0
+            } else {
+                num_deleted_docs as f64 / physical_num_docs as f64
+            },
             num_segments: searcher.segment_readers().len() as u32,
             schema: schema_str,
             memory_stats: Some(memory_stats),

@@ -739,14 +739,15 @@ pub async fn collect_segment_with_limit_seeded<C: Collector>(
     initial_threshold: f32,
 ) -> Result<()> {
     let options = super::ScorerOptions {
-        eligibility: None,
+        eligibility: reader.alive_docs(),
         collect_positions: collector.needs_positions(),
         initial_threshold,
         shared_threshold: None,
         lsp_plan: None,
         global_stats: None,
     };
-    let mut scorer = query.scorer_with_options(reader, limit, options).await?;
+    let scorer = query.scorer_with_options(reader, limit, options).await?;
+    let mut scorer = super::filtered::filtered(scorer, reader.alive_docs());
     drive_scorer(scorer.as_mut(), collector);
     Ok(())
 }
@@ -836,14 +837,15 @@ pub fn collect_segment_with_limit_seeded_sync<C: Collector>(
     initial_threshold: f32,
 ) -> Result<()> {
     let options = super::ScorerOptions {
-        eligibility: None,
+        eligibility: reader.alive_docs(),
         collect_positions: collector.needs_positions(),
         initial_threshold,
         shared_threshold: None,
         lsp_plan: None,
         global_stats: None,
     };
-    let mut scorer = query.scorer_sync_with_options(reader, limit, options)?;
+    let scorer = query.scorer_sync_with_options(reader, limit, options)?;
+    let mut scorer = super::filtered::filtered(scorer, reader.alive_docs());
     drive_scorer(scorer.as_mut(), collector);
     Ok(())
 }
@@ -911,14 +913,15 @@ pub(crate) fn search_segment_shared_sync_planned(
 ) -> Result<(Vec<SearchResult>, u32)> {
     let segment_limit = limit.min(reader.num_docs() as usize);
     let options = super::ScorerOptions {
-        eligibility: None,
+        eligibility: reader.alive_docs(),
         collect_positions,
         initial_threshold: shared_threshold.get(),
         shared_threshold: Some(shared_threshold.clone()),
         lsp_plan,
         global_stats,
     };
-    let mut scorer = query.scorer_sync_with_options(reader, segment_limit, options)?;
+    let scorer = query.scorer_sync_with_options(reader, segment_limit, options)?;
+    let mut scorer = super::filtered::filtered(scorer, reader.alive_docs());
     Ok(top_k_from_scorer(
         scorer.as_mut(),
         segment_limit,
@@ -1007,16 +1010,17 @@ pub(crate) async fn search_segment_shared_planned(
 ) -> Result<(Vec<SearchResult>, u32)> {
     let segment_limit = limit.min(reader.num_docs() as usize);
     let options = super::ScorerOptions {
-        eligibility: None,
+        eligibility: reader.alive_docs(),
         collect_positions,
         initial_threshold: shared_threshold.get(),
         shared_threshold: Some(shared_threshold.clone()),
         lsp_plan,
         global_stats,
     };
-    let mut scorer = query
+    let scorer = query
         .scorer_with_options(reader, segment_limit, options)
         .await?;
+    let mut scorer = super::filtered::filtered(scorer, reader.alive_docs());
     Ok(top_k_from_scorer(
         scorer.as_mut(),
         segment_limit,

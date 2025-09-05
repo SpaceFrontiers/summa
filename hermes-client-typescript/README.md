@@ -285,3 +285,42 @@ union before global inference. Exports that exceed budgets fail explicitly.
 Expressions are bounded to 4 KiB, 256 tokens and 32 parenthesis levels. Invalid
 variables, invalid syntax and non-finite predictions fail explicitly. Servers
 and brokers must support `formula_v1` (`candidate_scoring_version=3`).
+
+### Compact deleted rows
+
+```typescript
+await client.forceMerge("articles"); // Retain deletion masks.
+await client.forceMerge("articles", undefined, true); // Physically compact final outputs.
+const info = await client.getIndexInfo("articles");
+console.log(info.numDeletedDocs, info.physicalNumDocs, info.deletedRatio);
+```
+
+The optional second argument remains the timeout in milliseconds. Compaction
+also handles a singleton and can change document addresses and BM25 statistics.
+
+### Delete and upsert documents
+
+With a text field declared `[primary]`, delete by exact key and replace by passing
+the complete document. Every chunk belongs to its document and is deleted with it.
+
+```typescript
+await client.deleteDocument("articles", "obsolete-key");
+await client.upsertDocument("articles", {
+  id: "article-42",
+  body: ["replacement chunk one", "replacement chunk two"],
+});
+await client.commit("articles");
+
+const result = await client.deleteDocuments("articles", ["old-a", "old-b"]);
+console.log(result.acceptedCount, result.errors); // errors: [{ index, error }]
+await client.commit("articles"); // publishes accepted operations
+```
+
+`upsertDocuments` accepts a list of full replacements and returns the same
+`DocumentMutationResult`. Single-item helpers throw on rejection. Missing deletes
+are accepted; upserts insert missing keys. Commit before replacing/deleting a key with
+a pending insertion. Limits are 100,000 deletion keys / 8 MiB key bytes and 1,000
+replacement documents / 32 MiB encoded bytes. Normal deadlines apply; an expired
+RPC can have staged work, so do not blindly retry replacements. Broker commits
+are atomic within each partition. Physical cleanup remains
+`await client.forceMerge("articles", undefined, true)`.

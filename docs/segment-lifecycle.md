@@ -35,6 +35,13 @@ reorder also claim all sources, which prevents overlapping rewrites of the same
 segment. Newly generated outputs are claimed before their first file write, so
 partial builders are protected from an orphan sweep too.
 
+Row deletion uses this same protocol. Each immutable `.del` generation has an
+independent tracked ID referenced by segment metadata; snapshots retain both the
+data segment and its exact mask. Layout-preserving rewrites carry the latest
+mask, while compaction checks its captured visibility before replacement. The
+`.rowstats` file belongs to its data segment's ordinary file set. See
+[row deletion and compaction](row-deletion.md) for the format and API contract.
+
 ## Metadata is the commit point
 
 Metadata mutations are serialized. A generation is written and fsynced as
@@ -198,3 +205,20 @@ Any new segment-producing or deleting path must answer all of these:
   readers/deferred deletion no longer own the ID?
 - Is a deterministic corrupt source quarantined while transient failures back
   off and wake themselves?
+
+## Compaction admission and visibility
+
+Ordinary merge publication concatenates current source visibility masks while
+retaining physical row counts. Address-preserving single-source rewrites reuse
+the exact immutable mask generation, transferring its metadata ownership before
+retiring the source. Explicit compaction claims the source/output and snapshots
+its mask; publication rejects a changed visibility generation. It writes directly
+from the source and carries global/local maintenance and optimizer-class permits
+inside the owned lifecycle task until blocking work drains. The server's existing
+optimizer uses nonblocking admission and a completion cooldown for automatic
+compaction. Force-merge RPC admission remains cancellable while waiting for the
+writer; after acquiring it, the owned operation retains its guard through reader
+refresh even after client cancellation. CLI row-mutation and merge commands stop
+workers, release writer snapshots, and await core cleanup before exiting their
+runtime, on both successful and failed maintenance. See
+[row deletion](row-deletion.md) for the API and ordering rules.

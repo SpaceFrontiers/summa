@@ -1818,3 +1818,101 @@ mod tests {
         );
     }
 }
+
+#[cfg(feature = "native")]
+impl SparseBlock {
+    /// Rewrite address columns while preserving original quantizer parameters
+    /// and code bytes, including when deleted rows held the old extrema.
+    pub(crate) fn remap_documents(
+        &self,
+        remap: impl Fn(DocId) -> Option<DocId>,
+    ) -> io::Result<Option<Self>> {
+        let docs = self.decode_doc_ids();
+        let ordinals = self.decode_ordinals();
+        let mut kept = Vec::new();
+        let mut postings = Vec::new();
+        for (i, doc) in docs.into_iter().enumerate() {
+            if let Some(new) = remap(doc) {
+                kept.push(i);
+                postings.push((new, ordinals[i], 0.0));
+            }
+        }
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        let mut output = Self::from_postings(&postings, WeightQuantization::Float32)?;
+        let source = self.weights_data.as_slice();
+        let mut weights = Vec::new();
+        match self.header.weight_quant {
+            WeightQuantization::Float32 | WeightQuantization::Float16 => {
+                let width = if self.header.weight_quant == WeightQuantization::Float32 {
+                    4
+                } else {
+                    2
+                };
+                for i in kept {
+                    weights.extend_from_slice(&source[i * width..(i + 1) * width]);
+                }
+            }
+            WeightQuantization::UInt8 => {
+                weights.extend_from_slice(&source[..8]);
+                for i in kept {
+                    weights.push(source[8 + i]);
+                }
+            }
+            WeightQuantization::UInt4 => {
+                weights.extend_from_slice(&source[..8]);
+                for (new, old) in kept.into_iter().enumerate() {
+                    let nibble = (source[8 + old / 2] >> (old % 2 * 4)) & 15;
+                    if new % 2 == 0 {
+                        weights.push(nibble);
+                    } else {
+                        *weights.last_mut().unwrap() |= nibble << 4;
+                    }
+                }
+            }
+        }
+        output.header.weight_quant = self.header.weight_quant;
+        output.header.max_weight = self.header.max_weight;
+        output.weights_data = OwnedBytes::new(weights);
+        Ok(Some(output))
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+#[test]
+fn deletion_remapping_preserves_quantized_weights_and_ordinals() {
+    for quant in [
+        WeightQuantization::Float32,
+        WeightQuantization::Float16,
+        WeightQuantization::UInt8,
+        WeightQuantization::UInt4,
+    ] {
+        let input: Vec<_> = (0..255u32)
+            .map(|i| (i / 2, (i % 2) as u16, 0.1 + i as f32 / 7.0))
+            .collect();
+        let source = SparseBlock::from_postings(&input, quant).unwrap();
+        let source_weights = source.decode_weights();
+        let compacted = source
+            .remap_documents(|doc| (doc % 3 == 2).then_some(doc / 3))
+            .unwrap()
+            .unwrap();
+        let expected: Vec<_> = input
+            .iter()
+            .enumerate()
+            .filter(|(_, (doc, _, _))| doc % 3 == 2)
+            .map(|(i, (_, ordinal, _))| (*ordinal, source_weights[i].to_bits()))
+            .collect();
+        assert_eq!(
+            compacted
+                .decode_ordinals()
+                .into_iter()
+                .zip(compacted.decode_weights().into_iter().map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        if matches!(quant, WeightQuantization::UInt8 | WeightQuantization::UInt4) {
+            assert_eq!(&compacted.weights_data[..8], &source.weights_data[..8]);
+        }
+    }
+}

@@ -22,6 +22,10 @@ use hermes_core::segment::pin::{PinMode, PinPolicy, set_pin_policy};
 
 pub mod proto {
     tonic::include_proto!("hermes");
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../hermes-proto/mutations.rs"
+    ));
 }
 
 use proto::index_service_server::IndexServiceServer;
@@ -135,6 +139,18 @@ struct Args {
     /// follow-up deepening.
     #[arg(long, default_value = "3")]
     optimizer_max_unconverged_passes: u32,
+
+    /// Compact segments with at least this deleted/physical row ratio (0 disables).
+    #[arg(long, default_value = "0.30")]
+    optimizer_compaction_deleted_ratio: f64,
+
+    /// Minimum wait after an automatic compaction completes, across all indexes.
+    #[arg(long, default_value = "60")]
+    optimizer_compaction_cooldown_secs: u64,
+
+    /// Scratch cap (MiB) per manual or automatic physical compaction.
+    #[arg(long, default_value = "256")]
+    compaction_memory_budget_mb: usize,
 
     /// Wall-clock budget in seconds for merge-time BP reorder (0 = unbudgeted).
     /// A truncated pass still produces a valid, better-ordered segment; it is
@@ -591,6 +607,20 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .bp_memory_budget_mb
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--bp-memory-budget-mb is too large"))?;
+    if !args.optimizer_compaction_deleted_ratio.is_finite()
+        || !(0.0..=1.0).contains(&args.optimizer_compaction_deleted_ratio)
+    {
+        anyhow::bail!(
+            "--optimizer-compaction-deleted-ratio must be finite and in 0..=1 (0 disables)"
+        );
+    }
+    let compaction_memory_budget_bytes = args
+        .compaction_memory_budget_mb
+        .checked_mul(1024 * 1024)
+        .filter(|&bytes| bytes >= 1024 * 1024)
+        .ok_or_else(|| {
+            anyhow::anyhow!("--compaction-memory-budget-mb must be at least 1 and fit usize")
+        })?;
     let merge_bp_time_budget = merge_bp_time_budget(args.merge_bp_budget_secs);
     let concurrent_reorder_passes = args
         .optimizer_concurrent_passes
@@ -664,6 +694,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         background_merge_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent_merges)),
         merge_bp_time_budget,
         bp_memory_budget_bytes,
+        compaction_memory_budget_bytes,
         background_reorder_permits: Arc::new(hermes_core::index::ReorderConcurrencyGate::new(
             concurrent_reorder_passes,
         )),
@@ -714,6 +745,9 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             partial_min_partition_docs: args.optimizer_partial_min_partition_docs,
             unconverged_cooldown: Duration::from_secs(args.optimizer_unconverged_cooldown_secs),
             max_unconverged_passes: args.optimizer_max_unconverged_passes,
+            compaction_deleted_ratio: args.optimizer_compaction_deleted_ratio,
+            compaction_cooldown: Duration::from_secs(args.optimizer_compaction_cooldown_secs),
+            compaction_memory_budget: compaction_memory_budget_bytes,
         },
         shutdown_rx,
     );

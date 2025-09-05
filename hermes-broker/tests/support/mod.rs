@@ -225,6 +225,28 @@ impl IndexService for MockBackend {
         }))
     }
 
+    async fn delete_documents(
+        &self,
+        request: Request<DeleteDocumentsRequest>,
+    ) -> Result<Response<DocumentMutationResponse>, Status> {
+        self.check_available()?;
+        Ok(Response::new(DocumentMutationResponse {
+            accepted_count: request.into_inner().primary_keys.len() as u32,
+            errors: vec![],
+        }))
+    }
+
+    async fn upsert_documents(
+        &self,
+        request: Request<UpsertDocumentsRequest>,
+    ) -> Result<Response<DocumentMutationResponse>, Status> {
+        self.check_available()?;
+        Ok(Response::new(DocumentMutationResponse {
+            accepted_count: request.into_inner().documents.len() as u32,
+            errors: vec![],
+        }))
+    }
+
     async fn commit(
         &self,
         request: Request<CommitRequest>,

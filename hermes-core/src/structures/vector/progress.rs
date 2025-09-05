@@ -67,11 +67,11 @@ impl PhaseProgress {
     /// Called from sequential outer loops only, so it never contends.
     #[allow(unused_variables)]
     pub(crate) fn advance(&mut self, done: usize) {
-        if !self.report {
-            return;
-        }
         #[cfg(feature = "native")]
         {
+            if !self.report {
+                return;
+            }
             let now = Instant::now();
             if now.duration_since(self.last_report) < PROGRESS_INTERVAL || done == 0 {
                 return;

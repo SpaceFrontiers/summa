@@ -1088,10 +1088,6 @@ pub async fn load_fast_fields_file<D: Directory>(
     files: &SegmentFiles,
     schema: &Schema,
 ) -> Result<FxHashMap<u32, crate::structures::fast_field::FastFieldReader>> {
-    use crate::structures::fast_field::{
-        FastFieldReader, read_fast_field_footer, read_fast_field_toc,
-    };
-
     // Skip if no fast fields in schema
     let has_fast = schema.fields().any(|(_, entry)| entry.fast);
     if !has_fast {
@@ -1108,6 +1104,15 @@ pub async fn load_fast_fields_file<D: Directory>(
         Err(e) => return Err(crate::Error::Io(e)),
     };
 
+    load_columns(handle).await
+}
+
+pub(crate) async fn load_columns(
+    handle: crate::directories::FileHandle,
+) -> Result<FxHashMap<u32, crate::structures::fast_field::FastFieldReader>> {
+    use crate::structures::fast_field::{
+        FastFieldReader, read_fast_field_footer, read_fast_field_toc,
+    };
     let file_data = handle.read_bytes().await?;
     if file_data.is_empty() {
         return Ok(FxHashMap::default());

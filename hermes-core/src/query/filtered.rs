@@ -76,7 +76,7 @@ fn fallback_limit(reader: &SegmentReader) -> Result<usize> {
     }
     Ok(reader.num_docs() as usize)
 }
-fn filtered<'a>(
+pub(super) fn filtered<'a>(
     scorer: Box<dyn Scorer + 'a>,
     bits: Option<Arc<DocBitset>>,
 ) -> Box<dyn Scorer + 'a> {

@@ -8,6 +8,7 @@
 //! to re-iterate every committed key. On load, only keys from segments that
 //! appeared since the last persist are iterated.
 
+#[cfg(feature = "native")]
 use std::collections::HashSet;
 
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -15,6 +16,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::dsl::Field;
 use crate::error::{Error, Result};
+#[cfg(feature = "native")]
 use crate::segment::SegmentSnapshot;
 use crate::structures::BloomFilter;
 
@@ -25,10 +27,36 @@ const BLOOM_BITS_PER_KEY: usize = 10;
 const BLOOM_HEADROOM: usize = 100_000;
 
 /// File name for the persisted primary-key bloom filter.
+#[cfg(feature = "native")]
 pub const PK_BLOOM_FILE: &str = "pk_bloom.bin";
 
 /// Magic bytes for the persisted bloom file.
 const PK_BLOOM_MAGIC: u32 = 0x504B424C; // "PKBL"
+
+/// The reservation, deletion target and persisted single-value column must
+/// identify the same key. Validate before mutating any writer state.
+pub(super) fn document_key(doc: &crate::dsl::Document, field: crate::Field) -> Result<&str> {
+    let mut values = doc.get_all(field);
+    let key = values
+        .next()
+        .ok_or_else(|| Error::Document("Missing primary key field".into()))?
+        .as_text()
+        .ok_or_else(|| Error::Document("Primary key must be text".into()))?;
+    if values.next().is_some() {
+        return Err(Error::Document(
+            "primary key requires exactly one text value".into(),
+        ));
+    }
+    if key.is_empty() {
+        return Err(Error::Document("Primary key must not be empty".into()));
+    }
+    if key.len() > 64 * 1024 {
+        return Err(Error::Document(
+            "primary key must contain 1..=65536 bytes".into(),
+        ));
+    }
+    Ok(key)
+}
 
 /// Lightweight per-segment data for primary key lookups.
 ///
@@ -36,7 +64,36 @@ const PK_BLOOM_MAGIC: u32 = 0x504B424C; // "PKBL"
 /// This avoids loading DimensionTables, SSTable FSTs, bloom filters, etc.
 pub struct PkSegmentData {
     pub segment_id: String,
+    pub deletion_meta: Option<crate::segment::DeletionMeta>,
+    pub alive_docs: Option<std::sync::Arc<crate::query::DocBitset>>,
+    pub live_key_ordinals: Option<crate::query::DocBitset>,
     pub fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
+}
+
+impl PkSegmentData {
+    // One scan at visibility refresh; duplicate checks stay dictionary lookup
+    // plus O(1) membership, even for a heavily deleted segment.
+    pub(crate) fn prepare_live_keys(&mut self, field: Field) {
+        if self.live_key_ordinals.is_some() {
+            return;
+        }
+        let Some(alive) = &self.alive_docs else {
+            return;
+        };
+        let Some(ff) = self.fast_fields.get(&field.0) else {
+            return;
+        };
+        let Some(dict) = ff.text_dict() else {
+            return;
+        };
+        let mut keys = crate::query::DocBitset::new(dict.len());
+        ff.scan_single_values(|doc, ordinal| {
+            if alive.contains(doc) && ordinal < u64::from(dict.len()) {
+                keys.set(ordinal as u32);
+            }
+        });
+        self.live_key_ordinals = Some(keys);
+    }
 }
 
 /// Thread-safe primary key deduplication index.
@@ -54,12 +111,15 @@ pub struct PrimaryKeyIndex {
     /// Only mutated by `&mut self` methods (refresh/clear) — no lock needed.
     committed_data: Vec<PkSegmentData>,
     /// Holds ref counts so segments aren't deleted while we hold readers.
+    #[cfg(feature = "native")]
     _snapshot: Option<SegmentSnapshot>,
 }
 
 struct PrimaryKeyState {
     bloom: BloomFilter,
     uncommitted: FxHashSet<Vec<u8>>,
+    deletes: FxHashSet<String>,
+    delete_bytes: usize,
 }
 
 impl PrimaryKeyIndex {
@@ -70,7 +130,17 @@ impl PrimaryKeyIndex {
     /// alive so segments aren't deleted while we hold data.
     ///
     /// **CPU-intensive** — call from `spawn_blocking`, not the async runtime.
+    #[cfg(feature = "native")]
     pub fn new(field: Field, pk_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) -> Self {
+        let mut index = Self::build(field, pk_data);
+        index._snapshot = Some(snapshot);
+        index
+    }
+
+    pub(crate) fn build(field: Field, mut pk_data: Vec<PkSegmentData>) -> Self {
+        for data in &mut pk_data {
+            data.prepare_live_keys(field);
+        }
         // Count total unique keys across all segments for bloom sizing.
         let mut total_keys: usize = 0;
         for data in &pk_data {
@@ -106,9 +176,12 @@ impl PrimaryKeyIndex {
             state: parking_lot::Mutex::new(PrimaryKeyState {
                 bloom,
                 uncommitted: FxHashSet::default(),
+                deletes: FxHashSet::default(),
+                delete_bytes: 0,
             }),
             committed_data: pk_data,
-            _snapshot: Some(snapshot),
+            #[cfg(feature = "native")]
+            _snapshot: None,
         }
     }
 
@@ -117,12 +190,16 @@ impl PrimaryKeyIndex {
     /// Skips dictionary iteration because the caller has already extended the
     /// persisted bloom with any segments it did not cover. `pk_data` contains
     /// data for all current segments.
+    #[cfg(feature = "native")]
     pub fn from_persisted(
         field: Field,
         bloom: BloomFilter,
-        pk_data: Vec<PkSegmentData>,
+        mut pk_data: Vec<PkSegmentData>,
         snapshot: SegmentSnapshot,
     ) -> Self {
+        for data in &mut pk_data {
+            data.prepare_live_keys(field);
+        }
         log::info!(
             "[primary_key] bloom filter loaded from cache: {}",
             crate::format_bytes(bloom.size_bytes() as u64),
@@ -133,6 +210,8 @@ impl PrimaryKeyIndex {
             state: parking_lot::Mutex::new(PrimaryKeyState {
                 bloom,
                 uncommitted: FxHashSet::default(),
+                deletes: FxHashSet::default(),
+                delete_bytes: 0,
             }),
             committed_data: pk_data,
             _snapshot: Some(snapshot),
@@ -153,7 +232,69 @@ impl PrimaryKeyIndex {
     /// Memory used by the bloom filter and uncommitted set.
     pub fn memory_bytes(&self) -> usize {
         let state = self.state.lock();
-        state.bloom.size_bytes() + state.uncommitted.len() * 32 // estimate 32 bytes per key
+        state.bloom.size_bytes()
+            + state.uncommitted.len() * 32
+            + state.delete_bytes
+            + state.deletes.capacity() * std::mem::size_of::<String>()
+            + self
+                .committed_data
+                .iter()
+                .map(|data| {
+                    data.alive_docs
+                        .as_ref()
+                        .map_or(0, |bits| bits.bits.len() * 8)
+                        + data
+                            .live_key_ordinals
+                            .as_ref()
+                            .map_or(0, |bits| bits.bits.len() * 8)
+                })
+                .sum::<usize>()
+    }
+
+    /// Stage deletion of a committed key. A key can be replaced once per commit;
+    /// deleting a newly admitted row requires committing that generation first.
+    pub(crate) fn delete(&self, key: &str) -> Result<bool> {
+        if key.is_empty() || key.len() > 64 * 1024 {
+            return Err(Error::Document(
+                "deletion key must contain 1..=65536 bytes".into(),
+            ));
+        }
+        let mut state = self.state.lock();
+        if state.uncommitted.contains(key.as_bytes()) {
+            return Err(Error::Document(
+                "commit the pending insertion before deleting or upserting this key again".into(),
+            ));
+        }
+        if state.deletes.contains(key) {
+            return Ok(false);
+        }
+        if state.deletes.len() >= 100_000 || state.delete_bytes + key.len() > 8 * 1024 * 1024 {
+            return Err(Error::Document(
+                "pending deletions exceed 100000 keys or 8 MiB; commit before continuing".into(),
+            ));
+        }
+        state.delete_bytes += key.len();
+        state.deletes.insert(key.to_owned());
+        Ok(true)
+    }
+
+    pub(crate) fn rollback_delete(&self, key: &str) {
+        let mut state = self.state.lock();
+        if state.deletes.remove(key) {
+            state.delete_bytes -= key.len();
+        }
+    }
+
+    // Clear at the publication boundary, independently of the fallible PK
+    // cache refresh. Retrying a refresh must never delete the replacement rows.
+    pub(crate) fn mark_deletes_published(&self) {
+        let mut state = self.state.lock();
+        state.deletes.clear();
+        state.delete_bytes = 0;
+    }
+
+    pub(crate) fn pending_deletes(&self) -> Vec<String> {
+        self.state.lock().deletes.iter().cloned().collect()
     }
 
     /// Check whether a document's primary key is unique, and if so, register it.
@@ -162,19 +303,11 @@ impl PrimaryKeyIndex {
     /// Returns `Err(DuplicatePrimaryKey)` if the key already exists.
     /// Returns `Err(Document)` if the primary key field is missing or empty.
     pub fn check_and_insert(&self, doc: &crate::dsl::Document) -> Result<()> {
-        let value = doc
-            .get_first(self.field)
-            .ok_or_else(|| Error::Document("Missing primary key field".into()))?;
-        let key = value
-            .as_text()
-            .ok_or_else(|| Error::Document("Primary key must be text".into()))?;
-        if key.is_empty() {
-            return Err(Error::Document("Primary key must not be empty".into()));
-        }
+        let key = document_key(doc, self.field)?;
 
         let key_bytes = key.as_bytes();
 
-        {
+        let deleting = {
             let mut state = self.state.lock();
 
             // Fast path: bloom says definitely not present → new key.
@@ -188,13 +321,17 @@ impl PrimaryKeyIndex {
             if state.uncommitted.contains(key_bytes) {
                 return Err(Error::DuplicatePrimaryKey(key.to_string()));
             }
-        }
+            state.deletes.contains(key)
+        };
         // Lock released — check committed segments without holding mutex.
         // committed_data is immutable (only changed via &mut self methods).
-        for data in &self.committed_data {
+        for data in self.committed_data.iter().filter(|_| !deleting) {
             if let Some(ff) = data.fast_fields.get(&self.field.0)
-                && let Some(dict) = ff.text_dict()
-                && dict.ordinal(key).is_some()
+                && let Some(ordinal) = ff.text_ordinal(key)
+                && data
+                    .live_key_ordinals
+                    .as_ref()
+                    .is_none_or(|keys| keys.contains(ordinal as u32))
             {
                 return Err(Error::DuplicatePrimaryKey(key.to_string()));
             }
@@ -219,7 +356,13 @@ impl PrimaryKeyIndex {
     /// Only `new_data` (segments not already held) need to be loaded by the
     /// caller. Existing data for segments still in `snapshot` is retained.
     /// The snapshot keeps ref counts alive so segments aren't deleted.
+    #[cfg(feature = "native")]
     pub fn refresh_incremental(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
+        self.refresh_data(new_data, snapshot.segment_ids());
+        self._snapshot = Some(snapshot);
+    }
+
+    pub(crate) fn refresh_data(&mut self, new_data: Vec<PkSegmentData>, segment_ids: &[String]) {
         // Insert new segments' keys into bloom (these were uncommitted before).
         // get_mut() bypasses the mutex — safe because we have &mut self.
         let state = self.state.get_mut();
@@ -233,35 +376,57 @@ impl PrimaryKeyIndex {
             }
         }
         state.uncommitted.clear();
-        self.replace_committed_data(new_data, snapshot);
+        state.deletes.clear();
+        state.delete_bytes = 0;
+        self.replace_committed_data(new_data, segment_ids);
     }
 
     /// Refresh segment readers after a topology-only replacement.
     ///
-    /// Merge and BP reorder outputs contain exactly the same primary keys as
-    /// their sources. Their keys are therefore already represented in the
+    /// Merge/reorder outputs contain only keys from their sources (compaction
+    /// can remove deleted keys). Their keys are already represented in the
     /// monotonic bloom filter, and any live ingestion reservations must remain
     /// registered while only the committed segment topology changes.
+    #[cfg(feature = "native")]
     pub fn refresh_replacement(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
-        self.replace_committed_data(new_data, snapshot);
+        self.replace_committed_data(new_data, snapshot.segment_ids());
+        self._snapshot = Some(snapshot);
     }
 
-    fn replace_committed_data(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
-        let new_seg_ids: HashSet<&str> =
-            snapshot.segment_ids().iter().map(|s| s.as_str()).collect();
+    fn replace_committed_data(&mut self, new_data: Vec<PkSegmentData>, segment_ids: &[String]) {
+        let new_seg_ids: FxHashSet<&str> = segment_ids.iter().map(|s| s.as_str()).collect();
+        let replaced: FxHashSet<&str> = new_data
+            .iter()
+            .map(|data| data.segment_id.as_str())
+            .collect();
         let mut kept: Vec<PkSegmentData> = self
             .committed_data
             .drain(..)
-            .filter(|d| new_seg_ids.contains(d.segment_id.as_str()))
+            .filter(|d| {
+                new_seg_ids.contains(d.segment_id.as_str())
+                    && !replaced.contains(d.segment_id.as_str())
+            })
             .collect();
         kept.extend(new_data);
         self.committed_data = kept;
-        self._snapshot = Some(snapshot);
+    }
+
+    #[cfg(all(feature = "wasm", not(feature = "native")))]
+    pub(crate) fn segment_data(&self) -> &[PkSegmentData] {
+        &self.committed_data
     }
 
     /// Iterator over segment IDs already held in this PK index.
     pub fn committed_segment_ids(&self) -> impl Iterator<Item = &str> {
         self.committed_data.iter().map(|d| d.segment_id.as_str())
+    }
+
+    pub(crate) fn committed_visibility(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<&crate::segment::DeletionMeta>)> {
+        self.committed_data
+            .iter()
+            .map(|data| (data.segment_id.as_str(), data.deletion_meta.as_ref()))
     }
 
     /// Roll back an uncommitted key registration (e.g. when channel send fails
@@ -279,7 +444,10 @@ impl PrimaryKeyIndex {
     /// but that only causes harmless false positives (extra committed-segment
     /// lookups), never missed duplicates.
     pub fn clear_uncommitted(&mut self) {
-        self.state.get_mut().uncommitted.clear();
+        let state = self.state.get_mut();
+        state.uncommitted.clear();
+        state.deletes.clear();
+        state.delete_bytes = 0;
     }
 }
 
@@ -315,6 +483,7 @@ fn write_pk_bloom(
 
 /// Deserialize `pk_bloom.bin`. Returns the set of covered segment IDs and the bloom filter,
 /// or `None` if the data is corrupt / wrong magic.
+#[cfg(feature = "native")]
 pub fn deserialize_pk_bloom(data: &[u8]) -> Option<(HashSet<String>, BloomFilter)> {
     if data.len() < 8 {
         return None;
@@ -340,7 +509,7 @@ pub fn deserialize_pk_bloom(data: &[u8]) -> Option<(HashSet<String>, BloomFilter
     Some((segment_ids, bloom))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use std::sync::Arc;
 
@@ -550,4 +719,32 @@ mod tests {
         assert_eq!(successes, 1, "Exactly one insert should succeed");
         assert_eq!(failures, 9, "Rest should fail with duplicate");
     }
+}
+
+/// Load only fast-field data for a segment (lightweight alternative to full SegmentReader).
+pub(crate) async fn load_pk_segment_data<D: crate::directories::Directory>(
+    dir: &D,
+    seg_id_str: &str,
+    schema: &crate::dsl::Schema,
+    deletion: Option<(u32, crate::segment::DeletionMeta)>,
+) -> Result<PkSegmentData> {
+    let seg_id = crate::segment::SegmentId::from_hex(seg_id_str)
+        .ok_or_else(|| Error::Internal(format!("Invalid segment id: {}", seg_id_str)))?;
+    let files = crate::segment::SegmentFiles::new(seg_id.0);
+    let fast_fields =
+        crate::segment::reader::loader::load_fast_fields_file(dir, &files, schema).await?;
+    let (deletion_meta, alive_docs) = match deletion {
+        Some((num_docs, meta)) => {
+            let alive = meta.load(dir, num_docs).await?;
+            (Some(meta), Some(alive))
+        }
+        None => (None, None),
+    };
+    Ok(PkSegmentData {
+        deletion_meta,
+        alive_docs,
+        live_key_ordinals: None,
+        segment_id: seg_id_str.to_string(),
+        fast_fields,
+    })
 }

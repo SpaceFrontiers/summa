@@ -334,3 +334,65 @@ async def test_symbolic_formula_roundtrips_and_legacy_coefficients_are_rejected(
     )
     with pytest.raises(RuntimeError, match="formula_v1"):
         await client.search("docs", query={"all": {}}, l1={"formula": formula})
+
+
+@pytest.mark.asyncio
+async def test_compaction_is_opt_in_and_deleted_statistics_are_exposed():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient()
+    client._ensure_connected = lambda: None
+    client._index_stub = AsyncMock()
+    client._index_stub.ForceMerge.return_value = pb.ForceMergeResponse(num_segments=1)
+    await client.force_merge("test", timeout=2)
+    assert not client._index_stub.ForceMerge.call_args.args[0].compact
+    await client.force_merge("test", compact=True)
+    request = client._index_stub.ForceMerge.call_args.args[0]
+    assert pb.ForceMergeRequest.FromString(request.SerializeToString()).compact
+    client._search_stub = AsyncMock()
+    client._search_stub.GetIndexInfo.return_value = pb.GetIndexInfoResponse(
+        num_docs=3, physical_num_docs=4, num_deleted_docs=1, deleted_ratio=0.25
+    )
+    info = await client.get_index_info("test")
+    assert (info.num_docs, info.physical_num_docs, info.num_deleted_docs) == (3, 4, 1)
+    assert info.deleted_ratio == 0.25
+
+
+@pytest.mark.asyncio
+async def test_mutations_preserve_keys_chunks_errors_deadlines_and_explicit_commit():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient(default_timeout=5)
+    client._ensure_connected = lambda: None
+    client._index_stub = AsyncMock()
+    client._index_stub.DeleteDocuments.return_value = pb.DocumentMutationResponse(
+        accepted_count=2, errors=[pb.DocumentError(index=1, error="invalid key")]
+    )
+    result = await client.delete_documents("docs", ["Á", "", "missing"], timeout=0.25)
+    assert result.accepted_count == 2
+    assert result.errors == [{"index": 1, "error": "invalid key"}]
+    call = client._index_stub.DeleteDocuments.call_args
+    assert list(call.args[0].primary_keys) == ["Á", "", "missing"]
+    assert call.kwargs["timeout"] == 0.25
+    client._index_stub.UpsertDocuments.return_value = pb.DocumentMutationResponse(
+        accepted_count=1
+    )
+    await client.upsert_document("docs", {"id": "Á", "body": ["one", "two"]})
+    call = client._index_stub.UpsertDocuments.call_args
+    assert [
+        (entry.name, entry.value.text) for entry in call.args[0].documents[0].fields
+    ] == [("id", "Á"), ("body", "one"), ("body", "two")]
+    assert call.kwargs["timeout"] == 5
+    client._index_stub.Commit.assert_not_called()
+    client._index_stub.UpsertDocuments.return_value = pb.DocumentMutationResponse(
+        errors=[pb.DocumentError(index=0, error="pending insertion")]
+    )
+    with pytest.raises(RuntimeError, match="pending insertion"):
+        await client.upsert_document("docs", {"id": "Á"})
+    client._index_stub.DeleteDocuments.return_value = pb.DocumentMutationResponse(
+        errors=[pb.DocumentError(index=0, error="invalid key")]
+    )
+    with pytest.raises(RuntimeError, match="invalid key"):
+        await client.delete_document("docs", "")
+    with pytest.raises(ValueError, match="1000 documents"):
+        await client.upsert_documents("docs", [{}] * 1001)

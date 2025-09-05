@@ -755,6 +755,11 @@ struct TextState {
 }
 
 impl FastFieldReader {
+    /// Heap directory only; encoded values and dictionaries remain file-backed.
+    pub(crate) fn block_metadata_bytes(&self) -> usize {
+        self.blocks.capacity() * std::mem::size_of::<ColumnBlock>()
+    }
+
     /// Bytes of column data backing this reader (values, offsets, dicts).
     pub fn disk_bytes(&self) -> u64 {
         self.blocks
@@ -1240,8 +1245,19 @@ impl FastFieldReader {
     /// For text columns, returned values are global ordinals (remapped).
     /// For multi-value columns, use `for_each_multi_value` instead.
     pub fn scan_single_values(&self, mut f: impl FnMut(u32, u64)) {
+        let _: Result<(), std::convert::Infallible> = self.try_scan_single_values(|doc, value| {
+            f(doc, value);
+            Ok(())
+        });
+    }
+
+    /// The same batch decoder with early error/cancellation propagation.
+    pub(crate) fn try_scan_single_values<E>(
+        &self,
+        mut f: impl FnMut(u32, u64) -> Result<(), E>,
+    ) -> Result<(), E> {
         if self.multi {
-            return;
+            return Ok(());
         }
         const BATCH: usize = 256;
         let mut buf = [0u64; BATCH];
@@ -1279,16 +1295,17 @@ impl FastFieldReader {
                         } else {
                             raw
                         };
-                        f(block.cumulative_docs + pos as u32 + i as u32, val);
+                        f(block.cumulative_docs + pos as u32 + i as u32, val)?;
                     }
                 } else {
                     for (i, &val) in buf[..chunk].iter().enumerate() {
-                        f(block.cumulative_docs + pos as u32 + i as u32, val);
+                        f(block.cumulative_docs + pos as u32 + i as u32, val)?;
                     }
                 }
                 pos += chunk;
             }
         }
+        Ok(())
     }
 
     /// Check if this doc has a value (not [`FAST_FIELD_MISSING`]).
@@ -1790,6 +1807,28 @@ mod tests {
         assert_eq!(reader.get_u64(2), 150);
         assert_eq!(reader.get_u64(3), FAST_FIELD_MISSING); // gap → absent sentinel
         assert_eq!(reader.get_u64(4), 300);
+    }
+
+    #[test]
+    fn fallible_column_scan_stops_at_the_first_error_across_batch_boundaries() {
+        let mut column = FastFieldWriter::new_numeric(FastFieldColumnType::U64);
+        for doc in 0..1024 {
+            column.add_u64(doc, u64::from(doc) * 17);
+        }
+        let mut bytes = Vec::new();
+        let (toc, _) = column.serialize(&mut bytes, 0).unwrap();
+        let reader = FastFieldReader::open(&owned(bytes), &toc).unwrap();
+        let mut visited = 0;
+        let error = reader
+            .try_scan_single_values(|doc, value| {
+                assert_eq!(doc, visited);
+                assert_eq!(value, u64::from(doc) * 17);
+                visited += 1;
+                if doc == 257 { Err("cancelled") } else { Ok(()) }
+            })
+            .unwrap_err();
+        assert_eq!(error, "cancelled");
+        assert_eq!(visited, 258);
     }
 
     #[test]

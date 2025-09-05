@@ -230,3 +230,13 @@ allowance without changing dimension selection or degree-lane admission. It
 does not fix the text adapter's older incomplete memory accounting; that
 adapter retains direct gain computation until its complete remaining budget
 can be supplied.
+
+## Deleted rows and optimizer admission
+
+The existing optimizer also schedules threshold-based [row compaction](row-deletion.md).
+Eligible compaction sources are excluded from fresh/deepening BP work in that scan.
+Compaction shares the optimizer whole-pass gate, merge capacity and CPU pool; one
+automatic compaction may run globally, followed by a separate completion cooldown.
+It does not reset exhausted BP attempt counts or consume a BP attempt. Filtering a
+previously reordered BMP layout invalidates convergence while retaining its order,
+so any allowed follow-up BP uses the existing bounded deepening policy.

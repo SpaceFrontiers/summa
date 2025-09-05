@@ -28,12 +28,14 @@ use crate::proto::hermes::index_service_server::IndexService;
 use crate::proto::hermes::{
     AlterVectorIndexRequest, AlterVectorIndexResponse, BatchIndexDocumentsRequest,
     BatchIndexDocumentsResponse, CommitRequest, CommitResponse, CreateIndexRequest,
-    CreateIndexResponse, DeleteIndexRequest, DeleteIndexResponse, ForceMergeRequest,
-    ForceMergeResponse, IndexDocumentRequest, IndexDocumentsResponse, ListIndexesRequest,
-    ListIndexesResponse, NamedDocument, ReorderRequest, ReorderResponse, RetrainVectorIndexRequest,
-    RetrainVectorIndexResponse,
+    CreateIndexResponse, DeleteDocumentsRequest, DeleteIndexRequest, DeleteIndexResponse,
+    DocumentMutationResponse, ForceMergeRequest, ForceMergeResponse, IndexDocumentRequest,
+    IndexDocumentsResponse, ListIndexesRequest, ListIndexesResponse, NamedDocument, ReorderRequest,
+    ReorderResponse, RetrainVectorIndexRequest, RetrainVectorIndexResponse, UpsertDocumentsRequest,
 };
 use crate::routes::{Route, Target, record_backend};
+
+mod mutations;
 
 /// Streaming IndexDocuments is buffered per index and forwarded as
 /// BatchIndexDocuments once either threshold is reached (mirrors the
@@ -256,6 +258,20 @@ impl IndexService for BrokerIndexService {
         // Make the new index routable without waiting a poll interval.
         self.ctx.refresh.notify_one();
         Ok(Response::new(CreateIndexResponse { success }))
+    }
+
+    async fn delete_documents(
+        &self,
+        request: Request<DeleteDocumentsRequest>,
+    ) -> Result<Response<DocumentMutationResponse>, Status> {
+        self.route_deletions(request).await.map(Response::new)
+    }
+
+    async fn upsert_documents(
+        &self,
+        request: Request<UpsertDocumentsRequest>,
+    ) -> Result<Response<DocumentMutationResponse>, Status> {
+        self.route_upserts(request).await.map(Response::new)
     }
 
     async fn index_documents(

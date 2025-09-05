@@ -75,6 +75,26 @@ impl MmapAnnIndex {
 }
 
 impl VectorIndex {
+    pub(crate) fn set_alive_docs(
+        &mut self,
+        bits: Arc<crate::query::DocBitset>,
+    ) -> crate::Result<()> {
+        let index = match self {
+            Self::BinaryIvf(index)
+            | Self::Tq { index, .. }
+            | Self::IvfTq { index, .. }
+            | Self::ScannAh(index)
+            | Self::ScannBinary(index) => index,
+        };
+        let index = Arc::get_mut(index).ok_or_else(|| {
+            crate::Error::Internal(
+                "ANN visibility must be installed before sharing its reader".into(),
+            )
+        })?;
+        index.index.alive_docs = Some(bits);
+        Ok(())
+    }
+
     /// Estimate heap retained by this vector index. Corpus-sized ANN columns
     /// remain file-backed and are not included.
     pub fn estimated_heap_bytes(&self) -> usize {

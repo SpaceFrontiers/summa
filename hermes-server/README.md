@@ -398,3 +398,38 @@ cargo fmt --all -- --check
 cargo clippy -p hermes-server --all-targets -- -D warnings
 cargo test -p hermes-server
 ```
+
+### Row compaction
+
+`ForceMerge` retains tombstones by default. Set `compact: true` to physically
+remove deleted rows from its final output, including a singleton. `GetIndexInfo`
+returns `physical_num_docs`, `num_deleted_docs`, and `deleted_ratio`; `num_docs`
+counts live rows. Broker responses aggregate counts before computing the ratio.
+
+The existing optimizer (`--optimizer-threads > 0`) also compacts segments with
+at least `--optimizer-compaction-deleted-ratio` deleted rows (default 0.30;
+0 disables compaction). It uses the existing task slots, maintenance capacity,
+whole-pass gate and CPU pool. Only one automatic compaction can run globally;
+`--optimizer-compaction-cooldown-secs` (default 60) starts at completion.
+`--compaction-memory-budget-mb` bounds scratch for manual/API and automatic
+compaction (default 256 MiB). Busy/foreground-owned segments are skipped; failures
+use optimizer backoff. Segments selected for compaction are excluded from BP work
+in the same scan. This applies to indexes without reorder fields too.
+
+Compaction preserves surviving row/BMP record order and the `reordered` flag,
+but changes BMP block membership, so it invalidates convergence on previously
+reordered nonempty BMP layouts. The BP attempt count is retained. See
+[the compaction contract](../docs/row-deletion.md) for details.
+
+### Primary-key deletion and upserts
+
+IndexService exposes `DeleteDocuments { index_name, primary_keys }` and
+`UpsertDocuments { index_name, documents }`. Both stage mutations and return
+`{ accepted_count, errors }`; `Commit` atomically publishes accepted work and
+reloads the reader. Deletion hides every chunk of a matching document. Upserts
+replace the complete document and insert missing keys. Batch errors keep their
+original positions; missing deletes are accepted. Requests require a primary-key
+schema and are bounded before conversion/admission. The broker routes both
+operations to the same partition as ingestion. See
+[the mutation contract](../docs/row-deletion.md#mutation-surfaces) for limits and
+failure/cancellation semantics.

@@ -95,3 +95,13 @@ output always has tail-only padding.
   `blocks_scored/blocks_total` pruning ratio per segment.
 - Routed placement: order small-segment docs by superblock term-mass
   signatures of the largest segment before merging.
+
+## Row visibility and explicit compaction
+
+Ordinary merges retain tombstones. `ForceMergeRequest.compact` is independent of
+`reorder_on_merge`: when true, the normal merge hierarchy (including configured
+BP) completes, then each final dirty output is compacted once. Compaction stably
+filters the current physical and per-field BMP orders; it does not run BP or
+retrain ANN structures. It preserves `reordered` and the BP attempt counter, but
+clears convergence for a surviving, previously reordered BMP layout because
+filtering changes block membership. See [row deletion](row-deletion.md).

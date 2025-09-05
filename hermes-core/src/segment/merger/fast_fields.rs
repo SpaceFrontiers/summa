@@ -222,6 +222,62 @@ fn write_merged_column(
     Ok(total)
 }
 
+impl SegmentMerger {
+    pub(super) async fn merge_row_stats<D: DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        files: &SegmentFiles,
+    ) -> Result<()> {
+        let mut fields: Vec<_> = segments
+            .iter()
+            .flat_map(|s| s.row_stats().keys().copied())
+            .collect();
+        fields.sort_unstable();
+        fields.dedup();
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let mut writer =
+            super::OffsetWriter::new(dir.streaming_writer_cold(&files.row_stats).await?);
+        let mut toc = Vec::new();
+        for field in fields {
+            if segments.iter().any(|s| !s.row_stats().contains_key(&field)) {
+                log::warn!(
+                    "[merge] field {field} has a source without lossless row statistics; output cannot compact that field until rebuilt"
+                );
+                continue;
+            }
+            let blocks: Vec<_> = segments
+                .iter()
+                .flat_map(|s| s.row_stats()[&field].blocks())
+                .map(|block| SourceBlock::Raw {
+                    num_docs: block.num_docs,
+                    data: block.data.as_slice(),
+                    dict_count: 0,
+                    dict_bytes: &[],
+                })
+                .collect();
+            let start = writer.offset();
+            let len = write_merged_column(&mut writer, false, &blocks)?;
+            toc.push(FastFieldTocEntry {
+                field_id: field,
+                column_type: FastFieldColumnType::U64,
+                multi: false,
+                data_offset: start,
+                data_len: len,
+                num_docs: segments.iter().map(SegmentReader::num_docs).sum(),
+                dict_offset: 0,
+                dict_count: 0,
+            });
+        }
+        let offset = writer.offset();
+        write_fast_field_toc_and_footer(&mut writer, offset, &toc)?;
+        writer.finish()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

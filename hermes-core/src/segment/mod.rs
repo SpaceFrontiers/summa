@@ -16,6 +16,8 @@ mod builder;
 #[cfg(all(test, feature = "native"))]
 pub(crate) use builder::bmp::build_bmp_blob;
 pub mod chunk_map;
+pub(crate) mod deletion;
+pub use deletion::DeletionMeta;
 pub(crate) mod format;
 pub(crate) mod logical_address;
 #[cfg(feature = "native")]
@@ -23,6 +25,8 @@ mod merger;
 pub(crate) mod reader;
 #[cfg(feature = "native")]
 pub(crate) mod reorder;
+#[cfg(feature = "native")]
+pub(crate) mod row_map;
 mod store;
 #[cfg(feature = "native")]
 pub(crate) mod text_reorder;

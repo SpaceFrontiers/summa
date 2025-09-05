@@ -227,3 +227,76 @@ test("symbolic formula roundtrips and legacy coefficients are rejected", async (
   rankingMethod = "linear_v2";
   await assert.rejects(client.search("docs", { query: { all: {} }, l1: { formula } }), /formula_v1/);
 });
+
+test("compaction is opt-in and index info exposes deletion counts", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { ForceMergeRequest } = require("../dist/generated/hermes.js");
+  const calls = [];
+  const client = new HermesClient();
+  client.indexClient = { forceMerge: async (request) => {
+    calls.push(ForceMergeRequest.decode(ForceMergeRequest.encode(request).finish()));
+    return { numSegments: 1 };
+  }};
+  client.searchClient = { getIndexInfo: async () => ({
+    numDocs: 3, physicalNumDocs: 4, numDeletedDocs: 1, deletedRatio: 0.25,
+  }) };
+  await client.forceMerge("test");
+  await client.forceMerge("test", undefined, true);
+  assert.deepEqual(calls.map((call) => call.compact), [false, true]);
+  const info = await client.getIndexInfo("test");
+  assert.deepEqual([info.numDocs, info.physicalNumDocs, info.numDeletedDocs, info.deletedRatio], [3, 4, 1, 0.25]);
+});
+
+test("mutations preserve keys, chunks, error positions and explicit commit", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const client = new HermesClient("localhost:50051", { defaultTimeoutMs: 5000 });
+  client.ensureConnected = () => {};
+  let sent;
+  client.indexClient = {
+    deleteDocuments: async (request, options) => {
+      sent = { request, options };
+      return { acceptedCount: 2, errors: [{ index: 1, error: "invalid key" }] };
+    },
+    upsertDocuments: async (request, options) => {
+      sent = { request, options };
+      return { acceptedCount: 1, errors: [] };
+    },
+    commit: () => assert.fail("mutations must not commit automatically"),
+  };
+  const result = await client.deleteDocuments("docs", ["Á", "", "missing"], 250);
+  assert.deepEqual(result, { acceptedCount: 2, errors: [{ index: 1, error: "invalid key" }] });
+  assert.deepEqual(sent.request.primaryKeys, ["Á", "", "missing"]);
+  await client.upsertDocument("docs", { id: "Á", body: ["one", "two"] });
+  assert.deepEqual(sent.request.documents[0].fields.map((entry) => [entry.name, entry.value.text]), [
+    ["id", "Á"], ["body", "one"], ["body", "two"],
+  ]);
+  client.indexClient.upsertDocuments = async () => ({ acceptedCount: 0, errors: [{ index: 0, error: "pending insertion" }] });
+  await assert.rejects(client.upsertDocument("docs", { id: "Á" }), /pending insertion/);
+  client.indexClient.deleteDocuments = async () => ({ acceptedCount: 0, errors: [{ index: 0, error: "invalid key" }] });
+  await assert.rejects(client.deleteDocument("docs", ""), /invalid key/);
+  await assert.rejects(client.upsertDocuments("docs", new Array(1001).fill({})), /1000 documents/);
+});
+
+test("maximum deletion batches receive every error over real gRPC transport", async () => {
+  const { createServer } = require("nice-grpc");
+  const { HermesClient, IndexServiceDefinition } = require("../dist/index.js");
+  const server = createServer();
+  server.add({ ...IndexServiceDefinition, methods: { deleteDocuments: IndexServiceDefinition.methods.deleteDocuments } }, {
+    deleteDocuments: async (request) => ({
+      acceptedCount: 0,
+      errors: request.primaryKeys.map((_, index) => ({ index, error: "commit the pending insertion before deleting or upserting this key again" })),
+    }),
+  });
+  const port = await server.listen("127.0.0.1:0");
+  const client = new HermesClient(`127.0.0.1:${port}`);
+  client.connect();
+  try {
+    const result = await client.deleteDocuments("docs", new Array(100000).fill("a"));
+    assert.equal(result.acceptedCount, 0);
+    assert.equal(result.errors.length, 100000);
+    assert.equal(result.errors[99999].index, 99999);
+  } finally {
+    client.close();
+    await server.shutdown();
+  }
+});

@@ -527,7 +527,15 @@ impl IndexRegistry {
                     continue;
                 };
 
-                match SegmentReader::open(&dir, seg_id, Arc::clone(&schema), 0).await {
+                match SegmentReader::open_with_deletions(
+                    &dir,
+                    seg_id,
+                    Arc::clone(&schema),
+                    0,
+                    meta.segment_metas[seg_id_str].deletions.clone(),
+                )
+                .await
+                {
                     Ok(_reader) => {
                         // Segment is valid — drop the reader
                     }
@@ -547,6 +555,15 @@ impl IndexRegistry {
             }
 
             // Remove bad segments from metadata and save
+            let retired_masks: Vec<_> = bad_segments
+                .iter()
+                .filter_map(|id| {
+                    meta.segment_metas[id]
+                        .deletions
+                        .as_ref()
+                        .map(|mask| mask.id.clone())
+                })
+                .collect();
             let mut meta = meta;
             for seg_id_str in &bad_segments {
                 meta.remove_segment(seg_id_str);
@@ -557,7 +574,7 @@ impl IndexRegistry {
             }
 
             // Delete orphan segment files
-            for seg_id_str in &bad_segments {
+            for seg_id_str in bad_segments.iter().chain(&retired_masks) {
                 if let Some(seg_id) = SegmentId::from_hex(seg_id_str) {
                     let _ = delete_segment(&dir, seg_id).await;
                 }

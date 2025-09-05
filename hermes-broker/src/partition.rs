@@ -362,6 +362,12 @@ pub fn merge_index_info(parts: Vec<GetIndexInfoResponse>) -> GetIndexInfoRespons
         merged
             .unprepared_candidate_fields
             .extend(part.unprepared_candidate_fields);
+        merged.physical_num_docs = merged
+            .physical_num_docs
+            .saturating_add(part.physical_num_docs);
+        merged.num_deleted_docs = merged
+            .num_deleted_docs
+            .saturating_add(part.num_deleted_docs);
         merged.num_docs = merged.num_docs.saturating_add(part.num_docs);
         merged.num_segments = merged.num_segments.saturating_add(part.num_segments);
         merged.memory_stats = match (merged.memory_stats.take(), part.memory_stats) {
@@ -387,6 +393,11 @@ pub fn merge_index_info(parts: Vec<GetIndexInfoResponse>) -> GetIndexInfoRespons
             }
         }
     }
+    merged.deleted_ratio = if merged.physical_num_docs == 0 {
+        0.0
+    } else {
+        merged.num_deleted_docs as f64 / merged.physical_num_docs as f64
+    };
     merged.unprepared_candidate_fields.sort();
     merged.unprepared_candidate_fields.dedup();
     merged.vector_stats = vectors.into_values().collect();
@@ -444,6 +455,30 @@ pub fn partition_failure(index_name: &str, shard: &str, status: Status) -> Statu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleted_share_is_weighted_by_physical_rows_across_partitions() {
+        let info = merge_index_info(vec![
+            GetIndexInfoResponse {
+                num_docs: 1,
+                physical_num_docs: 2,
+                num_deleted_docs: 1,
+                deleted_ratio: 0.5,
+                ..Default::default()
+            },
+            GetIndexInfoResponse {
+                num_docs: 90,
+                physical_num_docs: 100,
+                num_deleted_docs: 10,
+                deleted_ratio: 0.1,
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(info.physical_num_docs, 102);
+        assert_eq!(info.num_deleted_docs, 11);
+        assert_eq!(info.deleted_ratio, 11.0 / 102.0);
+        assert_eq!(info.num_docs, 91);
+    }
     use crate::proto::hermes::{
         DocAddress, FieldEntry, FusionQuery, MatchQuery, PhraseQuery, SparseVectorQuery,
         WeightedQuery,

@@ -26,6 +26,7 @@ import {
 import type {
   DocAddress,
   Document,
+  DocumentMutationResult,
   IndexInfo,
   SearchHit,
   SearchRequest,
@@ -65,6 +66,11 @@ export class HermesClient {
     this.channel = createChannel(
       this.address,
       ChannelCredentials.createInsecure(),
+      {
+        // Match Python and fit bounded mutation requests and per-item errors.
+        "grpc.max_receive_message_length": 50 * 1024 * 1024,
+        "grpc.max_send_message_length": 50 * 1024 * 1024,
+      },
     );
     const factory = createClientFactory().use(deadlineMiddleware);
     this.indexClient = factory.create(IndexServiceDefinition, this.channel);
@@ -147,6 +153,9 @@ export class HermesClient {
       numDocs: response.numDocs,
       numSegments: response.numSegments,
       schema: response.schema,
+      physicalNumDocs: response.physicalNumDocs,
+      numDeletedDocs: response.numDeletedDocs,
+      deletedRatio: response.deletedRatio,
       candidateScoringVersion: response.candidateScoringVersion,
       unpreparedCandidateFields: response.unpreparedCandidateFields,
       vectorStats: (response.vectorStats ?? []).map((stats) => ({
@@ -190,6 +199,74 @@ export class HermesClient {
     await this.indexDocuments(indexName, [document], timeoutMs);
   }
 
+  /** Stage exact-key deletions of whole documents and all their chunks.
+   * Missing keys are accepted. Inspect errors, then commit accepted work.
+   * Do not blindly retry mutations after an uncertain RPC outcome.
+   */
+  async deleteDocuments(
+    indexName: string,
+    primaryKeys: string[],
+    timeoutMs?: number,
+  ): Promise<DocumentMutationResult> {
+    this.ensureConnected();
+    if (
+      primaryKeys.length > 100_000 ||
+      primaryKeys.reduce((sum, key) => sum + Buffer.byteLength(key, "utf8"), 0) > 8 * 1024 * 1024
+    ) {
+      throw new Error("deletion request exceeds 100000 keys or 8 MiB of key bytes");
+    }
+    return this.indexClient!.deleteDocuments(
+      { indexName, primaryKeys },
+      this.callOptions(timeoutMs),
+    );
+  }
+
+  /** Stage one deletion; throws on rejection. Call commit to publish. */
+  async deleteDocument(
+    indexName: string,
+    primaryKey: string,
+    timeoutMs?: number,
+  ): Promise<void> {
+    const result = await this.deleteDocuments(indexName, [primaryKey], timeoutMs);
+    if (result.errors.length || result.acceptedCount !== 1) {
+      throw new Error(result.errors[0]?.error ?? "deletion was not accepted");
+    }
+  }
+
+  /** Stage complete replacements (inserts if absent); inspect errors, then commit.
+   * Each document needs its primary key. Only one pending replacement per key
+   * is allowed, including across calls. This is not a partial patch API.
+   */
+  async upsertDocuments(
+    indexName: string,
+    documents: Record<string, unknown>[],
+    timeoutMs?: number,
+  ): Promise<DocumentMutationResult> {
+    this.ensureConnected();
+    if (documents.length > 1_000) {
+      throw new Error("upsert request exceeds 1000 documents");
+    }
+    return this.indexClient!.upsertDocuments(
+      {
+        indexName,
+        documents: documents.map((document) => ({ fields: toFieldEntries(document) })),
+      },
+      this.callOptions(timeoutMs),
+    );
+  }
+
+  /** Stage one complete replacement; throws on rejection. Commit to publish. */
+  async upsertDocument(
+    indexName: string,
+    document: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<void> {
+    const result = await this.upsertDocuments(indexName, [document], timeoutMs);
+    if (result.errors.length || result.acceptedCount !== 1) {
+      throw new Error(result.errors[0]?.error ?? "upsert was not accepted");
+    }
+  }
+
   /** Stream documents for indexing. Returns number of indexed documents. */
   async indexDocumentsStream(
     indexName: string,
@@ -224,11 +301,11 @@ export class HermesClient {
     return response.numDocs;
   }
 
-  /** Force merge all segments. Returns number of segments after merge. */
-  async forceMerge(indexName: string, timeoutMs?: number): Promise<number> {
+  /** Merge segments; compact=true physically removes tombstones from final outputs. */
+  async forceMerge(indexName: string, timeoutMs?: number, compact = false): Promise<number> {
     this.ensureConnected();
     const response = await this.indexClient!.forceMerge(
-      { indexName },
+      { indexName, compact },
       this.callOptions(timeoutMs),
     );
     return response.numSegments;

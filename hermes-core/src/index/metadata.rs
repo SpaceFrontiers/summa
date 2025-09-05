@@ -29,7 +29,7 @@ const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 /// `load` requires this exact version. Metadata/segment compatibility is a
 /// clean rebuild boundary; serde_json would otherwise silently drop fields it
 /// does not know and a later save could destructively rewrite index state.
-pub const INDEX_META_FORMAT_VERSION: u32 = 6;
+pub const INDEX_META_FORMAT_VERSION: u32 = 7;
 
 /// Index-level centroids/codebooks are deliberately bounded before they are
 /// read or decoded. Besides limiting ordinary corruption damage, the matching
@@ -60,6 +60,9 @@ fn default_true() -> bool {
 /// This allows merge decisions without loading segment files
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SegmentMetaInfo {
+    /// Exact immutable row visibility generation; absence means all rows live.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<crate::segment::DeletionMeta>,
     /// Number of documents in this segment
     pub num_docs: u32,
     /// Parent segment IDs that were merged to produce this segment (empty for fresh segments)
@@ -82,6 +85,24 @@ pub struct SegmentMetaInfo {
     /// optimizer can impose a hard follow-up bound instead of rewriting forever.
     #[serde(default)]
     pub bp_unconverged_passes: u32,
+}
+
+impl SegmentMetaInfo {
+    pub fn num_deleted_docs(&self) -> u32 {
+        self.deletions.as_ref().map_or(0, |meta| meta.num_deleted)
+    }
+
+    pub fn num_live_docs(&self) -> u32 {
+        self.num_docs - self.num_deleted_docs()
+    }
+
+    pub fn deleted_ratio(&self) -> f64 {
+        if self.num_docs == 0 {
+            0.0
+        } else {
+            f64::from(self.num_deleted_docs()) / f64::from(self.num_docs)
+        }
+    }
 }
 
 /// Per-field vector index metadata
@@ -160,6 +181,28 @@ pub struct IndexMetadata {
 }
 
 impl IndexMetadata {
+    /// Every file identity protected by this metadata generation.
+    #[cfg(feature = "native")]
+    pub(crate) fn owned_ids(&self) -> Vec<String> {
+        self.segment_metas
+            .keys()
+            .cloned()
+            .chain(
+                self.segment_metas
+                    .values()
+                    .filter_map(|info| info.deletions.as_ref().map(|d| d.id.clone())),
+            )
+            .collect()
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn owns_id(&self, id: &str) -> bool {
+        self.has_segment(id)
+            || self
+                .segment_metas
+                .values()
+                .any(|info| info.deletions.as_ref().is_some_and(|d| d.id == id))
+    }
     /// Create new metadata with schema
     pub fn new(schema: Schema) -> Self {
         Self {
@@ -184,6 +227,7 @@ impl IndexMetadata {
         self.segment_metas.insert(
             segment_id,
             SegmentMetaInfo {
+                deletions: None,
                 num_docs,
                 ancestors: Vec::new(),
                 generation: 0,
@@ -207,6 +251,7 @@ impl IndexMetadata {
         self.add_segment_meta(
             segment_id,
             SegmentMetaInfo {
+                deletions: None,
                 num_docs,
                 ancestors,
                 generation,
@@ -396,6 +441,20 @@ impl IndexMetadata {
                  rebuild and republish the index with this Hermes version",
                 meta.version, INDEX_META_FORMAT_VERSION
             )));
+        }
+        let mut deletion_ids = std::collections::HashSet::new();
+        for info in meta.segment_metas.values() {
+            if let Some(deletion) = &info.deletions
+                && (deletion.num_deleted == 0
+                    || deletion.num_deleted > info.num_docs
+                    || crate::segment::SegmentId::from_hex(&deletion.id).is_none()
+                    || meta.segment_metas.contains_key(&deletion.id)
+                    || !deletion_ids.insert(&deletion.id))
+            {
+                return Err(Error::Corruption(
+                    "invalid or aliased deletion metadata".into(),
+                ));
+            }
         }
         Ok(meta)
     }
@@ -1044,7 +1103,10 @@ mod tests {
             .await
             .expect_err("metadata from a newer format version must be refused, not silently pruned")
             .to_string();
-        assert!(error.contains("version 6"), "{error}");
+        assert!(
+            error.contains(&format!("version {}", INDEX_META_FORMAT_VERSION + 1)),
+            "{error}"
+        );
         assert!(error.contains("incompatible"), "{error}");
     }
 
@@ -1064,7 +1126,10 @@ mod tests {
             .await
             .expect_err("temp-file recovery must apply the same version gate")
             .to_string();
-        assert!(error.contains("version 6"), "{error}");
+        assert!(
+            error.contains(&format!("version {}", INDEX_META_FORMAT_VERSION + 1)),
+            "{error}"
+        );
     }
 
     #[tokio::test]

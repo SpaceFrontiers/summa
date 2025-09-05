@@ -21,7 +21,7 @@ use std::sync::{OnceLock, Weak};
 mod searcher;
 pub use searcher::Searcher;
 
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 mod primary_key;
 #[cfg(feature = "native")]
 mod reader;
@@ -31,7 +31,7 @@ mod vector_builder;
 mod wasm_writer;
 #[cfg(feature = "native")]
 mod writer;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 pub use primary_key::PrimaryKeyIndex;
 #[cfg(feature = "native")]
 pub use reader::IndexReader;
@@ -186,6 +186,28 @@ impl ReorderConcurrencyGate {
 
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// Periodic maintenance must not occupy a queued task while foreground
+    /// work or another full sparse rewrite owns this shared capacity.
+    pub(crate) fn try_acquire_optimizer(
+        self: &Arc<Self>,
+    ) -> std::result::Result<ReorderPermit, tokio::sync::TryAcquireError> {
+        use std::sync::atomic::Ordering;
+        use tokio::sync::TryAcquireError;
+        if self.foreground_active.load(Ordering::Acquire) {
+            return Err(TryAcquireError::NoPermits);
+        }
+        let optimizer = Arc::clone(&self.optimizer_permits).try_acquire_owned()?;
+        let permit = Arc::clone(&self.permits).try_acquire_owned()?;
+        if self.foreground_active.load(Ordering::Acquire) {
+            return Err(TryAcquireError::NoPermits);
+        }
+        Ok(ReorderPermit {
+            _permit: permit,
+            _optimizer: Some(optimizer),
+            _automatic_merge: None,
+        })
     }
 
     pub(crate) async fn acquire(
@@ -384,6 +406,8 @@ pub struct IndexConfig {
     /// evidence: 18M-doc merges exceeded the former 2 GB default and dropped
     /// ~10% of eligible dims; hosts with less headroom may lower this.
     pub bp_memory_budget_bytes: usize,
+    /// Scratch limit for explicit or background physical row compaction.
+    pub compaction_memory_budget_bytes: usize,
     /// Hard limit on simultaneous whole-segment BP rewrites. This is shared
     /// by all indexes opened from clones of this config and applies to
     /// optimizer, merge-time, and manual reorder passes. It is deliberately
@@ -542,6 +566,7 @@ impl Default for IndexConfig {
             bp_memory_budget_bytes: 24 * 1024 * 1024 * 1024,
             #[cfg(not(target_pointer_width = "64"))]
             bp_memory_budget_bytes: usize::MAX,
+            compaction_memory_budget_bytes: 256 * 1024 * 1024,
             #[cfg(feature = "native")]
             background_reorder_permits: Arc::new(ReorderConcurrencyGate::new(2)),
             #[cfg(feature = "native")]

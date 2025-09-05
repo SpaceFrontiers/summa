@@ -1690,6 +1690,96 @@ impl<'a, W: Write> StoreMerger<'a, W> {
     }
 
     /// Finish writing the merged store
+    #[cfg(feature = "native")]
+    pub(crate) async fn append_compacted(
+        &mut self,
+        store: &AsyncStoreReader,
+        rows: &super::row_map::RowMap,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+        memory_budget: usize,
+    ) -> io::Result<()> {
+        if store
+            .index
+            .len()
+            .saturating_mul(std::mem::size_of::<StoreBlockIndex>())
+            > memory_budget / 8
+        {
+            return Err(io::Error::other(
+                "store compaction directory exceeds scratch budget",
+            ));
+        }
+        for entry in &store.index {
+            if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "store compaction cancelled",
+                ));
+            }
+            let count = (entry.first_doc_id..entry.first_doc_id + entry.num_docs)
+                .filter(|&doc| rows.get(doc).is_some())
+                .count() as u32;
+            if count == 0 {
+                continue;
+            }
+            if count == entry.num_docs && !store.has_dict() {
+                self.append_store(
+                    store.data_slice(),
+                    &[RawStoreBlock {
+                        first_doc_id: entry.first_doc_id,
+                        num_docs: entry.num_docs,
+                        offset: entry.offset,
+                        length: entry.length,
+                    }],
+                    cancellation,
+                )
+                .await?;
+                continue;
+            }
+            if entry.length as usize > memory_budget / 4 {
+                return Err(io::Error::other(
+                    "store block exceeds compaction scratch budget",
+                ));
+            }
+            let compressed = store
+                .data_slice
+                .read_bytes_range(entry.offset..entry.offset + u64::from(entry.length))
+                .await?;
+            let data = match store.dict() {
+                Some(dict) => crate::compression::decompress_with_dict_limited(
+                    compressed.as_slice(),
+                    dict,
+                    memory_budget / 4,
+                )?,
+                None => crate::compression::decompress_limited(
+                    compressed.as_slice(),
+                    memory_budget / 4,
+                )?,
+            };
+            let block = CachedBlock::build(data, entry.num_docs)?;
+            let mut retained = Vec::new();
+            for local in 0..entry.num_docs {
+                if rows.get(entry.first_doc_id + local).is_some() {
+                    let bytes = block.doc_bytes(local)?;
+                    retained.write_u32::<LittleEndian>(bytes.len() as u32)?;
+                    retained.extend_from_slice(bytes);
+                }
+            }
+            let compressed = crate::compression::compress(&retained, CompressionLevel::default())?;
+            self.writer.write_all(&compressed)?;
+            self.index.push(StoreBlockIndex {
+                first_doc_id: self.next_doc_id,
+                num_docs: count,
+                offset: self.current_offset,
+                length: u32::try_from(compressed.len())
+                    .map_err(|_| io::Error::other("compacted store block too large"))?,
+            });
+            self.current_offset += compressed.len() as u64;
+            self.next_doc_id += count;
+        }
+        Ok(())
+    }
+
+    /// Finish writing the merged store
     pub fn finish(self) -> io::Result<u32> {
         let data_end_offset = self.current_offset;
 

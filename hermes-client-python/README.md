@@ -313,3 +313,42 @@ union before global inference. Exports that exceed budgets fail explicitly.
 Expressions are bounded to 4 KiB, 256 tokens and 32 parenthesis levels. Invalid
 variables, invalid syntax and non-finite predictions fail explicitly. Servers
 and brokers must support `formula_v1` (`candidate_scoring_version=3`).
+
+### Compact deleted rows
+
+```python
+await client.force_merge("articles")  # Copy encoded data and retain tombstones.
+await client.force_merge("articles", compact=True)  # Remove deleted rows physically.
+info = await client.get_index_info("articles")
+print(info.num_deleted_docs, info.physical_num_docs, info.deleted_ratio)
+```
+
+Compaction also works when there is only one segment. It preserves surviving
+values and may change document addresses and BM25 statistics.
+
+### Delete and upsert documents
+
+Declare one text field `[primary]` in the schema. Deletion removes the document
+and all of its chunks; upserts replace the entire document, including indexed-only
+fields, and insert when the key is absent.
+
+```python
+await client.delete_document("articles", "obsolete-key")
+await client.upsert_document("articles", {
+    "id": "article-42", "body": ["replacement chunk one", "replacement chunk two"]
+})
+await client.commit("articles")
+
+result = await client.delete_documents("articles", ["old-a", "old-b"])
+print(result.accepted_count, result.errors)  # errors: [{"index": 0, "error": "..."}]
+await client.commit("articles")  # publishes accepted operations
+```
+
+`upsert_documents` takes a list of complete replacement documents and returns the
+same `DocumentMutationResult`. Single-document helpers raise on rejection. Missing
+deletion keys are accepted. Commit before deleting/upserting a key with a pending
+insertion or replacement. Limits are 100,000 deletion keys / 8 MiB key bytes and
+1,000 replacement documents / 32 MiB encoded bytes. Mutations use the usual timeout
+argument; an expired RPC may have staged work, so do not blindly retry replacements.
+Broker commits are atomic within each partition. Physical cleanup remains
+`await client.force_merge("articles", compact=True)`.

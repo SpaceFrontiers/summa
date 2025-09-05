@@ -13,3 +13,6 @@ pub use tq::{
     tq_ivf_codes_column_len_checked, tq_pack_block, tq_pack_ivf_block, tq_padded_dim,
     tq_score_block, tq_score_ivf_block, tq_shared_codec,
 };
+
+#[cfg(feature = "native")]
+pub(crate) use tq::tq_repack_rows;

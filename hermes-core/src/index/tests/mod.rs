@@ -219,3 +219,4 @@ async fn cancelled_foreground_wait_resumes_optimizer_passes() {
     drop(resumed);
     drop(second);
 }
+mod deletion;

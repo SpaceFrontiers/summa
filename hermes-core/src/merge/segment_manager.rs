@@ -742,6 +742,8 @@ enum ReplacementLayout {
     /// globally reordered, but an interrupted BP lineage remains owed its
     /// record-level deepening pass.
     BlockCopy,
+    /// Stable row/record filtering; block boundaries may need new BP refinement.
+    Compacted,
     /// A BP pass produced the replacement layout.
     BpReordered { converged: bool },
     /// A vector-only rewrite leaves document order and sparse layout exactly
@@ -755,6 +757,9 @@ fn replacement_bp_state(
     layout: ReplacementLayout,
 ) -> (bool, bool, u32) {
     match layout {
+        ReplacementLayout::Compacted => {
+            unreachable!("compaction preserves its single source lineage")
+        }
         ReplacementLayout::BlockCopy => (
             false,
             !parent_has_debt,
@@ -939,8 +944,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
 
         let tracker = Arc::new(SegmentTracker::new());
-        for seg_id in metadata.segment_metas.keys() {
-            tracker.register(seg_id);
+        for seg_id in metadata.owned_ids() {
+            tracker.register(&seg_id);
         }
 
         let lifecycle_handles: Arc<parking_lot::Mutex<Vec<JoinHandle<()>>>> =
@@ -1290,7 +1295,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    fn pause_reorder_retries(&self, segment_id: &str, error: &Error) {
+    async fn pause_reorder_retries(&self, segment_id: &str, error: &Error) {
+        // Serialize failure admission with replacement publication: a worker
+        // reporting late must not recreate retry state for a retired source.
+        let st = self.state.lock().await;
+        if !st.metadata.has_segment(segment_id) {
+            return;
+        }
         let mut retries = self.reorder_retries.lock();
         let retry = retries.entry(segment_id.to_string()).or_default();
         retry.consecutive_failures = retry.consecutive_failures.saturating_add(1);
@@ -1308,6 +1319,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
     fn clear_reorder_retry(&self, segment_id: &str) {
         self.reorder_retries.lock().remove(segment_id);
+    }
+
+    /// Called with publication state held, matching failure admission order.
+    fn retire_reorder_retries(&self, retired: &[String]) {
+        let mut retries = self.reorder_retries.lock();
+        for id in retired {
+            retries.remove(id);
+        }
     }
 
     fn paused_reorder_segments(&self) -> HashSet<String> {
@@ -1381,7 +1400,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let output_hex = output_id.to_hex();
         {
             let st = self.state.lock().await;
-            if st.metadata.has_segment(&output_hex) {
+            if st.metadata.owns_id(&output_hex) {
                 return;
             }
         }
@@ -1600,6 +1619,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let published_generation = Arc::clone(&self.published_generation);
         let tracker = Arc::clone(&self.tracker);
         let replacement_refresh = self.replacement_refresh.read().clone();
+        let manager = Arc::clone(self);
         // Keep the producer gate raised if the requesting future is cancelled
         // after the metadata transaction has been detached. The last guard
         // clone drops only after durable metadata and ArcSwap state agree.
@@ -1634,6 +1654,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .iter()
                 .map(|replacement| replacement.source_id.clone())
                 .collect::<Vec<_>>();
+            manager.retire_reorder_retries(&retired);
             let ready_to_delete = tracker.mark_for_deletion(&retired);
             drop(st);
             for &segment_id in &ready_to_delete {
@@ -1705,21 +1726,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Acquire a snapshot of current segments for reading.
     /// The snapshot holds references — segments won't be deleted while snapshot exists.
     pub async fn acquire_snapshot(&self) -> SegmentSnapshot {
-        let (acquired, generation) = {
-            let st = self.state.lock().await;
-            let segment_ids = st.metadata.segment_ids();
-            (
-                self.tracker.acquire(&segment_ids),
-                self.published_generation.load_full(),
-            )
-        };
-
+        let st = self.state.lock().await;
+        let acquired = self.tracker.acquire(&st.metadata.segment_ids());
         SegmentSnapshot::with_generation(
             Arc::clone(&self.tracker),
             acquired,
-            generation,
+            self.published_generation.load_full(),
             Arc::clone(&self.delete_fn),
         )
+        .with_deletions(&st.metadata)
     }
 
     /// Get the segment tracker
@@ -1985,6 +2000,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     output_id,
                     reorder_bmp,
                     ReorderPriority::AutomaticMerge,
+                    Arc::new((guard, merge_permit, global_merge_permit)),
                 )
                 .await;
 
@@ -2023,10 +2039,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
             // Release source/output ownership before re-evaluating policy, so
             // the completed operation cannot artificially hide candidates.
-            drop(guard);
-            // A failed merge must not reserve capacity during its retry delay.
-            drop(merge_permit);
-            drop(global_merge_permit);
 
             if reevaluate {
                 sm.maybe_merge().await;
@@ -2049,6 +2061,28 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// with the caller. Keeping the transaction here prevents background and
     /// force-merge paths from drifting on cleanup or BP metadata semantics.
     async fn merge_and_replace_registered(
+        self: &Arc<Self>,
+        ids: &[String],
+        output_id: SegmentId,
+        reorder_bmp: bool,
+        priority: ReorderPriority,
+        ownership: Arc<dyn Send + Sync>,
+    ) -> MergeTaskResult<(String, u32, bool)> {
+        let manager = Arc::clone(self);
+        let ids = ids.to_vec();
+        // Keep source/output claims and capacity through started blocking
+        // compaction even when a force-merge requester is cancelled.
+        self.run_lifecycle_transaction(async move {
+            let _ownership = ownership;
+            Ok(manager
+                .merge_and_replace_owned(&ids, output_id, reorder_bmp, priority)
+                .await)
+        })
+        .await
+        .map_err(MergeTaskError::from)?
+    }
+
+    async fn merge_and_replace_owned(
         self: &Arc<Self>,
         ids: &[String],
         output_id: SegmentId,
@@ -2104,7 +2138,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             ReplacementLayout::BlockCopy
         };
         if let Err(error) = self
-            .replace_segments(ids, new_id.clone(), doc_count, layout)
+            .replace_segments(ids, new_id.clone(), doc_count, layout, None)
             .await
         {
             self.delete_output_if_unregistered(output_id, "replacement failure")
@@ -2148,6 +2182,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         new_id: String,
         doc_count: u32,
         layout: ReplacementLayout,
+        expected_deletions: Option<&HashMap<String, Option<crate::segment::DeletionMeta>>>,
     ) -> Result<()> {
         // The operation guard owns the output during validation. Publication
         // below replaces that ownership with metadata + tracker atomically.
@@ -2177,6 +2212,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 output_reader.num_docs(),
             )));
         }
+        let has_surviving_bmp = !output_reader.bmp_indexes().is_empty();
         drop(output_reader);
 
         let mut st = Arc::clone(&self.state).lock_owned().await;
@@ -2195,7 +2231,21 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             )));
         }
 
-        let replacement_info = match layout {
+        if let Some(expected) = expected_deletions {
+            if old_ids
+                .iter()
+                .any(|id| expected.get(id) != Some(&st.metadata.segment_metas[id].deletions))
+            {
+                return Err(Error::Internal(
+                    "row visibility changed during compaction; retry with a fresh snapshot".into(),
+                ));
+            }
+        } else if matches!(layout, ReplacementLayout::Compacted) {
+            return Err(Error::Internal(
+                "compaction requires a visibility snapshot".into(),
+            ));
+        }
+        let mut replacement_info = match layout {
             ReplacementLayout::BlockCopy | ReplacementLayout::BpReordered { .. } => {
                 let generation = old_ids
                     .iter()
@@ -2218,6 +2268,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 let (reordered, bp_converged, bp_unconverged_passes) =
                     replacement_bp_state(parent_has_debt, parent_unconverged_passes, layout);
                 SegmentMetaInfo {
+                    deletions: None,
                     num_docs: doc_count,
                     ancestors: old_ids.to_vec(),
                     generation,
@@ -2226,7 +2277,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     bp_unconverged_passes,
                 }
             }
-            ReplacementLayout::PreserveSingleSource => {
+            ReplacementLayout::PreserveSingleSource | ReplacementLayout::Compacted => {
                 let [source_id] = old_ids else {
                     return Err(Error::Internal(
                         "layout-preserving replacement requires exactly one source".into(),
@@ -2243,26 +2294,113 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         ))
                     })?;
                 source.num_docs = doc_count;
+                if matches!(layout, ReplacementLayout::Compacted) {
+                    source.deletions = None;
+                    source.ancestors = old_ids.to_vec();
+                    source.generation = source.generation.checked_add(1).ok_or_else(|| {
+                        Error::Corruption("compaction generation overflow".into())
+                    })?;
+                    // Retain historical order and the finite BP attempt budget.
+                    // New BMP block membership invalidates convergence, but
+                    // compaction itself is not a BP attempt.
+                    if has_surviving_bmp && source.reordered {
+                        source.bp_converged = false;
+                    }
+                }
                 source
             }
         };
-        let retired_ids = old_ids.to_vec();
+        // Take the latest source visibility under the publication lock. A
+        // deletion may have committed while encoded payloads were being copied.
+        // Field-only BP and ANN rewrites preserve the same physical row order.
+        let mut retired_ids = old_ids.to_vec();
+        let mut deletion_output = None;
+        let has_deletions = old_ids
+            .iter()
+            .any(|id| st.metadata.segment_metas[id].deletions.is_some());
+        if matches!(layout, ReplacementLayout::Compacted) {
+            for id in old_ids {
+                if let Some(deletion) = &st.metadata.segment_metas[id].deletions {
+                    retired_ids.push(deletion.id.clone());
+                }
+            }
+        } else if has_deletions && old_ids.len() == 1 {
+            let source = &st.metadata.segment_metas[&old_ids[0]];
+            if source.num_docs != doc_count {
+                return Err(Error::Corruption(
+                    "layout-preserving replacement changed physical row count".into(),
+                ));
+            }
+            // BP/ANN rewrites retain physical addresses; share the exact
+            // immutable mask generation rather than copying it again.
+            replacement_info.deletions = source.deletions.clone();
+        } else if has_deletions {
+            let mut alive = crate::query::DocBitset::all(doc_count);
+            let mut offset = 0u32;
+            for id in old_ids {
+                let info = &st.metadata.segment_metas[id];
+                if let Some(deletion) = &info.deletions {
+                    let source = deletion
+                        .load(self.directory.as_ref(), info.num_docs)
+                        .await?;
+                    crate::segment::deletion::append_dead_rows(
+                        &mut alive,
+                        &source,
+                        info.num_docs,
+                        offset,
+                    )?;
+                    retired_ids.push(deletion.id.clone());
+                }
+                offset = offset
+                    .checked_add(info.num_docs)
+                    .ok_or_else(|| Error::Corruption("merge row count overflow".into()))?;
+            }
+            if offset != doc_count {
+                return Err(Error::Corruption(
+                    "layout-preserving merge changed physical row count".into(),
+                ));
+            }
+            let deletion_id = SegmentId::new();
+            let claim = self.protect_new_segment(deletion_id.to_hex())?;
+            deletion_output = Some((claim, self.output_cleanup_guard(deletion_id)));
+            replacement_info.deletions = Some(
+                crate::segment::deletion::write(
+                    self.directory.as_ref(),
+                    deletion_id,
+                    doc_count,
+                    &alive,
+                )
+                .await?,
+            );
+        }
         let mut next = st.metadata.clone();
         for id in old_ids {
             next.remove_segment(id);
         }
         next.add_segment_meta(new_id.clone(), replacement_info);
+        retired_ids.sort_unstable();
+        retired_ids.dedup();
+        retired_ids.retain(|id| !next.owns_id(id));
 
         let directory = Arc::clone(&self.directory);
         let tracker = Arc::clone(&self.tracker);
         let replacement_refresh = self.replacement_refresh.read().clone();
+        let manager = Arc::clone(self);
         let index_label = self.schema.index_label().to_owned();
         self.run_lifecycle_transaction(async move {
             // Durable-before-visible. If persistence fails, old metadata and
             // tracker ownership stay intact and source deletion is never armed.
             next.save(directory.as_ref()).await?;
             tracker.register(&new_id);
+            if let Some(deletion) = &next.segment_metas[&new_id].deletions {
+                tracker.register(&deletion.id);
+            }
+            if let Some((_, cleanup)) = deletion_output.as_mut() {
+                cleanup.disarm();
+            }
             st.metadata = next;
+
+            manager.retire_reorder_retries(&retired_ids);
 
             // Keep state locked until retired sources enter the tracker. The
             // transaction itself also performs deletion, so cancellation of
@@ -2560,8 +2698,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Force merge all segments into one (packing up to the u32 document
     /// format limit per output).
     ///
-    /// An explicit force merge is a full compaction: unlike background
-    /// merges, it deliberately ignores the policy's `max_segment_docs` cap
+    /// An explicit force merge consolidates segments while retaining tombstones.
+    /// Unlike background merges, it ignores the policy's `max_segment_docs` cap
     /// (which exists to bound background BP/merge cost, not to keep an index
     /// permanently split). Only the u32 doc-id format limit can force more
     /// than one output, and that outcome is logged loudly.
@@ -2584,6 +2722,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// each batch while the force merge remains otherwise memory bounded.
     pub(crate) async fn force_merge_with_snapshot_refresh<F, Fut>(
         self: &Arc<Self>,
+        refresh_snapshots: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        self.force_merge_with_compaction_and_snapshot_refresh(None, refresh_snapshots)
+            .await
+    }
+
+    pub(crate) async fn force_merge_with_compaction_and_snapshot_refresh<F, Fut>(
+        self: &Arc<Self>,
+        compaction_budget: Option<usize>,
         mut refresh_snapshots: F,
     ) -> Result<()>
     where
@@ -2726,6 +2877,21 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         completed_outputs.clear();
                         continue;
                     }
+                    if let Some(memory_budget) = compaction_budget {
+                        let dirty: Vec<_> = {
+                            let st = self.state.lock().await;
+                            st.metadata
+                                .segment_metas
+                                .iter()
+                                .filter(|(_, meta)| meta.deletions.is_some())
+                                .map(|(id, _)| id.clone())
+                                .collect()
+                        };
+                        for id in dirty {
+                            self.compact_segment(&id, memory_budget).await?;
+                            refresh_snapshots().await?;
+                        }
+                    }
                     // Every remaining free segment is either already at the
                     // u32 format limit or cannot be paired without exceeding
                     // it. More than one leftover segment is an exceptional,
@@ -2797,7 +2963,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     .then(|| self.active_operations.try_register(all_ids))
                     .flatten()
             };
-            let _group_guard = match group_guard {
+            let _group_guard = Arc::new(match group_guard {
                 Some(guard) => guard,
                 None if !self.active_operations.is_accepting() => {
                     return Err(Error::IndexClosed);
@@ -2817,7 +2983,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     }
                     continue;
                 }
-            };
+            });
 
             log::info!(
                 "[force_merge] index={} planned final group: {} segments, {} docs, {} merge pass(es)",
@@ -2858,7 +3024,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         capacity_start.elapsed().as_secs_f64(),
                     );
                 }
-                Some(permit)
+                Some(Arc::new(permit))
             } else {
                 None
             };
@@ -2882,7 +3048,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         admission_start.elapsed().as_secs_f64(),
                     );
                 }
-                Some(guard)
+                Some(Arc::new(guard))
             } else {
                 None
             };
@@ -2907,7 +3073,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
                 let capacity_start = std::time::Instant::now();
                 let step_global_merge_permit = if group_global_merge_permit.is_none() {
-                    Some(tokio::select! {
+                    Some(Arc::new(tokio::select! {
                         biased;
                         () = self.active_operations.wait_for_shutdown() => {
                             return Err(Error::IndexClosed);
@@ -2919,7 +3085,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                                 )
                             })?
                         }
-                    })
+                    }))
                 } else {
                     None
                 };
@@ -2953,6 +3119,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         output_id,
                         reorder_bmp,
                         ReorderPriority::Foreground,
+                        Arc::new((
+                            Arc::clone(&_group_guard),
+                            group_global_merge_permit.clone(),
+                            _foreground_reorder.clone(),
+                            step_global_merge_permit.clone(),
+                        )),
                     )
                     .await
                     .map_err(|error| error.error)?;
@@ -3118,7 +3290,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         Ok(false)
     }
 
-    async fn acquire_vector_rewrite_capacity(
+    async fn acquire_maintenance_capacity(
         &self,
     ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
         let global = tokio::select! {
@@ -3235,7 +3407,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
             // A single rewrite may hold several gigabytes while assigning all
             // vectors. Reuse the ordinary local and process-wide merge bounds.
-            let _capacity = self.acquire_vector_rewrite_capacity().await?;
+            let _capacity = self.acquire_maintenance_capacity().await?;
 
             let output_id = SegmentId::new();
             let output_hex = output_id.to_hex();
@@ -3336,7 +3508,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // ownership. A vector rewrite can hold several gigabytes while it
         // assigns vectors, so it participates in both local and process-wide
         // merge limits.
-        let _capacity = self.acquire_vector_rewrite_capacity().await?;
+        let _capacity = self.acquire_maintenance_capacity().await?;
 
         let output_id = SegmentId::new();
         let output_hex = output_id.to_hex();
@@ -3394,6 +3566,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 new_id,
                 doc_count,
                 ReplacementLayout::PreserveSingleSource,
+                None,
             )
             .await
         {
@@ -3786,7 +3959,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             if is_deterministic_source_error(&error) {
                 self.quarantine_segment(seg_id, &error);
             } else if !matches!(&error, Error::IndexClosed) {
-                self.pause_reorder_retries(seg_id, &error);
+                self.pause_reorder_retries(seg_id, &error).await;
             }
             return Err(error);
         }
@@ -3819,7 +3992,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 if is_deterministic_source_error(&e) {
                     self.quarantine_segment(seg_id, &e);
                 } else if !matches!(&e, Error::IndexClosed) {
-                    self.pause_reorder_retries(seg_id, &e);
+                    self.pause_reorder_retries(seg_id, &e).await;
                 }
                 return Err(e);
             }
@@ -3839,6 +4012,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 ReplacementLayout::BpReordered {
                     converged: ladder_converged,
                 },
+                None,
             )
             .await
         {
@@ -3846,7 +4020,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .await;
             output_cleanup.disarm();
             if !matches!(&e, Error::IndexClosed) {
-                self.pause_reorder_retries(seg_id, &e);
+                self.pause_reorder_retries(seg_id, &e).await;
             }
             return Err(e);
         }
@@ -3894,7 +4068,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             // a multi-GB orphan must not freeze commits and snapshot acquisition.
             let deletion_guard = {
                 let st = self.state.lock().await;
-                if st.metadata.has_segment(hex_id) {
+                if st.metadata.owns_id(hex_id) {
                     continue;
                 }
                 let Some(guard) = self
@@ -3968,6 +4142,36 @@ mod tests {
             Arc::new(ReorderConcurrencyGate::new(1)),
             None,
         ))
+    }
+
+    #[tokio::test]
+    async fn queued_compaction_does_not_deadlock_a_vector_rewrite_holding_global_capacity() {
+        use std::time::Duration;
+        let manager = lifecycle_test_manager();
+        let global = Arc::clone(&manager.global_merge_permits)
+            .acquire_owned()
+            .await
+            .unwrap();
+        let id = SegmentId::new().to_hex();
+        let mut compaction = Box::pin(manager.compact_segment(&id, 1024 * 1024));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut compaction)
+                .await
+                .is_err()
+        );
+        // A rewrite already holding global capacity must still be able to
+        // acquire local capacity and finish; compaction waits behind it.
+        let local = Arc::clone(&manager.merge_permits)
+            .try_acquire_owned()
+            .expect("waiting compaction must not reserve local capacity first");
+        drop(local);
+        drop(global);
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), compaction)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 
     #[test]
@@ -4490,6 +4694,7 @@ mod tests {
             state.metadata.add_segment_meta(
                 "eligible".into(),
                 SegmentMetaInfo {
+                    deletions: None,
                     num_docs: 10,
                     ancestors: Vec::new(),
                     generation: 1,
@@ -4501,6 +4706,7 @@ mod tests {
             state.metadata.add_segment_meta(
                 "at-limit".into(),
                 SegmentMetaInfo {
+                    deletions: None,
                     num_docs: 20,
                     ancestors: Vec::new(),
                     generation: 1,
@@ -4512,6 +4718,7 @@ mod tests {
             state.metadata.add_segment_meta(
                 "carried-debt".into(),
                 SegmentMetaInfo {
+                    deletions: None,
                     num_docs: 15,
                     ancestors: Vec::new(),
                     generation: 2,
@@ -4523,6 +4730,7 @@ mod tests {
             state.metadata.add_segment_meta(
                 "carried-debt-at-limit".into(),
                 SegmentMetaInfo {
+                    deletions: None,
                     num_docs: 25,
                     ancestors: Vec::new(),
                     generation: 2,
@@ -4534,6 +4742,7 @@ mod tests {
             state.metadata.add_segment_meta(
                 "converged".into(),
                 SegmentMetaInfo {
+                    deletions: None,
                     num_docs: 30,
                     ancestors: Vec::new(),
                     generation: 1,
@@ -4583,13 +4792,73 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn transient_reorder_failure_is_backed_off_until_cleared() {
+    #[tokio::test]
+    async fn transient_reorder_failure_is_backed_off_until_cleared() {
         let manager = lifecycle_test_manager();
-        manager.pause_reorder_retries("source", &Error::Internal("transient".into()));
+        manager
+            .state
+            .lock()
+            .await
+            .metadata
+            .add_segment("source".into(), 1);
+        manager
+            .pause_reorder_retries("source", &Error::Internal("transient".into()))
+            .await;
         assert!(manager.paused_reorder_segments().contains("source"));
         manager.clear_reorder_retry("source");
         assert!(!manager.paused_reorder_segments().contains("source"));
+    }
+
+    #[tokio::test]
+    async fn optimizer_backoff_does_not_retain_retired_or_unknown_segments() {
+        let mut schema = crate::SchemaBuilder::default();
+        let key = schema.add_text_field("id", true, false);
+        schema.set_primary_key(key);
+        let index = crate::Index::create(
+            crate::RamDirectory::new(),
+            schema.build(),
+            crate::IndexConfig {
+                merge_policy: Box::new(crate::NoMergePolicy),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut writer = index.writer();
+        writer.init_primary_key_dedup().await.unwrap();
+        for value in ["dead", "live"] {
+            let mut doc = crate::Document::new();
+            doc.add_text(key, value);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        writer.delete_primary_key("dead").unwrap();
+        writer.commit().await.unwrap();
+        let manager = Arc::clone(writer.segment_manager());
+        let source = manager.get_segment_ids().await[0].clone();
+        assert!(
+            manager
+                .compact_segment_if_eligible(&source, 0.3, 0)
+                .await
+                .is_err()
+        );
+        assert!(manager.reorder_retries.lock().contains_key(&source));
+        let mut doc = crate::Document::new();
+        doc.add_text(key, "another");
+        writer.add_document(doc).unwrap();
+        writer.force_merge().await.unwrap();
+        assert!(
+            manager.reorder_retries.lock().is_empty(),
+            "retired segment leaked retry state"
+        );
+        // A delayed worker failure (or invalid caller ID) must not restore it.
+        assert!(
+            manager
+                .compact_segment_if_eligible(&source, 0.3, 0)
+                .await
+                .is_err()
+        );
+        assert!(manager.reorder_retries.lock().is_empty());
     }
 
     /// Fails `exists` with the transient I/O error class that sends a
@@ -4923,3 +5192,5 @@ mod tests {
         .expect("shutdown did not drain the merge retry wakeup task");
     }
 }
+#[path = "row_mutation.rs"]
+mod row_mutation;

@@ -300,6 +300,69 @@ async fn broker_routes_real_hermes_servers() {
         .unwrap()
         .into_inner();
     assert_eq!(empty.hits.len(), 0);
+    // Unary mutation routing also preserves the single-shard write contract.
+    let updated = index
+        .upsert_documents(UpsertDocumentsRequest {
+            index_name: "docs_e2e".into(),
+            documents: vec![doc("doc-1", "replacement")],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(updated.accepted_count, 1);
+    index
+        .commit(CommitRequest {
+            index_name: "docs_e2e".into(),
+        })
+        .await
+        .unwrap();
+    let replacement_request = SearchRequest {
+        index_name: "docs_e2e".into(),
+        query: Some(Query {
+            query: Some(query::Query::Term(TermQuery {
+                field: "title".into(),
+                term: "replacement".into(),
+                ..Default::default()
+            })),
+        }),
+        limit: 10,
+        ..Default::default()
+    };
+    assert_eq!(
+        search
+            .search(replacement_request.clone())
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .len(),
+        1
+    );
+    let deleted = index
+        .delete_documents(DeleteDocumentsRequest {
+            index_name: "docs_e2e".into(),
+            primary_keys: vec!["doc-1".into(), "".into()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(deleted.accepted_count, 1);
+    assert_eq!(deleted.errors[0].index, 1);
+    index
+        .commit(CommitRequest {
+            index_name: "docs_e2e".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        search
+            .search(replacement_request)
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -863,4 +926,216 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
         .into_inner();
     assert_eq!(raw.ranking_method, "feature_export_v2");
     assert_eq!(raw.hits.len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the hermes-server binary; see module docs"]
+async fn partitioned_mutations_route_exact_keys_and_remove_all_document_chunks() {
+    let server_a = spawn_server();
+    let server_b = spawn_server();
+    wait_server_ready(&server_a.addr).await;
+    wait_server_ready(&server_b.addr).await;
+    let broker = spawn_broker(
+        &[
+            format!("id=a,addr={},shard=0", server_a.addr),
+            format!("id=b,addr={},shard=1", server_b.addr),
+        ],
+        &["--placement", "docs*=0,1"],
+    );
+    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    let mut index = broker_index_client(&broker).await;
+    let mut search = broker_search_client(&broker).await;
+    let oversized = index
+        .delete_documents(DeleteDocumentsRequest {
+            index_name: "missing".into(),
+            primary_keys: vec![String::new(); 100_001],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(oversized.code(), tonic::Code::ResourceExhausted);
+    let name = "docs_mutations";
+    index.create_index(CreateIndexRequest {
+        index_name: name.into(), schema: format!("index {name} {{\n field id: text<raw> [primary, indexed, stored]\n field title: text<simple> [indexed<chunked, token_position>]\n }}"),
+    }).await.unwrap();
+    wait_for_indexes(&broker, &[name], Duration::from_secs(10)).await;
+    let documents = (0..4)
+        .map(|i| {
+            let mut document = doc(&format!("doc{i}"), "oldhead needle");
+            document.fields.push(FieldEntry {
+                name: "title".into(),
+                value: Some(FieldValue {
+                    value: Some(field_value::Value::Text("oldtail needle".into())),
+                }),
+            });
+            document
+        })
+        .collect();
+    assert_eq!(
+        index
+            .batch_index_documents(BatchIndexDocumentsRequest {
+                index_name: name.into(),
+                documents
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .indexed_count,
+        4
+    );
+    index
+        .commit(CommitRequest {
+            index_name: name.into(),
+        })
+        .await
+        .unwrap();
+    let response = index
+        .upsert_documents(UpsertDocumentsRequest {
+            index_name: name.into(),
+            documents: vec![
+                NamedDocument::default(),
+                doc("doc0", "replacement"),
+                doc("doc0", "rejected"),
+                doc("doc1", "replacement"),
+            ],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.accepted_count, 2);
+    assert_eq!(
+        response
+            .errors
+            .iter()
+            .map(|error| error.index)
+            .collect::<Vec<_>>(),
+        [0, 2]
+    );
+    let response = index
+        .delete_documents(DeleteDocumentsRequest {
+            index_name: name.into(),
+            primary_keys: ["doc2", "doc3", "", "missing", "doc0"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.accepted_count, 3);
+    assert_eq!(
+        response
+            .errors
+            .iter()
+            .map(|error| error.index)
+            .collect::<Vec<_>>(),
+        [2, 4]
+    );
+    let request = |term: &str| SearchRequest {
+        index_name: name.into(),
+        query: Some(Query {
+            query: Some(query::Query::Term(TermQuery {
+                field: "title".into(),
+                term: term.into(),
+                ..Default::default()
+            })),
+        }),
+        limit: 10,
+        fields_to_load: vec!["id".into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        search
+            .search(request("oldtail"))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .len(),
+        4
+    );
+    index
+        .commit(CommitRequest {
+            index_name: name.into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        search
+            .search(request("oldhead"))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    assert!(
+        search
+            .search(request("oldtail"))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .is_empty()
+    );
+    let mut keys: Vec<_> = search
+        .search(request("replacement"))
+        .await
+        .unwrap()
+        .into_inner()
+        .hits
+        .into_iter()
+        .map(
+            |hit| match hit.fields["id"].values[0].value.as_ref().unwrap() {
+                field_value::Value::Text(key) => key.clone(),
+                _ => panic!("expected text key"),
+            },
+        )
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["doc0", "doc1"]);
+    // Ordinary merges retain tombstones; explicit compaction retires them on both shards.
+    for compact in [false, true] {
+        index
+            .force_merge(ForceMergeRequest {
+                index_name: name.into(),
+                compact,
+            })
+            .await
+            .unwrap();
+        let info = search
+            .get_index_info(GetIndexInfoRequest {
+                index_name: name.into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(info.num_docs, 2);
+        assert_eq!(info.num_deleted_docs, if compact { 0 } else { 4 });
+    }
+    let response = index
+        .batch_index_documents(BatchIndexDocumentsRequest {
+            index_name: name.into(),
+            documents: vec![doc("doc0", "duplicate"), doc("doc2", "reused")],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.indexed_count, 1);
+    assert_eq!(response.error_count, 1);
+    index
+        .commit(CommitRequest {
+            index_name: name.into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        search
+            .search(request("reused"))
+            .await
+            .unwrap()
+            .into_inner()
+            .hits
+            .len(),
+        1
+    );
 }

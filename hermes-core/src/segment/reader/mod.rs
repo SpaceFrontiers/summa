@@ -37,6 +37,11 @@ pub struct SegmentMemoryStats {
     pub num_docs: u32,
     /// Term dictionary block cache bytes
     pub term_dict_cache_bytes: usize,
+    /// Heap bytes in this reader generation's immutable row visibility.
+    pub deletion_bytes: usize,
+    /// Numeric row-statistic block directories; values remain evictable.
+    pub row_stats_heap_bytes: usize,
+    pub row_stats_file_backed_bytes: u64,
     /// Document store block cache bytes
     pub store_cache_bytes: usize,
     /// Sparse-vector lookup structures retained on the heap.
@@ -67,7 +72,9 @@ pub struct SegmentMemoryStats {
 impl SegmentMemoryStats {
     /// Total estimated heap retained by this segment reader.
     pub fn estimated_heap_bytes(&self) -> usize {
-        self.term_dict_cache_bytes
+        self.deletion_bytes
+            + self.row_stats_heap_bytes
+            + self.term_dict_cache_bytes
             + self.store_cache_bytes
             + self.sparse_heap_bytes
             + self.dense_heap_bytes
@@ -78,6 +85,7 @@ impl SegmentMemoryStats {
     /// This is mapped address space for `MmapDirectory`, not resident memory.
     pub fn file_backed_bytes(&self) -> u64 {
         self.term_bloom_file_bytes
+            .saturating_add(self.row_stats_file_backed_bytes)
             .saturating_add(self.sparse_file_backed_bytes)
             .saturating_add(self.dense_file_backed_bytes)
     }
@@ -1326,6 +1334,7 @@ fn document_aligned_batches(flat: &LazyFlatVectorData, batch_len: usize) -> Vec<
 #[cfg(feature = "sync")]
 fn brute_force_flat_scan_sync(
     flat: &LazyFlatVectorData,
+    visibility: Option<&crate::query::DocBitset>,
     query: &[f32],
     unit_norm: bool,
     limit: usize,
@@ -1376,7 +1385,9 @@ fn brute_force_flat_scan_sync(
                     prepared_query.score_batch(batch_bytes.as_slice(), &mut scores[..count])?;
                     for (i, &score) in scores.iter().enumerate().take(count) {
                         let (doc_id, ordinal) = flat.get_doc_id(start + i);
-                        collector.push(doc_id, ordinal, score);
+                        if visibility.is_none_or(|bits| bits.contains(doc_id)) {
+                            collector.push(doc_id, ordinal, score);
+                        }
                     }
                     Ok::<_, Error>((collector, scores))
                 },
@@ -1399,7 +1410,9 @@ fn brute_force_flat_scan_sync(
         stats.scored_blocks += 1;
         for (i, &score) in scores.iter().enumerate().take(batch_count) {
             let (doc_id, ordinal) = flat.get_doc_id(batch_start + i);
-            collector.push(doc_id, ordinal, score);
+            if visibility.is_none_or(|bits| bits.contains(doc_id)) {
+                collector.push(doc_id, ordinal, score);
+            }
         }
     }
     Ok((collector.into_results(), stats))
@@ -1901,6 +1914,9 @@ fn binary_scann_probe_clusters(
 /// - Postings: loaded on-demand per term via HTTP range requests
 /// - Document store: only index loaded, blocks loaded on-demand via HTTP range requests
 pub struct SegmentReader {
+    row_stats: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
+    deletion_meta: Option<super::DeletionMeta>,
+    alive_docs: Option<Arc<crate::query::DocBitset>>,
     meta: SegmentMeta,
     /// Term dictionary with lazy block loading
     term_dict: Arc<AsyncSSTableReader<TermInfo>>,
@@ -2069,8 +2085,24 @@ impl SegmentReader {
             log::debug!("{}", parts.join(", "));
         }
 
+        let row_stats = match dir.open_read(&files.row_stats).await {
+            Ok(handle) => loader::load_columns(handle).await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => FxHashMap::default(),
+            Err(error) => return Err(error.into()),
+        };
+        for column in row_stats.values() {
+            if column.num_docs != meta.num_docs
+                || column.multi
+                || column.column_type != crate::structures::fast_field::FastFieldColumnType::U64
+            {
+                return Err(Error::Corruption("invalid row statistics column".into()));
+            }
+        }
         #[allow(unused_mut)]
         let mut reader = Self {
+            row_stats,
+            deletion_meta: None,
+            alive_docs: None,
             meta,
             term_dict: Arc::new(term_dict),
             postings_handle,
@@ -2239,6 +2271,70 @@ impl SegmentReader {
 
     pub fn meta(&self) -> &SegmentMeta {
         &self.meta
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn row_stats(
+        &self,
+    ) -> &FxHashMap<u32, crate::structures::fast_field::FastFieldReader> {
+        &self.row_stats
+    }
+
+    /// Open a standalone segment with an exact visibility reference from the
+    /// same committed index metadata generation. Prefer `IndexReader` when
+    /// reading a live index: it also retains lifecycle ownership of the files.
+    pub async fn open_with_deletions<D: Directory>(
+        dir: &D,
+        id: SegmentId,
+        schema: Arc<Schema>,
+        term_cache_blocks: usize,
+        deletions: Option<super::DeletionMeta>,
+    ) -> Result<Self> {
+        let mut reader = Self::open(dir, id, schema, term_cache_blocks).await?;
+        if let Some(meta) = deletions {
+            reader.load_deletions(dir, meta).await?;
+        }
+        Ok(reader)
+    }
+
+    pub(crate) async fn load_deletions<D: Directory>(
+        &mut self,
+        dir: &D,
+        meta: super::DeletionMeta,
+    ) -> Result<()> {
+        let bits = meta.load(dir, self.num_docs()).await?;
+        for index in self.vector_indexes.values_mut() {
+            index.set_alive_docs(Arc::clone(&bits))?;
+        }
+        self.alive_docs = Some(bits);
+        self.deletion_meta = Some(meta);
+        Ok(())
+    }
+
+    pub(crate) fn deletion_meta(&self) -> Option<&super::DeletionMeta> {
+        self.deletion_meta.as_ref()
+    }
+
+    pub(crate) fn alive_docs(&self) -> Option<Arc<crate::query::DocBitset>> {
+        self.alive_docs.clone()
+    }
+
+    /// Whether this row is visible in this immutable reader generation.
+    pub fn is_alive(&self, doc_id: u32) -> bool {
+        doc_id < self.num_docs()
+            && self
+                .alive_docs
+                .as_ref()
+                .is_none_or(|bits| bits.contains(doc_id))
+    }
+
+    /// Number of visible rows. `num_docs` remains the physical ID-space bound.
+    pub fn num_live_docs(&self) -> u32 {
+        self.num_docs()
+            - self
+                .deletion_meta
+                .as_ref()
+                .map_or(0, |meta| meta.num_deleted)
     }
 
     pub fn num_docs(&self) -> u32 {
@@ -2420,7 +2516,21 @@ impl SegmentReader {
         let pin_intended_bytes = sparse_pin_intended_bytes.saturating_add(dense_pin_intended_bytes);
 
         SegmentMemoryStats {
+            row_stats_heap_bytes: self
+                .row_stats
+                .values()
+                .map(|column| column.block_metadata_bytes())
+                .sum(),
+            row_stats_file_backed_bytes: self
+                .row_stats
+                .values()
+                .map(|column| column.disk_bytes())
+                .sum(),
             segment_id: self.meta.id,
+            deletion_bytes: self
+                .alive_docs
+                .as_ref()
+                .map_or(0, |bits| bits.bits.len() * 8),
             num_docs: self.meta.num_docs,
             term_dict_cache_bytes,
             store_cache_bytes,
@@ -2585,6 +2695,9 @@ impl SegmentReader {
         local_doc_id: DocId,
         fields: Option<&rustc_hash::FxHashSet<u32>>,
     ) -> Result<Option<Document>> {
+        if !self.is_alive(local_doc_id) {
+            return Ok(None);
+        }
         let mut doc = match fields {
             Some(set) => {
                 let field_ids: Vec<u32> = set.iter().copied().collect();
@@ -3182,7 +3295,9 @@ impl SegmentReader {
 
                 for (i, &score) in scores.iter().enumerate().take(batch_count) {
                     let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                    collector.push(doc_id, ordinal, score);
+                    if self.is_alive(doc_id) {
+                        collector.push(doc_id, ordinal, score);
+                    }
                 }
             }
 
@@ -3524,7 +3639,9 @@ impl SegmentReader {
 
             for (i, &score) in scores.iter().enumerate().take(batch_count) {
                 let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                collector.push(doc_id, ordinal, score);
+                if self.is_alive(doc_id) {
+                    collector.push(doc_id, ordinal, score);
+                }
             }
         }
 
@@ -3959,6 +4076,7 @@ impl SegmentReader {
             // Batched brute-force (sync mmap reads), parallel on large segments.
             let (results, flat_stats) = brute_force_flat_scan_sync(
                 lazy_flat,
+                self.alive_docs.as_deref(),
                 query,
                 params.unit_norm,
                 fetch_k.min(lazy_flat.num_vectors),
@@ -4246,7 +4364,9 @@ impl SegmentReader {
 
             for (i, &score) in scores.iter().enumerate().take(batch_count) {
                 let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                collector.push(doc_id, ordinal, score);
+                if self.is_alive(doc_id) {
+                    collector.push(doc_id, ordinal, score);
+                }
             }
         }
 

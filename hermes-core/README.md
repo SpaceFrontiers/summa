@@ -51,6 +51,17 @@ cargo check -p hermes-core --no-default-features --features wasm,http \
   --target wasm32-unknown-unknown
 ```
 
+## Row deletion and upserts
+
+The native writer supports `delete_primary_key`, `upsert_document`, `compact`,
+and `compact_segment`. Initialize primary-key deduplication, stage mutations,
+then commit; reload readers to observe the new generation. Compaction preserves
+indexed-only fields and trained ANN codes. Old searchers retain their snapshots.
+`force_merge()` retains tombstones; `force_merge_with_compaction(true)` additionally
+compacts the final output, including a single-segment index.
+See the [deletion design](../docs/row-deletion.md) for budgets, the format-7 rebuild
+boundary, and the one-pending-upsert-per-key rule.
+
 ## Maintenance rules
 
 - Keep storage access behind `Directory`/`DirectoryWriter`; query and segment
