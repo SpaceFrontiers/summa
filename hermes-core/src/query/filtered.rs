@@ -50,12 +50,13 @@ fn enumerate_filter(
 ) -> Option<DocBitset> {
     let mut bits = DocBitset::new(num_docs);
     let mut visited = 0usize;
-    while scorer.doc() != crate::TERMINATED {
+    let mut doc = scorer.doc();
+    while doc != crate::TERMINATED {
         if visited.is_multiple_of(1024) && options.stop_if_expired() {
             return None;
         }
-        bits.set(scorer.doc());
-        scorer.advance();
+        bits.set(doc);
+        doc = scorer.advance();
         visited += 1;
     }
     (!options.stop_if_expired()).then_some(bits)

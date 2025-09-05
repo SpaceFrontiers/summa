@@ -8,6 +8,7 @@ use crate::structures::BlockPostingList;
 use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
+use super::docset::DocSet;
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture, TermQueryInfo};
 
 /// Term query - matches documents containing a specific term
@@ -70,6 +71,50 @@ impl TermQuery {
     pub fn set_global_stats(&mut self, stats: Arc<GlobalStats>) {
         self.global_stats = Some(stats);
     }
+
+    fn fast_field_bitset(
+        &self,
+        reader: &SegmentReader,
+        options: &super::ScorerOptions,
+    ) -> Option<super::DocBitset> {
+        let mut bits = super::DocBitset::new(reader.num_docs());
+        let Some(fast_field) = reader.fast_field(self.field.0) else {
+            return Some(bits);
+        };
+        let term = String::from_utf8_lossy(&self.term);
+        let Some(target_ordinal) = fast_field.text_ordinal(&term) else {
+            return (!options.stop_if_expired()).then_some(bits);
+        };
+        if !fast_field.multi {
+            // Avoid decoding column codec headers separately for every doc.
+            let scanned = fast_field.try_scan_single_values(|doc, ordinal| {
+                if doc.is_multiple_of(1024) && options.stop_if_expired() {
+                    return Err(());
+                }
+                if ordinal == target_ordinal {
+                    bits.set(doc);
+                }
+                Ok(())
+            });
+            return (scanned.is_ok() && !options.stop_if_expired()).then_some(bits);
+        }
+        // Multi-value fast equality retains the ordinary scorer's first-value
+        // semantics. The single-value batch API cannot represent those offsets.
+        if let Some(mut scorer) = FastFieldTextScorer::try_new(
+            reader,
+            self.field,
+            &term,
+            options.shared_threshold.as_ref(),
+        ) {
+            let mut doc = scorer.doc();
+            while doc != TERMINATED {
+                bits.set(doc);
+                doc = scorer.advance();
+            }
+        }
+        // A cancelled scan is never a complete filter, especially under NOT.
+        (!options.stop_if_expired()).then_some(bits)
+    }
 }
 
 /// Compute (idf, avg_field_len) from a posting list, using global stats when available.
@@ -119,7 +164,7 @@ macro_rules! term_plan {
         let is_indexed = reader.schema().get_field_entry(field).is_none_or(|e| e.indexed);
         if !is_indexed {
             let term_str = String::from_utf8_lossy(term);
-            if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
+            if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str, budget) {
                 return Ok(Box::new(scorer) as Box<dyn Scorer + '_>);
             }
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
@@ -171,7 +216,7 @@ macro_rules! term_plan {
             }
             None => {
                 let term_str = String::from_utf8_lossy(term);
-                if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str) {
+                if let Some(scorer) = FastFieldTextScorer::try_new(reader, field, &term_str, budget) {
                     Ok(Box::new(scorer) as Box<dyn Scorer + '_>)
                 } else {
                     Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>)
@@ -293,29 +338,55 @@ impl Query for TermQuery {
         Some(pl.doc_count() as u64)
     }
 
-    #[cfg(feature = "sync")]
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
-        // Chunked postings are keyed by virtual chunk ids, not document ids;
-        // a bitset over them would filter the wrong documents.
-        if reader.is_chunked_field(self.field) {
+        self.as_doc_bitset_with_options(reader, &super::ScorerOptions::default())
+    }
+
+    fn as_doc_bitset_with_options(
+        &self,
+        reader: &SegmentReader,
+        options: &super::ScorerOptions,
+    ) -> Option<super::DocBitset> {
+        if options.stop_if_expired() {
             return None;
         }
-        // Build bitset from posting list: O(M) where M = matching doc count.
-        // Much faster than O(N) fast-field scan for selective terms.
-        let mut bitset = super::DocBitset::new(reader.num_docs());
-        let Some(pl) = reader.get_postings_sync(self.field, &self.term).ok()? else {
-            return Some(bitset);
-        };
-        let mut iter = pl.iterator();
-        loop {
-            let doc = iter.doc();
-            if doc == crate::structures::TERMINATED {
-                break;
-            }
-            bitset.set(doc);
-            iter.advance();
+        if reader
+            .schema()
+            .get_field_entry(self.field)
+            .is_some_and(|entry| !entry.indexed)
+        {
+            // Fast-only text has no posting list. Match exactly as its ordinary
+            // scorer does, without the bounded candidate-heap fallback.
+            return self.fast_field_bitset(reader, options);
         }
-        Some(bitset)
+        #[cfg(feature = "sync")]
+        {
+            // Chunked postings use chunk ids, not document ids.
+            if reader.is_chunked_field(self.field) {
+                return None;
+            }
+            let Some(pl) = reader.get_postings_sync(self.field, &self.term).ok()? else {
+                // Preserve the ordinary term scorer's fast-column fallback.
+                return self.fast_field_bitset(reader, options);
+            };
+            // Indexed membership remains O(matches), not a full-column scan.
+            let mut bitset = super::DocBitset::new(reader.num_docs());
+            let mut iter = pl.iterator();
+            let mut visited = 0usize;
+            while iter.doc() != TERMINATED {
+                if visited.is_multiple_of(1024) && options.stop_if_expired() {
+                    return None;
+                }
+                bitset.set(iter.doc());
+                iter.advance();
+                visited += 1;
+            }
+            (!options.stop_if_expired()).then_some(bitset)
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            None
+        }
     }
 
     fn text_terms(&self, out: &mut Vec<(Field, Vec<u8>)>) {
@@ -433,10 +504,16 @@ struct FastFieldTextScorer<'a> {
     target_ordinal: u64,
     current: u32,
     num_docs: u32,
+    budget: Option<super::SharedThreshold>,
 }
 
 impl<'a> FastFieldTextScorer<'a> {
-    fn try_new(reader: &'a SegmentReader, field: Field, text: &str) -> Option<Self> {
+    fn try_new(
+        reader: &'a SegmentReader,
+        field: Field,
+        text: &str,
+        budget: Option<&super::SharedThreshold>,
+    ) -> Option<Self> {
         let fast_field = reader.fast_field(field.0)?;
         let target_ordinal = fast_field.text_ordinal(text)?;
         let num_docs = reader.num_docs();
@@ -445,9 +522,10 @@ impl<'a> FastFieldTextScorer<'a> {
             target_ordinal,
             current: 0,
             num_docs,
+            budget: budget.filter(|budget| budget.deadline().is_some()).cloned(),
         };
         // Position on first matching doc
-        if num_docs > 0 && fast_field.get_u64(0) != target_ordinal {
+        if scorer.doc() != TERMINATED && fast_field.get_u64(0) != target_ordinal {
             scorer.scan_forward();
         }
         Some(scorer)
@@ -456,7 +534,13 @@ impl<'a> FastFieldTextScorer<'a> {
     fn scan_forward(&mut self) {
         loop {
             self.current += 1;
-            if self.current >= self.num_docs {
+            if self.current >= self.num_docs
+                || (self.current.is_multiple_of(1024)
+                    && self
+                        .budget
+                        .as_ref()
+                        .is_some_and(super::SharedThreshold::stop_if_expired))
+            {
                 self.current = self.num_docs;
                 return;
             }
@@ -469,7 +553,12 @@ impl<'a> FastFieldTextScorer<'a> {
 
 impl super::docset::DocSet for FastFieldTextScorer<'_> {
     fn doc(&self) -> DocId {
-        if self.current >= self.num_docs {
+        if self.current >= self.num_docs
+            || self
+                .budget
+                .as_ref()
+                .is_some_and(super::SharedThreshold::stop_if_expired)
+        {
             TERMINATED
         } else {
             self.current
@@ -477,11 +566,17 @@ impl super::docset::DocSet for FastFieldTextScorer<'_> {
     }
 
     fn advance(&mut self) -> DocId {
+        if self.doc() == TERMINATED {
+            return TERMINATED;
+        }
         self.scan_forward();
         self.doc()
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
+        if self.doc() == TERMINATED {
+            return TERMINATED;
+        }
         if target > self.current {
             self.current = target;
             if self.current < self.num_docs

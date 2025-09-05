@@ -79,6 +79,34 @@ test("Search in index", async () => {
 	expect(titleOnly).toEqual({ title: "Rust Programming" });
 });
 
+test("Hybrid branches retain fast-only type matches and honor exclusions", async () => {
+	await init();
+	const index = await LocalIndex.create(`index fast_type {
+		field type: text<raw_ci> [fast]
+		field title: text<simple> [indexed]
+		field body: text<simple> [indexed<chunked, token_position>]
+	}`);
+	await index.addDocuments([
+		...Array.from({ length: 3 }, () => ({ type: "journal-article", title: "candidate", body: ["candidate"] })),
+		{ type: "book", title: "candidate", body: ["candidate"] },
+	]);
+	await index.commit();
+	const kind = { term: { field: "type", value: "journal-article" } };
+	expect((await index.searchStructured({ query: kind, limit: 3 })).hits.map((hit: any) => hit.address.doc_id)).toEqual([0, 1, 2]);
+	for (const exclude of [false, true]) {
+		const query = { fusion: { fetchLimit: 4, queries: ["title", "body"].map(field => ({
+			name: field,
+			query: { boolean: {
+				must: [{ term: { field, value: "candidate" } }, ...(exclude ? [] : [kind])],
+				mustNot: exclude ? [kind] : [],
+			} },
+		})) } };
+		const response = await index.searchStructured({ query, limit: 3, tracing: true });
+		expect(response.hits.map((hit: any) => hit.address.doc_id)).toEqual(exclude ? [3] : [0, 1, 2]);
+		expect(response.trace.shards[0].queries.map((branch: any) => branch.candidates.length)).toEqual(exclude ? [1, 1] : [3, 3]);
+	}
+});
+
 test("BMP search returns identical scores with optional forward storage", async () => {
 	await init();
 	const index = await LocalIndex.create(`

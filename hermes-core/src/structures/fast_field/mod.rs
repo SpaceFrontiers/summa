@@ -1832,6 +1832,53 @@ mod tests {
     }
 
     #[test]
+    fn cancellable_text_scans_preserve_global_ordinals_and_stop_at_the_requested_document() {
+        let mut a = FastFieldWriter::new_text();
+        let mut b = FastFieldWriter::new_text();
+        for doc in 0..600 {
+            if doc % 7 != 0 {
+                a.add_text(
+                    doc,
+                    if doc % 2 == 0 {
+                        "book"
+                    } else {
+                        "journal-article"
+                    },
+                );
+                b.add_text(doc, if doc % 2 == 0 { "article" } else { "book" });
+            }
+        }
+        a.pad_to(600);
+        b.pad_to(600);
+        let (data_a, dict_a, entry_a) = serialize_single_block(&mut a);
+        let (data_b, dict_b, entry_b) = serialize_single_block(&mut b);
+        let (buf, toc) = assemble_blocked_column(
+            0,
+            FastFieldColumnType::TextOrdinal,
+            false,
+            &[
+                (entry_a.num_docs, &data_a, entry_a.dict_count, &dict_a),
+                (entry_b.num_docs, &data_b, entry_b.dict_count, &dict_b),
+            ],
+        );
+        let ob = owned(buf);
+        let reader = FastFieldReader::open(&ob, &toc).unwrap();
+        let expected: Vec<_> = (0..1200).map(|doc| (doc, reader.get_u64(doc))).collect();
+        let mut complete = Vec::new();
+        reader.scan_single_values(|doc, ordinal| complete.push((doc, ordinal)));
+        assert_eq!(complete, expected);
+        for stop in [0, 255, 256, 599, 600, 1024, 1199] {
+            let mut visited = Vec::new();
+            let outcome = reader.try_scan_single_values(|doc, ordinal| {
+                visited.push((doc, ordinal));
+                if doc == stop { Err(()) } else { Ok(()) }
+            });
+            assert!(outcome.is_err());
+            assert_eq!(visited, expected[..=stop as usize]);
+        }
+    }
+
+    #[test]
     fn test_writer_reader_i64_roundtrip() {
         let mut writer = FastFieldWriter::new_numeric(FastFieldColumnType::I64);
         writer.add_i64(0, -100);
