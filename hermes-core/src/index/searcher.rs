@@ -144,6 +144,7 @@ impl<D: Directory + 'static> Searcher<D> {
             resources.term_cache_blocks,
             Arc::clone(&resources.store_cache),
             &[],
+            snapshot.deletions(),
         )
         .await?;
 
@@ -185,6 +186,7 @@ impl<D: Directory + 'static> Searcher<D> {
             resources.term_cache_blocks,
             Arc::clone(&resources.store_cache),
             existing_segments,
+            snapshot.deletions(),
         )
         .await?;
 
@@ -215,6 +217,24 @@ impl<D: Directory + 'static> Searcher<D> {
         term_cache_blocks: usize,
         store_cache: Arc<crate::segment::SharedStoreCache>,
     ) -> Result<Self> {
+        let deletions = match super::IndexMetadata::load(directory.as_ref()).await {
+            Ok(metadata) => {
+                if segment_ids.iter().any(|id| !metadata.has_segment(id)) {
+                    return Err(crate::Error::Query(
+                        "segment list is stale; reopen the index metadata before searching".into(),
+                    ));
+                }
+                metadata
+                    .segment_metas
+                    .into_iter()
+                    .filter_map(|(id, info)| info.deletions.map(|d| (id, (info.num_docs, d))))
+                    .collect()
+            }
+            Err(crate::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Default::default()
+            }
+            Err(error) => return Err(error),
+        };
         let (segments, default_fields, global_stats, segment_map, total_docs) = Self::load_common(
             &directory,
             &schema,
@@ -223,6 +243,7 @@ impl<D: Directory + 'static> Searcher<D> {
             term_cache_blocks,
             store_cache,
             &[],
+            &deletions,
         )
         .await?;
 
@@ -262,6 +283,7 @@ impl<D: Directory + 'static> Searcher<D> {
     }
 
     /// Common loading logic shared by create and from_snapshot
+    #[allow(clippy::too_many_arguments)]
     async fn load_common(
         directory: &Arc<D>,
         schema: &Arc<Schema>,
@@ -270,6 +292,7 @@ impl<D: Directory + 'static> Searcher<D> {
         term_cache_blocks: usize,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
+        deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
     ) -> Result<(
         Vec<Arc<SegmentReader>>,
         Vec<crate::Field>,
@@ -285,6 +308,7 @@ impl<D: Directory + 'static> Searcher<D> {
             term_cache_blocks,
             store_cache,
             existing_segments,
+            deletions,
         )
         .await?;
         let default_fields = Self::build_default_fields(schema);
@@ -302,6 +326,7 @@ impl<D: Directory + 'static> Searcher<D> {
     /// Load segment readers from IDs (parallel loading for performance).
     /// Reuses existing segment readers for unchanged segments when `existing_segments`
     /// is non-empty — avoids re-opening mmaps, fast fields, sparse indexes, etc.
+    #[allow(clippy::too_many_arguments)]
     async fn load_segments(
         directory: &Arc<D>,
         schema: &Arc<Schema>,
@@ -310,6 +335,7 @@ impl<D: Directory + 'static> Searcher<D> {
         term_cache_blocks: usize,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
+        deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
     ) -> Result<Vec<Arc<SegmentReader>>> {
         // Build lookup from existing segment readers for reuse
         let existing_map: FxHashMap<u128, Arc<SegmentReader>> = existing_segments
@@ -335,7 +361,9 @@ impl<D: Directory + 'static> Searcher<D> {
         let mut reused: Vec<(usize, Arc<SegmentReader>)> = Vec::new();
         let mut to_load: Vec<(usize, SegmentId)> = Vec::new();
         for (idx, sid) in &valid_segments {
-            if let Some(existing) = existing_map.get(&sid.0) {
+            if let Some(existing) = existing_map.get(&sid.0)
+                && existing.deletion_meta() == deletions.get(&sid.to_hex()).map(|(_, d)| d)
+            {
                 reused.push((*idx, Arc::clone(existing)));
             } else {
                 to_load.push((*idx, *sid));
@@ -390,6 +418,16 @@ impl<D: Directory + 'static> Searcher<D> {
         for ((idx, sid), result) in to_load.into_iter().zip(results) {
             match result {
                 Ok(mut reader) => {
+                    if let Some((num_docs, meta)) = deletions.get(&sid.to_hex()) {
+                        if *num_docs != reader.num_docs() {
+                            return Err(crate::Error::Corruption(
+                                "deletion metadata row count mismatch".into(),
+                            ));
+                        }
+                        reader
+                            .load_deletions(directory.as_ref(), meta.clone())
+                            .await?;
+                    }
                     // Inject the single immutable index-level artifact generation.
                     reader.set_trained_vectors(Arc::clone(trained_vectors));
                     loaded.push((idx, Arc::new(reader)));
@@ -563,7 +601,7 @@ impl<D: Directory + 'static> Searcher<D> {
         let mut total = 0u32;
         for (i, seg) in segments.iter().enumerate() {
             segment_map.insert(seg.meta().id, i);
-            total = total.saturating_add(seg.meta().num_docs);
+            total = total.saturating_add(seg.num_live_docs());
         }
         (segment_map, total)
     }

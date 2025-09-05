@@ -7,7 +7,10 @@ use crate::index::{IndexConfig, IndexWriter};
 struct BlockingMetadataDirectory {
     inner: RamDirectory,
     block_next_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    block_next_row_stats: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fail_next_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fail_pk_refresh_after_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fail_next_fast_read: std::sync::Arc<std::sync::atomic::AtomicBool>,
     panic_next_bloom_write: std::sync::Arc<std::sync::atomic::AtomicBool>,
     rename_started: std::sync::Arc<tokio::sync::Semaphore>,
     allow_rename: std::sync::Arc<tokio::sync::Semaphore>,
@@ -18,7 +21,12 @@ impl Default for BlockingMetadataDirectory {
         Self {
             inner: RamDirectory::default(),
             block_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            block_next_row_stats: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_pk_refresh_after_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
+            fail_next_fast_read: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             panic_next_bloom_write: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rename_started: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
             allow_rename: std::sync::Arc::new(tokio::sync::Semaphore::new(0)),
@@ -65,6 +73,17 @@ impl crate::directories::Directory for BlockingMetadataDirectory {
         &self,
         path: &std::path::Path,
     ) -> std::io::Result<crate::directories::FileHandle> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "fast")
+            && self
+                .fail_next_fast_read
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(std::io::Error::other(
+                "injected PK visibility refresh failure",
+            ));
+        }
         self.inner.open_read(path).await
     }
 
@@ -127,7 +146,16 @@ impl crate::directories::DirectoryWriter for BlockingMetadataDirectory {
             self.rename_started.add_permits(1);
             self.allow_rename.acquire().await.unwrap().forget();
         }
-        self.inner.rename(from, to).await
+        self.inner.rename(from, to).await?;
+        if to == std::path::Path::new(crate::index::INDEX_META_FILENAME)
+            && self
+                .fail_pk_refresh_after_rename
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.fail_next_fast_read
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
     }
 
     async fn sync(&self) -> std::io::Result<()> {
@@ -138,6 +166,16 @@ impl crate::directories::DirectoryWriter for BlockingMetadataDirectory {
         &self,
         path: &std::path::Path,
     ) -> std::io::Result<Box<dyn crate::directories::StreamingWriter>> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "rowstats")
+            && self
+                .block_next_row_stats
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.rename_started.add_permits(1);
+            self.allow_rename.acquire().await.unwrap().forget();
+        }
         self.inner.streaming_writer(path).await
     }
 }
@@ -716,4 +754,656 @@ fn test_schema_primary_field() {
     builder.add_text_field("title", true, true);
     let schema = builder.build();
     assert_eq!(schema.primary_field(), None);
+}
+
+#[tokio::test]
+async fn deleted_primary_keys_survive_bloom_cache_reopen_without_blocking_reuse() {
+    for reused in ["reused", "RETAINED", "ключ/日本語"] {
+        let (schema, pk, title) = make_schema();
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        };
+        let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+            .await
+            .unwrap();
+        writer.init_primary_key_dedup().await.unwrap();
+        writer
+            .add_document(make_doc(pk, title, reused, "old"))
+            .unwrap();
+        writer
+            .add_document(make_doc(pk, title, "retained", "stable"))
+            .unwrap();
+        writer.commit().await.unwrap();
+        writer.delete_primary_key(reused).unwrap();
+        writer.commit().await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        let mut writer = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        writer.init_primary_key_dedup().await.unwrap();
+        // The persisted Bloom still contains this key. Visibility, not a Bloom
+        // positive, decides whether the exact dictionary match is a duplicate.
+        writer
+            .add_document(make_doc(pk, title, reused, "new"))
+            .unwrap();
+        assert!(matches!(
+            writer.add_document(make_doc(pk, title, "retained", "duplicate")),
+            Err(Error::DuplicatePrimaryKey(_))
+        ));
+        assert!(matches!(
+            writer.add_document(make_doc(pk, title, reused, "duplicate")),
+            Err(Error::DuplicatePrimaryKey(_))
+        ));
+        writer.commit().await.unwrap();
+        writer.force_merge().await.unwrap();
+        for key in [reused, "retained"] {
+            assert!(matches!(
+                writer.add_document(make_doc(pk, title, key, "duplicate")),
+                Err(Error::DuplicatePrimaryKey(_))
+            ));
+        }
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        let mut reopened = IndexWriter::open(dir.clone(), config.clone())
+            .await
+            .unwrap();
+        reopened.init_primary_key_dedup().await.unwrap();
+        assert!(matches!(
+            reopened.add_document(make_doc(pk, title, reused, "duplicate")),
+            Err(Error::DuplicatePrimaryKey(_))
+        ));
+        let index = crate::index::Index::open(dir, config).await.unwrap();
+        assert_eq!(index.num_docs().await.unwrap(), 2);
+    }
+}
+
+#[tokio::test]
+async fn aborted_and_failed_upserts_preserve_old_primary_key_rows() {
+    let (schema, pk, title) = make_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    writer
+        .add_document(make_doc(pk, title, "same", "old"))
+        .unwrap();
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "same", "aborted"))
+        .unwrap();
+    writer.prepare_commit().await.unwrap().abort();
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "same", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+    writer
+        .upsert_document(make_doc(pk, title, "same", "new"))
+        .unwrap();
+    dir.fail_next_metadata_rename();
+    assert!(writer.commit().await.is_err());
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert!(
+        metadata
+            .segment_metas
+            .values()
+            .all(|info| info.deletions.is_none())
+    );
+    writer.commit().await.unwrap();
+    let index = crate::index::Index::open(dir, IndexConfig::default())
+        .await
+        .unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 1);
+    assert_eq!(
+        searcher
+            .search(&crate::query::TermQuery::new(title, "new"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        searcher
+            .search(&crate::query::TermQuery::new(title, "old"), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancelled_upsert_commit_publishes_deletion_and_replacement_together() {
+    let (schema, pk, title) = make_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    writer
+        .add_document(make_doc(pk, title, "same", "old"))
+        .unwrap();
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "same", "new"))
+        .unwrap();
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    dir.block_next_metadata_rename();
+    let operation = {
+        let writer = std::sync::Arc::clone(&writer);
+        tokio::spawn(async move { writer.lock().await.commit().await })
+    };
+    dir.wait_until_rename_started().await;
+    operation.abort();
+    assert!(operation.await.unwrap_err().is_cancelled());
+    dir.release_rename();
+    let mut guard = writer.lock().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        guard.wait_for_commit_finalization(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        guard.add_document(make_doc(pk, title, "same", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+    guard.commit().await.unwrap();
+    let index = crate::index::Index::open(dir, IndexConfig::default())
+        .await
+        .unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 1);
+    assert_eq!(
+        searcher
+            .search(&crate::query::TermQuery::new(title, "new"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn compaction_rejects_stale_visibility_instead_of_resurrecting_concurrent_deletes() {
+    let (schema, pk, title) = make_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for key in ["first", "second", "third"] {
+        writer
+            .add_document(make_doc(pk, title, key, "present"))
+            .unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.delete_primary_key("first").unwrap();
+    writer.commit().await.unwrap();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    let id = crate::index::IndexMetadata::load(&dir)
+        .await
+        .unwrap()
+        .segment_ids()[0]
+        .clone();
+    dir.block_next_row_stats
+        .store(true, std::sync::atomic::Ordering::Release);
+    let compact = {
+        let manager = std::sync::Arc::clone(&manager);
+        let id = id.clone();
+        tokio::spawn(async move { manager.compact_segment(&id, 16 * 1024 * 1024).await })
+    };
+    dir.wait_until_rename_started().await;
+    writer.delete_primary_key("second").unwrap();
+    writer.commit().await.unwrap();
+    dir.release_rename();
+    let error = compact.await.unwrap().unwrap_err();
+    assert!(error.to_string().contains("visibility changed"), "{error}");
+    manager
+        .compact_segment(&id, 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    let index = crate::index::Index::open(dir, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 1);
+    assert_eq!(searcher.segment_readers()[0].num_docs(), 1);
+    let hits = searcher.search(&crate::query::AllQuery, 10).await.unwrap();
+    assert_eq!(
+        searcher
+            .doc(hits[0].segment_id, hits[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .get_first(pk)
+            .unwrap()
+            .as_text(),
+        Some("third")
+    );
+    writer
+        .add_document(make_doc(pk, title, "second", "reused"))
+        .unwrap();
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "third", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+}
+
+#[tokio::test]
+async fn cancelled_compaction_retains_ownership_and_shutdown_drains_its_blocking_writer() {
+    use crate::directories::Directory;
+    let (schema, pk, title) = make_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for key in ["deleted", "live"] {
+        writer
+            .add_document(make_doc(pk, title, key, "present"))
+            .unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.delete_primary_key("deleted").unwrap();
+    writer.commit().await.unwrap();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    let id = crate::index::IndexMetadata::load(&dir)
+        .await
+        .unwrap()
+        .segment_ids()[0]
+        .clone();
+    // Drain any cleanup from commit before capturing the exact source file set.
+    manager.cleanup_orphan_segments().await.unwrap();
+    let mut before = dir.list_files(std::path::Path::new("")).await.unwrap();
+    before.sort();
+    dir.block_next_row_stats
+        .store(true, std::sync::atomic::Ordering::Release);
+    let compact = {
+        let manager = std::sync::Arc::clone(&manager);
+        tokio::spawn(async move { manager.compact_segment(&id, 16 * 1024 * 1024).await })
+    };
+    dir.wait_until_rename_started().await;
+    compact.abort();
+    assert!(compact.await.unwrap_err().is_cancelled());
+    manager.begin_shutdown();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            manager.wait_for_shutdown()
+        )
+        .await
+        .is_err()
+    );
+    dir.release_rename();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        manager.wait_for_shutdown(),
+    )
+    .await
+    .unwrap();
+    let mut after = dir.list_files(std::path::Path::new("")).await.unwrap();
+    after.sort();
+    assert_eq!(before, after, "cancelled compaction left a partial output");
+}
+
+#[tokio::test]
+async fn primary_key_visibility_uses_global_ordinals_after_stacking_dictionaries() {
+    use crate::directories::Directory;
+    let (schema, pk, title) = make_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for batch in [["z", "b"], ["a", "c"]] {
+        for key in batch {
+            writer
+                .add_document(make_doc(pk, title, key, "present"))
+                .unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    writer.force_merge().await.unwrap();
+    let index = crate::index::Index::open(dir.clone(), config)
+        .await
+        .unwrap();
+    let reader = index.reader().await.unwrap();
+    let physical = reader.searcher().await.unwrap();
+    assert_eq!(
+        reader.searcher().await.unwrap().segment_readers()[0]
+            .fast_field(pk.0)
+            .unwrap()
+            .num_blocks(),
+        2
+    );
+    writer.delete_primary_key("b").unwrap();
+    writer.commit().await.unwrap();
+    // Compare the complete persisted mask with the former scalar text scan,
+    // including a source whose local dictionaries have different orderings.
+    let source = &physical.segment_readers()[0];
+    let mut expected = crate::query::DocBitset::all(source.num_docs());
+    for doc in 0..source.num_docs() {
+        if source.fast_field(pk.0).unwrap().get_text(doc) == Some("b") {
+            expected.clear(doc);
+        }
+    }
+    let scratch = RamDirectory::new();
+    let reference = crate::segment::deletion::write(
+        &scratch,
+        crate::segment::SegmentId::new(),
+        source.num_docs(),
+        &expected,
+    )
+    .await
+    .unwrap();
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let actual = metadata
+        .segment_metas
+        .values()
+        .next()
+        .unwrap()
+        .deletions
+        .as_ref()
+        .unwrap();
+    let reference_bytes = scratch
+        .open_read(&reference.path().unwrap())
+        .await
+        .unwrap()
+        .read_bytes()
+        .await
+        .unwrap();
+    let actual_bytes = dir
+        .open_read(&actual.path().unwrap())
+        .await
+        .unwrap()
+        .read_bytes()
+        .await
+        .unwrap();
+    assert_eq!(actual_bytes.as_slice(), reference_bytes.as_slice());
+    for key in ["z", "a", "c"] {
+        assert!(matches!(
+            writer.add_document(make_doc(pk, title, key, "duplicate")),
+            Err(Error::DuplicatePrimaryKey(_))
+        ));
+    }
+    writer
+        .add_document(make_doc(pk, title, "b", "reused"))
+        .unwrap();
+    writer.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_visibility_refresh_and_abort_do_not_replay_published_upsert_deletions() {
+    let (schema, pk, title) = make_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let index = crate::index::Index::create(
+        dir.clone(),
+        schema,
+        IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+    writer.init_primary_key_dedup().await.unwrap();
+    for key in ["updated", "deleted", "untouched"] {
+        writer
+            .add_document(make_doc(pk, title, key, "old"))
+            .unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "updated", "replacement"))
+        .unwrap();
+    writer.delete_primary_key("deleted").unwrap();
+    dir.fail_pk_refresh_after_rename
+        .store(true, std::sync::atomic::Ordering::Release);
+    assert!(
+        writer.commit().await.unwrap(),
+        "durable publication must still succeed"
+    );
+    assert!(
+        !dir.fail_next_fast_read
+            .load(std::sync::atomic::Ordering::Acquire),
+        "injected read error was not consumed"
+    );
+    assert!(matches!(
+        writer.delete_primary_key("updated"),
+        Err(Error::CommitInProgress)
+    ));
+    writer.prepare_commit().await.unwrap().abort();
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "updated", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+    writer
+        .add_document(make_doc(pk, title, "recovery", "new"))
+        .unwrap();
+    writer.commit().await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 3);
+    assert_eq!(
+        searcher
+            .search(&crate::query::TermQuery::new(title, "replacement"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    writer
+        .add_document(make_doc(pk, title, "deleted", "reused"))
+        .unwrap();
+    writer.force_merge_with_compaction(true).await.unwrap();
+    reader.reload().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 4);
+    assert_eq!(searcher.segment_readers()[0].num_docs(), 4);
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "updated", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+}
+
+#[tokio::test]
+async fn ambiguous_or_undeletable_primary_keys_are_rejected_before_mutation() {
+    let (schema, pk, title) = make_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    writer
+        .add_document(make_doc(pk, title, "original", "old"))
+        .unwrap();
+    writer.commit().await.unwrap();
+
+    let mut ambiguous = make_doc(pk, title, "original", "replacement");
+    ambiguous.add_text(pk, "different");
+    assert!(matches!(
+        writer.upsert_document(ambiguous),
+        Err(Error::Document(_))
+    ));
+    let mut ambiguous = make_doc(pk, title, "fresh", "insertion");
+    ambiguous.add_text(pk, "different");
+    assert!(matches!(
+        writer.add_document(ambiguous),
+        Err(Error::Document(_))
+    ));
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, &"x".repeat(65_537), "long")),
+        Err(Error::Document(_))
+    ));
+    assert!(
+        !writer.commit().await.unwrap(),
+        "rejected mutations staged changes"
+    );
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "original", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+    writer
+        .add_document(make_doc(pk, title, "fresh", "valid"))
+        .unwrap();
+    writer.commit().await.unwrap();
+    writer.delete_primary_key("fresh").unwrap();
+    writer.commit().await.unwrap();
+    writer.force_merge_with_compaction(true).await.unwrap();
+    let index = crate::index::Index::open(dir, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 1);
+    let hits = searcher
+        .search(&crate::query::TermQuery::new(title, "old"), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_merge_carries_concurrent_deletes_upserts_and_pending_key_reservations() {
+    use std::collections::BTreeMap;
+    let (schema, pk, title) = make_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let index = crate::index::Index::create(
+        dir.clone(),
+        schema,
+        IndexConfig {
+            num_indexing_threads: 1,
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+    writer.init_primary_key_dedup().await.unwrap();
+    for range in [0..65, 65..132] {
+        for key in range {
+            writer
+                .add_document(make_doc(pk, title, &format!("key{key}"), "old"))
+                .unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    let reader = index.reader().await.unwrap();
+    let original = reader.searcher().await.unwrap();
+    for key in [0, 64] {
+        writer.delete_primary_key(&format!("key{key}")).unwrap();
+    }
+    writer.commit().await.unwrap();
+    reader.reload().await.unwrap();
+    let before_merge = reader.searcher().await.unwrap();
+    dir.block_next_row_stats
+        .store(true, std::sync::atomic::Ordering::Release);
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    let merge = tokio::spawn(async move { manager.force_merge().await });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        dir.wait_until_rename_started(),
+    )
+    .await
+    .unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "key1", "replacement"))
+        .unwrap();
+    for key in [65, 131] {
+        writer.delete_primary_key(&format!("key{key}")).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer
+        .add_document(make_doc(pk, title, "pending", "unpublished"))
+        .unwrap();
+    dir.release_rename();
+    tokio::time::timeout(std::time::Duration::from_secs(10), merge)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "pending", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "key1", "duplicate")),
+        Err(Error::DuplicatePrimaryKey(_))
+    ));
+    reader.reload().await.unwrap();
+    let merged = reader.searcher().await.unwrap();
+    assert_eq!(
+        merged
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.num_docs())
+            .sum::<u32>(),
+        133
+    );
+    for (snapshot, removed, replacement) in [
+        (&original, vec![], false),
+        (&before_merge, vec![0, 64], false),
+        (&merged, vec![0, 64, 65, 131], true),
+    ] {
+        let mut actual = BTreeMap::new();
+        for hit in snapshot.search(&crate::query::AllQuery, 200).await.unwrap() {
+            let doc = snapshot
+                .doc(hit.segment_id, hit.doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let key = doc.get_first(pk).unwrap().as_text().unwrap().to_owned();
+            assert!(
+                actual
+                    .insert(
+                        key,
+                        doc.get_first(title).unwrap().as_text().unwrap().to_owned()
+                    )
+                    .is_none(),
+                "duplicate live key"
+            );
+        }
+        let expected: BTreeMap<_, _> = (0..132)
+            .filter(|key| !removed.contains(key))
+            .map(|key| {
+                (
+                    format!("key{key}"),
+                    if replacement && key == 1 {
+                        "replacement"
+                    } else {
+                        "old"
+                    }
+                    .to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+    writer.prepare_commit().await.unwrap().abort();
+    writer.force_merge_with_compaction(true).await.unwrap();
+    reader.reload().await.unwrap();
+    let compacted = reader.searcher().await.unwrap();
+    assert_eq!(compacted.num_docs(), 128);
+    assert_eq!(compacted.segment_readers()[0].num_docs(), 128);
+    assert_eq!(
+        original
+            .search(&crate::query::AllQuery, 200)
+            .await
+            .unwrap()
+            .len(),
+        132
+    );
 }

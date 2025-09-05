@@ -225,13 +225,14 @@ pub async fn commit_index(index_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub async fn merge_index(index_path: PathBuf) -> Result<()> {
+pub async fn merge_index(index_path: PathBuf, compact: bool) -> Result<()> {
     let dir = MmapDirectory::new(&index_path);
     let config = IndexConfig::default();
     let mut writer = IndexWriter::open(dir, config).await?;
 
     info!("Starting force merge...");
-    writer.force_merge().await?;
+    let result = writer.force_merge_with_compaction(compact).await;
+    finish_local_maintenance(writer, result).await?;
     info!("Force merge completed");
 
     Ok(())
@@ -695,9 +696,146 @@ pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> 
     Ok(())
 }
 
+pub async fn delete_rows(index_path: PathBuf, keys: Vec<String>) -> Result<()> {
+    anyhow::ensure!(
+        !keys.is_empty() && keys.len() <= 100_000,
+        "supply 1..=100000 keys"
+    );
+    anyhow::ensure!(
+        keys.iter().all(|key| !key.is_empty() && key.len() <= 65536),
+        "keys must contain 1..=65536 bytes"
+    );
+    anyhow::ensure!(
+        keys.iter().map(String::len).sum::<usize>() <= 8 * 1024 * 1024,
+        "deletion keys exceed 8 MiB"
+    );
+    let mut writer =
+        IndexWriter::open(MmapDirectory::new(&index_path), IndexConfig::default()).await?;
+    writer.init_primary_key_dedup().await?;
+    for key in &keys {
+        writer.delete_primary_key(key)?;
+    }
+    let result = writer.commit().await;
+    finish_local_maintenance(writer, result).await?;
+    info!(
+        "Committed deletion of {} requested primary keys",
+        keys.len()
+    );
+    Ok(())
+}
+
+pub async fn upsert_row(index_path: PathBuf, json: String) -> Result<()> {
+    anyhow::ensure!(
+        json.len() <= 8 * 1024 * 1024,
+        "replacement document exceeds 8 MiB"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&json).context("invalid replacement JSON")?;
+    let mut writer =
+        IndexWriter::open(MmapDirectory::new(&index_path), IndexConfig::default()).await?;
+    writer.init_primary_key_dedup().await?;
+    let doc =
+        Document::from_json(&value, &writer.schema()).context("invalid replacement document")?;
+    writer.upsert_document(doc)?;
+    let result = writer.commit().await;
+    finish_local_maintenance(writer, result).await?;
+    info!("Committed replacement document");
+    Ok(())
+}
+
+pub async fn compact_rows(
+    index_path: PathBuf,
+    segment: Option<String>,
+    memory_budget_mb: usize,
+) -> Result<()> {
+    let budget = memory_budget_mb
+        .checked_mul(1024 * 1024)
+        .filter(|bytes| *bytes >= 1024 * 1024)
+        .context("compaction budget must be at least 1 MiB and fit usize")?;
+    if let Some(id) = &segment {
+        anyhow::ensure!(
+            hermes_core::segment::SegmentId::from_hex(id).is_some(),
+            "invalid segment ID"
+        );
+    }
+    let mut writer =
+        IndexWriter::open(MmapDirectory::new(&index_path), IndexConfig::default()).await?;
+    let result = match segment {
+        Some(id) => writer.compact_segment(&id, budget).await.map(usize::from),
+        None => writer.compact(budget).await,
+    };
+    let count = finish_local_maintenance(writer, result).await?;
+    info!("Compacted {count} segment(s)");
+    Ok(())
+}
+
+/// A command exits its runtime on return, so drain core-owned cleanup after
+/// releasing the writer's snapshots, including when maintenance failed.
+async fn finish_local_maintenance<T>(
+    mut writer: IndexWriter<MmapDirectory>,
+    result: hermes_core::Result<T>,
+) -> Result<T> {
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    let shutdown = writer.shutdown().await;
+    drop(writer);
+    manager.wait_for_shutdown().await;
+    let value = result?;
+    shutdown?;
+    Ok(value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compacting_merge_drains_retired_files_before_returning() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index");
+        init_index_from_sdl(
+            path.clone(),
+            "index rows { field id: text<raw> [primary, fast, stored] }".into(),
+        )
+        .await
+        .unwrap();
+        let mut writer = IndexWriter::open(MmapDirectory::new(&path), IndexConfig::default())
+            .await
+            .unwrap();
+        writer.init_primary_key_dedup().await.unwrap();
+        let id = writer.schema().primary_field().unwrap();
+        for key in ["dead", "live"] {
+            let mut doc = Document::new();
+            doc.add_text(id, key);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        writer.delete_primary_key("dead").unwrap();
+        writer.commit().await.unwrap();
+        let manager = std::sync::Arc::clone(writer.segment_manager());
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        manager.wait_for_shutdown().await;
+        drop(manager);
+
+        merge_index(path.clone(), true).await.unwrap();
+        // Do not yield: returning from the CLI must mean cleanup has drained,
+        // because its runtime is about to exit.
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("metadata.json")).unwrap()).unwrap();
+        let metas = metadata["segment_metas"].as_object().unwrap();
+        assert_eq!(metas.len(), 1);
+        let (id, meta) = metas.iter().next().unwrap();
+        assert_eq!(meta["num_docs"], 1);
+        for entry in fs::read_dir(&path).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.starts_with("seg_") {
+                assert!(
+                    name.starts_with(&format!("seg_{id}.")),
+                    "retired file remains at CLI return: {name}"
+                );
+            }
+        }
+    }
 
     /// Regression: the CLI `index` command must enforce a schema-declared
     /// primary-key unique constraint (init_primary_key_dedup, mirroring

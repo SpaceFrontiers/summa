@@ -117,3 +117,22 @@ commands or defaults change.
 ## License
 
 MIT
+
+### Delete, upsert, and compact rows
+
+These commands require a primary-key field and commit their changes:
+
+```bash
+hermes-tool merge -i ./my_index --compact
+hermes-tool delete -i ./my_index --key obsolete-id --key another-id
+hermes-tool upsert -i ./my_index --document '{"id":"existing-id","title":"replacement"}'
+hermes-tool compact -i ./my_index --memory-budget-mb 256
+hermes-tool compact -i ./my_index --segment SEGMENT_HEX_ID --memory-budget-mb 256
+```
+
+`upsert` supplies a complete replacement document and inserts a missing key.
+`compact` removes deleted rows from each dirty segment, including a singleton.
+`merge` combines segments and retains deletion masks; `merge --compact`
+physically removes deleted rows after merging. Indexed-only fields are
+preserved. Index metadata format 7 requires rebuilding older indexes. See the
+[row-deletion design](../docs/row-deletion.md) for snapshot, budget, and key semantics.

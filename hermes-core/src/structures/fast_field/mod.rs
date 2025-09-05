@@ -755,6 +755,11 @@ struct TextState {
 }
 
 impl FastFieldReader {
+    /// Heap directory only; encoded values and dictionaries remain file-backed.
+    pub(crate) fn block_metadata_bytes(&self) -> usize {
+        self.blocks.capacity() * std::mem::size_of::<ColumnBlock>()
+    }
+
     /// Bytes of column data backing this reader (values, offsets, dicts).
     pub fn disk_bytes(&self) -> u64 {
         self.blocks
@@ -1240,19 +1245,19 @@ impl FastFieldReader {
     /// For text columns, returned values are global ordinals (remapped).
     /// For multi-value columns, use `for_each_multi_value` instead.
     pub fn scan_single_values(&self, mut f: impl FnMut(u32, u64)) {
-        let _ = self.try_scan_single_values(|doc, value| {
+        let _: Result<(), std::convert::Infallible> = self.try_scan_single_values(|doc, value| {
             f(doc, value);
-            std::ops::ControlFlow::Continue(())
+            Ok(())
         });
     }
 
-    /// The same batched scan, with immediate caller-controlled cancellation.
-    pub(crate) fn try_scan_single_values(
+    /// The same batch decoder with early error/cancellation propagation.
+    pub(crate) fn try_scan_single_values<E>(
         &self,
-        mut f: impl FnMut(u32, u64) -> std::ops::ControlFlow<()>,
-    ) -> std::ops::ControlFlow<()> {
+        mut f: impl FnMut(u32, u64) -> Result<(), E>,
+    ) -> Result<(), E> {
         if self.multi {
-            return std::ops::ControlFlow::Continue(());
+            return Ok(());
         }
         const BATCH: usize = 256;
         let mut buf = [0u64; BATCH];
@@ -1300,7 +1305,7 @@ impl FastFieldReader {
                 pos += chunk;
             }
         }
-        std::ops::ControlFlow::Continue(())
+        Ok(())
     }
 
     /// Check if this doc has a value (not [`FAST_FIELD_MISSING`]).
@@ -1805,6 +1810,28 @@ mod tests {
     }
 
     #[test]
+    fn fallible_column_scan_stops_at_the_first_error_across_batch_boundaries() {
+        let mut column = FastFieldWriter::new_numeric(FastFieldColumnType::U64);
+        for doc in 0..1024 {
+            column.add_u64(doc, u64::from(doc) * 17);
+        }
+        let mut bytes = Vec::new();
+        let (toc, _) = column.serialize(&mut bytes, 0).unwrap();
+        let reader = FastFieldReader::open(&owned(bytes), &toc).unwrap();
+        let mut visited = 0;
+        let error = reader
+            .try_scan_single_values(|doc, value| {
+                assert_eq!(doc, visited);
+                assert_eq!(value, u64::from(doc) * 17);
+                visited += 1;
+                if doc == 257 { Err("cancelled") } else { Ok(()) }
+            })
+            .unwrap_err();
+        assert_eq!(error, "cancelled");
+        assert_eq!(visited, 258);
+    }
+
+    #[test]
     fn cancellable_text_scans_preserve_global_ordinals_and_stop_at_the_requested_document() {
         let mut a = FastFieldWriter::new_text();
         let mut b = FastFieldWriter::new_text();
@@ -1844,13 +1871,9 @@ mod tests {
             let mut visited = Vec::new();
             let outcome = reader.try_scan_single_values(|doc, ordinal| {
                 visited.push((doc, ordinal));
-                if doc == stop {
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
+                if doc == stop { Err(()) } else { Ok(()) }
             });
-            assert!(outcome.is_break());
+            assert!(outcome.is_err());
             assert_eq!(visited, expected[..=stop as usize]);
         }
     }

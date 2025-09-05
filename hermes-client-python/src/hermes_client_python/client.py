@@ -20,6 +20,7 @@ from .types import (
     CandidateScores,
     DocAddress,
     Document,
+    DocumentMutationResult,
     FusionCandidate,
     FusionCandidateList,
     IndexInfo,
@@ -223,6 +224,9 @@ class HermesClient:
             num_docs=response.num_docs,
             num_segments=response.num_segments,
             schema=response.schema,
+            physical_num_docs=response.physical_num_docs,
+            num_deleted_docs=response.num_deleted_docs,
+            deleted_ratio=response.deleted_ratio,
             candidate_scoring_version=response.candidate_scoring_version,
             unprepared_candidate_fields=list(response.unprepared_candidate_fields),
             vector_stats=vector_stats,
@@ -279,6 +283,95 @@ class HermesClient:
         """
         await self.index_documents(index_name, [document], timeout=timeout)
 
+    async def delete_documents(
+        self,
+        index_name: str,
+        primary_keys: list[str],
+        timeout: float | None = None,
+    ) -> DocumentMutationResult:
+        """Stage exact-key deletions of whole documents, including all chunks.
+
+        Missing keys are accepted. Inspect per-item errors; commit publishes
+        accepted operations. Do not blindly retry after an uncertain RPC outcome.
+        """
+        self._ensure_connected()
+        if (
+            len(primary_keys) > 100_000
+            or sum(len(key.encode("utf-8")) for key in primary_keys) > 8 * 1024 * 1024
+        ):
+            raise ValueError(
+                "deletion request exceeds 100000 keys or 8 MiB of key bytes"
+            )
+        response = await self._index_stub.DeleteDocuments(
+            pb.DeleteDocumentsRequest(index_name=index_name, primary_keys=primary_keys),
+            timeout=self._deadline(timeout),
+        )
+        return DocumentMutationResult(
+            response.accepted_count,
+            [{"index": error.index, "error": error.error} for error in response.errors],
+        )
+
+    async def delete_document(
+        self,
+        index_name: str,
+        primary_key: str,
+        timeout: float | None = None,
+    ) -> None:
+        """Stage one deletion; raises if rejected. Call commit to publish."""
+        result = await self.delete_documents(index_name, [primary_key], timeout=timeout)
+        if result.errors or result.accepted_count != 1:
+            raise RuntimeError(
+                result.errors[0]["error"]
+                if result.errors
+                else "deletion was not accepted"
+            )
+
+    async def upsert_documents(
+        self,
+        index_name: str,
+        documents: list[dict[str, Any]],
+        timeout: float | None = None,
+    ) -> DocumentMutationResult:
+        """Stage complete replacements, inserting missing keys. No partial patches.
+
+        Each document must contain its primary key. Inspect per-item errors;
+        commit publishes accepted operations. At most one pending replacement
+        per key is allowed, including across calls.
+        """
+        self._ensure_connected()
+        if len(documents) > 1_000:
+            raise ValueError("upsert request exceeds 1000 documents")
+        request = pb.UpsertDocumentsRequest(
+            index_name=index_name,
+            documents=[
+                pb.NamedDocument(fields=_to_field_entries(doc)) for doc in documents
+            ],
+        )
+        if request.ByteSize() > 32 * 1024 * 1024:
+            raise ValueError("upsert request exceeds 32 MiB encoded bytes")
+        response = await self._index_stub.UpsertDocuments(
+            request, timeout=self._deadline(timeout)
+        )
+        return DocumentMutationResult(
+            response.accepted_count,
+            [{"index": error.index, "error": error.error} for error in response.errors],
+        )
+
+    async def upsert_document(
+        self,
+        index_name: str,
+        document: dict[str, Any],
+        timeout: float | None = None,
+    ) -> None:
+        """Stage one complete replacement; raises if rejected. Commit to publish."""
+        result = await self.upsert_documents(index_name, [document], timeout=timeout)
+        if result.errors or result.accepted_count != 1:
+            raise RuntimeError(
+                result.errors[0]["error"]
+                if result.errors
+                else "upsert was not accepted"
+            )
+
     async def index_documents_stream(
         self,
         index_name: str,
@@ -324,8 +417,10 @@ class HermesClient:
         )
         return response.num_docs
 
-    async def force_merge(self, index_name: str, timeout: float | None = None) -> int:
-        """Force merge all segments.
+    async def force_merge(
+        self, index_name: str, timeout: float | None = None, *, compact: bool = False
+    ) -> int:
+        """Force merge all segments; compact=True physically removes deleted rows.
 
         Args:
             index_name: Name of the index
@@ -334,7 +429,7 @@ class HermesClient:
             Number of segments after merge
         """
         self._ensure_connected()
-        request = pb.ForceMergeRequest(index_name=index_name)
+        request = pb.ForceMergeRequest(index_name=index_name, compact=compact)
         response = await self._index_stub.ForceMerge(
             request, timeout=self._deadline(timeout)
         )

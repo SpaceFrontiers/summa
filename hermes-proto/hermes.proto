@@ -32,6 +32,12 @@ service IndexService {
   // Add documents in batch
   rpc BatchIndexDocuments(BatchIndexDocumentsRequest) returns (BatchIndexDocumentsResponse);
 
+  // Stage whole-document deletions by exact primary key, including every chunk.
+  rpc DeleteDocuments(DeleteDocumentsRequest) returns (DocumentMutationResponse);
+
+  // Stage complete replacements (inserts if absent). Commit publishes them.
+  rpc UpsertDocuments(UpsertDocumentsRequest) returns (DocumentMutationResponse);
+
   // Commit pending changes
   rpc Commit(CommitRequest) returns (CommitResponse);
 
@@ -526,6 +532,9 @@ message GetIndexInfoResponse {
   repeated TextFieldInfo text_fields = 7;
   uint32 candidate_scoring_version = 8; // 3 requires symbolic L1 formula; preserves organic scores, optional backfill and raw defaults.
   repeated string unprepared_candidate_fields = 9; // Fields requiring lookup preparation/migration.
+  uint64 physical_num_docs = 10; // Includes tombstones; num_docs counts live rows.
+  uint64 num_deleted_docs = 11;
+  double deleted_ratio = 12; // num_deleted_docs / physical_num_docs; zero for an empty index.
 }
 
 // Tokenization facts of one text field.
@@ -624,6 +633,25 @@ message BatchIndexDocumentsResponse {
   repeated DocumentError errors = 3;
 }
 
+// Requests are bounded before conversion or writer admission. Both require a
+// primary-key schema and an explicit Commit. No cross-partition transaction.
+message DeleteDocumentsRequest {
+  string index_name = 1;
+  repeated string primary_keys = 2; // <=100,000 keys, <=8 MiB total key bytes
+}
+
+message UpsertDocumentsRequest {
+  string index_name = 1;
+  repeated NamedDocument documents = 2; // <=1,000 documents, <=32 MiB encoded request
+}
+
+message DocumentMutationResponse {
+  // Admitted operations, not affected rows. A missing deletion is accepted.
+  // Every input is accepted or has one error; Commit publishes accepted work.
+  uint32 accepted_count = 1;
+  repeated DocumentError errors = 2;
+}
+
 // Per-document error detail (e.g. duplicate primary key)
 message DocumentError {
   uint32 index = 1;   // 0-based index in the request batch
@@ -654,6 +682,9 @@ message CommitResponse {
 // Force merge request/response
 message ForceMergeRequest {
   string index_name = 1;
+  // Expensive physical removal of deleted rows, once per final output.
+  // Omitted/false copies encoded data and carries deletion masks unchanged.
+  bool compact = 2;
 }
 
 message ForceMergeResponse {

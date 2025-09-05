@@ -277,3 +277,49 @@ pub(crate) use rewrite::{validate_copy_sources, write_forward_sources};
 
 #[cfg(all(test, feature = "native"))]
 mod tests;
+
+/// Copy retained forward payloads and rewrite only their logical directory.
+#[cfg(feature = "native")]
+pub(crate) fn write_compacted_forward(
+    bmp: &super::BmpIndex,
+    rows: &super::row_map::RowMap,
+    writer: &mut super::OffsetWriter,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use std::io::Write;
+    let Some(forward) = bmp.forward() else {
+        return write_disabled(writer).map(|_| ()).map_err(Error::from);
+    };
+    let mut count = 0u32;
+    let start = writer.offset();
+    for i in 0..forward.len() {
+        if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+            return Err(Error::IndexClosed);
+        }
+        if rows.get(forward.key(i).doc).is_some() {
+            writer.write_all(
+                &forward.payload.as_slice()
+                    [forward.offset(i) as usize..forward.offset(i + 1) as usize],
+            )?;
+            count += 1;
+        }
+    }
+    let payload_len = writer.offset() - start;
+    let mut offset = 0u64;
+    let records = (0..forward.len()).filter_map(|i| {
+        let key = forward.key(i);
+        rows.get(key.doc).map(|doc| {
+            let at = offset;
+            offset += forward.offset(i + 1) - forward.offset(i);
+            Ok((
+                LogicalUnit {
+                    doc,
+                    ordinal: key.ordinal,
+                },
+                at,
+            ))
+        })
+    });
+    write_directory(writer, records, count, payload_len)?;
+    Ok(())
+}

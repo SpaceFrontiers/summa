@@ -381,6 +381,10 @@ impl SegmentMeta {
 
 /// Paths for segment files
 pub struct SegmentFiles {
+    /// Encoded per-row text presence and exact token counts for compaction.
+    pub row_stats: PathBuf,
+    /// Immutable row visibility, when this ID owns a deletion generation.
+    pub deletions: PathBuf,
     pub term_dict: PathBuf,
     pub postings: PathBuf,
     pub store: PathBuf,
@@ -402,6 +406,8 @@ impl SegmentFiles {
         let prefix = format!("seg_{:032x}", segment_id);
         Self {
             term_dict: PathBuf::from(format!("{}.terms", prefix)),
+            deletions: PathBuf::from(format!("{}.del", prefix)),
+            row_stats: PathBuf::from(format!("{}.rowstats", prefix)),
             postings: PathBuf::from(format!("{}.post", prefix)),
             store: PathBuf::from(format!("{}.store", prefix)),
             meta: PathBuf::from(format!("{}.meta", prefix)),
@@ -428,15 +434,17 @@ impl SegmentFiles {
     ///
     /// Readers never open it, but abort and orphan cleanup must treat it as a
     /// segment-owned artifact.
-    #[cfg(feature = "native")]
+    #[cfg(any(feature = "native", feature = "wasm"))]
     pub(crate) fn sparse_skip_temp(&self) -> PathBuf {
         self.sparse.with_extension("skip.tmp")
     }
 
     /// Every permanent or temporary path owned by this segment ID.
-    #[cfg(feature = "native")]
-    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 10] {
+    #[cfg(any(feature = "native", feature = "wasm"))]
+    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 12] {
         [
+            self.deletions.clone(),
+            self.row_stats.clone(),
             self.term_dict.clone(),
             self.postings.clone(),
             self.store.clone(),

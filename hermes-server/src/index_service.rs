@@ -12,6 +12,8 @@ use crate::proto::index_service_server::IndexService;
 use crate::proto::*;
 use crate::registry::IndexRegistry;
 
+mod mutations;
+
 #[cfg(test)]
 mod tests;
 
@@ -219,6 +221,24 @@ impl IndexService for IndexServiceImpl {
         }))
     }
 
+    async fn delete_documents(
+        &self,
+        request: Request<DeleteDocumentsRequest>,
+    ) -> Result<Response<DocumentMutationResponse>, Status> {
+        self.stage_deletions(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
+    async fn upsert_documents(
+        &self,
+        request: Request<UpsertDocumentsRequest>,
+    ) -> Result<Response<DocumentMutationResponse>, Status> {
+        self.stage_upserts(request.into_inner())
+            .await
+            .map(Response::new)
+    }
+
     async fn index_documents(
         &self,
         request: Request<tonic::Streaming<IndexDocumentRequest>>,
@@ -362,35 +382,50 @@ impl IndexService for IndexServiceImpl {
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let writer = self.registry.get_writer(&req.index_name).await?;
 
-        let reload_index = Arc::clone(&index);
-        writer
-            .write()
-            .await
-            .force_merge_with_snapshot_refresh(move || {
-                let index = Arc::clone(&reload_index);
-                async move {
-                    index.reader().await?.reload().await?;
-                    Ok(())
-                }
-            })
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
+        // Match Commit admission: cancellation while waiting starts no work.
+        // An admitted request retains its writer guard through reader refresh.
+        let mut writer = writer.write_owned().await;
+        tokio::spawn(async move {
+            let result = async {
+                let reload_index = Arc::clone(&index);
+                writer
+                    .force_merge_with_compaction_and_snapshot_refresh(req.compact, move || {
+                        let index = Arc::clone(&reload_index);
+                        async move {
+                            index.reader().await?.reload().await?;
+                            Ok(())
+                        }
+                    })
+                    .await
+                    .map_err(crate::error::hermes_error_to_status)?;
 
-        let reader = index
-            .reader()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
-        let searcher = reader
-            .searcher()
-            .await
-            .map_err(crate::error::hermes_error_to_status)?;
+                let reader = index
+                    .reader()
+                    .await
+                    .map_err(crate::error::hermes_error_to_status)?;
+                let searcher = reader
+                    .searcher()
+                    .await
+                    .map_err(crate::error::hermes_error_to_status)?;
 
-        info!("Force merged: {}", req.index_name);
+                info!("Force merged: {}", req.index_name);
 
-        Ok(Response::new(ForceMergeResponse {
-            success: true,
-            num_segments: searcher.segment_readers().len() as u32,
-        }))
+                Ok(Response::new(ForceMergeResponse {
+                    success: true,
+                    num_segments: searcher.segment_readers().len() as u32,
+                }))
+            }
+            .await;
+            if let Err(error) = &result {
+                warn!(
+                    "ForceMerge failed: index={}; compact={}; {error}",
+                    req.index_name, req.compact
+                );
+            }
+            result
+        })
+        .await
+        .map_err(|error| Status::internal(format!("ForceMerge task failed: {error}")))?
     }
 
     async fn delete_index(

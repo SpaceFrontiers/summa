@@ -719,6 +719,7 @@ fn write_record_doc_maps(
     writer: &mut OffsetWriter,
     rayon_pool: Option<&rayon::ThreadPool>,
     cancellation: Option<&std::sync::atomic::AtomicBool>,
+    row_map: Option<&super::row_map::RowMap>,
 ) -> Result<()> {
     use rayon::prelude::*;
 
@@ -754,6 +755,14 @@ fn write_record_doc_maps(
                                     source_doc_id, sources[source].1,
                                 ))
                             })?;
+                    let output_doc_id = match row_map {
+                        Some(rows) => rows.get(output_doc_id).ok_or_else(|| {
+                            crate::Error::Corruption(
+                                "deleted BMP record survived compaction".into(),
+                            )
+                        })?,
+                        None => output_doc_id,
+                    };
                     output.copy_from_slice(&output_doc_id.to_le_bytes());
                     Ok(())
                 })
@@ -1060,6 +1069,11 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         ),
         (&src_files.store, &dst_files.store, true),
         (
+            &src_files.row_stats,
+            &dst_files.row_stats,
+            !reader.row_stats().is_empty(),
+        ),
+        (
             &src_files.fast,
             &dst_files.fast,
             !reader.fast_fields().is_empty(),
@@ -1194,6 +1208,11 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
             reader.has_chunks_file(),
         ),
         (&src_files.store, &dst_files.store, true),
+        (
+            &src_files.row_stats,
+            &dst_files.row_stats,
+            !reader.row_stats().is_empty(),
+        ),
         (
             &src_files.fast,
             &dst_files.fast,
@@ -2042,9 +2061,54 @@ pub(crate) fn reorder_bmp_field(
     granularity: BpGranularity,
     scratch_path: PathBuf,
     store_forward: bool,
+    writer: OffsetWriter,
+    field_tocs: Vec<SparseFieldToc>,
+    rayon_pool: Option<Arc<rayon::ThreadPool>>,
+) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
+    rewrite_bmp_field(
+        sources,
+        field_id,
+        index_label,
+        field_name,
+        dims,
+        effective_block_size,
+        grid_bits,
+        max_weight_scale,
+        total_vectors,
+        memory_budget,
+        bp_budget,
+        cancellation,
+        granularity,
+        scratch_path,
+        store_forward,
+        writer,
+        field_tocs,
+        rayon_pool,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rewrite_bmp_field(
+    sources: &[(crate::segment::BmpIndex, u32)],
+    field_id: u32,
+    index_label: &str,
+    field_name: &str,
+    dims: u32,
+    effective_block_size: usize,
+    grid_bits: u8,
+    max_weight_scale: f32,
+    total_vectors: u32,
+    memory_budget: usize,
+    bp_budget: crate::segment::BpBudget,
+    cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    granularity: BpGranularity,
+    scratch_path: PathBuf,
+    store_forward: bool,
     mut writer: OffsetWriter,
     mut field_tocs: Vec<SparseFieldToc>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
+    row_map: Option<&super::row_map::RowMap>,
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
     if cancellation_requested(cancellation.as_deref()) {
         return Err(crate::Error::IndexClosed);
@@ -2193,6 +2257,11 @@ pub(crate) fn reorder_bmp_field(
     let record_fixed_peak = record_map_bytes.max(record_rewrite_fixed_bytes);
     const MIN_RECORD_WORKSPACE: usize = 16 * 1024 * 1024;
     if record_fixed_peak > memory_budget.saturating_sub(MIN_RECORD_WORKSPACE) {
+        if row_map.is_some() {
+            return Err(crate::Error::Schema(
+                "BMP compaction record maps exceed scratch budget".into(),
+            ));
+        }
         log::warn!(
             "[reorder_bmp] index={} field {}: record maps need {} of the {} total budget; falling back to blockwise order",
             index_label,
@@ -2239,6 +2308,16 @@ pub(crate) fn reorder_bmp_field(
                 .collect::<Result<_>>()
         })?
     };
+    if let Some(rows) = row_map {
+        if sources.len() != 1 {
+            return Err(crate::Error::Internal(
+                "row compaction expects one BMP source".into(),
+            ));
+        }
+        vid_maps[0]
+            .1
+            .retain(|&vid| rows.get(sources[0].0.virtual_to_doc(vid).0).is_some());
+    }
     // Prefix sums of real doc counts: source s owns global real ids
     // real_base[s]..real_base[s+1].
     let mut real_base = Vec::with_capacity(vid_maps.len() + 1);
@@ -2669,6 +2748,7 @@ pub(crate) fn reorder_bmp_field(
         &mut writer,
         rayon_pool.as_deref(),
         cancellation.as_deref(),
+        row_map,
     )?;
     let doc_maps_elapsed = doc_maps_start.elapsed();
 
@@ -2676,15 +2756,24 @@ pub(crate) fn reorder_bmp_field(
     drop(real_to_virtual);
     drop(encoded_block);
     drop(block_encode_scratch);
-    let forward_sources: Vec<_> = sources.iter().map(|(bmp, offset)| (bmp, *offset)).collect();
-    crate::segment::bmp_forward::write_forward_sources(
-        &forward_sources,
-        &[],
-        &mut writer,
-        Some(memory_budget),
-        cancellation.as_deref(),
-        store_forward,
-    )?;
+    if let Some(rows) = row_map {
+        crate::segment::bmp_forward::write_compacted_forward(
+            &sources[0].0,
+            rows,
+            &mut writer,
+            cancellation.as_deref(),
+        )?;
+    } else {
+        let forward_sources: Vec<_> = sources.iter().map(|(bmp, offset)| (bmp, *offset)).collect();
+        crate::segment::bmp_forward::write_forward_sources(
+            &forward_sources,
+            &[],
+            &mut writer,
+            Some(memory_budget),
+            cancellation.as_deref(),
+            store_forward,
+        )?;
+    }
 
     // Versioned footer.
     write_bmp_footer(

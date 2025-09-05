@@ -35,6 +35,7 @@
 //! Since `prepare_commit`/`commit` take `&mut self`, Rust’s borrow checker
 //! guarantees no concurrent `add_document` calls during the commit window.
 
+use super::primary_key::load_pk_segment_data;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -1070,7 +1071,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 let seg_id_str = seg_id_str.clone();
                 let dir = self.directory.as_ref();
                 let schema = Arc::clone(&self.schema);
-                async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
+                let deletion = snapshot.deletions().get(&seg_id_str).cloned();
+                async move { load_pk_segment_data(dir, &seg_id_str, &schema, deletion).await }
             })
             .collect();
         let all_data = futures::future::try_join_all(load_futures).await?;
@@ -1234,6 +1236,68 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 Err(Error::CommitInProgress)
             }
         }
+    }
+
+    /// Stage deletion of a committed row by exact primary key. Commit publishes
+    /// visibility atomically. Missing keys are idempotent. Commit a pending
+    /// insertion before deleting/upserting that same key again.
+    pub fn delete_primary_key(&mut self, key: &str) -> Result<()> {
+        self.ensure_writer_lock()?;
+        if self.worker_state.shutdown.load(Ordering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
+        if self.commit_finalization.in_progress.load(Ordering::Acquire)
+            || self.doc_sender.read().is_closed()
+        {
+            return Err(Error::CommitInProgress);
+        }
+        if self.pk_reservations_retained.load(Ordering::Acquire) {
+            return Err(Error::CommitInProgress);
+        }
+        let guard = self.primary_key_index.read();
+        let pk = guard.as_ref().ok_or_else(|| {
+            Error::Schema("row deletion requires initialized primary-key deduplication".into())
+        })?;
+        pk.delete(key)?;
+        Ok(())
+    }
+
+    /// Replace a committed row (or insert a missing key). Deletion and the new
+    /// document become visible together at commit. Queue rejection rolls back
+    /// this call's deletion so a failed upsert cannot remove the old row.
+    pub fn upsert_document(&mut self, doc: Document) -> Result<()> {
+        let field = self
+            .schema
+            .primary_field()
+            .ok_or_else(|| Error::Schema("upserts require a primary key".into()))?;
+        let key = super::primary_key::document_key(&doc, field)?.to_owned();
+        validate_vector_value_counts(&doc, &self.schema)?;
+        // Validate writer admission before touching the reservation set.
+        self.ensure_writer_lock()?;
+        if self.worker_state.shutdown.load(Ordering::Acquire) {
+            return Err(Error::IndexClosed);
+        }
+        if self.commit_finalization.in_progress.load(Ordering::Acquire)
+            || self.doc_sender.read().is_closed()
+            || self.pk_reservations_retained.load(Ordering::Acquire)
+        {
+            return Err(Error::CommitInProgress);
+        }
+        let staged = self
+            .primary_key_index
+            .read()
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Schema("upserts require initialized primary-key deduplication".into())
+            })?
+            .delete(&key)?;
+        if let Err(error) = self.add_document(doc) {
+            if staged && let Some(pk) = self.primary_key_index.read().as_ref() {
+                pk.rollback_delete(&key);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Add multiple documents to the indexing queue.
@@ -1715,6 +1779,54 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.prepare_commit().await?.commit().await
     }
 
+    /// Commit admitted mutations, then physically remove deleted rows from
+    /// the selected segment using a bounded scratch budget. Row addresses can
+    /// change; primary keys remain stable.
+    pub async fn compact_segment(
+        &mut self,
+        segment_id: &str,
+        memory_budget: usize,
+    ) -> Result<bool> {
+        if memory_budget < 1024 * 1024 {
+            return Err(Error::Schema(
+                "compaction memory budget must be at least 1 MiB".into(),
+            ));
+        }
+        if crate::segment::SegmentId::from_hex(segment_id).is_none() {
+            return Err(Error::Document("invalid compaction segment ID".into()));
+        }
+        self.commit().await?;
+        let changed = self
+            .segment_manager
+            .compact_segment(segment_id, memory_budget)
+            .await?;
+        self.persist_replacement_snapshot().await?;
+        Ok(changed)
+    }
+
+    /// Compact every tombstoned segment in the current snapshot. Works even
+    /// when the index contains only one segment.
+    pub async fn compact(&mut self, memory_budget: usize) -> Result<usize> {
+        if memory_budget < 1024 * 1024 {
+            return Err(Error::Schema(
+                "compaction memory budget must be at least 1 MiB".into(),
+            ));
+        }
+        self.commit().await?;
+        self.wait_for_merging_thread().await;
+        let ids = self.segment_manager.get_segment_ids().await;
+        let mut count = 0;
+        for id in ids {
+            count += usize::from(
+                self.segment_manager
+                    .compact_segment(&id, memory_budget)
+                    .await?,
+            );
+        }
+        self.persist_replacement_snapshot().await?;
+        Ok(count)
+    }
+
     /// Force merge all segments into one.
     pub async fn force_merge(&mut self) -> Result<()> {
         self.force_merge_with_snapshot_refresh(|| std::future::ready(Ok(())))
@@ -1735,10 +1847,38 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
+        self.force_merge_with_compaction_and_snapshot_refresh(false, refresh_external)
+            .await
+    }
+
+    /// Merge normally, optionally compacting the final outputs once. Defaults
+    /// to retaining tombstones through `force_merge()`.
+    pub async fn force_merge_with_compaction(&mut self, compact: bool) -> Result<()> {
+        self.force_merge_with_compaction_and_snapshot_refresh(compact, || {
+            std::future::ready(Ok(()))
+        })
+        .await
+    }
+
+    pub async fn force_merge_with_compaction_and_snapshot_refresh<F, Fut>(
+        &mut self,
+        compact: bool,
+        refresh_external: F,
+    ) -> Result<()>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        let budget = compact.then_some(self.config.compaction_memory_budget_bytes);
+        if budget.is_some_and(|bytes| bytes < 1024 * 1024) {
+            return Err(Error::Schema(
+                "compaction memory budget must be at least 1 MiB".into(),
+            ));
+        }
         self.prepare_commit().await?.commit().await?;
 
         self.segment_manager
-            .force_merge_with_snapshot_refresh(refresh_external)
+            .force_merge_with_compaction_and_snapshot_refresh(budget, refresh_external)
             .await?;
 
         // Segment IDs in the on-disk bloom cache need only the final
@@ -1988,18 +2128,19 @@ async fn refresh_primary_key_snapshot<D: DirectoryWriter + 'static>(
     refresh: PrimaryKeyRefresh,
 ) -> Result<()> {
     let _refresh_guard = primary_key_refresh_lock.lock().await;
+    let snapshot = segment_manager.acquire_snapshot().await;
     let existing_ids: std::collections::HashSet<String> = {
         let guard = primary_key_index.read();
         let Some(pk_index) = guard.as_ref() else {
             return Ok(());
         };
         pk_index
-            .committed_segment_ids()
-            .map(ToOwned::to_owned)
+            .committed_visibility()
+            .filter(|(id, deletion)| *deletion == snapshot.deletions().get(*id).map(|(_, d)| d))
+            .map(|(id, _)| id.to_owned())
             .collect()
     };
 
-    let snapshot = segment_manager.acquire_snapshot().await;
     let load_futures: Vec<_> = snapshot
         .segment_ids()
         .iter()
@@ -2008,10 +2149,23 @@ async fn refresh_primary_key_snapshot<D: DirectoryWriter + 'static>(
             let seg_id_str = seg_id_str.clone();
             let dir = directory.as_ref();
             let schema = Arc::clone(schema);
-            async move { load_pk_segment_data(dir, &seg_id_str, &schema).await }
+            let deletion = snapshot.deletions().get(&seg_id_str).cloned();
+            async move { load_pk_segment_data(dir, &seg_id_str, &schema, deletion).await }
         })
         .collect();
-    let new_data = futures::future::try_join_all(load_futures).await?;
+    let mut new_data = futures::future::try_join_all(load_futures).await?;
+    if let Some(field) = schema.primary_field() {
+        new_data = tokio::task::spawn_blocking(move || {
+            for data in &mut new_data {
+                data.prepare_live_keys(field);
+            }
+            new_data
+        })
+        .await
+        .map_err(|error| {
+            Error::Internal(format!("primary-key visibility refresh failed: {error}"))
+        })?;
+    }
     let seg_ids: Vec<String> = snapshot.segment_ids().to_vec();
 
     let persist_bloom = {
@@ -2082,8 +2236,19 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     // This entire future is owned by a Tokio task. Cancelling the RPC only
     // drops its JoinHandle; it cannot split durable metadata publication from
     // PK reservations or worker resumption.
-    commit.segment_manager.commit(&metadata_entries).await?;
+    let deletes = commit
+        .primary_key_index
+        .read()
+        .as_ref()
+        .map_or_else(Vec::new, |pk| pk.pending_deletes());
+    commit
+        .segment_manager
+        .commit_with_deletes(&metadata_entries, deletes)
+        .await?;
     commit.publication_observed.store(true, Ordering::Release);
+    if let Some(pk) = commit.primary_key_index.read().as_ref() {
+        pk.mark_deletes_published();
+    }
 
     let mut published = commit.prepared.take_published();
     for segment in &mut published {
@@ -2153,7 +2318,14 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
         let segments = std::mem::take(&mut *self.writer.flushed_segments.lock());
 
         // Fast path: nothing to commit
-        if segments.is_empty() {
+        if segments.is_empty()
+            && self
+                .writer
+                .primary_key_index
+                .read()
+                .as_ref()
+                .is_none_or(|pk| pk.pending_deletes().is_empty())
+        {
             log::debug!(
                 "[commit] index={} no segments to commit, skipping",
                 self.writer.schema.index_label()
@@ -2256,21 +2428,4 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
             self.writer.resume_workers();
         }
     }
-}
-
-/// Load only fast-field data for a segment (lightweight alternative to full SegmentReader).
-async fn load_pk_segment_data<D: crate::directories::Directory>(
-    dir: &D,
-    seg_id_str: &str,
-    schema: &Arc<crate::dsl::Schema>,
-) -> Result<super::primary_key::PkSegmentData> {
-    let seg_id = crate::segment::SegmentId::from_hex(seg_id_str)
-        .ok_or_else(|| Error::Internal(format!("Invalid segment id: {}", seg_id_str)))?;
-    let files = crate::segment::SegmentFiles::new(seg_id.0);
-    let fast_fields =
-        crate::segment::reader::loader::load_fast_fields_file(dir, &files, schema).await?;
-    Ok(super::primary_key::PkSegmentData {
-        segment_id: seg_id_str.to_string(),
-        fast_fields,
-    })
 }

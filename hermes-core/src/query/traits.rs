@@ -108,12 +108,19 @@ pub type DocPredicate<'a> = Box<dyn Fn(DocId) -> bool + 'a>;
 /// Built from posting lists or predicate scans. Used by BMP filtered queries
 /// to avoid repeated fast-field decoding during per-slot predicate evaluation.
 /// Lookup cost depends on residency and the caller's dispatch, not just this type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DocBitset {
     pub(crate) bits: Vec<u64>,
 }
 
 impl DocBitset {
+    /// Clear one document from this set.
+    #[cfg(any(feature = "native", feature = "wasm"))]
+    pub(crate) fn clear(&mut self, doc_id: u32) {
+        if let Some(word) = self.bits.get_mut(doc_id as usize / 64) {
+            *word &= !(1u64 << (doc_id % 64));
+        }
+    }
     /// Create an empty bitset for `num_docs` documents.
     pub fn new(num_docs: u32) -> Self {
         let num_words = (num_docs as usize).div_ceil(64);

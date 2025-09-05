@@ -224,6 +224,23 @@ pub struct FstBlockIndex {
 impl FstBlockIndex {
     /// Build FST index from keys and block addresses
     pub fn build(entries: &[(Vec<u8>, BlockAddr)]) -> io::Result<Vec<u8>> {
+        // Empty term dictionaries are common after compaction and in vector/
+        // fast-field-only segments. FST's registry setup dominates these small
+        // writes; retain just the canonical empty bytes, never its build scratch.
+        static EMPTY: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        if entries.is_empty() {
+            if let Some(bytes) = EMPTY.get() {
+                return Ok(bytes.clone());
+            }
+            let bytes = Self::build_uncached(entries)?;
+            // Concurrent first calls may both encode the same tiny artifact.
+            let _ = EMPTY.set(bytes.clone());
+            return Ok(bytes);
+        }
+        Self::build_uncached(entries)
+    }
+
+    fn build_uncached(entries: &[(Vec<u8>, BlockAddr)]) -> io::Result<Vec<u8>> {
         use fst::MapBuilder;
 
         // Build FST mapping keys to block ordinals
@@ -1005,6 +1022,21 @@ mod tests {
         assert_eq!(index.locate(b"aab"), Some(0)); // Between aaa and bbb
         assert_eq!(index.locate(b"ddd"), Some(2)); // After all keys
         assert_eq!(index.locate(b"000"), None); // Before all keys
+    }
+
+    #[cfg(feature = "fst-index")]
+    #[test]
+    fn cached_empty_fst_preserves_canonical_bytes_and_empty_lookup() {
+        let expected = FstBlockIndex::build_uncached(&[]).unwrap();
+        assert!(expected.len() <= 128, "empty-index cache must remain tiny");
+        let mut first = FstBlockIndex::build(&[]).unwrap();
+        assert_eq!(first, expected);
+        first.clear();
+        let next = FstBlockIndex::build(&[]).unwrap();
+        assert_eq!(next, expected, "callers cannot mutate the cached artifact");
+        let index = FstBlockIndex::load(OwnedBytes::new(next)).unwrap();
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.locate(b"anything"), None);
     }
 
     #[cfg(feature = "fst-index")]

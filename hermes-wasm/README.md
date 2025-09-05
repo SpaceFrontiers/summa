@@ -359,3 +359,34 @@ the configured retrieval depth and does not run Boolean clauses independently.
 The diagnostic window is capped at 10,000; candidate/ordinal bounds and a 64 MiB
 JSON response limit reject oversized exports. WASM supports its existing RRF and
 weighted-sum fusion modes; server L1/reranker features remain server APIs.
+
+## Delete and upsert local documents
+
+LocalIndex supports primary-key schemas and enforces uniqueness on insert and
+reopen. Delete removes the document and every chunk, including indexed-only data.
+Upserts are complete replacements; an absent key is inserted.
+
+```javascript
+const index = await LocalIndex.create(`index documents {
+  field id: text<raw> [primary, indexed, stored]
+  field body: text<simple> [indexed<chunked>]
+}`);
+await index.addDocument({ id: "a", body: ["first chunk", "second chunk"] });
+await index.commit();
+await index.upsertDocument({ id: "a", body: ["replacement"] });
+await index.commit();
+index.deleteDocument("a");
+await index.commit();
+```
+
+`deleteDocuments(keys)` and `await upsertDocuments(documents)` return
+`{ acceptedCount, errors: [{ index, error }] }`. Inspect errors and commit accepted
+work. A pending insertion/replacement must be committed before another mutation
+of the same key. `await index.abort()` discards the entire pending transaction.
+A failed builder requires abort; a failed storage commit can be retried without
+replaying mutations. RemoteIndex and IpfsIndex remain read-only.
+
+Deletion batches allow 100,000 keys / 8 MiB key bytes; replacement batches allow
+1,000 documents / 32 MiB JSON. Keep one writable LocalIndex per storage namespace,
+and implement atomic per-file replacement in the storage adapter. Physical
+compaction is available through native core, CLI, and the server ForceMerge API.

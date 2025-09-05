@@ -1,6 +1,8 @@
 //! Segment merger for combining multiple segments
 
 mod chunk_maps;
+mod compact;
+mod compact_vectors;
 mod dense;
 mod fast_fields;
 mod postings;
@@ -547,6 +549,10 @@ impl SegmentMerger {
     /// Uses streaming writers so postings, positions, and store data flow directly
     /// to files instead of buffering everything in memory. Only the term dictionary
     /// (compact key+TermInfo entries) is buffered.
+    ///
+    /// This is the physical encoded-copy primitive. Readers with deletion masks
+    /// must use `compact`, or the index writer's merge operation, which owns
+    /// visibility capture and atomic publication across multiple sources.
     pub async fn merge<D: Directory + DirectoryWriter>(
         &self,
         dir: &D,
@@ -555,6 +561,14 @@ impl SegmentMerger {
         trained: Option<&TrainedVectorStructures>,
     ) -> Result<(SegmentMeta, MergeStats)> {
         self.ensure_not_cancelled()?;
+        if segments
+            .iter()
+            .any(|segment| segment.deletion_meta().is_some())
+        {
+            return Err(crate::Error::Schema(
+                "encoded-copy merge cannot discard deletion masks; use IndexWriter::force_merge or SegmentMerger::compact".into(),
+            ));
+        }
         // Reject an unrepresentable merge before creating any output files.
         // The previous late check left a complete orphan output behind after
         // doing all expensive phases.
@@ -692,6 +706,8 @@ impl SegmentMerger {
             merge_start.elapsed().as_secs_f64(),
             stats
         );
+
+        self.merge_row_stats(dir, segments, &files).await?;
 
         // === Mandatory: merge field stats + write meta ===
         self.ensure_not_cancelled()?;

@@ -78,6 +78,9 @@ export interface IndexInfo {
   numSegments: number;
   schema: string;
   vectorStats: VectorFieldStats[];
+  physicalNumDocs?: number;
+  numDeletedDocs?: number;
+  deletedRatio?: number;
   candidateScoringVersion?: number;
   unpreparedCandidateFields?: string[];
 }
@@ -292,4 +295,10 @@ export interface SearchRequest {
   candidateLimit?: number;
   /** Anytime mode: wall-clock budget of the scoring phase in ms (0 = exact). */
   timeBudgetMs?: number;
+}
+
+/** Staged operations, not affected rows. Commit publishes accepted work. */
+export interface DocumentMutationResult {
+  acceptedCount: number;
+  errors: Array<{ index: number; error: string }>;
 }

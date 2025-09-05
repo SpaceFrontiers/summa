@@ -398,7 +398,7 @@ impl<D: Directory + 'static> Searcher<D> {
                 .ok_or_else(|| {
                     Error::Query("candidate address is stale or belongs to another snapshot".into())
                 })?;
-            if candidate.doc_id >= self.segment_readers()[segment].num_docs()
+            if !self.segment_readers()[segment].is_alive(candidate.doc_id)
                 || !addresses.insert((candidate.segment_id, candidate.doc_id))
             {
                 return Err(Error::Query(

@@ -10,6 +10,10 @@
 #[allow(clippy::enum_variant_names)]
 pub mod hermes {
     tonic::include_proto!("hermes");
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../hermes-proto/mutations.rs"
+    ));
 }
 
 pub mod broker {

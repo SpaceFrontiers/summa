@@ -65,7 +65,8 @@ prefetch and release one-shot source ranges. Cold I/O reduces cache pollution;
 it does not replace durability or guarantee a particular kernel's cache state.
 
 References: [posting codecs](posting-codecs.md), [cold I/O](cold-io.md),
-[merge-time reorder](merge-time-reorder.md), [store v3](document-store-v3.md).
+[merge-time reorder](merge-time-reorder.md), [store v3](document-store-v3.md),
+[row deletion and compaction](row-deletion.md).
 
 ## Memory and execution
 

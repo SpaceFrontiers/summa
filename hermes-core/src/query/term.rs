@@ -89,14 +89,14 @@ impl TermQuery {
             // Avoid decoding column codec headers separately for every doc.
             let scanned = fast_field.try_scan_single_values(|doc, ordinal| {
                 if doc.is_multiple_of(1024) && options.stop_if_expired() {
-                    return std::ops::ControlFlow::Break(());
+                    return Err(());
                 }
                 if ordinal == target_ordinal {
                     bits.set(doc);
                 }
-                std::ops::ControlFlow::Continue(())
+                Ok(())
             });
-            return (scanned.is_continue() && !options.stop_if_expired()).then_some(bits);
+            return (scanned.is_ok() && !options.stop_if_expired()).then_some(bits);
         }
         // Multi-value fast equality retains the ordinary scorer's first-value
         // semantics. The single-value batch API cannot represent those offsets.

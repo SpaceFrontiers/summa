@@ -260,6 +260,8 @@ pub struct SegmentBuilder {
     /// Uses a flat `Vec` instead of `Vec<HashMap>` for better cache locality
     /// Layout: [doc0_field0_len, doc0_field1_len, ..., doc1_field0_len, ...]
     doc_field_lengths: Vec<u32>,
+    /// Zero = absent, otherwise exact token count + 1. Includes empty values.
+    row_stat_lengths: Vec<u64>,
     num_indexed_fields: usize,
     field_to_slot: FxHashMap<u32, usize>,
 
@@ -351,7 +353,9 @@ impl SegmentBuilder {
         let mut tokenizers = FxHashMap::default();
         let mut tokenizer_hint_fields = FxHashMap::default();
         for (field, entry) in schema.fields() {
-            if entry.indexed && matches!(entry.field_type, FieldType::Text) {
+            if (entry.indexed && entry.field_type == FieldType::Text)
+                || entry.field_type == FieldType::SparseVector
+            {
                 field_to_slot.insert(field.0, num_indexed_fields);
                 num_indexed_fields += 1;
                 if entry.positions.is_some() {
@@ -426,6 +430,7 @@ impl SegmentBuilder {
             field_stats: FxHashMap::default(),
             chunk_maps: FxHashMap::default(),
             doc_field_lengths: Vec::new(),
+            row_stat_lengths: Vec::new(),
             num_indexed_fields,
             field_to_slot,
             local_tf_buffer: FxHashMap::default(),
@@ -743,7 +748,10 @@ impl SegmentBuilder {
         let base_idx = self.doc_field_lengths.len();
         self.doc_field_lengths
             .resize(base_idx + self.num_indexed_fields, 0);
-        self.estimated_memory += self.num_indexed_fields * std::mem::size_of::<u32>();
+        self.row_stat_lengths
+            .resize(base_idx + self.num_indexed_fields, 0);
+        self.estimated_memory +=
+            self.num_indexed_fields * (std::mem::size_of::<u32>() + std::mem::size_of::<u64>());
 
         // Reset element ordinals for this document (for multi-valued fields)
         self.current_element_ordinal.clear();
@@ -804,6 +812,14 @@ impl SegmentBuilder {
                         let stats = self.field_stats.entry(field.0).or_default();
                         stats.total_tokens += token_count as u64;
                         stats.doc_count += 1;
+                        let slot = self.field_to_slot[&field.0];
+                        let exact = &mut self.row_stat_lengths[base_idx + slot];
+                        *exact = (*exact)
+                            .max(1)
+                            .checked_add(u64::from(token_count))
+                            .ok_or_else(|| {
+                                crate::Error::Document("per-row token count overflow".into())
+                            })?;
                     } else if entry.indexed {
                         let element_ordinal = self.next_element_ordinal(field.0);
                         let hinted = self.resolve_tokenizer_hint(*field, &doc, element_ordinal);
@@ -821,6 +837,13 @@ impl SegmentBuilder {
                             // the sum over its values.
                             let len = &mut self.doc_field_lengths[base_idx + slot];
                             *len = len.saturating_add(token_count);
+                            let exact = &mut self.row_stat_lengths[base_idx + slot];
+                            *exact = (*exact)
+                                .max(1)
+                                .checked_add(u64::from(token_count))
+                                .ok_or_else(|| {
+                                    crate::Error::Document("per-row token count overflow".into())
+                                })?;
                         }
                     }
 
@@ -867,6 +890,9 @@ impl SegmentBuilder {
                 }
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
                     let ordinal = self.next_vector_ordinal(field.0)?;
+                    if let Some(&slot) = self.field_to_slot.get(&field.0) {
+                        self.row_stat_lengths[base_idx + slot] += 1;
+                    }
                     self.index_sparse_vector_field(*field, doc_id, ordinal, entries)?;
                 }
                 // Only reachable for stored-only types (bytes/json) and for
@@ -1389,6 +1415,44 @@ impl SegmentBuilder {
         self.store_file.flush()?;
 
         let files = SegmentFiles::new(segment_id.0);
+
+        // Lossless deletion compaction needs presence and full token lengths;
+        // the query norm is deliberately narrower and cannot recover either.
+        if self.schema.fields().any(|(_, e)| {
+            (e.indexed && e.field_type == FieldType::Text)
+                || e.field_type == FieldType::SparseVector
+        }) {
+            use crate::structures::fast_field::{
+                FastFieldColumnType, FastFieldWriter, write_fast_field_toc_and_footer,
+            };
+            let mut writer =
+                super::OffsetWriter::new(dir.streaming_writer(&files.row_stats).await?);
+            let mut entries = Vec::new();
+            for (field, entry) in self.schema.fields() {
+                if !((entry.indexed && entry.field_type == FieldType::Text)
+                    || entry.field_type == FieldType::SparseVector)
+                {
+                    continue;
+                }
+                let slot = self.field_to_slot[&field.0];
+                let mut column = FastFieldWriter::new_numeric(FastFieldColumnType::U64);
+                for doc in 0..self.next_doc_id {
+                    column.add_u64(
+                        doc,
+                        self.row_stat_lengths[doc as usize * self.num_indexed_fields + slot],
+                    );
+                }
+                let offset = writer.offset();
+                let (mut toc, _) = column.serialize(&mut writer, offset)?;
+                toc.field_id = field.0;
+                entries.push(toc);
+            }
+            let offset = writer.offset();
+            write_fast_field_toc_and_footer(&mut writer, offset, &entries)?;
+            writer.finish()?;
+        }
+        self.row_stat_lengths.clear();
+        self.row_stat_lengths.shrink_to_fit();
 
         // Phase 1: Stream positions directly to disk (consumes position_index)
         let position_index = std::mem::take(&mut self.position_index);

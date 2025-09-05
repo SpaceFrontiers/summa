@@ -224,6 +224,39 @@ enum Commands {
         /// Path to the index directory
         #[arg(short, long)]
         index: PathBuf,
+        /// Physically remove deleted rows from final outputs (more expensive)
+        #[arg(long, default_value_t = false)]
+        compact: bool,
+    },
+
+    /// Delete committed rows by exact primary key and commit visibility
+    Delete {
+        #[arg(short, long)]
+        index: PathBuf,
+        /// Repeat --key for several rows (at most 100000 keys / 8 MiB)
+        #[arg(long = "key", required = true)]
+        keys: Vec<String>,
+    },
+
+    /// Replace a row by primary key, or insert it if missing, and commit
+    Upsert {
+        #[arg(short, long)]
+        index: PathBuf,
+        /// Complete replacement document as a JSON object
+        #[arg(long)]
+        document: String,
+    },
+
+    /// Remove deleted rows physically, preserving separate segments
+    Compact {
+        #[arg(short, long)]
+        index: PathBuf,
+        /// Compact this segment only; defaults to every segment with deletions
+        #[arg(long)]
+        segment: Option<String>,
+        /// Scratch budget per segment, in MiB (in addition to source readers)
+        #[arg(long, default_value_t = 256)]
+        memory_budget_mb: usize,
     },
 
     /// Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning
@@ -516,8 +549,17 @@ async fn main() -> Result<()> {
         Commands::Commit { index } => {
             index_ops::commit_index(index).await?;
         }
-        Commands::Merge { index } => {
-            index_ops::merge_index(index).await?;
+        Commands::Merge { index, compact } => {
+            index_ops::merge_index(index, compact).await?;
+        }
+        Commands::Delete { index, keys } => index_ops::delete_rows(index, keys).await?,
+        Commands::Upsert { index, document } => index_ops::upsert_row(index, document).await?,
+        Commands::Compact {
+            index,
+            segment,
+            memory_budget_mb,
+        } => {
+            index_ops::compact_rows(index, segment, memory_budget_mb).await?;
         }
         Commands::Reorder { index } => {
             index_ops::reorder_index(index).await?;

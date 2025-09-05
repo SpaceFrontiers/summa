@@ -173,6 +173,8 @@ impl Default for SegmentTracker {
 ///
 /// Not generic over Directory — the delete callback abstracts away directory access.
 pub struct SegmentSnapshot {
+    deletions: std::collections::HashMap<String, (u32, super::DeletionMeta)>,
+    deletion_ids: Vec<String>,
     tracker: Arc<SegmentTracker>,
     segment_ids: Vec<String>,
     /// The index-global ANN artifacts paired with exactly this segment set.
@@ -190,6 +192,8 @@ impl SegmentSnapshot {
             tracker,
             segment_ids,
             generation: None,
+            deletions: Default::default(),
+            deletion_ids: Vec::new(),
             delete_fn: None,
         }
     }
@@ -204,6 +208,8 @@ impl SegmentSnapshot {
             tracker,
             segment_ids,
             generation: None,
+            deletions: Default::default(),
+            deletion_ids: Vec::new(),
             delete_fn: Some(delete_fn),
         }
     }
@@ -220,8 +226,31 @@ impl SegmentSnapshot {
             tracker,
             segment_ids,
             generation: Some(generation),
+            deletions: Default::default(),
+            deletion_ids: Vec::new(),
             delete_fn: Some(delete_fn),
         }
+    }
+
+    pub(crate) fn with_deletions(mut self, metadata: &crate::index::IndexMetadata) -> Self {
+        self.deletions = metadata
+            .segment_metas
+            .iter()
+            .filter_map(|(id, info)| {
+                info.deletions
+                    .clone()
+                    .map(|d| (id.clone(), (info.num_docs, d)))
+            })
+            .collect();
+        let ids: Vec<_> = self.deletions.values().map(|(_, d)| d.id.clone()).collect();
+        self.deletion_ids = self.tracker.acquire(&ids);
+        self
+    }
+
+    pub(crate) fn deletions(
+        &self,
+    ) -> &std::collections::HashMap<String, (u32, super::DeletionMeta)> {
+        &self.deletions
     }
 
     /// Get the segment IDs in this snapshot
@@ -246,7 +275,8 @@ impl SegmentSnapshot {
 
 impl Drop for SegmentSnapshot {
     fn drop(&mut self) {
-        let to_delete = self.tracker.release(&self.segment_ids);
+        let mut to_delete = self.tracker.release(&self.segment_ids);
+        to_delete.extend(self.tracker.release(&self.deletion_ids));
         if !to_delete.is_empty() {
             if let Some(delete_fn) = &self.delete_fn {
                 log::info!(

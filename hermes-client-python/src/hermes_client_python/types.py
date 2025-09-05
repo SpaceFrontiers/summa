@@ -279,5 +279,23 @@ class IndexInfo:
     num_segments: int
     schema: str
     vector_stats: list[VectorFieldStats] = field(default_factory=list)
+    physical_num_docs: int = 0
+    num_deleted_docs: int = 0
+    deleted_ratio: float = 0.0
     candidate_scoring_version: int = 0
     unprepared_candidate_fields: list[str] = field(default_factory=list)
+
+
+class DocumentMutationError(TypedDict):
+    """Rejected operation at a zero-based position in the input batch."""
+
+    index: int
+    error: str
+
+
+@dataclass
+class DocumentMutationResult:
+    """Staged operations (not affected rows); commit publishes accepted work."""
+
+    accepted_count: int
+    errors: list[DocumentMutationError] = field(default_factory=list)

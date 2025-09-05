@@ -800,6 +800,11 @@ export interface GetIndexInfoResponse {
   candidateScoringVersion: number;
   /** Fields requiring lookup preparation/migration. */
   unpreparedCandidateFields: string[];
+  /** Includes tombstones; num_docs counts live rows. */
+  physicalNumDocs: number;
+  numDeletedDocs: number;
+  /** num_deleted_docs / physical_num_docs; zero for an empty index. */
+  deletedRatio: number;
 }
 
 /** Tokenization facts of one text field. */
@@ -911,6 +916,31 @@ export interface BatchIndexDocumentsResponse {
   errors: DocumentError[];
 }
 
+/**
+ * Requests are bounded before conversion or writer admission. Both require a
+ * primary-key schema and an explicit Commit. No cross-partition transaction.
+ */
+export interface DeleteDocumentsRequest {
+  indexName: string;
+  /** <=100,000 keys, <=8 MiB total key bytes */
+  primaryKeys: string[];
+}
+
+export interface UpsertDocumentsRequest {
+  indexName: string;
+  /** <=1,000 documents, <=32 MiB encoded request */
+  documents: NamedDocument[];
+}
+
+export interface DocumentMutationResponse {
+  /**
+   * Admitted operations, not affected rows. A missing deletion is accepted.
+   * Every input is accepted or has one error; Commit publishes accepted work.
+   */
+  acceptedCount: number;
+  errors: DocumentError[];
+}
+
 /** Per-document error detail (e.g. duplicate primary key) */
 export interface DocumentError {
   /** 0-based index in the request batch */
@@ -943,6 +973,11 @@ export interface CommitResponse {
 /** Force merge request/response */
 export interface ForceMergeRequest {
   indexName: string;
+  /**
+   * Expensive physical removal of deleted rows, once per final output.
+   * Omitted/false copies encoded data and carries deletion masks unchanged.
+   */
+  compact: boolean;
 }
 
 export interface ForceMergeResponse {
@@ -7055,6 +7090,9 @@ function createBaseGetIndexInfoResponse(): GetIndexInfoResponse {
     textFields: [],
     candidateScoringVersion: 0,
     unpreparedCandidateFields: [],
+    physicalNumDocs: 0,
+    numDeletedDocs: 0,
+    deletedRatio: 0,
   };
 }
 
@@ -7086,6 +7124,15 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     }
     for (const v of message.unpreparedCandidateFields) {
       writer.uint32(74).string(v!);
+    }
+    if (message.physicalNumDocs !== 0) {
+      writer.uint32(80).uint64(message.physicalNumDocs);
+    }
+    if (message.numDeletedDocs !== 0) {
+      writer.uint32(88).uint64(message.numDeletedDocs);
+    }
+    if (message.deletedRatio !== 0) {
+      writer.uint32(97).double(message.deletedRatio);
     }
     return writer;
   },
@@ -7169,6 +7216,30 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
           message.unpreparedCandidateFields.push(reader.string());
           continue;
         }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.physicalNumDocs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 11: {
+          if (tag !== 88) {
+            break;
+          }
+
+          message.numDeletedDocs = longToNumber(reader.uint64());
+          continue;
+        }
+        case 12: {
+          if (tag !== 97) {
+            break;
+          }
+
+          message.deletedRatio = reader.double();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -7221,6 +7292,21 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
         : globalThis.Array.isArray(object?.unprepared_candidate_fields)
         ? object.unprepared_candidate_fields.map((e: any) => globalThis.String(e))
         : [],
+      physicalNumDocs: isSet(object.physicalNumDocs)
+        ? globalThis.Number(object.physicalNumDocs)
+        : isSet(object.physical_num_docs)
+        ? globalThis.Number(object.physical_num_docs)
+        : 0,
+      numDeletedDocs: isSet(object.numDeletedDocs)
+        ? globalThis.Number(object.numDeletedDocs)
+        : isSet(object.num_deleted_docs)
+        ? globalThis.Number(object.num_deleted_docs)
+        : 0,
+      deletedRatio: isSet(object.deletedRatio)
+        ? globalThis.Number(object.deletedRatio)
+        : isSet(object.deleted_ratio)
+        ? globalThis.Number(object.deleted_ratio)
+        : 0,
     };
   },
 
@@ -7253,6 +7339,15 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     if (message.unpreparedCandidateFields?.length) {
       obj.unpreparedCandidateFields = message.unpreparedCandidateFields;
     }
+    if (message.physicalNumDocs !== 0) {
+      obj.physicalNumDocs = Math.round(message.physicalNumDocs);
+    }
+    if (message.numDeletedDocs !== 0) {
+      obj.numDeletedDocs = Math.round(message.numDeletedDocs);
+    }
+    if (message.deletedRatio !== 0) {
+      obj.deletedRatio = message.deletedRatio;
+    }
     return obj;
   },
 
@@ -7272,6 +7367,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     message.textFields = object.textFields?.map((e) => TextFieldInfo.fromPartial(e)) || [];
     message.candidateScoringVersion = object.candidateScoringVersion ?? 0;
     message.unpreparedCandidateFields = object.unpreparedCandidateFields?.map((e) => e) || [];
+    message.physicalNumDocs = object.physicalNumDocs ?? 0;
+    message.numDeletedDocs = object.numDeletedDocs ?? 0;
+    message.deletedRatio = object.deletedRatio ?? 0;
     return message;
   },
 };
@@ -8510,6 +8608,252 @@ export const BatchIndexDocumentsResponse: MessageFns<BatchIndexDocumentsResponse
   },
 };
 
+function createBaseDeleteDocumentsRequest(): DeleteDocumentsRequest {
+  return { indexName: "", primaryKeys: [] };
+}
+
+export const DeleteDocumentsRequest: MessageFns<DeleteDocumentsRequest> = {
+  encode(message: DeleteDocumentsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.indexName !== "") {
+      writer.uint32(10).string(message.indexName);
+    }
+    for (const v of message.primaryKeys) {
+      writer.uint32(18).string(v!);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): DeleteDocumentsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseDeleteDocumentsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.indexName = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.primaryKeys.push(reader.string());
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): DeleteDocumentsRequest {
+    return {
+      indexName: isSet(object.indexName)
+        ? globalThis.String(object.indexName)
+        : isSet(object.index_name)
+        ? globalThis.String(object.index_name)
+        : "",
+      primaryKeys: globalThis.Array.isArray(object?.primaryKeys)
+        ? object.primaryKeys.map((e: any) => globalThis.String(e))
+        : globalThis.Array.isArray(object?.primary_keys)
+        ? object.primary_keys.map((e: any) => globalThis.String(e))
+        : [],
+    };
+  },
+
+  toJSON(message: DeleteDocumentsRequest): unknown {
+    const obj: any = {};
+    if (message.indexName !== "") {
+      obj.indexName = message.indexName;
+    }
+    if (message.primaryKeys?.length) {
+      obj.primaryKeys = message.primaryKeys;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<DeleteDocumentsRequest>): DeleteDocumentsRequest {
+    return DeleteDocumentsRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<DeleteDocumentsRequest>): DeleteDocumentsRequest {
+    const message = createBaseDeleteDocumentsRequest();
+    message.indexName = object.indexName ?? "";
+    message.primaryKeys = object.primaryKeys?.map((e) => e) || [];
+    return message;
+  },
+};
+
+function createBaseUpsertDocumentsRequest(): UpsertDocumentsRequest {
+  return { indexName: "", documents: [] };
+}
+
+export const UpsertDocumentsRequest: MessageFns<UpsertDocumentsRequest> = {
+  encode(message: UpsertDocumentsRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.indexName !== "") {
+      writer.uint32(10).string(message.indexName);
+    }
+    for (const v of message.documents) {
+      NamedDocument.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): UpsertDocumentsRequest {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseUpsertDocumentsRequest();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.indexName = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.documents.push(NamedDocument.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): UpsertDocumentsRequest {
+    return {
+      indexName: isSet(object.indexName)
+        ? globalThis.String(object.indexName)
+        : isSet(object.index_name)
+        ? globalThis.String(object.index_name)
+        : "",
+      documents: globalThis.Array.isArray(object?.documents)
+        ? object.documents.map((e: any) => NamedDocument.fromJSON(e))
+        : [],
+    };
+  },
+
+  toJSON(message: UpsertDocumentsRequest): unknown {
+    const obj: any = {};
+    if (message.indexName !== "") {
+      obj.indexName = message.indexName;
+    }
+    if (message.documents?.length) {
+      obj.documents = message.documents.map((e) => NamedDocument.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<UpsertDocumentsRequest>): UpsertDocumentsRequest {
+    return UpsertDocumentsRequest.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<UpsertDocumentsRequest>): UpsertDocumentsRequest {
+    const message = createBaseUpsertDocumentsRequest();
+    message.indexName = object.indexName ?? "";
+    message.documents = object.documents?.map((e) => NamedDocument.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseDocumentMutationResponse(): DocumentMutationResponse {
+  return { acceptedCount: 0, errors: [] };
+}
+
+export const DocumentMutationResponse: MessageFns<DocumentMutationResponse> = {
+  encode(message: DocumentMutationResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.acceptedCount !== 0) {
+      writer.uint32(8).uint32(message.acceptedCount);
+    }
+    for (const v of message.errors) {
+      DocumentError.encode(v!, writer.uint32(18).fork()).join();
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): DocumentMutationResponse {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseDocumentMutationResponse();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 8) {
+            break;
+          }
+
+          message.acceptedCount = reader.uint32();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.errors.push(DocumentError.decode(reader, reader.uint32()));
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): DocumentMutationResponse {
+    return {
+      acceptedCount: isSet(object.acceptedCount)
+        ? globalThis.Number(object.acceptedCount)
+        : isSet(object.accepted_count)
+        ? globalThis.Number(object.accepted_count)
+        : 0,
+      errors: globalThis.Array.isArray(object?.errors) ? object.errors.map((e: any) => DocumentError.fromJSON(e)) : [],
+    };
+  },
+
+  toJSON(message: DocumentMutationResponse): unknown {
+    const obj: any = {};
+    if (message.acceptedCount !== 0) {
+      obj.acceptedCount = Math.round(message.acceptedCount);
+    }
+    if (message.errors?.length) {
+      obj.errors = message.errors.map((e) => DocumentError.toJSON(e));
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<DocumentMutationResponse>): DocumentMutationResponse {
+    return DocumentMutationResponse.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<DocumentMutationResponse>): DocumentMutationResponse {
+    const message = createBaseDocumentMutationResponse();
+    message.acceptedCount = object.acceptedCount ?? 0;
+    message.errors = object.errors?.map((e) => DocumentError.fromPartial(e)) || [];
+    return message;
+  },
+};
+
 function createBaseDocumentError(): DocumentError {
   return { index: 0, error: "" };
 }
@@ -8891,13 +9235,16 @@ export const CommitResponse: MessageFns<CommitResponse> = {
 };
 
 function createBaseForceMergeRequest(): ForceMergeRequest {
-  return { indexName: "" };
+  return { indexName: "", compact: false };
 }
 
 export const ForceMergeRequest: MessageFns<ForceMergeRequest> = {
   encode(message: ForceMergeRequest, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.indexName !== "") {
       writer.uint32(10).string(message.indexName);
+    }
+    if (message.compact !== false) {
+      writer.uint32(16).bool(message.compact);
     }
     return writer;
   },
@@ -8917,6 +9264,14 @@ export const ForceMergeRequest: MessageFns<ForceMergeRequest> = {
           message.indexName = reader.string();
           continue;
         }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.compact = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -8933,6 +9288,7 @@ export const ForceMergeRequest: MessageFns<ForceMergeRequest> = {
         : isSet(object.index_name)
         ? globalThis.String(object.index_name)
         : "",
+      compact: isSet(object.compact) ? globalThis.Boolean(object.compact) : false,
     };
   },
 
@@ -8940,6 +9296,9 @@ export const ForceMergeRequest: MessageFns<ForceMergeRequest> = {
     const obj: any = {};
     if (message.indexName !== "") {
       obj.indexName = message.indexName;
+    }
+    if (message.compact !== false) {
+      obj.compact = message.compact;
     }
     return obj;
   },
@@ -8950,6 +9309,7 @@ export const ForceMergeRequest: MessageFns<ForceMergeRequest> = {
   fromPartial(object: DeepPartial<ForceMergeRequest>): ForceMergeRequest {
     const message = createBaseForceMergeRequest();
     message.indexName = object.indexName ?? "";
+    message.compact = object.compact ?? false;
     return message;
   },
 };
@@ -9794,6 +10154,24 @@ export const IndexServiceDefinition = {
       requestType: BatchIndexDocumentsRequest,
       requestStream: false,
       responseType: BatchIndexDocumentsResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Stage whole-document deletions by exact primary key, including every chunk. */
+    deleteDocuments: {
+      name: "DeleteDocuments",
+      requestType: DeleteDocumentsRequest,
+      requestStream: false,
+      responseType: DocumentMutationResponse,
+      responseStream: false,
+      options: {},
+    },
+    /** Stage complete replacements (inserts if absent). Commit publishes them. */
+    upsertDocuments: {
+      name: "UpsertDocuments",
+      requestType: UpsertDocumentsRequest,
+      requestStream: false,
+      responseType: DocumentMutationResponse,
       responseStream: false,
       options: {},
     },

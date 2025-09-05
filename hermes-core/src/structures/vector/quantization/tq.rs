@@ -1496,6 +1496,65 @@ impl TqFlatBuilder {
     }
 }
 
+/// Repack selected rows without changing any scale, gamma, or nibble.
+#[cfg(feature = "native")]
+pub(crate) fn tq_repack_rows(
+    codes: &[u8],
+    code_size: usize,
+    ivf: bool,
+    rows: impl Iterator<Item = usize>,
+    writer: &mut (impl std::io::Write + ?Sized),
+) -> std::io::Result<usize> {
+    let dim = code_size * 2;
+    let header = if ivf { 128 } else { 64 };
+    let block_bytes = TQ_BLOCK_LANES * code_size + header;
+    let mut values = vec![vec![0u8; dim]; TQ_BLOCK_LANES];
+    let mut scales = Vec::with_capacity(TQ_BLOCK_LANES);
+    let mut gammas = Vec::with_capacity(TQ_BLOCK_LANES);
+    let mut output = Vec::with_capacity(block_bytes);
+    let mut bytes = 0;
+    let mut emit =
+        |count: usize, scales: &[f32], gammas: &[f32], values: &[Vec<u8>]| -> std::io::Result<()> {
+            output.clear();
+            let refs: Vec<_> = values[..count].iter().map(Vec::as_slice).collect();
+            if ivf {
+                tq_pack_ivf_block(&refs, scales, gammas, dim, &mut output);
+            } else {
+                tq_pack_block(&refs, gammas, dim, &mut output);
+            }
+            writer.write_all(&output)?;
+            bytes += output.len();
+            Ok(())
+        };
+    for row in rows {
+        let at = row / TQ_BLOCK_LANES * block_bytes;
+        let lane = row % TQ_BLOCK_LANES;
+        let block = codes
+            .get(at..at + block_bytes)
+            .ok_or_else(|| std::io::Error::other("TQ compacted row is out of bounds"))?;
+        let read = |offset| f32::from_le_bytes(block[offset..offset + 4].try_into().unwrap());
+        if ivf {
+            scales.push(read(lane * 4));
+        }
+        let gamma_offset = if ivf { 64 } else { 0 };
+        let target = gammas.len();
+        gammas.push(read(gamma_offset + lane * 4));
+        for d in 0..dim {
+            let byte = block[header + d * 8 + lane % 8];
+            values[target][d] = (byte >> (if lane < 8 { 0 } else { 4 })) & 15;
+        }
+        if gammas.len() == TQ_BLOCK_LANES {
+            emit(TQ_BLOCK_LANES, &scales, &gammas, &values)?;
+            scales.clear();
+            gammas.clear();
+        }
+    }
+    if !gammas.is_empty() {
+        emit(gammas.len(), &scales, &gammas, &values)?;
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

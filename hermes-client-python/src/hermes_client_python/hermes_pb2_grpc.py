@@ -278,6 +278,18 @@ class IndexServiceStub:
             response_deserializer=hermes__pb2.BatchIndexDocumentsResponse.FromString,
             _registered_method=True,
         )
+        self.DeleteDocuments = channel.unary_unary(
+            "/hermes.IndexService/DeleteDocuments",
+            request_serializer=hermes__pb2.DeleteDocumentsRequest.SerializeToString,
+            response_deserializer=hermes__pb2.DocumentMutationResponse.FromString,
+            _registered_method=True,
+        )
+        self.UpsertDocuments = channel.unary_unary(
+            "/hermes.IndexService/UpsertDocuments",
+            request_serializer=hermes__pb2.UpsertDocumentsRequest.SerializeToString,
+            response_deserializer=hermes__pb2.DocumentMutationResponse.FromString,
+            _registered_method=True,
+        )
         self.Commit = channel.unary_unary(
             "/hermes.IndexService/Commit",
             request_serializer=hermes__pb2.CommitRequest.SerializeToString,
@@ -343,6 +355,18 @@ class IndexServiceServicer:
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")
 
+    def DeleteDocuments(self, request, context):
+        """Stage whole-document deletions by exact primary key, including every chunk."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
+    def UpsertDocuments(self, request, context):
+        """Stage complete replacements (inserts if absent). Commit publishes them."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details("Method not implemented!")
+        raise NotImplementedError("Method not implemented!")
+
     def Commit(self, request, context):
         """Commit pending changes"""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -402,6 +426,16 @@ def add_IndexServiceServicer_to_server(servicer, server):
             servicer.BatchIndexDocuments,
             request_deserializer=hermes__pb2.BatchIndexDocumentsRequest.FromString,
             response_serializer=hermes__pb2.BatchIndexDocumentsResponse.SerializeToString,
+        ),
+        "DeleteDocuments": grpc.unary_unary_rpc_method_handler(
+            servicer.DeleteDocuments,
+            request_deserializer=hermes__pb2.DeleteDocumentsRequest.FromString,
+            response_serializer=hermes__pb2.DocumentMutationResponse.SerializeToString,
+        ),
+        "UpsertDocuments": grpc.unary_unary_rpc_method_handler(
+            servicer.UpsertDocuments,
+            request_deserializer=hermes__pb2.UpsertDocumentsRequest.FromString,
+            response_serializer=hermes__pb2.DocumentMutationResponse.SerializeToString,
         ),
         "Commit": grpc.unary_unary_rpc_method_handler(
             servicer.Commit,
@@ -529,6 +563,66 @@ class IndexService:
             "/hermes.IndexService/BatchIndexDocuments",
             hermes__pb2.BatchIndexDocumentsRequest.SerializeToString,
             hermes__pb2.BatchIndexDocumentsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def DeleteDocuments(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/hermes.IndexService/DeleteDocuments",
+            hermes__pb2.DeleteDocumentsRequest.SerializeToString,
+            hermes__pb2.DocumentMutationResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True,
+        )
+
+    @staticmethod
+    def UpsertDocuments(
+        request,
+        target,
+        options=(),
+        channel_credentials=None,
+        call_credentials=None,
+        insecure=False,
+        compression=None,
+        wait_for_ready=None,
+        timeout=None,
+        metadata=None,
+    ):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            "/hermes.IndexService/UpsertDocuments",
+            hermes__pb2.UpsertDocumentsRequest.SerializeToString,
+            hermes__pb2.DocumentMutationResponse.FromString,
             options,
             channel_credentials,
             insecure,

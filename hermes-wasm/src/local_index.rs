@@ -123,6 +123,8 @@ pub struct LocalIndex {
     storage: Option<JsStorageAdapter>,
     /// File paths already persisted (for incremental sync)
     persisted_files: HashSet<String>,
+    needs_publish: bool,
+    attempted_storage_files: HashSet<String>,
 }
 
 #[wasm_bindgen]
@@ -138,6 +140,8 @@ impl LocalIndex {
             searcher: None,
             storage: None,
             persisted_files: HashSet::new(),
+            needs_publish: false,
+            attempted_storage_files: HashSet::new(),
         })
     }
 
@@ -168,6 +172,8 @@ impl LocalIndex {
                 searcher: None,
                 storage: Some(adapter),
                 persisted_files: HashSet::new(),
+                needs_publish: true,
+                attempted_storage_files: HashSet::new(),
             })
         } else {
             // Reopen from storage
@@ -189,11 +195,19 @@ impl LocalIndex {
 
             let persisted_files: HashSet<String> = existing_files.into_iter().collect();
 
+            let needs_publish = writer
+                .directory()
+                .list_files_sync(Path::new(""))
+                .map_err(|error| JsValue::from_str(&error.to_string()))?
+                .len()
+                != persisted_files.len();
             let mut index = LocalIndex {
                 writer: Some(writer),
                 searcher: None,
                 storage: Some(adapter),
                 persisted_files,
+                needs_publish,
+                attempted_storage_files: HashSet::new(),
             };
             index.refresh_searcher().await?;
             Ok(index)
@@ -246,6 +260,97 @@ impl LocalIndex {
         Ok(count)
     }
 
+    /// Stage a whole-document deletion by exact primary key, including all chunks.
+    #[wasm_bindgen(js_name = "deleteDocument")]
+    pub fn delete_document(&mut self, primary_key: String) -> Result<(), JsValue> {
+        self.writer
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("Index not writable"))?
+            .delete_primary_key(&primary_key)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Stage deletions. Returns { acceptedCount, errors: [{ index, error }] }.
+    /// Commit publishes accepted operations; missing keys are accepted.
+    #[wasm_bindgen(js_name = "deleteDocuments")]
+    pub fn delete_documents(&mut self, primary_keys: JsValue) -> Result<JsValue, JsValue> {
+        let values = bounded_array(&primary_keys, 100_000)?;
+        let keys: Vec<String> = values
+            .iter()
+            .map(|value| {
+                value
+                    .as_string()
+                    .ok_or_else(|| JsValue::from_str("primary keys must be strings"))
+            })
+            .collect::<Result<_, _>>()?;
+        if keys.iter().map(String::len).sum::<usize>() > 8 * 1024 * 1024 {
+            return Err(JsValue::from_str(
+                "deletion request exceeds 8 MiB of key bytes",
+            ));
+        }
+        let mut response = MutationResult::default();
+        for (position, key) in keys.into_iter().enumerate() {
+            response.record(position, self.delete_document(key));
+        }
+        serde_wasm_bindgen::to_value(&response)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Stage a complete replacement (insert if absent); call commit to publish.
+    #[wasm_bindgen(js_name = "upsertDocument")]
+    pub async fn upsert_document(&mut self, document: JsValue) -> Result<(), JsValue> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("Index not writable"))?;
+        let values = js_sys::Array::new();
+        values.push(&document);
+        let mut values = parse_mutation_documents(values.into())?;
+        let value = values.pop().unwrap();
+        let doc = hermes_core::Document::from_json(&value, writer.schema())
+            .ok_or_else(|| JsValue::from_str("Failed to parse document from JSON"))?;
+        writer
+            .upsert_document(doc)
+            .await
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Stage replacements, returning { acceptedCount, errors: [{ index, error }] }.
+    #[wasm_bindgen(js_name = "upsertDocuments")]
+    pub async fn upsert_documents(&mut self, documents: JsValue) -> Result<JsValue, JsValue> {
+        let documents = parse_mutation_documents(documents)?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("Index not writable"))?;
+        let mut response = MutationResult::default();
+        for (position, value) in documents.into_iter().enumerate() {
+            let result = match hermes_core::Document::from_json(&value, writer.schema()) {
+                Some(document) => writer
+                    .upsert_document(document)
+                    .await
+                    .map_err(|error| JsValue::from_str(&error.to_string())),
+                None => Err(JsValue::from_str("Failed to parse document from JSON")),
+            };
+            response.record(position, result);
+        }
+        serde_wasm_bindgen::to_value(&response)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Discard the entire pending transaction, retaining published documents.
+    #[wasm_bindgen]
+    pub async fn abort(&mut self) -> Result<(), JsValue> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("Index not writable"))?;
+        let generation = writer.metadata().publication_generation;
+        let result = writer.abort().await;
+        self.needs_publish |= writer.metadata().publication_generation != generation;
+        result.map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
     /// Commit pending documents — builds segments and updates metadata.
     ///
     /// For persistent indexes, only writes new/changed files to storage.
@@ -256,17 +361,17 @@ impl LocalIndex {
             .as_mut()
             .ok_or_else(|| JsValue::from_str("Index not writable"))?;
 
-        let committed = writer
-            .commit()
-            .await
-            .map_err(|e| JsValue::from_str(&format!("Commit error: {}", e)))?;
-
-        if committed {
+        let generation = writer.metadata().publication_generation;
+        let result = writer.commit().await;
+        self.needs_publish |= writer.metadata().publication_generation != generation;
+        result.map_err(|e| JsValue::from_str(&format!("Commit error: {e}")))?;
+        let published = self.needs_publish;
+        if published {
             self.refresh_searcher().await?;
             self.sync_to_storage().await?;
+            self.needs_publish = false;
         }
-
-        Ok(committed)
+        Ok(published)
     }
 
     /// Search the index.
@@ -441,13 +546,20 @@ impl LocalIndex {
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
-        let (writes, removed) = plan_storage_sync(&current_set, &self.persisted_files);
+        let (writes, _) = plan_storage_sync(&current_set, &self.persisted_files);
+        let known: HashSet<_> = self
+            .persisted_files
+            .union(&self.attempted_storage_files)
+            .cloned()
+            .collect();
+        let (_, removed) = plan_storage_sync(&current_set, &known);
 
         // Write new files and metadata.json (always changes on commit)
         for path_str in &writes {
             let data = dir
                 .read_file_sync(Path::new(path_str))
                 .map_err(|e| JsValue::from_str(&format!("Read error: {}", e)))?;
+            self.attempted_storage_files.insert(path_str.clone());
             adapter.write(path_str, &data).await?;
         }
 
@@ -459,8 +571,72 @@ impl LocalIndex {
         }
 
         self.persisted_files = current_set;
+        self.attempted_storage_files.clear();
         Ok(())
     }
+}
+
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MutationResult {
+    accepted_count: u32,
+    errors: Vec<MutationError>,
+}
+
+#[derive(serde::Serialize)]
+struct MutationError {
+    index: usize,
+    error: String,
+}
+
+impl MutationResult {
+    fn record(&mut self, index: usize, result: Result<(), JsValue>) {
+        match result {
+            Ok(()) => self.accepted_count += 1,
+            Err(error) => self.errors.push(MutationError {
+                index,
+                error: error.as_string().unwrap_or_else(|| format!("{error:?}")),
+            }),
+        }
+    }
+}
+
+// Decode through the same JS/serde bridge as addDocuments (including typed
+// arrays and integer values). Count JSON bytes without allocating a second
+// serialized payload, before document conversion or mutation admission.
+fn parse_mutation_documents(value: JsValue) -> Result<Vec<serde_json::Value>, JsValue> {
+    bounded_array(&value, 1_000)?;
+    let documents: Vec<serde_json::Value> = serde_wasm_bindgen::from_value(value)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    struct ByteBudget(usize);
+    impl std::io::Write for ByteBudget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("upsert request exceeds 32 MiB JSON bytes"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(ByteBudget(32 * 1024 * 1024), &documents)
+        .map_err(|error| JsValue::from_str(&error.to_string()))?;
+    Ok(documents)
+}
+
+fn bounded_array(value: &JsValue, limit: u32) -> Result<js_sys::Array, JsValue> {
+    if !js_sys::Array::is_array(value) {
+        return Err(JsValue::from_str("expected an array"));
+    }
+    let array: js_sys::Array = value.clone().unchecked_into();
+    if array.length() > limit {
+        return Err(JsValue::from_str(&format!(
+            "mutation batch exceeds {limit} items"
+        )));
+    }
+    Ok(array)
 }
 
 /// Name of the index metadata file — the durable commit point for a synced index.
