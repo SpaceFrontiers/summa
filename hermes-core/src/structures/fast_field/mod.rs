@@ -1240,8 +1240,19 @@ impl FastFieldReader {
     /// For text columns, returned values are global ordinals (remapped).
     /// For multi-value columns, use `for_each_multi_value` instead.
     pub fn scan_single_values(&self, mut f: impl FnMut(u32, u64)) {
+        let _ = self.try_scan_single_values(|doc, value| {
+            f(doc, value);
+            std::ops::ControlFlow::Continue(())
+        });
+    }
+
+    /// The same batched scan, with immediate caller-controlled cancellation.
+    pub(crate) fn try_scan_single_values(
+        &self,
+        mut f: impl FnMut(u32, u64) -> std::ops::ControlFlow<()>,
+    ) -> std::ops::ControlFlow<()> {
         if self.multi {
-            return;
+            return std::ops::ControlFlow::Continue(());
         }
         const BATCH: usize = 256;
         let mut buf = [0u64; BATCH];
@@ -1279,16 +1290,17 @@ impl FastFieldReader {
                         } else {
                             raw
                         };
-                        f(block.cumulative_docs + pos as u32 + i as u32, val);
+                        f(block.cumulative_docs + pos as u32 + i as u32, val)?;
                     }
                 } else {
                     for (i, &val) in buf[..chunk].iter().enumerate() {
-                        f(block.cumulative_docs + pos as u32 + i as u32, val);
+                        f(block.cumulative_docs + pos as u32 + i as u32, val)?;
                     }
                 }
                 pos += chunk;
             }
         }
+        std::ops::ControlFlow::Continue(())
     }
 
     /// Check if this doc has a value (not [`FAST_FIELD_MISSING`]).
@@ -1790,6 +1802,57 @@ mod tests {
         assert_eq!(reader.get_u64(2), 150);
         assert_eq!(reader.get_u64(3), FAST_FIELD_MISSING); // gap → absent sentinel
         assert_eq!(reader.get_u64(4), 300);
+    }
+
+    #[test]
+    fn cancellable_text_scans_preserve_global_ordinals_and_stop_at_the_requested_document() {
+        let mut a = FastFieldWriter::new_text();
+        let mut b = FastFieldWriter::new_text();
+        for doc in 0..600 {
+            if doc % 7 != 0 {
+                a.add_text(
+                    doc,
+                    if doc % 2 == 0 {
+                        "book"
+                    } else {
+                        "journal-article"
+                    },
+                );
+                b.add_text(doc, if doc % 2 == 0 { "article" } else { "book" });
+            }
+        }
+        a.pad_to(600);
+        b.pad_to(600);
+        let (data_a, dict_a, entry_a) = serialize_single_block(&mut a);
+        let (data_b, dict_b, entry_b) = serialize_single_block(&mut b);
+        let (buf, toc) = assemble_blocked_column(
+            0,
+            FastFieldColumnType::TextOrdinal,
+            false,
+            &[
+                (entry_a.num_docs, &data_a, entry_a.dict_count, &dict_a),
+                (entry_b.num_docs, &data_b, entry_b.dict_count, &dict_b),
+            ],
+        );
+        let ob = owned(buf);
+        let reader = FastFieldReader::open(&ob, &toc).unwrap();
+        let expected: Vec<_> = (0..1200).map(|doc| (doc, reader.get_u64(doc))).collect();
+        let mut complete = Vec::new();
+        reader.scan_single_values(|doc, ordinal| complete.push((doc, ordinal)));
+        assert_eq!(complete, expected);
+        for stop in [0, 255, 256, 599, 600, 1024, 1199] {
+            let mut visited = Vec::new();
+            let outcome = reader.try_scan_single_values(|doc, ordinal| {
+                visited.push((doc, ordinal));
+                if doc == stop {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            });
+            assert!(outcome.is_break());
+            assert_eq!(visited, expected[..=stop as usize]);
+        }
     }
 
     #[test]

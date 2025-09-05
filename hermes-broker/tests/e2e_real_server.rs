@@ -527,7 +527,9 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
     wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
 
     let index_name = "docs_fusion_e2e";
-    let schema = SCHEMA.replace("index e2e", &format!("index {index_name}"));
+    let schema = SCHEMA
+        .replace("index e2e", &format!("index {index_name}"))
+        .replace('}', "field type: text<raw_ci> [fast]\n}");
     let mut index = broker_index_client(&broker).await;
     index
         .create_index(CreateIndexRequest {
@@ -537,12 +539,22 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
         .await
         .unwrap();
     wait_for_indexes(&broker, &[index_name], Duration::from_secs(10)).await;
+    let typed_doc = |id: &str, title: &str, kind: &str| {
+        let mut document = doc(id, title);
+        document.fields.push(FieldEntry {
+            name: "type".into(),
+            value: Some(FieldValue {
+                value: Some(field_value::Value::Text(kind.into())),
+            }),
+        });
+        document
+    };
     index
         .batch_index_documents(BatchIndexDocumentsRequest {
             index_name: index_name.to_string(),
             documents: vec![
-                doc("doc-1", "quantum field theory"),
-                doc("doc-2", "another quantum document"),
+                typed_doc("doc-1", "quantum field theory", "journal-article"),
+                typed_doc("doc-2", "another quantum document", "book"),
             ],
         })
         .await
@@ -689,6 +701,42 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
         b["specific"], 0.0,
         "score-only backfill distinguishes a valid nonmatch"
     );
+    for mode in ["rrf", "formula", "export"] {
+        let mut filtered = request.clone();
+        if mode != "formula" {
+            filtered.l1 = None;
+        }
+        if mode == "rrf" {
+            filtered.score_export = None;
+        }
+        let Some(query::Query::Fusion(fusion)) = filtered.query.as_mut().unwrap().query.as_mut()
+        else {
+            unreachable!()
+        };
+        if mode == "rrf" {
+            fusion.queries.truncate(1);
+            fusion.candidate_depth = 0;
+        }
+        fusion.filters = vec![Query {
+            query: Some(query::Query::Term(TermQuery {
+                field: "type".into(),
+                term: "journal-article".into(),
+                ..Default::default()
+            })),
+        }];
+        let response = broker_search_client(&broker)
+            .await
+            .search(filtered)
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.hits.len(), 1, "{mode}: fast-only type filter");
+        assert_eq!(
+            response.hits[0].fields["id"].values[0].value,
+            Some(field_value::Value::Text("doc-1".into())),
+            "{mode}: fast-only type filter"
+        );
+    }
     let mut traced_request = request.clone();
     traced_request.tracing = true;
     traced_request.include_rrf_scores = true;
