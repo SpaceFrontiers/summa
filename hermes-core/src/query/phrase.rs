@@ -355,6 +355,7 @@ pub(super) async fn score_phrase_candidates(
             &[(query.terms[0].clone(), 1.0)],
             targets,
             stats,
+            &mut Default::default(),
         )
         .await;
     }

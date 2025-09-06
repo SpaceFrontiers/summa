@@ -9,6 +9,8 @@ mod posting_codecs;
 mod primary_key;
 mod range;
 mod search;
+#[cfg(feature = "sync")]
+mod search_cpu;
 
 mod vector;
 
