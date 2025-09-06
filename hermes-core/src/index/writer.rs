@@ -760,7 +760,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Err(Error::Internal(reason.clone()));
         }
 
-        let metadata = super::IndexMetadata::load(directory.as_ref()).await?;
+        let metadata = super::IndexMetadata::load_persisting_migration(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());

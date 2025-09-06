@@ -2,6 +2,7 @@ mod basic;
 mod bmp;
 mod boolean;
 mod chunked;
+mod format_migration;
 mod maintenance;
 mod merge;
 mod pin;
