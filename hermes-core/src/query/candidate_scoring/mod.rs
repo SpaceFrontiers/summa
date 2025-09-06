@@ -67,7 +67,7 @@ impl DocumentExpression {
     fn score(&self, components: &[Vec<f32>], locations: &[(u32, usize)]) -> Result<f32> {
         let value = match self {
             Self::Component(index, combiner) => {
-                let values: Vec<_> = locations
+                let values: smallvec::SmallVec<[(u32, f32); 16]> = locations
                     .iter()
                     .map(|&(ordinal, position)| (ordinal, components[*index][position]))
                     .collect();

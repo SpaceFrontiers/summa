@@ -1,7 +1,39 @@
 # Candidate rescoring for L1 ranking
 
-Status: opt-in Hermes implementation, 2026-09-06. Search API training and
+Status: opt-in Hermes implementation, updated 2026-09-09. Search API training and
 activation are separate. Existing retrieval defaults remain unchanged.
+
+## Scoring execution efficiency (2026-09-09)
+
+The implementation pass retains the same candidate union, organic cells,
+component/ordinal reduction order, missing values, and request-wide admission
+limits. There is one core async scorer for native and WASM; neither adapters
+nor a second synchronous scorer implement feature backfill.
+
+On native multithread Tokio runtimes, each ready portion of the scoring future
+is polled on the shared search CPU pool. Nested BMP/vector kernels stay on that
+pool. A pending directory read returns the original task's waker and releases
+the worker; no worker blocks waiting for asynchronous I/O, and no detached task
+retains the request after cancellation. Polling is scoped over borrowed inputs,
+and the Tokio handle is entered on the worker for directory implementations
+that use it. Current-thread, non-Tokio and native-without-sync/WASM callers keep
+their existing execution path. This changes scheduling cost, not pruning or
+the number of features scored.
+
+Selected text probes reuse request-owned posting decode buffers and initialize
+their iterator at the first requested block, preserving ordinary seek and
+position-cursor semantics. Feature reduction uses sorted contiguous location
+spans and small inline buffers instead of allocating a tree and vector for
+each document/component. Chunk-field metadata is prepared once per request.
+Scoring-query preparation is reused across compatible segment probes; scratch
+is bounded by the existing admitted candidate/component/vector sizes and is
+released with the request. Payload remains evictable and exports retain their
+existing owned wire representation.
+
+Further proposals to share arbitrary overlapping field reads, change lazy text
+range loading, or parallelize segments need separate measurements and are not
+part of this execution change. In particular, no formula-dependency mask may
+omit features required by raw export or broker RRF.
 
 Logical addressing belongs to [BMP forward values](bmp-forward-index.md) and
 the existing text chunk map. There are no `.lookup` sidecars. The historical

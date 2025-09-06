@@ -630,6 +630,41 @@ impl<D: Directory + 'static> Searcher<D> {
         operation()
     }
 
+    /// Keep a ready scoring pipeline on the shared CPU pool. Polls borrow the
+    /// original future; pending I/O releases the worker and cancellation never
+    /// leaves detached scoring work holding a reader or request permit.
+    #[cfg(feature = "sync")]
+    pub(crate) async fn run_search_cpu<F>(&self, future: F) -> F::Output
+    where
+        F: std::future::Future + Send,
+        F::Output: Send,
+    {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return future.await;
+        };
+        if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+            return future.await;
+        }
+        let mut future = std::pin::pin!(future);
+        futures::future::poll_fn(|context| {
+            let waker = context.waker().clone();
+            tokio::task::block_in_place(|| {
+                self.install_search_cpu(|| {
+                    let _entered = runtime.enter();
+                    future
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(&waker))
+                })
+            })
+        })
+        .await
+    }
+
+    #[cfg(not(feature = "sync"))]
+    pub(crate) async fn run_search_cpu<F: std::future::Future>(&self, future: F) -> F::Output {
+        future.await
+    }
+
     /// Get number of segments
     pub fn num_segments(&self) -> usize {
         self.segments.len()

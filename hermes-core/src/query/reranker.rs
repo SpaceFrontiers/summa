@@ -1017,9 +1017,15 @@ async fn rerank_binary<D: crate::directories::Directory + 'static>(
     Ok(scored)
 }
 
-/// Backfill a selected set of flat vector values without ANN candidate
-/// generation. Shares range planning, bounded buffers and SIMD kernels with
-/// the existing exact reranker. Targets are sorted and unique.
+/// Request-owned preparation for one immutable dense scoring component. The
+/// F16 representation is materialized only if a segment needs that codec.
+pub(super) struct CandidateVectorPreparation {
+    inv_norm_q: f32,
+    query_f16: Vec<u16>,
+}
+
+/// Backfill sorted, unique flat vector targets with the existing rerank range
+/// planner and SIMD kernels, without ANN nomination.
 pub(super) async fn score_vector_candidates<D: crate::directories::Directory + 'static>(
     searcher: &crate::index::Searcher<D>,
     flat: &crate::segment::LazyFlatVectorData,
@@ -1027,18 +1033,35 @@ pub(super) async fn score_vector_candidates<D: crate::directories::Directory + '
     binary_vector: &[u8],
     unit_norm: bool,
     targets: &[u32],
+    preparation: &mut Option<CandidateVectorPreparation>,
 ) -> crate::Result<Vec<f32>> {
     use crate::structures::simd;
-    let norm = simd::dot_product_f32(vector, vector, vector.len());
-    let query_f16: Vec<u16> = vector.iter().map(|&v| simd::f32_to_f16(v)).collect();
-    let pq = PrecompQuery {
-        query: vector,
-        inv_norm_q: if norm < f32::EPSILON {
-            0.0
-        } else {
-            simd::fast_inv_sqrt(norm)
-        },
-        query_f16: &query_f16,
+    let pq = if binary_vector.is_empty() {
+        let preparation = preparation.get_or_insert_with(|| {
+            let norm = simd::dot_product_f32(vector, vector, vector.len());
+            CandidateVectorPreparation {
+                inv_norm_q: if norm < f32::EPSILON {
+                    0.0
+                } else {
+                    simd::fast_inv_sqrt(norm)
+                },
+                query_f16: Vec::new(),
+            }
+        });
+        if flat.quantization == crate::dsl::DenseVectorQuantization::F16
+            && preparation.query_f16.is_empty()
+        {
+            preparation
+                .query_f16
+                .extend(vector.iter().map(|&v| simd::f32_to_f16(v)));
+        }
+        Some(PrecompQuery {
+            query: vector,
+            inv_norm_q: preparation.inv_norm_q,
+            query_f16: &preparation.query_f16,
+        })
+    } else {
+        None
     };
     let vbs = flat.vector_byte_size();
     let batch_len = rerank_batch_len(vbs);
@@ -1055,7 +1078,14 @@ pub(super) async fn score_vector_candidates<D: crate::directories::Directory + '
             });
         } else {
             searcher.install_search_cpu(|| {
-                score_batch_precomp(&pq, raw, flat.quantization, flat.dim, out, unit_norm)
+                score_batch_precomp(
+                    pq.as_ref().expect("dense query"),
+                    raw,
+                    flat.quantization,
+                    flat.dim,
+                    out,
+                    unit_norm,
+                )
             })?;
         }
     }

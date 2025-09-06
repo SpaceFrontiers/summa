@@ -644,15 +644,19 @@ pub(super) async fn score_term_candidates(
     terms: &[(Vec<u8>, f32)],
     targets: &[u32],
     stats: Option<&Arc<GlobalStats>>,
+    scratch: &mut crate::structures::postings::PostingDecodeScratch,
 ) -> crate::Result<Vec<f32>> {
     let mut scores = vec![0.0; targets.len()];
+    let Some(&first_target) = targets.first() else {
+        return Ok(scores);
+    };
     let params = super::Bm25Params::for_field(reader.schema(), field);
     for (term, weight) in terms {
         let Some(postings) = reader.get_postings(field, term).await? else {
             continue;
         };
         let (idf, avg_len) = compute_term_idf(&postings, field, reader, stats, term);
-        let mut cursor = postings.into_iterator();
+        let mut cursor = postings.into_candidate_iterator(first_target, scratch);
         for (index, &target) in targets.iter().enumerate() {
             if cursor.seek(target) != target {
                 continue;
@@ -667,6 +671,7 @@ pub(super) async fn score_term_candidates(
             };
             scores[index] += params.score(tf, idf * weight, length, avg_len);
         }
+        cursor.recycle(scratch);
     }
     Ok(scores)
 }

@@ -2013,91 +2013,115 @@ fn score_forward_units(
     Ok(units)
 }
 
-/// Exact candidate probes use the very same integer query quantization and
-/// dequantization as exhaustive BMP retrieval. Nomination/LSP never enters
-/// this path. Targets are sorted forward rows when stored and real physical slots
-/// without forward storage, as resolved by the owning candidate-address reader.
+/// Request-owned preparation for one immutable scoring component. Retain only
+/// one dimension configuration; a differing segment replaces the preparation.
+#[derive(Default)]
+pub(super) struct CandidateBmpPreparation {
+    prepared: Option<(u32, Option<PreparedBmpQuery>)>,
+}
+
+/// Exact probes share retrieval's integer quantization/dequantization. Targets
+/// are sorted forward rows or real physical slots from the candidate reader.
+#[cfg(test)]
 pub(crate) fn score_bmp_candidates(
     index: &BmpIndex,
     terms: &[(u32, f32)],
     targets: &[u32],
 ) -> crate::Result<Vec<f32>> {
-    use crate::segment::bmp_adaptive::AdaptivePostings;
-    let mut scores = vec![0.0; targets.len()];
-    let Some(prepared) = prepare_bmp_query(index.dims(), terms, terms)? else {
-        return Ok(scores);
-    };
-    let dequant = prepared.dequant_for(index)?;
-    if let Some(forward) = index.forward() {
-        for (score, &target) in scores.iter_mut().zip(targets) {
-            let vector = forward.vector(target)?;
-            let units = score_forward_units(vector, &prepared.query_by_dim_u16)?;
-            *score = units as f32 * dequant;
+    CandidateBmpPreparation::default().score(index, terms, targets)
+}
+
+impl CandidateBmpPreparation {
+    pub(super) fn score(
+        &mut self,
+        index: &BmpIndex,
+        terms: &[(u32, f32)],
+        targets: &[u32],
+    ) -> crate::Result<Vec<f32>> {
+        use crate::segment::bmp_adaptive::AdaptivePostings;
+        let mut scores = vec![0.0; targets.len()];
+        if self
+            .prepared
+            .as_ref()
+            .is_none_or(|(dims, _)| *dims != index.dims())
+        {
+            self.prepared = Some((index.dims(), prepare_bmp_query(index.dims(), terms, terms)?));
         }
-        return Ok(scores);
-    }
-    let mut start = 0;
-    while start < targets.len() {
-        let block_id = targets[start] / index.bmp_block_size;
-        let mut end = start + 1;
-        while end < targets.len() && targets[end] / index.bmp_block_size == block_id {
-            end += 1;
+        let Some(prepared) = self.prepared.as_ref().and_then(|(_, query)| query.as_ref()) else {
+            return Ok(scores);
+        };
+        let dequant = prepared.dequant_for(index)?;
+        if let Some(forward) = index.forward() {
+            for (score, &target) in scores.iter_mut().zip(targets) {
+                let vector = forward.vector(target)?;
+                let units = score_forward_units(vector, &prepared.query_by_dim_u16)?;
+                *score = units as f32 * dequant;
+            }
+            return Ok(scores);
         }
-        // Missing/empty blocks contain no nonzero terms. Real-slot identity is
-        // validated by the reader before this call.
-        let (byte_start, byte_end) = index.block_data_range(block_id);
-        if byte_start == byte_end {
-            start = end;
-            continue;
-        }
-        let block = index.parse_block(block_id).ok_or_else(|| {
-            crate::Error::Corruption(format!("cannot decode candidate BMP block {block_id}"))
-        })?;
-        let mut units = [0u32; 256];
-        for &(dimension, weight) in &prepared.query_by_dim_u16 {
-            let Some(term) = block.find_dimension(dimension) else {
+        let mut start = 0;
+        while start < targets.len() {
+            let block_id = targets[start] / index.bmp_block_size;
+            let mut end = start + 1;
+            while end < targets.len() && targets[end] / index.bmp_block_size == block_id {
+                end += 1;
+            }
+            // Missing/empty blocks contain no nonzero terms. Real-slot identity is
+            // validated by the reader before this call.
+            let (byte_start, byte_end) = index.block_data_range(block_id);
+            if byte_start == byte_end {
+                start = end;
                 continue;
-            };
-            let postings = block.postings(term).ok_or_else(|| {
-                crate::Error::Corruption(format!(
-                    "cannot decode candidate BMP dimension {dimension}"
-                ))
+            }
+            let block = index.parse_block(block_id).ok_or_else(|| {
+                crate::Error::Corruption(format!("cannot decode candidate BMP block {block_id}"))
             })?;
-            match postings {
-                AdaptivePostings::Dense(impacts) => {
-                    for &target in &targets[start..end] {
-                        let slot = (target % index.bmp_block_size) as usize;
-                        units[slot] = units[slot]
-                            .checked_add(u32::from(impacts[slot]) * u32::from(weight))
-                            .ok_or_else(|| {
-                                crate::Error::Query("BMP candidate score overflow".into())
-                            })?;
-                    }
-                }
-                AdaptivePostings::Sparse(postings) => {
-                    for &target in &targets[start..end] {
-                        let slot = (target % index.bmp_block_size) as u8;
-                        let start = postings.partition_point(|p| p.local_slot < slot);
-                        for posting in postings[start..]
-                            .iter()
-                            .take_while(|p| p.local_slot == slot)
-                        {
-                            units[slot as usize] = units[slot as usize]
-                                .checked_add(u32::from(posting.impact) * u32::from(weight))
+            let mut units = [0u32; 256];
+            for &(dimension, weight) in &prepared.query_by_dim_u16 {
+                let Some(term) = block.find_dimension(dimension) else {
+                    continue;
+                };
+                let postings = block.postings(term).ok_or_else(|| {
+                    crate::Error::Corruption(format!(
+                        "cannot decode candidate BMP dimension {dimension}"
+                    ))
+                })?;
+                match postings {
+                    AdaptivePostings::Dense(impacts) => {
+                        for &target in &targets[start..end] {
+                            let slot = (target % index.bmp_block_size) as usize;
+                            units[slot] = units[slot]
+                                .checked_add(u32::from(impacts[slot]) * u32::from(weight))
                                 .ok_or_else(|| {
                                     crate::Error::Query("BMP candidate score overflow".into())
                                 })?;
                         }
                     }
+                    AdaptivePostings::Sparse(postings) => {
+                        for &target in &targets[start..end] {
+                            let slot = (target % index.bmp_block_size) as u8;
+                            let start = postings.partition_point(|p| p.local_slot < slot);
+                            for posting in postings[start..]
+                                .iter()
+                                .take_while(|p| p.local_slot == slot)
+                            {
+                                units[slot as usize] = units[slot as usize]
+                                    .checked_add(u32::from(posting.impact) * u32::from(weight))
+                                    .ok_or_else(|| {
+                                        crate::Error::Query("BMP candidate score overflow".into())
+                                    })?;
+                            }
+                        }
+                    }
                 }
             }
+            for i in start..end {
+                scores[i] = units[(targets[i] % index.bmp_block_size) as usize] as f32 * dequant;
+            }
+            start = end;
         }
-        for i in start..end {
-            scores[i] = units[(targets[i] % index.bmp_block_size) as usize] as f32 * dequant;
-        }
-        start = end;
+        Ok(scores)
     }
-    Ok(scores)
 }
 
 #[cfg(test)]
