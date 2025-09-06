@@ -105,7 +105,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
         let directory = Arc::new(directory);
-        let metadata = IndexMetadata::load(directory.as_ref()).await?;
+        let metadata = IndexMetadata::load_persisting_migration(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
 
         let mut writer =
