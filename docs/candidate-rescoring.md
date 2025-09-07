@@ -1,5 +1,8 @@
 # Candidate rescoring for L1 ranking
 
+Capability 4 adds opt-in [real passage seeding for document-only nominations](document-nominated-passages.md),
+with a response acknowledgment that fails closed through older adapters.
+
 Status: opt-in Hermes implementation, updated 2026-09-09. Search API training and
 activation are separate. Existing retrieval defaults remain unchanged.
 

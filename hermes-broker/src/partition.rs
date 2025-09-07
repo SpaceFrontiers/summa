@@ -218,6 +218,10 @@ pub fn merge_search_responses(
     let mut took_ms: u64 = 0;
     let mut timings: Option<SearchTimings> = None;
     let mut truncated = false;
+    let seeded_document_passages = !responses.is_empty()
+        && responses
+            .iter()
+            .all(|response| response.seeded_document_passages);
     let mut ranking_method: Option<String> = None;
     let mut trace: Option<crate::proto::hermes::SearchTrace> = None;
     let mut fusion_candidates = BTreeMap::<u32, Vec<crate::proto::hermes::FusionCandidate>>::new();
@@ -280,6 +284,7 @@ pub fn merge_search_responses(
         timings,
         truncated,
         ranking_method: ranking_method.unwrap_or_default(),
+        seeded_document_passages,
         trace,
         fusion_candidates: fusion_candidates
             .into_iter()

@@ -131,6 +131,7 @@ async fn prepared_backfill_keeps_distinct_queries_and_quantizations_correct_acro
         model: None,
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let combined = searcher
@@ -201,6 +202,7 @@ async fn index_creation_configures_phrase_limits_for_ranking_and_collection_afte
                     }),
                     export_passages: 1,
                     all_passages: !ranked,
+                    seed_document_passages: false,
                     document_combiner: MultiValueCombiner::Max,
                 };
                 let result = searcher.score_candidates(&[], &plan, None).await;
@@ -287,6 +289,7 @@ async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
                     }),
                     export_passages: 1,
                     all_passages: !ranked,
+                    seed_document_passages: false,
                     document_combiner: MultiValueCombiner::Max,
                 };
                 let scored = searcher
@@ -328,6 +331,7 @@ async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
         model: None,
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let error = searcher
@@ -405,6 +409,7 @@ async fn l1_preserves_organic_zero_and_negative_scores_and_backfills_only_missin
         ),
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let raw = searcher
@@ -545,6 +550,7 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
         ),
         export_passages: 10,
         all_passages: true,
+        seed_document_passages: false,
         document_combiner: crate::query::MultiValueCombiner::Max,
     };
     let scored = searcher
@@ -583,6 +589,7 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
     nominated.positions = vec![(dense.0, vec![crate::query::ScoredPosition::new(0, -1.0)])];
     let mut passage_plan = plan.clone();
     passage_plan.all_passages = false;
+    passage_plan.seed_document_passages = true;
     let passage_scores = searcher
         .score_candidates(&[nominated], &passage_plan, None)
         .await
@@ -594,6 +601,79 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
         irrelevant.values
     );
     assert_eq!(passage_scores[0].result.score, irrelevant.score);
+
+    let document_candidates = searcher
+        .search_with_positions(&profile_query, 10)
+        .await
+        .unwrap()
+        .0;
+    let mut document_plan = passage_plan.clone();
+    document_plan.seed_document_passages = false;
+    let unseeded = searcher
+        .score_candidates(&document_candidates, &document_plan, None)
+        .await
+        .unwrap();
+    assert!(unseeded.iter().all(|row| row.features.passages.is_empty()));
+    document_plan.seed_document_passages = true;
+    let mut invalid = document_plan.clone();
+    invalid.backfill = false;
+    assert!(
+        searcher
+            .score_candidates(&document_candidates, &invalid, None)
+            .await
+            .is_err()
+    );
+    invalid.backfill = true;
+    invalid
+        .features
+        .retain(|feature| feature.scope == ScoreScope::Document);
+    invalid.model = None;
+    assert!(
+        searcher
+            .score_candidates(&document_candidates, &invalid, None)
+            .await
+            .is_err()
+    );
+    let mut raw_plan = document_plan.clone();
+    raw_plan.model = None;
+    let raw_seeded = searcher
+        .score_candidates(&document_candidates, &raw_plan, None)
+        .await
+        .unwrap();
+    let raw_body = raw_seeded
+        .iter()
+        .find(|row| row.result.doc_id == candidates[0].doc_id)
+        .unwrap();
+    assert_eq!(raw_body.features.scored_passages, 2);
+    assert_eq!(
+        raw_body
+            .features
+            .passages
+            .iter()
+            .find(|row| row.ordinal == 1)
+            .unwrap()
+            .values,
+        matching.values
+    );
+    document_plan.export_passages = 1;
+    let seeded = searcher
+        .score_candidates(&document_candidates, &document_plan, None)
+        .await
+        .unwrap();
+    let with_body = seeded
+        .iter()
+        .find(|row| row.result.doc_id == candidates[0].doc_id)
+        .unwrap();
+    assert_eq!(with_body.features.scored_passages, 2);
+    assert_eq!(with_body.features.passages.len(), 1);
+    assert_eq!(with_body.features.passages[0].ordinal, 1);
+    assert_eq!(with_body.features.passages[0].values, matching.values);
+    assert_eq!(with_body.result.score, matching.score);
+    let without_body = seeded
+        .iter()
+        .find(|row| row.result.doc_id != candidates[0].doc_id)
+        .unwrap();
+    assert!(without_body.features.passages.is_empty());
 
     // Document feature reduction belongs to the query, while final passage
     // reduction belongs to fusion. Neither may be replaced with MAX or run
@@ -759,6 +839,7 @@ async fn absent_text_in_an_entire_segment_is_missing_not_zero_or_unsupported() {
         ),
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: crate::query::MultiValueCombiner::Max,
     };
     let scored = searcher
@@ -826,6 +907,7 @@ async fn maxscore_backfill_preserves_ordinals_across_block_boundaries_and_distin
         model: None,
         export_passages: 1024,
         all_passages: true,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let result = searcher
@@ -897,6 +979,7 @@ async fn complete_organic_scores_skip_legacy_addressing_and_reorder_upgrades_sma
         model: None,
         export_passages: 2,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let scored = searcher
@@ -999,6 +1082,7 @@ async fn bmp_backfill_without_forward_storage_preserves_missing_zero_and_organic
         ),
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let filled = searcher

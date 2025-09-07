@@ -255,6 +255,7 @@ class SearchResponse:
     took_ms: int
     timings: SearchTimings | None = None
     ranking_method: str = ""
+    seeded_document_passages: bool = False
     truncated: bool = False
     fusion_candidates: list[FusionCandidateList] = field(default_factory=list)
     trace: SearchTrace | None = None

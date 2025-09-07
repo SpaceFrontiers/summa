@@ -763,6 +763,76 @@ async fn l1_service_fixture() -> (tempfile::TempDir, Arc<IndexRegistry>, SearchS
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn document_only_nomination_seeds_real_passages_without_organic_body_votes() {
+    let (_temp, registry, service) = l1_service_fixture().await;
+    for ranked in [false, true] {
+        let mut request = named_l1_request();
+        request.include_rrf_scores = true;
+        if !ranked {
+            request.l1 = None;
+        }
+        request
+            .score_export
+            .as_mut()
+            .unwrap()
+            .seed_document_passages = true;
+        let Some(query::Query::Fusion(fusion)) = request.query.as_mut().unwrap().query.as_mut()
+        else {
+            unreachable!()
+        };
+        fusion.queries[1].score_only = true;
+        let response = service
+            .search(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.hits.len(), 1);
+        let hit = &response.hits[0];
+        assert!(response.seeded_document_passages);
+        assert_eq!(hit.address.as_ref().unwrap().doc_id, 0);
+        let raw = hit.candidate_scores.as_ref().unwrap();
+        assert_eq!(raw.scored_passages, 1);
+        assert_eq!(raw.passages[0].ordinal, 0);
+        assert_eq!(raw.passages[0].scores["body"], 0.0);
+        assert_eq!(hit.rrf_contributions.len(), 1);
+        assert!(
+            hit.rrf_contributions
+                .iter()
+                .all(|vote| vote.query_name == "title" && vote.ordinal.is_none())
+        );
+        request
+            .score_export
+            .as_mut()
+            .unwrap()
+            .seed_document_passages = false;
+        let unseeded = service
+            .search(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!unseeded.seeded_document_passages);
+        assert!(
+            unseeded.hits[0]
+                .candidate_scores
+                .as_ref()
+                .unwrap()
+                .passages
+                .is_empty()
+        );
+        assert_eq!(hit.rrf_contributions, unseeded.hits[0].rrf_contributions);
+    }
+    let mut invalid = named_l1_request();
+    invalid
+        .score_export
+        .as_mut()
+        .unwrap()
+        .seed_document_passages = true;
+    invalid.l1.as_mut().unwrap().backfill = Some(false);
+    assert!(validate_search_budget(&invalid, &limits()).is_err());
+    registry.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases() {
     let (_temp, registry, service) = l1_service_fixture().await;
     let ranked = service
@@ -822,7 +892,7 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(info.candidate_scoring_version, 3);
+    assert_eq!(info.candidate_scoring_version, 4);
     assert!(info.unprepared_candidate_fields.is_empty());
     registry.shutdown().await.unwrap();
 }

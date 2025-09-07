@@ -523,6 +523,7 @@ impl SearchService for SearchServiceImpl {
             }),
             truncated,
             ranking_method,
+            seeded_document_passages: req.score_export.as_ref().is_some_and(|export| export.seed_document_passages),
             fusion_candidates,
             trace,
         };
@@ -766,7 +767,7 @@ impl SearchService for SearchServiceImpl {
             memory_stats: Some(memory_stats),
             vector_stats,
             text_fields,
-            candidate_scoring_version: 3,
+            candidate_scoring_version: 4,
             unprepared_candidate_fields: searcher
                 .segment_readers()
                 .iter()

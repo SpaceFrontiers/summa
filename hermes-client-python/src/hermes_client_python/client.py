@@ -600,6 +600,14 @@ class HermesClient:
         )
 
         expected_l1 = "formula_v1"
+        if (
+            score_export
+            and score_export.get("seed_document_passages")
+            and not response.seeded_document_passages
+        ):
+            raise RuntimeError(
+                "Backend did not acknowledge document passage seeding; upgrade the broker and all backends"
+            )
         if l1 is not None and response.ranking_method != expected_l1:
             raise RuntimeError(
                 f"L1 requires a backend with {expected_l1} ranking semantics; "
@@ -676,6 +684,7 @@ class HermesClient:
             took_ms=response.took_ms,
             timings=timings,
             ranking_method=response.ranking_method,
+            seeded_document_passages=response.seeded_document_passages,
             truncated=response.truncated,
             fusion_candidates=[
                 FusionCandidateList(

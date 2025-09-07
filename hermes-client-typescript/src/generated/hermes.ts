@@ -290,6 +290,12 @@ export interface ScoreExport {
    * false scores the union of nominated passages only, plus document context.
    */
   allPassages: boolean;
+  /**
+   * Capability 4: score real body ordinals for document-only nominees.
+   * Requires backfill and a chunk-scoped feature. Existing body nominations
+   * retain their original passage union; no organic votes are fabricated.
+   */
+  seedDocumentPassages: boolean;
 }
 
 /**
@@ -700,7 +706,14 @@ export interface SearchResponse {
    */
   fusionCandidates: FusionCandidateList[];
   /** Present only when tracing is requested. */
-  trace: SearchTrace | undefined;
+  trace:
+    | SearchTrace
+    | undefined;
+  /**
+   * Capability 4 acknowledgment, true only when every backend honored the
+   * requested document-only passage seeding policy. Old adapters default false.
+   */
+  seededDocumentPassages: boolean;
 }
 
 export interface SearchTrace {
@@ -1797,7 +1810,7 @@ export const L1Ranking_MissingValuesEntry: MessageFns<L1Ranking_MissingValuesEnt
 };
 
 function createBaseScoreExport(): ScoreExport {
-  return { passagesPerDocument: 0, allPassages: false };
+  return { passagesPerDocument: 0, allPassages: false, seedDocumentPassages: false };
 }
 
 export const ScoreExport: MessageFns<ScoreExport> = {
@@ -1807,6 +1820,9 @@ export const ScoreExport: MessageFns<ScoreExport> = {
     }
     if (message.allPassages !== false) {
       writer.uint32(16).bool(message.allPassages);
+    }
+    if (message.seedDocumentPassages !== false) {
+      writer.uint32(24).bool(message.seedDocumentPassages);
     }
     return writer;
   },
@@ -1834,6 +1850,14 @@ export const ScoreExport: MessageFns<ScoreExport> = {
           message.allPassages = reader.bool();
           continue;
         }
+        case 3: {
+          if (tag !== 24) {
+            break;
+          }
+
+          message.seedDocumentPassages = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -1855,6 +1879,11 @@ export const ScoreExport: MessageFns<ScoreExport> = {
         : isSet(object.all_passages)
         ? globalThis.Boolean(object.all_passages)
         : false,
+      seedDocumentPassages: isSet(object.seedDocumentPassages)
+        ? globalThis.Boolean(object.seedDocumentPassages)
+        : isSet(object.seed_document_passages)
+        ? globalThis.Boolean(object.seed_document_passages)
+        : false,
     };
   },
 
@@ -1866,6 +1895,9 @@ export const ScoreExport: MessageFns<ScoreExport> = {
     if (message.allPassages !== false) {
       obj.allPassages = message.allPassages;
     }
+    if (message.seedDocumentPassages !== false) {
+      obj.seedDocumentPassages = message.seedDocumentPassages;
+    }
     return obj;
   },
 
@@ -1876,6 +1908,7 @@ export const ScoreExport: MessageFns<ScoreExport> = {
     const message = createBaseScoreExport();
     message.passagesPerDocument = object.passagesPerDocument ?? 0;
     message.allPassages = object.allPassages ?? false;
+    message.seedDocumentPassages = object.seedDocumentPassages ?? false;
     return message;
   },
 };
@@ -5789,6 +5822,7 @@ function createBaseSearchResponse(): SearchResponse {
     rankingMethod: "",
     fusionCandidates: [],
     trace: undefined,
+    seededDocumentPassages: false,
   };
 }
 
@@ -5817,6 +5851,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     }
     if (message.trace !== undefined) {
       SearchTrace.encode(message.trace, writer.uint32(66).fork()).join();
+    }
+    if (message.seededDocumentPassages !== false) {
+      writer.uint32(72).bool(message.seededDocumentPassages);
     }
     return writer;
   },
@@ -5892,6 +5929,14 @@ export const SearchResponse: MessageFns<SearchResponse> = {
           message.trace = SearchTrace.decode(reader, reader.uint32());
           continue;
         }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.seededDocumentPassages = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -5927,6 +5972,11 @@ export const SearchResponse: MessageFns<SearchResponse> = {
         ? object.fusion_candidates.map((e: any) => FusionCandidateList.fromJSON(e))
         : [],
       trace: isSet(object.trace) ? SearchTrace.fromJSON(object.trace) : undefined,
+      seededDocumentPassages: isSet(object.seededDocumentPassages)
+        ? globalThis.Boolean(object.seededDocumentPassages)
+        : isSet(object.seeded_document_passages)
+        ? globalThis.Boolean(object.seeded_document_passages)
+        : false,
     };
   },
 
@@ -5956,6 +6006,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     if (message.trace !== undefined) {
       obj.trace = SearchTrace.toJSON(message.trace);
     }
+    if (message.seededDocumentPassages !== false) {
+      obj.seededDocumentPassages = message.seededDocumentPassages;
+    }
     return obj;
   },
 
@@ -5976,6 +6029,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     message.trace = (object.trace !== undefined && object.trace !== null)
       ? SearchTrace.fromPartial(object.trace)
       : undefined;
+    message.seededDocumentPassages = object.seededDocumentPassages ?? false;
     return message;
   },
 };

@@ -485,7 +485,7 @@ async fn broker_ranks_and_exports_long_phrase_features_without_dropping_terms() 
                     _ => vec!["doc0"],
                 }
             );
-            for ranked in [false, true] {
+            for (ranked, seeded) in [(false, false), (true, false), (false, true), (true, true)] {
                 let response = search
                     .search(SearchRequest {
                         index_name: index_name.into(),
@@ -496,7 +496,11 @@ async fn broker_ranks_and_exports_long_phrase_features_without_dropping_terms() 
                                 queries: vec![
                                     WeightedQuery {
                                         name: "nomination".into(),
-                                        scope: ScoreScope::Chunk as i32,
+                                        scope: if seeded {
+                                            ScoreScope::Document
+                                        } else {
+                                            ScoreScope::Chunk
+                                        } as i32,
                                         query: Some(Query {
                                             query: Some(query::Query::Term(TermQuery {
                                                 field: "title".into(),
@@ -524,7 +528,8 @@ async fn broker_ranks_and_exports_long_phrase_features_without_dropping_terms() 
                         }),
                         score_export: Some(ScoreExport {
                             passages_per_document: 1,
-                            all_passages: !ranked,
+                            all_passages: !ranked && !seeded,
+                            seed_document_passages: seeded,
                         }),
                         ..Default::default()
                     })
@@ -553,6 +558,7 @@ async fn broker_ranks_and_exports_long_phrase_features_without_dropping_terms() 
                     }
                 );
                 assert_eq!(response.hits.len(), 4);
+                assert_eq!(response.seeded_document_passages, seeded);
                 for hit in &response.hits {
                     let expected = reference
                         .hits

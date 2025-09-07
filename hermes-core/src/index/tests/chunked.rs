@@ -854,6 +854,7 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
                     ),
                     export_passages: 10,
                     all_passages: true,
+                    seed_document_passages: false,
                     document_combiner: crate::query::MultiValueCombiner::Max,
                 };
                 let backfilled = searcher

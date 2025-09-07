@@ -35,6 +35,13 @@ struct ComponentPreparation {
 impl CandidateScoringPlan {
     pub fn validate(&self, schema: &crate::Schema) -> Result<()> {
         self.document_combiner.validate().map_err(Error::Query)?;
+        if self.seed_document_passages
+            && (!self.backfill || !self.features.iter().any(|f| f.scope == ScoreScope::Chunk))
+        {
+            return Err(Error::Query(
+                "seed_document_passages requires backfill and a chunk-scoped feature".into(),
+            ));
+        }
         if self.all_passages && !self.backfill {
             return Err(Error::Query(
                 "all_passages diagnostics require backfill".into(),
@@ -463,6 +470,7 @@ impl<D: Directory + 'static> Searcher<D> {
             })
             .collect();
         let mut reduction_locations = Vec::new();
+        let mut seed_locations = 0usize;
         for (segment, mut candidate_indices) in groups {
             let reader = &self.segment_readers()[segment];
             candidate_indices.sort_unstable_by_key(|&i| candidates[i].doc_id);
@@ -559,6 +567,49 @@ impl<D: Directory + 'static> Searcher<D> {
                     }
                     entry.insert(vec![None; count]);
                 }
+            }
+            if plan.seed_document_passages && !plan.all_passages {
+                let missing_documents: Vec<_> = documents
+                    .iter()
+                    .copied()
+                    .filter(|doc| {
+                        let index = nominated.partition_point(|key| key.doc < *doc);
+                        nominated.get(index).is_none_or(|key| key.doc != *doc)
+                    })
+                    .collect();
+                for &field in &chunk_fields {
+                    let locations = reader
+                        .candidate_locations(
+                            crate::dsl::Field(field),
+                            &missing_documents,
+                            MAX_FEATURE_VALUES.saturating_sub(seed_locations),
+                            &mut probe_budget.sparse,
+                        )
+                        .await?;
+                    seed_locations += locations.len();
+                    for location in locations {
+                        if let std::collections::btree_map::Entry::Vacant(entry) =
+                            passages.entry((location.doc, location.ordinal))
+                        {
+                            matrix_values = matrix_values.saturating_add(count);
+                            if matrix_values > MAX_FEATURE_VALUES {
+                                return Err(Error::Query(
+                                    "L1 feature matrix budget exceeded".into(),
+                                ));
+                            }
+                            entry.insert(vec![None; count]);
+                        }
+                    }
+                }
+                nominated = passages
+                    .keys()
+                    .map(
+                        |&(doc, ordinal)| crate::segment::logical_address::LogicalUnit {
+                            doc,
+                            ordinal,
+                        },
+                    )
+                    .collect();
             }
             for (feature_index, feature) in plan.features.iter().enumerate() {
                 if !plan.backfill {
