@@ -514,6 +514,7 @@ impl IndexMetadata {
     /// Load for a writer: upgrade a migratable older format and persist the
     /// new stamp immediately, so the index is never left readable by a build
     /// that would silently drop the fields this format added.
+    #[cfg(any(feature = "native", feature = "wasm"))]
     pub(crate) async fn load_persisting_migration<D: crate::directories::DirectoryWriter>(
         dir: &D,
     ) -> Result<Self> {
