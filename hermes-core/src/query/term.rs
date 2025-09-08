@@ -148,7 +148,7 @@ pub(super) fn compute_term_idf(
 //   $($aw)*          – .await  (present for async, absent for sync)
 macro_rules! term_plan {
     ($field:expr, $term:expr, $global_stats:expr, $reader:expr, $limit:expr,
-     $load_positions:expr, $eligibility:expr, $budget:expr, $get_postings_fn:ident, $get_positions_fn:ident
+     $load_positions:expr, $eligibility:expr, $budget:expr, $complete:expr, $get_postings_fn:ident, $get_positions_fn:ident
      $(, $aw:tt)*) => {{
         let field: Field = $field;
         let term: &[u8] = $term;
@@ -178,6 +178,9 @@ macro_rules! term_plan {
             Some(posting_list) if reader.is_chunked_field(field) => {
                 let (idf, avg_field_len) =
                     compute_term_idf(&posting_list, field, reader, global_stats, term);
+                if $complete {
+                    return complete_text_scorer(vec![(posting_list, idf)], avg_field_len, reader, field, budget.cloned(), $eligibility.clone());
+                }
                 super::planner::finish_chunked_text_maxscore(
                     vec![(posting_list, idf)],
                     avg_field_len,
@@ -254,6 +257,7 @@ impl Query for TermQuery {
                 load_positions,
                 options.eligibility,
                 options.shared_threshold.as_ref(),
+                options.complete_text_matches,
                 get_postings,
                 get_positions,
                 await
@@ -301,6 +305,7 @@ impl Query for TermQuery {
             options.collect_positions,
             options.eligibility,
             options.shared_threshold.as_ref(),
+            options.complete_text_matches,
             get_postings_sync,
             get_positions_sync
         )
@@ -416,6 +421,7 @@ struct TermScorer {
     positions: Option<crate::structures::TermPositions>,
     /// Persisted per-document field lengths; `None` keeps `tf` as the length.
     lengths: Option<crate::segment::chunk_map::DocLengths>,
+    chunk_lengths: Option<crate::segment::chunk_map::ChunkMap>,
     /// Per-field k1/b.
     params: super::Bm25Params,
 }
@@ -436,6 +442,7 @@ impl TermScorer {
             field_id: 0,
             positions: None,
             lengths: None,
+            chunk_lengths: None,
             params: super::Bm25Params::default(),
         }
     }
@@ -605,9 +612,14 @@ impl Scorer for TermScorer {
         // Persisted field length when the segment has norms; otherwise `tf`
         // stands in for the length (legacy segments).
         let doc_len = self
-            .lengths
+            .chunk_lengths
             .as_ref()
-            .map(|lengths| lengths.length(self.iterator.doc()) as f32)
+            .map(|map| map.length(self.iterator.doc()).max(map.length_floor()) as f32)
+            .or_else(|| {
+                self.lengths
+                    .as_ref()
+                    .map(|lengths| lengths.length(self.iterator.doc()) as f32)
+            })
             .filter(|len| *len > 0.0)
             .unwrap_or(tf);
         self.params
@@ -635,6 +647,56 @@ impl Scorer for TermScorer {
             .collect();
         Some(vec![(self.field_id, scored_positions)])
     }
+}
+
+pub(super) fn complete_text_scorer<'a>(
+    postings: Vec<(BlockPostingList, f32)>,
+    avg_field_len: f32,
+    reader: &'a SegmentReader,
+    field: Field,
+    budget: Option<super::SharedThreshold>,
+    eligibility: Option<Arc<super::DocBitset>>,
+) -> crate::Result<Box<dyn Scorer + 'a>> {
+    if postings.is_empty()
+        || budget
+            .as_ref()
+            .is_some_and(super::SharedThreshold::stop_if_expired)
+    {
+        return Ok(Box::new(EmptyScorer));
+    }
+    let map = reader.chunk_map(field);
+    if reader.is_chunked_field(field) && map.is_none() {
+        return Err(crate::Error::Corruption(
+            "chunked text has postings without a chunk map".into(),
+        ));
+    }
+    if map.is_some_and(|map| !map.is_doc_ordered()) {
+        return super::required_text::scorer(
+            postings,
+            avg_field_len,
+            reader,
+            field,
+            budget,
+            eligibility,
+        );
+    }
+    let mut terms: Vec<Box<dyn Scorer>> = Vec::with_capacity(postings.len());
+    for (posting, idf) in postings {
+        let mut scorer = TermScorer::new(posting, idf, avg_field_len, 1.0)
+            .with_params(super::Bm25Params::for_field(reader.schema(), field));
+        scorer.chunk_lengths = map.cloned();
+        scorer.lengths = reader.doc_lengths(field).cloned();
+        scorer.budget = budget.clone();
+        terms.push(Box::new(scorer));
+    }
+    let scorer = super::boolean::BooleanScorer::disjunction(terms);
+    let scorer: Box<dyn Scorer + 'a> = match map {
+        Some(map) => {
+            super::phrase::fold_chunked_phrase_scorer(scorer, map.clone(), field.0, budget)
+        }
+        None => Box::new(scorer),
+    };
+    Ok(super::filtered::filtered(scorer, eligibility))
 }
 
 /// Point BM25 probes. Targets are sorted physical IDs, never a retrieval top-k.

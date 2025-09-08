@@ -97,6 +97,35 @@ increase the chunk candidate budget or materialize all scored body matches.
 An expired scan publishes no partial eligibility. Filters without a document
 predicate continue to use the existing verifier path.
 
+### Required text streams
+
+A conjunction of scoring text clauses cannot intersect independently bounded
+top-k lists: their intersection can be empty even when a document matches every
+clause. Required text terms, single-token phrases, and nested term disjunctions
+therefore request complete membership with outer score thresholds cleared.
+Standalone text/fusion nomination keeps its existing bounded executor.
+Within each disjunction scores are summed per chunk, then reduced with MaxP;
+the outer Boolean composes document scores and preserves matching ordinals.
+
+Ordered chunk maps reuse the lazy phrase fold, retaining one document's
+ordinals and posting cursors. Reordered maps use a bounded document-membership
+bitmap (the existing 16 MiB filter limit), populated from matching postings,
+then probe only the current document's logical chunk slots for scores. They
+must not retain a corpus-sized vector of matching chunk scores. Scratch is
+one document's slots; posting bytes and logical addressing remain owned by
+the segment. The 16 MiB bitmap cap is per required text scorer, not a total
+query-memory cap. Membership construction checks the shared deadline and never
+publishes a partially built filter. Missing logical addressing fails loudly
+with the same explicit-Reorder prerequisite as existing L1 candidate backfill;
+this fix introduces no new index format or automatic migration.
+This avoids an all-passage response or vector-scoring expansion, but broad
+required clauses still have a posting traversal cost; production latency is
+not established by the correctness fixtures.
+
+Proximity-scored nested text requirements are rejected explicitly rather than
+silently approximated by an independently pruned child. No persisted or wire
+format changes are introduced by the internal scorer option.
+
 Cross-segment threshold seeding is skipped for chunked MaxScore groups: the
 k-th _chunk_ score of a full heap is not a valid document-level floor after
 `Max` folding.

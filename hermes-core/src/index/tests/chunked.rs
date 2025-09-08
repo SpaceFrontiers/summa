@@ -71,6 +71,159 @@ async fn open(dir: RamDirectory) -> Index<RamDirectory> {
 }
 
 #[tokio::test]
+async fn lexical_heading_prefix_matches_plain_phrase_on_existing_ordinal() {
+    use crate::tokenizer::{Purpose, TokenizerSpec};
+    let spec = "lex(by: languages, default: en, stop_words: true)";
+    let mut schema = SchemaBuilder::default();
+    let languages = schema.add_text_field_with_tokenizer("languages", false, true, "raw_ci");
+    let content = schema.add_text_field_with_tokenizer("content", true, false, spec);
+    schema.set_chunked(content, true);
+    schema.set_positions(content, PositionMode::TokenPosition);
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), schema.build(), IndexConfig::default())
+        .await
+        .unwrap();
+    let body = "\nA finite meeting provides a dictionary.";
+    for prefix in ["", "\n\n### 1.1 __The Meeting__ toy model\n"] {
+        let mut document = Document::new();
+        document.add_text(languages, "en");
+        document.add_text(content, "Previous body chunk.");
+        document.add_text(content, format!("{prefix}{body}"));
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let tokenizer = TokenizerSpec::parse(spec)
+        .unwrap()
+        .dynamic_tokenizer()
+        .unwrap();
+    let terms = tokenizer
+        .tokenize_with("The Meeting toy model", Some("en"), Purpose::Exact)
+        .into_iter()
+        .map(|token| (token.position, token.text.into_bytes()))
+        .collect();
+    let (hits, _) = searcher
+        .search_with_positions(&PhraseQuery::with_offsets(content, terms), 10)
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].doc_id, 1);
+    assert_eq!(ordinals(&hits[0]), vec![1]);
+}
+
+#[tokio::test]
+async fn chunked_conjunction_keeps_matches_outside_each_child_top_k() {
+    use crate::query::{Query, ScorerOptions};
+
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    for _ in 0..12 {
+        writer
+            .add_document(doc(&f, "other", &["alpha alpha alpha"]))
+            .unwrap();
+        writer
+            .add_document(doc(&f, "other", &["beta beta beta"]))
+            .unwrap();
+    }
+    writer
+        .add_document(doc(&f, "target", &["alpha padding", "beta padding"]))
+        .unwrap();
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let queries = [
+        BooleanQuery::new()
+            .must(TermQuery::text(f.content, "alpha"))
+            .must(TermQuery::text(f.content, "beta")),
+        BooleanQuery::new()
+            .must(PhraseQuery::text(f.content, "alpha"))
+            .must(PhraseQuery::text(f.content, "beta")),
+        BooleanQuery::new()
+            .must(
+                BooleanQuery::new()
+                    .should(TermQuery::text(f.content, "alpha"))
+                    .should(TermQuery::text(f.content, "absent")),
+            )
+            .must(PhraseQuery::text(f.content, "beta padding")),
+    ];
+    for query in queries {
+        let (all, _) = searcher.search_with_positions(&query, 40).await.unwrap();
+        assert_eq!(
+            all.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            vec![24]
+        );
+        let (small, _) = searcher.search_with_positions(&query, 1).await.unwrap();
+        assert_eq!(
+            small.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            vec![24],
+            "{query}"
+        );
+        assert_eq!(small[0].score.to_bits(), all[0].score.to_bits());
+        assert_eq!(ordinals(&small[0]), vec![0, 1]);
+        let segment = &searcher.segment_readers()[0];
+        let scorer = query
+            .scorer_with_options(segment, 1, ScorerOptions::with_positions())
+            .await
+            .unwrap();
+        assert_eq!(scorer.doc(), 24, "async {query}");
+        #[cfg(feature = "sync")]
+        assert_eq!(
+            query.scorer_sync(segment, 1).unwrap().doc(),
+            24,
+            "sync {query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn required_chunked_disjunction_stream_preserves_maxp_and_seek() {
+    use crate::query::{Query, ScorerOptions};
+    let f = chunked_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), f.schema.clone(), IndexConfig::default())
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        writer
+            .add_document(doc(
+                &f,
+                "article",
+                &["alpha alpha", "beta beta", "alpha beta"],
+            ))
+            .unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = open(dir).await;
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let query = BooleanQuery::new()
+        .should(TermQuery::text(f.content, "alpha"))
+        .should(TermQuery::text(f.content, "beta"));
+    let (oracle, _) = searcher.search_with_positions(&query, 100).await.unwrap();
+    let options = ScorerOptions::with_positions().for_required_clause();
+    let mut scorer = query
+        .scorer_with_options(&searcher.segment_readers()[0], 1, options)
+        .await
+        .unwrap();
+    assert!(scorer.precomputed_top_k(1, true).is_none());
+    assert_eq!(scorer.seek(90), 90);
+    assert!((scorer.score() - by_doc(&oracle, 90).score).abs() < 1e-6);
+    let positions = scorer.matched_positions().unwrap();
+    assert_eq!(
+        positions[0]
+            .1
+            .iter()
+            .map(|p| p.position)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    assert_eq!(scorer.advance(), 91);
+}
+
+#[tokio::test]
 async fn small_limits_preserve_required_chunked_text_matches() {
     use crate::query::{Query, ScorerOptions};
 
@@ -826,6 +979,15 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
                 ))
                 .should(TermQuery::text(content, "scheduler"))
                 .should(TermQuery::text(content, "latency")),
+        ),
+        Box::new(
+            BooleanQuery::new()
+                .must(TermQuery::text(content, "quantum"))
+                .must(
+                    BooleanQuery::new()
+                        .should(TermQuery::text(content, "photon"))
+                        .should(TermQuery::text(content, "spin")),
+                ),
         ),
     ];
     async fn snapshot(
