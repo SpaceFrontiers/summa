@@ -372,12 +372,15 @@ export class HermesClient {
           backfill: request.l1.backfill,
           missingValues: request.l1.missingValues ?? {},
         } : undefined,
-        scoreExport: request.scoreExport ? { passagesPerDocument: request.scoreExport.passagesPerDocument ?? 0, allPassages: request.scoreExport.allPassages ?? false } : undefined,
+        scoreExport: request.scoreExport ? { passagesPerDocument: request.scoreExport.passagesPerDocument ?? 0, allPassages: request.scoreExport.allPassages ?? false, seedDocumentPassages: request.scoreExport.seedDocumentPassages ?? false } : undefined,
       },
       this.callOptions(timeoutMs),
     );
 
     const expectedL1 = "formula_v1";
+    if (request.scoreExport?.seedDocumentPassages && !response.seededDocumentPassages) {
+      throw new Error("Backend did not acknowledge document passage seeding; upgrade the broker and all backends");
+    }
     if (request.l1 && response.rankingMethod !== expectedL1) {
       throw new Error(`L1 requires a backend with ${expectedL1} ranking semantics; received ${JSON.stringify(response.rankingMethod)}`);
     }
@@ -424,6 +427,7 @@ export class HermesClient {
       totalHits: response.totalHits,
       trace: response.trace,
       rankingMethod: response.rankingMethod,
+      seededDocumentPassages: response.seededDocumentPassages,
       fusionCandidates: response.fusionCandidates.map(branch => ({ queryIndex: branch.queryIndex,
         candidates: branch.candidates.map(hit => ({ address: { segmentId: hit.address?.segmentId ?? "", docId: hit.address?.docId ?? 0 },
           score: hit.score, ordinalScores: hit.ordinalScores })) })),

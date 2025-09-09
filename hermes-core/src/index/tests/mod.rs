@@ -2,6 +2,7 @@ mod basic;
 mod bmp;
 mod boolean;
 mod chunked;
+mod format_migration;
 mod maintenance;
 mod merge;
 mod pin;
@@ -9,6 +10,8 @@ mod posting_codecs;
 mod primary_key;
 mod range;
 mod search;
+#[cfg(feature = "sync")]
+mod search_cpu;
 
 mod vector;
 

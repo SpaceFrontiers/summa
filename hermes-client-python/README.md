@@ -334,9 +334,10 @@ fields, and insert when the key is absent.
 
 ```python
 await client.delete_document("articles", "obsolete-key")
-await client.upsert_document("articles", {
-    "id": "article-42", "body": ["replacement chunk one", "replacement chunk two"]
-})
+await client.upsert_document(
+    "articles",
+    {"id": "article-42", "body": ["replacement chunk one", "replacement chunk two"]},
+)
 await client.commit("articles")
 
 result = await client.delete_documents("articles", ["old-a", "old-b"])

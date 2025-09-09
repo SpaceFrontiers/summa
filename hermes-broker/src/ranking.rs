@@ -191,6 +191,23 @@ impl CoordinatorPlan {
             return Err(invalid("diagnostic branch names exceed 128 bytes"));
         }
         let combiner = combiner(fusion.combiner)?;
+        if request
+            .score_export
+            .as_ref()
+            .is_some_and(|export| export.seed_document_passages)
+            && (request
+                .l1
+                .as_ref()
+                .is_some_and(|model| model.backfill == Some(false))
+                || !fusion
+                    .queries
+                    .iter()
+                    .any(|branch| branch.scope == proto::ScoreScope::Chunk as i32))
+        {
+            return Err(invalid(
+                "seed_document_passages requires backfill and a chunk-scoped feature",
+            ));
+        }
         let names: Vec<_> = fusion
             .queries
             .iter()
@@ -274,6 +291,10 @@ impl CoordinatorPlan {
                     .score_export
                     .as_ref()
                     .is_some_and(|export| export.all_passages),
+                seed_document_passages: request
+                    .score_export
+                    .as_ref()
+                    .is_some_and(|export| export.seed_document_passages),
             });
         } else if !passthrough {
             if nominating != fusion.queries.len() {
@@ -364,6 +385,17 @@ impl CoordinatorPlan {
         let mut trace_candidates = 0usize;
         let mut trace_ordinals = 0usize;
         for response in &responses {
+            if self
+                .request
+                .score_export
+                .as_ref()
+                .is_some_and(|export| export.seed_document_passages)
+                && !response.seeded_document_passages
+            {
+                return Err(incompatible(
+                    "backend did not acknowledge document passage seeding; complete the Hermes rollout",
+                ));
+            }
             bytes = bytes.saturating_add(response.encoded_len());
             if bytes > MAX_TRANSFER_BYTES {
                 return Err(Status::resource_exhausted(
@@ -936,11 +968,46 @@ mod tests {
     }
 
     #[test]
+    fn document_passage_seeding_survives_shard_export_rewrite_and_requires_chunk_backfill() {
+        let mut req = request(true);
+        req.score_export = Some(proto::ScoreExport {
+            seed_document_passages: true,
+            ..Default::default()
+        });
+        assert!(CoordinatorPlan::new(req.clone(), 1).is_err());
+        let Some(proto::query::Query::Fusion(fusion)) =
+            req.query.as_mut().and_then(|query| query.query.as_mut())
+        else {
+            panic!("fusion")
+        };
+        fusion.queries[0].scope = proto::ScoreScope::Chunk as i32;
+        let plan = CoordinatorPlan::new(req.clone(), 1).unwrap();
+        let error = plan
+            .finish(vec![proto::SearchResponse::default()])
+            .unwrap_err();
+        assert!(
+            error
+                .message()
+                .contains("acknowledge document passage seeding")
+        );
+        assert!(
+            plan.shard_request
+                .score_export
+                .as_ref()
+                .unwrap()
+                .seed_document_passages
+        );
+        req.l1.as_mut().unwrap().backfill = Some(false);
+        assert!(CoordinatorPlan::new(req, 1).is_err());
+    }
+
+    #[test]
     fn disabled_backfill_rejects_all_passage_expansion_before_dispatch() {
         let mut req = request(true);
         req.l1.as_mut().unwrap().backfill = Some(false);
         req.score_export = Some(proto::ScoreExport {
             all_passages: true,
+            seed_document_passages: false,
             ..Default::default()
         });
         let error = CoordinatorPlan::new(req, 1).err().expect("invalid policy");
@@ -957,6 +1024,7 @@ mod tests {
         req.score_export = Some(proto::ScoreExport {
             passages_per_document: 1,
             all_passages: false,
+            seed_document_passages: false,
         });
         let max = CoordinatorPlan::new(req.clone(), 2).unwrap();
         assert_eq!(

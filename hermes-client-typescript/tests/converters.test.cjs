@@ -171,6 +171,25 @@ test("formula client request rejects a backend with legacy ranking semantics", a
   await assert.rejects(client.search("docs", { query: { all: {} }, l1: { formula: "dense" } }), /formula_v1/);
 });
 
+test("document passage seeding survives the client and protobuf boundary", async () => {
+  const { HermesClient } = require("../dist/client.js");
+  const { SearchRequest, SearchResponse } = require("../dist/generated/hermes.js");
+  const client = new HermesClient();
+  client.indexClient = {};
+  let sent;
+  client.searchClient = { search: async (request) => {
+    sent = SearchRequest.decode(SearchRequest.encode(request).finish());
+    return SearchResponse.fromPartial({ rankingMethod: "feature_export_v2", seededDocumentPassages: true });
+  } };
+  await client.search("docs", { query: { all: {} }, scoreExport: { seedDocumentPassages: true } });
+  assert.equal(sent.scoreExport.seedDocumentPassages, true);
+  assert.equal(sent.scoreExport.allPassages, false);
+  await client.search("docs", { query: { all: {} }, scoreExport: {} });
+  assert.equal(sent.scoreExport.seedDocumentPassages, false);
+  client.searchClient = { search: async () => SearchResponse.fromPartial({ rankingMethod: "feature_export_v2" }) };
+  await assert.rejects(client.search("docs", { query: { all: {} }, scoreExport: { seedDocumentPassages: true } }), /acknowledge document passage seeding/);
+});
+
 
 test("RRF and trace preserve zero presence and discarded nominations through client and wire", async () => {
   const { HermesClient } = require("../dist/client.js");

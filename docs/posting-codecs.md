@@ -88,7 +88,8 @@ blocks.
 ### Format break (fail loud)
 
 This layout originally shipped with metadata format **5**. The current
-reader requires metadata format **6** and STB5 term dictionaries. These
+reader requires metadata format **7** (format **6** is upgraded on open, see
+[row deletion](row-deletion.md)) and STB5 term dictionaries. These
 version numbers belong to separate formats and need not advance together. Older indexes must be rebuilt; see
 [`INDEX_META_FORMAT_VERSION`](../hermes-core/src/index/metadata.rs) and the
 [SSTable format gates](../hermes-core/src/structures/sstable.rs).

@@ -10,23 +10,38 @@ const MAX_FEATURES: usize = crate::query::MAX_FUSION_SUB_QUERIES;
 const MAX_FEATURE_VALUES: usize = 2_000_000;
 const MAX_VECTOR_BYTES: usize = 1024 * 1024 * 1024;
 
-struct CandidateProbeBudget {
+struct CandidateProbeState {
     sparse: crate::segment::reader::SparseProbeBudget,
     payload_remaining: u64,
+    text_scratch: crate::structures::postings::PostingDecodeScratch,
 }
 
-impl Default for CandidateProbeBudget {
+impl Default for CandidateProbeState {
     fn default() -> Self {
         Self {
             sparse: Default::default(),
             payload_remaining: 256 * 1024 * 1024,
+            text_scratch: Default::default(),
         }
     }
+}
+
+#[derive(Default)]
+struct ComponentPreparation {
+    sparse: crate::query::bmp::CandidateBmpPreparation,
+    vector: Option<crate::query::reranker::CandidateVectorPreparation>,
 }
 
 impl CandidateScoringPlan {
     pub fn validate(&self, schema: &crate::Schema) -> Result<()> {
         self.document_combiner.validate().map_err(Error::Query)?;
+        if self.seed_document_passages
+            && (!self.backfill || !self.features.iter().any(|f| f.scope == ScoreScope::Chunk))
+        {
+            return Err(Error::Query(
+                "seed_document_passages requires backfill and a chunk-scoped feature".into(),
+            ));
+        }
         if self.all_passages && !self.backfill {
             return Err(Error::Query(
                 "all_passages diagnostics require backfill".into(),
@@ -162,17 +177,19 @@ impl CandidateScoringPlan {
 async fn score_field<D: Directory + 'static>(
     searcher: &Searcher<D>,
     reader: &SegmentReader,
-    query: &CandidateQuery,
+    feature: &CandidateFeature,
     locations: &[crate::segment::reader::candidate_lookup::CandidateLocation],
     stats: &Arc<GlobalStats>,
-    document_scope: bool,
-    budget: &mut CandidateProbeBudget,
+    budget: &mut CandidateProbeState,
+    preparation: &mut [ComponentPreparation],
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+    let query = &feature.query;
+    let document_scope = feature.scope == ScoreScope::Document;
     let targets: Vec<u32> = locations.iter().map(|location| location.physical).collect();
     let targets = targets.as_slice();
     let mut result = vec![0.0; targets.len()];
     let mut components = Vec::new();
-    for (component, boost) in &query.components {
+    for ((component, boost), preparation) in query.components.iter().zip(preparation) {
         let values = match component {
             ScoreComponent::Text(terms) => {
                 for (term, _) in terms {
@@ -191,6 +208,7 @@ async fn score_field<D: Directory + 'static>(
                     terms,
                     targets,
                     Some(stats),
+                    &mut budget.text_scratch,
                 )
                 .await?
             }
@@ -215,9 +233,8 @@ async fn score_field<D: Directory + 'static>(
                         targets,
                         &mut budget.payload_remaining,
                     )?;
-                    searcher.install_search_cpu(|| {
-                        crate::query::bmp::score_bmp_candidates(index, terms, targets)
-                    })?
+                    searcher
+                        .install_search_cpu(|| preparation.sparse.score(index, terms, targets))?
                 } else {
                     let index = reader.sparse_index(query.field).ok_or_else(|| {
                         Error::Corruption("L1 sparse locations lack a sparse index".into())
@@ -268,6 +285,7 @@ async fn score_field<D: Directory + 'static>(
                     &[],
                     unit_norm,
                     targets,
+                    &mut preparation.vector,
                 )
                 .await?
             }
@@ -282,6 +300,7 @@ async fn score_field<D: Directory + 'static>(
                     vector,
                     false,
                     targets,
+                    &mut preparation.vector,
                 )
                 .await?
             }
@@ -389,6 +408,18 @@ impl<D: Directory + 'static> Searcher<D> {
                 "candidate scoring document budget exceeded".into(),
             ));
         }
+        self.run_search_cpu(self.score_candidate_features(candidates, plan, stats, retrieved, rrf))
+            .await
+    }
+
+    async fn score_candidate_features(
+        &self,
+        candidates: &[SearchResult],
+        plan: &CandidateScoringPlan,
+        stats: Option<Arc<GlobalStats>>,
+        retrieved: &[(usize, &[SearchResult])],
+        rrf: Option<&[crate::query::RrfScore]>,
+    ) -> Result<Vec<ScoredCandidate>> {
         let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         let mut addresses = BTreeSet::new();
         for (i, candidate) in candidates.iter().enumerate() {
@@ -418,11 +449,28 @@ impl<D: Directory + 'static> Searcher<D> {
         };
         let names: Vec<&str> = plan.features.iter().map(|f| f.name.as_str()).collect();
         let count = names.len();
+        let chunk_fields: BTreeSet<u32> = plan
+            .features
+            .iter()
+            .filter(|feature| feature.scope == ScoreScope::Chunk)
+            .map(|feature| feature.query.field.0)
+            .collect();
         let mut output = Vec::with_capacity(candidates.len());
         let mut scored_values = 0usize;
         let mut vector_bytes = 0usize;
         let mut matrix_values = 0usize;
-        let mut probe_budget = CandidateProbeBudget::default();
+        let mut probe_budget = CandidateProbeState::default();
+        let mut preparations: Vec<Vec<ComponentPreparation>> = plan
+            .features
+            .iter()
+            .map(|feature| {
+                std::iter::repeat_with(ComponentPreparation::default)
+                    .take(feature.query.components.len())
+                    .collect()
+            })
+            .collect();
+        let mut reduction_locations = Vec::new();
+        let mut seed_locations = 0usize;
         for (segment, mut candidate_indices) in groups {
             let reader = &self.segment_readers()[segment];
             candidate_indices.sort_unstable_by_key(|&i| candidates[i].doc_id);
@@ -438,12 +486,6 @@ impl<D: Directory + 'static> Searcher<D> {
             }
             let mut doc_values = vec![vec![None; count]; documents.len()];
             let mut passages: BTreeMap<(u32, u16), Vec<Option<f32>>> = BTreeMap::new();
-            let chunk_fields: BTreeSet<u32> = plan
-                .features
-                .iter()
-                .filter(|feature| feature.scope == ScoreScope::Chunk)
-                .map(|feature| feature.query.field.0)
-                .collect();
             let mut nominated = Vec::new();
             if !plan.all_passages && retrieved.is_empty() {
                 for &i in &candidate_indices {
@@ -526,6 +568,49 @@ impl<D: Directory + 'static> Searcher<D> {
                     entry.insert(vec![None; count]);
                 }
             }
+            if plan.seed_document_passages && !plan.all_passages {
+                let missing_documents: Vec<_> = documents
+                    .iter()
+                    .copied()
+                    .filter(|doc| {
+                        let index = nominated.partition_point(|key| key.doc < *doc);
+                        nominated.get(index).is_none_or(|key| key.doc != *doc)
+                    })
+                    .collect();
+                for &field in &chunk_fields {
+                    let locations = reader
+                        .candidate_locations(
+                            crate::dsl::Field(field),
+                            &missing_documents,
+                            MAX_FEATURE_VALUES.saturating_sub(seed_locations),
+                            &mut probe_budget.sparse,
+                        )
+                        .await?;
+                    seed_locations += locations.len();
+                    for location in locations {
+                        if let std::collections::btree_map::Entry::Vacant(entry) =
+                            passages.entry((location.doc, location.ordinal))
+                        {
+                            matrix_values = matrix_values.saturating_add(count);
+                            if matrix_values > MAX_FEATURE_VALUES {
+                                return Err(Error::Query(
+                                    "L1 feature matrix budget exceeded".into(),
+                                ));
+                            }
+                            entry.insert(vec![None; count]);
+                        }
+                    }
+                }
+                nominated = passages
+                    .keys()
+                    .map(
+                        |&(doc, ordinal)| crate::segment::logical_address::LogicalUnit {
+                            doc,
+                            ordinal,
+                        },
+                    )
+                    .collect();
+            }
             for (feature_index, feature) in plan.features.iter().enumerate() {
                 if !plan.backfill {
                     continue;
@@ -604,29 +689,33 @@ impl<D: Directory + 'static> Searcher<D> {
                 let (scores, components) = score_field(
                     self,
                     reader,
-                    &feature.query,
+                    feature,
                     &locations,
                     stats.as_ref().expect("backfill statistics"),
-                    document_scope,
                     &mut probe_budget,
+                    &mut preparations[feature_index],
                 )
                 .await?;
                 if document_scope {
-                    let mut groups: BTreeMap<u32, Vec<(u32, usize)>> = BTreeMap::new();
-                    for (position, location) in locations.iter().enumerate() {
-                        groups
-                            .entry(location.doc)
-                            .or_default()
-                            .push((u32::from(location.ordinal), position));
-                    }
-                    for (doc, mut locations) in groups {
-                        // Physical reordering must not alter floating-point reductions.
-                        locations.sort_unstable_by_key(|&(ordinal, _)| ordinal);
+                    reduction_locations.clear();
+                    reduction_locations.extend(
+                        locations
+                            .iter()
+                            .enumerate()
+                            .map(|(i, location)| (u32::from(location.ordinal), i)),
+                    );
+                    // Physical reordering must not alter floating-point reductions.
+                    reduction_locations
+                        .sort_unstable_by_key(|&(ordinal, i)| (locations[i].doc, ordinal));
+                    for selected in reduction_locations
+                        .chunk_by(|a, b| locations[a.1].doc == locations[b.1].doc)
+                    {
+                        let doc = locations[selected[0].1].doc;
                         let doc_index = documents
                             .binary_search(&doc)
                             .expect("resolved selected doc");
                         doc_values[doc_index][feature_index] =
-                            Some(feature.query.document.score(&components, &locations)?);
+                            Some(feature.query.document.score(&components, selected)?);
                     }
                     continue;
                 }
@@ -665,7 +754,16 @@ impl<D: Directory + 'static> Searcher<D> {
                     });
                 }
                 let scored_passages = rows.len();
-                let mut result = candidate.clone();
+                let mut result = SearchResult {
+                    doc_id: candidate.doc_id,
+                    segment_id: candidate.segment_id,
+                    score: candidate.score,
+                    positions: if plan.model.is_some() {
+                        Vec::new()
+                    } else {
+                        candidate.positions.clone()
+                    },
+                };
                 let mut features = CandidateScores {
                     document,
                     passages: rows,
@@ -699,15 +797,9 @@ impl<D: Directory + 'static> Searcher<D> {
                 rows.truncate(plan.export_passages);
                 // A document-only feature never creates an ordinal-zero row.
                 if plan.model.is_some() {
-                    let fields: BTreeSet<u32> = plan
-                        .features
+                    result.positions = chunk_fields
                         .iter()
-                        .filter(|f| f.scope == ScoreScope::Chunk)
-                        .map(|f| f.query.field.0)
-                        .collect();
-                    result.positions = fields
-                        .into_iter()
-                        .map(|field| {
+                        .map(|&field| {
                             (
                                 field,
                                 rows.iter()
@@ -785,18 +877,22 @@ mod tests {
                 .candidate_locations(field, &[0], 1, &mut Default::default())
                 .await
                 .unwrap();
-            let mut budget = CandidateProbeBudget {
+            let mut budget = CandidateProbeState {
                 payload_remaining: 0,
                 ..Default::default()
             };
             let error = score_field(
                 &searcher,
                 reader,
-                &query,
+                &CandidateFeature {
+                    name: "sparse".into(),
+                    scope: ScoreScope::Chunk,
+                    query,
+                },
                 &locations,
                 &stats,
-                false,
                 &mut budget,
+                &mut [ComponentPreparation::default()],
             )
             .await
             .unwrap_err();

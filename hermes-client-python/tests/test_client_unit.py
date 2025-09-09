@@ -337,6 +337,32 @@ async def test_symbolic_formula_roundtrips_and_legacy_coefficients_are_rejected(
 
 
 @pytest.mark.asyncio
+async def test_document_passage_seeding_requires_a_backend_acknowledgment():
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient()
+    client._ensure_connected = lambda: None
+    client._search_stub = AsyncMock()
+    client._search_stub.Search.return_value = pb.SearchResponse(
+        seeded_document_passages=True
+    )
+    result = await client.search(
+        "docs", query={"all": {}}, score_export={"seed_document_passages": True}
+    )
+    sent = client._search_stub.Search.call_args.args[0]
+    copy = pb.SearchRequest.FromString(sent.SerializeToString())
+    assert copy.score_export.seed_document_passages
+    assert not copy.score_export.all_passages
+    assert result.seeded_document_passages
+    client._search_stub.Search.return_value = pb.SearchResponse()
+    with pytest.raises(RuntimeError, match="acknowledge document passage seeding"):
+        await client.search(
+            "docs", query={"all": {}}, score_export={"seed_document_passages": True}
+        )
+    await client.search("docs", query={"all": {}}, score_export={})
+
+
+@pytest.mark.asyncio
 async def test_compaction_is_opt_in_and_deleted_statistics_are_exposed():
     from hermes_client_python import hermes_pb2 as pb
 

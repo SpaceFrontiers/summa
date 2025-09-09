@@ -463,6 +463,23 @@ fn validate_search_request_shape(
             return Err(Status::invalid_argument("too many fusion branches"));
         }
         let names: Vec<&str> = fusion.queries.iter().map(|q| q.name.as_str()).collect();
+        if req
+            .score_export
+            .as_ref()
+            .is_some_and(|export| export.seed_document_passages)
+            && (req
+                .l1
+                .as_ref()
+                .is_some_and(|model| model.backfill == Some(false))
+                || !fusion
+                    .queries
+                    .iter()
+                    .any(|branch| branch.scope == ScoreScope::Chunk as i32))
+        {
+            return Err(Status::invalid_argument(
+                "seed_document_passages requires backfill and a chunk-scoped feature",
+            ));
+        }
         let mut seen = std::collections::HashSet::new();
         for branch in &fusion.queries {
             if branch.name.is_empty()

@@ -58,6 +58,7 @@ export interface SearchResponse {
   tookMs: number;
   timings?: SearchTimings;
   rankingMethod?: string;
+  seededDocumentPassages?: boolean;
   fusionCandidates?: FusionCandidateList[];
   trace?: SearchTrace;
   truncated?: boolean;
@@ -285,7 +286,7 @@ export interface SearchRequest {
   /** Preserve per-shard nomination/selection trace. Default false. */
   tracing?: boolean;
   l1?: Pick<L1Ranking, "formula"> & Partial<Omit<L1Ranking, "formula">>;
-  scoreExport?: { passagesPerDocument?: number; allPassages?: boolean };
+  scoreExport?: { passagesPerDocument?: number; allPassages?: boolean; seedDocumentPassages?: boolean };
   query: Query;
   limit?: number;
   offset?: number;

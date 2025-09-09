@@ -1559,6 +1559,39 @@ impl BlockPostingList {
     pub fn into_iterator(self) -> BlockPostingIterator<'static> {
         BlockPostingIterator::owned(self)
     }
+
+    /// Point probes start at their first requested block and reuse decode
+    /// storage. Ordinary iteration still starts at the first posting.
+    pub(crate) fn into_candidate_iterator(
+        self,
+        first_target: DocId,
+        scratch: &mut PostingDecodeScratch,
+    ) -> BlockPostingIterator<'static> {
+        let first_block = self.seek_block(first_target, 0);
+        let PostingDecodeScratch {
+            doc_ids,
+            term_freqs,
+        } = std::mem::take(scratch);
+        let mut iterator = BlockPostingIterator {
+            block_list: std::borrow::Cow::Owned(self),
+            current_block: first_block.unwrap_or(0),
+            block_doc_ids: doc_ids,
+            block_tfs: term_freqs,
+            position_in_block: 0,
+            tf_prefix: 0,
+            exhausted: first_block.is_none(),
+        };
+        if let Some(block) = first_block {
+            iterator.load_block(block);
+        }
+        iterator
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PostingDecodeScratch {
+    doc_ids: Vec<u32>,
+    term_freqs: Vec<u32>,
 }
 
 /// Iterator over block posting list with skip support
@@ -1581,6 +1614,13 @@ pub struct BlockPostingIterator<'a> {
 }
 
 impl<'a> BlockPostingIterator<'a> {
+    pub(crate) fn recycle(self, scratch: &mut PostingDecodeScratch) {
+        *scratch = PostingDecodeScratch {
+            doc_ids: self.block_doc_ids,
+            term_freqs: self.block_tfs,
+        };
+    }
+
     fn new(block_list: &'a BlockPostingList) -> Self {
         let exhausted = block_list.l0_count == 0;
         let mut iter = Self {
@@ -1743,6 +1783,36 @@ impl<'a> BlockPostingIterator<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn candidate_posting_probes_reuse_buffers_and_preserve_seek_and_position_cursors() {
+        let mut list = PostingList::new();
+        for i in 0..700 {
+            list.push(i * 3, i % 7 + 1);
+        }
+        let postings = BlockPostingList::from_posting_list(&list).unwrap();
+        let mut scratch = PostingDecodeScratch::default();
+        for first in [0, 385, 900, 1800, 2100, 100, 2097] {
+            let mut reference = postings.clone().into_iterator();
+            let mut selected = postings
+                .clone()
+                .into_candidate_iterator(first, &mut scratch);
+            assert_eq!(
+                selected.current_block_idx(),
+                postings.seek_block(first, 0).unwrap_or(0)
+            );
+            for target in (first..2200).step_by(17) {
+                assert_eq!(selected.seek(target), reference.seek(target));
+                assert_eq!(selected.term_freq(), reference.term_freq());
+                if selected.doc() != TERMINATED {
+                    assert_eq!(selected.position_cursor(), reference.position_cursor());
+                }
+            }
+            selected.recycle(&mut scratch);
+            assert!(scratch.doc_ids.capacity() >= BLOCK_SIZE);
+            assert!(scratch.term_freqs.capacity() >= BLOCK_SIZE);
+        }
+    }
 
     #[test]
     fn test_posting_list_basic() {

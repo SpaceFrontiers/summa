@@ -67,7 +67,7 @@ impl DocumentExpression {
     fn score(&self, components: &[Vec<f32>], locations: &[(u32, usize)]) -> Result<f32> {
         let value = match self {
             Self::Component(index, combiner) => {
-                let values: Vec<_> = locations
+                let values: smallvec::SmallVec<[(u32, f32); 16]> = locations
                     .iter()
                     .map(|&(ordinal, position)| (ordinal, components[*index][position]))
                     .collect();
@@ -188,6 +188,8 @@ pub struct CandidateScoringPlan {
     /// Diagnostics may request every stored passage. Search normally scores
     /// only the union of nominated passage ordinals, plus document context.
     pub all_passages: bool,
+    /// Score real body ordinals only when a candidate has no nominated passage.
+    pub seed_document_passages: bool,
     /// Reduce all final passage predictions before export truncation/top-K.
     pub document_combiner: MultiValueCombiner,
 }

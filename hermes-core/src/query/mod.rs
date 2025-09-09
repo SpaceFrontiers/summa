@@ -31,6 +31,7 @@ pub use filtered::FilteredQuery;
 mod global_stats;
 mod phrase;
 mod planner;
+mod required_text;
 pub(crate) use planner::bmp_executor_limit;
 mod prefix;
 mod proximity;

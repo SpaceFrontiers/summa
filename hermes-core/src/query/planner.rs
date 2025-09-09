@@ -1058,6 +1058,7 @@ mod tests {
         let shared = super::super::SharedThreshold::new();
         shared.raise(7.0);
         let options = super::super::ScorerOptions {
+            complete_text_matches: false,
             eligibility: None,
             collect_positions: false,
             initial_threshold: 5.0,
@@ -1087,6 +1088,7 @@ mod tests {
     fn bmp_threshold_from_a_clamped_heap_is_never_published() {
         let shared = super::super::SharedThreshold::new();
         let options = super::super::ScorerOptions {
+            complete_text_matches: false,
             eligibility: None,
             collect_positions: false,
             initial_threshold: 0.0,

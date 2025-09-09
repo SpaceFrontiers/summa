@@ -290,6 +290,10 @@ pub(super) fn scoring_plan(
             .score_export
             .as_ref()
             .is_some_and(|export| export.all_passages),
+        seed_document_passages: req
+            .score_export
+            .as_ref()
+            .is_some_and(|export| export.seed_document_passages),
     };
     plan.validate(schema)
         .map_err(crate::error::hermes_error_to_status)?;

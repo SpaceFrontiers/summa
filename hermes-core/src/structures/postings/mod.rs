@@ -52,6 +52,7 @@ pub(crate) use positions_v2::TermPositionCursor;
 pub use positions_v2::{
     POSITION_STREAM_BLOCK, PositionStream, PositionStreamEncoder, TermPositions,
 };
+pub(crate) use posting::PostingDecodeScratch;
 pub use posting::{
     BLOCK_SIZE as POSTING_BLOCK_SIZE, BlockPostingIterator, BlockPostingList, Posting,
     PostingCodec, PostingList, PostingListIterator, TERMINATED,

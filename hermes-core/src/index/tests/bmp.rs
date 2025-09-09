@@ -1860,6 +1860,7 @@ async fn test_bmp_reorder_multi_field_scores_without_inverse_sidecars() {
             model: Some(RankingModel::compile("b", &["a", "b"], &Default::default()).unwrap()),
             export_passages: 1,
             all_passages: true,
+            seed_document_passages: false,
             document_combiner: crate::query::MultiValueCombiner::Max,
         };
         let backfilled = searcher

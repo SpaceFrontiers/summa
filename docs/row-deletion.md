@@ -1,8 +1,13 @@
 # Row deletion, upserts, and compaction
 
 Status: implemented in native/portable core, CLI, gRPC server and broker,
-Python and TypeScript clients, and WASM LocalIndex. Index metadata format 7 is a
-rebuild boundary. Older releases cannot safely read deletion generations.
+Python and TypeScript clients, and WASM LocalIndex. Index metadata format 7 is
+required; format 6 metadata (1.8.121..=1.8.133) is upgraded on open because it
+differs only by the optional `deletions` entry. Readers upgrade in memory with a
+`log::warn!`; writers persist the new stamp on open, after which older releases
+cannot open the index (they would silently drop deletion generations). Segments
+written before 1.8.125 still fail at segment open (BMP blob magic) and need a
+rebuild; segments without `.rowstats` refuse compaction until merged.
 Native mutation APIs require an initialized primary-key index; server and WASM
 writers initialize it automatically. Cross-shard atomic upserts are not supported.
 

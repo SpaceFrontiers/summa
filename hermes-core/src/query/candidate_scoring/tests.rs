@@ -6,6 +6,166 @@ use crate::query::{
 use crate::structures::{SparseFormat, SparseVectorConfig, WeightQuantization};
 use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepared_backfill_keeps_distinct_queries_and_quantizations_correct_across_segments() {
+    let mut schema = Schema::builder();
+    let dense: Vec<_> = [
+        DenseVectorQuantization::F32,
+        DenseVectorQuantization::F16,
+        DenseVectorQuantization::UInt8,
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, quantization)| {
+        schema.add_dense_vector_field_with_config(
+            &format!("dense{i}"),
+            true,
+            false,
+            DenseVectorConfig {
+                dim: 4,
+                index_type: VectorIndexType::Flat,
+                quantization,
+                num_clusters: None,
+                target_vectors: None,
+                tree_levels: None,
+                ivf_routing: crate::dsl::IvfRoutingMode::Auto,
+                nprobe: 1,
+                unit_norm: false,
+                soar: None,
+            },
+        )
+    })
+    .collect();
+    let sparse = schema.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        false,
+        SparseVectorConfig {
+            format: SparseFormat::Bmp,
+            dims: Some(16),
+            max_weight: Some(2.0),
+            ..Default::default()
+        },
+    );
+    let binary = schema.add_binary_dense_vector_field("binary", 16, true, false);
+    let directory = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    for segment in 0..2 {
+        for doc in 0..3 {
+            let mut document = Document::new();
+            // A missing row, one value, and a value set exceeding inline scratch.
+            for ordinal in 0..[0, 1, 20][doc] {
+                let x = (segment + ordinal + 1) as f32 / 25.0;
+                for &field in &dense {
+                    document.add_dense_vector(field, vec![x, 1.0 - x, 0.2, -0.3]);
+                }
+                document.add_sparse_vector(sparse, vec![(0, x), (1, 1.0 - x)]);
+                document.add_binary_dense_vector(binary, vec![ordinal as u8, segment as u8]);
+            }
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    let index = Index::open(directory, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(searcher.segment_readers().len(), 2);
+    let candidates: Vec<_> = searcher
+        .segment_readers()
+        .iter()
+        .flat_map(|reader| {
+            (0..reader.num_docs()).map(move |doc_id| crate::query::SearchResult {
+                doc_id,
+                score: 0.0,
+                segment_id: reader.meta().id,
+                positions: Vec::new(),
+            })
+        })
+        .collect();
+    let mut features = Vec::new();
+    for (i, &field) in dense.iter().enumerate() {
+        for (j, vector) in [vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 2.0, 0.0, 0.0]]
+            .into_iter()
+            .enumerate()
+        {
+            features.push(CandidateFeature {
+                name: format!("dense_{i}_{j}"),
+                scope: ScoreScope::Document,
+                query: DenseVectorQuery::new(field, vector)
+                    .with_combiner(MultiValueCombiner::Avg)
+                    .candidate_query()
+                    .unwrap(),
+            });
+        }
+    }
+    for (i, terms) in [vec![(0, 0.3), (0, 0.1)], vec![(1, 0.8)]]
+        .into_iter()
+        .enumerate()
+    {
+        features.push(CandidateFeature {
+            name: format!("sparse_{i}"),
+            scope: ScoreScope::Document,
+            query: SparseVectorQuery::new(sparse, terms)
+                .with_combiner(MultiValueCombiner::Sum)
+                .candidate_query()
+                .unwrap(),
+        });
+    }
+    for (i, vector) in [vec![0, 0], vec![255, 0]].into_iter().enumerate() {
+        features.push(CandidateFeature {
+            name: format!("binary_{i}"),
+            scope: ScoreScope::Document,
+            query: crate::query::BinaryDenseVectorQuery::new(binary, vector)
+                .candidate_query()
+                .unwrap(),
+        });
+    }
+    let plan = CandidateScoringPlan {
+        features,
+        backfill: true,
+        model: None,
+        export_passages: 1,
+        all_passages: false,
+        seed_document_passages: false,
+        document_combiner: MultiValueCombiner::Max,
+    };
+    let combined = searcher
+        .score_candidates(&candidates, &plan, None)
+        .await
+        .unwrap();
+    for (i, feature) in plan.features.iter().enumerate() {
+        let isolated = CandidateScoringPlan {
+            features: vec![feature.clone()],
+            ..plan.clone()
+        };
+        for candidate in &candidates {
+            // Fresh request and one document: no cross-segment/component cache reuse.
+            let expected = searcher
+                .score_candidates(std::slice::from_ref(candidate), &isolated, None)
+                .await
+                .unwrap();
+            let actual = combined
+                .iter()
+                .find(|hit| {
+                    hit.result.segment_id == candidate.segment_id
+                        && hit.result.doc_id == candidate.doc_id
+                })
+                .unwrap();
+            assert_eq!(
+                actual.features.document[i].map(f32::to_bits),
+                expected[0].features.document[0].map(f32::to_bits),
+                "{}",
+                feature.name
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn index_creation_configures_phrase_limits_for_ranking_and_collection_after_reopen() {
     for configured in [None, Some(1), Some(65), Some(300)] {
@@ -42,6 +202,7 @@ async fn index_creation_configures_phrase_limits_for_ranking_and_collection_afte
                     }),
                     export_passages: 1,
                     all_passages: !ranked,
+                    seed_document_passages: false,
                     document_combiner: MultiValueCombiner::Max,
                 };
                 let result = searcher.score_candidates(&[], &plan, None).await;
@@ -128,6 +289,7 @@ async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
                     }),
                     export_passages: 1,
                     all_passages: !ranked,
+                    seed_document_passages: false,
                     document_combiner: MultiValueCombiner::Max,
                 };
                 let scored = searcher
@@ -169,6 +331,7 @@ async fn long_phrase_features_keep_every_term_in_ranking_and_collection() {
         model: None,
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let error = searcher
@@ -246,6 +409,7 @@ async fn l1_preserves_organic_zero_and_negative_scores_and_backfills_only_missin
         ),
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let raw = searcher
@@ -386,6 +550,7 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
         ),
         export_passages: 10,
         all_passages: true,
+        seed_document_passages: false,
         document_combiner: crate::query::MultiValueCombiner::Max,
     };
     let scored = searcher
@@ -424,6 +589,7 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
     nominated.positions = vec![(dense.0, vec![crate::query::ScoredPosition::new(0, -1.0)])];
     let mut passage_plan = plan.clone();
     passage_plan.all_passages = false;
+    passage_plan.seed_document_passages = true;
     let passage_scores = searcher
         .score_candidates(&[nominated], &passage_plan, None)
         .await
@@ -435,6 +601,79 @@ async fn cross_vertical_backfill(sparse_format: SparseFormat) {
         irrelevant.values
     );
     assert_eq!(passage_scores[0].result.score, irrelevant.score);
+
+    let document_candidates = searcher
+        .search_with_positions(&profile_query, 10)
+        .await
+        .unwrap()
+        .0;
+    let mut document_plan = passage_plan.clone();
+    document_plan.seed_document_passages = false;
+    let unseeded = searcher
+        .score_candidates(&document_candidates, &document_plan, None)
+        .await
+        .unwrap();
+    assert!(unseeded.iter().all(|row| row.features.passages.is_empty()));
+    document_plan.seed_document_passages = true;
+    let mut invalid = document_plan.clone();
+    invalid.backfill = false;
+    assert!(
+        searcher
+            .score_candidates(&document_candidates, &invalid, None)
+            .await
+            .is_err()
+    );
+    invalid.backfill = true;
+    invalid
+        .features
+        .retain(|feature| feature.scope == ScoreScope::Document);
+    invalid.model = None;
+    assert!(
+        searcher
+            .score_candidates(&document_candidates, &invalid, None)
+            .await
+            .is_err()
+    );
+    let mut raw_plan = document_plan.clone();
+    raw_plan.model = None;
+    let raw_seeded = searcher
+        .score_candidates(&document_candidates, &raw_plan, None)
+        .await
+        .unwrap();
+    let raw_body = raw_seeded
+        .iter()
+        .find(|row| row.result.doc_id == candidates[0].doc_id)
+        .unwrap();
+    assert_eq!(raw_body.features.scored_passages, 2);
+    assert_eq!(
+        raw_body
+            .features
+            .passages
+            .iter()
+            .find(|row| row.ordinal == 1)
+            .unwrap()
+            .values,
+        matching.values
+    );
+    document_plan.export_passages = 1;
+    let seeded = searcher
+        .score_candidates(&document_candidates, &document_plan, None)
+        .await
+        .unwrap();
+    let with_body = seeded
+        .iter()
+        .find(|row| row.result.doc_id == candidates[0].doc_id)
+        .unwrap();
+    assert_eq!(with_body.features.scored_passages, 2);
+    assert_eq!(with_body.features.passages.len(), 1);
+    assert_eq!(with_body.features.passages[0].ordinal, 1);
+    assert_eq!(with_body.features.passages[0].values, matching.values);
+    assert_eq!(with_body.result.score, matching.score);
+    let without_body = seeded
+        .iter()
+        .find(|row| row.result.doc_id != candidates[0].doc_id)
+        .unwrap();
+    assert!(without_body.features.passages.is_empty());
 
     // Document feature reduction belongs to the query, while final passage
     // reduction belongs to fusion. Neither may be replaced with MAX or run
@@ -600,6 +839,7 @@ async fn absent_text_in_an_entire_segment_is_missing_not_zero_or_unsupported() {
         ),
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: crate::query::MultiValueCombiner::Max,
     };
     let scored = searcher
@@ -667,6 +907,7 @@ async fn maxscore_backfill_preserves_ordinals_across_block_boundaries_and_distin
         model: None,
         export_passages: 1024,
         all_passages: true,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let result = searcher
@@ -738,6 +979,7 @@ async fn complete_organic_scores_skip_legacy_addressing_and_reorder_upgrades_sma
         model: None,
         export_passages: 2,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let scored = searcher
@@ -840,6 +1082,7 @@ async fn bmp_backfill_without_forward_storage_preserves_missing_zero_and_organic
         ),
         export_passages: 1,
         all_passages: false,
+        seed_document_passages: false,
         document_combiner: MultiValueCombiner::Max,
     };
     let filled = searcher

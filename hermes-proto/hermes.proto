@@ -147,6 +147,10 @@ message ScoreExport {
   // Diagnostics: score every stored passage of nominated documents. Default
   // false scores the union of nominated passages only, plus document context.
   bool all_passages = 2;
+  // Capability 4: score real body ordinals for document-only nominees.
+  // Requires backfill and a chunk-scoped feature. Existing body nominations
+  // retain their original passage union; no organic votes are fabricated.
+  bool seed_document_passages = 3;
 }
 
 // How to combine scores for multi-valued documents
@@ -453,6 +457,9 @@ message SearchResponse {
   // these lists preserve independent branch scores and nominated ordinals.
   repeated FusionCandidateList fusion_candidates = 7;
   SearchTrace trace = 8; // Present only when tracing is requested.
+  // Capability 4 acknowledgment, true only when every backend honored the
+  // requested document-only passage seeding policy. Old adapters default false.
+  bool seeded_document_passages = 9;
 }
 
 message SearchTrace {
