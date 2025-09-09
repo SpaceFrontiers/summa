@@ -3342,7 +3342,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-broker"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3372,7 +3372,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "anyhow",
  "axum",
@@ -3457,7 +3457,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "anyhow",
  "pest",
@@ -3469,7 +3469,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3478,7 +3478,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "anyhow",
  "clap",
@@ -3503,7 +3503,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3545,7 +3545,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3574,7 +3574,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.138"
+version = "1.8.139"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -7139,9 +7139,9 @@ dependencies = [
 
 [[package]]
 name = "smallvec"
-version = "1.16.0"
+version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+checksum = "ba467056f1b547ed52077911161fc86985becbc60e8e1857c8a144dab0def891"
 dependencies = [
  "serde",
 ]
@@ -7169,18 +7169,18 @@ dependencies = [
 
 [[package]]
 name = "sonic-number"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3775c3390edf958191f1ab1e8c5c188907feebd0f3ce1604cb621f72961dbf32"
+checksum = "d7c350a05f295f922fc153a3af8b443c10db70904a9291a624ddb6058c6110d0"
 dependencies = [
  "cfg-if",
 ]
 
 [[package]]
 name = "sonic-rs"
-version = "0.5.8"
+version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d971cc77a245ccf1756dbd1a87c3e7f709c0191464096510d43eec056d0f2c4f"
+checksum = "756586caeeb21126a57c17d1ef2b9386e2613ba784aae0f27104f5e9982335ec"
 dependencies = [
  "ahash",
  "bumpalo",
@@ -7817,9 +7817,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12c0ba9680044b4ce98d391a62094047eada0d64860b80166c39f4a6b5640785"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
  "indexmap",
  "serde_core",
