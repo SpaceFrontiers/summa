@@ -687,7 +687,16 @@ fn merge_bmp_field(
             grid_bits,
             max_weight_scale,
         )?;
-        bmp.visit_real_slots_for_rewrite(|_| {})?;
+        bmp.visit_real_slots_for_rewrite(
+            &|| {
+                if cancellation_requested(cancellation) {
+                    Err(crate::Error::IndexClosed)
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        )?;
         total_source_blocks = total_source_blocks
             .checked_add(bmp.num_blocks)
             .ok_or_else(|| {

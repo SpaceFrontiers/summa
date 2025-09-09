@@ -1407,3 +1407,66 @@ async fn ordinary_merge_carries_concurrent_deletes_upserts_and_pending_key_reser
         132
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upsert_commit_finishes_while_background_maintenance_pool_is_occupied() {
+    use std::sync::Arc;
+    use std::time::Duration;
+    let (schema, pk, title) = make_schema();
+    let dir = RamDirectory::new();
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap(),
+    );
+    let config = IndexConfig {
+        background_reorder_pool: Some(pool.clone()),
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    writer
+        .add_document(make_doc(pk, title, "same", "old"))
+        .unwrap();
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "same", "replacement"))
+        .unwrap();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let (started, ready) = tokio::sync::oneshot::channel();
+    pool.spawn(move || {
+        let _ = started.send(());
+        let _ = blocked.recv();
+    });
+    ready.await.unwrap();
+    let committed = tokio::time::timeout(Duration::from_secs(3), writer.commit()).await;
+    // Always release the pool before asserting so a failing regression cannot
+    // strand the commit finalizer or the test runtime during shutdown.
+    release.send(()).unwrap();
+    writer.wait_for_commit_finalization().await;
+    committed
+        .expect("publication queued behind bulk maintenance")
+        .unwrap();
+    let index = crate::index::Index::open(dir, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 1);
+    assert_eq!(
+        searcher
+            .search(&crate::query::TermQuery::new(title, "replacement"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        searcher
+            .search(&crate::query::TermQuery::new(title, "old"), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

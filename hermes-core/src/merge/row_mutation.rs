@@ -44,27 +44,25 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 // the source dictionary/row count. Decode global ordinals in
                 // batches instead of looking up and hashing each row's text.
                 let cancellation = manager.active_operations.cancellation_flag();
-                let pool = manager.background_cpu_pool();
-                let lookup_pool = Arc::clone(&pool);
                 let lookup_cancellation = Arc::clone(&cancellation);
                 let keys = Arc::clone(&keys);
                 let num_docs = info.num_docs;
+                // Publication holds the state lock. Run its bounded serial scan
+                // directly on Tokio's blocking executor, never behind bulk BP.
                 let (ff, ordinals) = tokio::task::spawn_blocking(move || {
-                    lookup_pool.install(|| {
-                        let ordinals = crate::segment::deletion::target_ordinals(
-                            &ff,
-                            num_docs,
-                            keys.iter().map(String::as_str),
-                            || {
-                                if lookup_cancellation.load(Ordering::Acquire) {
-                                    Err(Error::IndexClosed)
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                        )?;
-                        Ok::<_, Error>((ff, ordinals))
-                    })
+                    let ordinals = crate::segment::deletion::target_ordinals(
+                        &ff,
+                        num_docs,
+                        keys.iter().map(String::as_str),
+                        || {
+                            if lookup_cancellation.load(Ordering::Acquire) {
+                                Err(Error::IndexClosed)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )?;
+                    Ok::<_, Error>((ff, ordinals))
                 })
                 .await
                 .map_err(|error| {
@@ -80,21 +78,19 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     None => DocBitset::all(info.num_docs),
                 };
                 let (alive, changed) = tokio::task::spawn_blocking(move || {
-                    pool.install(|| {
-                        let changed = crate::segment::deletion::clear_target_rows(
-                            &ff,
-                            &ordinals,
-                            &mut alive,
-                            || {
-                                if cancellation.load(Ordering::Acquire) {
-                                    Err(Error::IndexClosed)
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                        )?;
-                        Ok::<_, Error>((alive, changed))
-                    })
+                    let changed = crate::segment::deletion::clear_target_rows(
+                        &ff,
+                        &ordinals,
+                        &mut alive,
+                        || {
+                            if cancellation.load(Ordering::Acquire) {
+                                Err(Error::IndexClosed)
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )?;
+                    Ok::<_, Error>((alive, changed))
                 })
                 .await
                 .map_err(|error| Error::Internal(format!("deletion worker failed: {error}")))??;

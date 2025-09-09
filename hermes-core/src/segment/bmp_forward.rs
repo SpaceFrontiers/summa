@@ -177,8 +177,12 @@ impl BmpForward {
     }
 
     #[cfg(any(feature = "native", feature = "wasm", test))]
-    pub(crate) fn validate_payload(&self) -> Result<ValidatedForward<'_>> {
+    pub(crate) fn validate_payload(
+        &self,
+        check_cancel: &(impl Fn() -> Result<()> + Sync),
+    ) -> Result<ValidatedForward<'_>> {
         for i in 0..self.len() {
+            check_cancel()?;
             self.vector(i)?;
         }
         Ok(ValidatedForward(self))
