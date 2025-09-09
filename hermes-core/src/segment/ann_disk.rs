@@ -5040,6 +5040,30 @@ mod tests {
     }
 }
 
+#[cfg(feature = "native")]
+fn copy_selected_column(
+    writer: &mut (impl Write + ?Sized),
+    bytes: &[u8],
+    width: usize,
+    rows: impl Iterator<Item = usize>,
+    check: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    let mut live = rows.peekable();
+    while let Some(first) = live.next() {
+        check()?;
+        let mut end = first + 1;
+        while end - first < 4096 && live.peek() == Some(&end) {
+            live.next();
+            end += 1;
+        }
+        for chunk in bytes[first * width..end * width].chunks(4 * 1024 * 1024) {
+            check()?;
+            writer.write_all(chunk)?;
+        }
+    }
+    Ok(())
+}
+
 /// Remove document assignments while preserving every encoded survivor and
 /// its global artifacts. Run-local packed lanes are repacked without training.
 #[cfg(feature = "native")]
@@ -5130,55 +5154,84 @@ pub(crate) fn write_live_ann(
         }
         offset = checked_advance(offset, count * 4)?;
         let ordinals_offset = offset;
-        for old in kept() {
-            writer
-                .write_all(&raw[run.ordinals.start + old * 2..run.ordinals.start + old * 2 + 2])?;
-        }
+        copy_selected_column(writer, &raw[run.ordinals.clone()], 2, kept(), &check)?;
         offset = checked_advance(offset, count * 2)?;
         let codes_offset = offset;
         let codes = &raw[run.codes.clone()];
-        match header.kind {
-            AnnKind::BinaryIvf | AnnKind::ScannBinary => {
-                for old in kept() {
-                    if old.is_multiple_of(4096) {
+        if count == run.count {
+            for chunk in codes.chunks(4 * 1024 * 1024) {
+                check()?;
+                writer.write_all(chunk)?;
+            }
+        } else {
+            match header.kind {
+                AnnKind::BinaryIvf | AnnKind::ScannBinary => {
+                    copy_selected_column(writer, codes, header.code_size, kept(), &check)?
+                }
+                AnnKind::TqFlat | AnnKind::IvfTq => {
+                    crate::structures::vector::quantization::tq_repack_rows(
+                        codes,
+                        header.code_size,
+                        header.kind == AnnKind::IvfTq,
+                        kept(),
+                        writer,
+                    )?;
+                }
+                AnnKind::ScannAh => {
+                    let blocks = header.dim.div_ceil(header.code_size);
+                    let lanes = crate::structures::vector::scann::FAST_SCAN_LANES;
+                    let mut unpacked = Vec::with_capacity(lanes * blocks);
+                    let mut packed = Vec::new();
+                    let mut live = kept();
+                    let mut selected = [0usize; crate::structures::vector::scann::FAST_SCAN_LANES];
+                    loop {
                         check()?;
-                    }
-                    writer
-                        .write_all(&codes[old * header.code_size..(old + 1) * header.code_size])?;
-                }
-            }
-            AnnKind::TqFlat | AnnKind::IvfTq => {
-                crate::structures::vector::quantization::tq_repack_rows(
-                    codes,
-                    header.code_size,
-                    header.kind == AnnKind::IvfTq,
-                    kept(),
-                    writer,
-                )?;
-            }
-            AnnKind::ScannAh => {
-                let blocks = header.dim.div_ceil(header.code_size);
-                let lanes = crate::structures::vector::scann::FAST_SCAN_LANES;
-                let mut unpacked = Vec::with_capacity(lanes * blocks);
-                let mut packed = Vec::new();
-                for old in kept() {
-                    check()?;
-                    unpack_scann_ah_row(codes, run.count, blocks, old, &mut unpacked)?;
-                    if unpacked.len() == lanes * blocks {
-                        packed.clear();
-                        crate::structures::vector::scann::pack_fast_scan_block(
-                            &unpacked,
-                            blocks,
-                            &mut packed,
-                        )
-                        .map_err(|error| invalid_data(error.to_string()))?;
-                        writer.write_all(&packed)?;
+                        let mut count = 0;
+                        for slot in &mut selected {
+                            let Some(row) = live.next() else {
+                                break;
+                            };
+                            *slot = row;
+                            count += 1;
+                        }
+                        if count == 0 {
+                            break;
+                        }
+                        if count == lanes
+                            && selected[0].is_multiple_of(lanes)
+                            && selected.windows(2).all(|pair| pair[1] == pair[0] + 1)
+                        {
+                            let width =
+                                crate::structures::vector::scann::packed_block_bytes(blocks)
+                                    .ok_or_else(|| {
+                                        invalid_data("ScaNN AH block size overflows usize")
+                                    })?;
+                            let at = selected[0] / lanes * width;
+                            writer.write_all(&codes[at..at + width])?;
+                            continue;
+                        }
                         unpacked.clear();
-                    }
-                }
-                for row in unpacked.chunks_exact(blocks) {
-                    for pair in row.chunks(2) {
-                        writer.write_all(&[pair[0] | (pair.get(1).copied().unwrap_or(0) << 4)])?;
+                        for &old in &selected[..count] {
+                            unpack_scann_ah_row(codes, run.count, blocks, old, &mut unpacked)?;
+                        }
+                        if count == lanes {
+                            packed.clear();
+                            crate::structures::vector::scann::pack_fast_scan_block(
+                                &unpacked,
+                                blocks,
+                                &mut packed,
+                            )
+                            .map_err(|error| invalid_data(error.to_string()))?;
+                            writer.write_all(&packed)?;
+                        } else {
+                            for row in unpacked.chunks_exact(blocks) {
+                                for pair in row.chunks(2) {
+                                    writer.write_all(&[
+                                        pair[0] | (pair.get(1).copied().unwrap_or(0) << 4)
+                                    ])?;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -5295,65 +5348,141 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
         )
         .unwrap();
         let source = AnnDiskIndex::open(OwnedBytes::new(source_bytes), kind, 33).unwrap();
-        let rows = super::row_map::RowMap::new(33, 22, |doc| doc % 3 != 1, 4096).unwrap();
-        let survivors: Vec<usize> = indexes
-            .into_iter()
-            .filter(|&i| rows.get(docs[i]).is_some())
-            .collect();
-        let kept_docs: Vec<u32> = survivors
-            .iter()
-            .map(|&i| rows.get(docs[i]).unwrap())
-            .collect();
-        let kept_ords: Vec<u16> = survivors.iter().map(|&i| ords[i]).collect();
-        let kept_codes = encode(&survivors);
-        let expected_header = AnnDiskHeader {
-            vector_count: survivors.len(),
-            ..header
-        };
-        let mut expected = Vec::new();
-        write_built_runs(
-            expected_header,
-            &[BuildRun {
-                cluster_id: 0,
-                doc_ids: &kept_docs,
-                ordinals: &kept_ords,
-                codes: &kept_codes,
-            }],
-            &mut expected,
-        )
-        .unwrap();
-        let mut actual = Vec::new();
-        write_live_ann(&source, &rows, &mut actual, 1024 * 1024, None).unwrap();
-        assert_eq!(
-            actual, expected,
-            "{kind:?}: compaction changed surviving codes or global identity"
-        );
-        AnnDiskIndex::open(OwnedBytes::new(actual), kind, rows.len()).unwrap();
-        if kind == AnnKind::TqFlat {
-            struct CancelDuringLabels<'a> {
-                flag: &'a std::sync::atomic::AtomicBool,
-                written: usize,
-            }
-            impl std::io::Write for CancelDuringLabels<'_> {
-                fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                    self.written += bytes.len();
-                    if self.written > ANN_HEADER_SIZE {
-                        self.flag.store(true, std::sync::atomic::Ordering::Release);
-                    }
-                    Ok(bytes.len())
-                }
-                fn flush(&mut self) -> io::Result<()> {
-                    Ok(())
-                }
-            }
-            let flag = std::sync::atomic::AtomicBool::new(false);
-            let mut writer = CancelDuringLabels {
-                flag: &flag,
-                written: 0,
+        for pattern in 0..5 {
+            let rows = super::row_map::RowMap::new(
+                33,
+                33,
+                |doc| match pattern {
+                    0 => doc % 3 != 1,
+                    1 => doc >= 16,
+                    2 => !(8..16).contains(&doc),
+                    3 => doc != 0,
+                    _ => true,
+                },
+                4096,
+            )
+            .unwrap();
+            let survivors: Vec<usize> = indexes
+                .iter()
+                .copied()
+                .filter(|&i| rows.get(docs[i]).is_some())
+                .collect();
+            let kept_docs: Vec<u32> = survivors
+                .iter()
+                .map(|&i| rows.get(docs[i]).unwrap())
+                .collect();
+            let kept_ords: Vec<u16> = survivors.iter().map(|&i| ords[i]).collect();
+            let kept_codes = encode(&survivors);
+            let expected_header = AnnDiskHeader {
+                vector_count: survivors.len(),
+                ..header.clone()
             };
-            let error = write_live_ann(&source, &rows, &mut writer, 1024 * 1024, Some(&flag))
-                .expect_err("cancelled ANN iterator reported a truncated output as success");
-            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            let mut expected = Vec::new();
+            write_built_runs(
+                expected_header,
+                &[BuildRun {
+                    cluster_id: 0,
+                    doc_ids: &kept_docs,
+                    ordinals: &kept_ords,
+                    codes: &kept_codes,
+                }],
+                &mut expected,
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            write_live_ann(&source, &rows, &mut actual, 1024 * 1024, None).unwrap();
+            assert_eq!(
+                actual, expected,
+                "{kind:?}: compaction changed surviving codes or global identity"
+            );
+            AnnDiskIndex::open(OwnedBytes::new(actual), kind, rows.len()).unwrap();
+            if kind == AnnKind::TqFlat {
+                struct CancelDuringLabels<'a> {
+                    flag: &'a std::sync::atomic::AtomicBool,
+                    written: usize,
+                }
+                impl std::io::Write for CancelDuringLabels<'_> {
+                    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                        self.written += bytes.len();
+                        if self.written > ANN_HEADER_SIZE {
+                            self.flag.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let flag = std::sync::atomic::AtomicBool::new(false);
+                let mut writer = CancelDuringLabels {
+                    flag: &flag,
+                    written: 0,
+                };
+                let error = write_live_ann(&source, &rows, &mut writer, 1024 * 1024, Some(&flag))
+                    .expect_err("cancelled ANN iterator reported a truncated output as success");
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            }
         }
     }
+}
+
+#[cfg(all(test, feature = "native"))]
+#[tokio::test]
+async fn compacted_aligned_scann_groups_preserve_odd_block_padding() {
+    let encode = |first: usize| {
+        let mut bytes = Vec::new();
+        for group in (first..96).step_by(32) {
+            let rows: Vec<_> = (group..group + 32)
+                .flat_map(|row| (0..3).map(move |block| ((row + block) % 16) as u8))
+                .collect();
+            crate::structures::vector::scann::pack_fast_scan_block(&rows, 3, &mut bytes).unwrap();
+        }
+        bytes
+    };
+    let header = AnnDiskHeader {
+        kind: AnnKind::ScannAh,
+        routing: IvfRoutingMode::Flat,
+        dim: 9,
+        code_size: 3,
+        num_clusters: 1,
+        quantizer_version: 42,
+        codebook_version: 73,
+        vector_count: 96,
+    };
+    let docs: Vec<_> = (0..96).collect();
+    let ordinals = vec![0; 96];
+    let codes = encode(0);
+    let mut bytes = Vec::new();
+    write_built_runs(
+        header.clone(),
+        &[BuildRun {
+            cluster_id: 0,
+            doc_ids: &docs,
+            ordinals: &ordinals,
+            codes: &codes,
+        }],
+        &mut bytes,
+    )
+    .unwrap();
+    let source = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, 96).unwrap();
+    let rows = super::row_map::RowMap::new(96, 64, |doc| doc >= 32, 4096).unwrap();
+    let mut actual = Vec::new();
+    write_live_ann(&source, &rows, &mut actual, 1024 * 1024, None).unwrap();
+    let mut expected = Vec::new();
+    write_built_runs(
+        AnnDiskHeader {
+            vector_count: 64,
+            ..header
+        },
+        &[BuildRun {
+            cluster_id: 0,
+            doc_ids: &docs[..64],
+            ordinals: &ordinals[..64],
+            codes: &encode(32),
+        }],
+        &mut expected,
+    )
+    .unwrap();
+    assert_eq!(actual, expected);
+    AnnDiskIndex::open(OwnedBytes::new(actual), AnnKind::ScannAh, 64).unwrap();
 }

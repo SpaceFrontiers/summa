@@ -37,6 +37,8 @@
 //! |  3 | BlockwiseLinear | Per-512-block linear + residuals          |
 
 pub mod codec;
+#[cfg(feature = "native")]
+mod compact;
 
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};

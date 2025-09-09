@@ -9,6 +9,10 @@
 //!
 //! The codec is stored per block in the header, so a single list (for example
 //! the output of a merge) may mix codecs.
+#[cfg(feature = "native")]
+mod compact;
+#[cfg(feature = "native")]
+pub(crate) use compact::{PostingBlockSource, PostingStreamWriter};
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use std::io::{self, Read, Write};
@@ -479,6 +483,10 @@ struct Footer {
 
 impl Footer {
     fn parse(raw: &[u8]) -> io::Result<Self> {
+        Self::parse_tail(raw, raw.len())
+    }
+
+    fn parse_tail(raw: &[u8], total_len: usize) -> io::Result<Self> {
         if raw.len() < FOOTER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -493,7 +501,13 @@ impl Footer {
             } else {
                 FOOTER_SIZE
             };
-        let stream_len = u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()) as usize;
+        let stream_len = usize::try_from(u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()))
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "posting stream exceeds address space",
+                )
+            })?;
         let l0_count = u32::from_le_bytes(raw[f + 8..f + 12].try_into().unwrap()) as usize;
         let l1_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap()) as usize;
         let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
@@ -518,7 +532,20 @@ impl Footer {
             l1_bounds: flags & FLAG_L1_BOUNDS != 0,
             min_len,
         };
-        if footer.cursors_end() > f {
+        let end = l0_count
+            .checked_mul(L0_SIZE)
+            .and_then(|n| {
+                l1_count
+                    .checked_mul(L1_SIZE + if footer.l1_bounds { 4 } else { 0 })
+                    .and_then(|m| n.checked_add(m))
+            })
+            .and_then(|n| {
+                l0_count
+                    .checked_mul(if footer.has_cursors { CURSOR_SIZE } else { 0 })
+                    .and_then(|m| n.checked_add(m))
+            })
+            .and_then(|n| n.checked_add(stream_len));
+        if end.is_none_or(|end| end > total_len.saturating_sub(raw.len() - f)) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "posting list sections exceed the footer offset",

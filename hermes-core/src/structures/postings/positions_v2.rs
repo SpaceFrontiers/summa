@@ -26,6 +26,10 @@
 //!
 //! [`BlockPostingList::pos_cursor`]: super::BlockPostingList::pos_cursor
 //! [`BlockPostingIterator::position_cursor`]: super::BlockPostingIterator::position_cursor
+#[cfg(feature = "native")]
+mod compact;
+#[cfg(feature = "native")]
+pub(crate) use compact::PositionRangeSource;
 
 use std::io::{self, Write};
 
@@ -50,6 +54,7 @@ pub struct PositionStreamEncoder<W: Write> {
     writer: W,
     pending: Vec<u32>,
     index: Vec<(u32, u64)>,
+    index_limit: Option<usize>,
     written: u64,
     total: u64,
     scratch: Vec<u8>,
@@ -61,6 +66,7 @@ impl<W: Write> PositionStreamEncoder<W> {
             writer,
             pending: Vec::with_capacity(POSITION_STREAM_BLOCK),
             index: Vec::new(),
+            index_limit: None,
             written: 0,
             total: 0,
             scratch: Vec::with_capacity(BLOCK_HEADER + POSITION_STREAM_BLOCK * 4),
@@ -98,6 +104,21 @@ impl<W: Write> PositionStreamEncoder<W> {
         Ok(())
     }
 
+    fn reserve_index_entry(&mut self) -> io::Result<()> {
+        if let Some(limit) = self.index_limit {
+            if self.index.len() >= limit {
+                return Err(io::Error::other(
+                    "position output directory exceeds compaction scratch budget",
+                ));
+            }
+            if self.index.len() == self.index.capacity() {
+                let capacity = self.index.capacity().saturating_mul(2).max(16).min(limit);
+                self.index.reserve_exact(capacity - self.index.len());
+            }
+        }
+        Ok(())
+    }
+
     fn flush_block(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
@@ -108,6 +129,7 @@ impl<W: Write> PositionStreamEncoder<W> {
                 "position stream exceeds u32::MAX bytes",
             ));
         }
+        self.reserve_index_entry()?;
         self.index
             .push((self.written as u32, self.total - self.pending.len() as u64));
         let max = self.pending.iter().copied().max().unwrap_or(0);
@@ -128,9 +150,20 @@ impl<W: Write> PositionStreamEncoder<W> {
 
     /// Flush the tail block and write the offsets and footer. Returns
     /// `(total_positions, bytes_written)`.
-    pub fn finish(mut self) -> io::Result<(u64, u64)> {
+    pub fn finish(self) -> io::Result<(u64, u64)> {
+        self.finish_checked(|| Ok(()))
+    }
+
+    fn finish_checked(
+        mut self,
+        mut check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<(u64, u64)> {
+        check()?;
         self.flush_block()?;
-        for &(offset, value_start) in &self.index {
+        for (i, &(offset, value_start)) in self.index.iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                check()?;
+            }
             self.writer.write_u32::<LittleEndian>(offset)?;
             self.writer.write_u64::<LittleEndian>(value_start)?;
         }
@@ -185,6 +218,10 @@ impl PositionStream {
     }
 
     fn parse_layout(raw: &[u8]) -> io::Result<(usize, usize, u64)> {
+        Self::parse_layout_tail(raw, raw.len())
+    }
+
+    fn parse_layout_tail(raw: &[u8], total_len: usize) -> io::Result<(usize, usize, u64)> {
         if !Self::is_stream(raw) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -199,12 +236,15 @@ impl PositionStream {
         let index_len = num_blocks.checked_mul(INDEX_ENTRY).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "position block index overflows")
         })?;
-        let index_start = footer_start.checked_sub(index_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "position block index longer than the stream",
-            )
-        })?;
+        let index_start = total_len
+            .saturating_sub(FOOTER)
+            .checked_sub(index_len)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "position block index longer than the stream",
+                )
+            })?;
         Ok((num_blocks, index_start, total))
     }
 
@@ -289,7 +329,10 @@ impl PositionStream {
         let Some((start, end, _)) = self.block_range(idx) else {
             return false;
         };
-        let raw = &self.bytes.as_slice()[start..end];
+        Self::decode_block_bytes(&self.bytes.as_slice()[start..end], out)
+    }
+
+    fn decode_block_bytes(raw: &[u8], out: &mut Vec<u32>) -> bool {
         let Some(count) = Self::block_count(raw) else {
             return false;
         };
