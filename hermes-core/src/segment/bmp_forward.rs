@@ -292,21 +292,43 @@ pub(crate) fn write_compacted_forward(
     };
     let mut count = 0u32;
     let start = writer.offset();
-    for i in 0..forward.len() {
+    let mut i = 0;
+    while i < forward.len() {
         if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
             return Err(Error::IndexClosed);
         }
-        if rows.get(forward.key(i).doc).is_some() {
-            writer.write_all(
-                &forward.payload.as_slice()
-                    [forward.offset(i) as usize..forward.offset(i + 1) as usize],
-            )?;
-            count += 1;
+        if rows.get(forward.key(i).doc).is_none() {
+            i += 1;
+            continue;
         }
+        let from = i;
+        // Bound both label scanning and writes even for a fully live field.
+        let end = i.saturating_add(4096).min(forward.len());
+        while i < end && rows.get(forward.key(i).doc).is_some() {
+            i += 1;
+        }
+        for chunk in forward.payload.as_slice()
+            [forward.offset(from) as usize..forward.offset(i) as usize]
+            .chunks(4 * 1024 * 1024)
+        {
+            if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
+                return Err(Error::IndexClosed);
+            }
+            writer.write_all(chunk)?;
+        }
+        count += i - from;
     }
     let payload_len = writer.offset() - start;
     let mut offset = 0u64;
     let records = (0..forward.len()).filter_map(|i| {
+        if i.is_multiple_of(4096)
+            && cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Some(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "BMP forward compaction cancelled",
+            )));
+        }
         let key = forward.key(i);
         rows.get(key.doc).map(|doc| {
             let at = offset;

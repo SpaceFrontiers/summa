@@ -27,9 +27,19 @@ impl SegmentMerger {
         for field in fields {
             self.ensure_not_cancelled()?;
             let flat = &source.flat_vectors()[&field];
-            let count = (0..flat.num_vectors)
-                .filter(|&i| rows.get(flat.get_doc_id(i).0).is_some())
-                .count();
+            let mut count = 0;
+            for i in 0..flat.num_vectors {
+                if i.is_multiple_of(4096) {
+                    self.ensure_not_cancelled()?;
+                }
+                let doc = flat.get_doc_id(i).0;
+                if doc >= rows.physical() {
+                    return Err(crate::Error::Corruption(
+                        "flat vector address exceeds compaction map".into(),
+                    ));
+                }
+                count += usize::from(rows.get(doc).is_some());
+            }
             if count == 0 {
                 continue;
             }
@@ -73,15 +83,28 @@ impl SegmentMerger {
             for start in (0..flat.num_vectors).step_by(batch_rows) {
                 self.ensure_not_cancelled()?;
                 let end = (start + batch_rows).min(flat.num_vectors);
+                // Decide before payload I/O. Retain one bounded batch read for
+                // scattered deletions rather than one remote read per survivor.
+                let Some(first) = (start..end).find(|&i| rows.get(flat.get_doc_id(i).0).is_some())
+                else {
+                    continue;
+                };
                 let base = flat.vectors_byte_offset();
                 let bytes = flat
                     .handle()
                     .read_bytes_range(base + (start * width) as u64..base + (end * width) as u64)
                     .await?;
-                for i in start..end {
-                    if rows.get(flat.get_doc_id(i).0).is_some() {
-                        let local = (i - start) * width;
-                        writer.write_all(&bytes.as_slice()[local..local + width])?;
+                let mut at = first;
+                while at < end {
+                    let from = at;
+                    while at < end && rows.get(flat.get_doc_id(at).0).is_some() {
+                        at += 1;
+                    }
+                    writer.write_all(
+                        &bytes.as_slice()[(from - start) * width..(at - start) * width],
+                    )?;
+                    while at < end && rows.get(flat.get_doc_id(at).0).is_none() {
+                        at += 1;
                     }
                 }
             }
@@ -128,7 +151,7 @@ impl SegmentMerger {
                 continue;
             }
             self.ensure_not_cancelled()?;
-            let total_vectors = rows.new_to_old.iter().try_fold(0u32, |total, &old| {
+            let total_vectors = rows.iter().try_fold(0u32, |total, old| {
                 let count = source.row_stats()[&field.0].get_u64(old);
                 u32::try_from(count)
                     .ok()

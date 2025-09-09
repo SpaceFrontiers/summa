@@ -3,13 +3,9 @@ use super::*;
 use crate::segment::chunk_map::{ChunkMapBuilder, DocLengthsColumn, write_chunk_maps};
 use crate::segment::row_map::RowMap;
 use crate::structures::fast_field::{
-    BLOCK_INDEX_ENTRY_SIZE, FastFieldColumnType, FastFieldReader, FastFieldWriter,
-    write_fast_field_toc_and_footer,
+    BLOCK_INDEX_ENTRY_SIZE, FastFieldReader, write_fast_field_toc_and_footer,
 };
-use crate::structures::{
-    BlockPostingList, PositionStreamEncoder, PostingList, SSTableWriter, TERMINATED, TermInfo,
-    TermPositions,
-};
+use crate::structures::{PositionStreamEncoder, SSTableWriter, TermInfo};
 use std::io::Write;
 
 fn admit(bytes: usize, budget: usize) -> Result<()> {
@@ -33,11 +29,12 @@ impl SegmentMerger {
         memory_budget: usize,
     ) -> Result<(SegmentMeta, MergeStats)> {
         self.ensure_not_cancelled()?;
-        let rows = RowMap::new(
+        let rows = RowMap::from_visibility(
             source.num_docs(),
             source.num_live_docs(),
-            |doc| source.is_alive(doc),
+            source.alive_docs(),
             memory_budget / 4,
+            || self.ensure_not_cancelled(),
         )?;
         let budget = memory_budget.saturating_sub(rows.memory_bytes());
         // Validate complete statistics before output: old standalone segments
@@ -105,6 +102,14 @@ impl SegmentMerger {
         rows: &RowMap,
         budget: usize,
     ) -> Result<usize> {
+        use crate::structures::fast_field::BlockIndexEntry;
+        struct OutputBlock {
+            source: usize,
+            range: std::ops::Range<u32>,
+            header: BlockIndexEntry,
+            copy: bool,
+            cached: Option<Vec<u8>>,
+        }
         if columns.is_empty() {
             return Ok(0);
         }
@@ -113,55 +118,120 @@ impl SegmentMerger {
         fields.sort_unstable();
         let mut toc = Vec::new();
         for field in fields {
+            self.ensure_not_cancelled()?;
             let reader = &columns[&field];
-            let offset = writer.offset();
-            let chunks = rows.new_to_old.chunks(4096);
+            if reader.num_docs != rows.physical() {
+                return Err(crate::Error::Corruption(
+                    "compaction column row count mismatch".into(),
+                ));
+            }
+            let capacity = reader
+                .blocks()
+                .iter()
+                .map(|block| {
+                    let live =
+                        rows.count(block.cumulative_docs..block.cumulative_docs + block.num_docs);
+                    if live == 0 {
+                        0
+                    } else if live == block.num_docs {
+                        1
+                    } else {
+                        (live as usize).min((block.num_docs as usize).div_ceil(4096))
+                    }
+                })
+                .sum::<usize>();
             admit(
-                chunks.len().saturating_mul(BLOCK_INDEX_ENTRY_SIZE),
+                capacity.saturating_mul(std::mem::size_of::<OutputBlock>()),
                 budget / 4,
             )?;
-            let mut headers = Vec::with_capacity(chunks.len());
-            // Keep only a budgeted prefix of encoded chunks. The leading block
-            // directory still requires a first pass over the whole column, but
-            // cached chunks avoid a second encode without unbounded buffering.
-            let cache_limit = budget / 4;
-            let slots = chunks
-                .len()
-                .min(cache_limit / std::mem::size_of::<Vec<u8>>());
-            let mut cached = Vec::with_capacity(slots);
-            let mut cached_bytes = cached.capacity() * std::mem::size_of::<Vec<u8>>();
-            for chunk in chunks {
+            let mut plan = Vec::with_capacity(capacity);
+            let mut cached_bytes = 0usize;
+            for (source, block) in reader.blocks().iter().enumerate() {
                 self.ensure_not_cancelled()?;
-                let bytes = compact_column_chunk(reader, chunk, budget / 2)?;
-                let can_cache = cached.len() == headers.len()
-                    && cached.len() < cached.capacity()
-                    && bytes.capacity() <= cache_limit.saturating_sub(cached_bytes);
-                headers.push(
-                    <[u8; BLOCK_INDEX_ENTRY_SIZE]>::try_from(&bytes[4..4 + BLOCK_INDEX_ENTRY_SIZE])
-                        .unwrap(),
-                );
-                if can_cache {
-                    cached_bytes += bytes.capacity();
-                    cached.push(bytes);
+                let live =
+                    rows.count(block.cumulative_docs..block.cumulative_docs + block.num_docs);
+                if live == 0 {
+                    continue;
+                }
+                if live == block.num_docs {
+                    plan.push(OutputBlock {
+                        source,
+                        range: 0..block.num_docs,
+                        copy: true,
+                        cached: None,
+                        header: BlockIndexEntry {
+                            num_docs: live,
+                            data_len: block.data.len() as u32,
+                            dict_count: block.dict.as_ref().map_or(0, |dict| dict.len()),
+                            dict_len: block.raw_dict.len() as u32,
+                        },
+                    });
+                    continue;
+                }
+                for start in (0..block.num_docs).step_by(4096) {
+                    self.ensure_not_cancelled()?;
+                    let end = start.saturating_add(4096).min(block.num_docs);
+                    if rows.count(block.cumulative_docs + start..block.cumulative_docs + end) == 0 {
+                        continue;
+                    }
+                    let bytes = block.compact_range(
+                        reader.column_type,
+                        reader.multi,
+                        start..end,
+                        |doc| rows.get(doc).is_some(),
+                        budget / 2,
+                    )?;
+                    let header = BlockIndexEntry::read_from(&mut &bytes[4..])?;
+                    let cached = if bytes.capacity() <= (budget / 4).saturating_sub(cached_bytes) {
+                        cached_bytes += bytes.capacity();
+                        Some(bytes)
+                    } else {
+                        None
+                    };
+                    plan.push(OutputBlock {
+                        source,
+                        range: start..end,
+                        header,
+                        copy: false,
+                        cached,
+                    });
                 }
             }
-            writer.write_all(&(headers.len() as u32).to_le_bytes())?;
-            for header in &headers {
-                writer.write_all(header)?;
+            let offset = writer.offset();
+            writer.write_all(&(plan.len() as u32).to_le_bytes())?;
+            for block in &plan {
+                block.header.write_to(&mut writer)?;
             }
-            let mut cached = cached.into_iter();
-            for (chunk, header) in rows.new_to_old.chunks(4096).zip(&headers) {
+            for block in plan {
                 self.ensure_not_cancelled()?;
-                let bytes = match cached.next() {
-                    Some(bytes) => bytes,
-                    None => compact_column_chunk(reader, chunk, budget / 2)?,
-                };
-                if &bytes[4..4 + BLOCK_INDEX_ENTRY_SIZE] != header {
-                    return Err(crate::Error::Corruption(
-                        "non-deterministic compacted fast column".into(),
-                    ));
+                let source = &reader.blocks()[block.source];
+                if block.copy {
+                    for data in [source.data.as_slice(), source.raw_dict.as_slice()] {
+                        for chunk in data.chunks(4 * 1024 * 1024) {
+                            self.ensure_not_cancelled()?;
+                            writer.write_all(chunk)?;
+                        }
+                    }
+                } else {
+                    let bytes = match block.cached {
+                        Some(bytes) => bytes,
+                        None => source.compact_range(
+                            reader.column_type,
+                            reader.multi,
+                            block.range,
+                            |doc| rows.get(doc).is_some(),
+                            budget / 2,
+                        )?,
+                    };
+                    let mut header = Vec::with_capacity(BLOCK_INDEX_ENTRY_SIZE);
+                    block.header.write_to(&mut header)?;
+                    if bytes.get(4..4 + BLOCK_INDEX_ENTRY_SIZE) != Some(header.as_slice()) {
+                        return Err(crate::Error::Corruption(
+                            "non-deterministic compacted fast column".into(),
+                        ));
+                    }
+                    writer.write_all(&bytes[4 + BLOCK_INDEX_ENTRY_SIZE..])?;
                 }
-                writer.write_all(&bytes[4 + BLOCK_INDEX_ENTRY_SIZE..])?;
             }
             toc.push(crate::structures::fast_field::FastFieldTocEntry {
                 field_id: field,
@@ -189,20 +259,7 @@ impl SegmentMerger {
         files: &SegmentFiles,
         budget: usize,
     ) -> Result<(FxHashMap<u32, FieldStats>, FxHashMap<u32, RowMap>)> {
-        let estimate = source
-            .chunk_maps()
-            .values()
-            .fold(0usize, |sum, map| {
-                sum.saturating_add(map.num_chunks() as usize * 32)
-            })
-            .saturating_add(
-                source
-                    .row_stats()
-                    .len()
-                    .saturating_mul(rows.len() as usize)
-                    .saturating_mul(4),
-            );
-        admit(estimate, budget / 2)?;
+        let mut retained_bytes = 0usize;
         let mut statistics = FxHashMap::default();
         let mut chunks = Vec::new();
         let mut maps = FxHashMap::default();
@@ -214,7 +271,10 @@ impl SegmentMerger {
             self.ensure_not_cancelled()?;
             let exact = &source.row_stats()[&field.0];
             let mut stat = FieldStats::default();
-            for &old in &rows.new_to_old {
+            for (visited, old) in rows.iter().enumerate() {
+                if visited.is_multiple_of(4096) {
+                    self.ensure_not_cancelled()?;
+                }
                 let value = exact.get_u64(old);
                 if value > 0 {
                     stat.doc_count += 1;
@@ -227,14 +287,26 @@ impl SegmentMerger {
             if entry.chunked {
                 stat.doc_count = 0;
                 if let Some(source_map) = source.chunk_map(field) {
-                    let map = RowMap::new(
+                    let map = RowMap::try_new(
                         source_map.num_chunks(),
                         source_map.num_chunks(),
-                        |vid| rows.get(source_map.doc_id(vid)).is_some(),
-                        budget / 2,
+                        |vid| {
+                            if vid.is_multiple_of(4096) {
+                                self.ensure_not_cancelled()?;
+                            }
+                            Ok(rows.get(source_map.doc_id(vid)).is_some())
+                        },
+                        (budget / 2).saturating_sub(retained_bytes),
                     )?;
+                    retained_bytes = retained_bytes
+                        .saturating_add(map.memory_bytes())
+                        .saturating_add(map.len() as usize * 8);
+                    admit(retained_bytes, budget / 2)?;
                     let mut builder = ChunkMapBuilder::with_capacity(map.len() as usize);
-                    for &old in &map.new_to_old {
+                    for (visited, old) in map.iter().enumerate() {
+                        if visited.is_multiple_of(4096) {
+                            self.ensure_not_cancelled()?;
+                        }
                         let (doc, ordinal) = source_map.resolve(old);
                         builder.push(rows.get(doc).unwrap(), ordinal, source_map.length(old))?;
                     }
@@ -244,11 +316,15 @@ impl SegmentMerger {
                     maps.insert(field.0, map);
                 }
             } else if let Some(lengths) = source.doc_lengths(field) {
-                let values: Vec<u16> = rows
-                    .new_to_old
-                    .iter()
-                    .map(|&old| lengths.length(old).min(u16::MAX as u32) as u16)
-                    .collect();
+                retained_bytes = retained_bytes.saturating_add(rows.len() as usize * 2);
+                admit(retained_bytes, budget / 2)?;
+                let mut values = Vec::with_capacity(rows.len() as usize);
+                for (visited, old) in rows.iter().enumerate() {
+                    if visited.is_multiple_of(4096) {
+                        self.ensure_not_cancelled()?;
+                    }
+                    values.push(lengths.length(old).min(u16::MAX as u32) as u16);
+                }
                 norms.push((field.0, values, stat.total_tokens));
             }
             statistics.insert(field.0, stat);
@@ -283,6 +359,10 @@ impl SegmentMerger {
         files: &SegmentFiles,
         budget: usize,
     ) -> Result<usize> {
+        // Fixed posting/position decoder and encoder buffers are independent
+        // of term frequency. Divide the rest between encoded directories.
+        admit(16 * 1024, budget)?;
+        let budget = budget - 16 * 1024;
         let mut postings = OffsetWriter::new(dir.streaming_writer_cold(&files.postings).await?);
         let mut positions = OffsetWriter::new(dir.streaming_writer_cold(&files.positions).await?);
         let mut terms_out = OffsetWriter::new(dir.streaming_writer_cold(&files.term_dict).await?);
@@ -301,104 +381,172 @@ impl SegmentMerger {
                     .unwrap(),
             ));
             let map = chunks.get(&field.0).unwrap_or(rows);
-            let mut entries = Vec::new();
-            let mut position_values = Vec::new();
-            let mut pos_scratch = Vec::new();
-            let has_positions = info.position_info().is_some();
-            let mut retained_bytes = 0usize;
-            if let Some((ids, tfs)) = info.decode_inline() {
-                for (old, tf) in ids.into_iter().zip(tfs) {
-                    if let Some(new) = map.get(old) {
-                        entries.push((new, tf));
-                    }
+            let info = if let Some((ids, tfs)) = info.decode_inline() {
+                let entries: Vec<_> = ids
+                    .into_iter()
+                    .zip(tfs)
+                    .filter_map(|(old, tf)| map.get(old).map(|new| (new, tf)))
+                    .collect();
+                if entries.is_empty() {
+                    continue;
                 }
+                // Removing rows only reduces the inline count and addresses.
+                TermInfo::try_inline_iter(entries.len(), entries.into_iter()).ok_or_else(|| {
+                    crate::Error::Corruption("compacted inline posting no longer fits".into())
+                })?
             } else if let Some((offset, len)) = info.external_info() {
-                admit(len as usize, budget / 4)?;
-                let bytes = source.read_postings(offset, len).await?;
-                let list = BlockPostingList::deserialize(bytes.as_slice())?;
-                admit((list.doc_count() as usize).saturating_mul(64), budget / 4)?;
-                let source_positions = match info.position_info() {
-                    Some((off, len)) => {
-                        admit(len as usize, budget / 4)?;
-                        Some(TermPositions::open(
-                            source.read_position_bytes(off, len).await?.ok_or_else(|| {
-                                crate::Error::Corruption("missing position data".into())
-                            })?,
-                        )?)
-                    }
+                use crate::structures::postings::{
+                    PositionRangeSource, PostingBlockSource, PostingStreamWriter,
+                };
+                let cancellation = self.cancellation.as_deref();
+                let input = PostingBlockSource::open(
+                    source.posting_file_range(offset, len)?,
+                    budget / 4,
+                    cancellation,
+                )
+                .await?;
+                if input.doc_count() != info.doc_freq() || input.doc_count() > map.physical() {
+                    return Err(crate::Error::Corruption(
+                        "posting source count disagrees with term or row space".into(),
+                    ));
+                }
+                let mut source_positions = match info.position_info() {
+                    Some((offset, len)) => Some(
+                        PositionRangeSource::open(
+                            source.position_file_range(offset, len)?,
+                            budget / 4,
+                            cancellation,
+                        )
+                        .await?,
+                    ),
                     None => None,
                 };
-                let mut cursor = list.iterator();
-                let mut visited = 0usize;
-                while cursor.doc() != TERMINATED {
-                    if visited.is_multiple_of(4096) {
-                        self.ensure_not_cancelled()?;
-                    }
-                    visited += 1;
-                    if let Some(new) = map.get(cursor.doc()) {
-                        let tf = cursor.term_freq();
-                        entries.push((new, tf));
-                        if let Some(source_positions) = &source_positions {
-                            retained_bytes = retained_bytes.saturating_add(tf as usize * 8 + 32);
-                            admit(retained_bytes, budget / 4)?;
-                            let mut pos = Vec::new();
-                            if !source_positions.positions_into(
-                                cursor.doc(),
-                                cursor.position_cursor(),
-                                tf,
-                                &mut pos_scratch,
-                                &mut pos,
-                            ) {
-                                return Err(crate::Error::Corruption(
-                                    "invalid compaction positions".into(),
-                                ));
-                            }
-                            position_values.push(pos);
-                        }
-                    }
-                    cursor.advance();
+                let has_positions = source_positions.is_some();
+                if input.has_positions() && !has_positions
+                    || source_positions
+                        .as_ref()
+                        .is_some_and(|positions| positions.is_stream() && !input.has_positions())
+                {
+                    return Err(crate::Error::Corruption(
+                        "posting and position formats disagree".into(),
+                    ));
                 }
-            }
-            if entries.is_empty() {
-                continue;
-            }
-            let info = if !has_positions
-                && let Some(inline) =
-                    TermInfo::try_inline_iter(entries.len(), entries.iter().copied())
-            {
-                inline
-            } else {
-                let mut list = PostingList::with_capacity(entries.len());
-                for &(doc, tf) in &entries {
-                    list.push(doc, tf);
+                if let Some(positions) = source_positions
+                    .as_ref()
+                    .filter(|positions| positions.is_stream())
+                {
+                    let total = if input.len() == 0 {
+                        0
+                    } else {
+                        input.position_span(input.len() - 1)?.end
+                    };
+                    if positions.total_positions() != total {
+                        return Err(crate::Error::Corruption(
+                            "posting and position counts disagree".into(),
+                        ));
+                    }
                 }
-                let length = |new: u32| {
-                    let old = map.new_to_old[new as usize];
-                    source.chunk_map(field).map_or_else(
-                        || source.doc_lengths(field).map_or(1, |norm| norm.length(old)),
-                        |map| map.bm25_length(old),
-                    )
-                };
-                let block = BlockPostingList::from_posting_list_with_options(
-                    &list,
-                    has_positions,
-                    Some(&length),
-                    self.posting_codec,
-                )?;
                 let off = postings.offset();
-                block.serialize(&mut postings)?;
-                let len = postings.offset() - off;
-                if has_positions {
-                    let pos_off = positions.offset();
-                    let mut encoder = PositionStreamEncoder::new(&mut positions);
-                    for pos in &mut position_values {
-                        encoder.push_doc(pos)?;
+                let pos_off = positions.offset();
+                let mut output = PostingStreamWriter::new(
+                    &mut postings,
+                    input.len(),
+                    has_positions,
+                    self.posting_codec,
+                    budget / 4,
+                )?;
+                let mut position_output =
+                    PositionStreamEncoder::with_budget(&mut positions, budget / 4);
+                let mut docs = Vec::with_capacity(crate::structures::postings::POSTING_BLOCK_SIZE);
+                let mut tfs = Vec::with_capacity(crate::structures::postings::POSTING_BLOCK_SIZE);
+                for i in 0..input.len() {
+                    self.ensure_not_cancelled()?;
+                    let (first, last) = input.bounds(i);
+                    if last >= map.physical() {
+                        return Err(crate::Error::Corruption(
+                            "posting address exceeds compaction map".into(),
+                        ));
                     }
-                    let (_, pos_len) = encoder.finish()?;
-                    TermInfo::external_with_positions(off, len, list.doc_count(), pos_off, pos_len)
-                } else {
-                    TermInfo::external(off, len, list.doc_count())
+                    let live = map.count(first..last + 1);
+                    if live == 0 {
+                        continue;
+                    }
+                    let block = input.read_block(i).await?;
+                    let span = input.position_span(i)?;
+                    if live == last - first + 1
+                        && (!has_positions
+                            || source_positions
+                                .as_ref()
+                                .is_some_and(|positions| positions.is_stream()))
+                    {
+                        output.append(&block, map.get(first).expect("live interval"))?;
+                        if let Some(positions) = &mut source_positions {
+                            positions
+                                .append_range(&mut position_output, span, cancellation)
+                                .await?;
+                        }
+                        continue;
+                    }
+                    if !block.decode_block_into(0, &mut docs, &mut tfs)
+                        || docs.first() != Some(&first)
+                        || docs.last() != Some(&last)
+                        || !docs.windows(2).all(|pair| pair[0] < pair[1])
+                        || tfs.contains(&0)
+                    {
+                        return Err(crate::Error::Corruption(
+                            "invalid compacted posting block".into(),
+                        ));
+                    }
+                    let mut cursor = span.start;
+                    for (&old, &tf) in docs.iter().zip(&tfs) {
+                        if let Some(new) = map.get(old) {
+                            let length = source.chunk_map(field).map_or_else(
+                                || source.doc_lengths(field).map_or(1, |norm| norm.length(old)),
+                                |map| map.bm25_length(old),
+                            );
+                            output.push(new, tf, length)?;
+                            if let Some(positions) = &mut source_positions {
+                                positions
+                                    .append_doc(&mut position_output, old, cursor, tf, cancellation)
+                                    .await?;
+                            }
+                        }
+                        cursor = cursor.checked_add(u64::from(tf)).ok_or_else(|| {
+                            crate::Error::Corruption("position count overflow".into())
+                        })?;
+                    }
+                    if input.has_positions() && cursor != span.end {
+                        return Err(crate::Error::Corruption(
+                            "position cursor disagrees with term frequencies".into(),
+                        ));
+                    }
                 }
+                if output.doc_count() == 0 {
+                    continue;
+                }
+                if output.doc_count() > input.doc_count() {
+                    return Err(crate::Error::Corruption(
+                        "compacted posting count exceeds source".into(),
+                    ));
+                }
+                let total_positions = output.total_positions();
+                let (docs, len) = output.finish(cancellation)?;
+                if has_positions {
+                    self.ensure_not_cancelled()?;
+                    let (total, pos_len) = position_output.finish_cancellable(cancellation)?;
+                    if total != total_positions {
+                        return Err(crate::Error::Corruption(
+                            "compacted position count mismatch".into(),
+                        ));
+                    }
+                    TermInfo::external_with_positions(off, len, docs, pos_off, pos_len)
+                } else {
+                    TermInfo::external(off, len, docs)
+                }
+            } else {
+                return Err(crate::Error::Corruption(
+                    "invalid term posting representation".into(),
+                ));
             };
             terms.insert(&key, &info)?;
             count += 1;
@@ -416,60 +564,156 @@ impl SegmentMerger {
     }
 }
 
-fn compact_column_chunk(reader: &FastFieldReader, docs: &[u32], budget: usize) -> Result<Vec<u8>> {
-    let text = reader.column_type == FastFieldColumnType::TextOrdinal;
-    let mut column = match (text, reader.multi) {
-        (true, false) => FastFieldWriter::new_text(),
-        (true, true) => FastFieldWriter::new_text_multi(),
-        (false, false) => FastFieldWriter::new_numeric(reader.column_type),
-        (false, true) => FastFieldWriter::new_numeric_multi(reader.column_type),
-    };
-    let mut estimate = docs.len() * 32;
-    for (new, &old) in docs.iter().enumerate() {
-        if !reader.has_value(old) {
-            continue;
-        }
-        let values = if reader.multi {
-            reader.value_range(old)
-        } else {
-            (0, 1)
-        };
-        estimate = estimate.saturating_add((values.1 - values.0) as usize * 64);
-        admit(estimate, budget / 4)?;
-        let mut append = |value| -> Result<()> {
-            if text {
-                let value = reader
-                    .text_dict()
-                    .and_then(|dict| dict.get(value as u32))
-                    .ok_or_else(|| crate::Error::Corruption("invalid fast text ordinal".into()))?;
-                estimate = estimate.saturating_add(value.len().saturating_mul(4));
-                admit(estimate, budget / 4)?;
-                column.add_text(new as u32, value);
-            } else {
-                column.add_u64(new as u32, value);
-            }
-            Ok(())
-        };
-        if reader.multi {
-            let mut result = Ok(());
-            reader.for_each_multi_value(old, |value| {
-                result = append(value);
-                result.is_err()
-            });
-            result?;
-        } else {
-            append(reader.get_u64(old))?;
-        }
-    }
-    column.pad_to(docs.len() as u32);
-    let mut bytes = Vec::new();
-    column.serialize(&mut bytes, 0)?;
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structures::BlockPostingList;
+    use crate::structures::fast_field::{FastFieldColumnType, FastFieldWriter};
+
+    #[tokio::test]
+    async fn frequent_terms_compact_with_block_sized_decoding_and_preserve_positions() {
+        use crate::directories::{Directory, RamDirectory};
+        use crate::structures::{TERMINATED, TermPositions};
+        let mut schema = crate::SchemaBuilder::default();
+        let body = schema.add_text_field("body", true, false);
+        schema.set_positions(body, crate::dsl::PositionMode::TokenPosition);
+        let schema = schema.build();
+        let dir = RamDirectory::new();
+        let index = crate::Index::create(
+            dir.clone(),
+            schema.clone(),
+            crate::IndexConfig {
+                merge_policy: Box::new(crate::NoMergePolicy),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut writer = index.writer();
+        for _ in 0..8192 {
+            let mut doc = crate::Document::new();
+            doc.add_text(body, "common common common common");
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        for sparse in [false, true] {
+            let rows = RowMap::new(
+                8192,
+                8192,
+                |doc| {
+                    if sparse {
+                        doc % 129 == 0
+                    } else {
+                        doc >= 256 && doc % 257 != 0
+                    }
+                },
+                4096,
+            )
+            .unwrap();
+            let merger = SegmentMerger::new(Arc::new(schema.clone()));
+            let files = SegmentFiles::new(SegmentId::new().0);
+            // The old whole-term decoded entries alone required 512 KiB.
+            merger
+                .compact_postings(
+                    &dir,
+                    &searcher.segment_readers()[0],
+                    &rows,
+                    &FxHashMap::default(),
+                    &files,
+                    64 * 1024,
+                )
+                .await
+                .unwrap();
+            let posting_bytes = dir
+                .open_read(&files.postings)
+                .await
+                .unwrap()
+                .read_bytes()
+                .await
+                .unwrap();
+            let postings = BlockPostingList::deserialize(posting_bytes.as_slice()).unwrap();
+            assert_eq!(postings.doc_count(), rows.len());
+            if sparse {
+                assert_eq!(
+                    postings.num_blocks(),
+                    1,
+                    "sparse survivors should share a rebuilt block"
+                );
+            }
+            let position_bytes = dir
+                .open_read(&files.positions)
+                .await
+                .unwrap()
+                .read_bytes()
+                .await
+                .unwrap();
+            let positions = TermPositions::open(position_bytes).unwrap();
+            let mut cursor = postings.iterator();
+            let mut scratch = Vec::new();
+            let mut values = Vec::new();
+            for doc in 0..rows.len() {
+                assert_eq!(cursor.doc(), doc);
+                assert_eq!(cursor.term_freq(), 4);
+                assert!(positions.positions_into(
+                    doc,
+                    cursor.position_cursor(),
+                    4,
+                    &mut scratch,
+                    &mut values
+                ));
+                assert_eq!(values, [0, 1, 2, 3]);
+                cursor.advance();
+            }
+            assert_eq!(cursor.doc(), TERMINATED);
+        }
+    }
+
+    #[tokio::test]
+    async fn intact_fast_blocks_keep_encoded_bytes_when_earlier_rows_are_deleted() {
+        let n = 8193;
+        let mut column = FastFieldWriter::new_numeric(FastFieldColumnType::U64);
+        for i in 0..n {
+            column.add_u64(i, u64::from(i) * 17);
+        }
+        let mut encoded = Vec::new();
+        let (mut toc, _) = column.serialize(&mut encoded, 0).unwrap();
+        let header = &encoded[4..4 + BLOCK_INDEX_ENTRY_SIZE];
+        let payload = &encoded[4 + BLOCK_INDEX_ENTRY_SIZE..];
+        let mut stacked = 2u32.to_le_bytes().to_vec();
+        stacked.extend_from_slice(header);
+        stacked.extend_from_slice(header);
+        stacked.extend_from_slice(payload);
+        stacked.extend_from_slice(payload);
+        toc.num_docs = 2 * n;
+        toc.data_len = stacked.len() as u64;
+        let source =
+            FastFieldReader::open(&crate::directories::OwnedBytes::new(stacked), &toc).unwrap();
+        let columns = FxHashMap::from_iter([(0, source)]);
+        let rows = RowMap::new(2 * n, n, |doc| doc >= n, 1024 * 1024).unwrap();
+        let dir = crate::directories::RamDirectory::new();
+        let merger = SegmentMerger::new(Arc::new(crate::SchemaBuilder::default().build()));
+        let path = std::path::Path::new("copied.fast");
+        merger
+            .compact_columns(&dir, path, &columns, &rows, 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let bytes = dir
+            .open_read(path)
+            .await
+            .unwrap()
+            .read_bytes()
+            .await
+            .unwrap();
+        let (offset, count) =
+            crate::structures::fast_field::read_fast_field_footer(bytes.as_slice()).unwrap();
+        let toc =
+            crate::structures::fast_field::read_fast_field_toc(bytes.as_slice(), offset, count)
+                .unwrap();
+        assert_eq!(toc[0].data_len as usize, encoded.len());
+        assert_eq!(&bytes.as_slice()[..encoded.len()], encoded.as_slice());
+    }
 
     #[tokio::test]
     async fn cached_and_reencoded_column_chunks_have_identical_bytes_and_missing_rows() {
@@ -530,7 +774,7 @@ mod tests {
         .unwrap();
         let actual = FastFieldReader::open(&outputs[0], &toc[0]).unwrap();
         assert_eq!(actual.num_docs, rows.len());
-        for (new, &old) in rows.new_to_old.iter().enumerate() {
+        for (new, old) in rows.iter().enumerate() {
             assert_eq!(actual.get_u64(new as u32), columns[&0].get_u64(old));
             assert_eq!(actual.has_value(new as u32), columns[&0].has_value(old));
         }

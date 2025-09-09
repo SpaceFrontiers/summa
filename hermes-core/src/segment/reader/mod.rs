@@ -2843,6 +2843,21 @@ impl SegmentReader {
             .map_err(crate::Error::from)
     }
 
+    #[cfg(feature = "native")]
+    pub(crate) fn posting_file_range(&self, offset: u64, len: u64) -> Result<FileHandle> {
+        let range = checked_file_range(offset, len, self.postings_handle.len(), "posting")?;
+        Ok(self.postings_handle.slice(range))
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn position_file_range(&self, offset: u64, len: u64) -> Result<FileHandle> {
+        let handle = self
+            .positions_handle
+            .as_ref()
+            .ok_or_else(|| Error::Corruption("missing position data".into()))?;
+        Ok(handle.slice(checked_file_range(offset, len, handle.len(), "position")?))
+    }
+
     /// Read raw posting bytes at offset
     pub async fn read_postings(&self, offset: u64, len: u64) -> Result<OwnedBytes> {
         let range = checked_file_range(offset, len, self.postings_handle.len(), "posting")?;

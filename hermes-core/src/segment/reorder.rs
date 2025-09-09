@@ -2236,6 +2236,7 @@ pub(crate) fn rewrite_bmp_field(
         );
     }
 
+    let zero_budget = bp_budget.time_budget.is_some_and(|d| d.is_zero());
     // Record-level BP needs both directions of every document map before it
     // can even start building the forward graph. Reserve that non-negotiable
     // peak up front; previously these vectors were allocated outside the
@@ -2244,7 +2245,11 @@ pub(crate) fn rewrite_bmp_field(
     // unconverged so a larger-budget/manual pass may still deepen it later.
     let record_map_bytes = sources.iter().fold(0usize, |total, (bmp, _)| {
         total
-            .saturating_add((bmp.num_virtual_docs as usize).saturating_mul(4))
+            .saturating_add(if zero_budget {
+                0
+            } else {
+                (bmp.num_virtual_docs as usize).saturating_mul(4)
+            })
             .saturating_add((bmp.num_real_docs() as usize).saturating_mul(4))
     });
     let record_rewrite_fixed_bytes = sources.iter().fold(0usize, |total, (bmp, _)| {
@@ -2304,7 +2309,16 @@ pub(crate) fn rewrite_bmp_field(
         install_on_pool(rayon_pool.as_deref(), || {
             bmp_refs
                 .par_iter()
-                .map(|bmp| build_vid_maps(bmp))
+                .map(|bmp| {
+                    if !zero_budget {
+                        return build_vid_maps(bmp);
+                    }
+                    // Identity reblocking never consumes the inverse map.
+                    // Preserve source virtual order, including interior padding.
+                    let mut real = Vec::with_capacity(bmp.num_real_docs() as usize);
+                    bmp.visit_real_slots_for_rewrite(|vid| real.push(vid as u32))?;
+                    Ok((Vec::new(), real))
+                })
                 .collect::<Result<_>>()
         })?
     };
@@ -2355,7 +2369,6 @@ pub(crate) fn rewrite_bmp_field(
     // forward-index build entirely, it would be discarded unread. Reported
     // unconverged, matching budgeted-pass semantics (a follow-up pass
     // deepens).
-    let zero_budget = bp_budget.time_budget.is_some_and(|d| d.is_zero());
 
     let (perm, converged) = if zero_budget {
         // No forward graph will consume virtual→real. Release it before
