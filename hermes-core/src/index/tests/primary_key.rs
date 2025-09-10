@@ -6,6 +6,7 @@ use crate::index::{IndexConfig, IndexWriter};
 #[derive(Clone)]
 struct BlockingMetadataDirectory {
     inner: RamDirectory,
+    store_read_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
     block_next_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
     block_next_row_stats: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fail_next_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -20,6 +21,7 @@ impl Default for BlockingMetadataDirectory {
     fn default() -> Self {
         Self {
             inner: RamDirectory::default(),
+            store_read_mode: Default::default(),
             block_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             block_next_row_stats: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -106,6 +108,33 @@ impl crate::directories::Directory for BlockingMetadataDirectory {
         &self,
         path: &std::path::Path,
     ) -> std::io::Result<crate::directories::FileHandle> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "store")
+        {
+            let handle = self.inner.open_lazy(path).await?;
+            let len = handle.len();
+            let mode = self.store_read_mode.clone();
+            return Ok(crate::directories::FileHandle::lazy(
+                len,
+                std::sync::Arc::new(move |range| {
+                    let handle = handle.clone();
+                    let mode = mode.clone();
+                    Box::pin(async move {
+                        match mode.load(std::sync::atomic::Ordering::Acquire) {
+                            1 => {
+                                return Err(std::io::Error::other(
+                                    "injected content hash read failure",
+                                ));
+                            }
+                            2 => std::future::pending::<()>().await,
+                            _ => {}
+                        }
+                        handle.read_bytes_range(range).await
+                    })
+                }),
+            ));
+        }
         self.inner.open_lazy(path).await
     }
 }
@@ -201,7 +230,6 @@ fn make_doc(pk: Field, title: Field, id: &str, title_val: &str) -> Document {
 // ---------------------------------------------------------------------------
 // Basic dedup within a single writer session (uncommitted keys)
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_rejects_duplicate_uncommitted() {
     let (schema, pk, title) = make_schema();
@@ -238,7 +266,6 @@ async fn test_dedup_rejects_duplicate_uncommitted() {
 // ---------------------------------------------------------------------------
 // Dedup across commit boundary (committed keys checked via fast-field dict)
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_across_commit() {
     let (schema, pk, title) = make_schema();
@@ -283,7 +310,6 @@ async fn test_dedup_across_commit() {
 // ---------------------------------------------------------------------------
 // Multiple commit cycles
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_multiple_commits() {
     let (schema, pk, title) = make_schema();
@@ -339,7 +365,6 @@ async fn test_dedup_multiple_commits() {
 // ---------------------------------------------------------------------------
 // Abort clears uncommitted keys so they can be re-inserted
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_abort_clears_uncommitted() {
     let (schema, pk, title) = make_schema();
@@ -492,7 +517,6 @@ async fn test_post_publication_finalizer_panic_still_reports_committed() {
 // ---------------------------------------------------------------------------
 // No primary key → dedup is a no-op, duplicates are allowed
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_no_primary_key_allows_duplicates() {
     let mut builder = SchemaBuilder::default();
@@ -517,7 +541,6 @@ async fn test_no_primary_key_allows_duplicates() {
 // ---------------------------------------------------------------------------
 // Concurrent inserts: exactly one wins
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_concurrent_inserts() {
     let (schema, pk, title) = make_schema();
@@ -555,7 +578,6 @@ async fn test_dedup_concurrent_inserts() {
 // ---------------------------------------------------------------------------
 // Reopen writer on existing index with committed keys
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_reopen_existing_index() {
     let (schema, pk, title) = make_schema();
@@ -662,7 +684,6 @@ async fn test_force_merge_refreshes_primary_key_snapshot_per_batch() {
 // ---------------------------------------------------------------------------
 // Batch: some succeed, some fail — partial success
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_partial_batch() {
     let (schema, pk, title) = make_schema();
@@ -697,7 +718,6 @@ async fn test_dedup_partial_batch() {
 // ---------------------------------------------------------------------------
 // Large batch to exercise bloom filter false-positive path
 // ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn test_dedup_large_batch_bloom_fps() {
     let (schema, pk, title) = make_schema();
@@ -743,7 +763,6 @@ async fn test_dedup_large_batch_bloom_fps() {
 // ---------------------------------------------------------------------------
 // Schema primary_field() returns correct field
 // ---------------------------------------------------------------------------
-
 #[test]
 fn test_schema_primary_field() {
     let (schema, pk, _) = make_schema();
@@ -834,6 +853,7 @@ async fn aborted_and_failed_upserts_preserve_old_primary_key_rows() {
     writer.commit().await.unwrap();
     writer
         .upsert_document(make_doc(pk, title, "same", "aborted"))
+        .await
         .unwrap();
     writer.prepare_commit().await.unwrap().abort();
     assert!(matches!(
@@ -842,6 +862,7 @@ async fn aborted_and_failed_upserts_preserve_old_primary_key_rows() {
     ));
     writer
         .upsert_document(make_doc(pk, title, "same", "new"))
+        .await
         .unwrap();
     dir.fail_next_metadata_rename();
     assert!(writer.commit().await.is_err());
@@ -889,6 +910,7 @@ async fn cancelled_upsert_commit_publishes_deletion_and_replacement_together() {
     writer.commit().await.unwrap();
     writer
         .upsert_document(make_doc(pk, title, "same", "new"))
+        .await
         .unwrap();
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
     dir.block_next_metadata_rename();
@@ -1166,6 +1188,7 @@ async fn failed_visibility_refresh_and_abort_do_not_replay_published_upsert_dele
     writer.commit().await.unwrap();
     writer
         .upsert_document(make_doc(pk, title, "updated", "replacement"))
+        .await
         .unwrap();
     writer.delete_primary_key("deleted").unwrap();
     dir.fail_pk_refresh_after_rename
@@ -1237,7 +1260,7 @@ async fn ambiguous_or_undeletable_primary_keys_are_rejected_before_mutation() {
     let mut ambiguous = make_doc(pk, title, "original", "replacement");
     ambiguous.add_text(pk, "different");
     assert!(matches!(
-        writer.upsert_document(ambiguous),
+        writer.upsert_document(ambiguous).await,
         Err(Error::Document(_))
     ));
     let mut ambiguous = make_doc(pk, title, "fresh", "insertion");
@@ -1321,6 +1344,7 @@ async fn ordinary_merge_carries_concurrent_deletes_upserts_and_pending_key_reser
     .unwrap();
     writer
         .upsert_document(make_doc(pk, title, "key1", "replacement"))
+        .await
         .unwrap();
     for key in [65, 131] {
         writer.delete_primary_key(&format!("key{key}")).unwrap();
@@ -1435,6 +1459,7 @@ async fn upsert_commit_finishes_while_background_maintenance_pool_is_occupied() 
     writer.commit().await.unwrap();
     writer
         .upsert_document(make_doc(pk, title, "same", "replacement"))
+        .await
         .unwrap();
     let (release, blocked) = std::sync::mpsc::channel();
     let (started, ready) = tokio::sync::oneshot::channel();
@@ -1468,5 +1493,353 @@ async fn upsert_commit_finishes_while_background_maintenance_pool_is_occupied() 
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn equal_content_hash_upserts_preserve_physical_rows_and_deletion_generations() {
+    let mut builder = SchemaBuilder::default();
+    let pk = builder.add_text_field("id", true, true);
+    builder.set_primary_key(pk);
+    let hash = builder.add_text_field("hash", false, true);
+    builder.set_content_hash(hash);
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), builder.build(), IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    let doc = make_doc(pk, hash, "same", "digest");
+    writer.add_document(doc.clone()).unwrap();
+    writer.commit().await.unwrap();
+    async fn snapshot(
+        dir: &RamDirectory,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        use crate::directories::Directory;
+        let mut bytes = std::collections::BTreeMap::new();
+        for path in dir.list_files(std::path::Path::new("")).await.unwrap() {
+            let data = dir
+                .open_read(&path)
+                .await
+                .unwrap()
+                .read_bytes()
+                .await
+                .unwrap();
+            bytes.insert(path, data.as_slice().to_vec());
+        }
+        bytes
+    }
+    let before = snapshot(&dir).await;
+    writer.upsert_document(doc.clone()).await.unwrap();
+    writer.upsert_document(doc).await.unwrap();
+    writer.commit().await.unwrap();
+    let after = snapshot(&dir).await;
+    assert_eq!(before, after, "no-op upserts preserve every persisted byte");
+}
+
+fn content_hash_schema() -> (crate::Schema, Field, Field, Field) {
+    let mut schema = SchemaBuilder::default();
+    let pk = schema.add_text_field("id", true, true);
+    schema.set_primary_key(pk);
+    let hash = schema.add_text_field("hash", false, true);
+    schema.set_content_hash(hash);
+    let body = schema.add_text_field("body", true, true);
+    (schema.build(), pk, hash, body)
+}
+
+#[tokio::test]
+async fn content_hash_respects_pending_rows_deletions_abort_reopen_and_compaction() {
+    let (schema, pk, hash, body) = content_hash_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::NoMergePolicy),
+        ..Default::default()
+    };
+    let index = crate::index::Index::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    writer.init_primary_key_dedup().await.unwrap();
+    let doc = |digest: Option<&str>, text: &str| {
+        let mut doc = make_doc(pk, body, "same", text);
+        if let Some(digest) = digest {
+            doc.add_text(hash, digest);
+        }
+        doc
+    };
+    writer
+        .upsert_document(doc(Some("v1"), "old"))
+        .await
+        .unwrap();
+    assert!(
+        writer
+            .upsert_document(doc(Some("v1"), "old"))
+            .await
+            .is_err()
+    );
+    writer.commit().await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let old = reader.searcher().await.unwrap();
+    // The hash is authoritative, including when the caller supplied different content.
+    writer
+        .upsert_document(doc(Some("v1"), "ignored"))
+        .await
+        .unwrap();
+    assert!(!writer.commit().await.unwrap());
+    writer
+        .upsert_document(doc(Some("v2"), "aborted"))
+        .await
+        .unwrap();
+    assert!(
+        writer
+            .upsert_document(doc(Some("v1"), "old"))
+            .await
+            .is_err()
+    );
+    writer.prepare_commit().await.unwrap().abort();
+    writer
+        .upsert_document(doc(Some("v1"), "old"))
+        .await
+        .unwrap();
+    assert!(!writer.commit().await.unwrap());
+    // A pending delete must not turn a matching replacement into a no-op.
+    writer.delete_primary_key("same").unwrap();
+    writer
+        .upsert_document(doc(Some("v1"), "replacement"))
+        .await
+        .unwrap();
+    writer.commit().await.unwrap();
+    assert_eq!(
+        old.search(&crate::query::TermQuery::new(body, "old"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    for digest in [None, None, Some("v2")] {
+        writer.upsert_document(doc(digest, "latest")).await.unwrap();
+        assert!(
+            writer.commit().await.unwrap(),
+            "missing hashes never compare equal"
+        );
+    }
+    writer.force_merge().await.unwrap();
+    writer
+        .upsert_document(doc(Some("v2"), "latest"))
+        .await
+        .unwrap();
+    assert!(!writer.commit().await.unwrap());
+    writer.force_merge_with_compaction(true).await.unwrap();
+    writer
+        .upsert_document(doc(Some("v2"), "latest"))
+        .await
+        .unwrap();
+    assert!(!writer.commit().await.unwrap());
+    drop(writer);
+    drop(index);
+    let mut writer = IndexWriter::open(dir.clone(), config).await.unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    writer
+        .upsert_document(doc(Some("v2"), "latest"))
+        .await
+        .unwrap();
+    assert!(!writer.commit().await.unwrap());
+    writer.delete_primary_key("same").unwrap();
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(doc(Some("v2"), "resurrected"))
+        .await
+        .unwrap();
+    assert!(writer.commit().await.unwrap());
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(
+        metadata
+            .segment_metas
+            .values()
+            .map(|info| info.num_live_docs())
+            .sum::<u32>(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn failed_and_cancelled_content_hash_reads_leave_pending_work_committable() {
+    let (schema, pk, hash, _) = content_hash_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    let doc = make_doc(pk, hash, "same", "v1");
+    writer.add_document(doc.clone()).unwrap();
+    writer.commit().await.unwrap();
+    for mode in [1, 2] {
+        dir.store_read_mode
+            .store(mode, std::sync::atomic::Ordering::Release);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            writer.upsert_document(doc.clone()),
+        )
+        .await;
+        if mode == 1 {
+            assert!(result.unwrap().is_err());
+        } else {
+            assert!(result.is_err());
+        }
+        // New keys never read a committed store block, even while its I/O fails.
+        writer
+            .upsert_document(make_doc(pk, hash, &format!("new{mode}"), "v1"))
+            .await
+            .unwrap();
+        dir.store_read_mode
+            .store(0, std::sync::atomic::Ordering::Release);
+        writer.commit().await.unwrap();
+        let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+        assert!(
+            metadata
+                .segment_metas
+                .values()
+                .all(|info| info.deletions.is_none())
+        );
+    }
+    writer.upsert_document(doc).await.unwrap();
+    assert!(!writer.commit().await.unwrap());
+}
+
+#[tokio::test]
+async fn content_hash_rejects_wrong_or_multiple_values_before_mutation() {
+    let (schema, pk, hash, _) = content_hash_schema();
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir, schema, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for multiple in [false, true] {
+        let mut doc = Document::new();
+        doc.add_text(pk, "same");
+        if multiple {
+            doc.add_text(hash, "one");
+            doc.add_text(hash, "two");
+        } else {
+            doc.add_u64(hash, 123);
+        }
+        assert!(writer.add_document(doc.clone()).is_err());
+        assert!(writer.upsert_document(doc).await.is_err());
+        assert!(!writer.commit().await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn content_hash_failed_commit_retry_keeps_replacement_and_comparison_atomic() {
+    let (schema, pk, hash, _) = content_hash_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    writer
+        .add_document(make_doc(pk, hash, "same", "v1"))
+        .unwrap();
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(make_doc(pk, hash, "same", "v2"))
+        .await
+        .unwrap();
+    dir.fail_next_metadata_rename();
+    assert!(writer.commit().await.is_err());
+    assert!(matches!(
+        writer
+            .upsert_document(make_doc(pk, hash, "same", "v1"))
+            .await,
+        Err(Error::CommitInProgress)
+    ));
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert!(
+        metadata
+            .segment_metas
+            .values()
+            .all(|info| info.deletions.is_none())
+    );
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(make_doc(pk, hash, "same", "v2"))
+        .await
+        .unwrap();
+    assert!(!writer.commit().await.unwrap());
+}
+
+#[tokio::test]
+async fn bytes_content_hash_compares_exact_values_including_empty_hashes() {
+    let schema = crate::dsl::sdl::parse_sdl("index test { field id: text [primary, stored] field digest: bytes [stored, content_hash] }").unwrap()[0].to_schema();
+    let id = schema.get_field("id").unwrap();
+    let hash = schema.get_field("digest").unwrap();
+    let mut writer = IndexWriter::create(RamDirectory::new(), schema, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for value in [vec![], vec![0, 255], vec![0, 254]] {
+        let mut doc = Document::new();
+        doc.add_text(id, "key");
+        doc.add_bytes(hash, value);
+        writer.upsert_document(doc.clone()).await.unwrap();
+        assert!(writer.commit().await.unwrap());
+        writer.upsert_document(doc).await.unwrap();
+        assert!(!writer.commit().await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn content_hash_resolves_global_ordinals_after_merging_independent_dictionaries() {
+    let (schema, pk, hash, _) = content_hash_schema();
+    let config = IndexConfig {
+        num_threads: 1,
+        merge_policy: Box::new(crate::NoMergePolicy),
+        ..Default::default()
+    };
+    let dir = RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config)
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for segment in 0..3 {
+        for row in (0..30).rev() {
+            writer
+                .add_document(make_doc(
+                    pk,
+                    hash,
+                    &format!("key{row:03}-{segment}"),
+                    &format!("digest{row}-{segment}"),
+                ))
+                .unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    writer.delete_primary_key("key005-1").unwrap();
+    writer.commit().await.unwrap();
+    writer.force_merge().await.unwrap();
+    for segment in 0..3 {
+        for row in 0..30 {
+            if (row, segment) == (5, 1) {
+                continue;
+            }
+            writer
+                .upsert_document(make_doc(
+                    pk,
+                    hash,
+                    &format!("key{row:03}-{segment}"),
+                    &format!("digest{row}-{segment}"),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+    assert!(!writer.commit().await.unwrap());
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(
+        metadata
+            .segment_metas
+            .values()
+            .map(|info| info.num_docs)
+            .sum::<u32>(),
+        90
     );
 }

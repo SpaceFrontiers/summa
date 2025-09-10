@@ -516,3 +516,82 @@ async fn cancelled_mutations_waiting_for_writer_do_not_stage_work() {
     drop(held);
     registry.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn content_hash_noops_are_accepted_without_new_physical_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(
+        root.path().to_owned(),
+        IndexConfig::default(),
+    ));
+    let service = IndexServiceImpl {
+        registry: registry.clone(),
+    };
+    service.create_index(Request::new(CreateIndexRequest {
+        index_name: "hashes".into(),
+        schema: "index hashes { field id: text<raw> [primary, stored] field digest: text [stored, content_hash] }".into(),
+    })).await.unwrap();
+    let document = |digest: &str| NamedDocument {
+        fields: [("id", "key"), ("digest", digest)]
+            .into_iter()
+            .map(|(name, text)| FieldEntry {
+                name: name.into(),
+                value: Some(FieldValue {
+                    value: Some(field_value::Value::Text(text.into())),
+                }),
+            })
+            .collect(),
+    };
+    for (documents, accepted, errors) in [
+        (vec![document("v1")], 1, 0),
+        (
+            vec![
+                document("v1"),
+                document("v1"),
+                document("v2"),
+                document("v2"),
+            ],
+            3,
+            1,
+        ),
+        (vec![document("v2"), document("v2")], 2, 0),
+    ] {
+        let response = service
+            .upsert_documents(Request::new(UpsertDocumentsRequest {
+                index_name: "hashes".into(),
+                documents,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.accepted_count, accepted);
+        assert_eq!(response.errors.len(), errors);
+        if errors > 0 {
+            assert_eq!(response.errors[0].index, 3);
+        }
+        service
+            .commit(Request::new(CommitRequest {
+                index_name: "hashes".into(),
+            }))
+            .await
+            .unwrap();
+    }
+    let dir = hermes_core::directories::MmapDirectory::new(root.path().join("hashes"));
+    let metadata = hermes_core::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(
+        metadata
+            .segment_metas
+            .values()
+            .map(|info| info.num_docs)
+            .sum::<u32>(),
+        2
+    );
+    assert_eq!(
+        metadata
+            .segment_metas
+            .values()
+            .map(|info| info.num_live_docs())
+            .sum::<u32>(),
+        1
+    );
+}

@@ -298,3 +298,35 @@ test("reopen reclaims orphan outputs after an interrupted storage commit", async
   expect((await storage.list()).sort()).toEqual(before);
   expect((await reopened.search("unpublished", 10)).hits).toHaveLength(0);
 });
+
+test("schema content hashes skip unchanged stored bytes and persist across reopen", async () => {
+  await init();
+  const schema = `index documents {
+    field id: text<raw> [primary, stored]
+    field digest: bytes [stored, content_hash]
+    field body: text<simple> [indexed, stored]
+  }`;
+  const storage = new InMemoryFS();
+  const index = await LocalIndex.withStorage(storage, schema);
+  await index.upsertDocument({ id: "a", digest: "AQI=", body: "original" });
+  await expect(index.upsertDocument({ id: "a", digest: "AQI=" })).rejects.toThrow(/pending insertion/);
+  await index.commit();
+  const before = await storage.get("metadata.json");
+  const response = await index.upsertDocuments([
+    { id: "a", digest: "AQI=", body: "ignored" },
+    { id: "a", digest: "AQI=", body: "ignored" },
+    { id: "a", digest: "malformed!" },
+  ]);
+  expect(response.acceptedCount).toBe(2);
+  expect(response.errors.map((error: any) => error.index)).toEqual([2]);
+  expect(await index.commit()).toBe(false);
+  expect(await storage.get("metadata.json")).toEqual(before);
+  expect((await index.search("original", 10)).hits).toHaveLength(1);
+  await index.upsertDocument({ id: "a", digest: "AgM=", body: "changed" });
+  await index.commit();
+  index.free();
+  const reopened = await LocalIndex.withStorage(storage, schema);
+  await reopened.upsertDocument({ id: "a", digest: "AgM=", body: "changed" });
+  expect(await reopened.commit()).toBe(false);
+  expect((await reopened.search("changed", 10)).hits).toHaveLength(1);
+});
