@@ -41,7 +41,7 @@ async fn mutation_merge_and_compaction_sequences_match_committed_rows_through_ab
                     staged.remove(&key);
                 }
                 1 => {
-                    writer.upsert_document(doc).unwrap();
+                    writer.upsert_document(doc).await.unwrap();
                     staged.insert(key, revision);
                 }
                 _ => {
@@ -638,7 +638,7 @@ async fn upserts_replace_atomically_and_single_segment_compaction_preserves_inde
     let mut replacement = Document::new();
     replacement.add_text(id, "a");
     replacement.add_text(title, "replacement");
-    writer.upsert_document(replacement).unwrap();
+    writer.upsert_document(replacement).await.unwrap();
     writer.commit().await.unwrap();
     reader.reload().await.unwrap();
     let updated = reader.searcher().await.unwrap();

@@ -22,6 +22,8 @@ mod searcher;
 pub use searcher::Searcher;
 
 #[cfg(any(feature = "native", feature = "wasm"))]
+mod content_hash;
+#[cfg(any(feature = "native", feature = "wasm"))]
 mod primary_key;
 #[cfg(feature = "native")]
 mod reader;
@@ -637,6 +639,7 @@ pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
 impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     /// Create a new index in the directory
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
+        schema.validate_content_hash()?;
         let search_resources = searcher::SearcherResources::new(
             config.term_cache_blocks,
             config.store_cache_budget_bytes,

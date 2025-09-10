@@ -205,3 +205,51 @@ async fn portable_publication_retry_reconciles_both_sides_of_the_metadata_rename
         );
     }
 }
+
+#[tokio::test]
+async fn portable_content_hash_preserves_noops_and_pending_transaction_semantics() {
+    let dir = FaultDirectory::default();
+    let mut schema = SchemaBuilder::default();
+    let id = schema.add_text_field("id", true, true);
+    schema.set_primary_key(id);
+    let hash = schema.add_u64_field("hash", false, true);
+    schema.set_content_hash(hash);
+    let mut writer = WasmIndexWriter::create(dir.clone(), schema.build(), IndexConfig::default())
+        .await
+        .unwrap();
+    let doc = |value| {
+        let mut doc = Document::new();
+        doc.add_text(id, "a");
+        doc.add_u64(hash, value);
+        doc
+    };
+    writer.add_document(doc(1)).await.unwrap();
+    assert!(writer.upsert_document(doc(1)).await.is_err());
+    writer.commit().await.unwrap();
+    writer.upsert_document(doc(1)).await.unwrap();
+    writer.upsert_document(doc(1)).await.unwrap();
+    assert!(!writer.commit().await.unwrap());
+    writer.upsert_document(doc(2)).await.unwrap();
+    assert!(writer.upsert_document(doc(1)).await.is_err());
+    writer.abort().await.unwrap();
+    writer.upsert_document(doc(1)).await.unwrap();
+    assert!(!writer.commit().await.unwrap());
+    writer.delete_primary_key("a").unwrap();
+    writer.upsert_document(doc(1)).await.unwrap();
+    writer.commit().await.unwrap();
+    assert_eq!(
+        writer
+            .metadata()
+            .segment_metas
+            .values()
+            .map(|info| info.num_docs)
+            .sum::<u32>(),
+        2
+    );
+    drop(writer);
+    let mut writer = WasmIndexWriter::open(dir, IndexConfig::default())
+        .await
+        .unwrap();
+    writer.upsert_document(doc(1)).await.unwrap();
+    assert!(!writer.commit().await.unwrap());
+}

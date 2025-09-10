@@ -85,6 +85,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         crate::dsl::reject_removed_vector_index_types(&schema)
             .map_err(crate::error::Error::Schema)?;
         let directory = Arc::new(directory);
+        schema.validate_content_hash()?;
         let schema = Arc::new(schema);
         let metadata = IndexMetadata::new((*schema).clone());
         metadata.save(directory.as_ref()).await?;
@@ -200,6 +201,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// native-only spill paths do not exist here); all of them are pure
     /// functions of (document, schema).
     fn validate_document(&self, doc: &Document) -> Result<()> {
+        super::content_hash::document_hash(doc, &self.schema)?;
         validate_vector_value_counts(doc, &self.schema)?;
         let mut stored_count = 0usize;
 

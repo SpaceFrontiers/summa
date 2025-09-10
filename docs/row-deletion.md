@@ -1,9 +1,9 @@
 # Row deletion, upserts, and compaction
 
 Status: implemented in native/portable core, CLI, gRPC server and broker,
-Python and TypeScript clients, and WASM LocalIndex. Index metadata format 7 is
-required; format 6 metadata (1.8.121..=1.8.133) is upgraded on open because it
-differs only by the optional `deletions` entry. Readers upgrade in memory with a
+Python and TypeScript clients, and WASM LocalIndex. Index metadata format 8 is
+required; formats 6 and 7 upgrade on open without rewriting segments. Format 7
+added optional `deletions`; format 8 protects the optional content-hash setting. Readers upgrade in memory with a
 `log::warn!`; writers persist the new stamp on open, after which older releases
 cannot open the index (they would silently drop deletion generations). Segments
 written before 1.8.125 still fail at segment open (BMP blob magic) and need a
@@ -31,7 +31,7 @@ with `indexed: true, stored: false`.
 
 The replacement operation is named **upsert**: insert when the primary key is
 absent, otherwise replace the complete document and all its chunks. The native
-and portable writer expose `upsert_document`; clients expose their corresponding
+and portable writer expose async `upsert_document`; clients expose their corresponding
 single/batch helpers; the CLI command is `upsert`; IndexService exposes
 `UpsertDocuments(UpsertDocumentsRequest)`. This renames the unreleased API on this
 branch, including its gRPC method path. Publication, request limits, and persisted
@@ -41,7 +41,7 @@ formats are unchanged, with the same execution and allocation costs.
 let mut writer = index.writer();
 writer.init_primary_key_dedup().await?;
 writer.delete_primary_key("old-key")?;
-writer.upsert_document(replacement)?; // complete document, including its key
+writer.upsert_document(replacement).await?; // complete document, including its key
 writer.commit().await?;
 reader.reload().await?;
 
@@ -56,6 +56,9 @@ replace the entire document; they are not partial field patches. A rejected
 queue admission rolls back that call's staged deletion. Commit publishes all
 staged deletions and replacement insertions together; prepared-commit abort
 rolls them back together. Keys are exact, case-sensitive primary-field values.
+
+With an optional [content-hash field](content-deduplication.md), matching committed
+live rows are accepted no-ops. Pending deletions disable that comparison.
 
 One insertion/upsert per key is allowed in a pending commit. Commit before
 deleting or upserting a key that already has a pending insertion; attempts return
@@ -85,8 +88,8 @@ Deletion requests admit at most 100,000 keys and 8 MiB of key bytes. Replacement
 requests admit at most 1,000 documents and 32 MiB of encoded protobuf data. Both
 server and broker check envelope limits before lookup, conversion or admission.
 The core's cumulative pending-key limits still apply across requests. Server
-mutation batches hold the existing exclusive writer lock through synchronous
-staging on blocking workers; cancellation while waiting starts no operation.
+mutation batches hold the existing exclusive writer lock through
+staging on blocking workers (async stored-hash reads are driven by their runtime handle); cancellation while waiting starts no operation.
 Conversion and staging share four application-wide admission permits, retained
 by started workers even if their request is cancelled. Commit retains its
 existing owned finalizer and reader publication. Batch conversion is bounded and
@@ -242,7 +245,7 @@ compaction; rebuilding from stored fields would lose indexed-only information.
 
 ### Compaction copy and streaming paths
 
-Compaction retains format 7, stable survivor ordering, exact encoded vector
+Compaction retains the current metadata format, stable survivor ordering, exact encoded vector
 values, and the existing publication/cancellation protocol. Physical row mapping
 shares the reader's visibility bitmap and adds one u32 population-count prefix
 per 64 rows plus a sentinel: `4 * (ceil(physical_rows / 64) + 1)` bytes for mixed

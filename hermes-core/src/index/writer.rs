@@ -39,7 +39,7 @@ use super::primary_key::load_pk_segment_data;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use rustc_hash::FxHashMap;
 
 use crate::directories::DirectoryWriter;
@@ -684,6 +684,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
+        schema.validate_content_hash()?;
         crate::dsl::reject_removed_vector_index_types(&schema).map_err(Error::Schema)?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
@@ -1075,7 +1076,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 async move { load_pk_segment_data(dir, &seg_id_str, &schema, deletion).await }
             })
             .collect();
-        let all_data = futures::future::try_join_all(load_futures).await?;
+        let all_data = futures::stream::iter(load_futures)
+            .buffer_unordered(4)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         if let Some((persisted_seg_ids, bloom)) = cached {
             // Partition: old segments (covered by bloom) first, new segments at end.
@@ -1215,6 +1219,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         // worker discovers these limits only after mutating a segment builder,
         // which invalidates every sibling document in the commit generation.
         validate_vector_value_counts(&doc, &self.schema)?;
+        super::content_hash::document_hash(&doc, &self.schema)?;
         let primary_key_index = self.primary_key_index.read();
         if let Some(ref pk_index) = *primary_key_index {
             pk_index.check_and_insert(&doc)?;
@@ -1265,13 +1270,16 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Replace a committed row (or insert a missing key). Deletion and the new
     /// document become visible together at commit. Queue rejection rolls back
     /// this call's deletion so a failed upsert cannot remove the old row.
-    pub fn upsert_document(&mut self, doc: Document) -> Result<()> {
+    /// Equal configured content hashes are accepted no-ops. Stored-hash I/O
+    /// precedes mutation, so cancelling that read leaves pending work unchanged.
+    pub async fn upsert_document(&mut self, doc: Document) -> Result<()> {
         let field = self
             .schema
             .primary_field()
             .ok_or_else(|| Error::Schema("upserts require a primary key".into()))?;
-        let key = super::primary_key::document_key(&doc, field)?.to_owned();
+        let key = super::primary_key::document_key(&doc, field)?;
         validate_vector_value_counts(&doc, &self.schema)?;
+        let hash = super::content_hash::document_hash(&doc, &self.schema)?;
         // Validate writer admission before touching the reservation set.
         self.ensure_writer_lock()?;
         if self.worker_state.shutdown.load(Ordering::Acquire) {
@@ -1283,6 +1291,22 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         {
             return Err(Error::CommitInProgress);
         }
+        if let Some(hash) = hash {
+            let target = self
+                .primary_key_index
+                .read()
+                .as_ref()
+                .ok_or_else(|| {
+                    Error::Schema("upserts require initialized primary-key deduplication".into())
+                })?
+                .content_hash_target(key)?;
+            if let Some(target) = target
+                && target.matches(hash, &self.schema).await?
+            {
+                return Ok(());
+            }
+        }
+        let key = key.to_owned();
         let staged = self
             .primary_key_index
             .read()
@@ -2153,7 +2177,10 @@ async fn refresh_primary_key_snapshot<D: DirectoryWriter + 'static>(
             async move { load_pk_segment_data(dir, &seg_id_str, &schema, deletion).await }
         })
         .collect();
-    let mut new_data = futures::future::try_join_all(load_futures).await?;
+    let mut new_data = futures::stream::iter(load_futures)
+        .buffer_unordered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
     if let Some(field) = schema.primary_field() {
         new_data = tokio::task::spawn_blocking(move || {
             for data in &mut new_data {

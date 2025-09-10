@@ -59,8 +59,8 @@ impl IndexServiceImpl {
             let mut response = DocumentMutationResponse::default();
             for (position, document) in documents.into_iter().enumerate() {
                 let result = document.map_err(|error| error.to_string()).and_then(|doc| {
-                    writer
-                        .upsert_document(doc)
+                    tokio::runtime::Handle::current()
+                        .block_on(writer.upsert_document(doc))
                         .map_err(|error| error.to_string())
                 });
                 record(&mut response, position, result);

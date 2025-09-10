@@ -71,6 +71,9 @@ pub struct FieldEntry {
     /// Whether this field is a primary key (unique constraint, at most one per schema)
     #[serde(default)]
     pub primary_key: bool,
+    /// Stored fingerprint used to skip unchanged committed upserts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_hash: bool,
     /// Whether build-time document reordering (Recursive Graph Bisection) is enabled.
     /// Valid for sparse_vector fields with BMP format. Clusters similar documents
     /// into the same blocks for better pruning effectiveness.
@@ -777,6 +780,8 @@ use super::query_field_router::QueryRouterRule;
 /// Schema defining document structure
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Schema {
+    #[serde(skip)]
+    content_hash_field: std::sync::OnceLock<Option<Field>>,
     fields: Vec<FieldEntry>,
     name_to_field: HashMap<String, Field>,
     /// Default fields for query parsing (when no field is specified)
@@ -950,6 +955,53 @@ impl Schema {
         self.query_routers = rules;
     }
 
+    /// Get the optional stored content fingerprint field.
+    pub fn content_hash_field(&self) -> Option<Field> {
+        *self.content_hash_field.get_or_init(|| {
+            self.fields
+                .iter()
+                .position(|entry| entry.content_hash)
+                .map(|id| Field(id as u32))
+        })
+    }
+
+    pub(crate) fn validate_content_hash(&self) -> crate::Result<()> {
+        let hashes: Vec<_> = self
+            .fields
+            .iter()
+            .filter(|entry| entry.content_hash)
+            .collect();
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        if hashes.len() != 1 || self.fields.iter().filter(|entry| entry.primary_key).count() != 1 {
+            return Err(crate::Error::Schema(
+                "content_hash requires exactly one hash field and one primary key".into(),
+            ));
+        }
+        let primary = self.get_field_entry(self.primary_field().unwrap()).unwrap();
+        if primary.field_type != FieldType::Text
+            || primary.multi
+            || !primary.fast
+            || !primary.indexed
+        {
+            return Err(crate::Error::Schema("content_hash requires a single-valued text primary key with fast and indexed enabled".into()));
+        }
+        let entry = hashes[0];
+        if !entry.stored
+            || entry.multi
+            || !matches!(
+                entry.field_type,
+                FieldType::Text | FieldType::Bytes | FieldType::U64
+            )
+        {
+            return Err(crate::Error::Schema(
+                "content_hash must be a stored, single-valued text, bytes, or u64 field".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Get the primary key field, if one is defined
     pub fn primary_field(&self) -> Option<Field> {
         self.fields
@@ -1060,6 +1112,7 @@ impl SchemaBuilder {
             binary_dense_vector_config: None,
             fast: false,
             primary_key: false,
+            content_hash: false,
             reorder: false,
             chunked: false,
             bm25_k1: None,
@@ -1115,6 +1168,7 @@ impl SchemaBuilder {
             binary_dense_vector_config: None,
             fast: false,
             primary_key: false,
+            content_hash: false,
             reorder: false,
             chunked: false,
             bm25_k1: None,
@@ -1165,6 +1219,7 @@ impl SchemaBuilder {
             binary_dense_vector_config: Some(config),
             fast: false,
             primary_key: false,
+            content_hash: false,
             reorder: false,
             chunked: false,
             bm25_k1: None,
@@ -1217,6 +1272,7 @@ impl SchemaBuilder {
             binary_dense_vector_config: None,
             fast: false,
             primary_key: false,
+            content_hash: false,
             reorder: false,
             chunked: false,
             bm25_k1: None,
@@ -1251,6 +1307,15 @@ impl SchemaBuilder {
             entry.fast = true;
             entry.indexed = true;
         }
+    }
+
+    /// Mark a stored scalar field as the caller-supplied content fingerprint.
+    /// Invalid configurations are rejected when creating an index.
+    pub fn set_content_hash(&mut self, field: Field) {
+        self.fields
+            .get_mut(field.0 as usize)
+            .expect("unknown content hash field")
+            .content_hash = true;
     }
 
     /// Enable build-time document reordering (Recursive Graph Bisection) for BMP fields
@@ -1328,6 +1393,7 @@ impl SchemaBuilder {
             .collect();
 
         Schema {
+            content_hash_field: Default::default(),
             fields: self.fields,
             name_to_field,
             default_fields,
@@ -1597,6 +1663,29 @@ impl Document {
         for (key, value) in obj {
             if let Some(field) = schema.get_field(key) {
                 let field_entry = schema.get_field_entry(field)?;
+                // Fingerprints must never disappear through permissive JSON conversion:
+                // that would turn a malformed hash into an unconditional replacement.
+                if field_entry.content_hash {
+                    match (&field_entry.field_type, value) {
+                        (FieldType::Text, serde_json::Value::String(text)) => {
+                            doc.add_text(field, text)
+                        }
+                        (FieldType::U64, serde_json::Value::Number(number)) => {
+                            doc.add_u64(field, number.as_u64()?)
+                        }
+                        (FieldType::Bytes, serde_json::Value::String(encoded)) => {
+                            use base64::Engine;
+                            doc.add_bytes(
+                                field,
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(encoded)
+                                    .ok()?,
+                            );
+                        }
+                        _ => return None,
+                    }
+                    continue;
+                }
                 Self::add_json_value(&mut doc, field, &field_entry.field_type, value);
             }
         }
@@ -1688,6 +1777,30 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_content_hashes_roundtrip_and_reject_invalid_values() {
+        for (kind, valid, invalid) in [
+            ("text", serde_json::json!("hash"), serde_json::json!(17)),
+            ("u64", serde_json::json!(17), serde_json::json!(-1)),
+            (
+                "bytes",
+                serde_json::json!("AP8="),
+                serde_json::json!("not base64!"),
+            ),
+        ] {
+            let schema = crate::dsl::sdl::parse_sdl(&format!("index test {{ field id: text [primary, stored] field hash: {kind} [stored, content_hash] }}")).unwrap()[0].to_schema();
+            let value = serde_json::json!({"id":"a", "hash":valid});
+            let doc = Document::from_json(&value, &schema).unwrap();
+            assert_eq!(doc.to_json(&schema), value);
+            for invalid in [invalid, serde_json::Value::Null, serde_json::json!([valid])] {
+                assert!(
+                    Document::from_json(&serde_json::json!({"id":"a", "hash":invalid}), &schema)
+                        .is_none()
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_schema_builder() {
