@@ -12,21 +12,23 @@ repos:
         pass_filenames: false
       - id: clippy
         name: clippy
-        entry: cargo clippy --workspace --all-targets -- -D warnings
+        # Linting does not need debug symbols or incremental compilation caches.
+        # Keep workspace/dictionary builds from exhausting local disk space.
+        entry: env CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy --workspace --all-targets -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
         stages: [pre-push]
       - id: clippy-metal
         name: clippy (Metal)
-        entry: cargo clippy -p hermes-llm -p hermes-train --all-targets --features metal -- -D warnings
+        entry: env CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p hermes-llm -p hermes-train --all-targets --features metal -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
         stages: [manual]
       - id: clippy-cuda
         name: clippy (CUDA)
-        entry: cargo clippy -p hermes-llm -p hermes-train --all-targets --features cuda -- -D warnings
+        entry: env CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p hermes-llm -p hermes-train --all-targets --features cuda -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
