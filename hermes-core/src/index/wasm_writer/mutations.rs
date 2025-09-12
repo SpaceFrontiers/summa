@@ -39,6 +39,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     }
 
     /// Stage a full replacement, inserting absent keys. One pending insertion per key.
+    /// Equal configured content hashes on committed live rows are accepted no-ops.
     pub async fn upsert_document(&mut self, doc: Document) -> Result<()> {
         self.ensure_healthy()?;
         self.validate_document(&doc)?;
@@ -46,7 +47,20 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .schema
             .primary_field()
             .ok_or_else(|| Error::Schema("upserts require a primary key".into()))?;
-        let key = document_key(&doc, field)?.to_owned();
+        let key = document_key(&doc, field)?;
+        if let Some(hash) = crate::index::content_hash::document_hash(&doc, &self.schema)? {
+            let target = self
+                .primary_key
+                .as_ref()
+                .unwrap()
+                .content_hash_target(key)?;
+            if let Some(target) = target
+                && target.matches(hash, &self.schema).await?
+            {
+                return Ok(());
+            }
+        }
+        let key = key.to_owned();
         let staged = self.primary_key.as_ref().unwrap().delete(&key)?;
         if let Err(error) = self.add_document(doc).await {
             if staged {

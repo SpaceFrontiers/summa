@@ -83,6 +83,7 @@ pub struct FieldDef {
     pub fast: bool,
     /// Whether this field is a primary key (unique constraint)
     pub primary: bool,
+    pub content_hash: bool,
     /// Whether build-time document reordering (BP) is enabled for BMP fields
     pub reorder: bool,
     /// BM25 k1 of a text field (`indexed<k1: ...>`), `None` = default
@@ -175,6 +176,9 @@ impl IndexDef {
             }
             if field.primary {
                 builder.set_primary_key(f);
+            }
+            if field.content_hash {
+                builder.set_content_hash(f);
             }
             if field.reorder {
                 builder.set_reorder(f, true);
@@ -330,6 +334,7 @@ struct ParsedAttributes {
     multi: bool,
     fast: bool,
     primary: bool,
+    content_hash: bool,
     reorder: bool,
     index_config: Option<IndexConfig>,
 }
@@ -342,6 +347,7 @@ fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> Result<ParsedAttribute
         multi: false,
         fast: false,
         primary: false,
+        content_hash: false,
         reorder: false,
         index_config: None,
     };
@@ -372,6 +378,7 @@ fn parse_attributes(pair: pest::iterators::Pair<Rule>) -> Result<ParsedAttribute
                     "stored" => attrs.stored = true,
                     "fast" => attrs.fast = true,
                     "primary" => attrs.primary = true,
+                    "content_hash" => attrs.content_hash = true,
                     "reorder" => attrs.reorder = true,
                     _ => {}
                 }
@@ -798,6 +805,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut multi = false;
     let mut fast = false;
     let mut primary = false;
+    let mut content_hash = false;
     let mut reorder = false;
     let mut index_config: Option<IndexConfig> = None;
 
@@ -845,6 +853,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 multi = attrs.multi;
                 fast = attrs.fast;
                 primary = attrs.primary;
+                content_hash = attrs.content_hash;
                 reorder = attrs.reorder;
                 index_config = attrs.index_config;
             }
@@ -940,6 +949,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         binary_dense_vector_config,
         fast,
         primary,
+        content_hash,
         reorder,
         chunked,
         bm25_k1,
@@ -1557,14 +1567,16 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
         }
     }
 
-    Ok(IndexDef {
+    let definition = IndexDef {
         name,
         fields,
         default_fields,
         query_routers,
         reorder_on_merge,
         max_l1_phrase_terms,
-    })
+    };
+    definition.to_schema().validate_content_hash()?;
+    Ok(definition)
 }
 
 /// Fail loudly on tokenizer specs that would otherwise degrade silently:
@@ -3382,5 +3394,33 @@ mod tests {
         let json = serde_json::to_string(&schema_on).unwrap();
         let back: crate::dsl::Schema = serde_json::from_str(&json).unwrap();
         assert!(back.reorder_on_merge());
+    }
+}
+
+#[cfg(test)]
+mod content_hash_tests {
+    use super::*;
+
+    #[test]
+    fn content_hash_requires_a_stored_scalar_and_primary_key() {
+        for fields in [
+            "field hash: text [stored, content_hash]",
+            "field id: text [primary] field hash: text [indexed, content_hash]",
+            "field id: text [primary] field hash: text [stored<multi>, content_hash]",
+            "field id: text [primary] field hash: f64 [stored, content_hash]",
+            "field id: text [primary] field a: text [stored, content_hash] field b: u64 [stored, content_hash]",
+        ] {
+            assert!(
+                parse_sdl(&format!("index test {{ {fields} }}")).is_err(),
+                "{fields}"
+            );
+        }
+        for kind in ["text", "bytes", "u64"] {
+            let schema = parse_sdl(&format!("index test {{ field id: text [primary] field hash: {kind} [stored, content_hash] }}")).unwrap()[0].to_schema();
+            assert_eq!(schema.content_hash_field(), schema.get_field("hash"));
+            let encoded = serde_json::to_vec(&schema).unwrap();
+            let decoded: Schema = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.content_hash_field(), schema.content_hash_field());
+        }
     }
 }

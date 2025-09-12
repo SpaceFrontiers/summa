@@ -26,6 +26,7 @@ directory. Package READMEs below document each executable or library.
 - [Hermes broker](broker.md)
 - [Segment Lifecycle and Recovery](segment-lifecycle.md)
 - [Row deletion, upserts, and compaction](row-deletion.md)
+- [Content-hash deduplication](content-deduplication.md)
 - [Index diagnostics](diagnostics.md)
 - [Prometheus Metrics](metrics.md)
 - [Document store v3](document-store-v3.md)

@@ -280,6 +280,11 @@ impl PositionPostingList {
             prev_doc_id = doc_id;
 
             let num_positions = read_vint(&mut reader).ok()? as usize;
+            // Every varint consumes at least one byte; reject corrupt counts
+            // before reserving a document-sized buffer.
+            if num_positions > reader.len() {
+                return None;
+            }
 
             if doc_id == target_doc_id {
                 // Found it! Read positions (stored absolute)

@@ -548,7 +548,7 @@ async fn forward_duplicate_impacts_survive_copy_merge_and_storage_enablement() {
                 .copied()
                 .collect();
             assert_eq!(forward.payload.as_slice(), expected);
-            forward.validate_payload().unwrap();
+            forward.validate_payload(&|| Ok(())).unwrap();
         }
     }
 }
@@ -729,4 +729,107 @@ fn enabled_forward_storage_keeps_the_published_bytes() {
     });
     assert_eq!(bytes.len(), 12_713);
     assert_eq!(hash, 0x5ccfbcdae3690623);
+}
+
+#[test]
+fn forward_construction_cancels_during_validation_counting_and_csr_fill() {
+    use crate::segment::builder::graph_bisection::{
+        build_forward_index_from_bmps_with_maps, build_vid_maps,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    for storage in [false, true] {
+        let bmp = fixture_with_storage(128, false, storage);
+        let maps = vec![build_vid_maps(&bmp, &|| Ok(())).unwrap()];
+        let checks = AtomicUsize::new(0);
+        let complete = build_forward_index_from_bmps_with_maps(
+            &[&bmp],
+            &maps,
+            1,
+            1000,
+            16 * 1024 * 1024,
+            &|| {
+                checks.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(complete.total_postings() > 0);
+        let total = checks.load(Ordering::Relaxed);
+        assert!(total > 4, "forward construction never checks cancellation");
+        for stop in [1, total / 4, total / 2, total - 1] {
+            checks.store(0, Ordering::Relaxed);
+            let result = build_forward_index_from_bmps_with_maps(
+                &[&bmp],
+                &maps,
+                1,
+                1000,
+                16 * 1024 * 1024,
+                &|| {
+                    if checks.fetch_add(1, Ordering::Relaxed) >= stop {
+                        Err(crate::Error::IndexClosed)
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert!(
+                matches!(result, Err(crate::Error::IndexClosed)),
+                "cancelled construction produced a graph at checkpoint {stop}/{total}"
+            );
+        }
+    }
+}
+
+#[test]
+fn block_forward_construction_cancels_before_returning_a_partial_graph() {
+    use crate::segment::builder::graph_bisection::build_forward_index_from_blocks;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut postings = rustc_hash::FxHashMap::default();
+    for doc in 0..2048 {
+        postings
+            .entry(doc / 128)
+            .or_insert_with(Vec::new)
+            .push((doc, 0, 1.0));
+    }
+    let mut bytes = Vec::new();
+    crate::segment::builder::bmp::build_bmp_blob(
+        postings, 32, 4, 0.0, None, 32, 5.0, 0, true, &mut bytes,
+    )
+    .unwrap();
+    let bmp = parse(bytes, 2048, 2048);
+    let checks = AtomicUsize::new(0);
+    let complete = build_forward_index_from_blocks(&[&bmp], 16 * 1024 * 1024, &|| {
+        checks.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    })
+    .unwrap();
+    assert!(complete.num_docs() > 0);
+    let total = checks.load(Ordering::Relaxed);
+    for stop in [1, total / 4, total / 2, total - 1] {
+        checks.store(0, Ordering::Relaxed);
+        let result = build_forward_index_from_blocks(&[&bmp], 16 * 1024 * 1024, &|| {
+            if checks.fetch_add(1, Ordering::Relaxed) >= stop {
+                Err(crate::Error::IndexClosed)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Err(crate::Error::IndexClosed)));
+    }
+}
+
+#[test]
+fn rewrite_document_map_scan_observes_cancellation_mid_scan() {
+    use crate::segment::builder::graph_bisection::build_vid_maps;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let bmp = fixture(2048);
+    let checks = AtomicUsize::new(0);
+    let result = build_vid_maps(&bmp, &|| {
+        if checks.fetch_add(1, Ordering::Relaxed) >= 3 {
+            Err(crate::Error::IndexClosed)
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(result, Err(crate::Error::IndexClosed)));
 }

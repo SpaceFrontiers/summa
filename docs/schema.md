@@ -39,8 +39,8 @@ index articles {
     # Rating score
     field rating: f64 [indexed, stored]
 
-    # Raw content hash (not indexed, just stored)
-    field content_hash: bytes [stored]
+    # Caller-supplied content hash: skip unchanged committed upserts
+    field content_hash: bytes [stored, content_hash]
 }
 ```
 
@@ -61,13 +61,14 @@ index articles {
 
 Attributes control how fields are processed and stored:
 
-| Attribute | Description                                                                                                                                                                                                                        |
-| --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `indexed` | Field is indexed for searching                                                                                                                                                                                                     |
-| `stored`  | Field value is stored and can be retrieved                                                                                                                                                                                         |
-| `primary` | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                                       |
-| `fast`    | Field is a fast field (column-oriented storage for range queries)                                                                                                                                                                  |
-| `reorder` | Opt a BMP sparse or indexed chunked-text field into BP reordering. Both support standalone/optimizer passes; merge-time BP applies to BMP sparse fields. See [field-level reordering](lexical-vertical.md#field-level-reordering). |
+| Attribute      | Description                                                                                                                                                                                                                        |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `indexed`      | Field is indexed for searching                                                                                                                                                                                                     |
+| `stored`       | Field value is stored and can be retrieved                                                                                                                                                                                         |
+| `content_hash` | Stored scalar fingerprint for unchanged upserts; requires a primary key                                                                                                                                                            |
+| `primary`      | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                                       |
+| `fast`         | Field is a fast field (column-oriented storage for range queries)                                                                                                                                                                  |
+| `reorder`      | Opt a BMP sparse or indexed chunked-text field into BP reordering. Both support standalone/optimizer passes; merge-time BP applies to BMP sparse fields. See [field-level reordering](lexical-vertical.md#field-level-reordering). |
 
 Index-level options (inside the `index { ... }` block):
 
@@ -117,7 +118,7 @@ The `primary` attribute designates a field as the primary key. When a primary ke
 - Documents with duplicate primary key values are rejected during indexing
 - The server automatically initializes deduplication tracking on index open
 - Only one field per index should be marked as `primary`
-- Works with `text`, `u64`, `i64`, and `bytes` field types
+- Requires a single-valued `text` field; implies `fast` and `indexed`
 
 ```
 index articles {
@@ -126,6 +127,43 @@ index articles {
     field body: text [indexed]
 }
 ```
+
+### Content Hash
+
+Mark one stored, single-valued `text`, `bytes`, or `u64` field with `content_hash`
+to skip reindexing a committed live document when its primary key and hash match.
+The hash does not need `indexed` or `fast`. Equality is exact and case-sensitive;
+the caller must change the hash whenever any part of the full document changes.
+Missing hashes cause normal replacement. Wrong types and multiple values error.
+JSON documents encode byte hashes as standard padded Base64 strings; invalid
+hashes (including explicit nulls or arrays) are rejected.
+
+```sdl
+index documents {
+    field id: text<raw> [primary, stored]
+    field digest: bytes [stored, content_hash]
+    field body: text [indexed]
+}
+```
+
+The JSON creation schema exposes the same settings:
+
+```json
+{
+  "fields": [
+    { "name": "id", "type": "text", "primary_key": true },
+    { "name": "digest", "type": "bytes", "stored": true, "content_hash": true }
+  ]
+}
+```
+
+Native Rust uses `builder.set_content_hash(digest)` and
+`writer.upsert_document(doc).await?`. Identical committed upserts succeed without
+new rows or tombstones. A pending insertion still requires commit before another
+upsert of that key; a pending deletion always permits its replacement insertion.
+Ordinary inserts still reject duplicate primary keys. RPC accepted counts include
+no-ops. See [content deduplication](content-deduplication.md) for cost and lifecycle
+guarantees. Existing schemas without the marker retain their current behavior.
 
 ### Multi-Value Fields
 
@@ -330,7 +368,7 @@ tokenizer_params = { "(" ~ tokenizer_param ~ ("," ~ tokenizer_param)* ~ ")" }
 tokenizer_param = { identifier ~ ":" ~ identifier }
 
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "reorder" }
+attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "content_hash" | "reorder" }
 
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 

@@ -288,10 +288,28 @@ macro_rules! boolean_plan {
         }
 
         // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
+        if scorer_options.complete_text_matches && must.is_empty() && must_not.is_empty()
+            && !should.is_empty()
+            && let Some((infos, field, avg_field_len, num_docs)) = prepare_text_maxscore(should, reader, global_stats)
+            && text_maxscore_allowed(reader, field, scorer_options.collect_positions)
+        {
+            if $proximity.is_some() {
+                return Err(crate::Error::Query("proximity scoring inside a required text clause is not supported".into()));
+            }
+            let mut postings = Vec::with_capacity(infos.len());
+            for info in infos {
+                if let Some(pl) = reader.$get_postings_fn(info.field, &info.term) $(. $aw)* ? {
+                    let idf = compute_idf(&pl, field, &info.term, num_docs, global_stats) * info.weight;
+                    postings.push((pl, idf));
+                }
+            }
+            return super::term::complete_text_scorer(postings, avg_field_len, reader, field, scorer_options.shared_threshold.clone(), scorer_options.eligibility.clone());
+        }
         if must.is_empty() && must_not.is_empty()
             && (should.len() >= 2 || (should.len() == 1 && $text_tuning.0 < 1.0)) {
             // 2a. Text MaxScore (single-field, all term queries)
-            if let Some((mut infos, text_field, avg_field_len, num_docs)) =
+            if !scorer_options.complete_text_matches
+                && let Some((mut infos, text_field, avg_field_len, num_docs)) =
                 prepare_text_maxscore(should, reader, global_stats)
                 && text_maxscore_allowed(reader, text_field, scorer_options.collect_positions)
             {
@@ -357,7 +375,8 @@ macro_rules! boolean_plan {
             }
 
             // 2c. Per-field text MaxScore (multi-field term grouping)
-            if let Some(grouping) = prepare_per_field_grouping(
+            if !scorer_options.complete_text_matches
+                && let Some(grouping) = prepare_per_field_grouping(
                 should,
                 reader,
                 limit,
@@ -430,7 +449,8 @@ macro_rules! boolean_plan {
         // predicates carry no positions to lose and verifier scorers keep
         // theirs. Only the posting-list bitset shortcut is skipped when
         // positions are requested, because a bitset cannot report them.
-        if !should.is_empty() && (!must.is_empty() || !must_not.is_empty()) {
+        if (!scorer_options.complete_text_matches || extract_all_sparse_infos(should).is_some())
+            && !should.is_empty() && (!must.is_empty() || !must_not.is_empty()) {
             // ── 3-text. Text SHOULD with materializable filters ──────────
             //
             // When every SHOULD clause is a text term and the MUST/MUST_NOT
@@ -680,13 +700,13 @@ macro_rules! boolean_plan {
                     } else {
                         log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
                         must_verifiers.push(q.$scorer_fn(
-                            reader, limit, scorer_options.without_threshold()
+                            reader, limit, scorer_options.for_required_clause()
                         ) $(. $aw)* ?);
                     }
                 } else {
                     log::debug!("BooleanQuery planner 3a: MUST clause → verifier scorer ({})", q);
                     must_verifiers.push(q.$scorer_fn(
-                        reader, limit, scorer_options.without_threshold()
+                        reader, limit, scorer_options.for_required_clause()
                     ) $(. $aw)* ?);
                 }
             }
@@ -703,12 +723,12 @@ macro_rules! boolean_plan {
                         predicates.push(Box::new(move |doc_id| !bitset.contains(doc_id)));
                     } else {
                         must_not_verifiers.push(q.$scorer_fn(
-                            reader, limit, scorer_options.without_threshold()
+                            reader, limit, scorer_options.for_required_clause()
                         ) $(. $aw)* ?);
                     }
                 } else {
                     must_not_verifiers.push(q.$scorer_fn(
-                        reader, limit, scorer_options.without_threshold()
+                        reader, limit, scorer_options.for_required_clause()
                     ) $(. $aw)* ?);
                 }
             }
@@ -797,7 +817,11 @@ macro_rules! boolean_plan {
             // Sparse retrieval keeps its combined candidate executor. Other
             // query shapes use the individual SHOULD streams so filters and
             // scoring requirements see the complete document streams.
-            let mut should_options = scorer_options.without_threshold();
+            let mut should_options = if must_verifiers.is_empty() && must_not_verifiers.is_empty() {
+                scorer_options.without_threshold()
+            } else {
+                scorer_options.for_required_clause()
+            };
             if should_is_sparse {
                 // The outer decomposition built this plan from the complete
                 // sparse SHOULD expression. Filters cannot increase scores,
@@ -807,6 +831,11 @@ macro_rules! boolean_plan {
                 should_options.lsp_plan = scorer_options.lsp_plan.clone();
             }
             let proximity_should = $proximity.is_some();
+            if proximity_should {
+                // This existing path explicitly uses the full text corpus as
+                // sub_limit below, so it already preserves required matches.
+                should_options.complete_text_matches = false;
+            }
             let combined_should = should.len() == 1 || should_is_sparse || proximity_should;
             let should_scorer: Option<Box<dyn Scorer + '_>> = if should.len() == 1 {
                 Some(should[0].$scorer_fn(reader, limit, should_options.clone()) $(. $aw)* ?)
@@ -907,25 +936,34 @@ macro_rules! boolean_plan {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
         }
         let mut must_scorers = Vec::with_capacity(must.len());
+        let child_options = if scorer_options.complete_text_matches
+            || !should.is_empty() && !must.is_empty()
+            || must.iter().filter(|query| query.as_doc_predicate(reader).is_none()).count() > 1
+            || must_not.iter().any(|query| query.as_doc_predicate(reader).is_none())
+        {
+            scorer_options.for_required_clause()
+        } else {
+            scorer_options.without_threshold()
+        };
         if must.is_empty() && should.is_empty() && !must_not.is_empty() {
             must_scorers.push(Box::new(super::AllDocSet::new(reader.num_docs()))
                 as Box<dyn Scorer + '_>);
         }
         for q in must {
             must_scorers.push(q.$scorer_fn(
-                reader, limit, scorer_options.without_threshold()
+                reader, limit, child_options.clone()
             ) $(. $aw)* ?);
         }
         let mut should_scorers = Vec::with_capacity(should.len());
         for q in should {
             should_scorers.push(q.$scorer_fn(
-                reader, limit, scorer_options.without_threshold()
+                reader, limit, child_options.clone()
             ) $(. $aw)* ?);
         }
         let mut must_not_scorers = Vec::with_capacity(must_not.len());
         for q in must_not {
             must_not_scorers.push(q.$scorer_fn(
-                reader, limit, scorer_options.without_threshold()
+                reader, limit, scorer_options.for_required_clause()
             ) $(. $aw)* ?);
         }
         let mut scorer = BooleanScorer {
@@ -1201,14 +1239,25 @@ impl Query for BooleanQuery {
     }
 }
 
-struct BooleanScorer<'a> {
+pub(super) struct BooleanScorer<'a> {
     must: Vec<Box<dyn Scorer + 'a>>,
     should: Vec<Box<dyn Scorer + 'a>>,
     must_not: Vec<Box<dyn Scorer + 'a>>,
     current_doc: DocId,
 }
 
-impl BooleanScorer<'_> {
+impl<'a> BooleanScorer<'a> {
+    pub(super) fn disjunction(should: Vec<Box<dyn Scorer + 'a>>) -> Self {
+        let mut scorer = Self {
+            must: Vec::new(),
+            should,
+            must_not: Vec::new(),
+            current_doc: 0,
+        };
+        scorer.current_doc = scorer.find_next_match();
+        scorer
+    }
+
     fn find_next_match(&mut self) -> DocId {
         if self.must.is_empty() && self.should.is_empty() {
             return TERMINATED;

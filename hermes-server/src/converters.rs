@@ -1077,6 +1077,9 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             attrs.push("fast".to_string());
         }
 
+        if entry.content_hash {
+            attrs.push("content_hash".to_string());
+        }
         if entry.primary_key {
             attrs.push("primary".to_string());
         }
@@ -2316,7 +2319,8 @@ mod tests {
     fn test_schema_to_sdl_roundtrip() {
         let input_sdl = r#"
             index documents {
-                field id: text<raw> [indexed, stored]
+                field id: text<raw> [primary, indexed, stored]
+                field content_hash: bytes [stored, content_hash]
                 field title: text<en_stem> [indexed, stored]
                 field uris: text<default> [indexed, stored<multi>]
                 field price: f64 [indexed, fast]
@@ -2377,6 +2381,11 @@ mod tests {
             assert_eq!(
                 orig.primary_key, reparsed.primary_key,
                 "primary_key mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.content_hash, reparsed.content_hash,
+                "content_hash mismatch for {}",
                 orig.name
             );
             assert_eq!(

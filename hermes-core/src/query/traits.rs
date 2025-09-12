@@ -22,6 +22,8 @@ pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 
 /// load their own internal data.
 #[derive(Debug, Clone, Default)]
 pub struct ScorerOptions {
+    /// Required text clauses must expose membership before any top-k cutoff.
+    pub(crate) complete_text_matches: bool,
     /// Eligibility pushed into candidate collectors; never a scoring feature.
     pub(crate) eligibility: Option<std::sync::Arc<DocBitset>>,
     pub collect_positions: bool,
@@ -47,6 +49,7 @@ pub struct ScorerOptions {
 impl ScorerOptions {
     pub const fn with_positions() -> Self {
         Self {
+            complete_text_matches: false,
             eligibility: None,
             collect_positions: true,
             initial_threshold: 0.0,
@@ -61,6 +64,7 @@ impl ScorerOptions {
     /// space.
     pub fn without_threshold(&self) -> Self {
         Self {
+            complete_text_matches: self.complete_text_matches,
             eligibility: self.eligibility.clone(),
             collect_positions: self.collect_positions,
             initial_threshold: 0.0,
@@ -71,6 +75,13 @@ impl ScorerOptions {
                 .map(super::SharedThreshold::budget_only),
             lsp_plan: None,
             global_stats: self.global_stats.clone(),
+        }
+    }
+
+    pub(crate) fn for_required_clause(&self) -> Self {
+        Self {
+            complete_text_matches: true,
+            ..self.without_threshold()
         }
     }
 

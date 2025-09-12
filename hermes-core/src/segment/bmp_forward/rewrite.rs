@@ -66,7 +66,9 @@ pub(crate) fn write_forward_sources(
             remaining = remaining.checked_sub(bytes).ok_or_else(|| Error::Schema(
                 "BMP forward materialization exceeds the reorder memory budget; increase bp-memory-budget-mb".into()))?;
             slots = Vec::with_capacity(bmp.num_real_docs() as usize);
-            bmp.visit_real_slots_for_rewrite(|slot| slots.push(slot as u32))?;
+            bmp.visit_real_slots_for_rewrite(&|| cancelled(cancellation), |slot| {
+                slots.push(slot as u32)
+            })?;
             slots.sort_unstable_by_key(|&slot| bmp.virtual_to_doc(slot));
             offsets = Vec::with_capacity(slots.len());
             log::info!(

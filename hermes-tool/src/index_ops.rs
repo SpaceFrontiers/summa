@@ -736,7 +736,7 @@ pub async fn upsert_row(index_path: PathBuf, json: String) -> Result<()> {
     writer.init_primary_key_dedup().await?;
     let doc =
         Document::from_json(&value, &writer.schema()).context("invalid replacement document")?;
-    writer.upsert_document(doc)?;
+    writer.upsert_document(doc).await?;
     let result = writer.commit().await;
     finish_local_maintenance(writer, result).await?;
     info!("Committed replacement document");

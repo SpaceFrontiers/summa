@@ -1,9 +1,9 @@
 # Row deletion, upserts, and compaction
 
 Status: implemented in native/portable core, CLI, gRPC server and broker,
-Python and TypeScript clients, and WASM LocalIndex. Index metadata format 7 is
-required; format 6 metadata (1.8.121..=1.8.133) is upgraded on open because it
-differs only by the optional `deletions` entry. Readers upgrade in memory with a
+Python and TypeScript clients, and WASM LocalIndex. Index metadata format 8 is
+required; formats 6 and 7 upgrade on open without rewriting segments. Format 7
+added optional `deletions`; format 8 protects the optional content-hash setting. Readers upgrade in memory with a
 `log::warn!`; writers persist the new stamp on open, after which older releases
 cannot open the index (they would silently drop deletion generations). Segments
 written before 1.8.125 still fail at segment open (BMP blob magic) and need a
@@ -31,7 +31,7 @@ with `indexed: true, stored: false`.
 
 The replacement operation is named **upsert**: insert when the primary key is
 absent, otherwise replace the complete document and all its chunks. The native
-and portable writer expose `upsert_document`; clients expose their corresponding
+and portable writer expose async `upsert_document`; clients expose their corresponding
 single/batch helpers; the CLI command is `upsert`; IndexService exposes
 `UpsertDocuments(UpsertDocumentsRequest)`. This renames the unreleased API on this
 branch, including its gRPC method path. Publication, request limits, and persisted
@@ -41,7 +41,7 @@ formats are unchanged, with the same execution and allocation costs.
 let mut writer = index.writer();
 writer.init_primary_key_dedup().await?;
 writer.delete_primary_key("old-key")?;
-writer.upsert_document(replacement)?; // complete document, including its key
+writer.upsert_document(replacement).await?; // complete document, including its key
 writer.commit().await?;
 reader.reload().await?;
 
@@ -56,6 +56,9 @@ replace the entire document; they are not partial field patches. A rejected
 queue admission rolls back that call's staged deletion. Commit publishes all
 staged deletions and replacement insertions together; prepared-commit abort
 rolls them back together. Keys are exact, case-sensitive primary-field values.
+
+With an optional [content-hash field](content-deduplication.md), matching committed
+live rows are accepted no-ops. Pending deletions disable that comparison.
 
 One insertion/upsert per key is allowed in a pending commit. Commit before
 deleting or upserting a key that already has a pending insertion; attempts return
@@ -85,8 +88,8 @@ Deletion requests admit at most 100,000 keys and 8 MiB of key bytes. Replacement
 requests admit at most 1,000 documents and 32 MiB of encoded protobuf data. Both
 server and broker check envelope limits before lookup, conversion or admission.
 The core's cumulative pending-key limits still apply across requests. Server
-mutation batches hold the existing exclusive writer lock through synchronous
-staging on blocking workers; cancellation while waiting starts no operation.
+mutation batches hold the existing exclusive writer lock through
+staging on blocking workers (async stored-hash reads are driven by their runtime handle); cancellation while waiting starts no operation.
 Conversion and staging share four application-wide admission permits, retained
 by started workers even if their request is cancelled. Commit retains its
 existing owned finalizer and reader publication. Batch conversion is bounded and
@@ -218,16 +221,16 @@ physical/deleted counts and their weighted ratio. Broker aggregation sums counts
 before computing the ratio. Compaction completion logs record input rows, removed
 rows, share, output rows and elapsed time; failures remain observable.
 
-| Representation                          | Treatment                                                                                                     |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Text/numeric postings                   | Drop dead entries; remap IDs and positions; rebuild affected terms and conservative bounds                    |
-| Chunked text                            | Drop dead rows' chunks, preserve value ordinals, remap virtual IDs and lengths                                |
-| Fast fields                             | Rebuild bounded blocks, preserving missing/multi-value offsets and text dictionaries                          |
-| Stored fields                           | Copy intact dictionary-free compressed blocks; recompress affected or dictionary-dependent blocks             |
-| BMP                                     | Filter record maps and reuse the bounded BMP writer with identity reblocking; copy surviving forward payloads |
-| MaxScore sparse                         | Remap addresses; preserve quantized weight bits and their original affine scale/minimum                       |
-| Flat vectors                            | Copy surviving encoded values and remap document labels and ordinals                                          |
-| TQ, IVF-TQ, binary IVF, ScaNN AH/binary | Preserve codes, assignments, scales, codebooks and fingerprints; repack partial SIMD blocks                   |
+| Representation                          | Treatment                                                                                                       |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Text/numeric postings                   | Skip dead blocks; copy compatible gaps/TFs and position blocks; rebuild affected blocks and conservative bounds |
+| Chunked text                            | Drop dead rows' chunks, preserve value ordinals, remap virtual IDs and lengths                                  |
+| Fast fields                             | Copy intact blocks/local dictionaries; batch-rebuild mixed blocks with missing/multi-value semantics            |
+| Stored fields                           | Copy intact dictionary-free compressed blocks; recompress affected or dictionary-dependent blocks               |
+| BMP                                     | Filter record maps and reuse the bounded BMP writer with identity reblocking; copy surviving forward payloads   |
+| MaxScore sparse                         | Remap addresses; preserve quantized weight bits and their original affine scale/minimum                         |
+| Flat vectors                            | Copy surviving encoded values and remap document labels and ordinals                                            |
+| TQ, IVF-TQ, binary IVF, ScaNN AH/binary | Preserve codes, assignments, scales, codebooks and fingerprints; repack partial SIMD blocks                     |
 
 New `.rowstats` numeric columns preserve information absent from the old formats:
 for each indexed text field, zero means missing and `token_count + 1` records
@@ -239,6 +242,54 @@ Legacy standalone segments without required row statistics explicitly refuse
 compaction; rebuilding from stored fields would lose indexed-only information.
 
 ## Cost and validation
+
+### Compaction copy and streaming paths
+
+Compaction retains the current metadata format, stable survivor ordering, exact encoded vector
+values, and the existing publication/cancellation protocol. Physical row mapping
+shares the reader's visibility bitmap and adds one u32 population-count prefix
+per 64 rows plus a sentinel: `4 * (ceil(physical_rows / 64) + 1)` bytes for mixed
+visibility. Forward mapping uses a rank lookup. Survivor traversal scans set bits;
+posting bounds are computed from the source rows without reverse lookups. Identity
+and empty mappings retain no map allocation. Chunk mappings own a bitmap plus
+the same prefix table, about 0.1875 bytes per physical chunk. Their surviving
+chunk labels/norms are admitted separately before allocating output builders.
+
+Column compaction preserves complete live source blocks and their local
+dictionaries, omits dead blocks, and batch-decodes mixed blocks in source ranges
+of at most 4096 rows. Text values use the source block's dictionary without
+materializing a merged global dictionary. The existing column encoder owns all
+rebuilding. Block boundaries may change, but copied payload bytes and decoded
+values are preserved.
+
+Posting compaction retains admitted encoded directories and reads payload blocks
+on demand. Entirely dead document intervals skip payload I/O. A fully live
+interval has a constant row-ID shift, so its header/directory can be remapped
+while copying encoded gaps and frequencies. A deletion inside a block's address
+span requires rebuilding gaps even when the deleted row did not match that term.
+Mixed blocks decode at most 128 postings with the existing codec. Their survivors
+fill a shared 128-posting output buffer across mixed source blocks; the buffer
+flushes before a copied block or at the end of the term. This avoids retaining
+one tiny block per sparse group of survivors. A fixed 16 KiB reserve covers
+posting/position codec buffers before the remaining budget is divided among
+encoded directories. Current position
+streams copy complete selected blocks and decode at most one partial block at a
+time. Output cursors, directories and conservative score bounds are rebuilt.
+Decoded survivors/positions are never retained for an entire current-format term.
+Encoded directories remain budgeted; legacy position lists use an explicitly
+admitted whole-list fallback with additional room for decoding.
+
+Flat-vector payloads use bounded batches (at most 4 MiB), skip all-dead batches
+before I/O, and copy contiguous surviving slices within mixed batches. ANN
+ordinals and binary codes also use interval copies. Clean ANN runs and aligned
+TQ/ScaNN packed groups preserve bytes; unaligned groups use the owning repacker.
+BMP forward payloads copy survivor intervals. Identity BMP reblocking skips the
+unused inverse map and forward graph; its surviving record map and identity
+permutation remain budgeted allocations. BMP block membership/pruning metadata
+still require rebuilding.
+
+Ordinary merges, background thresholds, concurrency and ANN training are
+unchanged. Fusing the final merge and compaction remains separate work.
 
 Visibility takes one bit per physical row per held reader generation, plus the
 writer's mask and live-key bitmap for dirty PK segments. Mask loading has a
@@ -254,25 +305,21 @@ global ordinal remapping. Its target set is bounded by the pending-key limit;
 it avoids decoding and hashing strings for every row. Cancellation interrupts
 the scan, and the manager retains the publication lock until the atomic commit
 completes. Deletion writes masks/metadata, not corpus payloads.
-The physical row space is bounded by u32. Compaction requires at least
-1 MiB scratch; at most a quarter is admitted for its two u32 row maps
-(`4 * (physical_rows + live_rows)` bytes). Chunk maps, column blocks, store decompression,
-per-term postings/positions, sparse directories and ANN packing have additional
-budget checks. Oversized work errors before publication rather than silently
-truncating data. Increase the budget or use smaller segments when a term or map
-cannot fit. Shared maintenance capacity bounds concurrent compactions.
+The physical row space is bounded by u32. Compaction requires at least 1 MiB
+scratch; at most a quarter is admitted for the physical map's prefix directory.
+Chunk maps, column blocks, store decompression, posting/position directories,
+sparse directories and ANN packing have additional budget checks. Oversized work
+errors before publication rather than silently truncating data. Shared maintenance
+capacity bounds concurrent compactions. The scratch limit does not include the
+immutable input reader's existing residency or the output directory's storage
+(for example, output bytes retained by a RAM directory).
 
-Compaction retains a bounded prefix of encoded
-fast-column chunks to avoid encoding them again after writing the leading block
-directory. It reserves at most a quarter of remaining scratch for that cache
-(including vector capacities), a quarter for directory entries, and half for
-the chunk encoder. Uncached chunks retain the existing deterministic two-pass
-fallback. Values use the existing column decoder without allocating
-a temporary vector per row. Both paths preserve complete `.fast` output bytes.
-Physical row maps reserve from the validated live count: `4 * (physical + live)`
-bytes instead of `8 * physical`. Chunk maps retain their conservative upper bound
-where the survivor count is not already known. A map exceeding its
-admitted live count fails before growing its allocation.
+Compaction retains a bounded prefix of rebuilt fast-column chunks to avoid
+encoding them again after writing the leading block directory. It reserves at
+most a quarter of remaining scratch for that cache (including vector capacities),
+a quarter for descriptors, and half for the chunk encoder. Uncached mixed chunks
+retain the deterministic two-pass fallback. Cached and uncached paths produce
+identical output bytes. Clean blocks require neither pass through the encoder.
 Profiling the small numeric-only merge fixture also found repeated construction
 of the FST registry for an empty term dictionary. The canonical empty block
 index bytes are cached once through the existing encoder, copying this fixed-size artifact for

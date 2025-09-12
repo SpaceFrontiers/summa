@@ -135,7 +135,7 @@ impl PhraseQuery {
 
 /// Ordered maps need only one document's ordinals and one matching-chunk
 /// lookahead. Reordered maps retain the stable, all-document aggregation.
-fn fold_chunked_phrase_scorer<'a, S: Scorer + 'a>(
+pub(super) fn fold_chunked_phrase_scorer<'a, S: Scorer + 'a>(
     mut scorer: S,
     chunk_map: crate::segment::chunk_map::ChunkMap,
     field_id: u32,

@@ -29,6 +29,12 @@ pub struct SchemaFieldConfig {
     /// Dimension for dense_vector fields
     #[serde(default)]
     pub dimension: usize,
+    /// Text primary key, matching the SDL `primary` attribute.
+    #[serde(default, alias = "primary", skip_serializing_if = "std::ops::Not::not")]
+    pub primary_key: bool,
+    /// Stored content fingerprint for unchanged upserts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_hash: bool,
 }
 
 fn default_true() -> bool {
@@ -53,44 +59,42 @@ impl SchemaConfig {
             builder.set_max_l1_phrase_terms(limit);
         }
 
+        if self.fields.iter().filter(|field| field.primary_key).count() > 1 {
+            return Err(Error::Schema("at most one primary key is allowed".into()));
+        }
         for field in &self.fields {
-            match field.field_type.as_str() {
-                "text" => {
-                    builder.add_text_field(&field.name, field.indexed, field.stored);
-                }
-                "u64" => {
-                    builder.add_u64_field(&field.name, field.indexed, field.stored);
-                }
-                "i64" => {
-                    builder.add_i64_field(&field.name, field.indexed, field.stored);
-                }
-                "f64" => {
-                    builder.add_f64_field(&field.name, field.indexed, field.stored);
-                }
-                "bytes" => {
-                    builder.add_bytes_field(&field.name, field.stored);
-                }
-                "json" => {
-                    builder.add_json_field(&field.name, field.stored);
-                }
+            if field.primary_key && field.field_type != "text" {
+                return Err(Error::Schema("primary key must be text".into()));
+            }
+            let id = match field.field_type.as_str() {
+                "text" => builder.add_text_field(&field.name, field.indexed, field.stored),
+                "u64" => builder.add_u64_field(&field.name, field.indexed, field.stored),
+                "i64" => builder.add_i64_field(&field.name, field.indexed, field.stored),
+                "f64" => builder.add_f64_field(&field.name, field.indexed, field.stored),
+                "bytes" => builder.add_bytes_field(&field.name, field.stored),
+                "json" => builder.add_json_field(&field.name, field.stored),
                 "sparse_vector" => {
-                    builder.add_sparse_vector_field(&field.name, field.indexed, field.stored);
+                    builder.add_sparse_vector_field(&field.name, field.indexed, field.stored)
                 }
-                "dense_vector" => {
-                    builder.add_dense_vector_field(
-                        &field.name,
-                        field.dimension,
-                        field.indexed,
-                        field.stored,
-                    );
-                }
-                other => {
-                    return Err(Error::Schema(format!("Unknown field type: {}", other)));
-                }
+                "dense_vector" => builder.add_dense_vector_field(
+                    &field.name,
+                    field.dimension,
+                    field.indexed,
+                    field.stored,
+                ),
+                other => return Err(Error::Schema(format!("Unknown field type: {}", other))),
+            };
+            if field.primary_key {
+                builder.set_primary_key(id);
+            }
+            if field.content_hash {
+                builder.set_content_hash(id);
             }
         }
 
-        Ok(builder.build())
+        let schema = builder.build();
+        schema.validate_content_hash()?;
+        Ok(schema)
     }
 }
 
@@ -256,6 +260,25 @@ mod tests {
         let json = r#"{"fields": [{"name": "text", "type": "text"}]}"#;
         let schema = parse_schema(json).unwrap();
         assert!(schema.get_field("text").is_some());
+    }
+
+    #[test]
+    fn json_schema_configures_content_hash_and_rejects_invalid_combinations() {
+        let json = r#"{"fields":[{"name":"id","type":"text","primary_key":true},{"name":"digest","type":"bytes","stored":true,"content_hash":true}]}"#;
+        let schema = parse_schema(json).unwrap();
+        assert_eq!(schema.primary_field(), schema.get_field("id"));
+        assert_eq!(schema.content_hash_field(), schema.get_field("digest"));
+        let config: SchemaConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parse_schema(&serde_json::to_string(&config).unwrap())
+                .unwrap()
+                .content_hash_field(),
+            schema.content_hash_field()
+        );
+        assert!(
+            parse_schema(&json.replace("\"primary_key\":true", "\"primary_key\":false")).is_err()
+        );
+        assert!(parse_schema(&json.replace("\"stored\":true", "\"stored\":false")).is_err());
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub use positions::{
     MAX_ELEMENT_ORDINAL, MAX_TOKEN_POSITION, PositionPostingIterator, PositionPostingList,
     PostingWithPositions, decode_element_ordinal, decode_token_position, encode_position,
 };
+#[cfg(feature = "native")]
+pub(crate) use positions_v2::PositionRangeSource;
 pub(crate) use positions_v2::TermPositionCursor;
 pub use positions_v2::{
     POSITION_STREAM_BLOCK, PositionStream, PositionStreamEncoder, TermPositions,
@@ -55,6 +57,8 @@ pub use posting::{
     BLOCK_SIZE as POSTING_BLOCK_SIZE, BlockPostingIterator, BlockPostingList, Posting,
     PostingCodec, PostingList, PostingListIterator, TERMINATED,
 };
+#[cfg(feature = "native")]
+pub(crate) use posting::{PostingBlockSource, PostingStreamWriter};
 pub use posting_common::{
     BLOCK_SIZE as COMMON_BLOCK_SIZE, RoundedBitWidth, SkipEntry, SkipList, pack_deltas_fixed,
     read_doc_id_block, read_vint, unpack_deltas_fixed, write_doc_id_block, write_vint,

@@ -53,17 +53,20 @@ fn count_frequencies_bounded<T: FrequencyParallelSafe>(
     items: &[T],
     num_terms: usize,
     available_bytes: usize,
-    count_item: impl Fn(&T, &mut [u32]) + FrequencyParallelSafe,
-) -> Option<Vec<u32>> {
+    count_item: impl Fn(&T, &mut [u32]) -> crate::Result<()> + FrequencyParallelSafe,
+) -> crate::Result<Option<Vec<u32>>> {
     if num_terms == 0 {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
     }
-    let table_bytes = num_terms
-        .checked_mul(std::mem::size_of::<u32>())?
-        .checked_add(std::mem::size_of::<Vec<u32>>())?;
-    let affordable_tables = available_bytes.checked_div(table_bytes)?;
+    let Some(table_bytes) = num_terms
+        .checked_mul(std::mem::size_of::<u32>())
+        .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<u32>>()))
+    else {
+        return Ok(None);
+    };
+    let affordable_tables = available_bytes / table_bytes;
     if affordable_tables == 0 {
-        return None;
+        return Ok(None);
     }
 
     #[cfg(feature = "native")]
@@ -78,24 +81,25 @@ fn count_frequencies_bounded<T: FrequencyParallelSafe>(
                 .map(|chunk| {
                     let mut counts = vec![0u32; num_terms];
                     for item in chunk {
-                        count_item(item, &mut counts);
+                        count_item(item, &mut counts)?;
                     }
-                    counts
+                    Ok(counts)
                 })
-                .reduce_with(|mut left, right| {
+                .try_reduce_with(|mut left, right| {
                     for (total, count) in left.iter_mut().zip(right) {
                         *total = total.saturating_add(count);
                     }
-                    left
-                });
+                    Ok(left)
+                })
+                .transpose();
         }
     }
 
     let mut counts = vec![0u32; num_terms];
     for item in items {
-        count_item(item, &mut counts);
+        count_item(item, &mut counts)?;
     }
-    Some(counts)
+    Ok(Some(counts))
 }
 
 /// Retain the lowest-frequency eligible dimensions while the frequency table
@@ -443,13 +447,19 @@ pub(crate) struct ForwardIndex {
 
 /// Build CSR offsets (prefix sums) from per-entity counts. u64 output — the
 /// sum of counts legitimately exceeds u32::MAX on large reorder passes.
-fn build_csr_offsets(counts: &[u32]) -> Vec<u64> {
+fn build_csr_offsets(
+    counts: &[u32],
+    check_cancel: &(impl Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<Vec<u64>> {
     let mut offsets = Vec::with_capacity(counts.len() + 1);
     offsets.push(0u64);
-    for &c in counts {
+    for (i, &c) in counts.iter().enumerate() {
+        if i.is_multiple_of(256) {
+            check_cancel()?;
+        }
         offsets.push(offsets.last().unwrap() + c as u64);
     }
-    offsets
+    Ok(offsets)
 }
 
 impl ForwardIndex {
@@ -517,14 +527,16 @@ impl ForwardIndex {
 /// is the dense real index or `u32::MAX` for padding.
 pub(crate) fn build_vid_maps(
     bmp: &crate::segment::reader::bmp::BmpIndex,
+    check_cancel: &(impl Fn() -> crate::Result<()> + Sync),
 ) -> crate::Result<(Vec<u32>, Vec<u32>)> {
+    check_cancel()?;
     let ids = bmp.doc_map_ids_slice();
     let num_virtual = bmp.num_virtual_docs as usize;
     let expected_real = bmp.num_real_docs() as usize;
     let mut virtual_to_real = vec![u32::MAX; num_virtual];
     let mut real_to_virtual = Vec::with_capacity(expected_real);
     debug_assert_eq!(ids.len(), virtual_to_real.len() * 4);
-    bmp.visit_real_slots_for_rewrite(|vid| {
+    bmp.visit_real_slots_for_rewrite(check_cancel, |vid| {
         virtual_to_real[vid] = real_to_virtual.len() as u32;
         real_to_virtual.push(vid as u32);
     })?;
@@ -550,13 +562,15 @@ struct BlockJob {
 fn build_block_jobs(
     bmps: &[&crate::segment::reader::bmp::BmpIndex],
     vid_maps: &[(Vec<u32>, Vec<u32>)],
-) -> Vec<BlockJob> {
+    check_cancel: &(impl Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<Vec<BlockJob>> {
     let total_blocks: usize = bmps.iter().map(|b| b.num_blocks as usize).sum();
     let mut jobs = Vec::with_capacity(total_blocks);
     for (src, (bmp, (v2r, _))) in bmps.iter().zip(vid_maps).enumerate() {
         let block_size = bmp.bmp_block_size as usize;
         let mut real_cursor = 0u32;
         for block_id in 0..bmp.num_blocks as usize {
+            check_cancel()?;
             let vid_start = block_id * block_size;
             let vid_end = ((block_id + 1) * block_size).min(v2r.len());
             let real_len = v2r[vid_start..vid_end]
@@ -572,7 +586,7 @@ fn build_block_jobs(
             real_cursor += real_len;
         }
     }
-    jobs
+    Ok(jobs)
 }
 
 fn visit_bmp_job(
@@ -581,12 +595,15 @@ fn visit_bmp_job(
     vid_maps: &[(Vec<u32>, Vec<u32>)],
     forward_views: &[Option<crate::segment::bmp_forward::ValidatedForward<'_>>],
     mut visit: impl FnMut(u32, u32),
-) {
+    check_cancel: &(impl Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<()> {
+    check_cancel()?;
     let bmp = bmps[job.src as usize];
     let (v2r, r2v) = &vid_maps[job.src as usize];
     if let Some(view) = &forward_views[job.src as usize] {
         let forward = bmp.forward().expect("validated forward source");
         for real in job.real_start..job.real_start + job.real_len {
+            check_cancel()?;
             let (doc, ordinal) = bmp.virtual_to_doc(r2v[real as usize]);
             let index = forward
                 .find(crate::segment::logical_address::LogicalUnit { doc, ordinal })
@@ -597,6 +614,7 @@ fn visit_bmp_job(
         }
     } else {
         for (dim, _, postings) in bmp.iter_block_terms(job.block_id) {
+            check_cancel()?;
             for posting in postings {
                 let vid = job.block_id as usize * bmp.bmp_block_size as usize
                     + posting.local_slot as usize;
@@ -609,6 +627,7 @@ fn visit_bmp_job(
             }
         }
     }
+    Ok(())
 }
 
 /// Build forward index from BmpIndex sources (single or multi-source).
@@ -633,7 +652,7 @@ pub(crate) fn build_forward_index_from_bmps(
 ) -> crate::Result<ForwardIndex> {
     let vid_maps: Vec<(Vec<u32>, Vec<u32>)> = bmps
         .iter()
-        .map(|bmp| build_vid_maps(bmp))
+        .map(|bmp| build_vid_maps(bmp, &|| Ok(())))
         .collect::<crate::Result<_>>()?;
     build_forward_index_from_bmps_with_maps(
         bmps,
@@ -641,6 +660,7 @@ pub(crate) fn build_forward_index_from_bmps(
         min_doc_freq,
         max_doc_freq,
         memory_budget_bytes,
+        &|| Ok(()),
     )
 }
 
@@ -653,7 +673,9 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     min_doc_freq: usize,
     max_doc_freq: usize,
     memory_budget_bytes: usize,
+    check_cancel: &(impl Fn() -> crate::Result<()> + Sync),
 ) -> crate::Result<ForwardIndex> {
+    check_cancel()?;
     debug_assert_eq!(bmps.len(), vid_maps.len());
     let total_docs: usize = vid_maps.iter().map(|(_, r2v)| r2v.len()).sum();
 
@@ -672,7 +694,8 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     // ascending vid order (see build_vid_maps), so each block owns a
     // contiguous real-id range — every phase below can process blocks in
     // parallel, writing disjoint slices.
-    let jobs = build_block_jobs(bmps, vid_maps);
+    let jobs = build_block_jobs(bmps, vid_maps, check_cancel)?;
+    check_cancel()?;
     let forward_views = bmps
         .iter()
         .zip(vid_maps)
@@ -681,6 +704,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
                 return Ok(None);
             };
             for &vid in r2v {
+                check_cancel()?;
                 let (doc, ordinal) = bmp.virtual_to_doc(vid);
                 if forward
                     .find(crate::segment::logical_address::LogicalUnit { doc, ordinal })
@@ -691,7 +715,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
                     ));
                 }
             }
-            forward.validate_payload().map(Some)
+            forward.validate_payload(check_cancel).map(Some)
         })
         .collect::<crate::Result<Vec<_>>>()?;
 
@@ -727,13 +751,21 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         max_dims,
         memory_budget_bytes.saturating_sub(jobs_bytes),
         |job, counts| {
-            visit_bmp_job(job, bmps, vid_maps, &forward_views, |_, dim| {
-                if let Some(total) = counts.get_mut(dim as usize) {
-                    *total = total.saturating_add(1);
-                }
-            });
+            visit_bmp_job(
+                job,
+                bmps,
+                vid_maps,
+                &forward_views,
+                |_, dim| {
+                    if let Some(total) = counts.get_mut(dim as usize) {
+                        *total = total.saturating_add(1);
+                    }
+                },
+                check_cancel,
+            )
         },
-    ) else {
+    )?
+    else {
         log::warn!(
             "[reorder] memory budget {} cannot hold a bounded dimension-frequency table; using identity order",
             crate::format_bytes(memory_budget_bytes as u64),
@@ -797,6 +829,7 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         });
     }
 
+    check_cancel()?;
     let mut term_remap = vec![u32::MAX; max_dims];
     for (compact_id, &(dim_id, _)) in eligible.iter().enumerate() {
         term_remap[dim_id as usize] = compact_id as u32;
@@ -817,16 +850,24 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     // Phase 2: count terms per doc (filtered) — per-block disjoint slices
     let mut counts = vec![0u32; total_docs];
     let fill_block_counts = |job: &BlockJob, out: &mut [u32]| {
-        visit_bmp_job(job, bmps, vid_maps, &forward_views, |real, dim| {
-            if term_remap.get(dim as usize).copied().unwrap_or(u32::MAX) != u32::MAX {
-                out[(real - job.real_start) as usize] += 1;
-            }
-        });
+        visit_bmp_job(
+            job,
+            bmps,
+            vid_maps,
+            &forward_views,
+            |real, dim| {
+                if term_remap.get(dim as usize).copied().unwrap_or(u32::MAX) != u32::MAX {
+                    out[(real - job.real_start) as usize] += 1;
+                }
+            },
+            check_cancel,
+        )
     };
     {
         let mut slices: Vec<(&BlockJob, &mut [u32])> = Vec::with_capacity(jobs.len());
         let mut rest: &mut [u32] = &mut counts;
         for job in &jobs {
+            check_cancel()?;
             let (head, tail) = rest.split_at_mut(job.real_len as usize);
             slices.push((job, head));
             rest = tail;
@@ -834,15 +875,17 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         #[cfg(feature = "native")]
         slices
             .into_par_iter()
-            .for_each(|(job, out)| fill_block_counts(job, out));
+            .try_for_each(|(job, out)| fill_block_counts(job, out))?;
         #[cfg(not(feature = "native"))]
         for (job, out) in slices {
-            fill_block_counts(job, out);
+            fill_block_counts(job, out)?;
         }
     }
 
     // Phase 3: build CSR offsets (u64 — sums exceed u32::MAX at scale)
-    let offsets = build_csr_offsets(&counts);
+    check_cancel()?;
+    let offsets = build_csr_offsets(&counts, check_cancel)?;
+    check_cancel()?;
     let total = *offsets.last().unwrap() as usize;
     drop(counts);
 
@@ -852,22 +895,30 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     let fill_block_terms = |job: &BlockJob, global_real_start: usize, out: &mut [u32]| {
         let mut cursor = [0u32; 256];
         let base = offsets[global_real_start] as usize;
-        visit_bmp_job(job, bmps, vid_maps, &forward_views, |real, dim| {
-            let compact = term_remap.get(dim as usize).copied().unwrap_or(u32::MAX);
-            if compact != u32::MAX {
-                let local = (real - job.real_start) as usize;
-                let pos =
-                    offsets[global_real_start + local] as usize - base + cursor[local] as usize;
-                out[pos] = compact;
-                cursor[local] += 1;
-            }
-        });
+        visit_bmp_job(
+            job,
+            bmps,
+            vid_maps,
+            &forward_views,
+            |real, dim| {
+                let compact = term_remap.get(dim as usize).copied().unwrap_or(u32::MAX);
+                if compact != u32::MAX {
+                    let local = (real - job.real_start) as usize;
+                    let pos =
+                        offsets[global_real_start + local] as usize - base + cursor[local] as usize;
+                    out[pos] = compact;
+                    cursor[local] += 1;
+                }
+            },
+            check_cancel,
+        )
     };
     {
         let mut slices: Vec<(&BlockJob, usize, &mut [u32])> = Vec::with_capacity(jobs.len());
         let mut rest: &mut [u32] = &mut terms;
         let mut global_real = 0usize;
         for job in &jobs {
+            check_cancel()?;
             let len =
                 (offsets[global_real + job.real_len as usize] - offsets[global_real]) as usize;
             let (head, tail) = rest.split_at_mut(len);
@@ -878,13 +929,14 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
         #[cfg(feature = "native")]
         slices
             .into_par_iter()
-            .for_each(|(job, g, out)| fill_block_terms(job, g, out));
+            .try_for_each(|(job, g, out)| fill_block_terms(job, g, out))?;
         #[cfg(not(feature = "native"))]
         for (job, g, out) in slices {
-            fill_block_terms(job, g, out);
+            fill_block_terms(job, g, out)?;
         }
     }
 
+    check_cancel()?;
     Ok(ForwardIndex {
         terms,
         offsets,
@@ -910,25 +962,32 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
 pub(crate) fn build_forward_index_from_blocks(
     bmps: &[&crate::segment::reader::bmp::BmpIndex],
     memory_budget_bytes: usize,
-) -> ForwardIndex {
+    check_cancel: &(impl Fn() -> crate::Result<()> + Sync),
+) -> crate::Result<ForwardIndex> {
+    check_cancel()?;
     let total_blocks: usize = bmps.iter().map(|b| b.num_blocks as usize).sum();
     if total_blocks == 0 {
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited: false,
-        };
+        });
     }
 
     // (source, block) pairs in global block order — the parallel unit.
     let blocks: Vec<(u32, u32)> = bmps
         .iter()
         .enumerate()
-        .flat_map(|(src, bmp)| (0..bmp.num_blocks).map(move |b| (src as u32, b)))
-        .collect();
+        .flat_map(|(src, bmp)| {
+            (0..bmp.num_blocks).map(move |b| {
+                check_cancel()?;
+                Ok((src as u32, b))
+            })
+        })
+        .collect::<crate::Result<_>>()?;
 
     // Phase 1: bounded worker-local frequency tables. This is the same policy
     // as record-level BP and avoids hot atomic increments on common terms.
@@ -945,38 +1004,42 @@ pub(crate) fn build_forward_index_from_blocks(
         log::warn!(
             "[reorder] block-level frequency table exceeds memory budget; using identity order"
         );
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited: true,
-        };
+        });
     }
     let Some(dim_bf) = count_frequencies_bounded(
         &blocks,
         max_dims,
         memory_budget_bytes.saturating_sub(blocks_bytes),
         |&(src, block_id), counts| {
+            check_cancel()?;
             for (dim_id, _, _) in bmps[src as usize].iter_block_terms(block_id) {
+                check_cancel()?;
                 if let Some(count) = counts.get_mut(dim_id as usize) {
                     *count = count.saturating_add(1);
                 }
             }
+            Ok(())
         },
-    ) else {
+    )?
+    else {
         log::warn!(
             "[reorder] block-level frequency table cannot fit its bounded allocation; using identity order"
         );
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited: true,
-        };
+        });
     };
 
     let max_bf = (total_blocks as f64 * 0.9) as usize;
@@ -1005,14 +1068,14 @@ pub(crate) fn build_forward_index_from_blocks(
     }
 
     if eligible.is_empty() {
-        return ForwardIndex {
+        return Ok(ForwardIndex {
             terms: Vec::new(),
             offsets: Vec::new(),
             num_terms: 0,
             parallel_bisect_lanes: 1,
             cache_gains: false,
             budget_limited,
-        };
+        });
     }
 
     let mut term_remap = vec![u32::MAX; max_dims];
@@ -1030,42 +1093,52 @@ pub(crate) fn build_forward_index_from_blocks(
 
     // Phase 2+3: counts and CSR fill — one entity per block, so each block
     // maps to a single count cell and a contiguous terms range.
-    let count_remapped = |&(src, block_id): &(u32, u32)| -> u32 {
-        bmps[src as usize]
-            .iter_block_terms(block_id)
-            .filter(|(dim_id, _, _)| {
-                term_remap
-                    .get(*dim_id as usize)
-                    .copied()
-                    .unwrap_or(u32::MAX)
-                    != u32::MAX
-            })
-            .count() as u32
+    let count_remapped = |&(src, block_id): &(u32, u32)| -> crate::Result<u32> {
+        check_cancel()?;
+        let mut count = 0;
+        for (dim_id, _, _) in bmps[src as usize].iter_block_terms(block_id) {
+            check_cancel()?;
+            check_cancel()?;
+            if term_remap.get(dim_id as usize).copied().unwrap_or(u32::MAX) != u32::MAX {
+                count += 1;
+            }
+        }
+        Ok(count)
     };
     #[cfg(feature = "native")]
-    let counts: Vec<u32> = blocks.par_iter().map(count_remapped).collect();
+    let counts: Vec<u32> = blocks
+        .par_iter()
+        .map(count_remapped)
+        .collect::<crate::Result<_>>()?;
     #[cfg(not(feature = "native"))]
-    let counts: Vec<u32> = blocks.iter().map(count_remapped).collect();
+    let counts: Vec<u32> = blocks
+        .iter()
+        .map(count_remapped)
+        .collect::<crate::Result<_>>()?;
 
-    let offsets = build_csr_offsets(&counts);
+    let offsets = build_csr_offsets(&counts, check_cancel)?;
     let total = *offsets.last().unwrap() as usize;
     drop(counts);
 
     let mut terms = vec![0u32; total];
-    let fill_block = |&(src, block_id): &(u32, u32), out: &mut [u32]| {
+    let fill_block = |&(src, block_id): &(u32, u32), out: &mut [u32]| -> crate::Result<()> {
+        check_cancel()?;
         let mut n = 0usize;
         for (dim_id, _, _) in bmps[src as usize].iter_block_terms(block_id) {
+            check_cancel()?;
             let compact = term_remap.get(dim_id as usize).copied().unwrap_or(u32::MAX);
             if compact != u32::MAX {
                 out[n] = compact;
                 n += 1;
             }
         }
+        Ok(())
     };
     {
         let mut slices: Vec<(&(u32, u32), &mut [u32])> = Vec::with_capacity(blocks.len());
         let mut rest: &mut [u32] = &mut terms;
         for (gb, b) in blocks.iter().enumerate() {
+            check_cancel()?;
             let len = (offsets[gb + 1] - offsets[gb]) as usize;
             let (head, tail) = rest.split_at_mut(len);
             slices.push((b, head));
@@ -1074,14 +1147,15 @@ pub(crate) fn build_forward_index_from_blocks(
         #[cfg(feature = "native")]
         slices
             .into_par_iter()
-            .for_each(|(b, out)| fill_block(b, out));
+            .try_for_each(|(b, out)| fill_block(b, out))?;
         #[cfg(not(feature = "native"))]
         for (b, out) in slices {
-            fill_block(b, out);
+            fill_block(b, out)?;
         }
     }
 
-    ForwardIndex {
+    check_cancel()?;
+    Ok(ForwardIndex {
         terms,
         offsets,
         num_terms,
@@ -1093,7 +1167,7 @@ pub(crate) fn build_forward_index_from_blocks(
             parallel_bisect_lanes,
         ),
         budget_limited,
-    }
+    })
 }
 
 // ── Recursive Graph Bisection ────────────────────────────────────────────
@@ -2691,7 +2765,9 @@ mod tests {
         let frequencies = count_frequencies_bounded(&items, 7, 16 * 1024, |item, counts| {
             let term = *item as usize % counts.len();
             counts[term] += 1;
+            Ok(())
         })
+        .unwrap()
         .unwrap();
         assert_eq!(frequencies.iter().sum::<u32>(), items.len() as u32);
         for (term, &frequency) in frequencies.iter().enumerate() {
@@ -2710,7 +2786,9 @@ mod tests {
     #[test]
     fn bounded_frequency_count_rejects_an_undersized_budget() {
         assert!(
-            count_frequencies_bounded(&[0u32], 32, 32, |_, _| {}).is_none(),
+            count_frequencies_bounded(&[0u32], 32, 32, |_, _| Ok(()))
+                .unwrap()
+                .is_none(),
             "one complete dense frequency table must fit before counting"
         );
     }
@@ -2917,7 +2995,7 @@ mod tests {
     #[test]
     fn test_csr_offsets_do_not_wrap_past_u32() {
         let counts = [1_500_000_000u32; 3]; // 4.5B total > u32::MAX
-        let offsets = build_csr_offsets(&counts);
+        let offsets = build_csr_offsets(&counts, &|| Ok(())).unwrap();
         assert_eq!(
             offsets,
             vec![0, 1_500_000_000, 3_000_000_000, 4_500_000_000]

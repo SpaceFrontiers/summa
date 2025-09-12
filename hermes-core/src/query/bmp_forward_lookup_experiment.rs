@@ -146,7 +146,7 @@ fn measure_layout(index: &BmpIndex, layout: &str) {
         .filter_map(|(i, &term)| (mask & (1 << i) != 0).then_some(term))
         .collect();
     let forward = index.forward().unwrap();
-    let validated = forward.validate_payload().unwrap();
+    let validated = forward.validate_payload(&|| Ok(())).unwrap();
     assert!(index.dims() <= MAX_TABLE_DIMS);
     let mut table = vec![0u32; index.dims() as usize];
     refresh_table(&mut table, &[], &remaining);

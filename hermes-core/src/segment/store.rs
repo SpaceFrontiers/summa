@@ -1715,9 +1715,17 @@ impl<'a, W: Write> StoreMerger<'a, W> {
                     "store compaction cancelled",
                 ));
             }
-            let count = (entry.first_doc_id..entry.first_doc_id + entry.num_docs)
-                .filter(|&doc| rows.get(doc).is_some())
-                .count() as u32;
+            let end = entry
+                .first_doc_id
+                .checked_add(entry.num_docs)
+                .filter(|&end| end <= rows.physical())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "store block exceeds compaction map",
+                    )
+                })?;
+            let count = rows.count(entry.first_doc_id..end);
             if count == 0 {
                 continue;
             }

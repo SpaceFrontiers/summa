@@ -64,6 +64,7 @@ pub(super) fn document_key(doc: &crate::dsl::Document, field: crate::Field) -> R
 /// This avoids loading DimensionTables, SSTable FSTs, bloom filters, etc.
 pub struct PkSegmentData {
     pub segment_id: String,
+    pub(super) content_hash: Option<super::content_hash::ContentHashLookup>,
     pub deletion_meta: Option<crate::segment::DeletionMeta>,
     pub alive_docs: Option<std::sync::Arc<crate::query::DocBitset>>,
     pub live_key_ordinals: Option<crate::query::DocBitset>,
@@ -112,7 +113,7 @@ pub struct PrimaryKeyIndex {
     committed_data: Vec<PkSegmentData>,
     /// Holds ref counts so segments aren't deleted while we hold readers.
     #[cfg(feature = "native")]
-    _snapshot: Option<SegmentSnapshot>,
+    _snapshot: Option<std::sync::Arc<SegmentSnapshot>>,
 }
 
 struct PrimaryKeyState {
@@ -133,7 +134,7 @@ impl PrimaryKeyIndex {
     #[cfg(feature = "native")]
     pub fn new(field: Field, pk_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) -> Self {
         let mut index = Self::build(field, pk_data);
-        index._snapshot = Some(snapshot);
+        index._snapshot = Some(std::sync::Arc::new(snapshot));
         index
     }
 
@@ -214,7 +215,7 @@ impl PrimaryKeyIndex {
                 delete_bytes: 0,
             }),
             committed_data: pk_data,
-            _snapshot: Some(snapshot),
+            _snapshot: Some(std::sync::Arc::new(snapshot)),
         }
     }
 
@@ -240,15 +241,69 @@ impl PrimaryKeyIndex {
                 .committed_data
                 .iter()
                 .map(|data| {
-                    data.alive_docs
+                    data.content_hash
                         .as_ref()
-                        .map_or(0, |bits| bits.bits.len() * 8)
+                        .map_or(0, |lookup| lookup.memory_bytes())
+                        + data
+                            .alive_docs
+                            .as_ref()
+                            .map_or(0, |bits| bits.bits.len() * 8)
                         + data
                             .live_key_ordinals
                             .as_ref()
                             .map_or(0, |bits| bits.bits.len() * 8)
                 })
                 .sum::<usize>()
+    }
+
+    /// Resolve committed content before staging any mutation. Pending insertions
+    /// are rejected even if their fingerprint would equal the committed value.
+    pub(super) fn content_hash_target(
+        &self,
+        key: &str,
+    ) -> Result<Option<super::content_hash::ContentHashTarget>> {
+        let state = self.state.lock();
+        if !state.bloom.may_contain(key.as_bytes()) {
+            return Ok(None);
+        }
+        if state.uncommitted.contains(key.as_bytes()) {
+            return Err(Error::Document(
+                "commit the pending insertion before deleting or upserting this key again".into(),
+            ));
+        }
+        if state.deletes.contains(key) {
+            return Ok(None);
+        }
+        drop(state);
+        let mut target = None;
+        for data in &self.committed_data {
+            let column = data
+                .fast_fields
+                .get(&self.field.0)
+                .ok_or_else(|| Error::Corruption("primary-key column is missing".into()))?;
+            if let Some(ordinal) = column.text_ordinal(key)
+                && data
+                    .live_key_ordinals
+                    .as_ref()
+                    .is_none_or(|keys| keys.contains(ordinal as u32))
+            {
+                if target.is_some() {
+                    return Err(Error::Corruption(
+                        "multiple live segments share a primary key".into(),
+                    ));
+                }
+                let lookup = data.content_hash.as_ref().ok_or_else(|| {
+                    Error::Internal("content hash lookup was not initialized".into())
+                })?;
+                target = Some(super::content_hash::ContentHashTarget {
+                    store: std::sync::Arc::clone(&lookup.store),
+                    row: lookup.row(ordinal, column, data)?,
+                    #[cfg(feature = "native")]
+                    snapshot: self._snapshot.clone(),
+                });
+            }
+        }
+        Ok(target)
     }
 
     /// Stage deletion of a committed key. A key can be replaced once per commit;
@@ -359,7 +414,7 @@ impl PrimaryKeyIndex {
     #[cfg(feature = "native")]
     pub fn refresh_incremental(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
         self.refresh_data(new_data, snapshot.segment_ids());
-        self._snapshot = Some(snapshot);
+        self._snapshot = Some(std::sync::Arc::new(snapshot));
     }
 
     pub(crate) fn refresh_data(&mut self, new_data: Vec<PkSegmentData>, segment_ids: &[String]) {
@@ -390,7 +445,7 @@ impl PrimaryKeyIndex {
     #[cfg(feature = "native")]
     pub fn refresh_replacement(&mut self, new_data: Vec<PkSegmentData>, snapshot: SegmentSnapshot) {
         self.replace_committed_data(new_data, snapshot.segment_ids());
-        self._snapshot = Some(snapshot);
+        self._snapshot = Some(std::sync::Arc::new(snapshot));
     }
 
     fn replace_committed_data(&mut self, new_data: Vec<PkSegmentData>, segment_ids: &[String]) {
@@ -740,11 +795,53 @@ pub(crate) async fn load_pk_segment_data<D: crate::directories::Directory>(
         }
         None => (None, None),
     };
-    Ok(PkSegmentData {
+    let data = PkSegmentData {
         deletion_meta,
         alive_docs,
         live_key_ordinals: None,
         segment_id: seg_id_str.to_string(),
+        content_hash: None,
         fast_fields,
-    })
+    };
+    if schema.content_hash_field().is_none() {
+        return Ok(data);
+    }
+    #[cfg(feature = "native")]
+    let cache = super::shared_store_cache(32 * 1024 * 1024);
+    #[cfg(not(feature = "native"))]
+    let cache = std::sync::Arc::new(crate::segment::SharedStoreCache::new(0));
+    let store = std::sync::Arc::new(
+        crate::segment::AsyncStoreReader::open(
+            dir.open_lazy(&files.store).await?,
+            dir as *const D as usize,
+            seg_id.0,
+            cache,
+        )
+        .await?,
+    );
+    let field = schema
+        .primary_field()
+        .ok_or_else(|| Error::Schema("content_hash requires a primary key".into()))?;
+    let prepare = move || {
+        let mut data = data;
+        let column = data
+            .fast_fields
+            .get(&field.0)
+            .ok_or_else(|| Error::Corruption("primary-key column is missing".into()))?;
+        let lookup = super::content_hash::ContentHashLookup::new(store, column, &data)?;
+        data.content_hash = Some(lookup);
+        Ok(data)
+    };
+    #[cfg(feature = "native")]
+    {
+        tokio::task::spawn_blocking(prepare)
+            .await
+            .map_err(|error| {
+                Error::Internal(format!("content hash lookup preparation failed: {error}"))
+            })?
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        prepare()
+    }
 }

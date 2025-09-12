@@ -34,6 +34,14 @@ fn cancellation_requested(cancellation: Option<&std::sync::atomic::AtomicBool>) 
     cancellation.is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
 }
 
+fn check_cancellation(cancellation: Option<&std::sync::atomic::AtomicBool>) -> Result<()> {
+    if cancellation_requested(cancellation) {
+        Err(crate::Error::IndexClosed)
+    } else {
+        Ok(())
+    }
+}
+
 /// Unique prefix for a pass's spilled grid-run temp files.
 ///
 /// MUST be unique per pass, not per (process, field): in a container the
@@ -1630,9 +1638,9 @@ fn reorder_bmp_field_blockwise(
     {
         use rayon::prelude::*;
         install_on_pool(rayon_pool.as_deref(), || {
-            bmp_refs
-                .par_iter()
-                .try_for_each(|bmp| bmp.visit_real_slots_for_rewrite(|_| {}))
+            bmp_refs.par_iter().try_for_each(|bmp| {
+                bmp.visit_real_slots_for_rewrite(&|| check_cancellation(cancellation), |_| {})
+            })
         })?;
     }
     let num_blocks_total = bmp_refs
@@ -1682,11 +1690,13 @@ fn reorder_bmp_field_blockwise(
         .min_partition_docs
         .map(|docs| (docs / effective_block_size).max(1));
     // Forward-index build is parallel too — keep it on the bounded pool.
-    let run_bp = || {
+    let run_bp = || -> Result<(Vec<u32>, bool)> {
         if bp_budget.time_budget.is_some_and(|budget| budget.is_zero()) {
-            return ((0..num_blocks_total as u32).collect(), false);
+            return Ok(((0..num_blocks_total as u32).collect(), false));
         }
-        let fwd = build_forward_index_from_blocks(&bmp_refs, memory_budget);
+        let fwd = build_forward_index_from_blocks(&bmp_refs, memory_budget, &|| {
+            check_cancellation(cancellation)
+        })?;
         if fwd.num_terms > 0 && num_blocks_total > sb {
             // The user-visible time budget covers the forward-index build as
             // well as graph refinement. Previously a multi-minute build ran
@@ -1697,7 +1707,7 @@ fn reorder_bmp_field_blockwise(
                     .time_budget
                     .map(|budget| budget.saturating_sub(bp_start.elapsed())),
             };
-            graph_bisection_with_progress(
+            Ok(graph_bisection_with_progress(
                 &fwd,
                 sb,
                 20,
@@ -1708,19 +1718,19 @@ fn reorder_bmp_field_blockwise(
                     field: field_name,
                     entity_kind: "blocks",
                 },
-            )
+            ))
         } else {
-            (
+            Ok((
                 (0..num_blocks_total as u32).collect(),
                 num_blocks_total <= sb || !fwd.budget_limited(),
-            )
+            ))
         }
     };
     let (perm, converged) = if let Some(ref pool) = rayon_pool {
         pool.install(run_bp)
     } else {
         run_bp()
-    };
+    }?;
     if cancellation_requested(cancellation) {
         return Err(crate::Error::IndexClosed);
     }
@@ -2236,6 +2246,7 @@ pub(crate) fn rewrite_bmp_field(
         );
     }
 
+    let zero_budget = bp_budget.time_budget.is_some_and(|d| d.is_zero());
     // Record-level BP needs both directions of every document map before it
     // can even start building the forward graph. Reserve that non-negotiable
     // peak up front; previously these vectors were allocated outside the
@@ -2244,7 +2255,11 @@ pub(crate) fn rewrite_bmp_field(
     // unconverged so a larger-budget/manual pass may still deepen it later.
     let record_map_bytes = sources.iter().fold(0usize, |total, (bmp, _)| {
         total
-            .saturating_add((bmp.num_virtual_docs as usize).saturating_mul(4))
+            .saturating_add(if zero_budget {
+                0
+            } else {
+                (bmp.num_virtual_docs as usize).saturating_mul(4)
+            })
             .saturating_add((bmp.num_real_docs() as usize).saturating_mul(4))
     });
     let record_rewrite_fixed_bytes = sources.iter().fold(0usize, |total, (bmp, _)| {
@@ -2304,7 +2319,21 @@ pub(crate) fn rewrite_bmp_field(
         install_on_pool(rayon_pool.as_deref(), || {
             bmp_refs
                 .par_iter()
-                .map(|bmp| build_vid_maps(bmp))
+                .map(|bmp| {
+                    if !zero_budget {
+                        return build_vid_maps(bmp, &|| {
+                            check_cancellation(cancellation.as_deref())
+                        });
+                    }
+                    // Identity reblocking never consumes the inverse map.
+                    // Preserve source virtual order, including interior padding.
+                    let mut real = Vec::with_capacity(bmp.num_real_docs() as usize);
+                    bmp.visit_real_slots_for_rewrite(
+                        &|| check_cancellation(cancellation.as_deref()),
+                        |vid| real.push(vid as u32),
+                    )?;
+                    Ok((Vec::new(), real))
+                })
                 .collect::<Result<_>>()
         })?
     };
@@ -2355,7 +2384,6 @@ pub(crate) fn rewrite_bmp_field(
     // forward-index build entirely, it would be discarded unread. Reported
     // unconverged, matching budgeted-pass semantics (a follow-up pass
     // deepens).
-    let zero_budget = bp_budget.time_budget.is_some_and(|d| d.is_zero());
 
     let (perm, converged) = if zero_budget {
         // No forward graph will consume virtual→real. Release it before
@@ -2389,6 +2417,7 @@ pub(crate) fn rewrite_bmp_field(
                 min_doc_freq,
                 max_doc_freq.max(1),
                 forward_budget,
+                &|| check_cancellation(cancellation.as_deref()),
             )
         };
         let fwd = if let Some(ref pool) = rayon_pool {

@@ -1508,49 +1508,69 @@ pub(crate) fn tq_repack_rows(
     let dim = code_size * 2;
     let header = if ivf { 128 } else { 64 };
     let block_bytes = TQ_BLOCK_LANES * code_size + header;
-    let mut values = vec![vec![0u8; dim]; TQ_BLOCK_LANES];
-    let mut scales = Vec::with_capacity(TQ_BLOCK_LANES);
-    let mut gammas = Vec::with_capacity(TQ_BLOCK_LANES);
+    let mut rows = rows;
+    let mut selected = [0usize; TQ_BLOCK_LANES];
+    let mut values = vec![0u8; dim * TQ_BLOCK_LANES];
+    let mut scales = [0.0; TQ_BLOCK_LANES];
+    let mut gammas = [0.0; TQ_BLOCK_LANES];
     let mut output = Vec::with_capacity(block_bytes);
     let mut bytes = 0;
-    let mut emit =
-        |count: usize, scales: &[f32], gammas: &[f32], values: &[Vec<u8>]| -> std::io::Result<()> {
-            output.clear();
-            let refs: Vec<_> = values[..count].iter().map(Vec::as_slice).collect();
+    loop {
+        let mut count = 0;
+        for slot in &mut selected {
+            let Some(row) = rows.next() else {
+                break;
+            };
+            *slot = row;
+            count += 1;
+        }
+        if count == 0 {
+            break;
+        }
+        if count == TQ_BLOCK_LANES
+            && selected[0].is_multiple_of(TQ_BLOCK_LANES)
+            && selected.windows(2).all(|pair| pair[1] == pair[0] + 1)
+        {
+            let at = selected[0] / TQ_BLOCK_LANES * block_bytes;
+            let block = codes
+                .get(at..at + block_bytes)
+                .ok_or_else(|| std::io::Error::other("TQ compacted block is out of bounds"))?;
+            writer.write_all(block)?;
+            bytes += block.len();
+            continue;
+        }
+        for (target, &row) in selected[..count].iter().enumerate() {
+            let at = row / TQ_BLOCK_LANES * block_bytes;
+            let lane = row % TQ_BLOCK_LANES;
+            let block = codes
+                .get(at..at + block_bytes)
+                .ok_or_else(|| std::io::Error::other("TQ compacted row is out of bounds"))?;
+            let read = |offset| f32::from_le_bytes(block[offset..offset + 4].try_into().unwrap());
             if ivf {
-                tq_pack_ivf_block(&refs, scales, gammas, dim, &mut output);
-            } else {
-                tq_pack_block(&refs, gammas, dim, &mut output);
+                scales[target] = read(lane * 4);
             }
-            writer.write_all(&output)?;
-            bytes += output.len();
-            Ok(())
-        };
-    for row in rows {
-        let at = row / TQ_BLOCK_LANES * block_bytes;
-        let lane = row % TQ_BLOCK_LANES;
-        let block = codes
-            .get(at..at + block_bytes)
-            .ok_or_else(|| std::io::Error::other("TQ compacted row is out of bounds"))?;
-        let read = |offset| f32::from_le_bytes(block[offset..offset + 4].try_into().unwrap());
+            gammas[target] = read(if ivf { 64 } else { 0 } + lane * 4);
+            for d in 0..dim {
+                let byte = block[header + d * 8 + lane % 8];
+                values[target * dim + d] = (byte >> (if lane < 8 { 0 } else { 4 })) & 15;
+            }
+        }
+        output.clear();
+        let refs: [&[u8]; TQ_BLOCK_LANES] =
+            std::array::from_fn(|i| &values[i * dim..(i + 1) * dim]);
         if ivf {
-            scales.push(read(lane * 4));
+            tq_pack_ivf_block(
+                &refs[..count],
+                &scales[..count],
+                &gammas[..count],
+                dim,
+                &mut output,
+            );
+        } else {
+            tq_pack_block(&refs[..count], &gammas[..count], dim, &mut output);
         }
-        let gamma_offset = if ivf { 64 } else { 0 };
-        let target = gammas.len();
-        gammas.push(read(gamma_offset + lane * 4));
-        for d in 0..dim {
-            let byte = block[header + d * 8 + lane % 8];
-            values[target][d] = (byte >> (if lane < 8 { 0 } else { 4 })) & 15;
-        }
-        if gammas.len() == TQ_BLOCK_LANES {
-            emit(TQ_BLOCK_LANES, &scales, &gammas, &values)?;
-            scales.clear();
-            gammas.clear();
-        }
-    }
-    if !gammas.is_empty() {
-        emit(gammas.len(), &scales, &gammas, &values)?;
+        writer.write_all(&output)?;
+        bytes += output.len();
     }
     Ok(bytes)
 }

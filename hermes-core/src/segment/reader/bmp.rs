@@ -908,6 +908,7 @@ impl BmpIndex {
     #[cfg(any(feature = "native", feature = "wasm", test))]
     pub(crate) fn visit_real_slots_for_rewrite(
         &self,
+        check_cancel: &(impl Fn() -> crate::Result<()> + Sync),
         mut visitor: impl FnMut(usize),
     ) -> crate::Result<()> {
         let expected_real = self.num_real_docs as usize;
@@ -918,6 +919,9 @@ impl BmpIndex {
             .chunks_exact(4)
             .enumerate()
         {
+            if virtual_id.is_multiple_of(256) {
+                check_cancel()?;
+            }
             let doc_id = u32::from_le_bytes(chunk.try_into().unwrap());
             if doc_id == u32::MAX {
                 continue;
@@ -1409,7 +1413,7 @@ mod safety_tests {
 
         assert_eq!(index.doc_id_for_virtual(0), u32::MAX);
         assert!(matches!(
-            crate::segment::builder::graph_bisection::build_vid_maps(&index),
+            crate::segment::builder::graph_bisection::build_vid_maps(&index, &|| Ok(())),
             Err(crate::Error::Corruption(_))
         ));
     }

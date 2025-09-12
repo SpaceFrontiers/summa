@@ -181,10 +181,12 @@ pub fn decompress_limited(data: &[u8], max_output: usize) -> io::Result<Vec<u8>>
             std::cell::RefCell::new(zstd::bulk::Decompressor::new().unwrap());
     }
     DECOMPRESSOR.with(|dc| {
-        dc.borrow_mut().decompress(data, max_output).or_else(|_| {
-            let decoder = zstd::Decoder::new(data)?;
-            read_limited(decoder, max_output)
-        })
+        dc.borrow_mut()
+            .decompress(data, limited_capacity(data, max_output))
+            .or_else(|_| {
+                let decoder = zstd::Decoder::new(data)?;
+                read_limited(decoder, max_output)
+            })
     })
 }
 
@@ -246,12 +248,24 @@ pub fn decompress_with_dict_limited(
         slot.as_mut()
             .unwrap()
             .1
-            .decompress(data, max_output)
+            .decompress(data, limited_capacity(data, max_output))
             .or_else(|_| {
                 let decoder = zstd::Decoder::with_dictionary(data, dict.as_bytes())?;
                 read_limited(decoder, max_output)
             })
     })
+}
+
+// zstd::bulk::Decompressor reserves the requested capacity when its optional
+// experimental upper-bound feature is disabled. The safety limit is not a
+// capacity hint: retaining 256 MiB for a 16 KiB block also defeats store caching.
+fn limited_capacity(data: &[u8], max_output: usize) -> usize {
+    zstd::zstd_safe::get_frame_content_size(data)
+        .ok()
+        .flatten()
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(DECOMPRESS_CAPACITY)
+        .min(max_output)
 }
 
 fn read_limited(mut reader: impl Read, max_output: usize) -> io::Result<Vec<u8>> {
@@ -307,6 +321,50 @@ mod tests {
         let compressed = compress(&data, CompressionLevel::default()).unwrap();
         assert!(decompress_limited(&compressed, 1024).is_err());
         assert_eq!(decompress_limited(&compressed, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn bounded_small_block_decoding_does_not_reserve_the_safety_limit() {
+        let payload = vec![7u8; 16 * 1024];
+        let limit = 256 * 1024 * 1024;
+        let compressed = compress(&payload, CompressionLevel::default()).unwrap();
+        let output = decompress_limited(&compressed, limit).unwrap();
+        assert_eq!(output, payload);
+        assert!(
+            output.capacity() <= payload.len(),
+            "small block reserved {} bytes",
+            output.capacity()
+        );
+        let dict = CompressionDict::from_bytes(b"dictionary material".repeat(64));
+        let compressed = compress_with_dict(&payload, CompressionLevel::default(), &dict).unwrap();
+        let output = decompress_with_dict_limited(&compressed, &dict, limit).unwrap();
+        assert_eq!(output, payload);
+        assert!(output.capacity() <= payload.len());
+    }
+
+    #[test]
+    fn bounded_unknown_size_frames_preserve_large_output_and_reject_overflow() {
+        let payload = vec![17u8; DECOMPRESS_CAPACITY * 2];
+        let compressed = zstd::stream::encode_all(payload.as_slice(), 3).unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&compressed).unwrap(),
+            None
+        );
+        assert_eq!(
+            decompress_limited(&compressed, payload.len()).unwrap(),
+            payload
+        );
+        assert!(decompress_limited(&compressed, payload.len() - 1).is_err());
+        let dict = CompressionDict::from_bytes(b"dictionary material".repeat(64));
+        let mut encoder =
+            zstd::stream::Encoder::with_dictionary(Vec::new(), 3, dict.as_bytes()).unwrap();
+        std::io::Write::write_all(&mut encoder, &payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert_eq!(
+            decompress_with_dict_limited(&compressed, &dict, payload.len()).unwrap(),
+            payload
+        );
+        assert!(decompress_with_dict_limited(&compressed, &dict, payload.len() - 1).is_err());
     }
 
     #[test]

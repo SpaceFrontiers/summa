@@ -128,7 +128,7 @@ tokenizer_param = { identifier ~ ":" ~ identifier }
 // indexed can have optional index config: indexed<positions> or indexed<ivf_tq, nprobe: 64>
 // stored can have optional multi config: stored<multi> for array fields
 attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "reorder" }
+attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "content_hash" | "reorder" }
 
 // Stored attribute with optional multi flag
 // Examples:
