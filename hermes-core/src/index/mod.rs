@@ -445,6 +445,19 @@ static BMP_IO_GATES: OnceLock<
     parking_lot::Mutex<std::collections::HashMap<usize, Weak<BmpIoGate>>>,
 > = OnceLock::new();
 
+/// Announce each resource kind once per process. Weak registry entries can
+/// expire between index opens; subsequent creations (including different
+/// settings) remain visible at DEBUG without retaining resources or an
+/// unbounded history of configurations just for logging.
+#[cfg(feature = "native")]
+fn shared_resource_log_level(announced: &OnceLock<()>) -> log::Level {
+    if announced.set(()).is_ok() {
+        log::Level::Info
+    } else {
+        log::Level::Debug
+    }
+}
+
 #[cfg(feature = "native")]
 pub(crate) fn shared_bmp_io_gate(limit: usize) -> Arc<BmpIoGate> {
     let mut gates = BMP_IO_GATES
@@ -456,7 +469,11 @@ pub(crate) fn shared_bmp_io_gate(limit: usize) -> Arc<BmpIoGate> {
     let gate = Arc::new(BmpIoGate::new(limit));
     gates.retain(|_, gate| gate.strong_count() > 0);
     gates.insert(limit, Arc::downgrade(&gate));
-    log::info!("[bmp] process-wide random-I/O concurrency={limit}");
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    log::log!(
+        shared_resource_log_level(&ANNOUNCED),
+        "[bmp] process-wide random-I/O concurrency={limit}"
+    );
     gate
 }
 
@@ -471,7 +488,9 @@ pub(crate) fn shared_store_cache(budget_bytes: usize) -> Arc<crate::segment::Sha
     let cache = Arc::new(crate::segment::SharedStoreCache::new(budget_bytes));
     caches.retain(|_, cache| cache.strong_count() > 0);
     caches.insert(budget_bytes, Arc::downgrade(&cache));
-    log::info!(
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    log::log!(
+        shared_resource_log_level(&ANNOUNCED),
         "[store_cache] process-wide budget={}",
         crate::format_bytes(budget_bytes as u64)
     );
@@ -509,7 +528,12 @@ fn shared_search_pool(num_threads: usize) -> Result<Arc<rayon::ThreadPool>> {
     );
     pools.retain(|_, pool| pool.strong_count() > 0);
     pools.insert(num_threads, Arc::downgrade(&pool));
-    log::info!("[search] process-wide CPU pool: {} thread(s)", num_threads);
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    log::log!(
+        shared_resource_log_level(&ANNOUNCED),
+        "[search] process-wide CPU pool: {} thread(s)",
+        num_threads
+    );
     Ok(pool)
 }
 
