@@ -1,6 +1,6 @@
 //! Primary key deduplication index.
 //!
-//! Uses a bloom filter + `FxHashSet` for uncommitted keys to reject duplicates
+//! Uses a bloom filter + a map of latest staged rows to reject duplicate adds
 //! at `add_document()` time. Committed keys are checked via fast-field
 //! `TextDictReader::ordinal()` (binary search, O(log n)).
 //!
@@ -11,8 +11,11 @@
 #[cfg(feature = "native")]
 use std::collections::HashSet;
 
+use super::staged_row::StagedRow;
+use crate::dsl::{Document, FieldValue, Schema};
 use byteorder::{LittleEndian, WriteBytesExt};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::sync::Arc;
 
 use crate::dsl::Field;
 use crate::error::{Error, Result};
@@ -100,9 +103,9 @@ impl PkSegmentData {
 /// Thread-safe primary key deduplication index.
 ///
 /// Sync dedup in the hot path: `BloomFilter::may_contain()`,
-/// `FxHashSet::contains()`, and `TextDictReader::ordinal()` are all sync.
+/// `FxHashMap::contains_key()`, and `TextDictReader::ordinal()` are all sync.
 ///
-/// Interior mutability for the mutable state (bloom + uncommitted set) is
+/// Interior mutability for the mutable state (bloom + latest staged map) is
 /// behind `parking_lot::Mutex`. The committed data is only mutated via
 /// `&mut self` methods (commit/abort path), so no lock is needed for it.
 pub struct PrimaryKeyIndex {
@@ -118,9 +121,90 @@ pub struct PrimaryKeyIndex {
 
 struct PrimaryKeyState {
     bloom: BloomFilter,
-    uncommitted: FxHashSet<Vec<u8>>,
+    uncommitted: FxHashMap<Vec<u8>, PendingKey>,
+    pending_bytes: usize,
+    cancelled_bytes: usize,
     deletes: FxHashSet<String>,
     delete_bytes: usize,
+}
+
+const MAX_PENDING_KEY_BYTES: usize = 64 * 1024 * 1024;
+// Vec<u32> initially allocates four slots; later growth uses at most two per row.
+const CANCELLED_ROW_BYTES: usize = 4 * std::mem::size_of::<u32>();
+
+struct PendingKey {
+    row: Arc<StagedRow>,
+    hash: Option<FieldValue>,
+    bytes: usize,
+}
+
+// Twice entry size covers table occupancy, control bytes, and allocation overhead.
+const KEY_SLOT_BYTES: usize =
+    2 * (std::mem::size_of::<PendingKey>() + std::mem::size_of::<Vec<u8>>());
+
+fn pending_bytes(key: &str, hash: Option<&FieldValue>) -> usize {
+    KEY_SLOT_BYTES
+        + std::mem::size_of::<StagedRow>()
+        + 2 * std::mem::size_of::<usize>()
+        + key.len()
+        + match hash {
+            Some(FieldValue::Text(value)) => value.len(),
+            Some(FieldValue::Bytes(value)) => value.len(),
+            _ => 0,
+        }
+}
+
+fn check_pending_budget(
+    state: &PrimaryKeyState,
+    old: usize,
+    new: usize,
+    cancelled: usize,
+) -> Result<()> {
+    let next_len = state.uncommitted.len() + usize::from(new > 0) - usize::from(old > 0);
+    // HashMap may grow on the accepted insertion. Reserve a conservative next
+    // capacity before queue admission; retained capacity still counts after clear.
+    let capacity = if next_len > state.uncommitted.capacity() {
+        (next_len * 2).max(3)
+    } else {
+        state.uncommitted.capacity()
+    };
+    let payload = state.pending_bytes - old + new - next_len * KEY_SLOT_BYTES;
+    let used = payload + capacity * KEY_SLOT_BYTES + state.cancelled_bytes + cancelled;
+    if used > MAX_PENDING_KEY_BYTES {
+        return Err(Error::Document(
+            "pending primary-key metadata exceeds 64 MiB; commit before continuing".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mutation_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 64 * 1024 {
+        return Err(Error::Document(
+            "deletion key must contain 1..=65536 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_delete_budget(state: &PrimaryKeyState, key: &str) -> Result<()> {
+    if !state.deletes.contains(key)
+        && (state.deletes.len() >= 100_000 || state.delete_bytes + key.len() > 8 * 1024 * 1024)
+    {
+        return Err(Error::Document(
+            "pending deletions exceed 100000 keys or 8 MiB; commit before continuing".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn stage_delete(state: &mut PrimaryKeyState, key: &str) -> bool {
+    if state.deletes.contains(key) {
+        return false;
+    }
+    state.delete_bytes += key.len();
+    state.deletes.insert(key.to_owned());
+    true
 }
 
 impl PrimaryKeyIndex {
@@ -176,7 +260,9 @@ impl PrimaryKeyIndex {
             field,
             state: parking_lot::Mutex::new(PrimaryKeyState {
                 bloom,
-                uncommitted: FxHashSet::default(),
+                uncommitted: FxHashMap::default(),
+                pending_bytes: 0,
+                cancelled_bytes: 0,
                 deletes: FxHashSet::default(),
                 delete_bytes: 0,
             }),
@@ -210,7 +296,9 @@ impl PrimaryKeyIndex {
             field,
             state: parking_lot::Mutex::new(PrimaryKeyState {
                 bloom,
-                uncommitted: FxHashSet::default(),
+                uncommitted: FxHashMap::default(),
+                pending_bytes: 0,
+                cancelled_bytes: 0,
                 deletes: FxHashSet::default(),
                 delete_bytes: 0,
             }),
@@ -230,11 +318,13 @@ impl PrimaryKeyIndex {
         write_pk_bloom(writer, segment_ids, &state.bloom)
     }
 
-    /// Memory used by the bloom filter and uncommitted set.
+    /// Memory used by the bloom filter and latest staged map.
     pub fn memory_bytes(&self) -> usize {
         let state = self.state.lock();
         state.bloom.size_bytes()
-            + state.uncommitted.len() * 32
+            + state.pending_bytes
+            + (state.uncommitted.capacity() - state.uncommitted.len()) * KEY_SLOT_BYTES
+            + state.cancelled_bytes
             + state.delete_bytes
             + state.deletes.capacity() * std::mem::size_of::<String>()
             + self
@@ -256,8 +346,7 @@ impl PrimaryKeyIndex {
                 .sum::<usize>()
     }
 
-    /// Resolve committed content before staging any mutation. Pending insertions
-    /// are rejected even if their fingerprint would equal the committed value.
+    /// Resolve committed content only when there is no latest staged row.
     pub(super) fn content_hash_target(
         &self,
         key: &str,
@@ -266,10 +355,8 @@ impl PrimaryKeyIndex {
         if !state.bloom.may_contain(key.as_bytes()) {
             return Ok(None);
         }
-        if state.uncommitted.contains(key.as_bytes()) {
-            return Err(Error::Document(
-                "commit the pending insertion before deleting or upserting this key again".into(),
-            ));
+        if state.uncommitted.contains_key(key.as_bytes()) {
+            return Ok(None);
         }
         if state.deletes.contains(key) {
             return Ok(None);
@@ -306,37 +393,110 @@ impl PrimaryKeyIndex {
         Ok(target)
     }
 
-    /// Stage deletion of a committed key. A key can be replaced once per commit;
-    /// deleting a newly admitted row requires committing that generation first.
+    /// Stage deletion of the latest row, including an unpublished insertion.
     pub(crate) fn delete(&self, key: &str) -> Result<bool> {
-        if key.is_empty() || key.len() > 64 * 1024 {
-            return Err(Error::Document(
-                "deletion key must contain 1..=65536 bytes".into(),
-            ));
-        }
+        validate_mutation_key(key)?;
         let mut state = self.state.lock();
-        if state.uncommitted.contains(key.as_bytes()) {
-            return Err(Error::Document(
-                "commit the pending insertion before deleting or upserting this key again".into(),
-            ));
+        check_delete_budget(&state, key)?;
+        if let Some(old) = state.uncommitted.get(key.as_bytes()) {
+            check_pending_budget(&state, old.bytes, 0, CANCELLED_ROW_BYTES)?;
         }
-        if state.deletes.contains(key) {
-            return Ok(false);
+        let staged = stage_delete(&mut state, key);
+        if let Some(old) = state.uncommitted.remove(key.as_bytes()) {
+            state.pending_bytes -= old.bytes;
+            state.cancelled_bytes += CANCELLED_ROW_BYTES;
+            old.row.cancel();
         }
-        if state.deletes.len() >= 100_000 || state.delete_bytes + key.len() > 8 * 1024 * 1024 {
-            return Err(Error::Document(
-                "pending deletions exceed 100000 keys or 8 MiB; commit before continuing".into(),
-            ));
-        }
-        state.delete_bytes += key.len();
-        state.deletes.insert(key.to_owned());
-        Ok(true)
+        Ok(staged)
     }
 
-    pub(crate) fn rollback_delete(&self, key: &str) {
+    /// Some(false) means a staged version exists and committed content must
+    /// not be consulted. Missing hashes are never equality assertions.
+    pub(super) fn staged_hash_matches(&self, key: &str, hash: &FieldValue) -> Option<bool> {
+        self.state
+            .lock()
+            .uncommitted
+            .get(key.as_bytes())
+            .map(|pending| pending.hash.as_ref() == Some(hash))
+    }
+
+    pub(super) fn admit_document(
+        &self,
+        doc: Document,
+        schema: &Schema,
+        replace: bool,
+        accept: impl FnOnce(Document, Arc<StagedRow>) -> Result<()>,
+    ) -> Result<()> {
+        let key = document_key(&doc, self.field)?.to_owned();
+        let hash = super::content_hash::document_hash(&doc, schema)?;
+        // Check the budget before cloning a caller-controlled hash.
+        let bytes = pending_bytes(&key, hash);
         let mut state = self.state.lock();
-        if state.deletes.remove(key) {
-            state.delete_bytes -= key.len();
+        self.check_admission(&state, &key, replace, bytes)?;
+        let hash = hash.cloned();
+        let row = Arc::new(StagedRow::default());
+        accept(doc, Arc::clone(&row))?;
+        self.finish_admission(&mut state, key, PendingKey { row, hash, bytes }, replace);
+        Ok(())
+    }
+
+    fn check_admission(
+        &self,
+        state: &PrimaryKeyState,
+        key: &str,
+        replace: bool,
+        bytes: usize,
+    ) -> Result<()> {
+        if replace {
+            check_delete_budget(state, key)?;
+        } else if state.uncommitted.contains_key(key.as_bytes()) {
+            return Err(Error::DuplicatePrimaryKey(key.to_owned()));
+        } else if !state.deletes.contains(key) && state.bloom.may_contain(key.as_bytes()) {
+            for data in &self.committed_data {
+                if let Some(ff) = data.fast_fields.get(&self.field.0)
+                    && let Some(ordinal) = ff.text_ordinal(key)
+                    && data
+                        .live_key_ordinals
+                        .as_ref()
+                        .is_none_or(|keys| keys.contains(ordinal as u32))
+                {
+                    return Err(Error::DuplicatePrimaryKey(key.to_owned()));
+                }
+            }
+        }
+        let old_bytes = state
+            .uncommitted
+            .get(key.as_bytes())
+            .map_or(0, |old| old.bytes);
+        check_pending_budget(
+            state,
+            old_bytes,
+            bytes,
+            if old_bytes > 0 {
+                CANCELLED_ROW_BYTES
+            } else {
+                0
+            },
+        )?;
+        Ok(())
+    }
+
+    fn finish_admission(
+        &self,
+        state: &mut PrimaryKeyState,
+        key: String,
+        pending: PendingKey,
+        replace: bool,
+    ) {
+        if replace {
+            stage_delete(state, &key);
+        }
+        state.bloom.insert(key.as_bytes());
+        state.pending_bytes += pending.bytes;
+        if let Some(old) = state.uncommitted.insert(key.into_bytes(), pending) {
+            state.pending_bytes -= old.bytes;
+            state.cancelled_bytes += CANCELLED_ROW_BYTES;
+            old.row.cancel();
         }
     }
 
@@ -354,59 +514,29 @@ impl PrimaryKeyIndex {
 
     /// Check whether a document's primary key is unique, and if so, register it.
     ///
-    /// Returns `Ok(())` if the key is new (inserted into bloom + uncommitted set).
+    /// Returns `Ok(())` if the key is new (inserted into bloom + latest staged map).
     /// Returns `Err(DuplicatePrimaryKey)` if the key already exists.
     /// Returns `Err(Document)` if the primary key field is missing or empty.
-    pub fn check_and_insert(&self, doc: &crate::dsl::Document) -> Result<()> {
+    pub fn check_and_insert(&self, doc: &Document) -> Result<()> {
         let key = document_key(doc, self.field)?;
-
-        let key_bytes = key.as_bytes();
-
-        let deleting = {
-            let mut state = self.state.lock();
-
-            // Fast path: bloom says definitely not present → new key.
-            if !state.bloom.may_contain(key_bytes) {
-                state.bloom.insert(key_bytes);
-                state.uncommitted.insert(key_bytes.to_vec());
-                return Ok(());
-            }
-
-            // Bloom positive → check uncommitted set first (fast, in-memory).
-            if state.uncommitted.contains(key_bytes) {
-                return Err(Error::DuplicatePrimaryKey(key.to_string()));
-            }
-            state.deletes.contains(key)
-        };
-        // Lock released — check committed segments without holding mutex.
-        // committed_data is immutable (only changed via &mut self methods).
-        for data in self.committed_data.iter().filter(|_| !deleting) {
-            if let Some(ff) = data.fast_fields.get(&self.field.0)
-                && let Some(ordinal) = ff.text_ordinal(key)
-                && data
-                    .live_key_ordinals
-                    .as_ref()
-                    .is_none_or(|keys| keys.contains(ordinal as u32))
-            {
-                return Err(Error::DuplicatePrimaryKey(key.to_string()));
-            }
-        }
-
-        // Re-acquire lock to insert. Re-check uncommitted in case another
-        // thread inserted the same key while we were scanning committed segments.
+        let bytes = pending_bytes(key, None);
         let mut state = self.state.lock();
-        if state.uncommitted.contains(key_bytes) {
-            return Err(Error::DuplicatePrimaryKey(key.to_string()));
-        }
-
-        // Bloom false positive — key is genuinely new.
-        state.bloom.insert(key_bytes);
-        state.uncommitted.insert(key_bytes.to_vec());
+        self.check_admission(&state, key, false, bytes)?;
+        self.finish_admission(
+            &mut state,
+            key.to_owned(),
+            PendingKey {
+                row: Arc::new(StagedRow::default()),
+                hash: None,
+                bytes,
+            },
+            false,
+        );
         Ok(())
     }
 
     /// Refresh after commit: merge new segment data, prune removed segments,
-    /// insert new keys into bloom, and clear uncommitted set.
+    /// insert new keys into bloom, and clear latest staged map.
     ///
     /// Only `new_data` (segments not already held) need to be loaded by the
     /// caller. Existing data for segments still in `snapshot` is retained.
@@ -431,6 +561,8 @@ impl PrimaryKeyIndex {
             }
         }
         state.uncommitted.clear();
+        state.pending_bytes = 0;
+        state.cancelled_bytes = 0;
         state.deletes.clear();
         state.delete_bytes = 0;
         self.replace_committed_data(new_data, segment_ids);
@@ -491,7 +623,12 @@ impl PrimaryKeyIndex {
         if let Some(value) = doc.get_first(self.field)
             && let Some(key) = value.as_text()
         {
-            self.state.lock().uncommitted.remove(key.as_bytes());
+            let mut state = self.state.lock();
+            if let Some(old) = state.uncommitted.remove(key.as_bytes()) {
+                state.pending_bytes -= old.bytes;
+                state.cancelled_bytes += CANCELLED_ROW_BYTES;
+                old.row.cancel();
+            }
         }
     }
 
@@ -501,6 +638,8 @@ impl PrimaryKeyIndex {
     pub fn clear_uncommitted(&mut self) {
         let state = self.state.get_mut();
         state.uncommitted.clear();
+        state.pending_bytes = 0;
+        state.cancelled_bytes = 0;
         state.deletes.clear();
         state.delete_bytes = 0;
     }

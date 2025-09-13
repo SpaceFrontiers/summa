@@ -318,8 +318,10 @@ await client.commit("articles"); // publishes accepted operations
 
 `upsertDocuments` accepts a list of full replacements and returns the same
 `DocumentMutationResult`. Single-item helpers throw on rejection. Missing deletes
-are accepted; upserts insert missing keys. Commit before replacing/deleting a key with
-a pending insertion. Limits are 100,000 deletion keys / 8 MiB key bytes and 1,000
+are accepted; upserts insert missing keys. Replacing/deleting a pending insertion
+is supported; the latest accepted version is published at commit. With a schema
+content hash, an identical retry of the latest staged version is a no-op.
+Limits are 100,000 deletion keys / 8 MiB key bytes and 1,000
 replacement documents / 32 MiB encoded bytes. Normal deadlines apply; an expired
 RPC can have staged work, so do not blindly retry replacements. Broker commits
 are atomic within each partition. Physical cleanup remains

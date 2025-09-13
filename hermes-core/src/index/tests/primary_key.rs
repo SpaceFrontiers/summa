@@ -912,6 +912,15 @@ async fn cancelled_upsert_commit_publishes_deletion_and_replacement_together() {
         .upsert_document(make_doc(pk, title, "same", "new"))
         .await
         .unwrap();
+    writer.delete_primary_key("same").unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "same", "discarded"))
+        .await
+        .unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "same", "new"))
+        .await
+        .unwrap();
     let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
     dir.block_next_metadata_rename();
     let operation = {
@@ -1570,12 +1579,10 @@ async fn content_hash_respects_pending_rows_deletions_abort_reopen_and_compactio
         .upsert_document(doc(Some("v1"), "old"))
         .await
         .unwrap();
-    assert!(
-        writer
-            .upsert_document(doc(Some("v1"), "old"))
-            .await
-            .is_err()
-    );
+    writer
+        .upsert_document(doc(Some("v1"), "old"))
+        .await
+        .unwrap();
     writer.commit().await.unwrap();
     let reader = index.reader().await.unwrap();
     let old = reader.searcher().await.unwrap();
@@ -1589,12 +1596,10 @@ async fn content_hash_respects_pending_rows_deletions_abort_reopen_and_compactio
         .upsert_document(doc(Some("v2"), "aborted"))
         .await
         .unwrap();
-    assert!(
-        writer
-            .upsert_document(doc(Some("v1"), "old"))
-            .await
-            .is_err()
-    );
+    writer
+        .upsert_document(doc(Some("v1"), "old"))
+        .await
+        .unwrap();
     writer.prepare_commit().await.unwrap().abort();
     writer
         .upsert_document(doc(Some("v1"), "old"))
@@ -1842,4 +1847,222 @@ async fn content_hash_resolves_global_ordinals_after_merging_independent_diction
             .sum::<u32>(),
         90
     );
+}
+
+#[tokio::test]
+async fn staged_upserts_compare_latest_hash_and_allow_replacement_and_delete() {
+    let (schema, pk, hash, body) = content_hash_schema();
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        num_threads: 1,
+        merge_policy: Box::new(crate::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    let doc = |key: &str, digest: &str, text: &str| {
+        let mut doc = make_doc(pk, hash, key, digest);
+        doc.add_text(body, text);
+        doc
+    };
+    writer
+        .upsert_document(doc("a", "v1", "original"))
+        .await
+        .unwrap();
+    writer
+        .upsert_document(doc("a", "v1", "ignored"))
+        .await
+        .unwrap();
+    writer
+        .upsert_document(doc("b", "v1", "independent"))
+        .await
+        .unwrap();
+    writer
+        .upsert_document(doc("a", "v2", "replacement"))
+        .await
+        .unwrap();
+    writer.delete_primary_key("a").unwrap();
+    writer
+        .upsert_document(doc("a", "v1", "resurrected"))
+        .await
+        .unwrap();
+    writer.delete_primary_key("b").unwrap();
+    writer.commit().await.unwrap();
+    let index = crate::index::Index::open(dir, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let hits = searcher.search(&crate::query::AllQuery, 10).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    let actual = searcher
+        .doc(hits[0].segment_id, hits[0].doc_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actual.get_first(body).unwrap().as_text(),
+        Some("resurrected")
+    );
+}
+
+#[tokio::test]
+async fn staged_hash_noops_preserve_payload_without_reading_the_committed_store() {
+    let (schema, pk, hash, body) = content_hash_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let config = IndexConfig {
+        num_threads: 1,
+        merge_policy: Box::new(crate::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    let doc = |key: &str, digest: &str, text: &str| {
+        let mut doc = make_doc(pk, hash, key, digest);
+        doc.add_text(body, text);
+        doc
+    };
+    writer.add_document(doc("a", "v1", "committed")).unwrap();
+    writer.commit().await.unwrap();
+    writer
+        .upsert_document(doc("a", "v2", "staged"))
+        .await
+        .unwrap();
+    dir.store_read_mode
+        .store(1, std::sync::atomic::Ordering::Release);
+    for _ in 0..10 {
+        writer
+            .upsert_document(doc("a", "v2", "ignored"))
+            .await
+            .unwrap();
+    }
+    // Matching the committed hash must replace the latest staged version.
+    writer
+        .upsert_document(doc("a", "v1", "latest"))
+        .await
+        .unwrap();
+    writer
+        .upsert_document(doc("b", "v1", "independent"))
+        .await
+        .unwrap();
+    dir.store_read_mode
+        .store(0, std::sync::atomic::Ordering::Release);
+    writer.commit().await.unwrap();
+    let index = crate::index::Index::open(dir, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(
+        searcher
+            .search(&crate::query::AllQuery, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        searcher
+            .search(&crate::query::TermQuery::new(body, "latest"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        searcher
+            .search(&crate::query::TermQuery::new(body, "ignored"), 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn flushed_staged_rows_can_be_replaced_deleted_and_retried_atomically() {
+    use crate::directories::Directory;
+    let (schema, pk, hash, body) = content_hash_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let config = IndexConfig {
+        num_threads: 1,
+        max_indexing_memory_bytes: 1,
+        merge_policy: Box::new(crate::NoMergePolicy),
+        ..Default::default()
+    };
+    let index = crate::index::Index::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    let mut writer = index.writer();
+    writer.init_primary_key_dedup().await.unwrap();
+    let doc = |key: &str, digest: &str| {
+        let mut doc = make_doc(pk, hash, key, digest);
+        doc.add_text(body, digest);
+        doc
+    };
+    writer.add_document(doc("a", "committed")).unwrap();
+    writer.commit().await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let old = reader.searcher().await.unwrap();
+    let before = dir.list_files(std::path::Path::new("")).await.unwrap();
+    writer.upsert_document(doc("a", "first")).await.unwrap();
+    for id in 1..100 {
+        writer
+            .add_document(doc(&format!("key{id}"), "filler"))
+            .unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if dir
+                .list_files(std::path::Path::new(""))
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.extension().is_some_and(|e| e == "meta") && !before.contains(p))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    writer.upsert_document(doc("a", "second")).await.unwrap();
+    writer.delete_primary_key("key1").unwrap();
+    writer.upsert_document(doc("a", "third")).await.unwrap();
+    dir.fail_next_metadata_rename();
+    assert!(writer.commit().await.is_err());
+    assert_eq!(old.num_docs(), 1);
+    assert!(matches!(
+        writer.upsert_document(doc("a", "third")).await,
+        Err(Error::CommitInProgress)
+    ));
+    writer.commit().await.unwrap();
+    reader.reload().await.unwrap();
+    let latest = reader.searcher().await.unwrap();
+    assert_eq!(latest.num_docs(), 99);
+    assert_eq!(
+        latest
+            .search(&crate::query::TermQuery::new(body, "third"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    for text in ["committed", "first", "second"] {
+        assert!(
+            latest
+                .search(&crate::query::TermQuery::new(body, text), 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        old.search(&crate::query::TermQuery::new(body, "committed"), 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    writer.force_merge_with_compaction(true).await.unwrap();
+    writer.upsert_document(doc("a", "third")).await.unwrap();
+    assert!(!writer.commit().await.unwrap());
 }

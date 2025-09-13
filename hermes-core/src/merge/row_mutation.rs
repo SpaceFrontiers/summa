@@ -7,8 +7,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self: &Arc<Self>,
         new_segments: &[(String, u32)],
         keys: Vec<String>,
+        staged_deletions: Vec<(String, Arc<crate::index::staged_row::StagedSegment>)>,
     ) -> Result<()> {
-        if keys.is_empty() {
+        if keys.is_empty() && staged_deletions.is_empty() {
             return self.commit(new_segments).await;
         }
         let field = self
@@ -28,7 +29,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let mut outputs = Vec::new();
             // Only committed rows are targets. The same transaction's replacement
             // insertions must survive the deletion of their old primary keys.
-            for (segment_id, info) in &st.metadata.segment_metas {
+            for (segment_id, info) in st
+                .metadata
+                .segment_metas
+                .iter()
+                .filter(|_| !keys.is_empty())
+            {
                 let sid = SegmentId::from_hex(segment_id)
                     .ok_or_else(|| Error::Corruption("invalid deletion source".into()))?;
                 let mut fields = crate::segment::reader::loader::load_fast_fields_file(
@@ -118,6 +124,33 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 if !next.has_segment(id) {
                     next.add_segment(id.clone(), *count);
                 }
+            }
+            for (segment_id, staged) in &staged_deletions {
+                if st.metadata.has_segment(segment_id) {
+                    return Err(Error::Corruption(
+                        "staged visibility must refer to a new segment".into(),
+                    ));
+                }
+                let info = next
+                    .segment_metas
+                    .get_mut(segment_id)
+                    .ok_or_else(|| Error::Corruption("staged segment is missing".into()))?;
+                let alive = staged.live_rows(info.num_docs).ok_or_else(|| {
+                    Error::Internal("staged visibility has no cancelled rows".into())
+                })?;
+                let id = SegmentId::new();
+                let claim = manager.protect_new_segment(id.to_hex())?;
+                let cleanup = manager.output_cleanup_guard(id);
+                outputs.push((claim, cleanup));
+                info.deletions = Some(
+                    crate::segment::deletion::write(
+                        manager.directory.as_ref(),
+                        id,
+                        info.num_docs,
+                        &alive,
+                    )
+                    .await?,
+                );
             }
             next.publication_generation = next
                 .publication_generation

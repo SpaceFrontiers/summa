@@ -27,6 +27,8 @@ mod content_hash;
 mod primary_key;
 #[cfg(feature = "native")]
 mod reader;
+#[cfg(any(feature = "native", feature = "wasm"))]
+pub(crate) mod staged_row;
 #[cfg(feature = "native")]
 mod vector_builder;
 #[cfg(all(feature = "wasm", not(feature = "native")))]

@@ -36,6 +36,12 @@
 //! guarantees no concurrent `add_document` calls during the commit window.
 
 use super::primary_key::load_pk_segment_data;
+use super::staged_row::{StagedRow, StagedSegment};
+
+struct QueuedDocument {
+    doc: Document,
+    row: Option<Arc<StagedRow>>,
+}
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -509,7 +515,7 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     pub(super) config: IndexConfig,
     /// MPMC sender, replaced under a brief lock on each commit cycle (workers
     /// get the corresponding new receiver via resume).
-    doc_sender: Arc<parking_lot::RwLock<async_channel::Sender<Document>>>,
+    doc_sender: Arc<parking_lot::RwLock<async_channel::Sender<QueuedDocument>>>,
     /// Worker OS thread handles — long-lived, survive across commits.
     workers: Vec<std::thread::JoinHandle<()>>,
     /// Shared worker state (immutable config + mutable segment output + sync)
@@ -603,7 +609,7 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     flush_mutex: parking_lot::Mutex<()>,
     flush_cvar: parking_lot::Condvar,
     /// Holds the new channel receiver after commit/abort. Workers clone from this.
-    resume_receiver: parking_lot::Mutex<Option<async_channel::Receiver<Document>>>,
+    resume_receiver: parking_lot::Mutex<Option<async_channel::Receiver<QueuedDocument>>>,
     /// Monotonically increasing epoch, bumped by each resume_workers call.
     /// Workers compare against their local epoch to avoid re-cloning a stale receiver.
     resume_epoch: AtomicUsize,
@@ -624,6 +630,7 @@ struct PreparedSegment<D: DirectoryWriter + 'static> {
     id: String,
     segment_id: SegmentId,
     num_docs: u32,
+    staged_rows: Arc<StagedSegment>,
     segment_manager: Arc<crate::merge::SegmentManager<D>>,
     operation: Option<crate::merge::SegmentOperationGuard>,
     runtime: tokio::runtime::Handle,
@@ -948,7 +955,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         worker_state: &Arc<WorkerState<D>>,
         num_workers: usize,
     ) -> (
-        async_channel::Sender<Document>,
+        async_channel::Sender<QueuedDocument>,
         Vec<std::thread::JoinHandle<()>>,
     ) {
         let (sender, receiver) = async_channel::bounded(PIPELINE_MAX_SIZE_IN_DOCS);
@@ -1201,6 +1208,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// Returns an explicit backpressure error when the queue is at capacity or
     /// a prepared commit generation is not yet resolved.
     pub fn add_document(&self, doc: Document) -> Result<()> {
+        self.enqueue_document(doc, false)
+    }
+
+    fn enqueue_document(&self, doc: Document, replace: bool) -> Result<()> {
         self.ensure_writer_lock()?;
         if self.worker_state.shutdown.load(Ordering::Acquire) {
             return Err(Error::IndexClosed);
@@ -1221,31 +1232,25 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         validate_vector_value_counts(&doc, &self.schema)?;
         super::content_hash::document_hash(&doc, &self.schema)?;
         let primary_key_index = self.primary_key_index.read();
-        if let Some(ref pk_index) = *primary_key_index {
-            pk_index.check_and_insert(&doc)?;
-        }
-        match sender.try_send(doc) {
-            Ok(()) => Ok(()),
-            Err(async_channel::TrySendError::Full(doc)) => {
-                // Roll back PK registration so the caller can retry later
-                if let Some(ref pk_index) = *primary_key_index {
-                    pk_index.rollback_uncommitted_key(&doc);
-                }
-                Err(Error::QueueFull)
-            }
-            Err(async_channel::TrySendError::Closed(doc)) => {
-                // Roll back PK registration for defense-in-depth
-                if let Some(ref pk_index) = *primary_key_index {
-                    pk_index.rollback_uncommitted_key(&doc);
-                }
-                Err(Error::CommitInProgress)
-            }
+        let enqueue = |doc, row| {
+            sender
+                .try_send(QueuedDocument { doc, row })
+                .map_err(|error| match error {
+                    async_channel::TrySendError::Full(_) => Error::QueueFull,
+                    async_channel::TrySendError::Closed(_) => Error::CommitInProgress,
+                })
+        };
+        if let Some(pk) = primary_key_index.as_ref() {
+            pk.admit_document(doc, &self.schema, replace, |doc, row| {
+                enqueue(doc, Some(row))
+            })
+        } else {
+            enqueue(doc, None)
         }
     }
 
-    /// Stage deletion of a committed row by exact primary key. Commit publishes
-    /// visibility atomically. Missing keys are idempotent. Commit a pending
-    /// insertion before deleting/upserting that same key again.
+    /// Stage deletion of the latest committed or unpublished row by exact key.
+    /// Commit publishes visibility atomically. Missing keys are idempotent.
     pub fn delete_primary_key(&mut self, key: &str) -> Result<()> {
         self.ensure_writer_lock()?;
         if self.worker_state.shutdown.load(Ordering::Acquire) {
@@ -1292,36 +1297,35 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Err(Error::CommitInProgress);
         }
         if let Some(hash) = hash {
-            let target = self
-                .primary_key_index
-                .read()
-                .as_ref()
-                .ok_or_else(|| {
+            let target = {
+                let guard = self.primary_key_index.read();
+                let pk = guard.as_ref().ok_or_else(|| {
                     Error::Schema("upserts require initialized primary-key deduplication".into())
-                })?
-                .content_hash_target(key)?;
+                })?;
+                match pk.staged_hash_matches(key, hash) {
+                    Some(true) => {
+                        log::debug!(
+                            "[content_hash] index={} skipped unchanged staged upsert",
+                            self.schema.index_label()
+                        );
+                        return Ok(());
+                    }
+                    Some(false) => None,
+                    None => pk.content_hash_target(key)?,
+                }
+            };
             if let Some(target) = target
                 && target.matches(hash, &self.schema).await?
             {
                 return Ok(());
             }
         }
-        let key = key.to_owned();
-        let staged = self
-            .primary_key_index
-            .read()
-            .as_ref()
-            .ok_or_else(|| {
-                Error::Schema("upserts require initialized primary-key deduplication".into())
-            })?
-            .delete(&key)?;
-        if let Err(error) = self.add_document(doc) {
-            if staged && let Some(pk) = self.primary_key_index.read().as_ref() {
-                pk.rollback_delete(&key);
-            }
-            return Err(error);
+        if self.primary_key_index.read().is_none() {
+            return Err(Error::Schema(
+                "upserts require initialized primary-key deduplication".into(),
+            ));
         }
-        Ok(())
+        self.enqueue_document(doc, true)
     }
 
     /// Add multiple documents to the indexing queue.
@@ -1354,7 +1358,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     ///   On shutdown (Drop): exit permanently.
     fn worker_loop(
         state: Arc<WorkerState<D>>,
-        initial_receiver: async_channel::Receiver<Document>,
+        initial_receiver: async_channel::Receiver<QueuedDocument>,
         handle: tokio::runtime::Handle,
         worker_id: usize,
     ) {
@@ -1370,6 +1374,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             // prepare_commit forever).
             let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut builder: Option<SegmentBuilder> = None;
+                let mut staged_rows = Arc::new(StagedSegment::default());
 
                 while let Ok(doc) = receiver.recv_blocking() {
                     if state.shutdown.load(Ordering::Acquire) {
@@ -1405,7 +1410,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     }
 
                     let b = builder.as_mut().unwrap();
-                    if let Err(e) = b.add_document(doc) {
+                    if let Some(row) = &doc.row
+                        && !row.attach(&staged_rows, b.num_docs())
+                    {
+                        continue;
+                    }
+                    if let Err(e) = b.add_document(doc.doc) {
                         log::error!("Failed to index document: {:?}", e);
                         state.record_cycle_error(format!("failed to index document: {e}"));
                         continue;
@@ -1444,7 +1454,12 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                             crate::format_bytes(hard_flush_threshold as u64),
                         );
                         let full_builder = builder.take().unwrap();
-                        Self::build_segment_inline(&state, full_builder, &handle);
+                        Self::build_segment_inline(
+                            &state,
+                            full_builder,
+                            std::mem::take(&mut staged_rows),
+                            &handle,
+                        );
                     }
                 }
 
@@ -1454,7 +1469,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     && b.num_docs() > 0
                 {
                     let _build_permit = state.segment_build_limiter.acquire_flush();
-                    Self::build_segment_inline(&state, b, &handle);
+                    Self::build_segment_inline(&state, b, staged_rows, &handle);
                 }
             }));
 
@@ -1509,6 +1524,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     fn build_segment_inline(
         state: &WorkerState<D>,
         builder: SegmentBuilder,
+        staged_rows: Arc<StagedSegment>,
         handle: &tokio::runtime::Handle,
     ) {
         let segment_id = SegmentId::new();
@@ -1552,6 +1568,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             id: segment_hex.clone(),
             segment_id,
             num_docs: doc_count,
+            staged_rows,
             segment_manager: Arc::clone(&state.segment_manager),
             operation: Some(operation),
             runtime: handle.clone(),
@@ -1985,7 +2002,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
 
     fn resume_workers_shared(
         worker_state: &Arc<WorkerState<D>>,
-        doc_sender: &Arc<parking_lot::RwLock<async_channel::Sender<Document>>>,
+        doc_sender: &Arc<parking_lot::RwLock<async_channel::Sender<QueuedDocument>>>,
     ) {
         if worker_state.shutdown.load(Ordering::Acquire) {
             return;
@@ -2066,6 +2083,16 @@ impl<D: DirectoryWriter + 'static> PreparedSegmentsGuard<D> {
             .collect()
     }
 
+    fn staged_deletions(&self) -> Vec<(String, Arc<StagedSegment>)> {
+        self.segments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|segment| segment.staged_rows.is_dirty())
+            .map(|segment| (segment.id.clone(), Arc::clone(&segment.staged_rows)))
+            .collect()
+    }
+
     fn take_published(&mut self) -> Vec<PreparedSegment<D>> {
         self.segments.take().unwrap_or_default()
     }
@@ -2096,7 +2123,7 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedSegmentsGuard<D> {
 struct CommitFinalizationGuard<D: DirectoryWriter + 'static> {
     state: Arc<CommitFinalizationState>,
     worker_state: Arc<WorkerState<D>>,
-    doc_sender: Arc<parking_lot::RwLock<async_channel::Sender<Document>>>,
+    doc_sender: Arc<parking_lot::RwLock<async_channel::Sender<QueuedDocument>>>,
     resume_workers: bool,
 }
 
@@ -2270,7 +2297,11 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
         .map_or_else(Vec::new, |pk| pk.pending_deletes());
     commit
         .segment_manager
-        .commit_with_deletes(&metadata_entries, deletes)
+        .commit_with_deletes(
+            &metadata_entries,
+            deletes,
+            commit.prepared.staged_deletions(),
+        )
         .await?;
     commit.publication_observed.store(true, Ordering::Release);
     if let Some(pk) = commit.primary_key_index.read().as_ref() {
@@ -2456,3 +2487,7 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedCommit<'_, D> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/staged_admission.rs"]
+mod staged_admission;

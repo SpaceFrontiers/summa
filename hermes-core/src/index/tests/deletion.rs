@@ -29,7 +29,7 @@ async fn mutation_merge_and_compaction_sequences_match_committed_rows_through_ab
         let old_expected = expected.clone();
         let mut staged = expected.clone();
         for operation in 0..8u64 {
-            let key = format!("key{}", (cycle * 13 + operation * 7) % 41);
+            let key = format!("key{}", (cycle * 13 + operation * 7) % 5);
             let revision = cycle * 8 + operation;
             let mut doc = Document::new();
             doc.add_text(id, key.clone());

@@ -224,13 +224,13 @@ async fn portable_content_hash_preserves_noops_and_pending_transaction_semantics
         doc
     };
     writer.add_document(doc(1)).await.unwrap();
-    assert!(writer.upsert_document(doc(1)).await.is_err());
+    writer.upsert_document(doc(1)).await.unwrap();
     writer.commit().await.unwrap();
     writer.upsert_document(doc(1)).await.unwrap();
     writer.upsert_document(doc(1)).await.unwrap();
     assert!(!writer.commit().await.unwrap());
     writer.upsert_document(doc(2)).await.unwrap();
-    assert!(writer.upsert_document(doc(1)).await.is_err());
+    writer.upsert_document(doc(1)).await.unwrap();
     writer.abort().await.unwrap();
     writer.upsert_document(doc(1)).await.unwrap();
     assert!(!writer.commit().await.unwrap());
@@ -252,4 +252,80 @@ async fn portable_content_hash_preserves_noops_and_pending_transaction_semantics
         .unwrap();
     writer.upsert_document(doc(1)).await.unwrap();
     assert!(!writer.commit().await.unwrap());
+}
+
+#[tokio::test]
+async fn portable_replacements_and_deletes_cover_flushed_rows_and_failed_publication() {
+    for cancel in [false, true] {
+        let dir = FaultDirectory::default();
+        let mut schema = SchemaBuilder::default();
+        let id = schema.add_text_field("id", true, true);
+        schema.set_primary_key(id);
+        let hash = schema.add_u64_field("hash", false, true);
+        schema.set_content_hash(hash);
+        let mut writer = WasmIndexWriter::create(
+            dir.clone(),
+            schema.build(),
+            IndexConfig {
+                max_indexing_memory_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let doc = |key: &str, value| {
+            let mut doc = Document::new();
+            doc.add_text(id, key);
+            doc.add_u64(hash, value);
+            doc
+        };
+        for key in 0..100 {
+            writer.add_document(doc(&key.to_string(), 1)).await.unwrap();
+        }
+        assert_eq!(
+            writer.pending_docs(),
+            0,
+            "fixture must flush before mutation"
+        );
+        writer.upsert_document(doc("0", 1)).await.unwrap();
+        writer.upsert_document(doc("0", 2)).await.unwrap();
+        writer.upsert_document(doc("0", 2)).await.unwrap();
+        writer.delete_primary_key("1").unwrap();
+        writer.delete_primary_key("0").unwrap();
+        writer.upsert_document(doc("0", 3)).await.unwrap();
+        dir.mode.store(if cancel { 4 } else { 3 }, Ordering::SeqCst);
+        if cancel {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), writer.commit())
+                    .await
+                    .is_err()
+            );
+        } else {
+            assert!(writer.commit().await.is_err());
+        }
+        dir.mode.store(0, Ordering::SeqCst);
+        writer.commit().await.unwrap();
+        assert_eq!(
+            writer
+                .metadata()
+                .segment_metas
+                .values()
+                .map(|meta| meta.num_live_docs())
+                .sum::<u32>(),
+            99
+        );
+        writer.upsert_document(doc("0", 3)).await.unwrap();
+        assert!(!writer.commit().await.unwrap());
+        writer.upsert_document(doc("0", 4)).await.unwrap();
+        writer.delete_primary_key("0").unwrap();
+        writer.abort().await.unwrap();
+        writer.upsert_document(doc("0", 3)).await.unwrap();
+        assert!(!writer.commit().await.unwrap());
+        drop(writer);
+        let mut writer = WasmIndexWriter::open(dir, IndexConfig::default())
+            .await
+            .unwrap();
+        writer.upsert_document(doc("0", 3)).await.unwrap();
+        assert!(!writer.commit().await.unwrap());
+    }
 }
