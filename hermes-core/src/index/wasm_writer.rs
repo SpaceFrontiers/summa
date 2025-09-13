@@ -27,6 +27,7 @@ use crate::segment::{
 use crate::tokenizer::BoxedTokenizer;
 
 use super::IndexConfig;
+use super::staged_row::StagedSegment;
 
 mod mutations;
 
@@ -58,6 +59,8 @@ pub struct IndexWriter<D: DirectoryWriter + 'static> {
     metadata: IndexMetadata,
     /// Segments built but not yet committed to metadata
     pending_segments: Vec<(String, u32)>,
+    staged_segments: FxHashMap<String, Arc<StagedSegment>>,
+    staged_rows: Arc<StagedSegment>,
     /// Memory budget per builder (bytes)
     memory_budget: usize,
     primary_key: Option<super::primary_key::PrimaryKeyIndex>,
@@ -145,6 +148,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             tokenizers,
             metadata,
             pending_segments: Vec::new(),
+            staged_segments: FxHashMap::default(),
+            staged_rows: Arc::default(),
             memory_budget,
             primary_key: None,
             poisoned: false,
@@ -310,15 +315,28 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
     /// All-or-nothing: an invalid document is rejected without mutating any
     /// writer/builder state, so buffered documents stay committable.
     pub async fn add_document(&mut self, doc: Document) -> Result<()> {
+        self.add_document_impl(doc, false).await
+    }
+
+    async fn add_document_impl(&mut self, doc: Document, replace: bool) -> Result<()> {
         self.ensure_healthy()?;
         self.validate_document(&doc)?;
         self.ensure_builder()?;
-        if let Some(pk) = &self.primary_key {
-            pk.check_and_insert(&doc)?;
-        }
-        self.poisoned = true;
         let b = self.builder.as_mut().unwrap();
-        if let Err(e) = b.add_document(doc) {
+        let result = if let Some(pk) = &self.primary_key {
+            pk.admit_document(doc, &self.schema, replace, |doc, row| {
+                self.poisoned = true;
+                assert!(row.attach(&self.staged_rows, b.num_docs()));
+                b.add_document(doc).map(|_| ())
+            })
+        } else {
+            self.poisoned = true;
+            b.add_document(doc).map(|_| ())
+        };
+        if let Err(e) = result {
+            if !self.poisoned {
+                return Err(e);
+            }
             // Defensive: `validate_document` mirrors every fallible path in
             // `SegmentBuilder::add_document`, so this should be unreachable.
             // If a new fallible path slips through, the builder is poisoned
@@ -381,6 +399,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 .build(self.directory.as_ref(), segment_id, None)
                 .await?;
 
+            self.staged_segments
+                .insert(segment_hex.clone(), std::mem::take(&mut self.staged_rows));
             self.pending_segments.push((segment_hex, doc_count));
             self.poisoned = false;
         }

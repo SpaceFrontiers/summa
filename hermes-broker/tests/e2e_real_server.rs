@@ -1048,21 +1048,21 @@ async fn partitioned_mutations_route_exact_keys_and_remove_all_document_chunks()
             documents: vec![
                 NamedDocument::default(),
                 doc("doc0", "replacement"),
-                doc("doc0", "rejected"),
+                doc("doc0", "superseded"),
                 doc("doc1", "replacement"),
             ],
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response.accepted_count, 2);
+    assert_eq!(response.accepted_count, 3);
     assert_eq!(
         response
             .errors
             .iter()
             .map(|error| error.index)
             .collect::<Vec<_>>(),
-        [0, 2]
+        [0]
     );
     let response = index
         .delete_documents(DeleteDocumentsRequest {
@@ -1075,14 +1075,14 @@ async fn partitioned_mutations_route_exact_keys_and_remove_all_document_chunks()
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response.accepted_count, 3);
+    assert_eq!(response.accepted_count, 4);
     assert_eq!(
         response
             .errors
             .iter()
             .map(|error| error.index)
             .collect::<Vec<_>>(),
-        [2, 4]
+        [2]
     );
     let request = |term: &str| SearchRequest {
         index_name: name.into(),
@@ -1146,7 +1146,7 @@ async fn partitioned_mutations_route_exact_keys_and_remove_all_document_chunks()
         )
         .collect();
     keys.sort();
-    assert_eq!(keys, ["doc0", "doc1"]);
+    assert_eq!(keys, ["doc1"]);
     // Ordinary merges retain tombstones; explicit compaction retires them on both shards.
     for compact in [false, true] {
         index
@@ -1163,13 +1163,19 @@ async fn partitioned_mutations_route_exact_keys_and_remove_all_document_chunks()
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(info.num_docs, 2);
-        assert_eq!(info.num_deleted_docs, if compact { 0 } else { 4 });
+        assert_eq!(info.num_docs, 1);
+        if compact {
+            assert_eq!(info.num_deleted_docs, 0);
+        } else {
+            // Four committed originals are deleted. Either of the two staged
+            // doc0 versions may have been encoded before its cancellation.
+            assert!((4..=6).contains(&info.num_deleted_docs));
+        }
     }
     let response = index
         .batch_index_documents(BatchIndexDocumentsRequest {
             index_name: name.into(),
-            documents: vec![doc("doc0", "duplicate"), doc("doc2", "reused")],
+            documents: vec![doc("doc1", "duplicate"), doc("doc2", "reused")],
         })
         .await
         .unwrap()

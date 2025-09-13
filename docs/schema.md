@@ -158,12 +158,13 @@ The JSON creation schema exposes the same settings:
 ```
 
 Native Rust uses `builder.set_content_hash(digest)` and
-`writer.upsert_document(doc).await?`. Identical committed upserts succeed without
-new rows or tombstones. A pending insertion still requires commit before another
-upsert of that key; a pending deletion always permits its replacement insertion.
+`writer.upsert_document(doc).await?`. A hash matching the latest staged or
+committed version of the same key succeeds without new rows or tombstones.
+Staged rows can be replaced or deleted without committing; a pending deletion
+always permits its replacement insertion.
 Ordinary inserts still reject duplicate primary keys. RPC accepted counts include
 no-ops. See [content deduplication](content-deduplication.md) for cost and lifecycle
-guarantees. Existing schemas without the marker retain their current behavior.
+guarantees. Hash comparison remains opt-in; staged replacement and deletion also work without the marker.
 
 ### Multi-Value Fields
 

@@ -381,10 +381,10 @@ async fn mutation_batches_account_for_every_input_and_publish_only_on_commit() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response.accepted_count, 1);
+    assert_eq!(response.accepted_count, 2);
     assert_eq!(
         response.errors.iter().map(|e| e.index).collect::<Vec<_>>(),
-        [1, 2]
+        [2]
     );
     let response = service
         .delete_documents(Request::new(DeleteDocumentsRequest {
@@ -394,10 +394,10 @@ async fn mutation_batches_account_for_every_input_and_publish_only_on_commit() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(response.accepted_count, 2);
+    assert_eq!(response.accepted_count, 3);
     assert_eq!(
         response.errors.iter().map(|e| e.index).collect::<Vec<_>>(),
-        [2, 3]
+        [2]
     );
     assert_eq!(
         index
@@ -410,6 +410,37 @@ async fn mutation_batches_account_for_every_input_and_publish_only_on_commit() {
             .num_docs(),
         2
     );
+    service
+        .commit(Request::new(CommitRequest {
+            index_name: "docs".into(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        index
+            .reader()
+            .await
+            .unwrap()
+            .searcher()
+            .await
+            .unwrap()
+            .num_docs(),
+        0
+    );
+    assert_eq!(old.num_docs(), 2);
+    let make_upsert = || {
+        Request::new(UpsertDocumentsRequest {
+            index_name: "docs".into(),
+            documents: vec![doc(Some("concurrent"), &["one replacement"])],
+        })
+    };
+    let (left, right) = tokio::join!(
+        service.upsert_documents(make_upsert()),
+        service.upsert_documents(make_upsert())
+    );
+    let (left, right) = (left.unwrap().into_inner(), right.unwrap().into_inner());
+    assert_eq!(left.accepted_count + right.accepted_count, 2);
+    assert_eq!(left.errors.len() + right.errors.len(), 0);
     service
         .commit(Request::new(CommitRequest {
             index_name: "docs".into(),
@@ -426,37 +457,6 @@ async fn mutation_batches_account_for_every_input_and_publish_only_on_commit() {
             .unwrap()
             .num_docs(),
         1
-    );
-    assert_eq!(old.num_docs(), 2);
-    let make_upsert = || {
-        Request::new(UpsertDocumentsRequest {
-            index_name: "docs".into(),
-            documents: vec![doc(Some("concurrent"), &["one replacement"])],
-        })
-    };
-    let (left, right) = tokio::join!(
-        service.upsert_documents(make_upsert()),
-        service.upsert_documents(make_upsert())
-    );
-    let (left, right) = (left.unwrap().into_inner(), right.unwrap().into_inner());
-    assert_eq!(left.accepted_count + right.accepted_count, 1);
-    assert_eq!(left.errors.len() + right.errors.len(), 1);
-    service
-        .commit(Request::new(CommitRequest {
-            index_name: "docs".into(),
-        }))
-        .await
-        .unwrap();
-    assert_eq!(
-        index
-            .reader()
-            .await
-            .unwrap()
-            .searcher()
-            .await
-            .unwrap()
-            .num_docs(),
-        2
     );
     drop(old);
     drop(index);
@@ -551,8 +551,8 @@ async fn content_hash_noops_are_accepted_without_new_physical_rows() {
                 document("v2"),
                 document("v2"),
             ],
-            3,
-            1,
+            4,
+            0,
         ),
         (vec![document("v2"), document("v2")], 2, 0),
     ] {

@@ -189,7 +189,8 @@ test("primary-key mutations hide every indexed-only chunk and survive reopen", a
   await expect(index.addDocument({ id: "a", body: "duplicate" })).rejects.toThrow(/uplicate/);
   await index.upsertDocument({ id: "a", body: ["newhead", "newtail"] });
   expect((await index.search("oldtail", 10)).hits).toHaveLength(1);
-  expect(() => index.deleteDocument("a")).toThrow(/pending insertion/);
+  index.deleteDocument("a");
+  await index.upsertDocument({ id: "a", body: ["newhead", "newtail"] });
   const deletion = index.deleteDocuments(["b", "absent", ""]);
   expect(deletion.acceptedCount).toBe(2);
   expect(deletion.errors.map((error: any) => error.index)).toEqual([2]);
@@ -217,8 +218,8 @@ test("failed and aborted replacements preserve old rows and reservations", async
     { id: "a", body: "second replacement" },
     { id: ["x", "y"], body: "ambiguous" },
   ]);
-  expect(response.acceptedCount).toBe(1);
-  expect(response.errors.map((error: any) => error.index)).toEqual([0, 2, 3]);
+  expect(response.acceptedCount).toBe(2);
+  expect(response.errors.map((error: any) => error.index)).toEqual([0, 3]);
   await index.abort();
   expect(await index.commit()).toBe(false);
   expect((await index.search("original", 10)).hits).toHaveLength(1);
@@ -309,7 +310,7 @@ test("schema content hashes skip unchanged stored bytes and persist across reope
   const storage = new InMemoryFS();
   const index = await LocalIndex.withStorage(storage, schema);
   await index.upsertDocument({ id: "a", digest: "AQI=", body: "original" });
-  await expect(index.upsertDocument({ id: "a", digest: "AQI=" })).rejects.toThrow(/pending insertion/);
+  await index.upsertDocument({ id: "a", digest: "AQI=" });
   await index.commit();
   const before = await storage.get("metadata.json");
   const response = await index.upsertDocuments([
@@ -329,4 +330,33 @@ test("schema content hashes skip unchanged stored bytes and persist across reope
   await reopened.upsertDocument({ id: "a", digest: "AgM=", body: "changed" });
   expect(await reopened.commit()).toBe(false);
   expect((await reopened.search("changed", 10)).hits).toHaveLength(1);
+});
+
+test("staged hashes use the latest ID version and mutations wait for commit", async () => {
+  await init();
+  const storage = new InMemoryFS();
+  const schema = `index documents {
+    field id: text<raw> [primary, stored]
+    field digest: bytes [stored, content_hash]
+    field body: text<simple> [indexed, stored]
+  }`;
+  const index = await LocalIndex.withStorage(storage, schema);
+  await index.upsertDocument({ id: "a", digest: "AQ==", body: "committed" });
+  await index.commit();
+  await index.upsertDocument({ id: "a", digest: "Ag==", body: "staged" });
+  await index.upsertDocument({ id: "a", digest: "Ag==", body: "ignored" });
+  await index.upsertDocument({ id: "a", digest: "AQ==", body: "latest" });
+  await index.upsertDocument({ id: "b", digest: "AQ==", body: "independent" });
+  index.deleteDocument("b");
+  await index.upsertDocument({ id: "b", digest: "AQ==", body: "resurrected" });
+  expect((await index.search("committed", 10)).hits).toHaveLength(1);
+  expect((await index.search("latest", 10)).hits).toHaveLength(0);
+  await index.commit();
+  expect(index.numDocs()).toBe(2);
+  expect((await index.search("latest", 10)).hits).toHaveLength(1);
+  expect((await index.search("resurrected", 10)).hits).toHaveLength(1);
+  expect((await index.search("ignored", 10)).hits).toHaveLength(0);
+  const reopened = await LocalIndex.withStorage(storage, schema);
+  await reopened.upsertDocument({ id: "a", digest: "AQ==" });
+  expect(await reopened.commit()).toBe(false);
 });

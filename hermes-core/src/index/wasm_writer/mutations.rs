@@ -38,8 +38,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(())
     }
 
-    /// Stage a full replacement, inserting absent keys. One pending insertion per key.
-    /// Equal configured content hashes on committed live rows are accepted no-ops.
+    /// Stage a full replacement of the latest committed or pending row.
+    /// Equal configured hashes are accepted no-ops for the same key.
     pub async fn upsert_document(&mut self, doc: Document) -> Result<()> {
         self.ensure_healthy()?;
         self.validate_document(&doc)?;
@@ -49,26 +49,25 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             .ok_or_else(|| Error::Schema("upserts require a primary key".into()))?;
         let key = document_key(&doc, field)?;
         if let Some(hash) = crate::index::content_hash::document_hash(&doc, &self.schema)? {
-            let target = self
-                .primary_key
-                .as_ref()
-                .unwrap()
-                .content_hash_target(key)?;
+            let pk = self.primary_key.as_ref().unwrap();
+            let target = match pk.staged_hash_matches(key, hash) {
+                Some(true) => {
+                    log::debug!(
+                        "[content_hash] index={} skipped unchanged staged upsert",
+                        self.schema.index_label()
+                    );
+                    return Ok(());
+                }
+                Some(false) => None,
+                None => pk.content_hash_target(key)?,
+            };
             if let Some(target) = target
                 && target.matches(hash, &self.schema).await?
             {
                 return Ok(());
             }
         }
-        let key = key.to_owned();
-        let staged = self.primary_key.as_ref().unwrap().delete(&key)?;
-        if let Err(error) = self.add_document(doc).await {
-            if staged {
-                self.primary_key.as_ref().unwrap().rollback_delete(&key);
-            }
-            return Err(error);
-        }
-        Ok(())
+        self.add_document_impl(doc, true).await
     }
 
     /// Discard all pending additions, replacements and deletions. Published rows survive.
@@ -76,6 +75,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.recover_publication().await?;
         self.builder = None;
         self.pending_segments.clear();
+        self.staged_segments.clear();
+        self.staged_rows = Arc::default();
         if let Some(pk) = &mut self.primary_key {
             pk.clear_uncommitted();
         }
@@ -140,6 +141,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         for (id, count) in &self.pending_segments {
             next.add_segment(id.clone(), *count);
         }
+        for (segment_id, count) in &self.pending_segments {
+            if let Some(alive) = self.staged_segments[segment_id].live_rows(*count) {
+                let id = SegmentId::new();
+                self.owned_outputs.insert(id.to_hex());
+                let mask = deletion::write(self.directory.as_ref(), id, *count, &alive).await?;
+                next.segment_metas.get_mut(segment_id).unwrap().deletions = Some(mask);
+            }
+        }
         next.publication_generation = next
             .publication_generation
             .checked_add(1)
@@ -190,6 +199,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.owned_outputs.retain(|id| !owned.contains(id.as_str()));
         self.metadata = next;
         self.pending_segments.clear();
+        self.staged_segments.clear();
+        self.staged_rows = Arc::default();
         if let Some(pk) = &mut self.primary_key {
             pk.mark_deletes_published();
             pk.refresh_data(data, &self.metadata.segment_ids());

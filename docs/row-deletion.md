@@ -57,15 +57,19 @@ queue admission rolls back that call's staged deletion. Commit publishes all
 staged deletions and replacement insertions together; prepared-commit abort
 rolls them back together. Keys are exact, case-sensitive primary-field values.
 
-With an optional [content-hash field](content-deduplication.md), matching committed
-live rows are accepted no-ops. Pending deletions disable that comparison.
+With an optional [content-hash field](content-deduplication.md), a hash matching
+this key's latest staged or committed live row is an accepted no-op. A pending
+delete disables comparison until another replacement is accepted.
 
-One insertion/upsert per key is allowed in a pending commit. Commit before
-deleting or upserting a key that already has a pending insertion; attempts return
-an explicit error. This differs from Tantivy's ordered operation stamps. A
-pending deletion can be followed by one replacement insertion, which survives
-that commit. Pending deletions are bounded at 100,000 distinct keys and 8 MiB of
-key bytes; each mutation key must contain 1–65,536 bytes.
+Upsert and delete apply to the latest accepted version, including queued,
+building, and flushed-but-unpublished rows. Multiple replacements of the same
+key can share one commit; ordinary add still rejects duplicates. A rejected
+replacement preserves the previous staged row. Commit publishes only the latest
+live version, while abort discards the complete pending sequence. Rows already
+encoded are hidden using the existing masks; queued cancelled rows can be skipped.
+Pending deletions are bounded at 100,000 distinct keys and 8 MiB of key bytes;
+each mutation key must contain 1–65,536 bytes. Pending primary-key metadata,
+including retained content hashes, is separately bounded at 64 MiB.
 
 Primary-key admission requires exactly one text value, including ordinary
 inserts with deduplication enabled. Inserts and upserts share the same key
