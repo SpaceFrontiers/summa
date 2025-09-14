@@ -2,9 +2,11 @@ mod basic;
 mod bmp;
 mod boolean;
 mod chunked;
+mod config_policy;
 mod format_migration;
 mod maintenance;
 mod merge;
+mod merge_bounds;
 mod pin;
 mod posting_codecs;
 mod primary_key;
@@ -28,13 +30,27 @@ fn search_cpu_pool_is_bounded_and_reused_by_width() {
 #[cfg(feature = "native")]
 #[test]
 fn zero_search_threads_is_rejected() {
-    assert!(super::searcher::SearcherResources::new(1, 1, 0, 1).is_err());
+    assert!(super::searcher::SearcherResources::new(1, None, 0, 1, 0, 1).is_err());
 }
 
 #[cfg(feature = "native")]
 #[test]
 fn zero_bmp_io_concurrency_is_rejected() {
-    assert!(super::searcher::SearcherResources::new(1, 1, 1, 0).is_err());
+    assert!(super::searcher::SearcherResources::new(1, None, 0, 1, 1, 0).is_err());
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn oversized_term_cache_block_cap_is_rejected_at_load() {
+    let error =
+        super::searcher::SearcherResources::new(super::MAX_TERM_CACHE_BLOCKS + 1, None, 0, 1, 1, 1)
+            .err()
+            .expect("cap above MAX_TERM_CACHE_BLOCKS must fail");
+    assert!(error.to_string().contains("term_cache_blocks"), "{error}");
+    assert!(
+        super::searcher::SearcherResources::new(super::MAX_TERM_CACHE_BLOCKS, Some(0), 0, 1, 1, 1)
+            .is_ok_and(|resources| resources.term_cache_budget_bytes == Some(0))
+    );
 }
 
 #[cfg(feature = "sync")]

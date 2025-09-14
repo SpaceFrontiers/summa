@@ -13,6 +13,9 @@ use log::{debug, warn};
 
 use crate::DocId;
 
+mod conjunction;
+mod windows;
+
 /// Avoid eagerly reserving an arbitrarily large top-k heap. Most searches
 /// return far fewer hits than a very large requested limit, so let the heap
 /// grow on demand beyond this point.
@@ -147,6 +150,8 @@ impl ScoreCollector {
                 self.update_threshold();
             }
             true
+        } else if score < self.cached_threshold {
+            false
         } else if self.heap.peek().is_some_and(|worst| entry < *worst) {
             {
                 let mut worst = self.heap.peek_mut().expect("full heap has a root");
@@ -159,15 +164,57 @@ impl ScoreCollector {
         }
     }
 
+    /// Screen eight scores together, then use the canonical heap admission.
+    /// A stale threshold only admits extra candidates. Equal and unordered
+    /// scores still reach the total-order comparison, including seeded heaps.
+    fn insert_text_run(&mut self, docs: &[DocId], scores: &[f32]) {
+        self.insert_text_run_with_mapping(docs, scores, |doc| doc);
+    }
+
+    /// Resolve stable IDs only after the score screen, before heap tie-breaking.
+    fn insert_text_run_with_mapping(
+        &mut self,
+        docs: &[DocId],
+        scores: &[f32],
+        resolve: impl Fn(DocId) -> DocId,
+    ) {
+        debug_assert_eq!(docs.len(), scores.len());
+        crate::observe::search_work!(score_batches += 1);
+        let (blocks, tail) = scores.as_chunks::<8>();
+        for (docs, scores) in docs.chunks_exact(8).zip(blocks) {
+            let threshold = if self.heap.len() >= self.k {
+                self.cached_threshold
+            } else {
+                f32::NEG_INFINITY
+            };
+            let mut candidates = 0u8;
+            for (i, &score) in scores.iter().enumerate() {
+                let eligible = if score < threshold { 0 } else { 1 };
+                candidates |= eligible << i;
+            }
+            while candidates != 0 {
+                let i = candidates.trailing_zeros() as usize;
+                self.insert(resolve(docs[i]), 0.0 + scores[i]);
+                candidates &= candidates - 1;
+            }
+        }
+        for (&doc, &score) in docs[blocks.len() * 8..].iter().zip(tail) {
+            if self.heap.len() >= self.k && score < self.cached_threshold {
+                continue;
+            }
+            self.insert(resolve(doc), 0.0 + score);
+        }
+    }
+
     /// Check if a score could potentially enter top-k
-    #[inline]
+    #[cfg(test)]
     pub fn would_enter(&self, score: f32) -> bool {
         self.len() < self.k || score > self.cached_threshold
     }
 
     /// Check whether this fully identified candidate ranks ahead of the current
     /// worst retained entry, including deterministic tie breaks.
-    #[inline]
+    #[cfg(test)]
     pub fn would_enter_candidate(&self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
         if self.k == 0 {
             return false;
@@ -449,19 +496,57 @@ pub struct ScoredDoc {
 /// 3. **Conjunction optimization** (Lucene/Grand 2023): progressively intersect
 ///    essential terms as threshold rises, skipping docs that lack enough terms
 pub struct MaxScoreExecutor<'a> {
-    /// Metric labels (index, field) — set via `with_metric_labels`; empty
-    /// strings render as "unknown"/"?" is avoided by callers passing real
-    /// names from the schema.
+    /// Metric labels (index, field) for the samples this executor emits.
+    /// Default to `"unknown"`; callers set real schema names through
+    /// [`Self::with_metric_labels`].
     metric_index: &'a str,
     metric_field: &'a str,
     cursors: Vec<TermCursor<'a>>,
     prefix_sums: Vec<f32>,
+    /// Cursor indices in input term order, independent of pruning order.
+    score_order: Vec<usize>,
+    /// Semantic conjunction: batch only fully aligned eligible hits.
+    all_required: bool,
+    /// Semantic requirements in sorted cursor order; zero for ordinary unions.
+    required_mask: u64,
     collector: ScoreCollector,
+    /// Plain mapped fields rank ties by stable document ID, never physical slot.
+    document_map: Option<&'a crate::segment::chunk_map::ChunkMap>,
     inv_heap_factor: f32,
     predicate: Option<super::DocPredicate<'a>>,
     /// Query-global budget: checked every few thousand loop iterations;
     /// an expired deadline ends traversal with the results so far.
     budget: Option<SharedThreshold>,
+    /// Cursors dropped by the constructor at `MAX_QUERY_TERMS`; once any were
+    /// dropped the input order is lost and required-term semantics are
+    /// refused.
+    dropped_cursors: usize,
+    /// A rejected `require_*` configuration; surfaced as an error by
+    /// `execute`/`execute_sync` instead of running with wrong semantics.
+    configuration_error: Option<String>,
+    /// Counters of the last run (summary log line, tests).
+    stats: ExecutorStats,
+}
+
+/// Counters of an executor's last run, reported in its summary log line and
+/// inspected by tests. Each path fills only the counters it tracks.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExecutorStats {
+    /// Windowed path: windows visited, windows skipped whole by their bounds,
+    /// L1 groups skipped by impact bounds (also counted by the single path).
+    pub windows: u64,
+    pub windows_skipped: u64,
+    pub groups_skipped: u64,
+    /// Windowed path: candidates that survived to full scoring, documents
+    /// that entered the heap.
+    pub candidates: u64,
+    pub docs_scored: u64,
+    /// REQUIRED windows driven by a cheaper optional term because the
+    /// required terms alone could not reach the threshold.
+    pub optional_leads: u64,
+    /// Single-cursor path: blocks decoded and scored / skipped by bounds.
+    pub blocks_scored: u64,
+    pub blocks_skipped: u64,
 }
 
 /// Where a text cursor reads the length of a scoring unit: chunk lengths of a
@@ -481,6 +566,13 @@ impl LengthSource<'_> {
             LengthSource::Docs(lengths) => lengths.length(id),
         }
     }
+
+    pub(crate) fn gather_lengths(&self, ids: &[u32], out: &mut [u32]) {
+        match self {
+            LengthSource::Chunks(map) => map.gather_bm25_lengths(ids, out),
+            LengthSource::Docs(lengths) => lengths.gather_lengths(ids, out),
+        }
+    }
 }
 
 /// Unified term cursor for Block-Max MaxScore execution.
@@ -496,9 +588,15 @@ pub(crate) struct TermCursor<'a> {
     num_blocks: usize,
     // ── Per-position state (filled by ensure_block_loaded) ──────────
     block_idx: usize,
+    /// Decoded ids of the loaded block. Taken from the per-thread
+    /// [`CursorBuffers`] pool and returned on drop.
     doc_ids: Vec<u32>,
+    /// Scores of the loaded block (empty while a text block's TF decode is
+    /// still deferred).
     scores: Vec<f32>,
     ordinals: Vec<u16>,
+    /// Decoded term frequencies of the loaded text block.
+    tfs: Vec<u32>,
     pos: usize,
     block_loaded: bool,
     exhausted: bool,
@@ -522,15 +620,6 @@ enum CursorVariant<'a> {
     Text {
         list: crate::structures::BlockPostingList,
         idf: f32,
-        /// Precomputed: idf * (BM25_K1 + 1.0) — numerator scale factor
-        idf_times_k1_plus_1: f32,
-        /// Precomputed: 1.0 + BM25_K1 * (BM25_B / avg_field_len) — denominator tf coefficient
-        denom_tf_coeff: f32,
-        /// Precomputed: BM25_K1 * (1.0 - BM25_B) — denominator constant
-        denom_const: f32,
-        /// Precomputed: BM25_K1 * BM25_B / avg_len — per-token length
-        /// coefficient, used when `lengths` supplies real chunk lengths.
-        denom_len_coeff: f32,
         /// Real per-posting lengths (chunk lengths or document norms).
         /// `None` keeps the historic `tf`-as-length approximation.
         lengths: Option<LengthSource<'a>>,
@@ -541,13 +630,15 @@ enum CursorVariant<'a> {
         length_floor: u32,
         block_bound: CachedScoreBound,
         group_bound: CachedScoreBound,
+        prepared_bounds: Option<super::bm25::PreparedBounds>,
         /// Average length used by the bounds (matches the scoring average).
         avg_len: f32,
         /// Per-field k1/b, used by the block and group bounds.
         params: super::Bm25Params,
-        tfs: Vec<u32>,
+        normalization: Option<Box<super::bm25::NormTable>>,
         /// Deferred TF decode state: (block_offset, tf_start, count).
-        /// Set when doc_ids are decoded but TFs/scores are not yet computed.
+        /// Set when doc_ids are decoded but TFs are not. Candidate runs may
+        /// decode TFs while leaving the full score vector empty.
         deferred_tf: Option<(usize, usize, usize)>,
     },
     /// Sparse vector — mmap'd SparseIndex (skip entries + block data)
@@ -557,6 +648,116 @@ enum CursorVariant<'a> {
         skip_start: usize,
         block_data_offset: u64,
     },
+}
+
+/// Decode buffers of one cursor. A query builds one cursor per term and
+/// each cursor needs three or four block-sized vectors, so they are pooled
+/// per thread (the `BmpScratch` pattern) instead of being allocated per
+/// query: [`TermCursor`] takes a set on construction and returns it on drop.
+#[derive(Default)]
+struct CursorBuffers {
+    doc_ids: Vec<u32>,
+    scores: Vec<f32>,
+    ordinals: Vec<u16>,
+    tfs: Vec<u32>,
+}
+
+/// Bound of the per-thread cursor-buffer pool: two full queries' worth.
+const CURSOR_BUFFER_POOL_LIMIT: usize = 2 * super::MAX_QUERY_TERMS;
+
+thread_local! {
+    static CURSOR_BUFFERS: std::cell::RefCell<Vec<CursorBuffers>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl CursorBuffers {
+    /// A pooled set, or a fresh one sized for a posting block.
+    fn take() -> Self {
+        CURSOR_BUFFERS
+            .with(|pool| pool.borrow_mut().pop())
+            .unwrap_or_else(|| {
+                // The largest block either variant decodes: text blocks hold
+                // `POSTING_BLOCK_SIZE` postings, sparse blocks up to 256
+                // (`sparse::block::MAX_BLOCK_SIZE`), so a fresh set never
+                // regrows and stays that size once pooled.
+                const BLOCK: usize = if crate::structures::postings::POSTING_BLOCK_SIZE > 256 {
+                    crate::structures::postings::POSTING_BLOCK_SIZE
+                } else {
+                    256
+                };
+                Self {
+                    doc_ids: Vec::with_capacity(BLOCK),
+                    scores: Vec::with_capacity(BLOCK),
+                    ordinals: Vec::new(),
+                    tfs: Vec::with_capacity(BLOCK),
+                }
+            })
+    }
+
+    /// Clear and return the set to the pool (dropped once the pool is full).
+    fn recycle(mut self) {
+        self.doc_ids.clear();
+        self.scores.clear();
+        self.ordinals.clear();
+        self.tfs.clear();
+        CURSOR_BUFFERS.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < CURSOR_BUFFER_POOL_LIMIT {
+                pool.push(self);
+            }
+        });
+    }
+}
+
+impl Drop for TermCursor<'_> {
+    fn drop(&mut self) {
+        CursorBuffers {
+            doc_ids: std::mem::take(&mut self.doc_ids),
+            scores: std::mem::take(&mut self.scores),
+            ordinals: std::mem::take(&mut self.ordinals),
+            tfs: std::mem::take(&mut self.tfs),
+        }
+        .recycle();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn score_text_run(
+    params: super::Bm25Params,
+    idf: f32,
+    avg_len: f32,
+    lengths: Option<LengthSource<'_>>,
+    normalization: Option<&super::bm25::NormTable>,
+    docs: &[DocId],
+    tfs: &[u32],
+    scores: &mut [f32],
+) {
+    debug_assert_eq!(docs.len(), tfs.len());
+    debug_assert_eq!(docs.len(), scores.len());
+    crate::observe::search_work!(score_batches += 1);
+    if let (Some(LengthSource::Docs(lengths)), Some(table)) = (lengths, normalization) {
+        crate::observe::search_work!(lookup_score_units += docs.len());
+        table.score_batch(
+            params,
+            idf,
+            avg_len,
+            1.0,
+            docs.iter().map(|&doc| lengths.norm_code(doc)),
+            tfs,
+            scores,
+        );
+        return;
+    }
+    let mut gathered = [0; crate::structures::postings::POSTING_BLOCK_SIZE];
+    crate::observe::search_work!(exact_score_units += docs.len());
+    if let Some(source) = lengths {
+        source.gather_lengths(docs, &mut gathered[..docs.len()]);
+    }
+    for ((&tf, &len), score) in tfs.iter().zip(&gathered[..docs.len()]).zip(scores) {
+        let tf = tf as f32;
+        let len = if len == 0 { tf } else { len as f32 };
+        *score = params.score(tf, idf, len, avg_len);
+    }
 }
 
 /// One query-local memoized bound, not a corpus-sized table. Atomic packing
@@ -608,8 +809,15 @@ macro_rules! cursor_ensure_block {
                     $self.block_loaded = true;
                     Ok(true)
                 } else {
+                    // `block_idx < num_blocks` here, so a block that fails to
+                    // decode is corrupt, not the end of the list. Surface it:
+                    // treating it as exhaustion would silently truncate the
+                    // top-k.
                     $self.exhausted = true;
-                    Ok(false)
+                    Err(crate::Error::Corruption(format!(
+                        "text posting block {} of {} failed to decode",
+                        $self.block_idx, $self.num_blocks
+                    )))
                 }
             }
             CursorVariant::Sparse {
@@ -677,7 +885,9 @@ macro_rules! cursor_seek {
 }
 
 impl<'a> TermCursor<'a> {
-    /// Full-text BM25 cursor with explicit per-field parameters.
+    /// Full-text BM25 cursor with explicit per-field parameters. `lengths`
+    /// supplies real scoring-unit lengths (chunk lengths or document norms);
+    /// without it `tf` stands in for the length.
     pub fn text_with_params(
         posting_list: crate::structures::BlockPostingList,
         idf: f32,
@@ -685,17 +895,8 @@ impl<'a> TermCursor<'a> {
         lengths: Option<LengthSource<'a>>,
         params: super::Bm25Params,
     ) -> Self {
-        Self::text_with_lengths(posting_list, idf, avg_field_len, lengths, params)
-    }
-
-    fn text_with_lengths(
-        posting_list: crate::structures::BlockPostingList,
-        idf: f32,
-        avg_field_len: f32,
-        lengths: Option<LengthSource<'a>>,
-        params: super::Bm25Params,
-    ) -> Self {
-        let max_tf = posting_list.max_tf() as f32;
+        let posting_max_tf = posting_list.max_tf();
+        let max_tf = posting_max_tf as f32;
         let safe_avg = avg_field_len.max(1.0);
         let length_bounds = lengths.is_some() && posting_list.min_len().is_some();
         let length_floor = match lengths {
@@ -712,13 +913,15 @@ impl<'a> TermCursor<'a> {
             _ => params.upper_bound(max_tf.max(1.0), idf),
         };
         let num_blocks = posting_list.num_blocks();
+        let buffers = CursorBuffers::take();
         Self {
             max_score,
             num_blocks,
             block_idx: 0,
-            doc_ids: Vec::with_capacity(128),
-            scores: Vec::with_capacity(128),
-            ordinals: Vec::new(),
+            doc_ids: buffers.doc_ids,
+            scores: buffers.scores,
+            ordinals: buffers.ordinals,
+            tfs: buffers.tfs,
             pos: 0,
             block_loaded: false,
             exhausted: num_blocks == 0,
@@ -728,18 +931,25 @@ impl<'a> TermCursor<'a> {
             variant: CursorVariant::Text {
                 list: posting_list,
                 idf,
-                idf_times_k1_plus_1: idf * (params.k1 + 1.0),
-                denom_tf_coeff: 1.0 + params.k1 * (params.b / safe_avg),
-                denom_const: params.k1 * (1.0 - params.b),
-                denom_len_coeff: params.k1 * params.b / safe_avg,
                 lengths,
                 length_bounds,
                 length_floor,
                 block_bound: CachedScoreBound::new(),
                 group_bound: CachedScoreBound::new(),
+                prepared_bounds: super::bm25::PreparedBounds::new(
+                    params,
+                    posting_max_tf,
+                    idf,
+                    safe_avg,
+                ),
                 avg_len: safe_avg,
                 params,
-                tfs: Vec::with_capacity(128),
+                normalization: match lengths {
+                    Some(LengthSource::Docs(lengths)) if lengths.is_quantized() => {
+                        Some(Box::new(super::bm25::NormTable::new(params, safe_avg)))
+                    }
+                    _ => None,
+                },
                 deferred_tf: None,
             },
         }
@@ -755,13 +965,15 @@ impl<'a> TermCursor<'a> {
         global_max_weight: f32,
         block_data_offset: u64,
     ) -> Self {
+        let buffers = CursorBuffers::take();
         Self {
             max_score: query_weight.abs() * global_max_weight,
             num_blocks: skip_count,
             block_idx: 0,
-            doc_ids: Vec::with_capacity(256),
-            scores: Vec::with_capacity(256),
-            ordinals: Vec::with_capacity(256),
+            doc_ids: buffers.doc_ids,
+            scores: buffers.scores,
+            ordinals: buffers.ordinals,
+            tfs: buffers.tfs,
             pos: 0,
             block_loaded: false,
             exhausted: skip_count == 0,
@@ -831,7 +1043,7 @@ impl<'a> TermCursor<'a> {
     /// This method triggers the deferred decode on first access, amortized over
     /// the block. Subsequent calls within the same block are free.
     #[inline]
-    pub fn ordinal_mut(&mut self) -> u16 {
+    fn ordinal_mut(&mut self) -> u16 {
         if !self.block_loaded {
             return 0;
         }
@@ -864,14 +1076,14 @@ impl<'a> TermCursor<'a> {
     /// loading until this method is called, saving work for blocks skipped by
     /// block-max or conjunction pruning. No-op for sparse cursors.
     #[inline]
-    pub fn ensure_scores(&mut self) {
+    fn ensure_scores(&mut self) {
         if self.block_loaded && self.scores.is_empty() {
             self.compute_deferred_scores();
         }
     }
 
     #[inline]
-    pub fn current_block_max_score(&self) -> f32 {
+    fn current_block_max_score(&self) -> f32 {
         if self.exhausted {
             return 0.0;
         }
@@ -890,7 +1102,7 @@ impl<'a> TermCursor<'a> {
     /// block, for text lists that store superblock bounds; `None` when the
     /// cursor cannot bound a whole group (sparse, legacy lists).
     #[inline]
-    pub fn current_group_max_score(&self) -> Option<f32> {
+    fn current_group_max_score(&self) -> Option<f32> {
         if self.exhausted {
             return Some(0.0);
         }
@@ -903,25 +1115,33 @@ impl<'a> TermCursor<'a> {
     /// Whether this cursor reads an in-memory text posting list (all of its
     /// I/O is synchronous, so the windowed executor can drive it).
     #[inline]
-    pub(crate) fn is_text(&self) -> bool {
+    fn is_text(&self) -> bool {
         matches!(self.variant, CursorVariant::Text { .. })
     }
 
     /// Upper bound of text block `idx` from its `(max_tf, min_len)` word.
     fn text_block_bound(&self, idx: usize) -> f32 {
+        self.text_block_bound_for_threshold(idx, f32::NEG_INFINITY)
+    }
+
+    /// A loose bound that already loses cannot benefit from impact refinement.
+    /// Cached loose bounds remain conservative for every subsequent caller.
+    fn text_block_bound_for_threshold(&self, idx: usize, threshold: f32) -> f32 {
+        crate::observe::search_work!(block_bound_calls += 1);
         match &self.variant {
             CursorVariant::Text {
                 list,
                 idf,
                 length_bounds,
                 length_floor,
+                prepared_bounds,
                 block_bound,
                 avg_len,
                 params,
                 ..
             } => block_bound.get_or_compute(idx, || {
                 let (max_tf, min_len) = list.block_bounds(idx).unwrap_or((0, None));
-                match min_len {
+                let bound = match min_len {
                     Some(min_len) if *length_bounds => params.upper_bound_with_len(
                         (max_tf as f32).max(1.0),
                         *idf,
@@ -929,6 +1149,21 @@ impl<'a> TermCursor<'a> {
                         *avg_len,
                     ),
                     _ => params.upper_bound((max_tf as f32).max(1.0), *idf),
+                };
+                if *length_bounds {
+                    let bound =
+                        bound.min(prepared_bounds.as_ref().map_or(f32::INFINITY, |bounds| {
+                            bounds.ratio(max_tf, list.block_length_ratio(idx))
+                        }));
+                    if bound >= threshold && list.has_impact_bounds() {
+                        bound.min(prepared_bounds.as_ref().map_or(f32::INFINITY, |bounds| {
+                            bounds.impacts(|a, b| list.block_impact_minimum(idx, a, b))
+                        }))
+                    } else {
+                        bound
+                    }
+                } else {
+                    bound
                 }
             }),
             CursorVariant::Sparse { .. } => self.max_score,
@@ -937,12 +1172,18 @@ impl<'a> TermCursor<'a> {
 
     /// Upper bound of the L1 group containing text block `idx`.
     fn text_group_bound(&self, idx: usize) -> Option<f32> {
+        self.text_group_bound_for_threshold(idx, f32::NEG_INFINITY)
+    }
+
+    fn text_group_bound_for_threshold(&self, idx: usize, threshold: f32) -> Option<f32> {
+        crate::observe::search_work!(group_bound_calls += 1);
         match &self.variant {
             CursorVariant::Text {
                 list,
                 idf,
                 length_bounds,
                 length_floor,
+                prepared_bounds,
                 group_bound,
                 avg_len,
                 params,
@@ -951,12 +1192,23 @@ impl<'a> TermCursor<'a> {
                 let (max_tf, min_len) = list.group_bounds(idx)?;
                 Some(group_bound.get_or_compute(list.next_group_block(idx), || {
                     if *length_bounds {
-                        params.upper_bound_with_len(
-                            (max_tf as f32).max(1.0),
-                            *idf,
-                            min_len.max(*length_floor) as f32,
-                            *avg_len,
-                        )
+                        let bound = params
+                            .upper_bound_with_len(
+                                (max_tf as f32).max(1.0),
+                                *idf,
+                                min_len.max(*length_floor) as f32,
+                                *avg_len,
+                            )
+                            .min(prepared_bounds.as_ref().map_or(f32::INFINITY, |bounds| {
+                                bounds.ratio(max_tf, list.group_length_ratio(idx))
+                            }));
+                        if bound >= threshold && list.has_group_impact_bounds() {
+                            bound.min(prepared_bounds.as_ref().map_or(f32::INFINITY, |bounds| {
+                                bounds.impacts(|a, b| list.group_impact_minimum(idx, a, b))
+                            }))
+                        } else {
+                            bound
+                        }
                     } else {
                         params.upper_bound((max_tf as f32).max(1.0), *idf)
                     }
@@ -966,12 +1218,36 @@ impl<'a> TermCursor<'a> {
         }
     }
 
+    fn has_group_impacts(&self) -> bool {
+        matches!(&self.variant, CursorVariant::Text { list, .. } if list.has_group_impact_bounds())
+    }
+
+    /// A remaining posting's enclosing group. Passed documents only loosen
+    /// the bound; no payload or scoring length is read by this probe.
+    fn text_group_span_from(&self, from: DocId) -> Option<(DocId, DocId, f32)> {
+        if self.exhausted {
+            return None;
+        }
+        let CursorVariant::Text { list, .. } = &self.variant else {
+            return None;
+        };
+        let start = from.max(self.doc());
+        let idx = list.seek_block(start, self.block_idx)?;
+        let first = start.max(list.block_first_doc(idx)?);
+        let (last, bound) = if let Some(bound) = self.text_group_bound(idx) {
+            (list.group_last_doc(idx)?, bound)
+        } else {
+            (list.block_last_doc(idx)?, self.text_block_bound(idx))
+        };
+        Some((first, last, bound))
+    }
+
     /// Upper bound of this cursor's contribution to any id in `[from, to]`:
     /// the largest block bound over the blocks intersecting the range, with
     /// one L1 word standing in for a group that lies inside it. Reads skip
     /// entries only; no block is decoded (Lucene `advanceShallow` +
     /// `getMaxScore(upTo)`).
-    pub(crate) fn window_upper_bound(&self, from: DocId, to: DocId) -> f32 {
+    fn window_upper_bound(&self, from: DocId, to: DocId) -> f32 {
         if self.exhausted {
             return 0.0;
         }
@@ -983,6 +1259,16 @@ impl<'a> TermCursor<'a> {
         let start = from.max(self.doc());
         if start > to {
             return 0.0;
+        }
+        // The loaded block often covers the entire window. Preserve the
+        // existing whole-group substitution when a complete group fits.
+        if self.block_last_doc(self.block_idx) >= to
+            && !(list.is_group_start(self.block_idx)
+                && list
+                    .group_last_doc(self.block_idx)
+                    .is_some_and(|last| last <= to))
+        {
+            return 0.0f32.max(self.text_block_bound(self.block_idx));
         }
         let Some(mut idx) = list.seek_block(start, self.block_idx) else {
             return 0.0;
@@ -1010,12 +1296,66 @@ impl<'a> TermCursor<'a> {
     /// buffers (`scores[id - from]`, bit `id - from` of `mask`) and leave the
     /// cursor on its first id after `to`. Whole runs of a block are
     /// processed in one pass over its decoded arrays. Text cursors only.
-    pub(crate) fn score_window_sync(
+    /// The per-term `contributions` (values, presence bits) feed the
+    /// canonical query-order reduction; a lone essential cursor uses
+    /// [`Self::append_scored_window_sync`] instead.
+    fn score_window_sync(
         &mut self,
         from: DocId,
         to: DocId,
         scores: &mut [f32],
         mask: &mut [u64],
+        mut contributions: Option<(&mut [f32], &mut [u64])>,
+    ) -> crate::Result<u32> {
+        self.visit_scored_window_sync(to, |docs, block_scores| {
+            for (doc, score) in docs.iter().zip(block_scores) {
+                let slot = (doc - from) as usize;
+                scores[slot] += score;
+                if let Some((values, present)) = contributions.as_mut() {
+                    values[slot] = *score;
+                    present[slot >> 6] |= 1u64 << (slot & 63);
+                }
+                mask[slot >> 6] |= 1u64 << (slot & 63);
+            }
+        })
+    }
+
+    /// A sole essential cursor already yields sorted, unique candidates.
+    /// Retain per-term contributions for the later canonical reduction without
+    /// expanding the candidate sequence into a dense document-ID window.
+    ///
+    /// `0.0 + score`: a single-term score is emitted as-is instead of through
+    /// the query-order fold, which starts at `0.0`. Adding `0.0` here
+    /// normalises a `-0.0` score to `+0.0` exactly like that fold does, so
+    /// every path stays bit-identical (all other bits are unchanged). The
+    /// same idiom appears in [`MaxScoreExecutor::execute_single_text`].
+    fn append_scored_window_sync(
+        &mut self,
+        from: DocId,
+        to: DocId,
+        docs: &mut Vec<DocId>,
+        scores: &mut Vec<f32>,
+        mut contributions: Option<(&mut [f32], &mut [u64])>,
+    ) -> crate::Result<u32> {
+        self.visit_scored_window_sync(to, |run_docs, run_scores| {
+            docs.extend_from_slice(run_docs);
+            scores.extend(run_scores.iter().map(|score| 0.0 + score));
+            if let Some((values, present)) = contributions.as_mut() {
+                for (&doc, &score) in run_docs.iter().zip(run_scores) {
+                    let slot = (doc - from) as usize;
+                    values[slot] = score;
+                    present[slot >> 6] |= 1u64 << (slot & 63);
+                }
+            }
+        })
+    }
+
+    /// Visit the same bounded decoded runs for dense and sparse materialization.
+    /// The caller has already positioned this cursor at the window's start.
+    fn visit_scored_window_sync(
+        &mut self,
+        to: DocId,
+        mut visit: impl FnMut(&[DocId], &[f32]),
     ) -> crate::Result<u32> {
         let mut matched = 0u32;
         loop {
@@ -1042,11 +1382,7 @@ impl<'a> TermCursor<'a> {
                 crate::structures::simd::find_first_ge_u32(remaining, to + 1)
             };
             let block_scores = &self.scores[self.pos..self.pos + end];
-            for (doc, score) in remaining[..end].iter().zip(block_scores) {
-                let slot = (doc - from) as usize;
-                scores[slot] += score;
-                mask[slot >> 6] |= 1u64 << (slot & 63);
-            }
+            visit(&remaining[..end], block_scores);
             matched += end as u32;
             self.pos += end;
             if self.pos >= self.doc_ids.len() {
@@ -1064,13 +1400,17 @@ impl<'a> TermCursor<'a> {
 
     /// Move past every id `<= to`, skipping whole blocks that end before it
     /// without decoding them.
-    pub(crate) fn skip_past_sync(&mut self, to: DocId) -> crate::Result<()> {
+    fn skip_past_sync(&mut self, to: DocId) -> crate::Result<()> {
         if to == u32::MAX {
             self.exhausted = true;
             return Ok(());
         }
         while !self.exhausted && self.block_last_doc(self.block_idx) <= to {
-            self.skip_to_next_block();
+            if self.current_group_last_doc() <= to {
+                self.skip_to_next_group();
+            } else {
+                self.skip_to_next_block();
+            }
         }
         if !self.exhausted && self.doc() <= to {
             self.seek_sync(to + 1)?;
@@ -1078,9 +1418,142 @@ impl<'a> TermCursor<'a> {
         Ok(())
     }
 
+    /// Probe sorted candidate IDs, optionally intersecting their membership.
+    /// Contributions stay in the caller's canonical per-term window buffers.
+    /// False reports deadline truncation before the window is collected.
+    fn score_candidates_sync(
+        &mut self,
+        from: DocId,
+        docs: &mut Vec<DocId>,
+        scores: &mut Vec<f32>,
+        required: bool,
+        contributions: Option<(&mut [f32], &mut [u64])>,
+        budget: Option<&SharedThreshold>,
+    ) -> crate::Result<bool> {
+        if required {
+            self.score_candidate_membership::<true>(from, docs, scores, contributions, budget)
+        } else {
+            self.score_candidate_membership::<false>(from, docs, scores, contributions, budget)
+        }
+    }
+
+    fn score_candidate_membership<const REQUIRED: bool>(
+        &mut self,
+        from: DocId,
+        docs: &mut Vec<DocId>,
+        scores: &mut Vec<f32>,
+        mut contributions: Option<(&mut [f32], &mut [u64])>,
+        budget: Option<&SharedThreshold>,
+    ) -> crate::Result<bool> {
+        const RUN: usize = crate::structures::postings::POSTING_BLOCK_SIZE;
+        let mut matched_docs = [0; RUN];
+        // A loaded text block has at most 128 entries.
+        const { assert!(RUN <= u8::MAX as usize + 1) };
+        let mut posting_slots = [0u8; RUN];
+        let mut output_slots = [0; RUN];
+        let mut values = [0.0; RUN];
+        let mut input = 0;
+        let mut kept = 0;
+        while input < docs.len() {
+            if budget.is_some_and(SharedThreshold::stop_if_expired) {
+                return Ok(false);
+            }
+            // One metadata-aware seek per block. All further probes in this
+            // run stay inside the loaded document slice and cannot load I/O.
+            if self.seek_sync(docs[input])? == u32::MAX {
+                break;
+            }
+            let block_last = *self.doc_ids.last().expect("loaded posting block");
+            let mut matched = 0;
+            while input < docs.len() && docs[input] <= block_last && matched < RUN {
+                if input.is_multiple_of(64) && budget.is_some_and(SharedThreshold::stop_if_expired)
+                {
+                    return Ok(false);
+                }
+                let doc = docs[input];
+                if self.doc_ids[self.pos] < doc {
+                    self.pos +=
+                        crate::structures::simd::find_first_ge_u32(&self.doc_ids[self.pos..], doc);
+                }
+                let present = self.doc_ids[self.pos] == doc;
+                if present || !REQUIRED {
+                    if REQUIRED {
+                        docs[kept] = doc;
+                        scores[kept] = scores[input];
+                    }
+                    if present {
+                        matched_docs[matched] = doc;
+                        posting_slots[matched] = self.pos as u8;
+                        output_slots[matched] = kept;
+                        matched += 1;
+                    }
+                    kept += 1;
+                }
+                input += 1;
+            }
+            if matched > 0 {
+                self.score_candidate_block(
+                    &matched_docs[..matched],
+                    &posting_slots[..matched],
+                    &mut values[..matched],
+                );
+                for i in 0..matched {
+                    scores[output_slots[i]] += values[i];
+                    if let Some((stored, present)) = contributions.as_mut() {
+                        let slot = (matched_docs[i] - from) as usize;
+                        stored[slot] = values[i];
+                        present[slot >> 6] |= 1u64 << (slot & 63);
+                    }
+                }
+            }
+        }
+        if REQUIRED {
+            docs.truncate(kept);
+            scores.truncate(kept);
+        }
+        Ok(true)
+    }
+
+    /// Score just the matching postings from one loaded block. TF unpacking
+    /// remains shared with full-window scoring; score readiness is independent.
+    fn score_candidate_block(&mut self, docs: &[DocId], slots: &[u8], values: &mut [f32]) {
+        if !self.scores.is_empty() {
+            for (&slot, value) in slots.iter().zip(values) {
+                *value = self.scores[usize::from(slot)];
+            }
+            return;
+        }
+        self.decode_deferred_tfs();
+        let CursorVariant::Text {
+            idf,
+            avg_len,
+            params,
+            lengths,
+            normalization,
+            ..
+        } = &self.variant
+        else {
+            unreachable!("loaded sparse blocks already contain scores");
+        };
+        let mut frequencies = [0; crate::structures::postings::POSTING_BLOCK_SIZE];
+        for (tf, &slot) in frequencies.iter_mut().zip(slots) {
+            *tf = self.tfs[usize::from(slot)];
+        }
+        score_text_run(
+            *params,
+            *idf,
+            *avg_len,
+            *lengths,
+            normalization.as_deref(),
+            docs,
+            &frequencies[..docs.len()],
+            values,
+        );
+    }
+
     /// Last doc of the L1 group containing the current block (text only).
     #[inline]
-    pub fn current_group_last_doc(&self) -> DocId {
+    fn current_group_last_doc(&self) -> DocId {
         match &self.variant {
             CursorVariant::Text { list, .. } => list.group_last_doc(self.block_idx).unwrap_or(0),
             CursorVariant::Sparse { .. } => self.block_last_doc(self.block_idx),
@@ -1088,7 +1561,7 @@ impl<'a> TermCursor<'a> {
     }
 
     /// Jump past the current L1 group (text) or block (sparse).
-    pub fn skip_to_next_group(&mut self) -> DocId {
+    fn skip_to_next_group(&mut self) -> DocId {
         if self.exhausted {
             return u32::MAX;
         }
@@ -1107,7 +1580,7 @@ impl<'a> TermCursor<'a> {
 
     // ── Block navigation ────────────────────────────────────────────────
 
-    pub fn skip_to_next_block(&mut self) -> DocId {
+    fn skip_to_next_block(&mut self) -> DocId {
         if self.exhausted {
             return u32::MAX;
         }
@@ -1136,50 +1609,38 @@ impl<'a> TermCursor<'a> {
 
     /// Compute BM25 scores from deferred TF data (lazy decode for text cursors).
     #[inline(never)]
-    fn compute_deferred_scores(&mut self) {
+    fn decode_deferred_tfs(&mut self) {
         if let CursorVariant::Text {
-            list,
-            idf_times_k1_plus_1,
-            denom_tf_coeff,
-            denom_const,
-            denom_len_coeff,
-            lengths,
-            tfs,
-            deferred_tf,
-            ..
+            list, deferred_tf, ..
         } = &mut self.variant
             && let Some((block_offset, tf_start, count)) = deferred_tf.take()
         {
-            list.decode_block_tfs_deferred(block_offset, tf_start, count, tfs);
-            let num_scale = *idf_times_k1_plus_1;
-            let d_tf = *denom_tf_coeff;
-            let d_const = *denom_const;
-            let d_len = *denom_len_coeff;
-            self.scores.clear();
-            self.scores.resize(count, 0.0);
-            match lengths {
-                // Real BM25 length normalisation per chunk or document.
-                Some(source) => {
-                    for i in 0..count {
-                        let tf = unsafe { *tfs.get_unchecked(i) } as f32;
-                        let vid = unsafe { *self.doc_ids.get_unchecked(i) };
-                        let len = source.length(vid) as f32;
-                        let score = (num_scale * tf) / (tf + d_const + d_len * len);
-                        unsafe {
-                            *self.scores.get_unchecked_mut(i) = score;
-                        }
-                    }
-                }
-                None => {
-                    for i in 0..count {
-                        let tf = unsafe { *tfs.get_unchecked(i) } as f32;
-                        let score = (num_scale * tf) / (d_tf * tf + d_const);
-                        unsafe {
-                            *self.scores.get_unchecked_mut(i) = score;
-                        }
-                    }
-                }
-            }
+            list.decode_block_tfs_deferred(block_offset, tf_start, count, &mut self.tfs);
+        }
+    }
+
+    fn compute_deferred_scores(&mut self) {
+        self.decode_deferred_tfs();
+        if let CursorVariant::Text {
+            idf,
+            avg_len,
+            params,
+            lengths,
+            normalization,
+            ..
+        } = &self.variant
+        {
+            self.scores.resize(self.doc_ids.len(), 0.0);
+            score_text_run(
+                *params,
+                *idf,
+                *avg_len,
+                *lengths,
+                normalization.as_deref(),
+                &self.doc_ids,
+                &self.tfs,
+                &mut self.scores,
+            );
         }
     }
 
@@ -1212,7 +1673,9 @@ impl<'a> TermCursor<'a> {
         cursor_seek!(self, ensure_block_loaded_sync, target,)
     }
 
+    #[inline]
     fn seek_prepare(&mut self, target: DocId) -> Option<DocId> {
+        crate::observe::search_work!(posting_seeks += 1);
         if self.exhausted {
             return Some(u32::MAX);
         }
@@ -1239,7 +1702,13 @@ impl<'a> TermCursor<'a> {
             }
         }
 
-        // Seek to the block containing target
+        self.seek_directory(target)
+    }
+
+    /// Keep the loaded-block seek small; directory traversal is needed only
+    /// after the current block cannot answer the target.
+    #[inline(never)]
+    fn seek_directory(&mut self, target: DocId) -> Option<DocId> {
         let lo = match &self.variant {
             // Text: SIMD-accelerated 2-level seek (L1 + L0)
             CursorVariant::Text { list, .. } => match list.seek_block(target, self.block_idx) {
@@ -1313,10 +1782,12 @@ macro_rules! bms_execute_loop {
         let mut groups_skipped = 0u64;
         let mut conjunction_skipped = 0u64;
         let mut ordinal_scores: Vec<(u16, f32)> = Vec::with_capacity(n * 2);
-        let _bms_start = crate::observe::WallTimer::start();
+        let started = crate::observe::WallTimer::start();
 
-        let inv_heap_factor = $self.inv_heap_factor;
-        let mut adjusted_threshold = $self.collector.threshold() * inv_heap_factor - 1e-6;
+        // The same rounding margin as every other path (`pruning_threshold`):
+        // bound sums and partial scores accumulate in traversal order, so a
+        // fixed absolute epsilon is not enough once scores exceed a few units.
+        let mut adjusted_threshold = $self.pruning_threshold();
         let mut iterations: u64 = 0;
 
         loop {
@@ -1533,7 +2004,7 @@ macro_rules! bms_execute_loop {
                 let (ord, score) = ordinal_scores[0];
                 if $self.collector.insert_with_ordinal(min_doc, score, ord) {
                     docs_scored += 1;
-                    adjusted_threshold = $self.collector.threshold() * inv_heap_factor - 1e-6;
+                    adjusted_threshold = $self.pruning_threshold();
                 } else {
                     docs_skipped += 1;
                 }
@@ -1556,7 +2027,7 @@ macro_rules! bms_execute_loop {
                         .insert_with_ordinal(min_doc, score, current_ord)
                     {
                         docs_scored += 1;
-                        adjusted_threshold = $self.collector.threshold() * inv_heap_factor - 1e-6;
+                        adjusted_threshold = $self.pruning_threshold();
                     } else {
                         docs_skipped += 1;
                     }
@@ -1564,22 +2035,13 @@ macro_rules! bms_execute_loop {
             }
         }
 
-        let results: Vec<ScoredDoc> = $self
-            .collector
-            .into_sorted_results()
-            .into_iter()
-            .map(|(doc_id, score, ordinal)| ScoredDoc {
-                doc_id,
-                score,
-                ordinal,
-            })
-            .collect();
+        let results = $self.finish();
 
-        let _bms_elapsed_ms = (_bms_start.secs() * 1000.0) as u64;
-        if _bms_elapsed_ms > 500 {
+        let elapsed_ms = (started.secs() * 1000.0) as u64;
+        if elapsed_ms > 500 {
             warn!(
                 "slow MaxScore: {}ms, cursors={}, scored={}, skipped={}, blocks_skipped={}, groups_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
-                _bms_elapsed_ms,
+                elapsed_ms,
                 n,
                 docs_scored,
                 docs_skipped,
@@ -1592,7 +2054,7 @@ macro_rules! bms_execute_loop {
         } else {
             debug!(
                 "MaxScoreExecutor: {}ms, scored={}, skipped={}, blocks_skipped={}, groups_skipped={}, conjunction_skipped={}, returned={}, top_score={:.4}",
-                _bms_elapsed_ms,
+                elapsed_ms,
                 docs_scored,
                 docs_skipped,
                 blocks_skipped,
@@ -1616,13 +2078,19 @@ impl<'a> MaxScoreExecutor<'a> {
         // The execution loop tracks cursors at the current document in a u64.
         // Query construction normally enforces this bound, but keep this
         // boundary defensive for direct/internal executor users as well.
-        if cursors.len() > super::MAX_QUERY_TERMS {
+        // Dropping cursors changes the query (and loses the input order the
+        // `require_*` builders rely on), so it is logged with counts and
+        // remembered.
+        let dropped_cursors = cursors.len().saturating_sub(super::MAX_QUERY_TERMS);
+        if dropped_cursors > 0 {
+            log::warn!(
+                "MaxScoreExecutor: {} cursors exceed the {}-term limit; dropping the {} with the lowest upper bounds (input order is lost, required-term semantics will be refused)",
+                cursors.len(),
+                super::MAX_QUERY_TERMS,
+                dropped_cursors
+            );
             cursors.sort_unstable_by(|a, b| b.max_score.total_cmp(&a.max_score));
             cursors.truncate(super::MAX_QUERY_TERMS);
-            log::warn!(
-                "MaxScore cursor count exceeded {}; retaining the strongest cursors",
-                super::MAX_QUERY_TERMS
-            );
         }
 
         // Enable lazy ordinal decode — ordinals are only decoded when a doc
@@ -1632,11 +2100,11 @@ impl<'a> MaxScoreExecutor<'a> {
         }
 
         // Sort by max_score ascending (non-essential first)
-        cursors.sort_by(|a, b| {
-            a.max_score
-                .partial_cmp(&b.max_score)
-                .unwrap_or(Ordering::Equal)
-        });
+        let mut numbered: Vec<_> = cursors.into_iter().enumerate().collect();
+        numbered.sort_by(|a, b| a.1.max_score.total_cmp(&b.1.max_score));
+        let mut score_order: Vec<_> = (0..numbered.len()).collect();
+        score_order.sort_unstable_by_key(|&i| numbered[i].0);
+        let cursors: Vec<_> = numbered.into_iter().map(|(_, cursor)| cursor).collect();
 
         let mut prefix_sums = Vec::with_capacity(cursors.len());
         let mut cumsum = 0.0f32;
@@ -1647,7 +2115,7 @@ impl<'a> MaxScoreExecutor<'a> {
 
         let clamped_heap_factor = heap_factor.clamp(0.01, 1.0);
 
-        debug!(
+        log::trace!(
             "Creating MaxScoreExecutor: num_cursors={}, k={}, total_upper={:.4}, heap_factor={:.2}",
             cursors.len(),
             k,
@@ -1658,18 +2126,84 @@ impl<'a> MaxScoreExecutor<'a> {
         Self {
             cursors,
             prefix_sums,
+            score_order,
+            all_required: false,
+            required_mask: 0,
             collector: ScoreCollector::new(k),
+            document_map: None,
             inv_heap_factor: 1.0 / clamped_heap_factor,
             predicate: None,
             budget: None,
             metric_index: "unknown",
             metric_field: "unknown",
+            dropped_cursors,
+            configuration_error: None,
+            stats: ExecutorStats::default(),
         }
+    }
+
+    /// Record a `require_*` misuse. Logged at error level and turned into an
+    /// `Error::Query` by `execute`/`execute_sync`: running anyway would
+    /// silently rank with the wrong semantics.
+    fn reject_configuration(&mut self, message: String) {
+        log::error!("MaxScoreExecutor: {message}; the query fails instead of mis-ranking");
+        self.configuration_error.get_or_insert(message);
     }
 
     /// Attach the query's wall-clock budget (anytime mode).
     pub fn with_budget(mut self, budget: Option<SharedThreshold>) -> Self {
         self.budget = budget.filter(|b| b.deadline().is_some());
+        self
+    }
+
+    /// Use compact hit batches for a pure conjunction. The planner retains complete
+    /// membership callers and unsupported compositions in the general scorer.
+    ///
+    /// Needs at least two text cursors and no cursor dropped at the term
+    /// limit; otherwise the executor is marked invalid and `execute` fails.
+    pub(crate) fn require_all_terms(mut self) -> Self {
+        if self.dropped_cursors > 0 {
+            self.reject_configuration(format!(
+                "require_all_terms after {} cursors were dropped at the {}-term limit",
+                self.dropped_cursors,
+                super::MAX_QUERY_TERMS
+            ));
+        } else if !self.all_text() || self.cursors.len() < 2 {
+            self.reject_configuration(format!(
+                "require_all_terms needs at least two text cursors (got {} cursors, all_text={})",
+                self.cursors.len(),
+                self.all_text()
+            ));
+        } else {
+            self.all_required = true;
+        }
+        self
+    }
+
+    /// The first input cursors are semantic MUST terms; later ones are optional.
+    /// Record identities after the constructor's bound-based cursor sort.
+    ///
+    /// Needs `1..=len` text cursors in their original input order; a cursor
+    /// dropped at the term limit destroys that order, so the executor is
+    /// then marked invalid and `execute` fails.
+    pub(crate) fn require_prefix_terms(mut self, count: usize) -> Self {
+        if self.dropped_cursors > 0 {
+            self.reject_configuration(format!(
+                "require_prefix_terms({count}) after {} cursors were dropped at the {}-term limit",
+                self.dropped_cursors,
+                super::MAX_QUERY_TERMS
+            ));
+        } else if !self.all_text() || count == 0 || count > self.cursors.len() {
+            self.reject_configuration(format!(
+                "require_prefix_terms({count}) needs 1..={} text cursors (all_text={})",
+                self.cursors.len(),
+                self.all_text()
+            ));
+        } else {
+            for &index in &self.score_order[..count] {
+                self.required_mask |= 1u64 << index;
+            }
+        }
         self
     }
 
@@ -1707,9 +2241,26 @@ impl<'a> MaxScoreExecutor<'a> {
         Self::new(cursors, k, heap_factor)
     }
 
-    /// Create an executor for full-text BM25 queries.
-    ///
-    /// Builds `TermCursor::Text` for each posting list.
+    /// Executor for full-text BM25 over `posting_lists` (`(list, idf)`
+    /// pairs). Every posting is scored with the length `lengths` supplies
+    /// (chunk lengths or document norms; `None` uses `tf` as the length).
+    pub fn text_with_lengths(
+        posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
+        avg_len: f32,
+        k: usize,
+        lengths: Option<LengthSource<'a>>,
+        params: super::Bm25Params,
+        heap_factor: f32,
+    ) -> Self {
+        let cursors: Vec<TermCursor<'a>> = posting_lists
+            .into_iter()
+            .map(|(pl, idf)| TermCursor::text_with_params(pl, idf, avg_len, lengths, params))
+            .collect();
+        Self::new(cursors, k, heap_factor)
+    }
+
+    /// Executor for full-text BM25 over a plain field, scored with the
+    /// persisted per-document lengths when available.
     pub fn text(
         posting_lists: Vec<(crate::structures::BlockPostingList, f32)>,
         avg_field_len: f32,
@@ -1718,19 +2269,14 @@ impl<'a> MaxScoreExecutor<'a> {
         params: super::Bm25Params,
         heap_factor: f32,
     ) -> Self {
-        let cursors: Vec<TermCursor<'a>> = posting_lists
-            .into_iter()
-            .map(|(pl, idf)| {
-                TermCursor::text_with_params(
-                    pl,
-                    idf,
-                    avg_field_len,
-                    lengths.map(LengthSource::Docs),
-                    params,
-                )
-            })
-            .collect();
-        Self::new(cursors, k, heap_factor)
+        Self::text_with_lengths(
+            posting_lists,
+            avg_field_len,
+            k,
+            lengths.map(LengthSource::Docs),
+            params,
+            heap_factor,
+        )
     }
 
     /// Executor for BM25 over a chunked text field: posting ids are virtual
@@ -1744,19 +2290,14 @@ impl<'a> MaxScoreExecutor<'a> {
         params: super::Bm25Params,
         heap_factor: f32,
     ) -> Self {
-        let cursors: Vec<TermCursor<'a>> = posting_lists
-            .into_iter()
-            .map(|(pl, idf)| {
-                TermCursor::text_with_params(
-                    pl,
-                    idf,
-                    avg_chunk_len,
-                    Some(LengthSource::Chunks(lengths)),
-                    params,
-                )
-            })
-            .collect();
-        Self::new(cursors, k, heap_factor)
+        Self::text_with_lengths(
+            posting_lists,
+            avg_chunk_len,
+            k,
+            Some(LengthSource::Chunks(lengths)),
+            params,
+            heap_factor,
+        )
     }
 
     #[inline]
@@ -1764,10 +2305,34 @@ impl<'a> MaxScoreExecutor<'a> {
         // Alpha < 1.0 raises the effective threshold → more terms become
         // non-essential → more aggressive pruning (approximate retrieval).
         // Use multiplication by reciprocal (cheaper than division).
-        let threshold = self.collector.threshold() * self.inv_heap_factor;
+        let threshold = self.pruning_threshold();
         // Keep an equal-score candidate essential: it can still displace the
         // current worst hit through the deterministic doc/ordinal tie-break.
         self.prefix_sums.partition_point(|&sum| sum < threshold)
+    }
+
+    /// The threshold every pruning decision compares bounds against (all
+    /// execution paths). Bound sums and partial scores use traversal order,
+    /// whereas final text scores use input order. Cover both accumulation
+    /// errors and subtraction of remaining bounds with a margin relative to
+    /// the score and the term count; an absolute epsilon alone fails once
+    /// scores exceed a few units.
+    fn pruning_threshold(&self) -> f32 {
+        let threshold = self.collector.threshold() * self.inv_heap_factor;
+        threshold - threshold.abs() * (4.0 * self.cursors.len() as f32 * f32::EPSILON) - 1e-6
+    }
+
+    pub(crate) fn with_document_map(
+        mut self,
+        map: &'a crate::segment::chunk_map::ChunkMap,
+    ) -> Self {
+        self.document_map = Some(map);
+        self
+    }
+
+    fn result_doc(&self, physical: DocId) -> DocId {
+        self.document_map
+            .map_or(physical, |map| map.doc_id(physical))
     }
 
     /// Attach a per-doc predicate filter to this executor.
@@ -1787,40 +2352,94 @@ impl<'a> MaxScoreExecutor<'a> {
 
     /// Execute Block-Max MaxScore and return top-k results (async).
     ///
-    /// Text cursors (in-memory posting lists) run the windowed executor;
-    /// sparse cursors, whose blocks may need asynchronous I/O, run the
-    /// document-at-a-time loop.
+    /// Text cursors (in-memory posting lists) run the synchronous dispatch
+    /// (`dispatch_sync`); sparse cursors, whose blocks may need asynchronous
+    /// I/O, run the document-at-a-time loop.
     pub async fn execute(mut self) -> crate::Result<Vec<ScoredDoc>> {
-        if self.cursors.is_empty() {
+        let Some(timer) = self.begin()? else {
             return Ok(Vec::new());
-        }
-        let t = crate::observe::Timer::start();
+        };
         let results = if self.all_text() {
-            self.execute_windowed()
+            self.dispatch_sync()
         } else {
             bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await)
         };
-        if let Ok(r) = &results {
-            crate::observe::maxscore_query(self.metric_index, self.metric_field, t.secs(), r.len());
-        }
+        self.record(timer, &results);
         results
     }
 
     /// Synchronous execution — works when all cursors are text or mmap-backed sparse.
     pub fn execute_sync(mut self) -> crate::Result<Vec<ScoredDoc>> {
-        if self.cursors.is_empty() {
+        let Some(timer) = self.begin()? else {
             return Ok(Vec::new());
+        };
+        let results = self.dispatch_sync();
+        self.record(timer, &results);
+        results
+    }
+
+    /// Shared entry checks: a rejected `require_*` configuration is an
+    /// error, an empty query returns nothing; otherwise the metrics timer
+    /// starts.
+    fn begin(&mut self) -> crate::Result<Option<crate::observe::Timer>> {
+        if let Some(error) = self.configuration_error.take() {
+            return Err(crate::Error::Query(error));
         }
-        let t = crate::observe::Timer::start();
-        let results = if self.all_text() {
+        if self.cursors.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::observe::Timer::start()))
+    }
+
+    /// Pick the synchronous path: semantic conjunction, required-prefix
+    /// windows, the single ratio-bounded text cursor, text windows, or the
+    /// document-at-a-time loop for sparse cursors.
+    fn dispatch_sync(&mut self) -> crate::Result<Vec<ScoredDoc>> {
+        if self.all_required {
+            self.execute_conjunction()
+        } else if self.required_mask != 0 {
+            self.execute_text_windows::<true>()
+        } else if self.single_text_with_ratio_bounds() {
+            self.execute_single_text()
+        } else if self.all_text() {
             self.execute_windowed()
         } else {
             bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
-        };
-        if let Ok(r) = &results {
-            crate::observe::maxscore_query(self.metric_index, self.metric_field, t.secs(), r.len());
         }
-        results
+    }
+
+    fn record(&self, timer: crate::observe::Timer, results: &crate::Result<Vec<ScoredDoc>>) {
+        crate::observe::search_work!(
+            executor_windows += self.stats.windows,
+            executor_windows_skipped += self.stats.windows_skipped,
+            executor_groups_skipped += self.stats.groups_skipped,
+            executor_candidates += self.stats.candidates,
+            executor_heap_admissions += self.stats.docs_scored,
+            single_blocks_scored += self.stats.blocks_scored,
+            single_blocks_skipped += self.stats.blocks_skipped
+        );
+        if let Ok(r) = results {
+            crate::observe::maxscore_query(
+                self.metric_index,
+                self.metric_field,
+                timer.secs(),
+                r.len(),
+            );
+        }
+    }
+
+    /// Drain the collector into results sorted by score (every path).
+    fn finish(&mut self) -> Vec<ScoredDoc> {
+        let collector = std::mem::replace(&mut self.collector, ScoreCollector::new(0));
+        collector
+            .into_sorted_results()
+            .into_iter()
+            .map(|(doc_id, score, ordinal)| ScoredDoc {
+                doc_id,
+                score,
+                ordinal,
+            })
+            .collect()
     }
 
     /// The document-at-a-time loop on any cursors (the reference the
@@ -1833,255 +2452,207 @@ impl<'a> MaxScoreExecutor<'a> {
         bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
     }
 
-    fn all_text(&self) -> bool {
-        self.cursors.iter().all(TermCursor::is_text)
+    /// Route a lone text cursor to [`Self::execute_single_text`] only when
+    /// its list stores ratio bounds. That path decides per block and group
+    /// from skip metadata alone and needs the tight ratio bounds to skip
+    /// anything; without them its bounds admit nearly every block, and the
+    /// measured cost of the windowed path at n = 1 (one sorted run per
+    /// block, no reduction) is no higher, so plain lists stay on the general
+    /// path.
+    fn single_text_with_ratio_bounds(&self) -> bool {
+        matches!(self.cursors.as_slice(), [TermCursor { variant: CursorVariant::Text { list, .. }, .. }] if list.has_ratio_bounds())
     }
 
-    /// Window-at-a-time Block-Max MaxScore for text cursors.
-    ///
-    /// The id space is walked in windows of at most [`WINDOW_IDS`] ids that
-    /// start at the first id a globally essential cursor can still reach and
-    /// end at the smallest current block end among those cursors. Per window
-    /// (Lucene `MaxScoreBulkScorer`; turbopuffer "batched iterator
-    /// advancement"):
-    ///
-    /// 1. every cursor's bound over the window is read from its skip entries
-    ///    (`window_upper_bound`), and the cursors are re-partitioned into
-    ///    essential and non-essential by those bounds, so the partition is
-    ///    the block-max one, not the list-max one;
-    /// 2. a window whose summed bounds cannot reach the threshold is skipped
-    ///    by every cursor without decoding a block;
-    /// 3. each essential cursor scores all of its postings in the window in
-    ///    one pass over its decoded block (dense `scores[id - from]` buffer
-    ///    plus a match bitset), so the same iterator advances many times in
-    ///    a row instead of alternating with the others;
-    /// 4. the candidates are filtered branch-free against the threshold
-    ///    minus what the remaining cursors could still add, and each
-    ///    non-essential cursor is then sought to the survivors in id order
-    ///    (again one iterator at a time), strongest bound first.
-    ///
-    /// Rank-safe: only documents whose window-essential score plus the
-    /// non-essential bounds cannot reach the threshold are dropped. The
-    /// approximate `heap_factor` mode scales the threshold as in the
-    /// document-at-a-time loop.
-    pub(crate) fn execute_windowed(&mut self) -> crate::Result<Vec<ScoredDoc>> {
-        if self
-            .budget
-            .as_ref()
-            .is_some_and(SharedThreshold::stop_if_expired)
-        {
+    /// A single text cursor needs no dense ID-window scratch or score reduction.
+    /// Keep skip decisions shallow: decode only after both levels admit a block.
+    fn execute_single_text(&mut self) -> crate::Result<Vec<ScoredDoc>> {
+        if self.collector.k == 0 {
             return Ok(Vec::new());
         }
-        let n = self.cursors.len();
-        for cursor in &mut self.cursors {
-            cursor.ensure_block_loaded_sync()?;
-        }
-        let inv_heap_factor = self.inv_heap_factor;
-        let mut window_scores = vec![0.0f32; WINDOW_IDS];
-        let mut window_mask = vec![0u64; WINDOW_IDS / 64];
-        let mut cand_docs: Vec<u32> = Vec::with_capacity(WINDOW_IDS);
-        let mut cand_scores: Vec<f32> = Vec::with_capacity(WINDOW_IDS);
-        let mut wmax = vec![0.0f32; n];
-        let mut order: Vec<usize> = (0..n).collect();
-        let mut wprefix = vec![0.0f32; n];
-        let mut windows = 0u64;
-        let mut windows_skipped = 0u64;
-        let mut candidates = 0u64;
-        let mut docs_scored = 0u64;
+        let mut blocks_scored = 0u64;
+        let mut blocks_skipped = 0u64;
+        let mut groups_skipped = 0u64;
+        let mut decisions = 0u64;
         let started = crate::observe::WallTimer::start();
-
-        loop {
-            windows += 1;
-            if windows & 0x3F == 0
-                && let Some(budget) = &self.budget
-                && budget.expired()
+        while !self.cursors[0].exhausted {
+            // One clock read per 64 block decisions, like the other loops.
+            if decisions & 0x3F == 0
+                && self
+                    .budget
+                    .as_ref()
+                    .is_some_and(SharedThreshold::stop_if_expired)
             {
-                budget.mark_truncated();
-                log::debug!(
-                    "MaxScoreExecutor(windowed): deadline reached after {} windows, {} scored",
-                    windows,
-                    docs_scored
-                );
                 break;
             }
-            let partition = self.find_partition();
-            if partition >= n {
-                break;
-            }
-            // Window: from the first id a globally essential cursor can
-            // still reach to the smallest current block end among them.
-            let mut from = u32::MAX;
-            let mut to = u32::MAX;
-            for cursor in &self.cursors[partition..] {
-                if cursor.exhausted {
-                    continue;
-                }
-                from = from.min(cursor.doc());
-                to = to.min(cursor.block_last_doc(cursor.block_idx));
-            }
-            if from == u32::MAX {
-                break;
-            }
-            let to = to.max(from).min(from.saturating_add(WINDOW_IDS as u32 - 1));
-            let width = (to - from) as usize + 1;
-            let words = width.div_ceil(64);
-
-            // Block-max partition over the window.
-            let heap_full = self.collector.len() >= self.collector.k;
-            let threshold = if heap_full {
-                self.collector.threshold() * inv_heap_factor - 1e-6
-            } else {
-                0.0
-            };
-            for (i, bound) in wmax.iter_mut().enumerate() {
-                *bound = self.cursors[i].window_upper_bound(from, to);
-            }
-            order.sort_unstable_by(|&a, &b| wmax[a].total_cmp(&wmax[b]));
-            let mut sum = 0.0f32;
-            for (rank, &i) in order.iter().enumerate() {
-                sum += wmax[i];
-                wprefix[rank] = sum;
-            }
-            let wpartition = if heap_full {
-                wprefix.partition_point(|&s| s < threshold)
-            } else {
-                0
-            };
-            if wpartition >= n {
-                // Nothing in the window can compete: every cursor jumps past it.
-                for cursor in &mut self.cursors {
-                    if !cursor.exhausted && cursor.doc() <= to {
-                        cursor.skip_past_sync(to)?;
-                    }
-                }
-                windows_skipped += 1;
+            decisions += 1;
+            let threshold = self.pruning_threshold();
+            let full = self.collector.len() >= self.collector.k;
+            let cursor = &mut self.cursors[0];
+            if full
+                && cursor
+                    .text_group_bound_for_threshold(cursor.block_idx, threshold)
+                    .is_some_and(|bound| bound < threshold)
+            {
+                let before = cursor.block_idx;
+                cursor.skip_to_next_group();
+                blocks_skipped += (cursor.block_idx - before) as u64;
+                groups_skipped += 1;
                 continue;
             }
-
-            // Essential cursors: bulk-score into the window buffers.
-            window_scores[..width].fill(0.0);
-            window_mask[..words].fill(0);
-            for &i in &order[wpartition..] {
-                let cursor = &mut self.cursors[i];
-                if cursor.exhausted {
-                    continue;
-                }
-                if cursor.doc() < from {
-                    cursor.seek_sync(from)?;
-                }
-                if cursor.exhausted || cursor.doc() > to {
-                    continue;
-                }
-                cursor.score_window_sync(
-                    from,
-                    to,
-                    &mut window_scores[..width],
-                    &mut window_mask[..words],
-                )?;
+            if full
+                && cursor.text_block_bound_for_threshold(cursor.block_idx, threshold) < threshold
+            {
+                cursor.skip_to_next_block();
+                blocks_skipped += 1;
+                continue;
             }
-
-            // Candidates in id order.
-            cand_docs.clear();
-            cand_scores.clear();
-            for (word_idx, word) in window_mask[..words].iter().enumerate() {
-                let mut bits = *word;
-                while bits != 0 {
-                    let slot = (word_idx << 6) | bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    cand_docs.push(from + slot as u32);
-                    cand_scores.push(window_scores[slot]);
-                }
+            if !cursor.ensure_block_loaded_sync()? {
+                break;
             }
-            if let Some(pred) = &self.predicate {
-                let mut kept = 0usize;
-                for j in 0..cand_docs.len() {
-                    let doc = cand_docs[j];
-                    cand_docs[kept] = doc;
-                    cand_scores[kept] = cand_scores[j];
-                    kept += pred(doc) as usize;
+            cursor.ensure_scores();
+            blocks_scored += 1;
+            if self.predicate.is_none() {
+                let docs = &cursor.doc_ids[cursor.pos..];
+                let scores = &cursor.scores[cursor.pos..];
+                if let Some(map) = self.document_map {
+                    self.collector
+                        .insert_text_run_with_mapping(docs, scores, |doc| map.doc_id(doc));
+                } else {
+                    self.collector.insert_text_run(docs, scores);
                 }
-                cand_docs.truncate(kept);
-                cand_scores.truncate(kept);
-            }
-
-            // Non-essential cursors on the survivors, strongest bound first.
-            let mut remaining = if wpartition > 0 {
-                wprefix[wpartition - 1]
             } else {
-                0.0
-            };
-            for rank in (0..wpartition).rev() {
-                let i = order[rank];
-                if heap_full {
-                    filter_competitive(&mut cand_docs, &mut cand_scores, remaining, threshold);
-                }
-                if cand_docs.is_empty() {
-                    break;
-                }
-                if wmax[i] > 0.0 {
-                    let cursor = &mut self.cursors[i];
-                    for (doc, score) in cand_docs.iter().zip(cand_scores.iter_mut()) {
-                        if cursor.seek_sync(*doc)? == *doc {
-                            cursor.ensure_scores();
-                            *score += cursor.score();
-                        }
+                for (&doc, &score) in cursor.doc_ids[cursor.pos..]
+                    .iter()
+                    .zip(&cursor.scores[cursor.pos..])
+                {
+                    if self
+                        .predicate
+                        .as_ref()
+                        .is_none_or(|predicate| predicate(doc))
+                    {
+                        // `0.0 + score`: see `TermCursor::append_scored_window_sync`.
+                        self.collector.insert_with_ordinal(
+                            self.document_map.map_or(doc, |map| map.doc_id(doc)),
+                            0.0 + score,
+                            0,
+                        );
                     }
                 }
-                remaining -= wmax[i];
             }
-            if heap_full {
-                filter_competitive(&mut cand_docs, &mut cand_scores, 0.0, threshold);
-            }
-            candidates += cand_docs.len() as u64;
-            for (doc, score) in cand_docs.iter().zip(&cand_scores) {
-                if self.collector.insert_with_ordinal(*doc, *score, 0) {
-                    docs_scored += 1;
-                }
-            }
+            cursor.skip_to_next_block();
         }
-
-        let collector = std::mem::replace(&mut self.collector, ScoreCollector::new(0));
-        let results: Vec<ScoredDoc> = collector
-            .into_sorted_results()
-            .into_iter()
-            .map(|(doc_id, score, ordinal)| ScoredDoc {
-                doc_id,
-                score,
-                ordinal,
-            })
-            .collect();
-        let elapsed_ms = (started.secs() * 1000.0) as u64;
-        if elapsed_ms > 500 {
-            warn!(
-                "slow windowed MaxScore: {}ms, cursors={}, windows={}, windows_skipped={}, candidates={}, scored={}, returned={}, top_score={:.4}",
-                elapsed_ms,
-                n,
-                windows,
-                windows_skipped,
-                candidates,
-                docs_scored,
-                results.len(),
-                results.first().map(|r| r.score).unwrap_or(0.0)
-            );
-        } else {
-            debug!(
-                "MaxScoreExecutor(windowed): {}ms, cursors={}, windows={}, windows_skipped={}, candidates={}, scored={}, returned={}, top_score={:.4}",
-                elapsed_ms,
-                n,
-                windows,
-                windows_skipped,
-                candidates,
-                docs_scored,
-                results.len(),
-                results.first().map(|r| r.score).unwrap_or(0.0)
-            );
-        }
+        let results = self.finish();
+        self.stats = ExecutorStats {
+            blocks_scored,
+            blocks_skipped,
+            groups_skipped,
+            ..ExecutorStats::default()
+        };
+        debug!(
+            "MaxScoreExecutor(single): {}ms, blocks_scored={}, blocks_skipped={}, groups_skipped={}, returned={}",
+            (started.secs() * 1000.0) as u64,
+            self.stats.blocks_scored,
+            self.stats.blocks_skipped,
+            self.stats.groups_skipped,
+            results.len()
+        );
         Ok(results)
+    }
+
+    fn all_text(&self) -> bool {
+        self.cursors.iter().all(TermCursor::is_text)
     }
 }
 
 /// Ids per window of the windowed executor (Lucene's `INNER_WINDOW_SIZE`).
 const WINDOW_IDS: usize = 4096;
+
+/// Per-thread scratch of the windowed and conjunction executors (the
+/// `BmpScratch` pattern): buffers are cleared or resized per run, never
+/// reallocated once grown, and bounded by `MAX_QUERY_TERMS` × `WINDOW_IDS`
+/// (about 1 MiB of contributions per thread at the term limit).
+#[derive(Default)]
+struct WindowScratch {
+    /// Dense per-window score accumulator (`WINDOW_IDS` slots).
+    window_scores: Vec<f32>,
+    /// Match bitset of the window (`WINDOW_IDS / 64` words).
+    window_mask: Vec<u64>,
+    /// Per-term contributions, `n × WINDOW_IDS`, read only through the
+    /// presence bits in `contribution_masks` (`n × WINDOW_IDS / 64`), so
+    /// stale values from earlier windows or queries are never summed.
+    contributions: Vec<f32>,
+    contribution_masks: Vec<u64>,
+    /// Surviving candidates of the current window, in id order.
+    cand_docs: Vec<u32>,
+    cand_scores: Vec<f32>,
+    /// Per-cursor window bounds, bound-sorted cursor order, prefix sums.
+    wmax: Vec<f32>,
+    order: Vec<usize>,
+    wprefix: Vec<f32>,
+    /// Conjunction: `n × POSTING_BLOCK_SIZE` term frequencies of one batch.
+    conjunction_tfs: Vec<u32>,
+}
+
+impl WindowScratch {
+    /// Size every window buffer for `n` cursors; grows only past the largest
+    /// query seen so far on this thread.
+    fn prepare_windows(&mut self, n: usize) {
+        debug_assert!(n <= super::MAX_QUERY_TERMS);
+        grow(&mut self.window_scores, WINDOW_IDS, 0.0);
+        grow(&mut self.window_mask, WINDOW_IDS / 64, 0);
+        if n > 1 {
+            grow(&mut self.contributions, n * WINDOW_IDS, 0.0);
+            grow(&mut self.contribution_masks, n * (WINDOW_IDS / 64), 0);
+        }
+        self.cand_docs.clear();
+        self.cand_scores.clear();
+        self.cand_docs.reserve(WINDOW_IDS);
+        self.cand_scores.reserve(WINDOW_IDS);
+        self.wmax.clear();
+        self.wmax.resize(n, 0.0);
+        self.wprefix.clear();
+        self.wprefix.resize(n, 0.0);
+        self.order.clear();
+        self.order.extend(0..n);
+    }
+
+    fn prepare_conjunction(&mut self, n: usize) {
+        debug_assert!(n <= super::MAX_QUERY_TERMS);
+        grow(
+            &mut self.conjunction_tfs,
+            n * crate::structures::postings::POSTING_BLOCK_SIZE,
+            0,
+        );
+    }
+}
+
+/// Extend `buffer` to at least `len` elements (no-op once large enough).
+fn grow<T: Copy>(buffer: &mut Vec<T>, len: usize, fill: T) {
+    if buffer.len() < len {
+        buffer.resize(len, fill);
+    }
+}
+
+thread_local! {
+    static WINDOW_SCRATCH: std::cell::RefCell<WindowScratch> =
+        std::cell::RefCell::new(WindowScratch::default());
+}
+
+/// Borrow this thread's scratch for one run. A nested run on the same thread
+/// (an executor driven from inside another executor's predicate) cannot
+/// share it and gets a private, freshly allocated scratch instead; that is
+/// logged because it defeats the reuse the scratch exists for.
+fn with_window_scratch<R>(run: impl FnOnce(&mut WindowScratch) -> R) -> R {
+    WINDOW_SCRATCH.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => run(&mut scratch),
+        Err(_) => {
+            log::warn!(
+                "MaxScoreExecutor: window scratch already in use on this thread (nested execution); allocating a private scratch"
+            );
+            run(&mut WindowScratch::default())
+        }
+    })
+}
 
 /// Keep the candidates that can still reach `threshold` once `remaining`
 /// (the bounds of the cursors not yet applied) is added. Written without a
@@ -2100,575 +2671,4 @@ fn filter_competitive(docs: &mut Vec<u32>, scores: &mut Vec<f32>, remaining: f32
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── Windowed executor parity ─────────────────────────────────────────
-
-    struct Corpus {
-        /// Per term: sorted `(doc, tf)` postings.
-        postings: Vec<Vec<(u32, u32)>>,
-        lengths: Vec<u16>,
-        n_docs: u32,
-    }
-
-    fn xorshift(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
-    }
-
-    /// Terms with very different densities (from 0.5% to 60% of the
-    /// documents), skewed term frequencies, and pseudo-random lengths.
-    fn random_corpus(seed: u64, n_docs: u32, n_terms: usize) -> Corpus {
-        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        let lengths: Vec<u16> = (0..n_docs)
-            .map(|_| 1 + (xorshift(&mut state) % 400) as u16)
-            .collect();
-        let densities = [0.6, 0.25, 0.1, 0.03, 0.005];
-        let postings = (0..n_terms)
-            .map(|t| {
-                let density = densities[t % densities.len()];
-                let cutoff = (density * u32::MAX as f64) as u64;
-                let mut postings = Vec::new();
-                for doc in 0..n_docs {
-                    if (xorshift(&mut state) & 0xFFFF_FFFF) >= cutoff {
-                        continue;
-                    }
-                    let r = xorshift(&mut state) % 100;
-                    let tf = if r < 70 {
-                        1
-                    } else if r < 90 {
-                        2
-                    } else {
-                        3 + (r % 6) as u32
-                    };
-                    postings.push((doc, tf));
-                }
-                postings
-            })
-            .collect();
-        Corpus {
-            postings,
-            lengths,
-            n_docs,
-        }
-    }
-
-    fn build_lists(
-        corpus: &Corpus,
-        lengths: Option<&crate::segment::chunk_map::DocLengths>,
-    ) -> Vec<(crate::structures::BlockPostingList, f32)> {
-        corpus
-            .postings
-            .iter()
-            .map(|postings| {
-                let mut list = crate::structures::PostingList::new();
-                for &(doc, tf) in postings {
-                    list.push(doc, tf);
-                }
-                let length_of = lengths.map(|l| move |doc: DocId| l.length(doc));
-                let block_list = crate::structures::BlockPostingList::from_posting_list_with(
-                    &list,
-                    false,
-                    length_of.as_ref().map(|f| f as &dyn Fn(DocId) -> u32),
-                )
-                .unwrap();
-                let idf = super::super::bm25_idf(postings.len() as f32, corpus.n_docs as f32);
-                (block_list, idf)
-            })
-            .collect()
-    }
-
-    /// Exhaustive per-document scores with the same formula the cursors use.
-    fn exhaustive(
-        corpus: &Corpus,
-        lists: &[(crate::structures::BlockPostingList, f32)],
-        real_lengths: bool,
-        avg: f32,
-        params: super::super::Bm25Params,
-    ) -> std::collections::HashMap<u32, f32> {
-        let mut scores: std::collections::HashMap<u32, f32> = std::collections::HashMap::new();
-        for (postings, (_, idf)) in corpus.postings.iter().zip(lists) {
-            for &(doc, tf) in postings {
-                let len = if real_lengths {
-                    corpus.lengths[doc as usize] as f32
-                } else {
-                    tf as f32
-                };
-                *scores.entry(doc).or_insert(0.0) += params.score(tf as f32, *idf, len, avg);
-            }
-        }
-        scores
-    }
-
-    fn check_top_k(
-        label: &str,
-        results: &[ScoredDoc],
-        exhaustive: &std::collections::HashMap<u32, f32>,
-        k: usize,
-        predicate: Option<&dyn Fn(u32) -> bool>,
-    ) {
-        let mut expected: Vec<(u32, f32)> = exhaustive
-            .iter()
-            .filter(|(doc, _)| predicate.is_none_or(|p| p(**doc)))
-            .map(|(doc, score)| (*doc, *score))
-            .collect();
-        expected.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        let want = k.min(expected.len());
-        assert_eq!(results.len(), want, "{label}: result count");
-        for (rank, (got, exp)) in results.iter().zip(&expected).enumerate() {
-            let tolerance = 1e-4 * exp.1.abs().max(1.0);
-            assert!(
-                (got.score - exp.1).abs() <= tolerance,
-                "{label}: rank {rank} score {} vs exhaustive {} (doc {} vs {})",
-                got.score,
-                exp.1,
-                got.doc_id,
-                exp.0
-            );
-            let own = exhaustive[&got.doc_id];
-            assert!(
-                (got.score - own).abs() <= tolerance,
-                "{label}: doc {} scored {} but exhaustive says {}",
-                got.doc_id,
-                got.score,
-                own
-            );
-            if let Some(p) = predicate {
-                assert!(
-                    p(got.doc_id),
-                    "{label}: doc {} fails the predicate",
-                    got.doc_id
-                );
-            }
-        }
-        for pair in results.windows(2) {
-            assert!(
-                pair[0].score >= pair[1].score,
-                "{label}: results not sorted"
-            );
-        }
-    }
-
-    /// The windowed executor returns the exact top-k (against an exhaustive
-    /// scorer and against the document-at-a-time loop) over corpora of
-    /// different sizes and term mixes, with and without real lengths,
-    /// predicates, and a seeded threshold.
-    #[test]
-    fn windowed_text_maxscore_matches_exhaustive_and_doc_at_a_time() {
-        let params = super::super::Bm25Params::default();
-        let predicate_fn = |doc: u32| !doc.is_multiple_of(3);
-        let mut cases = 0usize;
-        for seed in 1..=6u64 {
-            for &n_docs in &[300u32, 2_500, 12_000] {
-                for &n_terms in &[1usize, 2, 4, 9] {
-                    let corpus = random_corpus(seed, n_docs, n_terms);
-                    let doc_lengths =
-                        crate::segment::chunk_map::DocLengths::from_lengths(&corpus.lengths);
-                    for real_lengths in [true, false] {
-                        let lengths = real_lengths.then_some(&doc_lengths);
-                        let lists = build_lists(&corpus, lengths);
-                        let avg = if real_lengths {
-                            doc_lengths.avg_len()
-                        } else {
-                            1.0
-                        };
-                        let truth = exhaustive(&corpus, &lists, real_lengths, avg, params);
-                        for &k in &[1usize, 10, 100] {
-                            for with_predicate in [false, true] {
-                                let label = format!(
-                                    "seed={seed} docs={n_docs} terms={n_terms} lengths={real_lengths} k={k} pred={with_predicate}"
-                                );
-                                let pred: Option<&dyn Fn(u32) -> bool> =
-                                    with_predicate.then_some(&predicate_fn);
-                                let make = |seeded: f32| {
-                                    let mut executor = MaxScoreExecutor::text(
-                                        lists.clone(),
-                                        avg,
-                                        k,
-                                        lengths,
-                                        params,
-                                        1.0,
-                                    );
-                                    if with_predicate {
-                                        executor = executor.with_predicate(Box::new(predicate_fn));
-                                    }
-                                    if seeded > 0.0 {
-                                        executor.seed_threshold(seeded);
-                                    }
-                                    executor
-                                };
-                                let windowed = make(0.0).execute_windowed().unwrap();
-                                check_top_k(
-                                    &format!("windowed {label}"),
-                                    &windowed,
-                                    &truth,
-                                    k,
-                                    pred,
-                                );
-                                let reference = make(0.0).execute_doc_at_a_time_sync().unwrap();
-                                check_top_k(
-                                    &format!("reference {label}"),
-                                    &reference,
-                                    &truth,
-                                    k,
-                                    pred,
-                                );
-                                // A floor below the k-th score keeps the exact top-k.
-                                if let Some(kth) = windowed.last().map(|r| r.score)
-                                    && windowed.len() == k
-                                {
-                                    let seeded = make(kth * 0.9).execute_windowed().unwrap();
-                                    check_top_k(
-                                        &format!("seeded {label}"),
-                                        &seeded,
-                                        &truth,
-                                        k,
-                                        pred,
-                                    );
-                                    // A floor above every score returns nothing.
-                                    let above =
-                                        make(windowed[0].score * 1.5).execute_windowed().unwrap();
-                                    assert!(above.is_empty(), "{label}: floor above all scores");
-                                }
-                                cases += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(cases > 400);
-    }
-
-    /// The approximate mode returns a subset of the exact top-k with exact
-    /// scores.
-    #[test]
-    fn windowed_text_maxscore_heap_factor_is_a_subset_with_exact_scores() {
-        let params = super::super::Bm25Params::default();
-        let corpus = random_corpus(7, 20_000, 6);
-        let doc_lengths = crate::segment::chunk_map::DocLengths::from_lengths(&corpus.lengths);
-        let lists = build_lists(&corpus, Some(&doc_lengths));
-        let avg = doc_lengths.avg_len();
-        let truth = exhaustive(&corpus, &lists, true, avg, params);
-        let exact = MaxScoreExecutor::text(lists.clone(), avg, 50, Some(&doc_lengths), params, 1.0)
-            .execute_windowed()
-            .unwrap();
-        check_top_k("exact", &exact, &truth, 50, None);
-        let approx = MaxScoreExecutor::text(lists, avg, 50, Some(&doc_lengths), params, 0.6)
-            .execute_windowed()
-            .unwrap();
-        assert_eq!(approx.len(), 50);
-        for hit in &approx {
-            let own = truth[&hit.doc_id];
-            assert!((hit.score - own).abs() <= 1e-4 * own.max(1.0));
-        }
-        // The usual heap-factor guarantee: every returned score is within the
-        // factor of the exact k-th score, and the best document is exact.
-        let exact_kth = exact.last().unwrap().score;
-        assert!(approx.iter().all(|hit| hit.score >= exact_kth * 0.6 - 1e-4));
-        assert_eq!(approx[0].doc_id, exact[0].doc_id);
-        let overlap = approx
-            .iter()
-            .filter(|hit| exact.iter().any(|e| e.doc_id == hit.doc_id))
-            .count();
-        assert!(overlap >= 25, "overlap {overlap} of 50");
-    }
-
-    #[test]
-    fn text_heap_factor_below_one_actually_changes_pruning() {
-        let params = super::super::Bm25Params::default();
-        let corpus = random_corpus(7, 20_000, 6);
-        let lengths = crate::segment::chunk_map::DocLengths::from_lengths(&corpus.lengths);
-        let lists = build_lists(&corpus, Some(&lengths));
-        let mut exact = MaxScoreExecutor::text(
-            lists.clone(),
-            lengths.avg_len(),
-            50,
-            Some(&lengths),
-            params,
-            1.0,
-        );
-        let mut approximate =
-            MaxScoreExecutor::text(lists, lengths.avg_len(), 50, Some(&lengths), params, 0.01);
-        let exact = exact.execute_windowed().unwrap();
-        let approximate = approximate.execute_windowed().unwrap();
-        assert_ne!(
-            exact.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
-            approximate.iter().map(|hit| hit.doc_id).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn text_and_sparse_factors_have_identical_conventions() {
-        for factor in [0.0, 0.01, 0.5, 1.0] {
-            let text = MaxScoreExecutor::text(
-                Vec::new(),
-                1.0,
-                1,
-                None,
-                super::super::Bm25Params::default(),
-                factor,
-            );
-            let sparse = MaxScoreExecutor::new(Vec::new(), 1, factor);
-            assert_eq!(text.inv_heap_factor, sparse.inv_heap_factor);
-            assert_eq!(text.inv_heap_factor, factor.clamp(0.01, 1.0).recip());
-        }
-    }
-
-    #[test]
-    fn chunk_bounds_use_the_same_length_floor_as_scoring() {
-        use crate::segment::chunk_map::{ChunkMapBuilder, read_chunk_maps, write_chunk_maps};
-        use crate::structures::{BlockPostingList, PostingList};
-        let mut chunks = ChunkMapBuilder::default();
-        let mut postings = PostingList::new();
-        for id in 0..2048 {
-            chunks
-                .push(id / 4, (id % 4) as u16, if id % 4 == 0 { 1 } else { 200 })
-                .unwrap();
-            postings.push(id, 1);
-        }
-        let mut bytes = Vec::new();
-        write_chunk_maps(&mut bytes, &[(0, &chunks)], &[]).unwrap();
-        let maps = read_chunk_maps(crate::directories::OwnedBytes::new(bytes)).unwrap();
-        let map = &maps.chunk_maps[&0];
-        let list =
-            BlockPostingList::from_posting_list_with(&postings, false, Some(&|id| map.length(id)))
-                .unwrap();
-        assert_eq!(list.min_len(), Some(1));
-        let params = super::super::Bm25Params::default();
-        let cursor = TermCursor::text_with_params(
-            list,
-            2.0,
-            map.avg_len(),
-            Some(LengthSource::Chunks(map)),
-            params,
-        );
-        let expected = params.upper_bound_with_len(1.0, 2.0, 200.0, map.avg_len());
-        assert_eq!(cursor.max_score.to_bits(), expected.to_bits());
-        for block in 0..cursor.num_blocks {
-            assert_eq!(cursor.text_block_bound(block).to_bits(), expected.to_bits());
-            assert_eq!(
-                cursor.text_group_bound(block).unwrap().to_bits(),
-                expected.to_bits()
-            );
-        }
-    }
-
-    #[test]
-    fn nested_scorers_keep_deadline_but_not_outer_score_floor() {
-        let shared = SharedThreshold::for_limit(10).with_deadline(Some(std::time::Instant::now()));
-        shared.raise(100.0);
-        let options = super::super::ScorerOptions {
-            shared_threshold: Some(shared.clone()),
-            initial_threshold: 100.0,
-            ..Default::default()
-        }
-        .without_threshold();
-        assert_eq!(options.initial_threshold, 0.0);
-        let nested = options.shared_threshold.unwrap();
-        assert_eq!(nested.get(), 0.0);
-        assert!(!nested.covers(10));
-        assert!(nested.stop_if_expired());
-        assert!(shared.truncated());
-        nested.raise(200.0);
-        assert_eq!(shared.get(), 100.0);
-    }
-
-    #[test]
-    fn score_bound_cache_reuses_only_its_last_key() {
-        let cache = CachedScoreBound::new();
-        assert_eq!(cache.get_or_compute(0, || 1.5), 1.5);
-        assert_eq!(
-            cache.get_or_compute(0, || panic!("recomputed active bound")),
-            1.5
-        );
-        assert_eq!(cache.get_or_compute(1, || 2.5), 2.5);
-        assert_eq!(cache.get_or_compute(0, || 3.5), 3.5);
-    }
-
-    #[test]
-    fn test_shared_threshold_monotonic_raise() {
-        let shared = SharedThreshold::new();
-        assert_eq!(shared.get(), 0.0);
-
-        shared.raise(2.5);
-        assert_eq!(shared.get(), 2.5);
-
-        // Lower values never lower the floor.
-        shared.raise(1.0);
-        assert_eq!(shared.get(), 2.5);
-
-        // Higher values raise it.
-        shared.raise(4.0);
-        assert_eq!(shared.get(), 4.0);
-
-        // Non-positive and NaN are ignored.
-        shared.raise(0.0);
-        shared.raise(-3.0);
-        shared.raise(f32::NAN);
-        assert_eq!(shared.get(), 4.0);
-
-        // Clones share the same atomic cell.
-        let clone = shared.clone();
-        clone.raise(9.0);
-        assert_eq!(shared.get(), 9.0);
-    }
-
-    #[test]
-    fn test_shared_threshold_seed_matches_manual() {
-        // A collector seeded with a floor prunes anything at/below it, matching
-        // the threshold a fully-populated heap would have produced.
-        let mut seeded = ScoreCollector::new(2);
-        seeded.seed_threshold(3.0);
-        assert_eq!(seeded.threshold(), 3.0);
-        // A score at/below the floor cannot enter.
-        assert!(!seeded.would_enter(3.0));
-        assert!(seeded.would_enter(3.5));
-        // Real inserts above the floor evict the sentinels; results contain no
-        // sentinel (doc_id == u32::MAX) entries.
-        seeded.insert(1, 5.0);
-        seeded.insert(2, 4.0);
-        let results = seeded.into_sorted_results();
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, 1);
-        assert_eq!(results[1].0, 2);
-    }
-
-    #[test]
-    fn test_shared_threshold_can_raise_after_real_inserts() {
-        let mut collector = ScoreCollector::new(3);
-        collector.insert(1, 10.0);
-        collector.insert(2, 4.0);
-        assert_eq!(collector.real_len(), 2);
-
-        // Raising the floor after traversal has started removes retained work
-        // that can no longer reach the global top-k.
-        collector.seed_threshold(6.0);
-        assert_eq!(collector.threshold(), 6.0);
-        assert_eq!(collector.real_len(), 1);
-
-        // A real candidate tied with the floor displaces the sentinel because
-        // its doc id wins the canonical tie break.
-        assert!(collector.would_enter_candidate(3, 6.0, 0));
-        assert!(collector.insert(3, 6.0));
-        assert_eq!(collector.real_len(), 2);
-        let results = collector.into_sorted_results();
-        assert_eq!(results, vec![(1, 10.0, 0), (3, 6.0, 0)]);
-    }
-
-    #[test]
-    fn test_large_seed_uses_virtual_sentinels() {
-        let k = 1_000_000_000;
-        let mut collector = ScoreCollector::new(k);
-        assert!(collector.heap.capacity() <= MAX_INITIAL_SCORE_COLLECTOR_CAPACITY);
-
-        collector.seed_threshold(42.0);
-
-        // Seeding a huge top-k is constant-time and does not materialize any
-        // of its conceptual sentinel entries.
-        assert_eq!(collector.heap.len(), 0);
-        assert!(collector.heap.capacity() <= MAX_INITIAL_SCORE_COLLECTOR_CAPACITY);
-        assert_eq!(collector.len(), k);
-        assert_eq!(collector.real_len(), 0);
-        assert_eq!(collector.threshold(), 42.0);
-        assert!(!collector.is_empty());
-
-        // A real result tied with the floor beats the sentinel by doc-id, while
-        // a lower score remains below the conceptual threshold.
-        assert!(collector.insert_with_ordinal(9, 42.0, 7));
-        assert!(!collector.insert(10, 41.0));
-        assert!(collector.insert(11, 43.0));
-        assert_eq!(collector.len(), k);
-        assert_eq!(collector.real_len(), 2);
-        assert_eq!(
-            collector.into_sorted_results(),
-            vec![(11, 43.0, 0), (9, 42.0, 7)]
-        );
-    }
-
-    #[test]
-    fn test_virtual_sentinels_preserve_tie_order_when_filled() {
-        let mut collector = ScoreCollector::new(3);
-        collector.seed_threshold(5.0);
-
-        assert!(collector.insert_with_ordinal(3, 5.0, 2));
-        assert!(collector.insert_with_ordinal(2, 5.0, 8));
-        assert!(collector.insert_with_ordinal(1, 5.0, 4));
-        assert_eq!(collector.real_len(), 3);
-        assert!(collector.virtual_threshold.is_none());
-
-        // Once all virtual slots have been displaced, canonical doc/ordinal
-        // ordering still controls root replacement at an equal score.
-        assert!(collector.insert_with_ordinal(2, 5.0, 1));
-        assert!(!collector.insert_with_ordinal(4, 5.0, 0));
-        assert_eq!(
-            collector.into_sorted_results(),
-            vec![(1, 5.0, 4), (2, 5.0, 1), (2, 5.0, 8)]
-        );
-    }
-
-    #[test]
-    fn test_score_collector_basic() {
-        let mut collector = ScoreCollector::new(3);
-
-        collector.insert(1, 1.0);
-        collector.insert(2, 2.0);
-        collector.insert(3, 3.0);
-        assert_eq!(collector.threshold(), 1.0);
-
-        collector.insert(4, 4.0);
-        assert_eq!(collector.threshold(), 2.0);
-
-        let results = collector.into_sorted_results();
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0, 4); // Highest score
-        assert_eq!(results[1].0, 3);
-        assert_eq!(results[2].0, 2);
-    }
-
-    #[test]
-    fn test_score_collector_threshold() {
-        let mut collector = ScoreCollector::new(2);
-
-        collector.insert(1, 5.0);
-        collector.insert(2, 3.0);
-        assert_eq!(collector.threshold(), 3.0);
-
-        // Should not enter (score too low)
-        assert!(!collector.would_enter(2.0));
-        assert!(!collector.insert(3, 2.0));
-
-        // Should enter (score high enough)
-        assert!(collector.would_enter(4.0));
-        assert!(collector.insert(4, 4.0));
-        assert_eq!(collector.threshold(), 4.0);
-    }
-
-    #[test]
-    fn test_heap_entry_ordering() {
-        let mut heap = BinaryHeap::new();
-        heap.push(HeapEntry {
-            doc_id: 1,
-            score: 3.0,
-            ordinal: 0,
-        });
-        heap.push(HeapEntry {
-            doc_id: 2,
-            score: 1.0,
-            ordinal: 0,
-        });
-        heap.push(HeapEntry {
-            doc_id: 3,
-            score: 2.0,
-            ordinal: 0,
-        });
-
-        // Min-heap: lowest score should come out first
-        assert_eq!(heap.pop().unwrap().score, 1.0);
-        assert_eq!(heap.pop().unwrap().score, 2.0);
-        assert_eq!(heap.pop().unwrap().score, 3.0);
-    }
-}
+mod tests;

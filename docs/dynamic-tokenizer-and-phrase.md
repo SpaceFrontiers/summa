@@ -121,16 +121,55 @@ or within `slop` positions of them; with no stop words dropped that is the
 usual consecutive match. The score is BM25 over the phrase frequency (the
 number of occurrences of the whole phrase in the unit) with the summed idf of
 the terms and the unit's real length, Lucene semantics. Requires
-`indexed<token_position>` or `indexed<positions>`; without positions
-`hermes_core::PhraseQuery` degrades to a MUST of the terms, and a single
-token collapses to a `TermQuery`. Scored with BM25. The query-language parser
-now builds the same `PhraseQuery` for `"quoted spans"`.
+`indexed<token_position>` or `indexed<positions>`; a single analyzed token
+collapses to a `TermQuery`. Scored with BM25. The query-language parser builds
+the same `PhraseQuery` for `"quoted spans"`.
+
+The September 14 correctness change rejects multi-token phrases on fields
+without token positions, including ordinal-only fields. Previously the core
+silently converted missing-position phrases into a MUST of their terms, which
+accepted nonadjacent words; ordinal-only positions also cannot prove adjacency.
+The query owner shares one capability check between the parser, native/async
+scorers and candidate backfill. Errors identify the field and required indexing
+option. This is an intentional compatibility correction: use an explicit AND
+for unordered matching, or rebuild with token positions for phrases. Existing
+encoded indexes remain readable.
+
+Unqualified quoted text applies each configured default field's tokenizer and
+keeps every nonempty field branch, including one-token branches. Unsupported
+multi-token branches return an error rather than silently broadening matching or
+omitting a configured field. Field qualification selects the intended supported
+field. Additional field routing must propagate a default query's error, because
+dropping it would remove a required part of the requested search. Exclusive
+routing retains its configured replacement behavior. Regression coverage includes
+no-position/ordinal/token/full modes, empty-index parsing, single-token and
+multifield branches, direct and parsed sync/async queries, backfill and browser
+errors. No wire representation or scoring formula changes.
 
 Clients: Python (`{"phrase": {...}}`, `tokenizer_hint`), TypeScript
 (`{ phrase: {...} }`, `tokenizerHint`), WASM (`phrase`, `tokenizerHint`).
 The broker forwards `SearchRequest` opaquely but must be rebuilt against the
 new proto: a stale decoder drops the unknown oneof field and the server then
 rejects the request as having no query.
+
+## Competitive phrase confirmation
+
+For ordinary ranked phrase retrieval with document lengths, the shared top-k
+driver can reject a candidate before decoding its positions. The phrase scorer
+exposes a conservative final-score bound using its original-first term frequency
+and the document's actual scoring length. That frequency bounds matching starts,
+including duplicate starts; another term's smaller frequency is not a valid
+substitute. The existing BM25 owner supplies the floating-point safety margin.
+The scorer's confirmation operation itself continues to test exact membership.
+
+Only the ranked driver uses this capability, after its heap is full, with the
+existing score/document ordering for ties. Complete counts and combined
+top-k/count collectors still confirm every candidate. Nested, filtered and
+chunk-folded scorers do not inherit a leaf bound; unsupported lengths or numeric
+parameters retain ordinary traversal. Native synchronous and asynchronous
+retrieval share the driver and cancellation checks. Ranked `total_seen` counts
+examined matches, as with other pruned scorers; it is not an exact total.
+No token-position format or relevance formula changes.
 
 ## Performance notes (2026-09-03)
 

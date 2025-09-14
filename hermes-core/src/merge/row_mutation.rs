@@ -340,11 +340,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let _claim = claim;
             let _snapshot = snapshot;
             let mut cleanup = manager.output_cleanup_guard(output);
-            let mut reader = SegmentReader::open(
+            let mut reader = SegmentReader::open_with_term_cache_budget(
                 manager.directory.as_ref(),
                 sid,
                 schema.clone(),
                 manager.term_cache_blocks,
+                manager.term_cache_budget_bytes,
             )
             .await?;
             reader
@@ -386,6 +387,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let directory = Arc::clone(&self.directory);
         let merger = crate::segment::SegmentMerger::new(self.published_generation().schema.clone())
             .with_posting_config(self.optimization, self.posting_codec)
+            .with_term_dict_block_size(self.term_dict_block_size)
             .with_cancellation(self.active_operations.cancellation_flag())
             .with_background_pool(Some(self.background_cpu_pool()));
         let runtime = tokio::runtime::Handle::current();

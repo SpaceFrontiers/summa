@@ -32,6 +32,8 @@ pub mod index;
 pub mod merge;
 pub(crate) mod observe;
 pub mod query;
+#[cfg(feature = "query-diagnostics")]
+pub mod search_diagnostics;
 pub mod segment;
 pub mod structures;
 pub mod tokenizer;

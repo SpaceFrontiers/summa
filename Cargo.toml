@@ -67,6 +67,8 @@ lindera = { version = "6", features = ["embed-unidic", "embed-ko-dic"] }
 
 # Collections and utilities
 rustc-hash = "2.1"
+# SIMD posting codec; Cargo.lock pins the resolved 0.9.x release.
+bitpacking = { version = "0.9", default-features = false, features = ["bitpacker4x"] }
 parking_lot = "0.12"
 async-channel = "2.3"
 num_cpus = "1.17"

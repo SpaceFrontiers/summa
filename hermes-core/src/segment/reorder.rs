@@ -1012,15 +1012,24 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     source_id: SegmentId,
     output_id: SegmentId,
     term_cache_blocks: usize,
+    term_cache_budget_bytes: Option<usize>,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
     granularity: BpGranularity,
     optimization: crate::structures::IndexOptimization,
     posting_codec: crate::structures::PostingCodec,
+    term_dict_block_size: crate::structures::SSTableBlockSize,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(String, u32, bool)> {
-    let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
+    let reader = SegmentReader::open_with_term_cache_budget(
+        dir,
+        source_id,
+        Arc::clone(schema),
+        term_cache_blocks,
+        term_cache_budget_bytes,
+    )
+    .await?;
     let num_docs = reader.num_docs();
 
     let src_files = SegmentFiles::new(source_id.0);
@@ -1120,7 +1129,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
             &dst_files,
             schema,
             &text_plans,
-            (optimization, posting_codec),
+            (optimization, posting_codec, term_dict_block_size),
             memory_budget,
             cancellation.as_deref(),
         )
@@ -1141,6 +1150,8 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         )
         .await?;
     }
+    // Text plans no longer overlap the BMP graph scratch budget.
+    drop(text_plans);
     // Rebuild sparse file with reordered BMP data
     let bp_converged = reorder_sparse_file(
         dir,

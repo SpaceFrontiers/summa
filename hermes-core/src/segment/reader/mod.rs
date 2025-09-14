@@ -37,6 +37,10 @@ pub struct SegmentMemoryStats {
     pub num_docs: u32,
     /// Term dictionary block cache bytes
     pub term_dict_cache_bytes: usize,
+    /// Shared document/position validation table bytes; no decoded payloads.
+    pub posting_validation_cache_bytes: usize,
+    /// Constant-sized first-failure record shared by this reader's posting cursors.
+    pub posting_integrity_heap_bytes: usize,
     /// Heap bytes in this reader generation's immutable row visibility.
     pub deletion_bytes: usize,
     /// Numeric row-statistic block directories; values remain evictable.
@@ -75,6 +79,8 @@ impl SegmentMemoryStats {
         self.deletion_bytes
             + self.row_stats_heap_bytes
             + self.term_dict_cache_bytes
+            + self.posting_validation_cache_bytes
+            + self.posting_integrity_heap_bytes
             + self.store_cache_bytes
             + self.sparse_heap_bytes
             + self.dense_heap_bytes
@@ -1921,7 +1927,7 @@ pub struct SegmentReader {
     /// Term dictionary with lazy block loading
     term_dict: Arc<AsyncSSTableReader<TermInfo>>,
     /// Postings file handle - fetches ranges on demand
-    postings_handle: FileHandle,
+    postings: crate::structures::postings::PostingListReader,
     /// Document store with lazy block loading
     store: Arc<AsyncStoreReader>,
     schema: Arc<Schema>,
@@ -1939,8 +1945,6 @@ pub struct SegmentReader {
     bmp_indexes: FxHashMap<u32, BmpIndex>,
     /// Logical size of the retained `.sparse` file handle.
     sparse_file_backed_bytes: u64,
-    /// Position file handle for phrase queries (lazy loading)
-    positions_handle: Option<FileHandle>,
     /// Fast-field columnar readers per field_id
     fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
     /// Virtual-id maps of chunked text fields per field_id
@@ -1956,6 +1960,15 @@ pub struct SegmentReader {
 }
 
 impl SegmentReader {
+    /// Reject payload corruption detected by any posting cursor on this immutable
+    /// reader. Low-level cursor users must check after traversal; public segment
+    /// collectors do so automatically. This does not scan unvisited payloads.
+    pub fn check_posting_integrity(&self) -> Result<()> {
+        self.postings
+            .check_integrity()
+            .map_err(|error| Error::Corruption(format!("segment {:032x}: {error}", self.meta.id)))
+    }
+
     /// Open a segment with lazy loading
     pub async fn open<D: Directory>(
         dir: &D,
@@ -1963,11 +1976,23 @@ impl SegmentReader {
         schema: Arc<Schema>,
         term_cache_blocks: usize,
     ) -> Result<Self> {
+        Self::open_with_term_cache_budget(dir, segment_id, schema, term_cache_blocks, None).await
+    }
+
+    pub(crate) async fn open_with_term_cache_budget<D: Directory>(
+        dir: &D,
+        segment_id: SegmentId,
+        schema: Arc<Schema>,
+        term_cache_blocks: usize,
+        term_cache_budget_bytes: Option<usize>,
+    ) -> Result<Self> {
         Self::open_with_store_cache(
             dir,
             segment_id,
             schema,
             term_cache_blocks,
+            term_cache_budget_bytes,
+            0,
             dir as *const D as usize,
             Arc::new(super::SharedStoreCache::new(0)),
         )
@@ -1975,14 +2000,19 @@ impl SegmentReader {
     }
 
     /// Open a search segment against the process-wide document-store cache.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_with_store_cache<D: Directory>(
         dir: &D,
         segment_id: SegmentId,
         schema: Arc<Schema>,
         term_cache_blocks: usize,
+        term_cache_budget_bytes: Option<usize>,
+        posting_validation_cache_bytes: usize,
         store_cache_directory_namespace: usize,
         store_cache: Arc<super::SharedStoreCache>,
     ) -> Result<Self> {
+        // `posting_validation_cache_bytes` is validated once at index load
+        // (`SearcherResources`) and by `PostingListReader::new` below.
         let files = SegmentFiles::new(segment_id.0);
 
         // Read metadata (small, always loaded)
@@ -1993,10 +2023,20 @@ impl SegmentReader {
 
         // Open term dictionary with lazy loading (fetches ranges on demand)
         let term_dict_handle = dir.open_lazy(&files.term_dict).await?;
-        let term_dict = AsyncSSTableReader::open(term_dict_handle, term_cache_blocks).await?;
+        let term_dict = AsyncSSTableReader::open_with_cache_budget(
+            term_dict_handle,
+            term_cache_blocks,
+            term_cache_budget_bytes,
+        )
+        .await?;
 
-        // Get postings file handle (lazy - fetches ranges on demand)
-        let postings_handle = dir.open_lazy(&files.postings).await?;
+        // Own both immutable text files under one bounded admission cache.
+        let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
+        let postings = crate::structures::postings::PostingListReader::new(
+            dir.open_lazy(&files.postings).await?,
+            positions_handle,
+            posting_validation_cache_bytes,
+        )?;
 
         // Open store with lazy loading
         let store_handle = dir.open_lazy(&files.store).await?;
@@ -2031,9 +2071,6 @@ impl SegmentReader {
         let sparse_indexes = sparse_data.maxscore_indexes;
         let bmp_indexes = sparse_data.bmp_indexes;
 
-        // Open positions file handle (if exists) - offsets are now in TermInfo
-        let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
-
         // Load fast-field columns from .fast file
         let fast_fields = loader::load_fast_fields_file(dir, &files, &schema).await?;
 
@@ -2042,6 +2079,18 @@ impl SegmentReader {
         let chunk_file = loader::load_chunk_maps_file(dir, &files, &schema).await?;
         let chunk_maps = chunk_file.chunk_maps;
         let doc_lengths = chunk_file.doc_lengths;
+        for (&field, map) in &chunk_maps {
+            if map.is_document_map()
+                && (map.num_chunks() != meta.num_docs
+                    || schema.get_field_entry(Field(field)).is_none_or(|entry| {
+                        entry.chunked || entry.field_type != crate::dsl::FieldType::Text
+                    }))
+            {
+                return Err(Error::Corruption(
+                    "document map disagrees with segment scoring units".into(),
+                ));
+            }
+        }
 
         // Log segment loading stats
         {
@@ -2105,7 +2154,7 @@ impl SegmentReader {
             alive_docs: None,
             meta,
             term_dict: Arc::new(term_dict),
-            postings_handle,
+            postings,
             store: Arc::new(store),
             schema,
             vector_indexes,
@@ -2115,7 +2164,6 @@ impl SegmentReader {
             sparse_indexes,
             bmp_indexes,
             sparse_file_backed_bytes,
-            positions_handle,
             fast_fields,
             chunk_maps,
             doc_lengths,
@@ -2418,6 +2466,11 @@ impl SegmentReader {
             .is_some_and(|entry| entry.chunked)
     }
 
+    /// Physical text IDs require translation independently of BM25's scoring unit.
+    pub(crate) fn has_text_mapping(&self, field: Field) -> bool {
+        self.is_chunked_field(field) || self.chunk_maps.contains_key(&field.0)
+    }
+
     /// Number of chunks a chunked field holds in this segment (0 when none).
     pub fn num_chunks(&self, field: Field) -> u32 {
         self.chunk_maps
@@ -2533,6 +2586,8 @@ impl SegmentReader {
                 .map_or(0, |bits| bits.bits.len() * 8),
             num_docs: self.meta.num_docs,
             term_dict_cache_bytes,
+            posting_validation_cache_bytes: self.postings.heap_bytes(),
+            posting_integrity_heap_bytes: self.postings.integrity_heap_bytes(),
             store_cache_bytes,
             sparse_heap_bytes,
             dense_heap_bytes,
@@ -2612,11 +2667,10 @@ impl SegmentReader {
         let range = checked_file_range(
             posting_offset,
             posting_len,
-            self.postings_handle.len(),
+            self.postings.file().len(),
             "posting",
         )?;
-        let posting_bytes = self.postings_handle.read_bytes_range(range).await?;
-        let block_list = BlockPostingList::deserialize_zero_copy(posting_bytes)?;
+        let block_list = self.postings.read(range).await?;
 
         Ok(Some(block_list))
     }
@@ -2666,11 +2720,10 @@ impl SegmentReader {
                 let range = checked_file_range(
                     posting_offset,
                     posting_len,
-                    self.postings_handle.len(),
+                    self.postings.file().len(),
                     "prefix posting",
                 )?;
-                let posting_bytes = self.postings_handle.read_bytes_range(range).await?;
-                results.push(BlockPostingList::deserialize_zero_copy(posting_bytes)?);
+                results.push(self.postings.read(range).await?);
             }
         }
 
@@ -2833,40 +2886,39 @@ impl SegmentReader {
         self.term_dict.iter()
     }
 
-    /// Prefetch all term dictionary blocks in a single bulk I/O call.
-    ///
-    /// Call before merge iteration to eliminate per-block cache misses.
+    /// Warm a bounded initial term-dictionary range before merge iteration.
+    /// Configured cache caps remain in force; later blocks load on demand.
     pub async fn prefetch_term_dict(&self) -> crate::Result<()> {
         self.term_dict
-            .prefetch_all_data_bulk()
+            .prefetch_leading_blocks()
             .await
             .map_err(crate::Error::from)
     }
 
     #[cfg(feature = "native")]
     pub(crate) fn posting_file_range(&self, offset: u64, len: u64) -> Result<FileHandle> {
-        let range = checked_file_range(offset, len, self.postings_handle.len(), "posting")?;
-        Ok(self.postings_handle.slice(range))
+        let range = checked_file_range(offset, len, self.postings.file().len(), "posting")?;
+        Ok(self.postings.file().slice(range))
     }
 
     #[cfg(feature = "native")]
     pub(crate) fn position_file_range(&self, offset: u64, len: u64) -> Result<FileHandle> {
         let handle = self
-            .positions_handle
-            .as_ref()
+            .postings
+            .positions_file()
             .ok_or_else(|| Error::Corruption("missing position data".into()))?;
         Ok(handle.slice(checked_file_range(offset, len, handle.len(), "position")?))
     }
 
     /// Read raw posting bytes at offset
     pub async fn read_postings(&self, offset: u64, len: u64) -> Result<OwnedBytes> {
-        let range = checked_file_range(offset, len, self.postings_handle.len(), "posting")?;
-        Ok(self.postings_handle.read_bytes_range(range).await?)
+        let range = checked_file_range(offset, len, self.postings.file().len(), "posting")?;
+        Ok(self.postings.file().read_bytes_range(range).await?)
     }
 
     /// Read raw position bytes at offset (for merge)
     pub async fn read_position_bytes(&self, offset: u64, len: u64) -> Result<Option<OwnedBytes>> {
-        let handle = match &self.positions_handle {
+        let handle = match self.postings.positions_file() {
             Some(h) => h,
             None => return Ok(None),
         };
@@ -2876,7 +2928,7 @@ impl SegmentReader {
 
     /// Check if this segment has a positions file
     pub fn has_positions_file(&self) -> bool {
-        self.positions_handle.is_some()
+        self.postings.positions_file().is_some()
     }
 
     /// Validate all caller-controlled dense-search inputs before touching ANN
@@ -3722,7 +3774,7 @@ impl SegmentReader {
         term: &[u8],
     ) -> Result<Option<crate::structures::TermPositions>> {
         // Get positions handle
-        let handle = match &self.positions_handle {
+        let handle = match self.postings.positions_file() {
             Some(h) => h,
             None => return Ok(None),
         };
@@ -3750,8 +3802,7 @@ impl SegmentReader {
         let range = checked_file_range(offset, length, handle.len(), "position list")?;
         // Zero-copy on mmap directories: a v2 stream is decoded per block
         // on demand, only for the documents a scorer asks about.
-        let data = handle.read_bytes_range(range).await?;
-        Ok(Some(crate::structures::TermPositions::open(data)?))
+        Ok(Some(self.postings.read_positions(range).await?))
     }
 
     /// Check if positions are available for a field
@@ -3811,11 +3862,10 @@ impl SegmentReader {
         let range = checked_file_range(
             posting_offset,
             posting_len,
-            self.postings_handle.len(),
+            self.postings.file().len(),
             "posting",
         )?;
-        let posting_bytes = self.postings_handle.read_bytes_range_sync(range)?;
-        let block_list = BlockPostingList::deserialize_zero_copy(posting_bytes)?;
+        let block_list = self.postings.read_sync(range)?;
 
         Ok(Some(block_list))
     }
@@ -3863,11 +3913,10 @@ impl SegmentReader {
                 let range = checked_file_range(
                     posting_offset,
                     posting_len,
-                    self.postings_handle.len(),
+                    self.postings.file().len(),
                     "prefix posting",
                 )?;
-                let posting_bytes = self.postings_handle.read_bytes_range_sync(range)?;
-                results.push(BlockPostingList::deserialize_zero_copy(posting_bytes)?);
+                results.push(self.postings.read_sync(range)?);
             }
         }
 
@@ -3880,7 +3929,7 @@ impl SegmentReader {
         field: Field,
         term: &[u8],
     ) -> Result<Option<crate::structures::TermPositions>> {
-        let handle = match &self.positions_handle {
+        let handle = match self.postings.positions_file() {
             Some(h) => h,
             None => return Ok(None),
         };
@@ -3902,9 +3951,7 @@ impl SegmentReader {
         };
 
         let range = checked_file_range(offset, length, handle.len(), "position list")?;
-        let data = handle.read_bytes_range_sync(range)?;
-        let pos_list = crate::structures::TermPositions::open(data)?;
-        Ok(Some(pos_list))
+        Ok(Some(self.postings.read_positions_sync(range)?))
     }
 
     /// Synchronous dense vector search — ANN indexes are already sync,

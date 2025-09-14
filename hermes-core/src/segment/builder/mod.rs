@@ -1462,6 +1462,8 @@ impl SegmentBuilder {
                 position_index,
                 &self.term_interner,
                 &mut *pos_writer,
+                self.config.posting_codec,
+                self.config.compact_text,
             )?;
             pos_writer.finish()?;
             offsets
@@ -1471,7 +1473,27 @@ impl SegmentBuilder {
 
         // Phase 1b: chunk maps of chunked text fields (8 bytes per chunk) and
         // per-document length columns of plain text fields (2 bytes per doc).
-        let chunk_maps = std::mem::take(&mut self.chunk_maps);
+        let mut chunk_maps = std::mem::take(&mut self.chunk_maps);
+        // Reorderable plain text uses one field-local slot per document.
+        // Keeping the identity order at flush preserves its original postings;
+        // RGB may later permute the slots without moving document storage.
+        for (field, entry) in self.schema.fields() {
+            if entry.field_type != FieldType::Text
+                || !entry.indexed
+                || !entry.reorder
+                || entry.chunked
+            {
+                continue;
+            }
+            let slot = self.field_to_slot[&field.0];
+            let mut map = super::chunk_map::ChunkMapBuilder::default();
+            map.set_document_units(true);
+            for doc in 0..self.next_doc_id {
+                let length = self.doc_field_lengths[doc as usize * self.num_indexed_fields + slot];
+                map.push(doc, 0, length)?;
+            }
+            chunk_maps.insert(field.0, map);
+        }
         {
             let mut fields: Vec<(u32, &super::chunk_map::ChunkMapBuilder)> = chunk_maps
                 .iter()
@@ -1485,7 +1507,7 @@ impl SegmentBuilder {
                 if self
                     .schema
                     .get_field_entry(crate::dsl::Field(field_id))
-                    .is_some_and(|entry| entry.chunked)
+                    .is_some_and(|entry| entry.chunked || entry.reorder)
                 {
                     continue;
                 }
@@ -1514,11 +1536,17 @@ impl SegmentBuilder {
                 .collect();
             if !fields.is_empty() || !norms.is_empty() {
                 let mut writer = dir.streaming_writer(&files.chunks).await?;
-                super::chunk_map::write_chunk_maps(&mut *writer, &fields, &norms)?;
+                super::chunk_map::write_chunk_maps_with_norms(
+                    &mut *writer,
+                    &fields,
+                    &norms,
+                    self.config.quantized_norms,
+                )?;
                 writer.finish()?;
             }
         }
         let length_lookup = postings::LengthLookup {
+            quantized_norms: self.config.quantized_norms,
             doc_lengths: &self.doc_field_lengths,
             num_indexed_fields: self.num_indexed_fields,
             field_to_slot: &self.field_to_slot,
@@ -1534,8 +1562,7 @@ impl SegmentBuilder {
         #[cfg(feature = "native")]
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
-        let optimization = self.config.optimization;
-        let posting_codec = self.config.posting_codec;
+        let posting_config = &self.config;
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
         let binary_dense_vectors = std::mem::take(&mut self.binary_dense_vectors);
         let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
@@ -1603,7 +1630,7 @@ impl SegmentBuilder {
                                     &length_lookup,
                                     &mut term_dict_writer,
                                     &mut postings_writer,
-                                    (optimization, posting_codec),
+                                    posting_config,
                                     spill_arg,
                                 )
                             },
@@ -1671,7 +1698,7 @@ impl SegmentBuilder {
                 &length_lookup,
                 &mut term_dict_writer,
                 &mut postings_writer,
-                (optimization, posting_codec),
+                posting_config,
             )?;
             store::build_store_streaming_from_buffer(
                 &self.store_buffer,

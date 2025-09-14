@@ -419,6 +419,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitpacking"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "96a7139abd3d9cebf8cd6f920a389cf3dc9576172e32f4563f188cae3c3eb019"
+dependencies = [
+ "crunchy",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3379,6 +3388,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bincode",
+ "bitpacking",
  "byteorder",
  "exmex",
  "fst",

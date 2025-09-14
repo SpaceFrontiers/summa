@@ -371,9 +371,9 @@ impl SegmentReader {
         positions: bool,
         remaining: &mut u64,
     ) -> Result<()> {
-        let lazy_postings = !self.postings_handle.is_sync();
+        let lazy_postings = !self.postings.file().is_sync();
         let lazy_positions =
-            positions && self.positions_handle.as_ref().is_some_and(|h| !h.is_sync());
+            positions && self.postings.positions_file().is_some_and(|h| !h.is_sync());
         if !lazy_postings && !lazy_positions {
             return Ok(());
         }
@@ -405,7 +405,7 @@ impl SegmentReader {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn lazy_text_backfill_is_admitted_before_any_payload_read() {
+    async fn lazy_text_metadata_counts_and_backfill_admission_avoid_payload_reads() {
         use crate::directories::{FileHandle, RamDirectory};
         use crate::{Document, Index, IndexConfig, IndexWriter, Schema};
         let mut schema = Schema::builder();
@@ -426,10 +426,15 @@ mod tests {
         let searcher = index.reader().await.unwrap().searcher().await.unwrap();
         let id = crate::segment::SegmentId(searcher.segment_readers()[0].meta().id);
         let mut reader = SegmentReader::open(&dir, id, schema, 4).await.unwrap();
-        reader.postings_handle = FileHandle::lazy(
-            reader.postings_handle.len(),
-            std::sync::Arc::new(|_| Box::pin(async { panic!("payload I/O before admission") })),
-        );
+        reader.postings = crate::structures::postings::PostingListReader::new(
+            FileHandle::lazy(
+                reader.postings.file().len(),
+                std::sync::Arc::new(|_| Box::pin(async { panic!("payload I/O before admission") })),
+            ),
+            reader.postings.positions_file().cloned(),
+            0,
+        )
+        .unwrap();
         let error = reader
             .reserve_candidate_text_reads(field, b"common", false, &mut 0)
             .await
@@ -443,5 +448,25 @@ mod tests {
         // dictionary even when a common term has an external posting list.
         assert_eq!(reader.text_doc_freq(field, b"common").await.unwrap(), 256);
         assert_eq!(reader.text_doc_freq(field, b"absent").await.unwrap(), 0);
+        use crate::query::{CountCollector, Query, TermQuery, collect_segment};
+        let required = crate::query::BooleanQuery::new()
+            .must(TermQuery::text(field, "common"))
+            .should(TermQuery::text(field, "term"))
+            .should(TermQuery::text(field, "absent"));
+        let mut count = CountCollector::new();
+        collect_segment(&reader, &required, &mut count)
+            .await
+            .unwrap();
+        assert_eq!(count.count(), 256);
+        for (term, expected) in [("common", 256), ("absent", 0)] {
+            let query = TermQuery::text(field, term);
+            let mut count = CountCollector::new();
+            collect_segment(&reader, &query, &mut count).await.unwrap();
+            assert_eq!(count.count(), expected);
+            assert_eq!(
+                u64::from(query.count_estimate(&reader).await.unwrap()),
+                expected
+            );
+        }
     }
 }

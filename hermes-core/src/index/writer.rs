@@ -104,10 +104,16 @@ fn hard_flush_threshold(memory_budget: usize) -> usize {
 /// `SegmentBuilderConfig` default. Explicit `*_with_config` constructors bypass
 /// this helper and continue honoring every supplied builder option.
 fn default_builder_config(index_config: &IndexConfig) -> SegmentBuilderConfig {
+    let bounds = index_config.effective_posting_bounds();
     SegmentBuilderConfig {
         num_compression_threads: index_config.num_compression_threads,
         optimization: index_config.optimization,
         posting_codec: index_config.effective_posting_codec(),
+        quantized_norms: index_config.quantized_norms,
+        compact_text: index_config.compact_text,
+        posting_ratio_bounds: bounds.ratio,
+        posting_impact_bounds: bounds.impact,
+        term_dict_block_size: index_config.term_dict_block_size,
         ..SegmentBuilderConfig::default()
     }
 }
@@ -726,8 +732,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let mut segment_config = config.clone();
         segment_config.optimization = builder_config.optimization;
         segment_config.posting_codec = Some(builder_config.posting_codec);
+        segment_config.quantized_norms = builder_config.quantized_norms;
+        segment_config.compact_text = builder_config.compact_text;
+        segment_config.term_dict_block_size = builder_config.term_dict_block_size;
         let segment_manager =
-            super::segment_manager_from_config(&directory, &schema, metadata, &segment_config);
+            super::segment_manager_from_config(&directory, &schema, metadata, &segment_config)?;
         segment_manager.update_metadata(|_| {}).await?;
 
         Ok(Self::new_with_parts(
@@ -777,8 +786,14 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         let mut segment_config = config.clone();
         segment_config.optimization = builder_config.optimization;
         segment_config.posting_codec = Some(builder_config.posting_codec);
+        segment_config.quantized_norms = builder_config.quantized_norms;
+        segment_config.compact_text = builder_config.compact_text;
+        segment_config.term_dict_block_size = builder_config.term_dict_block_size;
+        segment_config.posting_ratio_bounds = builder_config.posting_ratio_bounds;
+        segment_config.posting_impact_bounds = builder_config.posting_impact_bounds;
+        super::log_posting_bounds_policy(directory.as_ref(), &metadata, &segment_config).await;
         let segment_manager =
-            super::segment_manager_from_config(&directory, &schema, metadata, &segment_config);
+            super::segment_manager_from_config(&directory, &schema, metadata, &segment_config)?;
         let swept = segment_manager.cleanup_orphan_segments().await?;
         if swept > 0 {
             log::warn!(

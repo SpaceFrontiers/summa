@@ -623,3 +623,19 @@ mod integrity_imp {
 }
 
 pub(crate) use integrity_imp::*;
+
+// Unlike production metrics, diagnostic counters may run inside hot loops.
+// Both the calls and argument evaluation disappear from normal builds.
+#[cfg(feature = "query-diagnostics")]
+macro_rules! search_work {
+    ($($field:ident += $value:expr),+ $(,)?) => {
+        crate::search_diagnostics::update(|work| {
+            $(work.$field = work.$field.saturating_add(($value) as u64);)+
+        });
+    };
+}
+#[cfg(not(feature = "query-diagnostics"))]
+macro_rules! search_work {
+    ($($field:ident += $value:expr),+ $(,)?) => {};
+}
+pub(crate) use search_work;

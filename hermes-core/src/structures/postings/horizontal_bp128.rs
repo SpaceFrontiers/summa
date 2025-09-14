@@ -28,109 +28,88 @@ pub fn pack_block(
     bit_width: u8,
     output: &mut Vec<u8>,
 ) {
-    if bit_width == 0 {
+    pack_block_n(values, bit_width, output);
+}
+
+/// Pack `values` at `width` bits each (little-endian bit order) into `out`.
+/// This is the one little-endian bit packer; every value must fit `width`.
+pub(super) fn pack_block_n(values: &[u32], width: u8, out: &mut Vec<u8>) {
+    debug_assert!(width <= 32, "bit width exceeds u32");
+    debug_assert!(
+        width == 32 || values.iter().all(|&v| v >> width == 0),
+        "value exceeds the packed width"
+    );
+    if width == 0 || values.is_empty() {
         return;
     }
-
-    let bytes_needed = (HORIZONTAL_BP128_BLOCK_SIZE * bit_width as usize).div_ceil(8);
-    let start = output.len();
-    output.resize(start + bytes_needed, 0);
-
-    let mut bit_pos = 0usize;
-    for &value in values {
-        let byte_idx = start + bit_pos / 8;
-        let bit_offset = bit_pos % 8;
-
-        // Write value across potentially multiple bytes
-        let mut remaining_bits = bit_width as usize;
-        let mut val = value;
-        let mut current_byte_idx = byte_idx;
-        let mut current_bit_offset = bit_offset;
-
-        while remaining_bits > 0 {
-            let bits_in_byte = (8 - current_bit_offset).min(remaining_bits);
-            let mask = ((1u32 << bits_in_byte) - 1) as u8;
-            output[current_byte_idx] |= ((val as u8) & mask) << current_bit_offset;
-            val >>= bits_in_byte;
-            remaining_bits -= bits_in_byte;
-            current_byte_idx += 1;
-            current_bit_offset = 0;
+    if width == 32 {
+        for &v in values {
+            out.extend_from_slice(&v.to_le_bytes());
         }
-
-        bit_pos += bit_width as usize;
-    }
-}
-
-/// Unpack a block of 128 u32 values
-/// Uses SIMD-optimized unpacking for common bit widths on supported architectures
-pub fn unpack_block(input: &[u8], bit_width: u8, output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
-    if bit_width == 0 {
-        output.fill(0);
         return;
     }
-
-    // Fast path for byte-aligned bit widths with SIMD
-    match bit_width {
-        8 => simd::unpack_8bit(input, output, HORIZONTAL_BP128_BLOCK_SIZE),
-        16 => simd::unpack_16bit(input, output, HORIZONTAL_BP128_BLOCK_SIZE),
-        32 => simd::unpack_32bit(input, output, HORIZONTAL_BP128_BLOCK_SIZE),
-        _ => unpack_block_generic(input, bit_width, output),
-    }
-}
-
-/// Generic unpacking for arbitrary bit widths
-/// Optimized: reads 64 bits at a time using unaligned pointer read
-#[inline]
-fn unpack_block_generic(
-    input: &[u8],
-    bit_width: u8,
-    output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE],
-) {
-    let mask = (1u64 << bit_width) - 1;
-    let bit_width_usize = bit_width as usize;
+    let start = out.len();
+    out.resize(start + (values.len() * width as usize).div_ceil(8), 0);
+    let dst = &mut out[start..];
     let mut bit_pos = 0usize;
-
-    // Ensure we have enough padding for the last read
-    // Max bytes needed: (127 * 32 + 32 + 7) / 8 = 516 bytes for 32-bit width
-    // For typical widths (1-20 bits), we need much less
-    let input_ptr = input.as_ptr();
-
-    for out in output.iter_mut() {
-        let byte_idx = bit_pos >> 3; // bit_pos / 8
-        let bit_offset = bit_pos & 7; // bit_pos % 8
-
-        // SAFETY: We read up to 8 bytes. The caller guarantees input has enough data.
-        // For 128 values at max 32 bits = 512 bytes, plus up to 7 bits offset = 513 bytes max.
-        let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
-
-        *out = ((word >> bit_offset) & mask) as u32;
-        bit_pos += bit_width_usize;
+    for &v in values {
+        let mut acc = (v as u64) << (bit_pos & 7);
+        let mut byte = bit_pos >> 3;
+        let mut remaining = (bit_pos & 7) + width as usize;
+        while remaining > 0 {
+            dst[byte] |= acc as u8;
+            acc >>= 8;
+            byte += 1;
+            remaining = remaining.saturating_sub(8);
+        }
+        bit_pos += width as usize;
     }
 }
 
-/// Unpack a smaller block (for variable block sizes)
-/// Optimized: reads 64 bits at a time using unaligned pointer read
+/// Unpack a block of 128 u32 values without requiring trailing padding.
+///
+/// Panics if the width exceeds 32 or the encoded input is truncated.
+pub fn unpack_block(input: &[u8], bit_width: u8, output: &mut [u32; HORIZONTAL_BP128_BLOCK_SIZE]) {
+    unpack_block_n(input, bit_width, output, HORIZONTAL_BP128_BLOCK_SIZE);
+}
+
+/// Unpack `n` horizontally packed integers, without reading outside `input`.
+/// Byte-aligned widths reuse SIMD widening; other widths use bounded word
+/// loads with a scalar tail. Shared by packed postings and patched low bits.
+///
+/// Panics if the width exceeds 32 or the input/output extents are too short.
 #[inline]
 pub fn unpack_block_n(input: &[u8], bit_width: u8, output: &mut [u32], n: usize) {
-    if bit_width == 0 {
-        output[..n].fill(0);
-        return;
-    }
-
-    let mask = (1u64 << bit_width) - 1;
-    let bit_width_usize = bit_width as usize;
-    let mut bit_pos = 0usize;
-    let input_ptr = input.as_ptr();
-
-    for out in output[..n].iter_mut() {
-        let byte_idx = bit_pos >> 3;
-        let bit_offset = bit_pos & 7;
-
-        // SAFETY: Caller guarantees input has enough data for n values at bit_width bits each
-        let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
-
-        *out = ((word >> bit_offset) & mask) as u32;
-        bit_pos += bit_width_usize;
+    assert!(bit_width <= 32, "bit width exceeds u32");
+    let output = &mut output[..n];
+    let bytes = n
+        .checked_mul(usize::from(bit_width))
+        .expect("packed input length overflows usize")
+        .div_ceil(8);
+    let input = &input[..bytes];
+    match bit_width {
+        0 => output.fill(0),
+        8 => simd::unpack_8bit(input, output, n),
+        16 => simd::unpack_16bit(input, output, n),
+        32 => simd::unpack_32bit(input, output, n),
+        _ => {
+            let mask = (1u64 << bit_width) - 1;
+            let mut bit_pos = 0usize;
+            for slot in output {
+                let byte = bit_pos >> 3;
+                let word = if byte + 8 <= input.len() {
+                    u64::from_le_bytes(input[byte..byte + 8].try_into().unwrap())
+                } else {
+                    let mut word = 0u64;
+                    for (i, &b) in input[byte..].iter().enumerate() {
+                        word |= (b as u64) << (i * 8);
+                    }
+                    word
+                };
+                *slot = ((word >> (bit_pos & 7)) & mask) as u32;
+                bit_pos += usize::from(bit_width);
+            }
+        }
     }
 }
 
@@ -141,26 +120,6 @@ pub fn binary_search_block(block: &[u32], target: u32) -> usize {
     match block.binary_search(&target) {
         Ok(idx) => idx,
         Err(idx) => idx,
-    }
-}
-
-/// Hillis-Steele inclusive prefix sum for 8 elements
-/// Computes: out[i] = sum(input[0..=i])
-/// This is the scalar fallback; SIMD version uses AVX2 intrinsics
-#[allow(dead_code)]
-#[inline]
-fn prefix_sum_8(deltas: &mut [u32; 8]) {
-    // Step 1: shift by 1
-    for i in (1..8).rev() {
-        deltas[i] = deltas[i].wrapping_add(deltas[i - 1]);
-    }
-    // Step 2: shift by 2
-    for i in (2..8).rev() {
-        deltas[i] = deltas[i].wrapping_add(deltas[i - 2]);
-    }
-    // Step 4: shift by 4
-    for i in (4..8).rev() {
-        deltas[i] = deltas[i].wrapping_add(deltas[i - 4]);
     }
 }
 
@@ -618,6 +577,110 @@ impl<'a> HorizontalBP128Iterator<'a> {
 mod tests {
     use super::*;
 
+    #[cfg(all(unix, feature = "native"))]
+    #[test]
+    fn exact_width_unpack_never_reads_past_the_encoded_slice() {
+        const CHILD: &str = "HERMES_CODEC_GUARD_CHILD";
+        const COMPLETE: &str = "guard-page decode verified";
+        if std::env::var_os(CHILD).is_none() {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "structures::postings::horizontal_bp128::tests::exact_width_unpack_never_reads_past_the_encoded_slice",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "exact-width decoder crossed the protected boundary: {}\n{}\n{}",
+                child.status,
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+            assert!(String::from_utf8_lossy(&child.stdout).contains(COMPLETE));
+            return;
+        }
+        // Isolate a potential SIGBUS/SIGSEGV in the child test process.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        assert!(page >= 512);
+        let page = page as usize;
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        struct Mapping(*mut libc::c_void, usize);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::munmap(self.0, self.1);
+                }
+            }
+        }
+        let _mapping = Mapping(mapping, page * 2);
+        let boundary = unsafe { mapping.cast::<u8>().add(page) };
+        assert_eq!(
+            unsafe { libc::mprotect(boundary.cast(), page, libc::PROT_NONE) },
+            0
+        );
+        for width in 0..=32u8 {
+            let mask = if width == 32 {
+                u32::MAX
+            } else {
+                (1u32 << width) - 1
+            };
+            let values = std::array::from_fn(|i| {
+                if width == 0 {
+                    0
+                } else {
+                    (i as u32).wrapping_mul(2_654_435_761) & mask
+                }
+            });
+            let mut packed = Vec::new();
+            pack_block(&values, width, &mut packed);
+            // Independent bit-at-a-time oracle for the persisted layout.
+            let mut expected_bytes = vec![0u8; (values.len() * usize::from(width)).div_ceil(8)];
+            for (i, &value) in values.iter().enumerate() {
+                for bit in 0..usize::from(width) {
+                    let at = i * usize::from(width) + bit;
+                    expected_bytes[at / 8] |= (((value >> bit) & 1) as u8) << (at % 8);
+                }
+            }
+            assert_eq!(packed, expected_bytes);
+            for count in 0..=HORIZONTAL_BP128_BLOCK_SIZE {
+                let len = (count * usize::from(width)).div_ceil(8);
+                let start = unsafe { boundary.sub(len) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(packed.as_ptr(), start, len);
+                }
+                let input = unsafe { std::slice::from_raw_parts(start, len) };
+                let mut decoded = vec![0xDEADBEEF; count + 4];
+                unpack_block_n(input, width, &mut decoded[..count], count);
+                assert_eq!(
+                    &decoded[..count],
+                    &values[..count],
+                    "width={width} count={count}"
+                );
+                assert_eq!(&decoded[count..], &[0xDEADBEEF; 4]);
+                if count == HORIZONTAL_BP128_BLOCK_SIZE {
+                    let mut full = [0; HORIZONTAL_BP128_BLOCK_SIZE];
+                    unpack_block(input, width, &mut full);
+                    assert_eq!(full, values);
+                }
+            }
+        }
+        println!("{COMPLETE}");
+    }
+
     #[test]
     fn test_bits_needed() {
         assert_eq!(simd::bits_needed(0), 0);
@@ -710,13 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hillis_steele_prefix_sum() {
-        // Test the prefix_sum_8 function directly
-        let mut deltas = [1u32, 2, 3, 4, 5, 6, 7, 8];
-        prefix_sum_8(&mut deltas);
-        // Expected: [1, 1+2, 1+2+3, 1+2+3+4, ...]
-        assert_eq!(deltas, [1, 3, 6, 10, 15, 21, 28, 36]);
-
+    fn test_simd_delta_decode() {
         // Test simd::delta_decode
         let deltas2 = [0u32; 16]; // gaps of 1 (stored as 0)
         let mut output2 = [0u32; 16];

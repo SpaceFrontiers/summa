@@ -34,15 +34,23 @@ sparse_map = { "{" ~ sparse_entry ~ ("," ~ sparse_entry)* ~ "}" }
 sparse_query = { field_spec ~ "sparse" ~ "(" ~ sparse_map ~ ("," ~ ann_params)? ~ ")" }
 
 // Boolean operators
-and_op = { "AND" | "&&" }
-or_op = { "OR" | "||" }
-not_op = { "NOT" | "-" | "!" }
+// Atomic keywords inspect the immediate boundary, without implicit whitespace
+// skipping. Do not split identifiers, field names or prefix values (NOTHING,
+// NOT:term, NOT*). Symbolic operators do not need a word boundary.
+keyword_end = _{ &(WHITESPACE | "(" | "\"" | EOI) }
+and_op = @{ "AND" ~ keyword_end | "&&" }
+or_op = @{ "OR" ~ keyword_end | "||" }
+not_op = @{ "NOT" ~ keyword_end | "!" }
+// Modifiers bind to the immediately following operand; a bare `+`/`-`
+// followed by whitespace is ordinary text.
+required_op = @{ "+" ~ !WHITESPACE }
+prohibited_op = @{ "-" ~ !WHITESPACE }
 
 // Grouping
 group = { "(" ~ or_expr ~ ")" }
 
 // Primary expression (vector queries added)
-primary = { not_op? ~ (group | ann_query | sparse_query | phrase_query | prefix_query | term_query) }
+primary = { (required_op | prohibited_op | not_op)? ~ !("+" | "-" | "!") ~ (group | ann_query | sparse_query | phrase_query | prefix_query | term_query) }
 
 // Boolean expressions
 and_expr = { primary ~ (and_op ~ primary)* }

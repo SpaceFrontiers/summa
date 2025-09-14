@@ -123,6 +123,9 @@ enum PostingCodecArg {
     Packed,
     /// Exact widths with patched exceptions (OptP4D): smallest, ~30% slower decode
     Pfor,
+    /// SIMD bitpacking for full document, frequency and position blocks
+    #[value(name = "simd4x")]
+    Simd4x,
 }
 
 impl PostingCodecArg {
@@ -131,6 +134,7 @@ impl PostingCodecArg {
             Self::Rounded => hermes_core::structures::PostingCodec::Rounded,
             Self::Packed => hermes_core::structures::PostingCodec::Packed,
             Self::Pfor => hermes_core::structures::PostingCodec::Pfor,
+            Self::Simd4x => hermes_core::structures::PostingCodec::Simd4x,
         }
     }
 }
@@ -210,6 +214,24 @@ enum Commands {
         /// Posting block codec override (default: derived from --optimization)
         #[arg(long)]
         posting_codec: Option<PostingCodecArg>,
+
+        /// Opt in to per-block length/TF ratio bounds on new segments (tighter exact
+        /// top-k pruning, same results). Existing segments keep their layout.
+        #[arg(long)]
+        posting_ratio_bounds: bool,
+
+        /// Opt in to per-block frequency/length impact envelopes on new segments
+        /// (implies --posting-ratio-bounds). Existing segments keep their layout.
+        #[arg(long)]
+        posting_impact_bounds: bool,
+
+        /// Disable automatic merges during ingestion; `hermes-tool merge` remains available
+        #[arg(long)]
+        no_background_merges: bool,
+
+        /// Uncompressed term-dictionary block target for new output (512..=1048576 bytes)
+        #[arg(long = "term-dict-block-bytes", default_value = "16384")]
+        term_dict_block_size: hermes_core::structures::SSTableBlockSize,
     },
 
     /// Commit pending changes
@@ -227,6 +249,10 @@ enum Commands {
         /// Physically remove deleted rows from final outputs (more expensive)
         #[arg(long, default_value_t = false)]
         compact: bool,
+
+        /// Uncompressed term-dictionary block target for new output (512..=1048576 bytes)
+        #[arg(long = "term-dict-block-bytes", default_value = "16384")]
+        term_dict_block_size: hermes_core::structures::SSTableBlockSize,
     },
 
     /// Delete committed rows by exact primary key and commit visibility
@@ -257,6 +283,10 @@ enum Commands {
         /// Scratch budget per segment, in MiB (in addition to source readers)
         #[arg(long, default_value_t = 256)]
         memory_budget_mb: usize,
+
+        /// Uncompressed term-dictionary block target for new output (512..=1048576 bytes)
+        #[arg(long = "term-dict-block-bytes", default_value = "16384")]
+        term_dict_block_size: hermes_core::structures::SSTableBlockSize,
     },
 
     /// Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning
@@ -264,6 +294,10 @@ enum Commands {
         /// Path to the index directory
         #[arg(short, long)]
         index: PathBuf,
+
+        /// Uncompressed term-dictionary block target for new output (512..=1048576 bytes)
+        #[arg(long = "term-dict-block-bytes", default_value = "16384")]
+        term_dict_block_size: hermes_core::structures::SSTableBlockSize,
     },
 
     /// Show index info
@@ -366,6 +400,16 @@ enum Commands {
         /// Offset for pagination (single --query only)
         #[arg(short, long, default_value = "0")]
         offset: usize,
+
+        /// Per-segment dictionary cache block cap (maximum 65536)
+        #[arg(long, default_value_t = 256)]
+        term_cache_blocks: usize,
+        /// Optional per-segment decompressed dictionary cache byte cap (0 disables retention)
+        #[arg(long)]
+        term_cache_bytes: Option<usize>,
+        /// Shared per-segment document/position validation budget (maximum 64 MiB)
+        #[arg(long, default_value_t = 0)]
+        posting_validation_cache_bytes: usize,
     },
 
     /// Warm up slice cache and save to file
@@ -532,6 +576,10 @@ async fn main() -> Result<()> {
             compression_threads,
             optimization,
             posting_codec,
+            posting_ratio_bounds,
+            posting_impact_bounds,
+            no_background_merges,
+            term_dict_block_size,
         } => {
             index_ops::index_documents(
                 index,
@@ -543,14 +591,22 @@ async fn main() -> Result<()> {
                 compression_threads,
                 optimization.to_index_optimization(),
                 posting_codec.map(PostingCodecArg::to_posting_codec),
+                posting_ratio_bounds,
+                posting_impact_bounds,
+                no_background_merges,
+                term_dict_block_size,
             )
             .await?;
         }
         Commands::Commit { index } => {
             index_ops::commit_index(index).await?;
         }
-        Commands::Merge { index, compact } => {
-            index_ops::merge_index(index, compact).await?;
+        Commands::Merge {
+            index,
+            compact,
+            term_dict_block_size,
+        } => {
+            index_ops::merge_index(index, compact, term_dict_block_size).await?;
         }
         Commands::Delete { index, keys } => index_ops::delete_rows(index, keys).await?,
         Commands::Upsert { index, document } => index_ops::upsert_row(index, document).await?,
@@ -558,11 +614,15 @@ async fn main() -> Result<()> {
             index,
             segment,
             memory_budget_mb,
+            term_dict_block_size,
         } => {
-            index_ops::compact_rows(index, segment, memory_budget_mb).await?;
+            index_ops::compact_rows(index, segment, memory_budget_mb, term_dict_block_size).await?;
         }
-        Commands::Reorder { index } => {
-            index_ops::reorder_index(index).await?;
+        Commands::Reorder {
+            index,
+            term_dict_block_size,
+        } => {
+            index_ops::reorder_index(index, term_dict_block_size).await?;
         }
         Commands::Info { index } => {
             index_ops::show_info(index).await?;
@@ -604,7 +664,17 @@ async fn main() -> Result<()> {
             search_threads,
             limit,
             offset,
+            term_cache_blocks,
+            term_cache_bytes,
+            posting_validation_cache_bytes,
         } => {
+            let config = index_ops::search_config(
+                term_cache_blocks,
+                term_cache_bytes,
+                posting_validation_cache_bytes,
+                search_threads,
+            );
+
             if let Some(queries_file) = queries_file {
                 anyhow::ensure!(offset == 0, "--offset is not supported with --queries-file");
                 let concurrency = concurrency.unwrap_or_else(|| {
@@ -612,15 +682,14 @@ async fn main() -> Result<()> {
                         .map(|n| n.get())
                         .unwrap_or(8)
                 });
-                index_ops::search_batch(index, queries_file, limit, concurrency, search_threads)
-                    .await?;
+                index_ops::search_batch(index, queries_file, limit, concurrency, config).await?;
             } else {
                 anyhow::ensure!(
                     concurrency.is_none(),
                     "--concurrency requires --queries-file"
                 );
                 let query = query.expect("clap enforces --query when --queries-file is absent");
-                index_ops::search_index(index, &query, limit, offset, search_threads).await?;
+                index_ops::search_index(index, &query, limit, offset, config).await?;
             }
         }
         Commands::Warmup { index, cache_size } => {

@@ -341,75 +341,91 @@ impl std::fmt::Debug for SharedBytes {
 /// Supports two backing stores:
 /// - `Vec<u8>` for owned data (RamDirectory, FsDirectory, decompressed blocks)
 /// - `Mmap` for zero-copy memory-mapped files (MmapDirectory, native only)
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OwnedBytes {
     data: SharedBytes,
-    range: Range<usize>,
+    /// Validated subview into `data`. Its allocation is immutable and stable
+    /// for the lifetime of the retained Arc; see `docs/owned-byte-views.md`.
+    view: std::ptr::NonNull<[u8]>,
+}
+
+// SAFETY: the view points into immutable storage owned by `data`. Both Arc
+// variants are Send + Sync, keep their allocation stable, and expose no mutable
+// access through this type. Every clone retains that same backing allocation.
+unsafe impl Send for OwnedBytes {}
+// SAFETY: shared access only yields immutable slices tied to the owner's borrow.
+unsafe impl Sync for OwnedBytes {}
+
+impl std::fmt::Debug for OwnedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnedBytes")
+            .field("data", &self.data)
+            .field("len", &self.len())
+            .finish()
+    }
 }
 
 impl OwnedBytes {
+    /// Validate a view while its stable backing owner is available. Moving the
+    /// Arc handle below does not move the Vec buffer or memory mapping.
+    fn with_range(data: SharedBytes, range: Range<usize>) -> Self {
+        let view = std::ptr::NonNull::from(&data.as_bytes()[range]);
+        Self { data, view }
+    }
+
     pub fn new(data: Vec<u8>) -> Self {
         let len = data.len();
-        Self {
-            data: SharedBytes::Vec(Arc::new(data)),
-            range: 0..len,
-        }
+        Self::with_range(SharedBytes::Vec(Arc::new(data)), 0..len)
     }
 
     pub fn empty() -> Self {
-        Self {
-            data: SharedBytes::Vec(Arc::new(Vec::new())),
-            range: 0..0,
-        }
+        Self::new(Vec::new())
     }
 
-    /// Create from a pre-existing Arc<Vec<u8>> with a sub-range.
+    /// Create from a pre-existing Arc<Vec<u8>> with a checked sub-range.
     /// Used by RamDirectory and CachingDirectory to share data without copying.
     pub(crate) fn from_arc_vec(data: Arc<Vec<u8>>, range: Range<usize>) -> Self {
-        Self {
-            data: SharedBytes::Vec(data),
-            range,
-        }
+        Self::with_range(SharedBytes::Vec(data), range)
     }
 
     /// Create from a memory-mapped file (zero-copy).
     #[cfg(feature = "native")]
     pub(crate) fn from_mmap(mmap: Arc<memmap2::Mmap>) -> Self {
         let len = mmap.len();
-        Self {
-            data: SharedBytes::Mmap(mmap),
-            range: 0..len,
-        }
+        Self::with_range(SharedBytes::Mmap(mmap), 0..len)
     }
 
-    /// Create from a memory-mapped file with a sub-range (zero-copy).
+    /// Create from a memory-mapped file with a checked sub-range (zero-copy).
     #[cfg(feature = "native")]
     pub(crate) fn from_mmap_range(mmap: Arc<memmap2::Mmap>, range: Range<usize>) -> Self {
-        Self {
-            data: SharedBytes::Mmap(mmap),
-            range,
-        }
+        Self::with_range(SharedBytes::Mmap(mmap), range)
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
-        self.range.len()
+        self.view.len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.range.is_empty()
+        self.len() == 0
     }
 
+    /// Create a checked subview bounded by this view, retaining the same owner.
     pub fn slice(&self, range: Range<usize>) -> Self {
-        let start = self.range.start + range.start;
-        let end = self.range.start + range.end;
+        let view = std::ptr::NonNull::from(&self.as_slice()[range]);
         Self {
             data: self.data.clone(),
-            range: start..end,
+            view,
         }
     }
 
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        &self.data.as_bytes()[self.range.clone()]
+        // SAFETY: constructors and slice validate this view against immutable
+        // Arc-owned storage. The owner outlives the returned borrow of self;
+        // neither moving a handle nor cloning it can move its backing bytes.
+        unsafe { self.view.as_ref() }
     }
 
     /// Returns `true` if the backing store is a memory-mapped file.
@@ -1356,6 +1372,80 @@ mod tests {
         // Sync reads work on inline handles
         let sync_bytes = handle.read_bytes_range_sync(0..5).unwrap();
         assert_eq!(sync_bytes.as_slice(), b"hello");
+    }
+
+    #[test]
+    fn owned_byte_views_retain_heap_storage_across_moves_clones_and_empty_slices() {
+        let backing = Arc::new((0u8..64).collect::<Vec<_>>());
+        let weak = Arc::downgrade(&backing);
+        let bytes = OwnedBytes::from_arc_vec(backing.clone(), 3..61);
+        let nested = bytes.slice(1..57).slice(2..53);
+        let expected = (6u8..57).collect::<Vec<_>>();
+        let pointer = nested.as_slice().as_ptr();
+        let empty = nested.slice(nested.len()..nested.len());
+        assert!(empty.is_empty());
+        assert!(OwnedBytes::empty().slice(0..0).as_slice().is_empty());
+        let cloned = nested.clone();
+        drop(backing);
+        drop(bytes);
+        drop(nested);
+        assert_eq!(cloned.as_slice().as_ptr(), pointer);
+        assert_eq!(cloned.as_slice(), expected);
+        drop(cloned);
+        assert!(
+            weak.upgrade().is_some(),
+            "empty views also retain their owner"
+        );
+        drop(empty);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(
+            std::mem::size_of::<OwnedBytes>(),
+            std::mem::size_of::<super::SharedBytes>() + 2 * std::mem::size_of::<usize>()
+        );
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn owned_byte_views_keep_heap_and_mmap_owners_alive_across_threads() {
+        fn check(bytes: OwnedBytes, mapped: bool) {
+            assert_eq!(bytes.is_mmap(), mapped);
+            let survivor = bytes.slice(3..61).slice(1..56);
+            let copied = survivor.clone();
+            drop(bytes);
+            let thread = std::thread::spawn(move || {
+                assert_eq!(survivor.as_slice(), &(4u8..59).collect::<Vec<_>>());
+                assert_eq!(survivor.is_mmap(), mapped);
+                survivor.slice(2..9)
+            });
+            assert_eq!(copied.as_slice(), &(4u8..59).collect::<Vec<_>>());
+            drop(copied);
+            let final_view = thread.join().unwrap();
+            assert_eq!(final_view.as_slice(), &[6, 7, 8, 9, 10, 11, 12]);
+            assert_eq!(final_view.is_mmap(), mapped);
+        }
+        check(OwnedBytes::new((0u8..64).collect()), false);
+        let mut mapping = memmap2::MmapMut::map_anon(64).unwrap();
+        mapping.copy_from_slice(&(0u8..64).collect::<Vec<_>>());
+        let mapping = Arc::new(mapping.make_read_only().unwrap());
+        let weak = Arc::downgrade(&mapping);
+        check(OwnedBytes::from_mmap_range(mapping.clone(), 0..64), true);
+        assert_eq!(Arc::strong_count(&mapping), 1);
+        drop(mapping);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn owned_byte_subslices_reject_access_outside_the_parent_view() {
+        let bytes = OwnedBytes::new(vec![1, 2, 3, 4, 5]);
+        let parent = bytes.slice(1..3);
+        assert_eq!(parent.slice(0..2).as_slice(), &[2, 3]);
+        assert!(std::panic::catch_unwind(|| parent.slice(0..3).to_vec()).is_err());
+        assert!(
+            std::panic::catch_unwind(|| parent.slice(Range { start: 2, end: 1 }).to_vec()).is_err()
+        );
+        assert!(
+            std::panic::catch_unwind(|| parent.slice(usize::MAX..usize::MAX).to_vec()).is_err()
+        );
     }
 
     #[tokio::test]

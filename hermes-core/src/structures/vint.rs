@@ -26,6 +26,12 @@ pub fn read_vint<R: Read + ?Sized>(reader: &mut R) -> io::Result<u64> {
         let mut encoded = [0_u8; 1];
         reader.read_exact(&mut encoded)?;
         let byte = encoded[0];
+        if shift == 63 && byte > 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint exceeds u64",
+            ));
+        }
         result |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(result);
@@ -69,5 +75,17 @@ mod tests {
             read_vint(&mut overlong).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn overflowing_tenth_varint_byte_is_rejected_instead_of_wrapping() {
+        for last in [2, 3, 0x7f] {
+            let mut bytes = [0x80; 10];
+            bytes[9] = last;
+            assert_eq!(
+                read_vint(&mut bytes.as_slice()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 }

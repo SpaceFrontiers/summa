@@ -21,6 +21,7 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
+bitpacking = { workspace = true }
 zstd = { workspace = true }
 rustc-hash = { workspace = true }
 parking_lot = { workspace = true }
@@ -90,6 +91,8 @@ default = ["sync"]
 native = ["fst-index", "dep:tokio", "dep:async-channel", "dep:num_cpus", "dep:rayon", "dep:lasso", "dep:memmap2", "dep:libc", "dep:uuid", "dep:tokenizers", "dep:hf-hub"]
 sync = ["native"]
 diagnostics = []
+# Per-query work accounting for dedicated diagnostic builds; absent by default.
+query-diagnostics = ["native"]
 metrics = ["dep:metrics"]
 fst-index = ["dep:fst"]
 # Japanese (unidic) and Korean (ko-dic) morphology for the `morph` tokenizer

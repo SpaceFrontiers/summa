@@ -199,10 +199,17 @@ mod neon {
         }
     }
 
-    /// Fused unpack 8-bit + delta decode using NEON
-    /// Processes 4 values at a time, fusing unpack and prefix sum
+    /// Fused unpack 8-bit + delta decode using NEON. Processes 4 values at a
+    /// time, fusing unpack and prefix sum; `OFFSET` is added to every gap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `input.len() >= count - 1` (one byte per
+    /// delta) and `output.len() >= count`; the vector loads/stores are
+    /// unchecked. The safe dispatchers in this module assert this once per
+    /// block. `count == 0` is not allowed (`output[0]` is written).
     #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_8bit_delta_decode(
+    pub unsafe fn unpack_8bit_delta_decode_with_offset<const OFFSET: u32>(
         input: &[u8],
         output: &mut [u32],
         first_value: u32,
@@ -213,7 +220,7 @@ mod neon {
             return;
         }
 
-        let ones = vdupq_n_u32(1);
+        let ones = vdupq_n_u32(OFFSET);
         let mut carry = vdupq_n_u32(first_value);
 
         let full_groups = (count - 1) / 4;
@@ -227,7 +234,7 @@ mod neon {
             let bytes = vreinterpret_u8_u32(vdup_n_u32(raw));
             let u16s = vmovl_u8(bytes); // 8×u8 → 8×u16 (only low 4 matter)
             let d = vmovl_u16(vget_low_u16(u16s)); // 4×u16 → 4×u32
-            // Add 1 (since we store gap-1)
+            // Add the format's gap offset
             let gaps = vaddq_u32(d, ones);
 
             // Compute prefix sum within the 4 elements
@@ -243,20 +250,27 @@ mod neon {
             carry = vdupq_n_u32(vgetq_lane_u32(result, 3));
         }
 
-        // Handle remainder
+        // Handle remainder: re-decode from output[base] (== carry) onward.
         let base = full_groups * 4;
-        let mut scalar_carry = vgetq_lane_u32(carry, 0);
-        for j in 0..remainder {
-            scalar_carry = scalar_carry
-                .wrapping_add(input[base + j] as u32)
-                .wrapping_add(1);
-            output[base + j + 1] = scalar_carry;
-        }
+        super::scalar::delta_decode_with_offset::<OFFSET, 1>(
+            &input[base..],
+            &mut output[base..],
+            vgetq_lane_u32(carry, 0),
+            remainder + 1,
+        );
     }
 
-    /// Fused unpack 16-bit + delta decode using NEON
+    /// Fused unpack 16-bit + delta decode using NEON; `OFFSET` is added to
+    /// every gap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `input.len() >= (count - 1) * 2` (two bytes
+    /// per delta) and `output.len() >= count`; the vector loads/stores are
+    /// unchecked. The safe dispatchers in this module assert this once per
+    /// block. `count == 0` is not allowed (`output[0]` is written).
     #[target_feature(enable = "neon")]
-    pub unsafe fn unpack_16bit_delta_decode(
+    pub unsafe fn unpack_16bit_delta_decode_with_offset<const OFFSET: u32>(
         input: &[u8],
         output: &mut [u32],
         first_value: u32,
@@ -267,7 +281,7 @@ mod neon {
             return;
         }
 
-        let ones = vdupq_n_u32(1);
+        let ones = vdupq_n_u32(OFFSET);
         let mut carry = vdupq_n_u32(first_value);
 
         let full_groups = (count - 1) / 4;
@@ -281,7 +295,7 @@ mod neon {
             let vals = vld1_u16(in_ptr);
             let d = vmovl_u16(vals);
 
-            // Add 1 (since we store gap-1)
+            // Add the format's gap offset
             let gaps = vaddq_u32(d, ones);
 
             // Compute prefix sum within the 4 elements
@@ -297,15 +311,14 @@ mod neon {
             carry = vdupq_n_u32(vgetq_lane_u32(result, 3));
         }
 
-        // Handle remainder
+        // Handle remainder: re-decode from output[base] (== carry) onward.
         let base = full_groups * 4;
-        let mut scalar_carry = vgetq_lane_u32(carry, 0);
-        for j in 0..remainder {
-            let idx = (base + j) * 2;
-            let delta = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-            scalar_carry = scalar_carry.wrapping_add(delta).wrapping_add(1);
-            output[base + j + 1] = scalar_carry;
-        }
+        super::scalar::delta_decode_with_offset::<OFFSET, 2>(
+            &input[base * 2..],
+            &mut output[base..],
+            vgetq_lane_u32(carry, 0),
+            remainder + 1,
+        );
     }
 
     /// NEON Hamming distance: XOR + byte popcount + horizontal sum.
@@ -572,9 +585,17 @@ mod sse {
         }
     }
 
-    /// Fused unpack 8-bit + delta decode using SSE
-    #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_8bit_delta_decode(
+    /// Fused unpack 8-bit + delta decode using SSE4.1; `OFFSET` is added to
+    /// every gap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `input.len() >= count - 1` (one byte per
+    /// delta) and `output.len() >= count`; the vector loads/stores are
+    /// unchecked. The safe dispatchers in this module assert this once per
+    /// block. `count == 0` is not allowed (`output[0]` is written).
+    #[target_feature(enable = "sse4.1")]
+    pub unsafe fn unpack_8bit_delta_decode_with_offset<const OFFSET: u32>(
         input: &[u8],
         output: &mut [u32],
         first_value: u32,
@@ -585,7 +606,7 @@ mod sse {
             return;
         }
 
-        let ones = _mm_set1_epi32(1);
+        let ones = _mm_set1_epi32(OFFSET as i32);
         let mut carry = _mm_set1_epi32(first_value as i32);
 
         let full_groups = (count - 1) / 4;
@@ -600,7 +621,7 @@ mod sse {
             ));
             let d = _mm_cvtepu8_epi32(bytes);
 
-            // Add 1 (since we store gap-1)
+            // Add the format's gap offset
             let gaps = _mm_add_epi32(d, ones);
 
             // Compute prefix sum within the 4 elements
@@ -616,20 +637,27 @@ mod sse {
             carry = _mm_shuffle_epi32(result, 0xFF);
         }
 
-        // Handle remainder
+        // Handle remainder: re-decode from output[base] (== carry) onward.
         let base = full_groups * 4;
-        let mut scalar_carry = _mm_extract_epi32(carry, 0) as u32;
-        for j in 0..remainder {
-            scalar_carry = scalar_carry
-                .wrapping_add(input[base + j] as u32)
-                .wrapping_add(1);
-            output[base + j + 1] = scalar_carry;
-        }
+        super::scalar::delta_decode_with_offset::<OFFSET, 1>(
+            &input[base..],
+            &mut output[base..],
+            _mm_extract_epi32(carry, 0) as u32,
+            remainder + 1,
+        );
     }
 
-    /// Fused unpack 16-bit + delta decode using SSE
-    #[target_feature(enable = "sse2", enable = "sse4.1")]
-    pub unsafe fn unpack_16bit_delta_decode(
+    /// Fused unpack 16-bit + delta decode using SSE4.1; `OFFSET` is added to
+    /// every gap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `input.len() >= (count - 1) * 2` (two bytes
+    /// per delta) and `output.len() >= count`; the vector loads/stores are
+    /// unchecked. The safe dispatchers in this module assert this once per
+    /// block. `count == 0` is not allowed (`output[0]` is written).
+    #[target_feature(enable = "sse4.1")]
+    pub unsafe fn unpack_16bit_delta_decode_with_offset<const OFFSET: u32>(
         input: &[u8],
         output: &mut [u32],
         first_value: u32,
@@ -640,7 +668,7 @@ mod sse {
             return;
         }
 
-        let ones = _mm_set1_epi32(1);
+        let ones = _mm_set1_epi32(OFFSET as i32);
         let mut carry = _mm_set1_epi32(first_value as i32);
 
         let full_groups = (count - 1) / 4;
@@ -654,7 +682,7 @@ mod sse {
             let vals = _mm_loadl_epi64(in_ptr as *const __m128i); // loadl_epi64 supports unaligned
             let d = _mm_cvtepu16_epi32(vals);
 
-            // Add 1 (since we store gap-1)
+            // Add the format's gap offset
             let gaps = _mm_add_epi32(d, ones);
 
             // Compute prefix sum within the 4 elements
@@ -670,15 +698,14 @@ mod sse {
             carry = _mm_shuffle_epi32(result, 0xFF);
         }
 
-        // Handle remainder
+        // Handle remainder: re-decode from output[base] (== carry) onward.
         let base = full_groups * 4;
-        let mut scalar_carry = _mm_extract_epi32(carry, 0) as u32;
-        for j in 0..remainder {
-            let idx = (base + j) * 2;
-            let delta = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-            scalar_carry = scalar_carry.wrapping_add(delta).wrapping_add(1);
-            output[base + j + 1] = scalar_carry;
-        }
+        super::scalar::delta_decode_with_offset::<OFFSET, 2>(
+            &input[base * 2..],
+            &mut output[base..],
+            _mm_extract_epi32(carry, 0) as u32,
+            remainder + 1,
+        );
     }
 
     /// Check if SSE4.1 is available at runtime
@@ -829,9 +856,17 @@ mod avx2 {
         _mm256_add_epi32(r2, carry_hi)
     }
 
-    /// AVX2 fused unpack 8-bit + delta decode (processes 8 values at a time)
+    /// AVX2 fused unpack 8-bit + delta decode (processes 8 values at a time);
+    /// `OFFSET` is added to every gap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `input.len() >= count - 1` (one byte per
+    /// delta) and `output.len() >= count`; the vector loads/stores are
+    /// unchecked. The safe dispatchers in this module assert this once per
+    /// block. `count == 0` is not allowed (`output[0]` is written).
     #[target_feature(enable = "avx2")]
-    pub unsafe fn unpack_8bit_delta_decode(
+    pub unsafe fn unpack_8bit_delta_decode_with_offset<const OFFSET: u32>(
         input: &[u8],
         output: &mut [u32],
         first_value: u32,
@@ -842,7 +877,7 @@ mod avx2 {
             return;
         }
 
-        let ones = _mm256_set1_epi32(1);
+        let ones = _mm256_set1_epi32(OFFSET as i32);
         let mut carry = _mm256_set1_epi32(first_value as i32);
         let broadcast_idx = _mm256_set1_epi32(7);
 
@@ -856,7 +891,7 @@ mod avx2 {
             let bytes = _mm_loadl_epi64(input.as_ptr().add(base) as *const __m128i);
             let d = _mm256_cvtepu8_epi32(bytes);
 
-            // Add 1 (since we store gap-1)
+            // Add the format's gap offset
             let gaps = _mm256_add_epi32(d, ones);
 
             // Compute prefix sum within 8 elements
@@ -872,20 +907,27 @@ mod avx2 {
             carry = _mm256_permutevar8x32_epi32(result, broadcast_idx);
         }
 
-        // Handle remainder with scalar
+        // Handle remainder: re-decode from output[base] (== carry) onward.
         let base = full_groups * 8;
-        let mut scalar_carry = _mm256_extract_epi32::<0>(carry) as u32;
-        for j in 0..remainder {
-            scalar_carry = scalar_carry
-                .wrapping_add(input[base + j] as u32)
-                .wrapping_add(1);
-            output[base + j + 1] = scalar_carry;
-        }
+        super::scalar::delta_decode_with_offset::<OFFSET, 1>(
+            &input[base..],
+            &mut output[base..],
+            _mm256_extract_epi32::<0>(carry) as u32,
+            remainder + 1,
+        );
     }
 
-    /// AVX2 fused unpack 16-bit + delta decode (processes 8 values at a time)
+    /// AVX2 fused unpack 16-bit + delta decode (processes 8 values at a time);
+    /// `OFFSET` is added to every gap.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee `input.len() >= (count - 1) * 2` (two bytes
+    /// per delta) and `output.len() >= count`; the vector loads/stores are
+    /// unchecked. The safe dispatchers in this module assert this once per
+    /// block. `count == 0` is not allowed (`output[0]` is written).
     #[target_feature(enable = "avx2")]
-    pub unsafe fn unpack_16bit_delta_decode(
+    pub unsafe fn unpack_16bit_delta_decode_with_offset<const OFFSET: u32>(
         input: &[u8],
         output: &mut [u32],
         first_value: u32,
@@ -896,7 +938,7 @@ mod avx2 {
             return;
         }
 
-        let ones = _mm256_set1_epi32(1);
+        let ones = _mm256_set1_epi32(OFFSET as i32);
         let mut carry = _mm256_set1_epi32(first_value as i32);
         let broadcast_idx = _mm256_set1_epi32(7);
 
@@ -911,7 +953,7 @@ mod avx2 {
             let vals = _mm_loadu_si128(in_ptr as *const __m128i);
             let d = _mm256_cvtepu16_epi32(vals);
 
-            // Add 1 (since we store gap-1)
+            // Add the format's gap offset
             let gaps = _mm256_add_epi32(d, ones);
 
             // Compute prefix sum within 8 elements
@@ -927,15 +969,14 @@ mod avx2 {
             carry = _mm256_permutevar8x32_epi32(result, broadcast_idx);
         }
 
-        // Handle remainder with scalar
+        // Handle remainder: re-decode from output[base] (== carry) onward.
         let base = full_groups * 8;
-        let mut scalar_carry = _mm256_extract_epi32::<0>(carry) as u32;
-        for j in 0..remainder {
-            let idx = (base + j) * 2;
-            let delta = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-            scalar_carry = scalar_carry.wrapping_add(delta).wrapping_add(1);
-            output[base + j + 1] = scalar_carry;
-        }
+        super::scalar::delta_decode_with_offset::<OFFSET, 2>(
+            &input[base * 2..],
+            &mut output[base..],
+            _mm256_extract_epi32::<0>(carry) as u32,
+            remainder + 1,
+        );
     }
 
     /// AVX2 Hamming distance using VPSHUFB-based popcount (Muła algorithm).
@@ -1065,7 +1106,7 @@ mod avx2 {
 // ============================================================================
 // Scalar fallback implementations
 // ============================================================================
-#[allow(dead_code)]
+
 mod scalar {
     /// Scalar unpack for 8-bit values
     #[inline]
@@ -1114,6 +1155,44 @@ mod scalar {
     pub fn add_one(values: &mut [u32], count: usize) {
         for val in values.iter_mut().take(count) {
             *val += 1;
+        }
+    }
+
+    /// Fused unpack + delta decode of `count` values: `output[0] = first_value`
+    /// and `output[i + 1] = output[i] + delta[i] + OFFSET` (wrapping), where
+    /// each little-endian delta occupies `BYTES` (1 or 2) bytes of `input`.
+    ///
+    /// This is the single scalar definition of the fused kernels: the SIMD
+    /// kernels call it for their sub-vector tails (with `first_value` set to
+    /// the last vector result and the slices advanced to it) and the
+    /// dispatchers use it as the non-SIMD fallback. `count == 0` is a no-op.
+    #[inline]
+    pub fn delta_decode_with_offset<const OFFSET: u32, const BYTES: usize>(
+        input: &[u8],
+        output: &mut [u32],
+        first_value: u32,
+        count: usize,
+    ) {
+        const {
+            assert!(
+                BYTES == 1 || BYTES == 2,
+                "scalar delta decode supports 8/16-bit deltas"
+            );
+        }
+        if count == 0 {
+            return;
+        }
+        output[0] = first_value;
+        let mut carry = first_value;
+        for i in 0..count - 1 {
+            let idx = i * BYTES;
+            let delta = if BYTES == 1 {
+                input[idx] as u32
+            } else {
+                u16::from_le_bytes([input[idx], input[idx + 1]]) as u32
+            };
+            carry = carry.wrapping_add(delta).wrapping_add(OFFSET);
+            output[i + 1] = carry;
         }
     }
 }
@@ -1331,16 +1410,26 @@ impl RoundedBitWidth {
         }
     }
 
-    /// Convert from stored u8 value (must be 0, 8, 16, or 32)
+    /// Convert from a stored u8 value; `None` unless it is exactly 0, 8, 16,
+    /// or 32. Readers of persisted headers must use this and surface `None`
+    /// as corruption instead of guessing a width.
+    #[inline]
+    pub fn try_from_u8(bits: u8) -> Option<Self> {
+        match bits {
+            0 => Some(RoundedBitWidth::Zero),
+            8 => Some(RoundedBitWidth::Bits8),
+            16 => Some(RoundedBitWidth::Bits16),
+            32 => Some(RoundedBitWidth::Bits32),
+            _ => None,
+        }
+    }
+
+    /// Convert from a stored u8 value that has already been validated to be
+    /// 0, 8, 16, or 32 (see [`Self::try_from_u8`]). Any other value maps to
+    /// `Bits32`, which is only acceptable after the header has been checked.
     #[inline]
     pub fn from_u8(bits: u8) -> Self {
-        match bits {
-            0 => RoundedBitWidth::Zero,
-            8 => RoundedBitWidth::Bits8,
-            16 => RoundedBitWidth::Bits16,
-            32 => RoundedBitWidth::Bits32,
-            _ => RoundedBitWidth::Bits32, // Fallback for invalid values
-        }
+        Self::try_from_u8(bits).unwrap_or(RoundedBitWidth::Bits32)
     }
 
     /// Get the byte size per value
@@ -1420,6 +1509,39 @@ pub fn unpack_rounded(input: &[u8], bit_width: RoundedBitWidth, output: &mut [u3
     }
 }
 
+/// Decode actual rounded gaps (unlike legacy gap-minus-one streams).
+/// Shares the ISA kernels; no intermediate unpacked delta buffer is needed.
+#[inline]
+pub(crate) fn unpack_rounded_raw_delta_decode(
+    input: &[u8],
+    bit_width: RoundedBitWidth,
+    output: &mut [u32],
+    first_value: u32,
+    count: usize,
+) {
+    match bit_width {
+        RoundedBitWidth::Zero => output.iter_mut().take(count).for_each(|v| *v = first_value),
+        RoundedBitWidth::Bits8 => {
+            unpack_8bit_delta_decode_with_offset::<0>(input, output, first_value, count)
+        }
+        RoundedBitWidth::Bits16 => {
+            unpack_16bit_delta_decode_with_offset::<0>(input, output, first_value, count)
+        }
+        RoundedBitWidth::Bits32 => {
+            if count > 0 {
+                output[0] = first_value;
+                let mut carry = first_value;
+                for i in 0..count - 1 {
+                    let offset = i * 4;
+                    let delta = u32::from_le_bytes(input[offset..offset + 4].try_into().unwrap());
+                    carry = carry.wrapping_add(delta);
+                    output[i + 1] = carry;
+                }
+            }
+        }
+    }
+}
+
 /// Fused unpack + delta decode using rounded bit width
 ///
 /// Combines unpacking and prefix sum in a single pass for better cache utilization.
@@ -1472,9 +1594,25 @@ pub fn unpack_rounded_delta_decode(
 /// improving cache utilization for large blocks.
 #[inline]
 pub fn unpack_8bit_delta_decode(input: &[u8], output: &mut [u32], first_value: u32, count: usize) {
+    unpack_8bit_delta_decode_with_offset::<1>(input, output, first_value, count);
+}
+
+/// Fused unpack 8-bit + delta decode with a configurable per-gap `OFFSET`.
+///
+/// Safe boundary for the unchecked ISA kernels: panics (once per block, not
+/// per value) unless `input` holds `count - 1` delta bytes and `output` holds
+/// `count` values.
+#[inline]
+pub(crate) fn unpack_8bit_delta_decode_with_offset<const OFFSET: u32>(
+    input: &[u8],
+    output: &mut [u32],
+    first_value: u32,
+    count: usize,
+) {
     if count == 0 {
         return;
     }
+    assert_delta_decode_bounds(input.len(), output.len(), count, 1);
 
     output[0] = first_value;
     if count == 1 {
@@ -1484,8 +1622,14 @@ pub fn unpack_8bit_delta_decode(input: &[u8], output: &mut [u32], first_value: u
     #[cfg(target_arch = "aarch64")]
     {
         if neon::is_available() {
+            // SAFETY: bounds asserted above; NEON availability checked.
             unsafe {
-                neon::unpack_8bit_delta_decode(input, output, first_value, count);
+                neon::unpack_8bit_delta_decode_with_offset::<OFFSET>(
+                    input,
+                    output,
+                    first_value,
+                    count,
+                );
             }
             return;
         }
@@ -1494,33 +1638,56 @@ pub fn unpack_8bit_delta_decode(input: &[u8], output: &mut [u32], first_value: u
     #[cfg(target_arch = "x86_64")]
     {
         if avx2::is_available() {
+            // SAFETY: bounds asserted above; AVX2 availability checked.
             unsafe {
-                avx2::unpack_8bit_delta_decode(input, output, first_value, count);
+                avx2::unpack_8bit_delta_decode_with_offset::<OFFSET>(
+                    input,
+                    output,
+                    first_value,
+                    count,
+                );
             }
             return;
         }
         if sse::is_available() {
+            // SAFETY: bounds asserted above; SSE4.1 availability checked.
             unsafe {
-                sse::unpack_8bit_delta_decode(input, output, first_value, count);
+                sse::unpack_8bit_delta_decode_with_offset::<OFFSET>(
+                    input,
+                    output,
+                    first_value,
+                    count,
+                );
             }
             return;
         }
     }
 
-    // Scalar fallback
-    let mut carry = first_value;
-    for i in 0..count - 1 {
-        carry = carry.wrapping_add(input[i] as u32).wrapping_add(1);
-        output[i + 1] = carry;
-    }
+    scalar::delta_decode_with_offset::<OFFSET, 1>(input, output, first_value, count);
 }
 
 /// Fused unpack 16-bit + delta decode in a single pass
 #[inline]
 pub fn unpack_16bit_delta_decode(input: &[u8], output: &mut [u32], first_value: u32, count: usize) {
+    unpack_16bit_delta_decode_with_offset::<1>(input, output, first_value, count);
+}
+
+/// Fused unpack 16-bit + delta decode with a configurable per-gap `OFFSET`.
+///
+/// Safe boundary for the unchecked ISA kernels: panics (once per block, not
+/// per value) unless `input` holds `(count - 1) * 2` delta bytes and
+/// `output` holds `count` values.
+#[inline]
+pub(crate) fn unpack_16bit_delta_decode_with_offset<const OFFSET: u32>(
+    input: &[u8],
+    output: &mut [u32],
+    first_value: u32,
+    count: usize,
+) {
     if count == 0 {
         return;
     }
+    assert_delta_decode_bounds(input.len(), output.len(), count, 2);
 
     output[0] = first_value;
     if count == 1 {
@@ -1530,8 +1697,14 @@ pub fn unpack_16bit_delta_decode(input: &[u8], output: &mut [u32], first_value: 
     #[cfg(target_arch = "aarch64")]
     {
         if neon::is_available() {
+            // SAFETY: bounds asserted above; NEON availability checked.
             unsafe {
-                neon::unpack_16bit_delta_decode(input, output, first_value, count);
+                neon::unpack_16bit_delta_decode_with_offset::<OFFSET>(
+                    input,
+                    output,
+                    first_value,
+                    count,
+                );
             }
             return;
         }
@@ -1540,27 +1713,48 @@ pub fn unpack_16bit_delta_decode(input: &[u8], output: &mut [u32], first_value: 
     #[cfg(target_arch = "x86_64")]
     {
         if avx2::is_available() {
+            // SAFETY: bounds asserted above; AVX2 availability checked.
             unsafe {
-                avx2::unpack_16bit_delta_decode(input, output, first_value, count);
+                avx2::unpack_16bit_delta_decode_with_offset::<OFFSET>(
+                    input,
+                    output,
+                    first_value,
+                    count,
+                );
             }
             return;
         }
         if sse::is_available() {
+            // SAFETY: bounds asserted above; SSE4.1 availability checked.
             unsafe {
-                sse::unpack_16bit_delta_decode(input, output, first_value, count);
+                sse::unpack_16bit_delta_decode_with_offset::<OFFSET>(
+                    input,
+                    output,
+                    first_value,
+                    count,
+                );
             }
             return;
         }
     }
 
-    // Scalar fallback
-    let mut carry = first_value;
-    for i in 0..count - 1 {
-        let idx = i * 2;
-        let delta = u16::from_le_bytes([input[idx], input[idx + 1]]) as u32;
-        carry = carry.wrapping_add(delta).wrapping_add(1);
-        output[i + 1] = carry;
-    }
+    scalar::delta_decode_with_offset::<OFFSET, 2>(input, output, first_value, count);
+}
+
+/// Bounds contract shared by the fused delta-decode dispatchers: the ISA
+/// kernels read `(count - 1) * bytes_per_delta` input bytes and write `count`
+/// outputs without checks, so a short slice must fail here, loudly.
+#[inline]
+fn assert_delta_decode_bounds(input_len: usize, output_len: usize, count: usize, bytes: usize) {
+    assert!(
+        output_len >= count,
+        "fused delta decode: output holds {output_len} values, block needs {count}"
+    );
+    let needed = (count - 1) * bytes;
+    assert!(
+        input_len >= needed,
+        "fused delta decode: input holds {input_len} bytes, block needs {needed}"
+    );
 }
 
 /// Fused unpack + delta decode for arbitrary bit widths
@@ -2825,7 +3019,7 @@ mod neon_quant {
 // ============================================================================
 // Scalar fallback for fused dot+norm on quantized vectors
 // ============================================================================
-#[allow(dead_code)]
+
 fn fused_dot_norm_f16_scalar(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> (f32, f32) {
     (0..dim).fold((0.0f32, 0.0f32), |(dot, norm), i| {
         let v = f16_to_f32(vec_f16[i]);
@@ -2837,7 +3031,6 @@ fn fused_dot_norm_f16_scalar(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> 
     })
 }
 
-#[allow(dead_code)]
 fn fused_dot_norm_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f32) {
     (0..dim).fold((0.0f32, 0.0f32), |(dot, norm), i| {
         let v = u8_to_f32(vec_u8[i]);
@@ -2848,14 +3041,12 @@ fn fused_dot_norm_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> (f32, f
     })
 }
 
-#[allow(dead_code)]
 fn dot_product_f16_scalar(query_f16: &[u16], vec_f16: &[u16], dim: usize) -> f32 {
     (0..dim).fold(0.0f32, |dot, i| {
         dot.algebraic_add(f16_to_f32(query_f16[i]).algebraic_mul(f16_to_f32(vec_f16[i])))
     })
 }
 
-#[allow(dead_code)]
 fn dot_product_u8_scalar(query: &[f32], vec_u8: &[u8], dim: usize) -> f32 {
     (0..dim).fold(0.0f32, |dot, i| {
         dot.algebraic_add(query[i].algebraic_mul(u8_to_f32(vec_u8[i])))
@@ -4019,7 +4210,6 @@ pub fn hamming_distance(a: &[u8], b: &[u8]) -> u32 {
 /// Scalar Hamming distance using u64 chunks + count_ones().
 /// On x86_64, count_ones() compiles to POPCNT when target-cpu supports it.
 #[inline]
-#[allow(dead_code)]
 fn hamming_distance_scalar(a: &[u8], b: &[u8]) -> u32 {
     let len = a.len();
     let chunks = len / 8;
@@ -4124,6 +4314,290 @@ pub fn batch_hamming_distances(query: &[u8], db: &[u8], byte_len: usize, out: &m
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_block_seek_preserves_suffix_lower_bounds_at_unsigned_extremes() {
+        for length in 0..=128 {
+            for base in [0u32, 1 << 31, u32::MAX - 512] {
+                let docs: Vec<_> = (0..length).map(|i| base + i as u32 * 3).collect();
+                let targets = [0, base, base + 1, base + 127, base + 383, u32::MAX];
+                for from in 0..=length {
+                    for target in targets {
+                        assert_eq!(
+                            super::find_first_ge_block_from(&docs, from, target),
+                            from + docs[from..].partition_point(|&doc| doc < target),
+                            "length={length} from={from} target={target}"
+                        );
+                    }
+                }
+            }
+        }
+        for from in 0..=128 {
+            for target in [0, 7, 8, u32::MAX] {
+                let docs = [7; 128];
+                assert_eq!(
+                    super::find_first_ge_block_from(&docs, from, target),
+                    from + docs[from..].partition_point(|&doc| doc < target)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn posting_block_intersection_preserves_suffixes_partial_outputs_and_unsigned_ids() {
+        for base in [0u32, 1 << 31, u32::MAX - 4096] {
+            for trial in 0..32 {
+                let all_left: Vec<_> = (0..128).map(|i| base + i * (trial % 7 + 1)).collect();
+                let all_right: Vec<_> = (0..128)
+                    .map(|i| base + i * (trial % 11 + 1) + trial % 3)
+                    .collect();
+                for len_a in [0, 1, 7, 8, 9, 127, 128] {
+                    for len_b in [0, 1, 7, 8, 9, 127, 128] {
+                        let left = &all_left[..len_a];
+                        let right = &all_right[..len_b];
+                        for (from_a, from_b) in [(0, 0), (len_a / 2, len_b / 3), (len_a, len_b)] {
+                            let expected: Vec<_> = left[from_a..]
+                                .iter()
+                                .copied()
+                                .filter(|value| right[from_b..].binary_search(value).is_ok())
+                                .collect();
+                            for limit in [1, 7, 128] {
+                                let (mut a, mut b) = (from_a, from_b);
+                                let mut actual = Vec::new();
+                                let mut pairs = [(0u8, 0u8); 128];
+                                while a < len_a && b < len_b {
+                                    let previous = (a, b);
+                                    let count = super::intersect_posting_blocks(
+                                        left,
+                                        &mut a,
+                                        right,
+                                        &mut b,
+                                        &mut pairs[..limit],
+                                    );
+                                    assert!(a > previous.0 || b > previous.1);
+                                    for &(l, r) in &pairs[..count] {
+                                        assert_eq!(left[l as usize], right[r as usize]);
+                                        actual.push(left[l as usize]);
+                                    }
+                                }
+                                assert_eq!(actual, expected);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The single scalar fused kernel (used for every SIMD tail and as the
+    /// non-SIMD fallback) must match a naive reference for every count that
+    /// crosses the 4/8/16-lane group boundaries, both widths and both offsets.
+    #[test]
+    fn scalar_delta_decode_with_offset_matches_naive_reference_for_all_counts() {
+        fn naive<const OFFSET: u32>(deltas: &[u32], first: u32) -> Vec<u32> {
+            let mut out = vec![first];
+            for &d in deltas {
+                out.push(out.last().unwrap().wrapping_add(d).wrapping_add(OFFSET));
+            }
+            out
+        }
+        for count in 0..=257usize {
+            let deltas: Vec<u32> = (0..count.saturating_sub(1))
+                .map(|i| [0, 1, 255, 65535, 42, 17][i % 6])
+                .collect();
+            for first in [0u32, 7, u32::MAX - 3] {
+                for bytes in [1usize, 2] {
+                    let mask = if bytes == 1 { 0xFF } else { 0xFFFF };
+                    let masked: Vec<u32> = deltas.iter().map(|d| d & mask).collect();
+                    let mut input = Vec::new();
+                    for d in &masked {
+                        input.extend_from_slice(&d.to_le_bytes()[..bytes]);
+                    }
+                    let (expected0, expected1) = if count == 0 {
+                        (Vec::new(), Vec::new())
+                    } else {
+                        (naive::<0>(&masked, first), naive::<1>(&masked, first))
+                    };
+                    let mut out0 = vec![0xDEAD_BEEF; count + 2];
+                    let mut out1 = vec![0xDEAD_BEEF; count + 2];
+                    if bytes == 1 {
+                        super::scalar::delta_decode_with_offset::<0, 1>(
+                            &input,
+                            &mut out0[..count],
+                            first,
+                            count,
+                        );
+                        super::scalar::delta_decode_with_offset::<1, 1>(
+                            &input,
+                            &mut out1[..count],
+                            first,
+                            count,
+                        );
+                    } else {
+                        super::scalar::delta_decode_with_offset::<0, 2>(
+                            &input,
+                            &mut out0[..count],
+                            first,
+                            count,
+                        );
+                        super::scalar::delta_decode_with_offset::<1, 2>(
+                            &input,
+                            &mut out1[..count],
+                            first,
+                            count,
+                        );
+                    }
+                    assert_eq!(
+                        &out0[..count],
+                        expected0,
+                        "offset 0 bytes={bytes} count={count}"
+                    );
+                    assert_eq!(
+                        &out1[..count],
+                        expected1,
+                        "offset 1 bytes={bytes} count={count}"
+                    );
+                    assert_eq!(&out0[count..], &[0xDEAD_BEEF; 2]);
+                    assert_eq!(&out1[count..], &[0xDEAD_BEEF; 2]);
+                    // The public dispatchers (SIMD where available, scalar
+                    // otherwise) must agree with the scalar definition.
+                    if bytes == 1 {
+                        let mut simd_out = vec![0; count];
+                        super::unpack_8bit_delta_decode_with_offset::<0>(
+                            &input,
+                            &mut simd_out,
+                            first,
+                            count,
+                        );
+                        assert_eq!(simd_out, expected0, "dispatch 8-bit count={count}");
+                    } else {
+                        let mut simd_out = vec![0; count];
+                        super::unpack_16bit_delta_decode_with_offset::<1>(
+                            &input,
+                            &mut simd_out,
+                            first,
+                            count,
+                        );
+                        assert_eq!(simd_out, expected1, "dispatch 16-bit count={count}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "fused delta decode: input holds")]
+    fn fused_delta_decode_rejects_short_input_before_touching_the_kernels() {
+        let input = [1u8; 3];
+        let mut output = [0u32; 8];
+        super::unpack_8bit_delta_decode(&input, &mut output, 0, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "fused delta decode: output holds")]
+    fn fused_delta_decode_rejects_short_output_before_touching_the_kernels() {
+        let input = [1u8; 16];
+        let mut output = [0u32; 4];
+        super::unpack_16bit_delta_decode(&input, &mut output, 0, 8);
+    }
+
+    #[test]
+    fn rounded_bit_width_try_from_u8_rejects_unrounded_widths() {
+        use super::RoundedBitWidth;
+        assert_eq!(RoundedBitWidth::try_from_u8(0), Some(RoundedBitWidth::Zero));
+        assert_eq!(
+            RoundedBitWidth::try_from_u8(8),
+            Some(RoundedBitWidth::Bits8)
+        );
+        assert_eq!(
+            RoundedBitWidth::try_from_u8(16),
+            Some(RoundedBitWidth::Bits16)
+        );
+        assert_eq!(
+            RoundedBitWidth::try_from_u8(32),
+            Some(RoundedBitWidth::Bits32)
+        );
+        for bad in (1..=255u8).filter(|b| ![8, 16, 32].contains(b)) {
+            assert_eq!(RoundedBitWidth::try_from_u8(bad), None, "width {bad}");
+        }
+    }
+
+    #[test]
+    fn raw_rounded_gaps_and_legacy_gaps_agree_with_scalar_at_all_tails() {
+        use super::*;
+        for (width, mask) in [
+            (RoundedBitWidth::Zero, 0u32),
+            (RoundedBitWidth::Bits8, 255),
+            (RoundedBitWidth::Bits16, 65535),
+            (RoundedBitWidth::Bits32, u32::MAX),
+        ] {
+            for count in 0..=257usize {
+                let first = u32::MAX - 17;
+                let gaps: Vec<_> = (0..count.saturating_sub(1))
+                    .map(|i| [0, 1, mask, mask / 2][i % 4] & mask)
+                    .collect();
+                let mut input = Vec::new();
+                for &gap in &gaps {
+                    let bytes = gap.to_le_bytes();
+                    input.extend_from_slice(&bytes[..width.bytes_per_value()]);
+                }
+                let mut expected = Vec::with_capacity(count);
+                if count > 0 {
+                    expected.push(first);
+                    for &gap in &gaps {
+                        expected.push(expected.last().unwrap().wrapping_add(gap));
+                    }
+                }
+                let mut actual = vec![0xDEADBEEF; count + 4];
+                unpack_rounded_raw_delta_decode(&input, width, &mut actual[..count], first, count);
+                assert_eq!(&actual[..count], expected, "width={width:?} count={count}");
+                assert_eq!(&actual[count..], &[0xDEADBEEF; 4]);
+                let mut legacy = vec![0; count];
+                unpack_rounded_delta_decode(&input, width, &mut legacy, first, count);
+                let biased: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &doc)| doc.wrapping_add(i as u32))
+                    .collect();
+                assert_eq!(legacy, biased, "legacy width={width:?} count={count}");
+                if count == 0 {
+                    continue;
+                }
+                // Exercise each available ISA, including SSE on AVX2 hosts.
+                #[cfg(target_arch = "x86_64")]
+                for (available, kernels) in [
+                    (
+                        sse::is_available(),
+                        [
+                            sse::unpack_8bit_delta_decode_with_offset::<0>
+                                as unsafe fn(&[u8], &mut [u32], u32, usize),
+                            sse::unpack_16bit_delta_decode_with_offset::<0>,
+                        ],
+                    ),
+                    (
+                        avx2::is_available(),
+                        [
+                            avx2::unpack_8bit_delta_decode_with_offset::<0>
+                                as unsafe fn(&[u8], &mut [u32], u32, usize),
+                            avx2::unpack_16bit_delta_decode_with_offset::<0>,
+                        ],
+                    ),
+                ] {
+                    let index = match width {
+                        RoundedBitWidth::Bits8 => Some(0),
+                        RoundedBitWidth::Bits16 => Some(1),
+                        _ => None,
+                    };
+                    if available && let Some(index) = index {
+                        let mut decoded = vec![0; count];
+                        unsafe {
+                            kernels[index](&input, &mut decoded, first, count);
+                        }
+                        assert_eq!(decoded, expected);
+                    }
+                }
+            }
+        }
+    }
     use super::*;
 
     #[test]
@@ -4967,6 +5441,127 @@ mod tests {
 // ============================================================================
 // SIMD-accelerated linear scan for sorted u32 slices (within-block seek)
 // ============================================================================
+/// Intersect two strictly increasing decoded posting blocks. Return index pairs
+/// in document order and resume positions for the unconsumed suffixes. Each
+/// input is at most 128 IDs; no document-space scratch or allocation is needed.
+#[inline]
+pub(crate) fn intersect_posting_blocks(
+    left: &[u32],
+    a: &mut usize,
+    right: &[u32],
+    b: &mut usize,
+    pairs: &mut [(u8, u8)],
+) -> usize {
+    assert!(left.len() <= 128 && right.len() <= 128);
+    assert!(*a <= left.len() && *b <= right.len());
+    let (mut left_pos, mut right_pos) = (*a, *b);
+    let mut count = 0;
+    while left_pos < left.len() && right_pos < right.len() && count < pairs.len() {
+        let doc = left[left_pos];
+        if let Some(group) = right.get(right_pos..right_pos + 8) {
+            let group: &[u32; 8] = group.try_into().unwrap();
+            if group[7] < doc {
+                right_pos += 8;
+                continue;
+            }
+            if doc < group[0] {
+                left_pos += find_first_ge_u32(&left[left_pos..], group[0]);
+                continue;
+            }
+            if let Some(lane) = equal_lane_8(group, doc) {
+                pairs[count] = (left_pos as u8, (right_pos + lane) as u8);
+                count += 1;
+                left_pos += 1;
+                if count == pairs.len() {
+                    right_pos += lane + 1;
+                    break;
+                }
+            } else {
+                left_pos += 1;
+            }
+        } else {
+            match doc.cmp(&right[right_pos]) {
+                std::cmp::Ordering::Less => left_pos += 1,
+                std::cmp::Ordering::Greater => right_pos += 1,
+                std::cmp::Ordering::Equal => {
+                    pairs[count] = (left_pos as u8, right_pos as u8);
+                    count += 1;
+                    left_pos += 1;
+                    right_pos += 1;
+                }
+            }
+        }
+    }
+    *a = left_pos;
+    *b = right_pos;
+    count
+}
+
+#[inline]
+fn equal_lane_8(values: &[u32; 8], target: u32) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if avx2::is_available() {
+        // SAFETY: the fixed input has eight lanes and AVX2 was checked.
+        let mask = unsafe { equal_mask_8_avx2(values, target) };
+        return (mask != 0).then(|| mask.trailing_zeros() as usize);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if neon::is_available() {
+        // SAFETY: the fixed input has eight lanes and NEON was checked.
+        let mask = unsafe { equal_mask_8_neon(values, target) };
+        return (mask != 0).then(|| mask.trailing_zeros() as usize);
+    }
+    values.iter().position(|&value| value == target)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn equal_mask_8_avx2(values: &[u32; 8], target: u32) -> u32 {
+    use std::arch::x86_64::*;
+    // SAFETY: the caller supplies all eight lanes; the feature is enabled here.
+    let values = unsafe { _mm256_loadu_si256(values.as_ptr().cast()) };
+    _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
+        values,
+        _mm256_set1_epi32(target as i32),
+    ))) as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn equal_mask_8_neon(values: &[u32; 8], target: u32) -> u32 {
+    use std::arch::aarch64::*;
+    // SAFETY: each load addresses four lanes of the fixed eight-lane input.
+    unsafe {
+        let target = vdupq_n_u32(target);
+        let weights = [1u32, 2, 4, 8];
+        let weights = vld1q_u32(weights.as_ptr());
+        let lo = vceqq_u32(vld1q_u32(values.as_ptr()), target);
+        let hi = vceqq_u32(vld1q_u32(values.as_ptr().add(4)), target);
+        vaddvq_u32(vandq_u32(lo, weights)) | (vaddvq_u32(vandq_u32(hi, weights)) << 4)
+    }
+}
+
+/// Lower bound at or after `from` in a decoded posting block. Full blocks
+/// expose their fixed geometry to LLVM; tails keep the existing SIMD search.
+#[inline]
+pub(crate) fn find_first_ge_block_from(docs: &[u32], from: usize, target: u32) -> usize {
+    debug_assert!(from <= docs.len());
+    if let Ok(block) = <&[u32; 128]>::try_from(docs) {
+        if block[127] < target {
+            return 128;
+        }
+        let mut base = 0;
+        let mut step = 64;
+        while step != 0 {
+            base += usize::from(block[base + step - 1] < target) * step;
+            step >>= 1;
+        }
+        base.max(from)
+    } else {
+        from + find_first_ge_u32(&docs[from..], target)
+    }
+}
+
 /// Find index of first element >= `target` in a sorted `u32` slice.
 ///
 /// Equivalent to `slice.partition_point(|&d| d < target)` but uses SIMD to
@@ -4980,19 +5575,29 @@ pub fn find_first_ge_u32(slice: &[u32], target: u32) -> usize {
     #[cfg(target_arch = "aarch64")]
     {
         if neon::is_available() {
+            // SAFETY: NEON availability checked; the kernel stays in bounds.
             return unsafe { find_first_ge_u32_neon(slice, target) };
         }
+        slice.partition_point(|&d| d < target)
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        if sse::is_available() {
-            return unsafe { find_first_ge_u32_sse(slice, target) };
+        if avx2::is_available() {
+            // SAFETY: AVX2 availability checked; the kernel stays in bounds.
+            return unsafe { find_first_ge_u32_avx2(slice, target) };
         }
+        // The kernel only needs SSE2, which is part of the x86_64 baseline,
+        // so no runtime feature detection is required.
+        // SAFETY: SSE2 is always available on x86_64; the kernel stays in bounds.
+        unsafe { find_first_ge_u32_sse(slice, target) }
     }
 
     // Scalar fallback (WASM, other architectures)
-    slice.partition_point(|&d| d < target)
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        slice.partition_point(|&d| d < target)
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -5157,6 +5762,27 @@ unsafe fn find_first_ge_u32_sse(slice: &[u32], target: u32) -> usize {
     n
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn find_first_ge_u32_avx2(slice: &[u32], target: u32) -> usize {
+    use std::arch::x86_64::*;
+    let target_vec = _mm256_set1_epi32(target as i32);
+    let mut base = 0;
+    while slice.len() - base >= 8 {
+        let values = _mm256_loadu_si256(slice.as_ptr().add(base).cast());
+        // min(value, target) equals target precisely when value >= target.
+        // Keep this unsigned comparison packed through the mask extraction.
+        let ge = _mm256_cmpeq_epi32(_mm256_min_epu32(values, target_vec), target_vec);
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(ge)) as u32;
+        if mask != 0 {
+            return base + mask.trailing_zeros() as usize;
+        }
+        base += 8;
+    }
+    base + find_first_ge_u32_sse(&slice[base..], target)
+}
+
 #[cfg(test)]
 mod find_first_ge_tests {
     use super::find_first_ge_u32;
@@ -5212,6 +5838,53 @@ mod find_first_ge_tests {
         assert_eq!(find_first_ge_u32(&data, u32::MAX - 10), 0);
         assert_eq!(find_first_ge_u32(&data, u32::MAX - 7), 1);
         assert_eq!(find_first_ge_u32(&data, u32::MAX), 3);
+    }
+
+    /// Every slice length that exercises the 16-wide, 4-wide and scalar
+    /// remainder paths, with duplicate runs, sign-bit crossings and
+    /// `u32::MAX`, against `partition_point` for every interesting target.
+    #[test]
+    fn find_first_ge_matches_partition_point_for_every_length_and_target() {
+        let mut state = 0x9E37_79B9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for n in 0..=140usize {
+            let mut data: Vec<u32> = Vec::with_capacity(n);
+            let mut value = next() % 8;
+            for i in 0..n {
+                // Duplicate runs, occasional big jumps across the sign bit,
+                // and a saturating tail so u32::MAX appears (possibly repeated).
+                let step = match next() % 5 {
+                    0 | 1 => 0,
+                    2 => 1,
+                    3 => next() % 1000,
+                    _ => 0x4000_0000 + next() % 0x1000_0000,
+                };
+                value = value.saturating_add(step);
+                if i + 3 >= n && n > 8 {
+                    value = u32::MAX;
+                }
+                data.push(value);
+            }
+            assert!(data.windows(2).all(|w| w[0] <= w[1]));
+            let mut targets: Vec<u32> =
+                vec![0, 1, u32::MAX - 1, u32::MAX, i32::MAX as u32, 1 << 31];
+            for &d in &data {
+                targets.extend([d.saturating_sub(1), d, d.saturating_add(1)]);
+            }
+            for target in targets {
+                let expected = data.partition_point(|&d| d < target);
+                assert_eq!(
+                    find_first_ge_u32(&data, target),
+                    expected,
+                    "n={n} target={target} data={data:?}"
+                );
+            }
+        }
     }
 }
 

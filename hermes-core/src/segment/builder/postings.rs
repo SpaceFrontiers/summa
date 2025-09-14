@@ -135,6 +135,7 @@ impl PositionPostingListBuilder {
 /// chunked fields and per-document field lengths of plain fields. Block
 /// bounds of the doc postings are derived from it.
 pub(super) struct LengthLookup<'a> {
+    pub quantized_norms: bool,
     pub doc_lengths: &'a [u32],
     pub num_indexed_fields: usize,
     pub field_to_slot: &'a FxHashMap<u32, usize>,
@@ -150,10 +151,16 @@ impl LengthLookup<'_> {
         let Some(&slot) = self.field_to_slot.get(&field_id) else {
             return 0;
         };
-        self.doc_lengths
+        let length = self
+            .doc_lengths
             .get(id as usize * self.num_indexed_fields + slot)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if self.quantized_norms {
+            crate::segment::norms::quantize(length.min(u16::MAX as u32))
+        } else {
+            length
+        }
     }
 }
 
@@ -188,16 +195,17 @@ pub(super) fn build_postings_streaming(
     lengths: &LengthLookup<'_>,
     term_dict_writer: &mut dyn Write,
     postings_writer: &mut dyn Write,
-    posting_config: (
-        crate::structures::IndexOptimization,
-        crate::structures::PostingCodec,
-    ),
+    config: &super::SegmentBuilderConfig,
     #[cfg(feature = "native")] spill_reader: Option<(
         &mut std::io::BufReader<std::fs::File>,
         &SpillIndex,
     )>,
 ) -> Result<()> {
-    let (optimization, posting_codec) = posting_config;
+    let crate::index::PostingBounds {
+        ratio: posting_ratio_bounds,
+        impact: posting_impact_bounds,
+    } = config.effective_posting_bounds();
+    let posting_codec = config.posting_codec;
     // Phase 0 (native only): Load spilled postings back into PostingListBuilders.
     // Spilled data (sorted by doc_id) is prepended before in-memory tail.
     #[cfg(feature = "native")]
@@ -310,13 +318,21 @@ pub(super) fn build_postings_streaming(
         // block records the shortest scoring unit it covers for its bound.
         let field_id = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
         let length_of = |id: u32| lengths.length(field_id, id);
-        let block_list = crate::structures::BlockPostingList::from_posting_list_with_options(
+        let build = if posting_impact_bounds {
+            crate::structures::BlockPostingList::from_posting_list_with_impact_bounds
+        } else if posting_ratio_bounds {
+            crate::structures::BlockPostingList::from_posting_list_with_ratio_bounds
+        } else {
+            crate::structures::BlockPostingList::from_posting_list_with_options
+        };
+        let block_list = build(
             &full_postings,
             has_positions,
             Some(&length_of),
             posting_codec,
         )?;
-        block_list.serialize(&mut posting_bytes)?;
+        if config.compact_text { block_list.serialize_compact(&mut posting_bytes)?; }
+        else { block_list.serialize(&mut posting_bytes)?; }
         let result = SerializedPosting::External {
             bytes: posting_bytes,
             doc_count: full_postings.doc_count(),
@@ -341,7 +357,10 @@ pub(super) fn build_postings_streaming(
     let mut postings_offset = 0u64;
     let mut writer = SSTableWriter::<_, TermInfo>::with_config(
         term_dict_writer,
-        crate::structures::SSTableWriterConfig::from_optimization(optimization),
+        crate::structures::SSTableWriterConfig {
+            block_size: config.term_dict_block_size,
+            ..crate::structures::SSTableWriterConfig::from_optimization(config.optimization)
+        },
     );
 
     for (key, serialized_posting) in serialized {
@@ -382,6 +401,8 @@ pub(super) fn build_positions_streaming(
     position_index: HashMap<TermKey, PositionPostingListBuilder>,
     term_interner: &Rodeo,
     writer: &mut dyn Write,
+    codec: crate::structures::PostingCodec,
+    compact: bool,
 ) -> Result<FxHashMap<Vec<u8>, (u64, u64)>> {
     use crate::structures::PositionStreamEncoder;
 
@@ -409,7 +430,10 @@ pub(super) fn build_positions_streaming(
         // capped like the u16 term frequency of the doc postings so the two
         // stay in step (the cursor of every later block depends on it).
         buf.clear();
-        let mut encoder = PositionStreamEncoder::new(&mut buf);
+        let mut encoder = PositionStreamEncoder::with_posting_codec(&mut buf, codec);
+        if compact {
+            encoder = encoder.with_compact_directory();
+        }
         for (_doc_id, mut positions) in pos_builder.postings {
             positions.truncate(u16::MAX as usize);
             encoder.push_doc(&mut positions).map_err(crate::Error::Io)?;

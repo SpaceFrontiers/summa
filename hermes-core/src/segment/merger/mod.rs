@@ -6,8 +6,11 @@ mod compact_vectors;
 mod dense;
 mod fast_fields;
 mod postings;
+pub(crate) use postings::PostingMergeStats;
 mod sparse;
 mod store;
+mod terms;
+pub(crate) use terms::MergedTerms;
 
 pub(crate) use dense::AnnWriteMode;
 
@@ -88,7 +91,7 @@ pub struct MergeStats {
     pub vectors_bytes: usize,
     /// Sparse vector index output size
     pub sparse_bytes: usize,
-    /// Whether merge-time BP reorder ran to full depth on every BMP field
+    /// Whether merge-time BP reorder ran to full depth on every text/BMP field
     /// (false = a pass hit its wall-clock budget; the segment is valid and
     /// better-ordered, and the background optimizer deepens it later).
     /// True when no BP ran (block-copy merges have nothing to deepen... they
@@ -96,13 +99,19 @@ pub struct MergeStats {
     pub bp_converged: bool,
     /// Fast-field output size
     pub fast_bytes: usize,
+    /// Posting blocks written into a ratio/impact-bounded list with an
+    /// unknown record: legacy external blocks copied next to bounded sources,
+    /// and promoted inline blocks joining an impact list (envelopes exist only
+    /// for multi-block lists). Their L1 group keeps an unknown (zero) bound;
+    /// only a rebuild adds metadata to legacy blocks (`docs/posting-codecs.md`).
+    pub posting_blocks_without_bounds: usize,
 }
 
 impl std::fmt::Display for MergeStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "terms={}, term_dict={}, postings={}, store={}, dense_vectors={}, sparse_vectors={}, fast_fields={}",
+            "terms={}, term_dict={}, postings={}, store={}, dense_vectors={}, sparse_vectors={}, fast_fields={}, posting_blocks_without_bounds={}",
             self.terms_processed,
             crate::format_bytes(self.term_dict_bytes as u64),
             crate::format_bytes(self.postings_bytes as u64),
@@ -110,6 +119,7 @@ impl std::fmt::Display for MergeStats {
             crate::format_bytes(self.vectors_bytes as u64),
             crate::format_bytes(self.sparse_bytes as u64),
             crate::format_bytes(self.fast_bytes as u64),
+            self.posting_blocks_without_bounds,
         )
     }
 }
@@ -292,10 +302,10 @@ pub struct SegmentMerger {
     /// External blocks still take the zero-copy concatenation path and retain
     /// their per-block codecs.
     posting_codec: crate::structures::PostingCodec,
-    /// Run BP reordering on BMP sparse fields while writing the merged blob
-    /// (instead of byte-level block stacking). The output segment is then
-    /// already ordered, so the standalone reorder pass is unnecessary.
-    reorder_bmp: bool,
+    term_dict_block_size: crate::structures::SSTableBlockSize,
+    /// Run BP on opted-in text and BMP fields while writing the merged
+    /// generation. Other fields retain the encoded-copy path.
+    reorder_fields: bool,
     /// Bounded rayon pool for merge-time BP. `None` = global pool (tests);
     /// the SegmentManager always passes its background pool so BP cannot
     /// starve query scoring.
@@ -328,7 +338,8 @@ impl SegmentMerger {
             schema,
             optimization: crate::structures::IndexOptimization::default(),
             posting_codec: crate::structures::PostingCodec::default(),
-            reorder_bmp: false,
+            term_dict_block_size: crate::structures::SSTableBlockSize::default(),
+            reorder_fields: false,
             background_pool: None,
             granularity: crate::segment::reorder::BpGranularity::Auto,
             bp_budget: crate::segment::BpBudget::full(),
@@ -339,8 +350,13 @@ impl SegmentMerger {
         }
     }
 
-    /// Configure term-dictionary compression and posting re-encoding for the
-    /// output segment.
+    /// Set the validated flush target for newly written term dictionaries.
+    pub fn with_term_dict_block_size(mut self, size: crate::structures::SSTableBlockSize) -> Self {
+        self.term_dict_block_size = size;
+        self
+    }
+
+    /// Configure posting compression for newly encoded output.
     pub fn with_posting_config(
         mut self,
         optimization: crate::structures::IndexOptimization,
@@ -351,9 +367,10 @@ impl SegmentMerger {
         self
     }
 
-    /// Enable BP reordering of BMP fields during the merge (see `reorder_bmp`).
+    /// Enable field-local BP during merge (historically BMP-only).
+    /// Text and BMP fields still opt in through their schema `reorder` flag.
     pub fn with_bmp_reorder(mut self, reorder: bool) -> Self {
-        self.reorder_bmp = reorder;
+        self.reorder_fields = reorder;
         self
     }
 
@@ -395,6 +412,16 @@ impl SegmentMerger {
     pub(crate) fn with_reorder_priority(mut self, priority: ReorderPriority) -> Self {
         self.reorder_priority = priority;
         self
+    }
+
+    async fn acquire_reorder_permit(&self) -> Result<Option<crate::index::ReorderPermit>> {
+        self.ensure_not_cancelled()?;
+        match &self.reorder_permits {
+            Some(gate) => Ok(Some(gate.acquire(self.reorder_priority).await.map_err(
+                |_| crate::Error::Internal("background reorder scheduler is closed".into()),
+            )?)),
+            None => Ok(None),
+        }
     }
 
     pub(super) fn ensure_not_cancelled(&self) -> Result<()> {
@@ -603,7 +630,31 @@ impl SegmentMerger {
         let merge_start = std::time::Instant::now();
 
         // ── Stage 1: text + store + fast fields ─────────────────────────
+        let reorder_text = self.reorder_fields
+            && self.schema.fields().any(|(_, entry)| {
+                entry.indexed && entry.reorder && entry.field_type == FieldType::Text
+            });
         let postings_fut = async {
+            let _permit = if reorder_text {
+                self.acquire_reorder_permit().await?
+            } else {
+                None
+            };
+            let plans = if reorder_text {
+                crate::segment::text_reorder::plan_text_reorders_from_sources(
+                    segments,
+                    &self.schema,
+                    self.bp_memory_budget,
+                    self.bp_budget,
+                    self.cancellation.as_deref(),
+                    self.background_pool.clone(),
+                    true,
+                )
+                .await?
+            } else {
+                Vec::new()
+            };
+            let text_converged = plans.iter().all(|plan| plan.converged);
             let mut postings_writer =
                 OffsetWriter::new(dir.streaming_writer_cold(&files.postings).await?);
             let mut positions_writer =
@@ -611,14 +662,16 @@ impl SegmentMerger {
             let mut term_dict_writer =
                 OffsetWriter::new(dir.streaming_writer_cold(&files.term_dict).await?);
 
-            let terms_processed = self
+            let posting_stats = self
                 .merge_postings(
                     segments,
                     &mut term_dict_writer,
                     &mut postings_writer,
                     &mut positions_writer,
+                    &plans,
                 )
                 .await?;
+            let terms_processed = posting_stats.terms_processed;
 
             let postings_bytes = postings_writer.offset() as usize;
             let term_dict_bytes = term_dict_writer.offset() as usize;
@@ -640,10 +693,17 @@ impl SegmentMerger {
                 crate::format_bytes(postings_bytes as u64),
                 crate::format_bytes(positions_bytes),
             );
-            Ok::<(usize, usize, usize), crate::Error>((
+            // Reuse the retained plan after term scratch is released. Do not
+            // overlap legacy map migration with budget-sized term buffers.
+            if reorder_text {
+                self.merge_chunk_maps(dir, segments, &files, &plans).await?;
+            }
+            Ok::<(usize, usize, usize, usize, bool), crate::Error>((
                 terms_processed,
                 term_dict_bytes,
                 postings_bytes,
+                posting_stats.blocks_without_bounds,
+                text_converged,
             ))
         };
 
@@ -658,9 +718,14 @@ impl SegmentMerger {
 
         let fast_fut = async { self.merge_fast_fields(dir, segments, &files).await };
 
-        let chunks_fut = async { self.merge_chunk_maps(dir, segments, &files).await };
-
-        let (postings_result, store_result, fast_bytes, _chunk_bytes) =
+        let chunks_fut = async {
+            if reorder_text {
+                Ok(0)
+            } else {
+                self.merge_chunk_maps(dir, segments, &files, &[]).await
+            }
+        };
+        let (postings_result, store_result, fast_bytes, _) =
             tokio::try_join!(postings_fut, store_fut, fast_fut, chunks_fut)?;
         self.ensure_not_cancelled()?;
 
@@ -683,7 +748,7 @@ impl SegmentMerger {
         // Merge-time BP constructs a potentially budget-sized forward index.
         // Do not overlap that allocation and its heavy source-file scan with
         // an ANN rebuild. Block-copy sparse merges remain concurrent with ANN.
-        let ((sparse_bytes, bp_converged), vectors_bytes) = if self.reorder_bmp {
+        let ((sparse_bytes, bp_converged), vectors_bytes) = if self.reorder_fields {
             let sparse = sparse_fut.await?;
             let dense = dense_fut.await?;
             (sparse, dense)
@@ -695,10 +760,11 @@ impl SegmentMerger {
         stats.terms_processed = postings_result.0;
         stats.term_dict_bytes = postings_result.1;
         stats.postings_bytes = postings_result.2;
+        stats.posting_blocks_without_bounds = postings_result.3;
         stats.store_bytes = store_bytes;
         stats.vectors_bytes = vectors_bytes;
         stats.sparse_bytes = sparse_bytes;
-        stats.bp_converged = bp_converged;
+        stats.bp_converged = bp_converged && postings_result.4;
         stats.fast_bytes = fast_bytes;
         log::info!(
             "[merge] index={} all phases done in {:.1}s: {}",

@@ -195,8 +195,10 @@ fn build_should_scorer<'a>(scorers: Vec<Box<dyn Scorer + 'a>>) -> Box<dyn Scorer
         should: scorers,
         must_not: vec![],
         current_doc: 0,
+        lead: 0,
+        doc_limit: 0,
     };
-    scorer.current_doc = scorer.find_next_match();
+    scorer.initialize();
     Box::new(scorer)
 }
 
@@ -226,6 +228,9 @@ macro_rules! boolean_plan {
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
         let mut scorer_options: super::ScorerOptions = $scorer_options;
+        // A Boolean node's resolved statistics apply to its complete child
+        // streams too. Explicit statistics on a child still take precedence.
+        scorer_options.global_stats = global_stats.cloned();
         if !$text_tuning.0.is_finite() || !(0.0..=1.0).contains(&$text_tuning.0) {
             return Err(crate::Error::Query(
                 "Text heap_factor must be finite and between 0 and 1".into(),
@@ -256,8 +261,8 @@ macro_rules! boolean_plan {
                         cursor_kept += 1;
                     }
                 }
-                log::debug!(
-                    "BooleanQuery: capping cursor SHOULD from {} to {} ({} fast-field predicates exempt)",
+                log::warn!(
+                    "BooleanQuery: capping cursor SHOULD from {} to {} ({} fast-field predicates exempt); dropped clauses do not match or score",
                     cursor_count,
                     super::MAX_QUERY_TERMS,
                     kept.len() - cursor_kept,
@@ -287,8 +292,7 @@ macro_rules! boolean_plan {
             }
         }
 
-        // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
-        if scorer_options.complete_text_matches && must.is_empty() && must_not.is_empty()
+        if (scorer_options.complete_text_matches || scorer_options.physical_text_field.is_some()) && must.is_empty() && must_not.is_empty()
             && !should.is_empty()
             && let Some((infos, field, avg_field_len, num_docs)) = prepare_text_maxscore(should, reader, global_stats)
             && text_maxscore_allowed(reader, field, scorer_options.collect_positions)
@@ -303,8 +307,67 @@ macro_rules! boolean_plan {
                     postings.push((pl, idf));
                 }
             }
-            return super::term::complete_text_scorer(postings, avg_field_len, reader, field, scorer_options.shared_threshold.clone(), scorer_options.eligibility.clone());
+            return super::term::complete_text_scorer(postings, avg_field_len, reader, field, &scorer_options);
         }
+
+        // Plain ranked text terms on one field share the bounded text window
+        // executor. Semantic membership (every MUST term, plus optional SHOULD
+        // terms) is imposed inside the executor before its top-k cutoff.
+        // Complete streams, positions, boosts, tuning, proximity, chunked
+        // fields and compositions with their own semantics stay below.
+        let counted_limit = scorer_options.ranked_count_limit.filter(|_| should.is_empty()
+            && scorer_options.shared_threshold.as_ref().and_then(super::SharedThreshold::deadline).is_none());
+        let ranked_limit = counted_limit.unwrap_or(limit);
+        if !must.is_empty() && must_not.is_empty()
+            && must.len() + should.len() <= super::MAX_QUERY_TERMS
+            && ranked_limit < reader.num_docs() as usize
+            && (!scorer_options.complete_text_matches || counted_limit.is_some()) && !scorer_options.collect_positions
+            && $proximity.is_none() && $text_tuning.0 == 1.0 && $text_tuning.1 == 0
+            && let Some((required, field, _, _)) = prepare_text_maxscore(must, reader, global_stats)
+            && let Some(optional) = ranked_optional_terms(should, field, reader, global_stats)
+            && required.iter().chain(&optional).all(|info| info.weight == 1.0)
+            && (!reader.has_text_mapping(field)
+                || (scorer_options.physical_text_field == Some(field) && reader.alive_docs().is_none()))
+        {
+            let required_count = required.len();
+            let params = super::Bm25Params::for_field(reader.schema(), field);
+            let mut cursors = Vec::with_capacity(required_count + optional.len());
+            for (index, info) in required.into_iter().chain(optional).enumerate() {
+                let Some(postings) = reader.$get_postings_fn(field, &info.term) $(. $aw)* ? else {
+                    if index < required_count {
+                        log::debug!("BooleanQuery planner: required term absent → empty result");
+                        return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
+                    }
+                    continue;
+                };
+                let (idf, avg_len) = super::term::compute_term_idf(
+                    &postings, field, reader, global_stats, &info.term,
+                );
+                cursors.push(super::TermCursor::text_with_params(
+                    postings, idf, avg_len,
+                    reader.chunk_map(field).map(super::LengthSource::Chunks)
+                        .or_else(|| reader.doc_lengths(field).map(super::LengthSource::Docs)), params,
+                ));
+            }
+            log::debug!(
+                "BooleanQuery planner: ranked text windows, {} required + {} optional terms",
+                required_count,
+                cursors.len() - required_count
+            );
+            let executor = ranked_text_executor(cursors, required_count, ranked_limit, reader, field, &scorer_options);
+            if counted_limit.is_some() {
+                let (mut results, count) = executor.execute_counted_conjunction()?;
+                super::text_mapping::physical_results(&mut results, reader, scorer_options.physical_text_field);
+                return Ok(Box::new(super::planner::TopKResultScorer::new(results).with_exact_count(count)) as Box<dyn Scorer + '_>);
+            }
+            let mut results = executor.$execute_fn() $(. $aw)* ?;
+            super::text_mapping::physical_results(&mut results, reader, scorer_options.physical_text_field);
+            return Ok(Box::new(super::planner::TopKResultScorer::new(results)) as Box<dyn Scorer + '_>);
+        }
+
+        // Other physical compositions keep complete child streams.
+        if scorer_options.physical_text_field.is_none() {
+        // ── 2. Pure OR → MaxScore optimisations ──────────────────────────
         if must.is_empty() && must_not.is_empty()
             && (should.len() >= 2 || (should.len() == 1 && $text_tuning.0 < 1.0)) {
             // 2a. Text MaxScore (single-field, all term queries)
@@ -326,7 +389,7 @@ macro_rules! boolean_plan {
                 }
                 cap_terms(&mut posting_lists, &mut term_bytes, $text_tuning.1);
                 // Chunked field: score chunks, fold to documents with ordinals.
-                if reader.is_chunked_field(text_field) {
+                if reader.has_text_mapping(text_field) {
                     return finish_chunked_text_maxscore(
                         posting_lists, avg_field_len, limit, reader, text_field, eligibility_predicate(&scorer_options),
                         $proximity.map(|config| (config, term_bytes)),
@@ -403,7 +466,7 @@ macro_rules! boolean_plan {
                         }
                     }
                     cap_terms(&mut posting_lists, &mut term_bytes, $text_tuning.1);
-                    if reader.is_chunked_field(*field) {
+                    if reader.has_text_mapping(*field) {
                         scorers.push(finish_chunked_text_maxscore(
                             posting_lists,
                             *avg_field_len,
@@ -432,11 +495,13 @@ macro_rules! boolean_plan {
                         )?);
                     }
                 }
+                // A child's own top-k is not a safe candidate set for a summed
+                // parent: request its complete stream.
                 for &idx in &grouping.fallback_indices {
                     scorers.push(should[idx].$scorer_fn(
                         reader,
                         limit,
-                        scorer_options.without_threshold(),
+                        scorer_options.for_required_clause(),
                     ) $(. $aw)* ?);
                 }
                 return Ok(build_should_scorer(scorers));
@@ -468,7 +533,7 @@ macro_rules! boolean_plan {
                 for q in should {
                     match q.decompose() {
                         super::QueryDecomposition::TextTerm(info)
-                            if text_maxscore_allowed(
+                            if info.global_stats.is_none() && text_maxscore_allowed(
                                 reader, info.field, scorer_options.collect_positions,
                             ) =>
                         {
@@ -498,7 +563,7 @@ macro_rules! boolean_plan {
                     || ($proximity.is_none()
                         && groups
                             .iter()
-                            .all(|(field, _)| !reader.is_chunked_field(*field))))
+                            .all(|(field, _)| !reader.has_text_mapping(*field))))
                 && let Some(bitset) = build_combined_bitset(must, must_not, reader, &scorer_options)
             {
                 if scorer_options.stop_if_expired() {
@@ -613,7 +678,7 @@ macro_rules! boolean_plan {
                     let filter = bitset.clone();
                     let predicate: super::DocPredicate<'_> =
                         Box::new(move |doc_id| filter.contains(doc_id));
-                    let scorer = if reader.is_chunked_field(field) {
+                    let scorer = if reader.has_text_mapping(field) {
                         finish_chunked_text_maxscore(
                             posting_lists, avg_field_len, group_limit, reader, field, Some(predicate),
                             $proximity.map(|config| (config, term_bytes)),
@@ -916,8 +981,10 @@ macro_rules! boolean_plan {
                 should: should_scorers,
                 must_not: Vec::new(),
                 current_doc: 0,
+        lead: 0,
+        doc_limit: reader.num_docs(),
             };
-            driver.current_doc = driver.find_next_match();
+            driver.initialize();
             return Ok(Box::new(super::PredicatedScorer::new(
                 Box::new(driver),
                 predicates,
@@ -926,17 +993,24 @@ macro_rules! boolean_plan {
             )));
         }
 
+        }
+
         // ── 4. Standard BooleanScorer fallback ───────────────────────────
-        super::planner::push_down_text_predicates(
-            must, should, must_not, reader, &mut scorer_options,
-        )?;
+        if scorer_options.physical_text_field.is_none() {
+            super::planner::push_down_text_predicates(
+                must, should, must_not, reader, &mut scorer_options,
+            )?;
+        }
         if scorer_options.stop_if_expired()
             || scorer_options.eligibility.as_ref()
                 .is_some_and(|bits| bits.next_set_bit(0).is_none()) {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
         }
         let mut must_scorers = Vec::with_capacity(must.len());
+        // A child top-k is not a safe candidate set for a summed parent:
+        // a document outside every child heap may still have the best total.
         let child_options = if scorer_options.complete_text_matches
+            || should.len() > 1
             || !should.is_empty() && !must.is_empty()
             || must.iter().filter(|query| query.as_doc_predicate(reader).is_none()).count() > 1
             || must_not.iter().any(|query| query.as_doc_predicate(reader).is_none())
@@ -971,13 +1045,36 @@ macro_rules! boolean_plan {
             should: should_scorers,
             must_not: must_not_scorers,
             current_doc: 0,
+        lead: 0,
+        doc_limit: reader.num_docs(),
         };
-        scorer.current_doc = scorer.find_next_match();
+        scorer.initialize();
         Ok(Box::new(scorer) as Box<dyn Scorer + '_>)
     }};
 }
 
 impl Query for BooleanQuery {
+    fn physical_text_field(&self, reader: &SegmentReader, complete: bool) -> Option<crate::Field> {
+        if self.proximity.is_some() || self.text_heap_factor != 1.0 || self.max_terms != 0 {
+            return None;
+        }
+        // Preserve the existing ranked union executor and its stable-ID heap.
+        if !complete
+            && self.must.is_empty()
+            && self.must_not.is_empty()
+            && self
+                .should
+                .iter()
+                .all(|q| matches!(q.decompose(), super::QueryDecomposition::TextTerm(_)))
+        {
+            return None;
+        }
+        let mut clauses = self.must.iter().chain(&self.should).chain(&self.must_not);
+        let field = clauses.next()?.physical_text_field(reader, true)?;
+        clauses
+            .all(|q| q.physical_text_field(reader, true) == Some(field))
+            .then_some(field)
+    }
     fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
         if !self.must.is_empty() || !self.must_not.is_empty() || self.proximity.is_some() {
             return Err(crate::Error::Query("L1 scoring branches support SHOULD composition; move required/excluded constraints into fusion.filters and use explicit phrase branches for proximity".into()));
@@ -1077,6 +1174,44 @@ impl Query for BooleanQuery {
         self.lsp_decomposition()
     }
 
+    fn count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
+        if self.must.len() == 1
+            && self.must_not.is_empty()
+            && self.proximity.is_none()
+            && self.text_heap_factor == 1.0
+            && self.max_terms == 0
+            && self
+                .should
+                .iter()
+                .all(|query| matches!(query.decompose(), super::QueryDecomposition::TextTerm(_)))
+        {
+            self.must[0].count_equivalent_term()
+        } else {
+            None
+        }
+    }
+
+    fn supports_ranked_conjunction_count(&self) -> bool {
+        self.must.len() >= 2 && self.should.is_empty() && self.must_not.is_empty()
+            && self.proximity.is_none() && self.text_heap_factor == 1.0 && self.max_terms == 0
+            && self.must.iter().all(|query| matches!(query.decompose(),
+                super::QueryDecomposition::TextTerm(info) if info.weight == 1.0 && info.global_stats.is_none()))
+    }
+
+    fn ranked_count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
+        let count = self.count_equivalent_term()?;
+        let super::QueryDecomposition::TextTerm(required) = self.must[0].decompose() else {
+            return None;
+        };
+        (required.weight.is_finite()
+            && required.weight > 0.0
+            && self.should.iter().all(|query| {
+                matches!(query.decompose(), super::QueryDecomposition::TextTerm(info)
+                    if info.field == required.field && info.weight.is_finite() && info.weight > 0.0)
+            }))
+        .then_some(count)
+    }
+
     fn lsp_decomposition(&self) -> super::QueryDecomposition {
         // LSP/0 selection depends only on the sparse scoring clauses. Pure
         // filters may remove documents but cannot increase their score, so a
@@ -1096,6 +1231,7 @@ impl Query for BooleanQuery {
             && self.must_not.is_empty()
             && !self.should.is_empty()
             && self.proximity.is_none()
+            && self.global_stats.is_none()
             && self.text_heap_factor == 1.0
             && self.max_terms == 0
         {
@@ -1244,6 +1380,10 @@ pub(super) struct BooleanScorer<'a> {
     should: Vec<Box<dyn Scorer + 'a>>,
     must_not: Vec<Box<dyn Scorer + 'a>>,
     current_doc: DocId,
+    /// Most selective required cursor; preserve score summation order.
+    lead: usize,
+    /// Segment document space, used only to estimate window setup cost.
+    doc_limit: u32,
 }
 
 impl<'a> BooleanScorer<'a> {
@@ -1253,9 +1393,24 @@ impl<'a> BooleanScorer<'a> {
             should,
             must_not: Vec::new(),
             current_doc: 0,
+            lead: 0,
+            doc_limit: 0,
         };
-        scorer.current_doc = scorer.find_next_match();
+        scorer.initialize();
         scorer
+    }
+
+    fn initialize(&mut self) {
+        self.lead = self
+            .must
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, scorer)| match scorer.size_hint() {
+                0 => u32::MAX,
+                cost => cost,
+            })
+            .map_or(0, |(index, _)| index);
+        self.current_doc = self.find_next_match();
     }
 
     fn find_next_match(&mut self) -> DocId {
@@ -1265,35 +1420,26 @@ impl<'a> BooleanScorer<'a> {
 
         loop {
             let candidate = if !self.must.is_empty() {
-                let mut max_doc = self
-                    .must
-                    .iter()
-                    .map(|s| s.doc())
-                    .max()
-                    .unwrap_or(TERMINATED);
-
-                if max_doc == TERMINATED {
-                    return TERMINATED;
-                }
-
-                loop {
-                    let mut all_match = true;
-                    for scorer in &mut self.must {
-                        let doc = scorer.seek(max_doc);
-                        if doc == TERMINATED {
-                            return TERMINATED;
+                let mut candidate = self.must[self.lead].doc();
+                'align: loop {
+                    if candidate == TERMINATED {
+                        return TERMINATED;
+                    }
+                    for index in 0..self.must.len() {
+                        if index == self.lead {
+                            continue;
                         }
-                        if doc > max_doc {
-                            max_doc = doc;
-                            all_match = false;
-                            break;
+                        let doc = self.must[index].seek_candidate(candidate);
+                        if doc > candidate {
+                            // No intersection exists before the rejecting
+                            // cursor's next candidate. Advance the selected
+                            // driver without revisiting the rejected prefix.
+                            candidate = self.must[self.lead].seek_candidate(doc);
+                            continue 'align;
                         }
                     }
-                    if all_match {
-                        break;
-                    }
+                    break candidate;
                 }
-                max_doc
             } else {
                 self.should
                     .iter()
@@ -1305,6 +1451,15 @@ impl<'a> BooleanScorer<'a> {
 
             if candidate == TERMINATED {
                 return TERMINATED;
+            }
+
+            if !self
+                .must
+                .iter_mut()
+                .all(|scorer| scorer.confirm_candidate())
+            {
+                self.must[self.lead].advance_candidate();
+                continue;
             }
 
             let excluded = self.must_not.iter_mut().any(|scorer| {
@@ -1323,9 +1478,7 @@ impl<'a> BooleanScorer<'a> {
 
             // Advance past excluded candidate
             if !self.must.is_empty() {
-                for scorer in &mut self.must {
-                    scorer.advance();
-                }
+                self.must[self.lead].advance_candidate();
             } else {
                 // For SHOULD-only: seek all scorers past the excluded candidate
                 for scorer in &mut self.should {
@@ -1339,15 +1492,104 @@ impl<'a> BooleanScorer<'a> {
 }
 
 impl super::docset::DocSet for BooleanScorer<'_> {
+    fn supports_doc_batches(&self) -> bool {
+        self.must.len() > 1
+            && self.should.is_empty()
+            && self.must_not.is_empty()
+            && self.must.iter().all(|child| child.supports_doc_batches())
+    }
+
+    fn fill_doc_batch(&mut self, docs: &mut super::docset::DocBatch) -> usize {
+        if !self.supports_doc_batches() {
+            return super::docset::fill_batch(self, docs);
+        }
+        if self.current_doc == TERMINATED {
+            return 0;
+        }
+        let mut count = self.must[self.lead].fill_doc_batch(docs);
+        for (index, child) in self.must.iter_mut().enumerate() {
+            if index != self.lead {
+                count = child.retain_doc_batch(docs, count);
+                if count == 0 {
+                    break;
+                }
+            }
+        }
+        self.current_doc = self.find_next_match();
+        count
+    }
+
+    fn supports_doc_windows(&self) -> bool {
+        self.must_not.is_empty()
+            && if self.must.is_empty() {
+                self.should.iter().all(|child| child.supports_doc_windows())
+            } else {
+                self.should.is_empty()
+                    && u64::from(self.must[self.lead].size_hint())
+                        * u64::from(super::docset::DOC_WINDOW_SIZE)
+                        >= u64::from(self.doc_limit) * super::docset::DOC_WINDOW_WORDS as u64
+                    && self.must.iter().all(|child| child.supports_doc_windows())
+            }
+    }
+
+    fn fill_doc_window(&mut self, base: DocId, bits: &mut super::docset::DocWindow) {
+        if !self.supports_doc_windows() {
+            return super::docset::fill_window(self, base, bits);
+        }
+        bits.fill(0);
+        if self.current_doc == TERMINATED {
+            return;
+        }
+        let mut child_bits = [0; super::docset::DOC_WINDOW_WORDS];
+        if self.must.is_empty() {
+            for child in &mut self.should {
+                child.fill_doc_window(base, &mut child_bits);
+                for (out, child_word) in bits.iter_mut().zip(child_bits) {
+                    *out |= child_word;
+                }
+            }
+        } else {
+            self.must[self.lead].fill_doc_window(base, bits);
+            for (index, child) in self.must.iter_mut().enumerate() {
+                if index == self.lead {
+                    continue;
+                }
+                let candidates: u32 = bits.iter().map(|word| word.count_ones()).sum();
+                if candidates == 0 {
+                    break;
+                }
+                // Dense masks amortize a full child batch over bitmap words;
+                // selective masks probe only the surviving candidates.
+                if candidates > super::docset::DOC_WINDOW_WORDS as u32 {
+                    child.fill_doc_window(base, &mut child_bits);
+                    for (out, child_word) in bits.iter_mut().zip(child_bits) {
+                        *out &= child_word;
+                    }
+                } else {
+                    for (word_index, word) in bits.iter_mut().enumerate() {
+                        let mut remaining = *word;
+                        while remaining != 0 {
+                            let bit = remaining.trailing_zeros();
+                            let doc = base + word_index as u32 * 64 + bit;
+                            if child.seek(doc) != doc {
+                                *word &= !(1u64 << bit);
+                            }
+                            remaining &= remaining - 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.current_doc = self.find_next_match();
+    }
+
     fn doc(&self) -> DocId {
         self.current_doc
     }
 
     fn advance(&mut self) -> DocId {
         if !self.must.is_empty() {
-            for scorer in &mut self.must {
-                scorer.advance();
-            }
+            self.must[self.lead].advance_candidate();
         } else {
             for scorer in &mut self.should {
                 if scorer.doc() == self.current_doc {
@@ -1361,12 +1603,12 @@ impl super::docset::DocSet for BooleanScorer<'_> {
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
-        for scorer in &mut self.must {
-            scorer.seek(target);
-        }
-
-        for scorer in &mut self.should {
-            scorer.seek(target);
+        if self.must.is_empty() {
+            for scorer in &mut self.should {
+                scorer.seek(target);
+            }
+        } else {
+            self.must[self.lead].seek_candidate(target);
         }
 
         self.current_doc = self.find_next_match();
@@ -1377,12 +1619,111 @@ impl super::docset::DocSet for BooleanScorer<'_> {
         if !self.must.is_empty() {
             self.must.iter().map(|s| s.size_hint()).min().unwrap_or(0)
         } else {
-            self.should.iter().map(|s| s.size_hint()).sum()
+            self.should
+                .iter()
+                .fold(0u32, |total, s| total.saturating_add(s.size_hint()))
         }
     }
 }
 
 impl Scorer for BooleanScorer<'_> {
+    fn supports_score_batches(&self) -> bool {
+        !self.must.is_empty()
+            && (self.must.len() > 1 || !self.must_not.is_empty())
+            && self.should.is_empty()
+            && self.must[self.lead].size_hint() > super::docset::DOC_BATCH_SIZE as u32
+            && self.must.iter().all(|child| child.supports_score_batches())
+    }
+
+    fn fill_score_batch(
+        &mut self,
+        docs: &mut super::docset::DocBatch,
+        scores: &mut super::ScoreBatch,
+    ) -> usize {
+        if !self.supports_score_batches() {
+            return super::traits::fill_score_batch_scalar(self, docs, scores);
+        }
+        if self.current_doc == TERMINATED {
+            return 0;
+        }
+        let mut lead_scores = [0.0; super::docset::DOC_BATCH_SIZE];
+        let mut count = self.must[self.lead].fill_score_batch(docs, &mut lead_scores);
+        let mut origins: [u8; super::docset::DOC_BATCH_SIZE] = std::array::from_fn(|i| i as u8);
+        let mut values = [0.0; super::docset::DOC_BATCH_SIZE];
+        let mut matches = [0; 2];
+        scores[..count].fill(0.0);
+        for (index, child) in self.must.iter_mut().enumerate() {
+            if index == self.lead {
+                for row in 0..count {
+                    scores[row] += lead_scores[origins[row] as usize];
+                }
+                continue;
+            }
+            child.score_batch_matches(docs, count, &mut values, &mut matches);
+            let mut kept = 0;
+            for row in 0..count {
+                if matches[row / 64] & (1 << (row % 64)) != 0 {
+                    docs[kept] = docs[row];
+                    scores[kept] = scores[row] + values[row];
+                    origins[kept] = origins[row];
+                    kept += 1;
+                }
+            }
+            count = kept;
+            if count == 0 {
+                break;
+            }
+        }
+        if !self.must_not.is_empty() {
+            let mut kept = 0;
+            for row in 0..count {
+                let doc = docs[row];
+                if self.must_not.iter_mut().all(|child| child.seek(doc) != doc) {
+                    docs[kept] = doc;
+                    scores[kept] = scores[row];
+                    kept += 1;
+                }
+            }
+            count = kept;
+        }
+        self.current_doc = self.find_next_match();
+        count
+    }
+
+    fn supports_filtered_windows(&self) -> bool {
+        super::docset::DocSet::supports_doc_windows(self)
+            && (self.must.len() > 1 || self.should.len() > 1)
+    }
+
+    fn supports_score_windows(&self) -> bool {
+        self.must.is_empty()
+            && self.should.len() > 1
+            && super::docset::DocSet::supports_doc_windows(self)
+    }
+
+    fn fill_score_window(
+        &mut self,
+        base: DocId,
+        scores: &mut [Score; super::docset::DOC_WINDOW_SIZE as usize],
+        bits: &mut super::docset::DocWindow,
+    ) {
+        scores.fill(0.0);
+        bits.fill(0);
+        if !self.supports_score_windows() {
+            self.accumulate_score_window(base, scores, bits);
+            return;
+        }
+        if self.current_doc == TERMINATED {
+            return;
+        }
+        // Preserve the scalar scorer's child order, including the complete
+        // score of any nested child. Never distribute a nested floating sum.
+        for child in &mut self.should {
+            child.accumulate_score_window(base, scores, bits);
+        }
+        self.current_doc = self.find_next_match();
+    }
+
     fn score(&self) -> Score {
         let mut total = 0.0;
 
@@ -1470,6 +1811,57 @@ pub(super) fn merge_matched_positions(
     merged
 }
 
+/// Optional SHOULD terms for the ranked text window executor: all plain text
+/// terms on `field`, or an empty list when there are none.
+fn ranked_optional_terms(
+    should: &[Arc<dyn Query>],
+    field: crate::Field,
+    reader: &SegmentReader,
+    global_stats: Option<&Arc<GlobalStats>>,
+) -> Option<Vec<super::TermQueryInfo>> {
+    if should.is_empty() {
+        return Some(Vec::new());
+    }
+    let (optional, optional_field, _, _) = prepare_text_maxscore(should, reader, global_stats)?;
+    (optional_field == field).then_some(optional)
+}
+
+/// Configure the shared text window executor for ranked term queries whose
+/// first `required_count` cursors are semantic MUST terms. All-required
+/// queries with at least two cursors use the conjunction driver.
+fn ranked_text_executor<'a>(
+    cursors: Vec<super::TermCursor<'a>>,
+    required_count: usize,
+    limit: usize,
+    reader: &'a SegmentReader,
+    field: crate::Field,
+    options: &super::ScorerOptions,
+) -> super::MaxScoreExecutor<'a> {
+    let all_required = required_count == cursors.len() && cursors.len() >= 2;
+    let executor = super::MaxScoreExecutor::new(cursors, limit, 1.0);
+    let mut executor = if all_required {
+        executor.require_all_terms()
+    } else {
+        executor.require_prefix_terms(required_count)
+    }
+    .with_metric_labels(
+        reader.schema().index_label(),
+        reader.schema().get_field_name(field).unwrap_or("?"),
+    )
+    .with_budget(options.shared_threshold.clone());
+    if options.physical_text_field == Some(field) {
+        executor =
+            executor.with_document_map(reader.chunk_map(field).expect("admitted document map"));
+    }
+    if let Some(predicate) = eligibility_predicate(options) {
+        executor = executor.with_predicate(predicate);
+    }
+    if options.initial_threshold > 0.0 {
+        executor.seed_threshold(options.initial_threshold);
+    }
+    executor
+}
+
 fn eligibility_predicate(options: &super::ScorerOptions) -> Option<super::DocPredicate<'static>> {
     options.eligibility.as_ref().map(|filter| {
         let filter = filter.clone();
@@ -1481,7 +1873,754 @@ fn eligibility_predicate(options: &super::ScorerOptions) -> Option<super::DocPre
 mod tests {
     use super::*;
     use crate::dsl::Field;
-    use crate::query::{QueryDecomposition, TermQuery};
+    use crate::query::{DocSet, QueryDecomposition, TermQuery};
+
+    #[test]
+    fn ranked_count_hints_require_an_exact_compatible_text_plan() {
+        struct CountOnly(TermQuery);
+        impl std::fmt::Display for CountOnly {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+        impl Query for CountOnly {
+            fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+                self.0.scorer(reader, limit)
+            }
+            fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
+                self.0.count_estimate(reader)
+            }
+            fn count_equivalent_term(&self) -> Option<super::super::TermQueryInfo> {
+                self.0.count_equivalent_term()
+            }
+        }
+        let field = Field(0);
+        let compatible = BooleanQuery::new()
+            .must(TermQuery::text(field, "required"))
+            .should(TermQuery::text(field, "optional"));
+        assert!(compatible.ranked_count_equivalent_term().is_some());
+        assert!(
+            Arc::new(compatible.clone())
+                .ranked_count_equivalent_term()
+                .is_some()
+        );
+        for query in [
+            compatible
+                .clone()
+                .must_not(TermQuery::text(field, "excluded")),
+            compatible.clone().must(TermQuery::text(field, "second")),
+            compatible.clone().with_text_heap_factor(0.5),
+            compatible.clone().with_max_terms(1),
+            compatible
+                .clone()
+                .should(TermQuery::text(Field(1), "other-field")),
+            compatible.should(super::super::BoostQuery::new(
+                TermQuery::text(field, "negative"),
+                -1.0,
+            )),
+            BooleanQuery::new()
+                .must(CountOnly(TermQuery::text(field, "opaque")))
+                .should(TermQuery::text(field, "optional")),
+        ] {
+            assert!(query.ranked_count_equivalent_term().is_none());
+        }
+        let opaque = CountOnly(TermQuery::text(field, "opaque"));
+        assert!(opaque.count_equivalent_term().is_some());
+        assert!(opaque.ranked_count_equivalent_term().is_none());
+    }
+
+    #[test]
+    fn compact_score_batches_preserve_query_order_and_nested_scores() {
+        use crate::query::docset::{DOC_BATCH_SIZE, DocSet, SortedVecDocSet};
+        struct ExactScore {
+            docs: SortedVecDocSet,
+            value: f32,
+        }
+        impl DocSet for ExactScore {
+            fn doc(&self) -> u32 {
+                self.docs.doc()
+            }
+            fn advance(&mut self) -> u32 {
+                self.docs.advance()
+            }
+            fn seek(&mut self, target: u32) -> u32 {
+                self.docs.seek(target)
+            }
+            fn size_hint(&self) -> u32 {
+                self.docs.size_hint()
+            }
+        }
+        impl Scorer for ExactScore {
+            fn score(&self) -> f32 {
+                self.value
+            }
+            fn supports_score_batches(&self) -> bool {
+                true
+            }
+        }
+        fn leaf(step: u32, value: f32) -> Box<dyn Scorer> {
+            Box::new(ExactScore {
+                docs: SortedVecDocSet::new(Arc::new(
+                    (0..20000).filter(|d| d % step == 0).collect(),
+                )),
+                value,
+            })
+        }
+        fn conjunction(children: Vec<Box<dyn Scorer>>) -> BooleanScorer<'static> {
+            let mut result = BooleanScorer::disjunction(Vec::new());
+            result.must = children;
+            result.initialize();
+            result
+        }
+        fn make(nested: bool, excluded: bool, single: bool) -> BooleanScorer<'static> {
+            let middle: Box<dyn Scorer> = if nested {
+                Box::new(conjunction(vec![leaf(7, 1.0e10), leaf(7, 1.0)]))
+            } else {
+                leaf(7, 1.0e10)
+            };
+            let mut scorer = if single {
+                conjunction(vec![leaf(3, 1.0)])
+            } else {
+                conjunction(vec![leaf(3, -1.0e10), middle, leaf(11, 1.0)])
+            };
+            if excluded {
+                scorer.must_not = vec![leaf(2, 500.0), leaf(13, 500.0)];
+                scorer.initialize();
+            }
+            scorer
+        }
+        for (nested, excluded, single) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, true, true),
+        ] {
+            let mut scalar = make(nested, excluded, single);
+            let mut batched = make(nested, excluded, single);
+            assert_eq!(batched.lead, if single { 0 } else { 2 });
+            assert!(batched.supports_score_batches());
+            let mut docs = [0; DOC_BATCH_SIZE];
+            let mut scores = [0.0; DOC_BATCH_SIZE];
+            assert_eq!(batched.seek(17), scalar.seek(17));
+            while batched.doc() != TERMINATED {
+                let count = batched.fill_score_batch(&mut docs, &mut scores);
+                assert!(count > 0);
+                for i in 0..count {
+                    assert_eq!(docs[i], scalar.doc());
+                    assert_eq!(scores[i].to_bits(), scalar.score().to_bits());
+                    assert_eq!(
+                        scores[i], 1.0,
+                        "lead-first or distributed sums change this value"
+                    );
+                    scalar.advance();
+                }
+                assert_eq!(batched.doc(), scalar.doc());
+                assert_eq!(batched.advance(), scalar.advance());
+            }
+            assert_eq!(scalar.doc(), TERMINATED);
+            assert_eq!(batched.fill_score_batch(&mut docs, &mut scores), 0);
+        }
+    }
+
+    #[test]
+    fn compact_boolean_batches_preserve_scalar_resume_and_nested_membership() {
+        use crate::query::docset::{DOC_BATCH_SIZE, DocSet, SortedVecDocSet};
+        struct ExactDocs(SortedVecDocSet);
+        impl DocSet for ExactDocs {
+            fn doc(&self) -> u32 {
+                self.0.doc()
+            }
+            fn advance(&mut self) -> u32 {
+                self.0.advance()
+            }
+            fn seek(&mut self, target: u32) -> u32 {
+                self.0.seek(target)
+            }
+            fn size_hint(&self) -> u32 {
+                self.0.size_hint()
+            }
+            fn supports_doc_batches(&self) -> bool {
+                true
+            }
+        }
+        impl Scorer for ExactDocs {
+            fn score(&self) -> f32 {
+                self.doc() as f32
+            }
+        }
+        fn leaf(step: u32) -> Box<dyn Scorer> {
+            Box::new(ExactDocs(SortedVecDocSet::new(Arc::new(
+                (0..5000).filter(|doc| doc % step == 0).collect(),
+            ))))
+        }
+        fn make(nested: bool) -> BooleanScorer<'static> {
+            let mut scorer = BooleanScorer::disjunction(Vec::new());
+            scorer.must = vec![leaf(3), leaf(7)];
+            if nested {
+                scorer.must.push(Box::new(make(false)));
+            }
+            scorer.doc_limit = 1_000_000;
+            scorer.initialize();
+            scorer
+        }
+        for nested in [false, true] {
+            let mut scalar = make(nested);
+            let mut batched = make(nested);
+            assert!(batched.supports_doc_batches());
+            assert_eq!(batched.seek(17), scalar.seek(17));
+            let mut docs = [0; DOC_BATCH_SIZE];
+            while batched.doc() != TERMINATED {
+                assert_eq!(batched.doc(), scalar.doc());
+                assert_eq!(batched.score().to_bits(), scalar.score().to_bits());
+                let count = batched.fill_doc_batch(&mut docs);
+                assert!(count > 0);
+                for &doc in &docs[..count] {
+                    assert_eq!(doc, scalar.doc());
+                    scalar.advance();
+                }
+                assert_eq!(batched.doc(), scalar.doc());
+                assert_eq!(batched.advance(), scalar.advance());
+            }
+            assert_eq!(scalar.doc(), TERMINATED);
+            assert_eq!(batched.fill_doc_batch(&mut docs), 0);
+        }
+    }
+
+    #[test]
+    fn score_windows_preserve_nested_sums_seek_and_exhaustion() {
+        struct Scores {
+            hits: Vec<(DocId, Score)>,
+            index: usize,
+        }
+        impl DocSet for Scores {
+            fn doc(&self) -> DocId {
+                self.hits.get(self.index).map_or(TERMINATED, |hit| hit.0)
+            }
+            fn advance(&mut self) -> DocId {
+                self.index = (self.index + 1).min(self.hits.len());
+                self.doc()
+            }
+            fn size_hint(&self) -> u32 {
+                self.hits.len() as u32
+            }
+            fn supports_doc_windows(&self) -> bool {
+                true
+            }
+        }
+        impl Scorer for Scores {
+            fn score(&self) -> Score {
+                self.hits[self.index].1
+            }
+        }
+        fn child(seed: u32) -> Box<dyn Scorer> {
+            let hits = (0..16_400)
+                .chain([u32::MAX - 4097, u32::MAX - 2])
+                .filter(|doc| (doc % (seed + 2)) != 1)
+                .map(|doc| {
+                    (
+                        doc,
+                        match seed {
+                            0 => 16_777_216.0,
+                            1 => 1.0,
+                            2 => -16_777_216.0,
+                            _ => -0.0,
+                        },
+                    )
+                })
+                .collect();
+            Box::new(Scores { hits, index: 0 })
+        }
+        fn build(shape: u8) -> BooleanScorer<'static> {
+            let children = if shape == 2 {
+                let mut conjunction = BooleanScorer {
+                    must: vec![child(1), child(2)],
+                    should: Vec::new(),
+                    must_not: Vec::new(),
+                    current_doc: 0,
+                    lead: 0,
+                    doc_limit: 0,
+                };
+                conjunction.initialize();
+                vec![child(0), Box::new(conjunction), child(3)]
+            } else if shape == 1 {
+                vec![
+                    child(0),
+                    Box::new(BooleanScorer::disjunction(vec![child(1), child(2)])),
+                    child(3),
+                ]
+            } else {
+                (0..4).map(child).collect()
+            };
+            BooleanScorer::disjunction(children)
+        }
+        for shape in 0..3 {
+            for start in [0, 17, 4095, 8193, u32::MAX - 4098, TERMINATED] {
+                let mut scalar = build(shape);
+                let mut batched = build(shape);
+                scalar.seek(start);
+                batched.seek(start);
+                assert!(batched.supports_score_windows());
+                let mut scores =
+                    Box::new([f32::NAN; super::super::docset::DOC_WINDOW_SIZE as usize]);
+                let mut bits = [u64::MAX; super::super::docset::DOC_WINDOW_WORDS];
+                while batched.doc() != TERMINATED {
+                    let base = batched.doc();
+                    let end = base.saturating_add(super::super::docset::DOC_WINDOW_SIZE);
+                    batched.fill_score_window(base, &mut scores, &mut bits);
+                    for (index, &word) in bits.iter().enumerate() {
+                        let mut remaining = word;
+                        while remaining != 0 {
+                            let slot = index * 64 + remaining.trailing_zeros() as usize;
+                            assert_eq!(base + slot as u32, scalar.doc());
+                            assert_eq!(
+                                scores[slot].to_bits(),
+                                scalar.score().to_bits(),
+                                "shape={shape} start={start} doc={}",
+                                scalar.doc()
+                            );
+                            scalar.advance();
+                            remaining &= remaining - 1;
+                        }
+                    }
+                    assert!(scalar.doc() >= end);
+                    assert_eq!(scalar.doc(), batched.doc());
+                    if scalar.doc() != TERMINATED {
+                        assert_eq!(scalar.score().to_bits(), batched.score().to_bits());
+                    }
+                }
+                batched.fill_score_window(TERMINATED, &mut scores, &mut bits);
+                assert!(bits.iter().all(|word| *word == 0));
+                assert_eq!(batched.advance(), TERMINATED);
+                assert_eq!(batched.seek(0), TERMINATED);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn document_windows_preserve_nested_boolean_membership_and_next_scores() {
+        use crate::query::{Collector, CountCollector, ScorerOptions, collect_segment};
+        use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
+        use crate::structures::PostingCodec;
+        use std::sync::Arc;
+        struct Ids(Vec<u32>);
+        impl Collector for Ids {
+            fn needs_scores(&self) -> bool {
+                false
+            }
+            fn collect(
+                &mut self,
+                doc: u32,
+                score: f32,
+                positions: &[(u32, Vec<crate::query::ScoredPosition>)],
+            ) {
+                assert_eq!(score, 0.0);
+                assert!(positions.is_empty());
+                self.0.push(doc);
+            }
+        }
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let dir = crate::RamDirectory::new();
+            let mut schema = crate::SchemaBuilder::default();
+            let field = schema.add_text_field("text", true, false);
+            schema.set_positions(field, crate::dsl::PositionMode::TokenPosition);
+            let schema = Arc::new(schema.build());
+            let config = SegmentBuilderConfig {
+                posting_codec: codec,
+                ..Default::default()
+            };
+            let mut builder = SegmentBuilder::new(schema.clone(), config).unwrap();
+            for doc_id in 0..12_345 {
+                let mut text = String::from("padding ");
+                for (term, divisor) in [("alpha", 2), ("beta", 3), ("gamma", 11), ("rare", 997)] {
+                    if doc_id % divisor == 0 {
+                        text.push_str(&format!("{term} {term} "));
+                    }
+                }
+                let mut doc = crate::Document::new();
+                doc.add_text(field, text);
+                builder.add_document(doc).unwrap();
+            }
+            let id = SegmentId::new();
+            builder.build(&dir, id, None).await.unwrap();
+            let reader = SegmentReader::open(&dir, id, schema, 16).await.unwrap();
+            let term = |name| TermQuery::text(field, name);
+            for shape in 0..9 {
+                let query = match shape {
+                    0 => BooleanQuery::new()
+                        .should(term("alpha"))
+                        .should(term("beta")),
+                    1 => BooleanQuery::new()
+                        .must(term("alpha"))
+                        .must(term("beta"))
+                        .should(term("gamma")),
+                    2 => BooleanQuery::new()
+                        .must(
+                            BooleanQuery::new()
+                                .should(term("alpha"))
+                                .should(term("beta")),
+                        )
+                        .must_not(term("gamma")),
+                    3 => BooleanQuery::new()
+                        .must(term("rare"))
+                        .must(
+                            BooleanQuery::new()
+                                .should(term("alpha"))
+                                .should(term("beta")),
+                        )
+                        .must_not(term("gamma")),
+                    4 => BooleanQuery::new().must(term("alpha")).should(term("beta")),
+                    5 => BooleanQuery::new().must(term("alpha")).must(term("beta")),
+                    6 => BooleanQuery::new().must(term("rare")).must(
+                        BooleanQuery::new()
+                            .should(term("alpha"))
+                            .should(term("beta")),
+                    ),
+                    7 => BooleanQuery::new()
+                        .must(term("alpha"))
+                        .must(term("missing")),
+                    _ => BooleanQuery::new()
+                        .must(BooleanQuery::new().must(term("alpha")).must(term("beta")))
+                        .must(term("gamma")),
+                };
+                let expected: Vec<u32> = (0..12_345)
+                    .filter(|doc| {
+                        let a = doc % 2 == 0;
+                        let b = doc % 3 == 0;
+                        let g = doc % 11 == 0;
+                        match shape {
+                            0 => a || b,
+                            1 => a && b,
+                            2 => (a || b) && !g,
+                            3 => doc % 997 == 0 && (a || b) && !g,
+                            4 => a,
+                            5 => a && b,
+                            6 => doc % 997 == 0 && (a || b),
+                            7 => false,
+                            _ => a && b && g,
+                        }
+                    })
+                    .collect();
+                let options = ScorerOptions {
+                    complete_text_matches: true,
+                    collect_positions: true,
+                    ..Default::default()
+                };
+                let mut scalar = query
+                    .scorer_with_options(&reader, 10, options.clone())
+                    .await
+                    .unwrap();
+                let mut batched = query
+                    .scorer_with_options(&reader, 10, options)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    batched.supports_doc_windows(),
+                    matches!(shape, 0 | 5 | 8),
+                    "shape={shape}"
+                );
+                let mut actual = Vec::new();
+                while batched.doc() != TERMINATED {
+                    let base = batched.doc();
+                    let mut bits = [u64::MAX; super::super::docset::DOC_WINDOW_WORDS];
+                    batched.fill_doc_window(base, &mut bits);
+                    for (index, word) in bits.into_iter().enumerate() {
+                        for bit in 0..64 {
+                            if word & (1 << bit) != 0 {
+                                actual.push(base + index as u32 * 64 + bit);
+                            }
+                        }
+                    }
+                    scalar.seek(base.saturating_add(super::super::docset::DOC_WINDOW_SIZE));
+                    assert_eq!(batched.doc(), scalar.doc());
+                    if scalar.doc() != TERMINATED {
+                        assert_eq!(batched.score().to_bits(), scalar.score().to_bits());
+                        let positions = |value: Option<crate::query::MatchedPositions>| {
+                            value.map(|fields| {
+                                fields
+                                    .into_iter()
+                                    .map(|(field, values)| {
+                                        (
+                                            field,
+                                            values
+                                                .into_iter()
+                                                .map(|p| (p.position, p.score.to_bits()))
+                                                .collect::<Vec<_>>(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                        };
+                        assert_eq!(
+                            positions(batched.matched_positions()),
+                            positions(scalar.matched_positions())
+                        );
+                    }
+                }
+                assert_eq!(actual, expected, "codec={codec:?} shape={shape}");
+                let mut count = CountCollector::new();
+                collect_segment(&reader, &query, &mut count).await.unwrap();
+                assert_eq!(count.count() as usize, expected.len());
+                let mut ids = Ids(Vec::new());
+                collect_segment(&reader, &query, &mut ids).await.unwrap();
+                assert_eq!(ids.0, expected);
+                #[cfg(feature = "sync")]
+                {
+                    let mut sync = query
+                        .scorer_sync_with_options(
+                            &reader,
+                            10,
+                            ScorerOptions {
+                                complete_text_matches: true,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    let mut sync_ids = Vec::new();
+                    while sync.doc() != TERMINATED {
+                        let base = sync.doc();
+                        let mut bits = [0; super::super::docset::DOC_WINDOW_WORDS];
+                        sync.fill_doc_window(base, &mut bits);
+                        for (index, word) in bits.into_iter().enumerate() {
+                            for bit in 0..64 {
+                                if word & (1 << bit) != 0 {
+                                    sync_ids.push(base + index as u32 * 64 + bit);
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(sync_ids, expected);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn conjunction_chooses_the_rare_term_over_a_common_phrase() {
+        let dir = crate::RamDirectory::new();
+        let mut schema = crate::SchemaBuilder::default();
+        let field = schema.add_text_field("text", true, false);
+        schema.set_positions(field, crate::dsl::PositionMode::TokenPosition);
+        schema.set_default_fields(vec!["text".into()]);
+        let config = crate::IndexConfig {
+            num_indexing_threads: 1,
+            num_threads: 1,
+            ..Default::default()
+        };
+        let mut writer = crate::IndexWriter::create(dir.clone(), schema.build(), config.clone())
+            .await
+            .unwrap();
+        for doc_id in 0..32 {
+            let mut doc = crate::Document::new();
+            doc.add_text(
+                field,
+                if doc_id == 24 {
+                    "alpha beta rare"
+                } else {
+                    "alpha beta"
+                },
+            );
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        writer.shutdown().await.unwrap();
+        let index = crate::Index::open(dir, config).await.unwrap();
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        let segment = &searcher.segment_readers()[0];
+        let parser = searcher.query_parser();
+        let phrase = parser.parse_strict("\"alpha beta\"").unwrap();
+        let term = parser.parse_strict("rare").unwrap();
+        let mut scorer = BooleanScorer {
+            must: vec![
+                phrase.scorer(segment, 100).await.unwrap(),
+                term.scorer(segment, 100).await.unwrap(),
+            ],
+            should: Vec::new(),
+            must_not: Vec::new(),
+            current_doc: 0,
+            lead: 0,
+            doc_limit: 0,
+        };
+        scorer.initialize();
+        assert_eq!(
+            scorer.lead, 1,
+            "the rarer term must drive candidate traversal"
+        );
+        assert_eq!(scorer.doc(), 24);
+        assert!(scorer.score() > 0.0);
+        assert_eq!(scorer.advance(), TERMINATED);
+    }
+
+    struct ObservedDocSet {
+        docs: Vec<u32>,
+        offset: usize,
+        cost: u32,
+        advances: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl super::super::DocSet for ObservedDocSet {
+        fn doc(&self) -> u32 {
+            self.docs.get(self.offset).copied().unwrap_or(TERMINATED)
+        }
+        fn advance(&mut self) -> u32 {
+            self.advances
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.offset = (self.offset + 1).min(self.docs.len());
+            self.doc()
+        }
+        fn seek(&mut self, target: u32) -> u32 {
+            self.offset += self.docs[self.offset..].partition_point(|doc| *doc < target);
+            self.doc()
+        }
+        fn size_hint(&self) -> u32 {
+            self.cost
+        }
+    }
+    impl Scorer for ObservedDocSet {
+        fn score(&self) -> f32 {
+            1.0
+        }
+    }
+
+    #[test]
+    fn conjunction_skips_expensive_advances_without_changing_matches_or_scores() {
+        let expensive = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cheap = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut scorer = BooleanScorer {
+            must: vec![
+                Box::new(ObservedDocSet {
+                    docs: (0..201).collect(),
+                    offset: 0,
+                    cost: 201,
+                    advances: expensive.clone(),
+                }),
+                Box::new(ObservedDocSet {
+                    docs: vec![0, 100, 200],
+                    offset: 0,
+                    cost: 3,
+                    advances: cheap.clone(),
+                }),
+            ],
+            should: Vec::new(),
+            must_not: Vec::new(),
+            current_doc: 0,
+            lead: 0,
+            doc_limit: 0,
+        };
+        scorer.initialize();
+        assert_eq!(scorer.doc(), 0);
+        assert_eq!(scorer.score(), 2.0);
+        assert_eq!(scorer.advance(), 100);
+        assert_eq!(scorer.score(), 2.0);
+        assert_eq!(scorer.seek(150), 200);
+        assert_eq!(scorer.score(), 2.0);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(expensive.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(cheap.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    struct ObservedTwoPhase {
+        doc: DocId,
+        confirmations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl super::super::docset::DocSet for ObservedTwoPhase {
+        fn doc(&self) -> DocId {
+            self.doc
+        }
+        fn advance(&mut self) -> DocId {
+            self.seek(self.doc.saturating_add(1))
+        }
+        fn seek(&mut self, target: DocId) -> DocId {
+            self.seek_candidate(target);
+            while self.doc != TERMINATED && !self.confirm_candidate() {
+                self.advance_candidate();
+            }
+            self.doc
+        }
+        fn size_hint(&self) -> u32 {
+            201
+        }
+    }
+
+    impl Scorer for ObservedTwoPhase {
+        fn score(&self) -> Score {
+            1.0
+        }
+        fn advance_candidate(&mut self) -> DocId {
+            self.seek_candidate(self.doc.saturating_add(1))
+        }
+        fn seek_candidate(&mut self, target: DocId) -> DocId {
+            self.doc = self.doc.max(target);
+            if self.doc > 200 {
+                self.doc = TERMINATED;
+            }
+            self.doc
+        }
+        fn confirm_candidate(&mut self) -> bool {
+            self.confirmations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.doc != TERMINATED && self.doc.is_multiple_of(50)
+        }
+    }
+
+    #[test]
+    fn conjunction_confirms_only_aligned_candidates_and_rejects_false_positives() {
+        let confirmations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut scorer = BooleanScorer {
+            must: vec![
+                Box::new(ObservedTwoPhase {
+                    doc: 0,
+                    confirmations: confirmations.clone(),
+                }),
+                Box::new(ObservedDocSet {
+                    docs: vec![0, 20, 100, 200],
+                    offset: 0,
+                    cost: 4,
+                    advances: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                }),
+            ],
+            should: Vec::new(),
+            must_not: vec![Box::new(ObservedDocSet {
+                docs: vec![100],
+                offset: 0,
+                cost: 1,
+                advances: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })],
+            current_doc: 0,
+            lead: 0,
+            doc_limit: 0,
+        };
+        scorer.initialize();
+        assert_eq!(scorer.doc(), 0);
+        assert_eq!(scorer.score(), 2.0);
+        assert_eq!(scorer.advance(), 200);
+        assert_eq!(scorer.score(), 2.0);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(confirmations.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn disjunction_cardinality_hints_saturate_instead_of_overflowing() {
+        let scorer = BooleanScorer::disjunction(
+            (0..2)
+                .map(|_| {
+                    Box::new(ObservedDocSet {
+                        docs: vec![0],
+                        offset: 0,
+                        cost: u32::MAX,
+                        advances: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                    }) as Box<dyn Scorer>
+                })
+                .collect(),
+        );
+        assert_eq!(scorer.size_hint(), u32::MAX);
+    }
 
     #[test]
     fn test_maxscore_eligible_pure_or_same_field() {
@@ -1533,39 +2672,6 @@ mod tests {
     }
 
     #[test]
-    fn test_maxscore_not_eligible_with_must() {
-        // Query with MUST clause should NOT use MaxScore optimization
-        let query = BooleanQuery::new()
-            .must(TermQuery::text(Field(0), "required"))
-            .should(TermQuery::text(Field(0), "hello"))
-            .should(TermQuery::text(Field(0), "world"));
-
-        // Has MUST clause, so MaxScore optimization should not kick in
-        assert!(!query.must.is_empty());
-    }
-
-    #[test]
-    fn test_maxscore_not_eligible_with_must_not() {
-        // Query with MUST_NOT clause should NOT use MaxScore optimization
-        let query = BooleanQuery::new()
-            .should(TermQuery::text(Field(0), "hello"))
-            .should(TermQuery::text(Field(0), "world"))
-            .must_not(TermQuery::text(Field(0), "excluded"));
-
-        // Has MUST_NOT clause, so MaxScore optimization should not kick in
-        assert!(!query.must_not.is_empty());
-    }
-
-    #[test]
-    fn test_maxscore_not_eligible_single_term() {
-        // Single SHOULD clause should NOT use MaxScore (no benefit)
-        let query = BooleanQuery::new().should(TermQuery::text(Field(0), "hello"));
-
-        // Only one term, MaxScore not beneficial
-        assert_eq!(query.should.len(), 1);
-    }
-
-    #[test]
     fn test_term_query_info_extraction() {
         let term_query = TermQuery::text(Field(42), "test");
         match term_query.decompose() {
@@ -1585,3 +2691,7 @@ mod tests {
         assert!(matches!(query.decompose(), QueryDecomposition::Opaque));
     }
 }
+
+#[cfg(test)]
+#[path = "boolean/conjunction_window_tests.rs"]
+mod conjunction_window_tests;

@@ -1,10 +1,10 @@
 # Merge-Time BP Reordering
 
-Status: design (2026-07-08), implemented.
+Status: implemented for BMP; extended to mapped text on September 17, 2026.
 
 ## Problem
 
-Recursive Graph Bisection (BP) reordering is currently a standalone,
+Recursive Graph Bisection (BP) reordering was originally a standalone,
 whole-segment operation: merges block-copy BMP data in concatenated source
 order, and a separate pass (`hermes-tool reorder` / the server's background
 optimizer) later rewrites the entire segment — copying every unchanged file
@@ -34,7 +34,7 @@ anyway:
   `reorder`-attributed field warns loudly at parse time (it would do
   nothing).
 
-- Per-field gate: only sparse fields carrying the `reorder` schema attribute
+- Per-field gate: only text and BMP sparse fields carrying the `reorder` schema attribute
   (`field splade: sparse_vector<...> [indexed, reorder]`,
   `SchemaBuilder::set_reorder`) are BP-reordered — by merges AND by the
   standalone reorder paths (`hermes-tool reorder`, `IndexWriter::reorder`,
@@ -51,7 +51,14 @@ anyway:
 - The merged segment is marked `reordered: true` in metadata, so the
   background optimizer skips it — eliminating the second whole-segment
   rewrite.
-- Non-BMP fields and all other segment files merge exactly as before.
+- Text fields use the shared text planner over source physical IDs and the
+  existing bounded posting/position writer. CHNK output applies the permutation
+  while streaming source columns; it translates logical slots through the same
+  inverse map. Legacy plain inputs with stored lengths use the existing identity
+  migration. Missing lengths with nonzero tokens fail explicitly.
+- Text and BMP convergence jointly determine the replacement metadata. Other
+  fields and segment files keep the normal copy/merge path. No intermediate
+  complete segment is written and reopened for reordering.
 
 Amortization property: the tiered merge cascade rewrites small segments often
 and large segments rarely, so BP cost is paid in proportion to (and at the
@@ -79,11 +86,18 @@ output always has tail-only padding.
 
 ## Cost
 
-- Extra merge CPU: forward-index build + BP. Bounded by the same
-  `memory_budget` df-dropping as standalone reorder (24 GB default). BP runs
-  in `spawn_blocking`; Rayon parallelism uses the process-wide background
-  pool. The server's `--optimizer-concurrent-passes` gate covers this path too,
+- Extra merge CPU: forward-index build + BP, and explicit text re-encoding.
+  Text planning shares the BMP frequency/budget selection helpers and k-way term
+  traversal with ordinary posting merge. Bounded by the same
+  `memory_budget` df-dropping as standalone reorder (24 GB default). BMP runs
+  in `spawn_blocking`; text uses the existing multithread-runtime blocking
+  boundary. Rayon parallelism uses the process-wide background pool. The
+  server's `--optimizer-concurrent-passes` gate covers this path too,
   so merge-time and standalone passes cannot multiply without bound.
+- Text rewriting retains bounded permutation records and source position
+  directories. Map migration follows term writing; text plans and its scheduler
+  permit are dropped before BMP work. Budget exhaustion and cancellation fail
+  through the existing output claim owner.
 - Saved: one full segment rewrite per merge (the optimizer pass), including
   its read traffic against the page cache.
 - Merge wall-clock grows; for latency-sensitive ingest keep the flag off and

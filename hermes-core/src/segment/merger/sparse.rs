@@ -14,7 +14,6 @@
 //! The raw block bytes are copied directly from mmap.
 
 use std::io::{Read, Write};
-use std::sync::Arc;
 
 use super::OffsetWriter;
 use super::SegmentMerger;
@@ -150,7 +149,7 @@ impl SegmentMerger {
                                 .find_map(|bi| bi.map(|idx| idx.max_weight_scale))
                                 .unwrap_or(5.0)
                         });
-                    if self.reorder_bmp && !*field_reorder {
+                    if self.reorder_fields && !*field_reorder {
                         // Reorder-on-merge is on, but this field opted out via
                         // its schema — fall through to block-copy. Loud so an
                         // operator can see why the merged field stays unordered.
@@ -160,7 +159,7 @@ impl SegmentMerger {
                             field.0,
                         );
                     }
-                    if self.reorder_bmp && *field_reorder {
+                    if self.reorder_fields && *field_reorder {
                         // Merge-time BP reorder: write the merged blob in
                         // permuted order instead of block stacking. The output
                         // segment needs no standalone reorder pass afterwards.
@@ -187,17 +186,7 @@ impl SegmentMerger {
                         let out_grid_bits = grid_bits;
                         let scratch_path = scratch_path.clone();
                         let permit_wait_start = std::time::Instant::now();
-                        let _reorder_permit = match &self.reorder_permits {
-                            Some(permits) => {
-                                let gate = Arc::clone(permits);
-                                Some(gate.acquire(self.reorder_priority).await.map_err(|_| {
-                                    crate::Error::Internal(
-                                        "background reorder scheduler is closed".into(),
-                                    )
-                                })?)
-                            }
-                            None => None,
-                        };
+                        let _reorder_permit = self.acquire_reorder_permit().await?;
                         let permit_wait = permit_wait_start.elapsed();
                         if permit_wait >= std::time::Duration::from_secs(1) {
                             log::info!(

@@ -38,9 +38,15 @@ const DEFAULT_WASM_MEMORY_BUDGET: usize = 32 * 1024 * 1024;
 const MIN_DOCS_BEFORE_FLUSH: u32 = 100;
 
 fn default_builder_config(index_config: &IndexConfig) -> SegmentBuilderConfig {
+    let bounds = index_config.effective_posting_bounds();
     SegmentBuilderConfig {
         optimization: index_config.optimization,
         posting_codec: index_config.effective_posting_codec(),
+        quantized_norms: index_config.quantized_norms,
+        compact_text: index_config.compact_text,
+        posting_ratio_bounds: bounds.ratio,
+        posting_impact_bounds: bounds.impact,
+        term_dict_block_size: index_config.term_dict_block_size,
         ..SegmentBuilderConfig::default()
     }
 }
@@ -418,13 +424,26 @@ mod tests {
     use super::default_builder_config;
 
     #[test]
-    fn standard_builder_config_honors_index_posting_policy() {
+    fn standard_builder_config_honors_index_text_policy() {
         let config = crate::index::IndexConfig {
             optimization: crate::structures::IndexOptimization::SizeOptimized,
+            term_dict_block_size: crate::structures::SSTableBlockSize::try_from(512).unwrap(),
             ..Default::default()
         };
         let builder = default_builder_config(&config);
         assert_eq!(builder.optimization, config.optimization);
+        assert_eq!(builder.term_dict_block_size, config.term_dict_block_size);
         assert_eq!(builder.posting_codec, crate::structures::PostingCodec::Pfor);
+        let configured = crate::index::IndexConfig {
+            posting_codec: Some(crate::structures::PostingCodec::Simd4x),
+            posting_impact_bounds: true,
+            ..config
+        };
+        assert!(default_builder_config(&configured).posting_impact_bounds);
+        assert!(default_builder_config(&configured).posting_ratio_bounds);
+        assert_eq!(
+            default_builder_config(&configured).posting_codec,
+            crate::structures::PostingCodec::Simd4x
+        );
     }
 }

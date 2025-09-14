@@ -14,11 +14,14 @@ directory. Package READMEs below document each executable or library.
 ## Schema, text search, and query behavior
 
 - [Hermes Schema Definition Language (SDL)](schema.md)
+- [Query language](query-language.md): required/prohibited clauses, precedence, and strict parsing.
 - [Dynamic per-document stemming and wire-level phrase queries](dynamic-tokenizer-and-phrase.md)
 - [Chunked text fields: BM25 over passages with ordinals](chunked-text-fields.md)
 - [BM25 over equal-length chunks](chunked-bm25.md)
 - [Lexical vertical: positions, pruning, reordering, tokenization](lexical-vertical.md)
 - [Posting block codecs](posting-codecs.md)
+- [Compact text storage and quantized norms](compact-text-format.md): versioned opt-in formats, normalization and compatibility.
+- [MaxScore text reordering: design and implementation status](maxscore-text-reordering.md)
 - [Hermes Web UX Configuration DSL](ux-config.md)
 
 ## Storage, operations, and distributed search
@@ -30,6 +33,7 @@ directory. Package READMEs below document each executable or library.
 - [Index diagnostics](diagnostics.md)
 - [Prometheus Metrics](metrics.md)
 - [Document store v3](document-store-v3.md)
+- [Owned byte views and their safety contract](owned-byte-views.md)
 - [Hot-Metadata Pinning (meta/data residency split)](hot-metadata-pinning.md)
 - [Cold IO for merges (hot-metadata-pinning Phase 2)](cold-io.md)
 - [Merge-Time BP Reordering](merge-time-reorder.md)
@@ -84,6 +88,8 @@ directory. Package READMEs below document each executable or library.
 - [hermes-web](../hermes-web/README.md)
 
 ## Keeping documentation current
+
+- [Query work diagnostics](query-work-diagnostics.md): separate traversal volume from per-unit cost.
 
 ## Additional guides
 

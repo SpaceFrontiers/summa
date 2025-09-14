@@ -1,4 +1,8 @@
-//! Position stream v3: positions addressed through the doc postings.
+//! Cursor-addressed position stream: positions addressed through the doc
+//! postings. On disk this supports revisions 3 (`"POS3"`) and 4 (`"POS4"`); the
+//! module keeps its historical `positions_v2` name because it is the second
+//! positions *design* (after the self-indexed [`PositionPostingList`], which
+//! remains readable as [`TermPositions::Legacy`]).
 //!
 //! One stream per term, referenced by `TermInfo::External { position_offset,
 //! position_len }`:
@@ -7,8 +11,17 @@
 //! [block 0][block 1]...[block n-1]
 //! [block index: (byte_offset u32, value_start u64) × n]
 //! [footer: num_blocks u32, total_positions u64, magic u32 "POS3"]   16 bytes
-//! block: [count u16][bits u8][pad u8][packed values: count × bytes_per_value(bits)]
+//! block: [count u16][bits u8][codec u8][packed values]
+//! codec 0: rounded widths (0/8/16/32 bits), any count 1..=128.
+//! codec 1: BitPacker4x, full 128-value blocks only. The encoder never emits
+//!          codec 1 for a short block (short blocks are downgraded to codec 0)
+//!          and the reader rejects one as corruption.
 //! ```
+//!
+//! Opt-in POS4 stores payloads without interleaved headers, followed by one
+//! `(byte_offset u32, value_start u64)` checkpoint per eight blocks and one
+//! two-byte count/width/codec descriptor per block. The footer differs only
+//! in its magic. Structural admission reads only this directory.
 //!
 //! The values form one flat sequence in posting order: for every document
 //! (or chunk) its sorted positions, delta-coded (`p0, p1 - p0, ...`). Blocks
@@ -26,8 +39,10 @@
 //!
 //! [`BlockPostingList::pos_cursor`]: super::BlockPostingList::pos_cursor
 //! [`BlockPostingIterator::position_cursor`]: super::BlockPostingIterator::position_cursor
+
 #[cfg(feature = "native")]
 mod compact;
+mod directory;
 #[cfg(feature = "native")]
 pub(crate) use compact::PositionRangeSource;
 
@@ -36,6 +51,7 @@ use std::io::{self, Write};
 use byteorder::{LittleEndian, WriteBytesExt};
 
 use super::positions::PositionPostingList;
+use super::{PostingCodec, bitpacking4x};
 use crate::DocId;
 use crate::directories::OwnedBytes;
 use crate::structures::simd;
@@ -46,7 +62,7 @@ pub const POSITION_STREAM_BLOCK: usize = 128;
 const BLOCK_HEADER: usize = 4;
 const INDEX_ENTRY: usize = 12;
 const FOOTER: usize = 16;
-/// "POS3" little-endian.
+/// Footer magic "POS3" (stream revision 3), little-endian.
 const MAGIC: u32 = 0x3353_4F50;
 
 /// Streaming writer of one term's position stream.
@@ -58,10 +74,19 @@ pub struct PositionStreamEncoder<W: Write> {
     written: u64,
     total: u64,
     scratch: Vec<u8>,
+    codec: PostingCodec,
+    compact: bool,
+    descriptors: Vec<u16>,
 }
 
 impl<W: Write> PositionStreamEncoder<W> {
     pub fn new(writer: W) -> Self {
+        Self::with_posting_codec(writer, PostingCodec::Rounded)
+    }
+
+    /// Use SIMD packing for `Simd4x`; other posting policies retain rounded
+    /// positions. Copied encoded blocks preserve their own codec tags.
+    pub fn with_posting_codec(writer: W, codec: PostingCodec) -> Self {
         Self {
             writer,
             pending: Vec::with_capacity(POSITION_STREAM_BLOCK),
@@ -70,7 +95,20 @@ impl<W: Write> PositionStreamEncoder<W> {
             written: 0,
             total: 0,
             scratch: Vec::with_capacity(BLOCK_HEADER + POSITION_STREAM_BLOCK * 4),
+            codec,
+            compact: false,
+            descriptors: Vec::new(),
         }
+    }
+
+    /// Emit POS4 metadata separately from payloads. Existing POS3 remains readable.
+    pub fn with_compact_directory(mut self) -> Self {
+        assert!(
+            self.index.is_empty() && self.pending.is_empty(),
+            "select the position format before appending values"
+        );
+        self.compact = true;
+        self
     }
 
     /// Append one document's positions. They are sorted here and stored as
@@ -116,6 +154,17 @@ impl<W: Write> PositionStreamEncoder<W> {
                 self.index.reserve_exact(capacity - self.index.len());
             }
         }
+        if self.compact && self.descriptors.len() == self.descriptors.capacity() {
+            let limit = self.index_limit.unwrap_or(usize::MAX);
+            let capacity = self
+                .descriptors
+                .capacity()
+                .saturating_mul(2)
+                .max(16)
+                .min(limit);
+            self.descriptors
+                .reserve_exact(capacity - self.descriptors.len());
+        }
         Ok(())
     }
 
@@ -132,19 +181,52 @@ impl<W: Write> PositionStreamEncoder<W> {
         self.reserve_index_entry()?;
         self.index
             .push((self.written as u32, self.total - self.pending.len() as u64));
-        let max = self.pending.iter().copied().max().unwrap_or(0);
-        let width = simd::RoundedBitWidth::from_exact(simd::bits_needed(max));
         let count = self.pending.len();
         self.scratch.clear();
-        self.scratch
-            .resize(BLOCK_HEADER + count * width.bytes_per_value(), 0);
+        self.scratch.resize(BLOCK_HEADER, 0);
         self.scratch[0..2].copy_from_slice(&(count as u16).to_le_bytes());
-        self.scratch[2] = width.as_u8();
-        self.scratch[3] = 0;
-        simd::pack_rounded(&self.pending, width, &mut self.scratch[BLOCK_HEADER..]);
-        self.writer.write_all(&self.scratch)?;
-        self.written += self.scratch.len() as u64;
+        if self.codec.for_count(count) == PostingCodec::Simd4x {
+            let width = bitpacking4x::encode(&self.pending, &mut self.scratch);
+            self.scratch[2] = width;
+            self.scratch[3] = 1;
+        } else {
+            let max = self.pending.iter().copied().max().unwrap_or(0);
+            let width = simd::RoundedBitWidth::from_exact(simd::bits_needed(max));
+            self.scratch
+                .resize(BLOCK_HEADER + count * width.bytes_per_value(), 0);
+            self.scratch[2] = width.as_u8();
+            simd::pack_rounded(&self.pending, width, &mut self.scratch[BLOCK_HEADER..]);
+        }
+        if self.compact {
+            self.descriptors.push(directory::descriptor(&self.scratch)?);
+            self.writer.write_all(&self.scratch[BLOCK_HEADER..])?;
+            self.written += (self.scratch.len() - BLOCK_HEADER) as u64;
+        } else {
+            self.writer.write_all(&self.scratch)?;
+            self.written += self.scratch.len() as u64;
+        }
         self.pending.clear();
+        Ok(())
+    }
+
+    fn append_encoded_block(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let count = PositionStream::block_count(bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid copied position block")
+        })?;
+        self.flush_block()?;
+        self.reserve_index_entry()?;
+        let offset = u32::try_from(self.written)
+            .map_err(|_| io::Error::other("position output exceeds u32 offsets"))?;
+        self.index.push((offset, self.total));
+        let payload = if self.compact {
+            self.descriptors.push(directory::descriptor(bytes)?);
+            &bytes[BLOCK_HEADER..]
+        } else {
+            bytes
+        };
+        self.writer.write_all(payload)?;
+        self.written += payload.len() as u64;
+        self.total += count as u64;
         Ok(())
     }
 
@@ -160,18 +242,33 @@ impl<W: Write> PositionStreamEncoder<W> {
     ) -> io::Result<(u64, u64)> {
         check()?;
         self.flush_block()?;
-        for (i, &(offset, value_start)) in self.index.iter().enumerate() {
-            if i.is_multiple_of(4096) {
-                check()?;
+        if self.compact {
+            directory::write(&mut self.writer, &self.index, &self.descriptors, &mut check)?;
+        } else {
+            for (i, &(offset, value_start)) in self.index.iter().enumerate() {
+                if i.is_multiple_of(4096) {
+                    check()?;
+                }
+                self.writer.write_u32::<LittleEndian>(offset)?;
+                self.writer.write_u64::<LittleEndian>(value_start)?;
             }
-            self.writer.write_u32::<LittleEndian>(offset)?;
-            self.writer.write_u64::<LittleEndian>(value_start)?;
         }
-        self.writer
-            .write_u32::<LittleEndian>(self.index.len() as u32)?;
+        self.writer.write_u32::<LittleEndian>(
+            u32::try_from(self.index.len())
+                .map_err(|_| io::Error::other("too many position blocks"))?,
+        )?;
         self.writer.write_u64::<LittleEndian>(self.total)?;
-        self.writer.write_u32::<LittleEndian>(MAGIC)?;
-        let bytes = self.written + (self.index.len() * INDEX_ENTRY) as u64 + FOOTER as u64;
+        self.writer.write_u32::<LittleEndian>(if self.compact {
+            directory::COMPACT_MAGIC
+        } else {
+            MAGIC
+        })?;
+        let index_len = if self.compact {
+            directory::directory_len(self.index.len()).unwrap()
+        } else {
+            self.index.len() * INDEX_ENTRY
+        };
+        let bytes = self.written + index_len as u64 + FOOTER as u64;
         Ok((self.total, bytes))
     }
 }
@@ -184,37 +281,72 @@ pub struct PositionStream {
     index_start: usize,
     total: u64,
     canonical_blocks: bool,
+    compact: bool,
+}
+
+/// Admission proof for one immutable byte range, retained by its file owner.
+#[derive(Clone, Copy)]
+pub(super) struct PositionStreamLayout {
+    num_blocks: usize,
+    index_start: usize,
+    total: u64,
+    canonical_blocks: bool,
+    compact: bool,
 }
 
 #[derive(Default)]
 struct PositionBlockCache {
     index: Option<usize>,
+    value_start: u64,
     values: Vec<u32>,
     #[cfg(test)]
     decodes: usize,
+    #[cfg(test)]
+    lookups: usize,
 }
 
 impl PositionStream {
     /// Whether `raw` ends with a current position-stream footer.
     pub fn is_stream(raw: &[u8]) -> bool {
-        raw.len() >= FOOTER && u32::from_le_bytes(raw[raw.len() - 4..].try_into().unwrap()) == MAGIC
+        directory::is_compact(raw)
+            || (raw.len() >= FOOTER
+                && u32::from_le_bytes(raw[raw.len() - 4..].try_into().unwrap()) == MAGIC)
     }
 
     pub fn open(bytes: OwnedBytes) -> io::Result<Self> {
-        let (num_blocks, index_start, total) = Self::parse_layout(bytes.as_slice())?;
+        let layout = Self::validate_bytes(bytes.as_slice())?;
+        Ok(Self::from_validated_bytes(bytes, layout))
+    }
+
+    pub(super) fn validate_bytes(bytes: &[u8]) -> io::Result<PositionStreamLayout> {
+        let (num_blocks, index_start, total) = Self::parse_layout(bytes)?;
+        // Query iterators cannot return I/O errors. Reject malformed directories
+        // and block headers before they can be mistaken for absent phrase hits.
+        Self::validate_blocks(bytes, total)?;
         // Freshly encoded streams keep every interior block full, retaining
         // the original O(1) cursor-to-block calculation. Only concatenated
         // streams with partial interior source tails need the index search.
         let canonical_blocks = num_blocks == 0
-            || Self::index_entry(bytes.as_slice(), index_start, num_blocks - 1).1
+            || Self::entry_for(bytes, index_start, num_blocks, num_blocks - 1).1
                 == (num_blocks as u64 - 1) * POSITION_STREAM_BLOCK as u64;
-        Ok(Self {
-            bytes,
+        Ok(PositionStreamLayout {
             num_blocks,
             index_start,
             total,
             canonical_blocks,
+            compact: directory::is_compact(bytes),
         })
+    }
+
+    pub(super) fn from_validated_bytes(bytes: OwnedBytes, layout: PositionStreamLayout) -> Self {
+        Self {
+            bytes,
+            num_blocks: layout.num_blocks,
+            index_start: layout.index_start,
+            total: layout.total,
+            canonical_blocks: layout.canonical_blocks,
+            compact: layout.compact,
+        }
     }
 
     fn parse_layout(raw: &[u8]) -> io::Result<(usize, usize, u64)> {
@@ -233,7 +365,12 @@ impl PositionStream {
             u32::from_le_bytes(raw[footer_start..footer_start + 4].try_into().unwrap()) as usize;
         let total =
             u64::from_le_bytes(raw[footer_start + 4..footer_start + 12].try_into().unwrap());
-        let index_len = num_blocks.checked_mul(INDEX_ENTRY).ok_or_else(|| {
+        let index_len = (if directory::is_compact(raw) {
+            directory::directory_len(num_blocks)
+        } else {
+            num_blocks.checked_mul(INDEX_ENTRY)
+        })
+        .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "position block index overflows")
         })?;
         let index_start = total_len
@@ -265,14 +402,37 @@ impl PositionStream {
         )
     }
 
+    fn entry_for(raw: &[u8], index_start: usize, blocks: usize, idx: usize) -> (usize, u64) {
+        if directory::is_compact(raw) {
+            directory::entry(&raw[index_start..raw.len() - FOOTER], blocks, idx)
+        } else {
+            Self::index_entry(raw, index_start, idx)
+        }
+    }
+
+    #[inline]
+    fn entry(&self, idx: usize) -> (usize, u64) {
+        if self.compact {
+            directory::entry(
+                &self.bytes[self.index_start..self.bytes.len() - FOOTER],
+                self.num_blocks,
+                idx,
+            )
+        } else {
+            Self::index_entry(self.bytes.as_slice(), self.index_start, idx)
+        }
+    }
+
     fn block_range(&self, idx: usize) -> Option<(usize, usize, u64)> {
         if idx >= self.num_blocks {
             return None;
         }
-        let raw = self.bytes.as_slice();
-        let (start, value_start) = Self::index_entry(raw, self.index_start, idx);
-        let end = if idx + 1 < self.num_blocks {
-            Self::index_entry(raw, self.index_start, idx + 1).0
+        let (start, value_start) = self.entry(idx);
+        let end = if self.compact {
+            let tag = directory::tag(&self.bytes[self.index_start..], self.num_blocks, idx);
+            start + directory::parts(tag).ok()?.3
+        } else if idx + 1 < self.num_blocks {
+            self.entry(idx + 1).0
         } else {
             self.index_start
         };
@@ -287,17 +447,19 @@ impl PositionStream {
         if count == 0 || count > POSITION_STREAM_BLOCK {
             return None;
         }
-        let bytes_per_value = match raw[2] {
-            0 => 0,
-            8 => 1,
-            16 => 2,
-            32 => 4,
+        // Mirror of the encoder: codec 1 (BitPacker4x) exists only for full
+        // blocks; `flush_block` downgrades any short block to codec 0.
+        let payload_len = match (raw[3], raw[2]) {
+            (0, 0 | 8 | 16 | 32) => count * (raw[2] as usize / 8),
+            (1, 0..=32) if count == POSITION_STREAM_BLOCK => {
+                bitpacking4x::encoded_len(count, raw[2])
+            }
             _ => return None,
         };
-        (raw.len() == BLOCK_HEADER + count * bytes_per_value).then_some(count)
+        (raw.len() == BLOCK_HEADER + payload_len).then_some(count)
     }
 
-    fn locate_value(&self, cursor: u64) -> Option<(usize, usize)> {
+    fn locate_value(&self, cursor: u64, forward_from: Option<usize>) -> Option<(usize, usize)> {
         if cursor >= self.total || self.num_blocks == 0 {
             return None;
         }
@@ -305,12 +467,29 @@ impl PositionStream {
             let idx = usize::try_from(cursor / POSITION_STREAM_BLOCK as u64).ok()?;
             return Some((idx, (cursor % POSITION_STREAM_BLOCK as u64) as usize));
         }
-        let raw = self.bytes.as_slice();
+        if self.compact {
+            return directory::locate(
+                &self.bytes[self.index_start..],
+                self.num_blocks,
+                cursor,
+                forward_from,
+            );
+        }
         let mut low = 0usize;
         let mut high = self.num_blocks;
+        if let Some(first) = forward_from {
+            low = first.min(self.num_blocks);
+            high = low.saturating_add(1).min(self.num_blocks);
+            let mut step = 1usize;
+            while high < self.num_blocks && self.entry(high).1 <= cursor {
+                low = high;
+                step = step.saturating_mul(2);
+                high = high.saturating_add(step).min(self.num_blocks);
+            }
+        }
         while low < high {
             let mid = low + (high - low) / 2;
-            let value_start = Self::index_entry(raw, self.index_start, mid).1;
+            let value_start = self.entry(mid).1;
             if value_start <= cursor {
                 low = mid + 1;
             } else {
@@ -318,10 +497,11 @@ impl PositionStream {
             }
         }
         let idx = low.checked_sub(1)?;
-        let (start, end, value_start) = self.block_range(idx)?;
-        let count = Self::block_count(&raw[start..end])?;
+        // Admission checked every logical span against its block header. The
+        // upper-bound search and cursor < total place this cursor in that span.
+        let value_start = self.entry(idx).1;
         let in_block = usize::try_from(cursor.checked_sub(value_start)?).ok()?;
-        (in_block < count).then_some((idx, in_block))
+        Some((idx, in_block))
     }
 
     /// Decode block `idx` (raw delta values) into `out`.
@@ -329,24 +509,70 @@ impl PositionStream {
         let Some((start, end, _)) = self.block_range(idx) else {
             return false;
         };
-        Self::decode_block_bytes(&self.bytes.as_slice()[start..end], out)
+        self.decode_payload(idx, &self.bytes.as_slice()[start..end], out)
+    }
+
+    fn decode_payload(&self, idx: usize, raw: &[u8], out: &mut Vec<u32>) -> bool {
+        if !self.compact {
+            return Self::decode_block_bytes(raw, out);
+        }
+        let tag = directory::tag(&self.bytes[self.index_start..], self.num_blocks, idx);
+        let Ok((count, width, codec, bytes)) = directory::parts(tag) else {
+            return false;
+        };
+        if bytes != raw.len() {
+            return false;
+        }
+        out.resize(count, 0);
+        crate::observe::search_work!(
+            position_blocks += 1,
+            position_values += count,
+            position_payload_bytes += bytes
+        );
+        if codec == 1 {
+            bitpacking4x::decode(raw, width, out);
+        } else {
+            simd::unpack_rounded(
+                raw,
+                simd::RoundedBitWidth::try_from_u8(width).unwrap(),
+                out,
+                count,
+            );
+        }
+        true
     }
 
     fn decode_block_bytes(raw: &[u8], out: &mut Vec<u32>) -> bool {
         let Some(count) = Self::block_count(raw) else {
             return false;
         };
-        let width = simd::RoundedBitWidth::from_u8(raw[2]);
-        let needed = BLOCK_HEADER + count * width.bytes_per_value();
-        out.clear();
         out.resize(count, 0);
-        simd::unpack_rounded(&raw[BLOCK_HEADER..needed], width, out, count);
+        crate::observe::search_work!(
+            position_blocks += 1,
+            position_values += count,
+            position_payload_bytes += raw.len() - BLOCK_HEADER
+        );
+        if raw[3] == 1 {
+            bitpacking4x::decode(&raw[BLOCK_HEADER..], raw[2], out);
+        } else {
+            // `block_count` already admitted only rounded widths; a `None`
+            // here is a corrupt block and is reported as a failed decode.
+            let Some(width) = simd::RoundedBitWidth::try_from_u8(raw[2]) else {
+                out.clear();
+                return false;
+            };
+            simd::unpack_rounded(&raw[BLOCK_HEADER..], width, out, count);
+        }
         true
     }
 
     /// Positions of one document: the `tf` values starting at `cursor`,
-    /// delta-decoded into absolute positions. `scratch` reuses allocation;
-    /// sequential consumers should use a term-bound `TermPositionCursor`.
+    /// delta-decoded into absolute positions. `scratch` reuses allocation.
+    ///
+    /// Not for the query path: every call builds a fresh block cache, so
+    /// consecutive documents in the same block are decoded again each time.
+    /// Query iterators bind a `TermPositionCursor` (via
+    /// `TermPositions::into_cursor`) which keeps the last decoded block.
     pub fn read_into(
         &self,
         cursor: u64,
@@ -380,7 +606,28 @@ impl PositionStream {
         {
             return false;
         }
-        let Some((mut idx, mut in_block)) = self.locate_value(cursor) else {
+        let located = if self.canonical_blocks {
+            self.locate_value(cursor, None)
+        } else {
+            let cached = cache.index.and_then(|idx| {
+                let offset = cursor.checked_sub(cache.value_start)?;
+                (offset < cache.values.len() as u64).then_some((idx, offset as usize))
+            });
+            if cached.is_some() {
+                cached
+            } else {
+                #[cfg(test)]
+                {
+                    cache.lookups += 1;
+                }
+                let forward = cache
+                    .index
+                    .filter(|_| cursor >= cache.value_start)
+                    .map(|idx| idx + 1);
+                self.locate_value(cursor, forward)
+            }
+        };
+        let Some((mut idx, mut in_block)) = located else {
             return false;
         };
         let mut remaining = tf as usize;
@@ -390,9 +637,21 @@ impl PositionStream {
         while remaining > 0 {
             if cache.index != Some(idx) {
                 cache.index = None;
-                if !self.decode_block(idx, &mut cache.values) {
+                let Some((start, end, value_start)) = self.block_range(idx) else {
+                    return false;
+                };
+                // Also validates adjacency when one document spans copied
+                // short blocks. A failed replacement cannot retain a stale range.
+                if value_start.checked_add(in_block as u64) != Some(next_cursor)
+                    || !self.decode_payload(
+                        idx,
+                        &self.bytes.as_slice()[start..end],
+                        &mut cache.values,
+                    )
+                {
                     return false;
                 }
+                cache.value_start = value_start;
                 cache.index = Some(idx);
                 #[cfg(test)]
                 {
@@ -411,13 +670,6 @@ impl PositionStream {
             next_cursor += take as u64;
             in_block = 0;
             idx += 1;
-            if remaining > 0
-                && self
-                    .block_range(idx)
-                    .is_none_or(|(_, _, value_start)| value_start != next_cursor)
-            {
-                return false;
-            }
         }
         true
     }
@@ -441,6 +693,34 @@ impl PositionStream {
             Self::validate_blocks(raw, total)?;
             writer.write_all(raw)?;
             return Ok((total, raw.len() as u64));
+        }
+
+        if sources.iter().any(|raw| directory::is_compact(raw)) {
+            let mut encoder = PositionStreamEncoder::new(writer).with_compact_directory();
+            let mut block = Vec::with_capacity(BLOCK_HEADER + POSITION_STREAM_BLOCK * 4);
+            for (raw, &(blocks, index_start, total)) in sources.iter().zip(&layouts) {
+                Self::validate_blocks(raw, total)?;
+                for idx in 0..blocks {
+                    let (start, _) = Self::entry_for(raw, index_start, blocks, idx);
+                    let end = if idx + 1 == blocks {
+                        index_start
+                    } else {
+                        Self::entry_for(raw, index_start, blocks, idx + 1).0
+                    };
+                    if directory::is_compact(raw) {
+                        let tag = directory::tag(&raw[index_start..], blocks, idx);
+                        let (count, width, codec, _) = directory::parts(tag)?;
+                        block.clear();
+                        block.extend_from_slice(&(count as u16).to_le_bytes());
+                        block.extend_from_slice(&[width, codec]);
+                        block.extend_from_slice(&raw[start..end]);
+                        encoder.append_encoded_block(&block)?;
+                    } else {
+                        encoder.append_encoded_block(&raw[start..end])?;
+                    }
+                }
+            }
+            return Ok(encoder.finish()?);
         }
 
         let total_blocks: usize = layouts.iter().map(|(blocks, _, _)| *blocks).sum();
@@ -515,6 +795,22 @@ impl PositionStream {
 
     fn validate_blocks(raw: &[u8], expected_total: u64) -> io::Result<()> {
         let (num_blocks, index_start, _) = Self::parse_layout(raw)?;
+        if directory::is_compact(raw) {
+            return directory::validate(
+                &raw[index_start..raw.len() - FOOTER],
+                num_blocks,
+                index_start,
+                expected_total,
+            );
+        }
+        if (num_blocks == 0 && index_start != 0)
+            || (num_blocks != 0 && Self::index_entry(raw, index_start, 0).0 != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid position block index: unaddressed payload prefix",
+            ));
+        }
         let mut total = 0u64;
         for idx in 0..num_blocks {
             let (start, value_start) = Self::index_entry(raw, index_start, idx);
@@ -567,6 +863,7 @@ impl TermPositionCursor {
         tf: u32,
         out: &mut Vec<u32>,
     ) -> bool {
+        crate::observe::search_work!(position_reads += 1, positions_requested += tf);
         match &self.positions {
             TermPositions::Legacy(list) => list.get_positions_into(doc, out),
             TermPositions::Stream(stream) => stream.read_cached(cursor, tf, &mut self.cache, out),
@@ -575,6 +872,12 @@ impl TermPositionCursor {
 }
 
 impl TermPositions {
+    /// Representation policy retained by explicit field reordering.
+    #[cfg(all(feature = "native", test))]
+    pub(crate) fn has_compact_directory(&self) -> bool {
+        matches!(self, Self::Stream(stream) if stream.compact)
+    }
+
     pub(crate) fn into_cursor(self) -> TermPositionCursor {
         TermPositionCursor {
             positions: self,
@@ -607,6 +910,11 @@ impl TermPositions {
         }
     }
 
+    /// Convenience for tests and diagnostics only: allocates a fresh output
+    /// and scratch vector per call and uses the uncached
+    /// [`PositionStream::read_into`]. Query code must use
+    /// `Self::into_cursor` / `TermPositionCursor::read_into` with reused
+    /// buffers.
     pub fn positions(&self, doc_id: DocId, cursor: u64, tf: u32) -> Option<Vec<u32>> {
         let mut out = Vec::new();
         let mut scratch = Vec::new();
@@ -616,8 +924,404 @@ impl TermPositions {
 }
 
 #[cfg(test)]
+mod compact_directory_tests {
+    use super::*;
+
+    fn encode(values: &[u32], compact: bool, codec: PostingCodec) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut encoder = PositionStreamEncoder::with_posting_codec(&mut bytes, codec);
+        if compact {
+            encoder = encoder.with_compact_directory();
+        }
+        encoder.push_values(values).unwrap();
+        encoder.finish().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn compact_positions_preserve_payloads_and_every_cursor_across_mixed_short_blocks() {
+        for codec in [PostingCodec::Rounded, PostingCodec::Simd4x] {
+            for count in [0, 1, 2, 127, 128, 129, 1024, 1025, 4097] {
+                let values: Vec<u32> = (0..count).map(|i| (i * 31 % 257) as u32).collect();
+                let old = encode(&values, false, codec);
+                let new = encode(&values, true, codec);
+                let legacy = PositionStream::open(OwnedBytes::new(old.clone())).unwrap();
+                let compact = PositionStream::open(OwnedBytes::new(new.clone())).unwrap();
+                assert!(compact.compact);
+                assert_eq!(
+                    new.len(),
+                    compact.index_start
+                        + directory::directory_len(compact.num_blocks).unwrap()
+                        + FOOTER
+                );
+                for i in 0..compact.num_blocks {
+                    let (a, b, _) = legacy.block_range(i).unwrap();
+                    let (c, d, _) = compact.block_range(i).unwrap();
+                    assert_eq!(&old[a + BLOCK_HEADER..b], &new[c..d]);
+                }
+                let tail = encode(&[7, 3, 11], true, codec);
+                let mut merged = Vec::new();
+                PositionStream::concatenate_streaming(&[&tail, &old, &new, &tail], &mut merged)
+                    .unwrap();
+                let stream = PositionStream::open(OwnedBytes::new(merged)).unwrap();
+                let expected: Vec<_> =
+                    [vec![7, 3, 11], values.clone(), values, vec![7, 3, 11]].concat();
+                let mut scratch = Vec::new();
+                let mut out = Vec::new();
+                for (i, &value) in expected.iter().enumerate() {
+                    assert!(stream.read_into(i as u64, 1, &mut scratch, &mut out));
+                    assert_eq!(out, [value]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_directory_rejects_bad_structure_without_interpreting_payload_values() {
+        let bytes = encode(&vec![7; 1153], true, PostingCodec::Rounded);
+        let (_, start, _) = PositionStream::parse_layout(&bytes).unwrap();
+        // Payload values are arbitrary valid deltas; admission only needs metadata.
+        let mut changed = bytes.clone();
+        changed[..start].fill(255);
+        assert!(PositionStream::open(OwnedBytes::new(changed)).is_ok());
+        for at in [
+            start,
+            start + 4,
+            start + 12,
+            start + 16,
+            bytes.len() - FOOTER - 1,
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[at] ^= 128;
+            assert!(
+                PositionStream::open(OwnedBytes::new(corrupt)).is_err(),
+                "byte {at}"
+            );
+        }
+        for n in 0..bytes.len() {
+            assert!(PositionStream::open(OwnedBytes::new(bytes[..n].to_vec())).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_decoding_overwrites_stale_values_across_lengths_and_codecs() {
+        let mut out = vec![u32::MAX; 256];
+        for codec in [PostingCodec::Rounded, PostingCodec::Simd4x] {
+            for count in [128, 1, 127, 128, 17] {
+                for value in [0, 1, 255, 65536] {
+                    for compact in [false, true] {
+                        let mut bytes = Vec::new();
+                        let mut encoder =
+                            PositionStreamEncoder::with_posting_codec(&mut bytes, codec);
+                        if compact {
+                            encoder = encoder.with_compact_directory();
+                        }
+                        encoder.push_values(&vec![value; count]).unwrap();
+                        encoder.finish().unwrap();
+                        let stream = PositionStream::open(OwnedBytes::new(bytes)).unwrap();
+                        out.fill(u32::MAX);
+                        assert!(stream.decode_block(0, &mut out));
+                        assert_eq!(out, vec![value; count]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn admitted_mixed_position_directories_locate_every_cursor_across_copied_short_blocks() {
+        let counts = [1, 127, 128, 3, 65, 128, 7];
+        let mut sources = Vec::new();
+        let mut expected = Vec::new();
+        for (block, &count) in counts.iter().enumerate() {
+            let mut bytes = Vec::new();
+            let codec = if block % 2 == 0 {
+                PostingCodec::Rounded
+            } else {
+                PostingCodec::Simd4x
+            };
+            let mut encoder = PositionStreamEncoder::with_posting_codec(&mut bytes, codec);
+            encoder.push_values(&vec![1; count]).unwrap();
+            encoder.finish().unwrap();
+            sources.push(bytes);
+            expected.extend((0..count).map(|offset| (block, offset)));
+        }
+        let mut bytes = Vec::new();
+        PositionStream::concatenate_streaming(
+            &sources.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &mut bytes,
+        )
+        .unwrap();
+        let original = bytes.clone();
+        let stream = PositionStream::open(OwnedBytes::new(bytes)).unwrap();
+        assert!(!stream.canonical_blocks);
+        for cursor in (0..expected.len()).rev().chain(0..expected.len()) {
+            let expected = expected[cursor];
+            assert_eq!(stream.locate_value(cursor as u64, None), Some(expected));
+            for first in 0..=expected.0 {
+                assert_eq!(
+                    stream.locate_value(cursor as u64, Some(first)),
+                    Some(expected)
+                );
+            }
+            let mut values = Vec::new();
+            assert!(stream.read_into(cursor as u64, 1, &mut Vec::new(), &mut values));
+            assert_eq!(values, [1]);
+        }
+        assert_eq!(stream.locate_value(expected.len() as u64, None), None);
+        assert_eq!(stream.locate_value(u64::MAX, Some(usize::MAX)), None);
+        assert_eq!(stream.bytes.as_slice(), original);
+    }
+
+    #[test]
+    fn sequential_merged_position_reads_reuse_logical_block_addresses() {
+        let docs = vec![vec![1, 5]; 13];
+        let (source, _) = encode(&docs);
+        let mut bytes = Vec::new();
+        PositionStream::concatenate_streaming(&vec![source.as_slice(); 30], &mut bytes).unwrap();
+        let original = bytes.clone();
+        let mut cursor = TermPositions::open(OwnedBytes::new(bytes))
+            .unwrap()
+            .into_cursor();
+        let mut out = Vec::new();
+        for doc in 0..390 {
+            assert!(cursor.read_into(doc, u64::from(doc) * 2, 2, &mut out));
+            assert_eq!(out, [1, 5]);
+        }
+        assert_eq!(cursor.cache.decodes, 30);
+        assert_eq!(
+            cursor.cache.lookups, 30,
+            "cached block addresses must serve all covered documents"
+        );
+        assert!(cursor.read_into(0, 0, 2, &mut out));
+        assert_eq!(out, [1, 5]);
+        assert!(cursor.read_into(389, 778, 2, &mut out));
+        assert_eq!(out, [1, 5]);
+        let TermPositions::Stream(stream) = cursor.positions else {
+            unreachable!()
+        };
+        assert_eq!(stream.bytes.as_slice(), original);
+    }
+
+    #[test]
+    fn merged_position_cursor_handles_forward_gaps_backward_reads_and_spanning_documents() {
+        let mut docs = Vec::new();
+        let mut sources = Vec::new();
+        for source in 0..40 {
+            let part: Vec<Vec<u32>> = (0..17)
+                .map(|doc| {
+                    (0..1 + (source * 17 + doc) % 301)
+                        .map(|p| p * 3 + doc)
+                        .collect()
+                })
+                .collect();
+            sources.push(encode(&part).0);
+            docs.extend(part);
+        }
+        let mut bytes = Vec::new();
+        PositionStream::concatenate_streaming(
+            &sources.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &mut bytes,
+        )
+        .unwrap();
+        let before = bytes.clone();
+        let mut cursor = TermPositions::open(OwnedBytes::new(bytes))
+            .unwrap()
+            .into_cursor();
+        let mut starts = Vec::new();
+        let mut next = 0u64;
+        for doc in &docs {
+            starts.push(next);
+            next += doc.len() as u64;
+        }
+        let mut out = Vec::new();
+        for at in (0..docs.len())
+            .step_by(7)
+            .chain((0..docs.len()).rev())
+            .chain(0..docs.len())
+        {
+            assert!(cursor.read_into(at as u32, starts[at], docs[at].len() as u32, &mut out));
+            assert_eq!(out, docs[at], "document {at}");
+        }
+        let TermPositions::Stream(stream) = cursor.positions else {
+            unreachable!()
+        };
+        assert_eq!(stream.bytes.as_slice(), before);
+    }
+
+    #[test]
+    fn failed_cross_block_position_read_does_not_publish_a_stale_cached_range() {
+        let (a, _) = encode(&[vec![1, 5, 9]]);
+        let (b, _) = encode(&[(0..300).collect()]);
+        let mut bytes = Vec::new();
+        PositionStream::concatenate_streaming(&[&a, &b], &mut bytes).unwrap();
+        let valid = PositionStream::open(OwnedBytes::new(bytes.clone())).unwrap();
+        let (start, _, _) = valid.block_range(2).unwrap();
+        bytes[start + 2] = 7; // Unsupported width in the middle of a spanning document.
+        assert!(TermPositions::open(OwnedBytes::new(bytes.clone())).is_err());
+        // Bypass public admission only inside this test to exercise defensive
+        // cache replacement after a failed decode. Public open rejects it.
+        let mut malformed = valid;
+        malformed.bytes = OwnedBytes::new(bytes);
+        let mut cursor = TermPositions::Stream(malformed).into_cursor();
+        let mut out = Vec::new();
+        assert!(cursor.read_into(0, 0, 3, &mut out));
+        assert!(!cursor.read_into(1, 3, 300, &mut out));
+        assert_eq!(cursor.cache.index, None);
+        assert!(cursor.read_into(0, 0, 3, &mut out));
+        assert_eq!(out, [1, 5, 9]);
+    }
+
+    #[test]
+    fn position_open_rejects_invalid_headers_directories_and_unaddressed_bytes() {
+        let (bytes, _) = encode(&[(0..300).collect()]);
+        let (_, index_start, _) = PositionStream::parse_layout(&bytes).unwrap();
+        for case in 0..7 {
+            let mut bad = bytes.clone();
+            match case {
+                0 => bad[2] = 7,
+                1 => bad[3] = 2,
+                2 => bad[index_start..index_start + 4].copy_from_slice(&1u32.to_le_bytes()),
+                3 => bad[index_start + 4..index_start + 12].copy_from_slice(&1u64.to_le_bytes()),
+                4 => bad[index_start + INDEX_ENTRY..index_start + INDEX_ENTRY + 4]
+                    .copy_from_slice(&u32::MAX.to_le_bytes()),
+                5 => bad[index_start + INDEX_ENTRY + 4..index_start + INDEX_ENTRY + 12]
+                    .copy_from_slice(&0u64.to_le_bytes()),
+                6 => {
+                    let total_at = bad.len() - FOOTER + 4;
+                    bad[total_at..total_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                PositionStream::open(OwnedBytes::new(bad)).is_err(),
+                "case {case}"
+            );
+        }
+        let (mut empty, _) = encode(&[]);
+        assert!(PositionStream::open(OwnedBytes::new(empty.clone())).is_ok());
+        empty.insert(0, 0);
+        assert!(PositionStream::open(OwnedBytes::new(empty)).is_err());
+        let stream = PositionStream::open(OwnedBytes::new(bytes.clone())).unwrap();
+        assert_eq!(stream.bytes.as_slice(), bytes);
+    }
+
+    #[test]
+    fn position_codecs_round_trip_every_width_and_short_tail() {
+        for codec in [PostingCodec::Rounded, PostingCodec::Simd4x] {
+            for count in [1, 3, 31, 127, 128, 129, 257] {
+                for width in 0..=32 {
+                    let max = if width == 0 {
+                        0
+                    } else {
+                        u32::MAX >> (32 - width)
+                    };
+                    let values: Vec<_> = (0..count)
+                        .map(|i| if i % 3 == 0 { max } else { 0 })
+                        .collect();
+                    let mut bytes = Vec::new();
+                    let mut encoder = PositionStreamEncoder::with_posting_codec(&mut bytes, codec);
+                    encoder.push_values(&values).unwrap();
+                    encoder.finish().unwrap();
+                    let stream = PositionStream::open(OwnedBytes::new(bytes.clone())).unwrap();
+                    let mut actual = Vec::new();
+                    let mut block = Vec::new();
+                    for idx in 0..stream.num_blocks() {
+                        assert!(stream.decode_block(idx, &mut block));
+                        actual.extend_from_slice(&block);
+                        let (start, end, _) = stream.block_range(idx).unwrap();
+                        assert_eq!(
+                            bytes[start + 3],
+                            u8::from(
+                                codec == PostingCodec::Simd4x
+                                    && block.len() == POSITION_STREAM_BLOCK
+                            )
+                        );
+                        if bytes[start + 3] == 0 {
+                            let rounded = simd::RoundedBitWidth::from_exact(simd::bits_needed(
+                                block.iter().copied().max().unwrap(),
+                            ));
+                            let mut expected = Vec::new();
+                            expected.extend_from_slice(&(block.len() as u16).to_le_bytes());
+                            expected.extend_from_slice(&[rounded.as_u8(), 0]);
+                            for value in &block {
+                                expected.extend_from_slice(
+                                    &value.to_le_bytes()[..rounded.bytes_per_value()],
+                                );
+                            }
+                            assert_eq!(&bytes[start..end], expected);
+                        }
+                    }
+                    assert_eq!(actual, values);
+                    for (at, replacement) in [(2, 33), (3, 2)] {
+                        let mut corrupt = bytes.clone();
+                        corrupt[at] = replacement;
+                        assert!(PositionStream::open(OwnedBytes::new(corrupt)).is_err());
+                    }
+                    let mut copied = Vec::new();
+                    PositionStream::concatenate_streaming(&[&bytes], &mut copied).unwrap();
+                    assert_eq!(copied, bytes);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_position_codecs_copy_short_interior_blocks_and_preserve_cursors() {
+        let mut encoded = Vec::new();
+        let mut docs = Vec::new();
+        for codec in [
+            PostingCodec::Simd4x,
+            PostingCodec::Rounded,
+            PostingCodec::Simd4x,
+        ] {
+            let mut bytes = Vec::new();
+            let mut encoder = PositionStreamEncoder::with_posting_codec(&mut bytes, codec);
+            for count in [1, 130, 7, 127] {
+                let mut positions: Vec<_> = (0..count).map(|i| i * 3 + 4).collect();
+                encoder.push_doc(&mut positions).unwrap();
+                docs.push(positions);
+            }
+            encoder.finish().unwrap();
+            encoded.push(bytes);
+        }
+        let mut output = Vec::new();
+        PositionStream::concatenate_streaming(
+            &encoded.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            &mut output,
+        )
+        .unwrap();
+        let stream = PositionStream::open(OwnedBytes::new(output.clone())).unwrap();
+        assert!(!stream.canonical_blocks);
+        let mut next = 0;
+        for source in encoded {
+            let source = PositionStream::open(OwnedBytes::new(source)).unwrap();
+            for idx in 0..source.num_blocks() {
+                let (start, end, _) = source.block_range(idx).unwrap();
+                let (out_start, out_end, _) = stream.block_range(next).unwrap();
+                assert_eq!(
+                    &output[out_start..out_end],
+                    &source.bytes.as_slice()[start..end]
+                );
+                next += 1;
+            }
+        }
+        let mut starts = vec![0u64];
+        for doc in &docs {
+            starts.push(starts.last().unwrap() + doc.len() as u64);
+        }
+        let mut cursor = TermPositions::Stream(stream).into_cursor();
+        let mut actual = Vec::new();
+        for i in (0..docs.len()).chain((0..docs.len()).rev()) {
+            assert!(cursor.read_into(i as u32, starts[i], docs[i].len() as u32, &mut actual));
+            assert_eq!(actual, docs[i]);
+        }
+    }
 
     #[test]
     fn term_cursor_reuses_blocks_and_isolates_terms_and_backward_seeks() {
@@ -834,45 +1538,67 @@ mod tests {
         assert_eq!(copied, encoded);
     }
 
-    /// Size of the two formats on a synthetic "content" term: run with
-    /// `cargo test -p hermes-core --lib -- --ignored --nocapture positions_v2`.
+    /// The encoder only emits BitPacker4x (codec 1) for full 128-value
+    /// blocks; a short codec-1 block is an encoding no writer produces and
+    /// must be rejected at open instead of being decoded by the tail path.
     #[test]
-    #[ignore]
-    fn size_comparison_report() {
-        // 20k chunks of ~200 tokens, term frequency 1–4, positions spread
-        // over the chunk (the shape of a mid-frequency stem in `content`).
-        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
-        let mut rng = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed
-        };
-        let docs: Vec<Vec<u32>> = (0..20_000)
-            .map(|_| {
-                let tf = (rng() % 4 + 1) as usize;
-                let mut p: Vec<u32> = (0..tf).map(|_| (rng() % 200) as u32).collect();
-                p.sort_unstable();
-                p
-            })
-            .collect();
-        let mut legacy = PositionPostingList::new();
-        for (i, doc) in docs.iter().enumerate() {
-            legacy.push(i as u32 * 3, doc.clone());
+    fn short_bitpacker_block_is_rejected_as_corruption() {
+        fn assemble(count: usize, width: u8, codec: u8, payload_len: usize) -> Vec<u8> {
+            let mut raw = Vec::new();
+            raw.extend_from_slice(&(count as u16).to_le_bytes());
+            raw.extend_from_slice(&[width, codec]);
+            raw.extend(std::iter::repeat_n(0u8, payload_len));
+            let block_len = raw.len();
+            raw.write_u32::<LittleEndian>(0).unwrap();
+            raw.write_u64::<LittleEndian>(0).unwrap();
+            raw.write_u32::<LittleEndian>(1).unwrap();
+            raw.write_u64::<LittleEndian>(count as u64).unwrap();
+            raw.write_u32::<LittleEndian>(MAGIC).unwrap();
+            assert_eq!(raw.len(), block_len + INDEX_ENTRY + FOOTER);
+            raw
         }
-        let mut legacy_bytes = Vec::new();
-        legacy.serialize(&mut legacy_bytes).unwrap();
-        let (v2, total) = encode(&docs);
-        let cursors = docs.len().div_ceil(128) * 8;
-        eprintln!(
-            "positions: legacy {} B, v2 {} B (+{} B cursors) for {} values -> {:.2} vs {:.2} B/pos",
-            legacy_bytes.len(),
-            v2.len(),
-            cursors,
-            total,
-            legacy_bytes.len() as f64 / total as f64,
-            (v2.len() + cursors) as f64 / total as f64
+        for count in [1usize, 5, 64, 127] {
+            for width in [0u8, 3, 8, 32] {
+                let short = assemble(count, width, 1, bitpacking4x::encoded_len(count, width));
+                let block = &short[..short.len() - INDEX_ENTRY - FOOTER];
+                assert_eq!(
+                    PositionStream::block_count(block),
+                    None,
+                    "count={count} width={width}"
+                );
+                assert!(
+                    PositionStream::open(OwnedBytes::new(short)).is_err(),
+                    "count={count} width={width}"
+                );
+            }
+        }
+        // The same shapes with codec 0 (what the encoder actually emits for a
+        // short block) and a full codec-1 block remain admitted.
+        for count in [1usize, 5, 64, 127] {
+            let rounded = assemble(count, 8, 0, count);
+            assert!(PositionStream::open(OwnedBytes::new(rounded)).is_ok());
+        }
+        let full = assemble(
+            POSITION_STREAM_BLOCK,
+            3,
+            1,
+            bitpacking4x::encoded_len(POSITION_STREAM_BLOCK, 3),
         );
+        let stream = PositionStream::open(OwnedBytes::new(full)).unwrap();
+        let mut block = Vec::new();
+        assert!(stream.decode_block(0, &mut block));
+        assert_eq!(block, vec![0; POSITION_STREAM_BLOCK]);
+        // The encoder agrees: a Simd4x stream with a short tail tags it 0.
+        let mut bytes = Vec::new();
+        let mut encoder =
+            PositionStreamEncoder::with_posting_codec(&mut bytes, PostingCodec::Simd4x);
+        encoder.push_values(&[1; 130]).unwrap();
+        encoder.finish().unwrap();
+        let stream = PositionStream::open(OwnedBytes::new(bytes.clone())).unwrap();
+        let (start, _, _) = stream.block_range(0).unwrap();
+        assert_eq!(bytes[start + 3], 1);
+        let (start, _, _) = stream.block_range(1).unwrap();
+        assert_eq!(bytes[start + 3], 0);
     }
 
     #[test]

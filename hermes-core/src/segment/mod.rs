@@ -17,6 +17,7 @@ mod builder;
 pub(crate) use builder::bmp::build_bmp_blob;
 pub mod chunk_map;
 pub(crate) mod deletion;
+pub(crate) mod norms;
 pub use deletion::DeletionMeta;
 pub(crate) mod format;
 pub(crate) mod logical_address;

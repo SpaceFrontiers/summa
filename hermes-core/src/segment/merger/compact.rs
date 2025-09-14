@@ -1,6 +1,8 @@
 //! Lossless compaction of one immutable segment, through owning encoders.
 use super::*;
-use crate::segment::chunk_map::{ChunkMapBuilder, DocLengthsColumn, write_chunk_maps};
+use crate::segment::chunk_map::{
+    ChunkMapBuilder, DocLengthsColumn, write_chunk_maps_with_norm_policy,
+};
 use crate::segment::row_map::RowMap;
 use crate::structures::fast_field::{
     BLOCK_INDEX_ENTRY_SIZE, FastFieldReader, write_fast_field_toc_and_footer,
@@ -284,8 +286,10 @@ impl SegmentMerger {
                         })?;
                 }
             }
-            if entry.chunked {
-                stat.doc_count = 0;
+            if source.has_text_mapping(field) {
+                if entry.chunked {
+                    stat.doc_count = 0;
+                }
                 if let Some(source_map) = source.chunk_map(field) {
                     let map = RowMap::try_new(
                         source_map.num_chunks(),
@@ -303,6 +307,7 @@ impl SegmentMerger {
                         .saturating_add(map.len() as usize * 8);
                     admit(retained_bytes, budget / 2)?;
                     let mut builder = ChunkMapBuilder::with_capacity(map.len() as usize);
+                    builder.set_document_units(source_map.is_document_map());
                     for (visited, old) in map.iter().enumerate() {
                         if visited.is_multiple_of(4096) {
                             self.ensure_not_cancelled()?;
@@ -310,7 +315,9 @@ impl SegmentMerger {
                         let (doc, ordinal) = source_map.resolve(old);
                         builder.push(rows.get(doc).unwrap(), ordinal, source_map.length(old))?;
                     }
-                    stat.doc_count = map.len();
+                    if entry.chunked {
+                        stat.doc_count = map.len();
+                    }
                     builder.set_total_tokens(stat.total_tokens);
                     chunks.push((field.0, builder));
                     maps.insert(field.0, map);
@@ -344,7 +351,11 @@ impl SegmentMerger {
             .collect();
         if !chunk_refs.is_empty() || !norm_refs.is_empty() {
             let mut writer = dir.streaming_writer_cold(&files.chunks).await?;
-            write_chunk_maps(&mut *writer, &chunk_refs, &norm_refs)?;
+            write_chunk_maps_with_norm_policy(&mut *writer, &chunk_refs, &norm_refs, |field_id| {
+                source
+                    .doc_lengths(crate::Field(field_id))
+                    .is_some_and(|lengths| lengths.is_quantized())
+            })?;
             writer.finish()?;
         }
         Ok((statistics, maps))
@@ -368,7 +379,10 @@ impl SegmentMerger {
         let mut terms_out = OffsetWriter::new(dir.streaming_writer_cold(&files.term_dict).await?);
         let mut terms = SSTableWriter::<_, TermInfo>::with_config(
             &mut terms_out,
-            crate::structures::SSTableWriterConfig::from_optimization(self.optimization),
+            crate::structures::SSTableWriterConfig {
+                block_size: self.term_dict_block_size,
+                ..crate::structures::SSTableWriterConfig::from_optimization(self.optimization)
+            },
         );
         let mut iter = source.term_dict_iter();
         let mut count = 0;
@@ -455,8 +469,26 @@ impl SegmentMerger {
                     self.posting_codec,
                     budget / 4,
                 )?;
-                let mut position_output =
-                    PositionStreamEncoder::with_budget(&mut positions, budget / 4);
+                if input.is_compact() && self.posting_codec != crate::structures::PostingCodec::Pfor
+                {
+                    output.enable_compact_headers()?;
+                }
+                if input.has_impact_bounds() {
+                    output.enable_impact_bounds()?;
+                } else if input.has_ratio_bounds() {
+                    output.enable_ratio_bounds()?;
+                }
+                let mut position_output = PositionStreamEncoder::with_budget(
+                    &mut positions,
+                    budget / 4,
+                    self.posting_codec,
+                );
+                if source_positions
+                    .as_ref()
+                    .is_some_and(PositionRangeSource::is_compact)
+                {
+                    position_output = position_output.with_compact_directory();
+                }
                 let mut docs = Vec::with_capacity(crate::structures::postings::POSTING_BLOCK_SIZE);
                 let mut tfs = Vec::with_capacity(crate::structures::postings::POSTING_BLOCK_SIZE);
                 for i in 0..input.len() {
@@ -500,9 +532,11 @@ impl SegmentMerger {
                     let mut cursor = span.start;
                     for (&old, &tf) in docs.iter().zip(&tfs) {
                         if let Some(new) = map.get(old) {
+                            // The replacement map can have a lower BM25 floor
+                            // after deletion. Bounds must use raw surviving lengths.
                             let length = source.chunk_map(field).map_or_else(
                                 || source.doc_lengths(field).map_or(1, |norm| norm.length(old)),
-                                |map| map.bm25_length(old),
+                                |map| map.length(old),
                             );
                             output.push(new, tf, length)?;
                             if let Some(positions) = &mut source_positions {
@@ -571,7 +605,100 @@ mod tests {
     use crate::structures::fast_field::{FastFieldColumnType, FastFieldWriter};
 
     #[tokio::test]
+    async fn compaction_preserves_mixed_norm_encodings_per_field() {
+        use crate::segment::builder::{SegmentBuilder, SegmentBuilderConfig};
+        use crate::segment::chunk_map::{
+            read_chunk_maps, write_chunk_maps_with_copied_norms, write_chunk_maps_with_norms,
+        };
+        let mut schema = crate::Schema::builder();
+        let exact = schema.add_text_field("exact", true, false);
+        let quantized = schema.add_text_field("quantized", true, false);
+        let schema = Arc::new(schema.build());
+        let dir = crate::RamDirectory::new();
+        let id = SegmentId::new();
+        let mut builder =
+            SegmentBuilder::new(schema.clone(), SegmentBuilderConfig::default()).unwrap();
+        for _ in 0..16 {
+            let mut doc = crate::Document::new();
+            doc.add_text(exact, "term ".repeat(32));
+            doc.add_text(quantized, "term ".repeat(32));
+            builder.add_document(doc).unwrap();
+        }
+        builder.build(&dir, id, None).await.unwrap();
+        let files = SegmentFiles::new(id.0);
+        let original = read_chunk_maps(
+            dir.open_read(&files.chunks)
+                .await
+                .unwrap()
+                .read_bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        write_chunk_maps_with_norms(
+            &mut bytes,
+            &[],
+            &[DocLengthsColumn {
+                field_id: quantized.0,
+                lengths: &[32; 16],
+                total_tokens: 512,
+            }],
+            true,
+        )
+        .unwrap();
+        let byte_column = read_chunk_maps(crate::directories::OwnedBytes::new(bytes)).unwrap();
+        let mut mixed = Vec::new();
+        write_chunk_maps_with_copied_norms(
+            &mut mixed,
+            &[],
+            &[
+                (exact.0, &original.doc_lengths[&exact.0]),
+                (quantized.0, &byte_column.doc_lengths[&quantized.0]),
+            ],
+        )
+        .unwrap();
+        // Assemble the fixture before opening its immutable reader. Length 32
+        // is exactly representable, so its existing posting bounds stay valid.
+        dir.write(&files.chunks, &mixed).await.unwrap();
+        let source = SegmentReader::open(&dir, id, schema.clone(), 4)
+            .await
+            .unwrap();
+        let rows = RowMap::new(16, 16, |doc| doc % 2 == 0, 1024).unwrap();
+        let output = SegmentFiles::new(SegmentId::new().0);
+        SegmentMerger::new(schema)
+            .compact_text_maps(&dir, &source, &rows, &output, 1024 * 1024)
+            .await
+            .unwrap();
+        let columns = read_chunk_maps(
+            dir.open_read(&output.chunks)
+                .await
+                .unwrap()
+                .read_bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        for (field, encoded) in [(exact, false), (quantized, true)] {
+            let lengths = &columns.doc_lengths[&field.0];
+            assert_eq!(lengths.is_quantized(), encoded);
+            assert_eq!(lengths.num_docs(), 8);
+            assert_eq!(lengths.total_tokens(), 256);
+            assert!((0..8).all(|doc| lengths.length(doc) == 32));
+        }
+    }
+
+    #[tokio::test]
     async fn frequent_terms_compact_with_block_sized_decoding_and_preserve_positions() {
+        check_frequent_compaction(false).await;
+    }
+
+    #[tokio::test]
+    async fn compact_layout_survives_dense_and_sparse_row_compaction() {
+        check_frequent_compaction(true).await;
+    }
+
+    async fn check_frequent_compaction(compact: bool) {
         use crate::directories::{Directory, RamDirectory};
         use crate::structures::{TERMINATED, TermPositions};
         let mut schema = crate::SchemaBuilder::default();
@@ -583,6 +710,8 @@ mod tests {
             dir.clone(),
             schema.clone(),
             crate::IndexConfig {
+                compact_text: compact,
+                quantized_norms: compact,
                 merge_policy: Box::new(crate::NoMergePolicy),
                 ..Default::default()
             },
@@ -633,6 +762,14 @@ mod tests {
                 .read_bytes()
                 .await
                 .unwrap();
+            if compact {
+                let flags = u32::from_le_bytes(
+                    posting_bytes[posting_bytes.len() - 12..posting_bytes.len() - 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                assert_ne!(flags & 64, 0, "compaction retains separated headers");
+            }
             let postings = BlockPostingList::deserialize(posting_bytes.as_slice()).unwrap();
             assert_eq!(postings.doc_count(), rows.len());
             if sparse {
@@ -649,6 +786,9 @@ mod tests {
                 .read_bytes()
                 .await
                 .unwrap();
+            if compact {
+                assert_eq!(&position_bytes[position_bytes.len() - 4..], b"POS4");
+            }
             let positions = TermPositions::open(position_bytes).unwrap();
             let mut cursor = postings.iterator();
             let mut scratch = Vec::new();

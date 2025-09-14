@@ -876,8 +876,10 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     optimization: crate::structures::IndexOptimization,
     /// Posting codec used by new segments and merge re-encoding.
     posting_codec: crate::structures::PostingCodec,
+    term_dict_block_size: crate::structures::SSTableBlockSize,
     /// Term cache blocks for segment readers during merge
     term_cache_blocks: usize,
+    term_cache_budget_bytes: Option<usize>,
     /// Hard concurrency limit for background merges. A semaphore permit is
     /// acquired before lifecycle ownership, closing the old handle-count race
     /// where concurrent schedulers could exceed the configured maximum.
@@ -1029,7 +1031,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             schema,
             optimization: crate::structures::IndexOptimization::default(),
             posting_codec: crate::structures::PostingCodec::default(),
+            term_dict_block_size: crate::structures::SSTableBlockSize::default(),
             term_cache_blocks,
+            term_cache_budget_bytes: None,
             merge_permits: Arc::new(Semaphore::new(max_concurrent_merges.max(1))),
             global_merge_permits,
             reorder_permits,
@@ -1041,8 +1045,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Set the persisted text-index layout selected by `IndexConfig` (or by
-    /// an explicit `SegmentBuilderConfig` override).
+    /// Cap decompressed dictionary blocks retained by lifecycle readers.
+    /// None retains the block-count policy; zero disables retention.
+    pub fn with_term_cache_budget(mut self, bytes: Option<usize>) -> Self {
+        self.term_cache_budget_bytes = bytes;
+        self
+    }
+
+    /// Set the validated flush target for newly written term dictionaries.
+    pub fn with_term_dict_block_size(mut self, size: crate::structures::SSTableBlockSize) -> Self {
+        self.term_dict_block_size = size;
+        self
+    }
+
+    /// Configure posting compression for newly encoded output.
     pub fn with_posting_config(
         mut self,
         optimization: crate::structures::IndexOptimization,
@@ -2103,8 +2119,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             ids,
             output_id,
             self.term_cache_blocks,
+            self.term_cache_budget_bytes,
             self.optimization,
             self.posting_codec,
+            self.term_dict_block_size,
             trained.as_deref(),
             reorder_bmp,
             granularity,
@@ -2190,11 +2208,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let output_id = SegmentId::from_hex(&new_id).ok_or_else(|| {
             Error::Corruption(format!("invalid replacement segment ID: {new_id}"))
         })?;
-        let output_reader = SegmentReader::open(
+        let output_reader = SegmentReader::open_with_term_cache_budget(
             self.directory.as_ref(),
             output_id,
             self.published_generation().schema.clone(),
             self.term_cache_blocks,
+            self.term_cache_budget_bytes,
         )
         .await
         .map_err(|error| match error {
@@ -2436,8 +2455,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         segment_ids_to_merge: &[String],
         output_segment_id: SegmentId,
         term_cache_blocks: usize,
+        term_cache_budget_bytes: Option<usize>,
         optimization: crate::structures::IndexOptimization,
         posting_codec: crate::structures::PostingCodec,
+        term_dict_block_size: crate::structures::SSTableBlockSize,
         trained: Option<&TrainedVectorStructures>,
         reorder_bmp: bool,
         granularity: crate::segment::reorder::BpGranularity,
@@ -2500,7 +2521,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .iter()
             .map(|&sid| {
                 let sch = Arc::clone(&schema_arc);
-                async move { SegmentReader::open(directory, sid, sch, term_cache_blocks).await }
+                async move {
+                    SegmentReader::open_with_term_cache_budget(
+                        directory,
+                        sid,
+                        sch,
+                        term_cache_blocks,
+                        term_cache_budget_bytes,
+                    )
+                    .await
+                }
             })
             .collect();
 
@@ -2558,6 +2588,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let merger = SegmentMerger::new(Arc::clone(schema))
             .with_posting_config(optimization, posting_codec)
+            .with_term_dict_block_size(term_dict_block_size)
             .with_bmp_reorder(reorder_bmp)
             .with_granularity(granularity)
             .with_bp_budget(crate::segment::BpBudget {
@@ -3431,11 +3462,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 }
             })?;
 
-            let reader = SegmentReader::open(
+            let reader = SegmentReader::open_with_term_cache_budget(
                 self.directory.as_ref(),
                 source_id,
                 Arc::clone(&source_schema),
                 self.term_cache_blocks,
+                self.term_cache_budget_bytes,
             )
             .await?;
             if !self.segment_needs_vector_rewrite(
@@ -3460,11 +3492,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 )
                 .await?;
             debug_assert_eq!(new_id, output_hex);
-            let output_reader = SegmentReader::open(
+            let output_reader = SegmentReader::open_with_term_cache_budget(
                 self.directory.as_ref(),
                 output_id,
                 Arc::clone(&schema),
                 self.term_cache_blocks,
+                self.term_cache_budget_bytes,
             )
             .await?;
             if self.segment_needs_vector_rewrite(
@@ -3531,11 +3564,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         };
         let schema = self.published_generation().schema.clone();
 
-        let reader = SegmentReader::open(
+        let reader = SegmentReader::open_with_term_cache_budget(
             self.directory.as_ref(),
             source_id,
             Arc::clone(&schema),
             self.term_cache_blocks,
+            self.term_cache_budget_bytes,
         )
         .await?;
         if !self.segment_needs_vector_rewrite(
@@ -3972,11 +4006,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             source_id,
             output_id,
             self.term_cache_blocks,
+            self.term_cache_budget_bytes,
             self.bp_memory_budget_bytes,
             bp_budget,
             granularity,
             self.optimization,
             self.posting_codec,
+            self.term_dict_block_size,
             rayon_pool,
             Some(self.active_operations.cancellation_flag()),
         )

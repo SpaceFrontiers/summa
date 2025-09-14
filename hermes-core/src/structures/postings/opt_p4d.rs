@@ -108,56 +108,24 @@ pub(crate) fn pack_with_exceptions(values: &[u32], bit_width: u8) -> (Vec<u8>, V
         return (Vec::new(), exceptions);
     }
 
+    let mut packed = Vec::new();
     if bit_width >= 32 {
         // No exceptions possible, just pack all 32 bits
-        let bytes_needed = values.len() * 4;
-        let mut packed = vec![0u8; bytes_needed];
-        for (i, &value) in values.iter().enumerate() {
-            let bytes = value.to_le_bytes();
-            packed[i * 4..i * 4 + 4].copy_from_slice(&bytes);
-        }
+        super::horizontal_bp128::pack_block_n(values, 32, &mut packed);
         return (packed, Vec::new());
     }
 
-    let mask = (1u64 << bit_width) - 1;
-    let bytes_needed = (values.len() * bit_width as usize).div_ceil(8);
-    let mut packed = vec![0u8; bytes_needed];
-    let mut exceptions = Vec::new();
-
-    let mut bit_pos = 0usize;
-    for (i, &value) in values.iter().enumerate() {
-        // Store lower b bits in main array (for ALL values, including exceptions)
-        let low_bits = (value as u64) & mask;
-
-        // Write low bits to packed array
-        let byte_idx = bit_pos / 8;
-        let bit_offset = bit_pos % 8;
-
-        let mut remaining_bits = bit_width as usize;
-        let mut val = low_bits;
-        let mut current_byte_idx = byte_idx;
-        let mut current_bit_offset = bit_offset;
-
-        while remaining_bits > 0 {
-            let bits_in_byte = (8 - current_bit_offset).min(remaining_bits);
-            let byte_mask = ((1u64 << bits_in_byte) - 1) as u8;
-            packed[current_byte_idx] |= ((val as u8) & byte_mask) << current_bit_offset;
-            val >>= bits_in_byte;
-            remaining_bits -= bits_in_byte;
-            current_byte_idx += 1;
-            current_bit_offset = 0;
-        }
-
-        bit_pos += bit_width as usize;
-
-        // Record exception: store only the HIGH (32-b) bits
-        let fits = value <= mask as u32;
-        if !fits {
-            let high_bits = value >> bit_width;
-            exceptions.push((i as u8, high_bits));
-        }
-    }
-
+    // Low b bits of every value go through the shared little-endian packer;
+    // the high bits of values that do not fit become exceptions.
+    let mask = u32::MAX >> (32 - bit_width);
+    let low: Vec<u32> = values.iter().map(|&value| value & mask).collect();
+    super::horizontal_bp128::pack_block_n(&low, bit_width, &mut packed);
+    let exceptions = values
+        .iter()
+        .enumerate()
+        .filter(|&(_, &value)| value > mask)
+        .map(|(i, &value)| (i as u8, value >> bit_width))
+        .collect();
     (packed, exceptions)
 }
 
@@ -176,43 +144,9 @@ pub(crate) fn unpack_with_exceptions(
     count: usize,
     output: &mut [u32],
 ) {
-    if bit_width == 0 {
-        output[..count].fill(0);
-    } else if bit_width == 8 {
-        // SIMD-accelerated 8-bit unpacking
-        simd::unpack_8bit(packed, output, count);
-    } else if bit_width == 16 {
-        // SIMD-accelerated 16-bit unpacking
-        simd::unpack_16bit(packed, output, count);
-    } else if bit_width >= 32 {
-        // SIMD-accelerated 32-bit unpacking
-        simd::unpack_32bit(packed, output, count);
-        return; // No exceptions for 32-bit
-    } else {
-        // Generic bit unpacking for other bit widths
-        let mask = (1u64 << bit_width) - 1;
-        let mut bit_pos = 0usize;
-        let input_ptr = packed.as_ptr();
-
-        for out in output[..count].iter_mut() {
-            let byte_idx = bit_pos >> 3;
-            let bit_offset = bit_pos & 7;
-
-            // Read 8 bytes at once for efficiency
-            let word = if byte_idx + 8 <= packed.len() {
-                unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() }
-            } else {
-                // Handle edge case near end of buffer
-                let mut word = 0u64;
-                for (i, &b) in packed[byte_idx..].iter().enumerate() {
-                    word |= (b as u64) << (i * 8);
-                }
-                word
-            };
-
-            *out = ((word >> bit_offset) & mask) as u32;
-            bit_pos += bit_width as usize;
-        }
+    super::horizontal_bp128::unpack_block_n(packed, bit_width, output, count);
+    if bit_width == 32 {
+        return; // No exceptions for 32-bit values.
     }
 
     // Apply exceptions: combine high bits with low bits already in output
@@ -225,10 +159,11 @@ pub(crate) fn unpack_with_exceptions(
     }
 }
 
-/// Fused unpack + exceptions + delta decode for doc_ids
+/// Unpack + exceptions + delta decode for doc_ids.
 ///
-/// Combines unpacking, exception application, and prefix sum in a single pass.
-/// Avoids intermediate buffer allocation.
+/// The `count - 1` gap-minus-one deltas are decoded in place through the
+/// bounded shared unpacker (never reading past `packed`), then turned into
+/// absolute ids by one prefix-sum pass.
 #[inline]
 fn unpack_exceptions_delta_decode(
     packed: &[u8],
@@ -247,96 +182,12 @@ fn unpack_exceptions_delta_decode(
         return;
     }
 
-    // Build exception lookup for O(1) access
-    // Since exceptions are sparse (typically <5%), a simple linear scan is fine
-    // But for very large blocks, we could use a small hashmap
-
-    let mask = if bit_width < 32 {
-        (1u64 << bit_width) - 1
-    } else {
-        u64::MAX
-    };
-
+    let deltas = &mut output[1..count];
+    unpack_with_exceptions(packed, bit_width, exceptions, count - 1, deltas);
     let mut carry = first_doc_id;
-
-    // Fast path for SIMD-friendly bit widths
-    match bit_width {
-        0 => {
-            // All zeros = consecutive doc IDs (gap of 1)
-            for item in output.iter_mut().take(count).skip(1) {
-                carry = carry.wrapping_add(1);
-                *item = carry;
-            }
-        }
-        8 => {
-            // Unpack 8-bit, apply exceptions, delta decode in one pass
-            for i in 0..count - 1 {
-                let mut delta = packed[i] as u32;
-                // Check for exception at this position
-                for &(pos, high_bits) in exceptions {
-                    if pos as usize == i {
-                        delta |= high_bits << bit_width;
-                        break;
-                    }
-                }
-                carry = carry.wrapping_add(delta).wrapping_add(1);
-                output[i + 1] = carry;
-            }
-        }
-        16 => {
-            // Unpack 16-bit, apply exceptions, delta decode in one pass
-            for i in 0..count - 1 {
-                let idx = i * 2;
-                let mut delta = u16::from_le_bytes([packed[idx], packed[idx + 1]]) as u32;
-                for &(pos, high_bits) in exceptions {
-                    if pos as usize == i {
-                        delta |= high_bits << bit_width;
-                        break;
-                    }
-                }
-                carry = carry.wrapping_add(delta).wrapping_add(1);
-                output[i + 1] = carry;
-            }
-        }
-        32 => {
-            // 32-bit has no exceptions
-            for i in 0..count - 1 {
-                let idx = i * 4;
-                let delta = u32::from_le_bytes([
-                    packed[idx],
-                    packed[idx + 1],
-                    packed[idx + 2],
-                    packed[idx + 3],
-                ]);
-                carry = carry.wrapping_add(delta).wrapping_add(1);
-                output[i + 1] = carry;
-            }
-        }
-        _ => {
-            // Generic bit width
-            let input_ptr = packed.as_ptr();
-            let mut bit_pos = 0usize;
-
-            for i in 0..count - 1 {
-                let byte_idx = bit_pos >> 3;
-                let bit_offset = bit_pos & 7;
-
-                let word = unsafe { (input_ptr.add(byte_idx) as *const u64).read_unaligned() };
-                let mut delta = ((word >> bit_offset) & mask) as u32;
-
-                // Check for exception
-                for &(pos, high_bits) in exceptions {
-                    if pos as usize == i {
-                        delta |= high_bits << bit_width;
-                        break;
-                    }
-                }
-
-                carry = carry.wrapping_add(delta).wrapping_add(1);
-                output[i + 1] = carry;
-                bit_pos += bit_width as usize;
-            }
-        }
+    for slot in deltas {
+        carry = carry.wrapping_add(*slot).wrapping_add(1);
+        *slot = carry;
     }
 }
 

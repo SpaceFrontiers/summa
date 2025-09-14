@@ -362,6 +362,15 @@ pub struct IndexConfig {
     pub num_compression_threads: usize,
     /// Block cache size for term dictionary per segment
     pub term_cache_blocks: usize,
+    /// Optional per-segment cap on retained decompressed dictionary-block bytes.
+    /// None preserves the block-count policy; zero disables retention.
+    pub term_cache_budget_bytes: Option<usize>,
+    /// Flush target for newly written term dictionaries; default 16 KiB.
+    pub term_dict_block_size: crate::structures::SSTableBlockSize,
+    /// Shared per-segment byte budget for document/position posting validation on
+    /// immutable mmap/RAM handles. Default 0 disables reuse; maximum 64 MiB.
+    /// Old reader generations may overlap. Lazy handles always revalidate.
+    pub posting_validation_cache_bytes: usize,
     /// Process-wide byte budget for decompressed document-store blocks.
     ///
     /// Indexes opened with the same budget share one read-concurrent,
@@ -387,6 +396,22 @@ pub struct IndexConfig {
     /// Explicit posting block codec; `None` derives it from `optimization`
     /// (`size` → `Pfor`, everything else → `Rounded`).
     pub posting_codec: Option<crate::structures::PostingCodec>,
+    /// New plain-text columns use versioned byte4 norms. Existing segments retain their scores.
+    pub quantized_norms: bool,
+    /// New position streams use a compact directory separate from payload pages.
+    pub compact_text: bool,
+    /// Opt in to compact, score-independent length/TF block bounds.
+    ///
+    /// Applies to new segments only. Merges, compaction, and reorder copy or
+    /// re-encode each list in the representation its sources already have:
+    /// existing blocks keep their layout and are never upgraded, not even by
+    /// `force_merge`. Rebuild (re-index) to add bounds to old data. Opening
+    /// an index whose segments lack the enabled bounds logs this once.
+    pub posting_ratio_bounds: bool,
+    /// Opt in to bounded competitive frequency/length envelopes. Implies ratio
+    /// bounds (`effective_posting_bounds`). Same new-segments-only policy as
+    /// `posting_ratio_bounds`.
+    pub posting_impact_bounds: bool,
     /// Reload interval in milliseconds for IndexReader (how often to check for new segments)
     pub reload_interval_ms: u64,
     /// Maximum number of concurrent background merges per index (default: 4)
@@ -557,6 +582,9 @@ impl Default for IndexConfig {
             num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
             term_cache_blocks: 256,
+            term_cache_budget_bytes: None,
+            term_dict_block_size: crate::structures::SSTableBlockSize::default(),
+            posting_validation_cache_bytes: 0,
             // Stored bodies can be much larger than the writer's nominal
             // 16-KiB block target. Keep this process-wide and byte bounded so
             // segment fan-out cannot multiply it into tens of GiB.
@@ -577,6 +605,10 @@ impl Default for IndexConfig {
             merge_policy: Box::new(crate::merge::TieredMergePolicy::large_scale()),
             optimization: crate::structures::IndexOptimization::default(),
             posting_codec: None,
+            quantized_norms: false,
+            compact_text: false,
+            posting_ratio_bounds: false,
+            posting_impact_bounds: false,
             reload_interval_ms: 1000, // 1 second default
             max_concurrent_merges: 4,
             #[cfg(feature = "native")]
@@ -603,11 +635,158 @@ impl Default for IndexConfig {
     }
 }
 
+/// Largest `IndexConfig::term_cache_blocks`; the per-segment dictionary block
+/// cache is sized by count and this keeps a typo from pinning a whole
+/// dictionary per segment.
+pub const MAX_TERM_CACHE_BLOCKS: usize = 65_536;
+
+/// Reject an out-of-range dictionary block cap before any segment is opened.
+#[cfg(feature = "native")]
+pub(crate) fn validate_term_cache_blocks(blocks: usize) -> crate::Result<()> {
+    if blocks > MAX_TERM_CACHE_BLOCKS {
+        return Err(crate::Error::Internal(format!(
+            "IndexConfig.term_cache_blocks must be at most {MAX_TERM_CACHE_BLOCKS} (got {blocks})"
+        )));
+    }
+    Ok(())
+}
+
+/// Block-bound metadata layout new posting lists are written with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PostingBounds {
+    /// Score-independent length/TF ratio minima per block and L1 group.
+    pub ratio: bool,
+    /// Competitive frequency/length envelopes (always together with ratios).
+    pub impact: bool,
+}
+
+impl PostingBounds {
+    pub(crate) fn new(ratio: bool, impact: bool) -> Self {
+        Self {
+            ratio: ratio || impact,
+            impact,
+        }
+    }
+}
+
 impl IndexConfig {
     /// Posting block codec new segments and merges are written with.
     pub fn effective_posting_codec(&self) -> crate::structures::PostingCodec {
         self.posting_codec
             .unwrap_or_else(|| self.optimization.default_posting_codec())
+    }
+
+    /// Block-bound metadata new segments are written with. Impact bounds
+    /// imply ratio bounds; this is the single place that rule is applied.
+    pub fn effective_posting_bounds(&self) -> PostingBounds {
+        PostingBounds::new(self.posting_ratio_bounds, self.posting_impact_bounds)
+    }
+}
+
+/// Segments probed by [`segments_missing_posting_bounds`] and dictionary
+/// entries scanned per segment before the probe gives up as inconclusive.
+#[cfg(feature = "native")]
+const POSTING_BOUNDS_PROBE_SEGMENTS: usize = 32;
+#[cfg(feature = "native")]
+const POSTING_BOUNDS_PROBE_TERMS: usize = 4096;
+
+/// Existing segments whose posting lists lack the block-bound metadata
+/// `config` enables (`posting_ratio_bounds` / `posting_impact_bounds`).
+///
+/// Bounds apply to new segments only; nothing upgrades old blocks. This
+/// probe reads one term dictionary prefix and one external posting list per
+/// segment (bounded by the constants above) so an operator learns at open
+/// time that the option is not retroactive. Returns `(missing, probed)`.
+/// Impact envelopes exist only on multi-block lists, so the probe checks
+/// ratio metadata, which both options write.
+#[cfg(feature = "native")]
+pub(crate) async fn segments_missing_posting_bounds<D: crate::directories::Directory>(
+    directory: &D,
+    metadata: &IndexMetadata,
+    config: &IndexConfig,
+) -> Result<(Vec<String>, usize)> {
+    use crate::segment::{SegmentFiles, SegmentId};
+    use crate::structures::{AsyncSSTableReader, BlockPostingList, TermInfo};
+
+    let mut missing = Vec::new();
+    let mut probed = 0usize;
+    if !config.effective_posting_bounds().ratio {
+        return Ok((missing, probed));
+    }
+    for id in metadata
+        .segment_ids()
+        .into_iter()
+        .take(POSTING_BOUNDS_PROBE_SEGMENTS)
+    {
+        let Some(segment_id) = SegmentId::from_hex(&id) else {
+            continue;
+        };
+        let files = SegmentFiles::new(segment_id.0);
+        if !directory.exists(&files.term_dict).await? {
+            continue;
+        }
+        let term_dict = AsyncSSTableReader::<TermInfo>::open_with_cache_budget(
+            directory.open_lazy(&files.term_dict).await?,
+            1,
+            None,
+        )
+        .await?;
+        let mut terms = term_dict.iter();
+        let mut external = None;
+        for _ in 0..POSTING_BOUNDS_PROBE_TERMS {
+            match terms.next().await? {
+                Some((_, info)) => {
+                    if let Some(range) = info.external_info() {
+                        external = Some(range);
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+        let Some((offset, len)) = external else {
+            continue;
+        };
+        let postings = directory.open_lazy(&files.postings).await?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            crate::Error::Corruption("posting range overflow while probing bounds".into())
+        })?;
+        let list =
+            BlockPostingList::deserialize_zero_copy(postings.read_bytes_range(offset..end).await?)?;
+        probed += 1;
+        if !list.has_ratio_bounds() {
+            missing.push(id);
+        }
+    }
+    Ok((missing, probed))
+}
+
+/// Log once per open when enabled posting bounds do not cover existing
+/// segments. Probe failures are logged, never fatal: a corrupt segment fails
+/// loudly when it is actually opened.
+#[cfg(feature = "native")]
+async fn log_posting_bounds_policy<D: crate::directories::Directory>(
+    directory: &D,
+    metadata: &IndexMetadata,
+    config: &IndexConfig,
+) {
+    match segments_missing_posting_bounds(directory, metadata, config).await {
+        Ok((missing, probed)) if !missing.is_empty() => log::info!(
+            "[index] {}: posting_ratio_bounds/posting_impact_bounds are enabled but {} of {} \
+             probed existing segments carry no block-bound metadata (e.g. {}). Bounds apply \
+             to new segments only; merges and compaction keep existing block layouts. \
+             Re-index to add bounds to old data.",
+            metadata.schema.index_label(),
+            missing.len(),
+            probed,
+            missing[0]
+        ),
+        Ok(_) => {}
+        Err(error) => log::warn!(
+            "[index] {}: could not probe existing segments for posting bounds: {}",
+            metadata.schema.index_label(),
+            error
+        ),
     }
 }
 
@@ -622,8 +801,11 @@ fn segment_manager_from_config<D: crate::directories::DirectoryWriter + 'static>
     schema: &Arc<Schema>,
     metadata: IndexMetadata,
     config: &IndexConfig,
-) -> Arc<crate::merge::SegmentManager<D>> {
-    Arc::new(
+) -> Result<Arc<crate::merge::SegmentManager<D>>> {
+    // Writer-only opens never build `SearcherResources`; lifecycle readers
+    // still size their dictionary caches from this value.
+    validate_term_cache_blocks(config.term_cache_blocks)?;
+    Ok(Arc::new(
         crate::merge::SegmentManager::new(
             Arc::clone(directory),
             Arc::clone(schema),
@@ -637,8 +819,10 @@ fn segment_manager_from_config<D: crate::directories::DirectoryWriter + 'static>
             Arc::clone(&config.background_reorder_permits),
             config.background_reorder_pool.clone(),
         )
-        .with_posting_config(config.optimization, config.effective_posting_codec()),
-    )
+        .with_posting_config(config.optimization, config.effective_posting_codec())
+        .with_term_dict_block_size(config.term_dict_block_size)
+        .with_term_cache_budget(config.term_cache_budget_bytes),
+    ))
 }
 
 /// Multi-segment async Index
@@ -666,12 +850,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     /// Create a new index in the directory
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
         schema.validate_content_hash()?;
-        let search_resources = searcher::SearcherResources::new(
-            config.term_cache_blocks,
-            config.store_cache_budget_bytes,
-            config.num_threads,
-            config.bmp_io_concurrency,
-        )?;
+        let search_resources = searcher::SearcherResources::from_config(&config)?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
@@ -694,7 +873,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
         let metadata = IndexMetadata::new((*schema).clone());
 
-        let segment_manager = segment_manager_from_config(&directory, &schema, metadata, &config);
+        let segment_manager = segment_manager_from_config(&directory, &schema, metadata, &config)?;
 
         // Save initial metadata
         segment_manager.update_metadata(|_| {}).await?;
@@ -710,12 +889,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
 
     /// Open an existing index from a directory
     pub async fn open(directory: D, config: IndexConfig) -> Result<Self> {
-        let search_resources = searcher::SearcherResources::new(
-            config.term_cache_blocks,
-            config.store_cache_budget_bytes,
-            config.num_threads,
-            config.bmp_io_concurrency,
-        )?;
+        let search_resources = searcher::SearcherResources::from_config(&config)?;
         let directory = Arc::new(directory);
 
         // Load metadata (includes schema)
@@ -723,8 +897,9 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         let schema = Arc::new(metadata.schema.clone());
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());
+        log_posting_bounds_policy(directory.as_ref(), &metadata, &config).await;
 
-        let segment_manager = segment_manager_from_config(&directory, &schema, metadata, &config);
+        let segment_manager = segment_manager_from_config(&directory, &schema, metadata, &config)?;
 
         // Load trained structures into SegmentManager's ArcSwap
         segment_manager.try_load_and_publish_trained().await?;
@@ -746,12 +921,7 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
         directory: D,
         config: IndexConfig,
     ) -> Result<(Self, IndexWriter<D>)> {
-        let search_resources = searcher::SearcherResources::new(
-            config.term_cache_blocks,
-            config.store_cache_budget_bytes,
-            config.num_threads,
-            config.bmp_io_concurrency,
-        )?;
+        let search_resources = searcher::SearcherResources::from_config(&config)?;
         let writer = IndexWriter::open(directory, config.clone()).await?;
         let index = Self {
             directory: Arc::clone(&writer.directory),

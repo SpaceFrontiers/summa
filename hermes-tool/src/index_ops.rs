@@ -157,6 +157,10 @@ pub async fn index_documents(
     compression_threads: Option<usize>,
     optimization: hermes_core::structures::IndexOptimization,
     posting_codec: Option<hermes_core::structures::PostingCodec>,
+    posting_ratio_bounds: bool,
+    posting_impact_bounds: bool,
+    no_background_merges: bool,
+    term_dict_block_size: hermes_core::structures::SSTableBlockSize,
 ) -> Result<()> {
     let optimization_mode = optimization;
 
@@ -169,6 +173,14 @@ pub async fn index_documents(
             .unwrap_or(default_config.num_compression_threads),
         optimization: optimization_mode,
         posting_codec,
+        posting_ratio_bounds,
+        posting_impact_bounds,
+        merge_policy: if no_background_merges {
+            Box::new(hermes_core::merge::NoMergePolicy)
+        } else {
+            default_config.merge_policy.clone()
+        },
+        term_dict_block_size,
         ..default_config
     };
     let mut writer = IndexWriter::open(dir, config.clone()).await?;
@@ -188,11 +200,15 @@ pub async fn index_documents(
             .collect::<Vec<_>>()
     );
     info!(
-        "Indexing threads: {}, Compression threads: {}, Optimization: {:?}, posting codec: {}",
+        "Indexing threads: {}, Compression threads: {}, Optimization: {:?}, posting codec: {}, ratio bounds: {}, impact bounds: {}, background merges: {}, term dictionary block bytes: {}",
         config.num_indexing_threads,
         config.num_compression_threads,
         optimization_mode,
-        config.effective_posting_codec()
+        config.effective_posting_codec(),
+        config.effective_posting_bounds().ratio,
+        config.effective_posting_bounds().impact,
+        !no_background_merges,
+        config.term_dict_block_size,
     );
 
     let count = if use_stdin {
@@ -225,9 +241,16 @@ pub async fn commit_index(index_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-pub async fn merge_index(index_path: PathBuf, compact: bool) -> Result<()> {
+pub async fn merge_index(
+    index_path: PathBuf,
+    compact: bool,
+    term_dict_block_size: hermes_core::structures::SSTableBlockSize,
+) -> Result<()> {
     let dir = MmapDirectory::new(&index_path);
-    let config = IndexConfig::default();
+    let config = IndexConfig {
+        term_dict_block_size,
+        ..Default::default()
+    };
     let mut writer = IndexWriter::open(dir, config).await?;
 
     info!("Starting force merge...");
@@ -238,9 +261,15 @@ pub async fn merge_index(index_path: PathBuf, compact: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn reorder_index(index_path: PathBuf) -> Result<()> {
+pub async fn reorder_index(
+    index_path: PathBuf,
+    term_dict_block_size: hermes_core::structures::SSTableBlockSize,
+) -> Result<()> {
     let dir = MmapDirectory::new(&index_path);
-    let config = IndexConfig::default();
+    let config = IndexConfig {
+        term_dict_block_size,
+        ..Default::default()
+    };
     let mut writer = IndexWriter::open(dir, config).await?;
 
     info!("Starting BP reorder...");
@@ -250,18 +279,35 @@ pub async fn reorder_index(index_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+/// Read-side `IndexConfig` for `hermes-tool search`. Limits
+/// (`term_cache_blocks <= 65536`, validation budget <= 64 MiB, non-zero
+/// search threads) are enforced by hermes-core when the index is opened.
+pub fn search_config(
+    term_cache_blocks: usize,
+    term_cache_bytes: Option<usize>,
+    posting_validation_cache_bytes: usize,
+    search_threads: Option<usize>,
+) -> IndexConfig {
+    let mut config = IndexConfig {
+        term_cache_blocks,
+        term_cache_budget_bytes: term_cache_bytes,
+        posting_validation_cache_bytes,
+        ..Default::default()
+    };
+    if let Some(threads) = search_threads {
+        config.num_threads = threads;
+    }
+    config
+}
+
 pub async fn search_index(
     index_path: PathBuf,
     query_str: &str,
     limit: usize,
     offset: usize,
-    search_threads: Option<usize>,
+    config: IndexConfig,
 ) -> Result<()> {
     let dir = MmapDirectory::new(&index_path);
-    let mut config = IndexConfig::default();
-    if let Some(threads) = search_threads {
-        config.num_threads = threads;
-    }
     let index = hermes_core::Index::open(dir, config).await?;
     let schema = index.schema().clone();
 
@@ -309,17 +355,13 @@ pub async fn search_batch(
     queries_path: PathBuf,
     limit: usize,
     concurrency: usize,
-    search_threads: Option<usize>,
+    config: IndexConfig,
 ) -> Result<()> {
     use std::io::Write;
     use std::sync::Arc;
 
     anyhow::ensure!(concurrency > 0, "--concurrency must be at least 1");
     let dir = MmapDirectory::new(&index_path);
-    let mut config = IndexConfig::default();
-    if let Some(threads) = search_threads {
-        config.num_threads = threads;
-    }
     let index = Arc::new(hermes_core::Index::open(dir, config).await?);
     let schema = Arc::new(index.schema().clone());
 
@@ -747,6 +789,7 @@ pub async fn compact_rows(
     index_path: PathBuf,
     segment: Option<String>,
     memory_budget_mb: usize,
+    term_dict_block_size: hermes_core::structures::SSTableBlockSize,
 ) -> Result<()> {
     let budget = memory_budget_mb
         .checked_mul(1024 * 1024)
@@ -758,8 +801,14 @@ pub async fn compact_rows(
             "invalid segment ID"
         );
     }
-    let mut writer =
-        IndexWriter::open(MmapDirectory::new(&index_path), IndexConfig::default()).await?;
+    let mut writer = IndexWriter::open(
+        MmapDirectory::new(&index_path),
+        IndexConfig {
+            term_dict_block_size,
+            ..Default::default()
+        },
+    )
+    .await?;
     let result = match segment {
         Some(id) => writer.compact_segment(&id, budget).await.map(usize::from),
         None => writer.compact(budget).await,
@@ -817,7 +866,9 @@ mod tests {
         manager.wait_for_shutdown().await;
         drop(manager);
 
-        merge_index(path.clone(), true).await.unwrap();
+        merge_index(path.clone(), true, Default::default())
+            .await
+            .unwrap();
         // Do not yield: returning from the CLI must mean cleanup has drained,
         // because its runtime is about to exit.
         let metadata: serde_json::Value =
@@ -835,6 +886,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `hermes-tool search --term-cache-blocks/--term-cache-bytes/
+    /// --posting-validation-cache-bytes` reach the index config unchanged and
+    /// out-of-range values fail at open with hermes-core's message.
+    #[tokio::test]
+    async fn search_flags_reach_index_config_and_core_limits_apply() {
+        let config = search_config(1024, Some(0), 4096, Some(2));
+        assert_eq!(config.term_cache_blocks, 1024);
+        assert_eq!(config.term_cache_budget_bytes, Some(0));
+        assert_eq!(config.posting_validation_cache_bytes, 4096);
+        assert_eq!(config.num_threads, 2);
+        let defaults = search_config(256, None, 0, None);
+        assert_eq!(defaults.term_cache_budget_bytes, None);
+        assert_eq!(defaults.num_threads, IndexConfig::default().num_threads);
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index");
+        init_index_from_sdl(path.clone(), "index rows { field body: text }".into())
+            .await
+            .unwrap();
+        for (config, needle) in [
+            (search_config(65_537, None, 0, None), "term_cache_blocks"),
+            (
+                search_config(256, None, 64 * 1024 * 1024 + 1, None),
+                "posting_validation_cache_bytes",
+            ),
+        ] {
+            let error = search_index(path.clone(), "body:x", 10, 0, config)
+                .await
+                .expect_err("out-of-range search option must fail at open");
+            assert!(format!("{error:#}").contains(needle), "{error:#}");
+        }
+        search_index(
+            path,
+            "body:x",
+            10,
+            0,
+            search_config(65_536, Some(0), 4096, Some(1)),
+        )
+        .await
+        .unwrap();
     }
 
     /// Regression: the CLI `index` command must enforce a schema-declared
@@ -883,6 +976,10 @@ mod tests {
             None,
             hermes_core::structures::IndexOptimization::default(),
             None,
+            false,
+            false,
+            false,
+            Default::default(),
         )
         .await
         .unwrap();
@@ -910,6 +1007,10 @@ mod tests {
             None,
             hermes_core::structures::IndexOptimization::default(),
             None,
+            false,
+            false,
+            false,
+            Default::default(),
         )
         .await
         .unwrap();
