@@ -595,3 +595,103 @@ async fn content_hash_noops_are_accepted_without_new_physical_rows() {
         1
     );
 }
+
+#[tokio::test]
+async fn large_singleton_upsert_rpc_preserves_complete_document_and_replacement() {
+    use crate::proto::{
+        index_service_client::IndexServiceClient, index_service_server::IndexServiceServer,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(
+        root.path().to_owned(),
+        IndexConfig {
+            merge_policy: Box::new(hermes_core::NoMergePolicy),
+            ..Default::default()
+        },
+    ));
+    let mut schema = SchemaBuilder::default();
+    let id = schema.add_text_field("id", true, true);
+    schema.set_primary_key(id);
+    let body = schema.add_text_field("body", false, true);
+    registry
+        .create_index("large", schema.build())
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, stop) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(
+                IndexServiceServer::new(IndexServiceImpl {
+                    registry: registry.clone(),
+                })
+                .max_decoding_message_size(256 * 1024 * 1024),
+            )
+            .serve_with_incoming_shutdown(
+                tonic::codegen::tokio_stream::wrappers::TcpListenerStream::new(listener),
+                async {
+                    let _ = stop.await;
+                },
+            ),
+    );
+    let mut client = IndexServiceClient::connect(format!("http://{address}"))
+        .await
+        .unwrap()
+        .max_encoding_message_size(200 * 1024 * 1024);
+    let index = registry.get_or_open_index("large").await.unwrap();
+    let reader = index.reader().await.unwrap();
+    for text in ["x".repeat(34 * 1024 * 1024), "replacement".into()] {
+        let response = client
+            .upsert_documents(UpsertDocumentsRequest {
+                index_name: "large".into(),
+                documents: vec![NamedDocument {
+                    fields: vec![
+                        FieldEntry {
+                            name: "id".into(),
+                            value: Some(FieldValue {
+                                value: Some(field_value::Value::Text("book".into())),
+                            }),
+                        },
+                        FieldEntry {
+                            name: "body".into(),
+                            value: Some(FieldValue {
+                                value: Some(field_value::Value::Text(text.clone())),
+                            }),
+                        },
+                    ],
+                }],
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.accepted_count, 1);
+        assert!(response.errors.is_empty());
+        client
+            .commit(CommitRequest {
+                index_name: "large".into(),
+            })
+            .await
+            .unwrap();
+        reader.reload().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        assert_eq!(searcher.num_docs(), 1);
+        let hits = searcher
+            .search(&hermes_core::query::AllQuery, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        let stored = searcher
+            .doc(hits[0].segment_id, hits[0].doc_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.get_first(body).unwrap().as_text(),
+            Some(text.as_str())
+        );
+    }
+    shutdown.send(()).unwrap();
+    server.await.unwrap().unwrap();
+    registry.shutdown().await.unwrap();
+}

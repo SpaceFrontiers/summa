@@ -932,3 +932,146 @@ async fn compaction_preserves_chunk_ordinals_positions_and_sparse_vector_scores(
         assert!(empty.search(&query, 10).await.unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn deletion_reload_shares_payloads_and_preserves_old_text_and_ann_visibility() {
+    use crate::directories::{Directory, DirectoryWriter};
+    use crate::dsl::{DenseVectorConfig, VectorIndexType};
+    use crate::query::{DenseVectorQuery, TermQuery};
+    let temp = tempfile::tempdir().unwrap();
+    let dir = crate::directories::MmapDirectory::new(temp.path());
+    let mut schema = SchemaBuilder::default();
+    let id = schema.add_text_field("id", true, true);
+    schema.set_primary_key(id);
+    let body = schema.add_text_field("body", true, false);
+    let dense = schema.add_dense_vector_field_with_config(
+        "dense",
+        true,
+        false,
+        DenseVectorConfig {
+            dim: 8,
+            index_type: VectorIndexType::Tq,
+            quantization: crate::dsl::DenseVectorQuantization::F32,
+            num_clusters: None,
+            target_vectors: None,
+            tree_levels: None,
+            ivf_routing: crate::dsl::IvfRoutingMode::Auto,
+            nprobe: 1,
+            unit_norm: false,
+            soar: None,
+        },
+    );
+    let sparse = schema.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        false,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::Bmp,
+            dims: Some(32),
+            max_weight: Some(5.0),
+            ..Default::default()
+        },
+    );
+    let index = Index::create(
+        dir.clone(),
+        schema.build(),
+        IndexConfig {
+            merge_policy: Box::new(crate::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+    writer.init_primary_key_dedup().await.unwrap();
+    for row in 0..65 {
+        let mut doc = Document::new();
+        doc.add_text(id, row.to_string());
+        doc.add_text(body, "present");
+        doc.add_dense_vector(dense, vec![1.0 + row as f32; 8]);
+        doc.add_sparse_vector(sparse, vec![(row % 32, 1.0)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let old = reader.searcher().await.unwrap();
+    for row in 0..64 {
+        writer.delete_primary_key(&row.to_string()).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let deletion = metadata
+        .segment_metas
+        .values()
+        .next()
+        .unwrap()
+        .deletions
+        .as_ref()
+        .unwrap();
+    let path = deletion.path().unwrap();
+    let saved = dir
+        .open_read(&path)
+        .await
+        .unwrap()
+        .read_bytes()
+        .await
+        .unwrap()
+        .as_slice()
+        .to_vec();
+    dir.write(&path, b"corrupt visibility").await.unwrap();
+    assert!(
+        reader.reload().await.is_err(),
+        "invalid sidecar must fail the reload"
+    );
+    assert_eq!(old.search(&AllQuery, 100).await.unwrap().len(), 65);
+    dir.write(&path, &saved).await.unwrap();
+    reader.reload().await.unwrap();
+    let new = reader.searcher().await.unwrap();
+    let old_segment = &old.segment_readers()[0];
+    let new_segment = &new.segment_readers()[0];
+    assert_eq!(old_segment.meta().id, new_segment.meta().id);
+    assert!(
+        std::ptr::eq(
+            old_segment.fast_field(id.0).unwrap(),
+            new_segment.fast_field(id.0).unwrap()
+        ),
+        "deletion reload must share parsed fast-field metadata"
+    );
+    assert_eq!(
+        old_segment
+            .bmp_index(sparse)
+            .unwrap()
+            .doc_map_ids_slice()
+            .as_ptr(),
+        new_segment
+            .bmp_index(sparse)
+            .unwrap()
+            .doc_map_ids_slice()
+            .as_ptr(),
+        "deletion reload must share mapped or copied BMP metadata"
+    );
+    for (snapshot, count) in [(&old, 65), (&new, 1)] {
+        assert_eq!(
+            snapshot
+                .search(&TermQuery::new(body, "present"), 100)
+                .await
+                .unwrap()
+                .len(),
+            count
+        );
+        let query = DenseVectorQuery::new(dense, vec![1.0; 8]);
+        let hits = snapshot.search(&query, 100).await.unwrap();
+        assert_eq!(hits.len(), count);
+        let async_hits =
+            crate::query::search_segment_with_count(&snapshot.segment_readers()[0], &query, 100)
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(async_hits.len(), count);
+        if count == 1 {
+            assert_eq!(hits[0].doc_id, 64);
+        }
+    }
+    drop(old);
+    assert_eq!(new.search(&AllQuery, 100).await.unwrap().len(), 1);
+}

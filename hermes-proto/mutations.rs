@@ -19,11 +19,69 @@ impl DeleteDocumentsRequest {
 
 impl UpsertDocumentsRequest {
     pub fn validate_limits(&self) -> Result<(), tonic::Status> {
-        if self.documents.len() > 1_000 || prost::Message::encoded_len(self) > 32 * 1024 * 1024 {
-            return Err(tonic::Status::resource_exhausted(
-                "upsert request exceeds 1000 documents or 32 MiB encoded bytes",
-            ));
+        let limit_mib = if self.documents.len() == 1 { 200 } else { 32 };
+        if self.documents.len() > 1_000
+            || prost::Message::encoded_len(self) > limit_mib * 1024 * 1024
+        {
+            return Err(tonic::Status::resource_exhausted(format!(
+                "upsert request exceeds 1000 documents or {limit_mib} MiB encoded bytes",
+            )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod mutation_limits_tests {
+    use super::*;
+    use prost::Message;
+
+    fn request_with_encoded_size(documents: usize, bytes: usize) -> UpsertDocumentsRequest {
+        let mut request = UpsertDocumentsRequest {
+            index_name: "large".into(),
+            documents: vec![NamedDocument::default(); documents],
+        };
+        request.documents[0].fields.push(FieldEntry {
+            name: "body".into(),
+            value: Some(FieldValue {
+                value: Some(field_value::Value::Text("x".repeat(bytes))),
+            }),
+        });
+        let overhead = request.encoded_len() - bytes;
+        let Some(field_value::Value::Text(text)) = request.documents[0].fields[0]
+            .value
+            .as_mut()
+            .unwrap()
+            .value
+            .as_mut()
+        else {
+            unreachable!()
+        };
+        text.truncate(bytes - overhead);
+        assert_eq!(request.encoded_len(), bytes);
+        request
+    }
+
+    #[test]
+    fn singleton_upsert_limit_counts_complete_envelope_and_preserves_batch_limit() {
+        for (documents, limit) in [(1, 200 * 1024 * 1024), (2, 32 * 1024 * 1024)] {
+            let mut request = request_with_encoded_size(documents, limit);
+            request.validate_limits().unwrap();
+            request.index_name.push('x');
+            assert_eq!(
+                request.validate_limits().unwrap_err().code(),
+                tonic::Code::ResourceExhausted
+            );
+        }
+        assert_eq!(
+            UpsertDocumentsRequest {
+                index_name: "large".into(),
+                documents: vec![NamedDocument::default(); 1001],
+            }
+            .validate_limits()
+            .unwrap_err()
+            .code(),
+            tonic::Code::ResourceExhausted
+        );
     }
 }

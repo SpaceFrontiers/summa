@@ -349,7 +349,8 @@ await client.commit("articles")  # publishes accepted operations
 same `DocumentMutationResult`. Single-document helpers raise on rejection. Missing
 deletion keys are accepted. Commit before deleting/upserting a key with a pending
 insertion or replacement. Limits are 100,000 deletion keys / 8 MiB key bytes and
-1,000 replacement documents / 32 MiB encoded bytes. Mutations use the usual timeout
+1,000 replacement documents / 32 MiB encoded bytes, or one replacement / 200 MiB
+including the request envelope. Mutations use the usual timeout
 argument; an expired RPC may have staged work, so do not blindly retry replacements.
 Broker commits are atomic within each partition. Physical cleanup remains
 `await client.force_merge("articles", compact=True)`.

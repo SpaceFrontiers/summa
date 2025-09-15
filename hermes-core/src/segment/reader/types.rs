@@ -40,6 +40,7 @@ pub enum VectorIndex {
 
 /// Thin public wrapper around the shared mmap ANN representation. Its internals
 /// remain crate-private so the segment format is not exposed as a library API.
+#[derive(Clone)]
 pub struct MmapAnnIndex {
     index: crate::segment::ann_disk::AnnDiskIndex,
 }
@@ -75,10 +76,7 @@ impl MmapAnnIndex {
 }
 
 impl VectorIndex {
-    pub(crate) fn set_alive_docs(
-        &mut self,
-        bits: Arc<crate::query::DocBitset>,
-    ) -> crate::Result<()> {
+    pub(crate) fn set_alive_docs(&mut self, bits: Option<Arc<crate::query::DocBitset>>) {
         let index = match self {
             Self::BinaryIvf(index)
             | Self::Tq { index, .. }
@@ -86,13 +84,9 @@ impl VectorIndex {
             | Self::ScannAh(index)
             | Self::ScannBinary(index) => index,
         };
-        let index = Arc::get_mut(index).ok_or_else(|| {
-            crate::Error::Internal(
-                "ANN visibility must be installed before sharing its reader".into(),
-            )
-        })?;
-        index.index.alive_docs = Some(bits);
-        Ok(())
+        // Clone only the visibility view; payload, parsed runs and pin owner
+        // remain shared with searchers retaining the previous generation.
+        Arc::make_mut(index).index.alive_docs = bits;
     }
 
     /// Estimate heap retained by this vector index. Corpus-sized ANN columns

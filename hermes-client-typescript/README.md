@@ -322,7 +322,8 @@ are accepted; upserts insert missing keys. Replacing/deleting a pending insertio
 is supported; the latest accepted version is published at commit. With a schema
 content hash, an identical retry of the latest staged version is a no-op.
 Limits are 100,000 deletion keys / 8 MiB key bytes and 1,000
-replacement documents / 32 MiB encoded bytes. Normal deadlines apply; an expired
+replacement documents / 32 MiB encoded bytes, or one replacement / 200 MiB
+including the request envelope. Normal deadlines apply; an expired
 RPC can have staged work, so do not blindly retry replacements. Broker commits
 are atomic within each partition. Physical cleanup remains
 `await client.forceMerge("articles", undefined, true)`.

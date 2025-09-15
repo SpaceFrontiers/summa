@@ -1913,8 +1913,9 @@ fn binary_scann_probe_clusters(
 /// - Term dictionary: only index loaded, blocks loaded on-demand
 /// - Postings: loaded on-demand per term via HTTP range requests
 /// - Document store: only index loaded, blocks loaded on-demand via HTTP range requests
+#[derive(Clone)]
 pub struct SegmentReader {
-    row_stats: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
+    row_stats: Arc<FxHashMap<u32, crate::structures::fast_field::FastFieldReader>>,
     deletion_meta: Option<super::DeletionMeta>,
     alive_docs: Option<Arc<crate::query::DocBitset>>,
     meta: SegmentMeta,
@@ -1942,7 +1943,7 @@ pub struct SegmentReader {
     /// Position file handle for phrase queries (lazy loading)
     positions_handle: Option<FileHandle>,
     /// Fast-field columnar readers per field_id
-    fast_fields: FxHashMap<u32, crate::structures::fast_field::FastFieldReader>,
+    fast_fields: Arc<FxHashMap<u32, crate::structures::fast_field::FastFieldReader>>,
     /// Virtual-id maps of chunked text fields per field_id
     chunk_maps: FxHashMap<u32, super::chunk_map::ChunkMap>,
     /// Per-document field lengths of plain (non-chunked) text fields.
@@ -2100,7 +2101,7 @@ impl SegmentReader {
         }
         #[allow(unused_mut)]
         let mut reader = Self {
-            row_stats,
+            row_stats: Arc::new(row_stats),
             deletion_meta: None,
             alive_docs: None,
             meta,
@@ -2116,7 +2117,7 @@ impl SegmentReader {
             bmp_indexes,
             sparse_file_backed_bytes,
             positions_handle,
-            fast_fields,
+            fast_fields: Arc::new(fast_fields),
             chunk_maps,
             doc_lengths,
             #[cfg(feature = "native")]
@@ -2304,11 +2305,31 @@ impl SegmentReader {
     ) -> Result<()> {
         let bits = meta.load(dir, self.num_docs()).await?;
         for index in self.vector_indexes.values_mut() {
-            index.set_alive_docs(Arc::clone(&bits))?;
+            index.set_alive_docs(Some(Arc::clone(&bits)));
         }
         self.alive_docs = Some(bits);
         self.deletion_meta = Some(meta);
         Ok(())
+    }
+
+    /// A new immutable visibility generation sharing all unchanged payloads.
+    /// Loading the sidecar cannot modify the original reader on error/cancellation.
+    pub(crate) async fn with_deletions<D: Directory>(
+        &self,
+        dir: &D,
+        meta: Option<super::DeletionMeta>,
+    ) -> Result<Self> {
+        let alive_docs = match &meta {
+            Some(meta) => Some(meta.load(dir, self.num_docs()).await?),
+            None => None,
+        };
+        let mut reader = self.clone();
+        for index in reader.vector_indexes.values_mut() {
+            index.set_alive_docs(alive_docs.clone());
+        }
+        reader.alive_docs = alive_docs;
+        reader.deletion_meta = meta;
+        Ok(reader)
     }
 
     pub(crate) fn deletion_meta(&self) -> Option<&super::DeletionMeta> {

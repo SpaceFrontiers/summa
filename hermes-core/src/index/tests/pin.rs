@@ -148,3 +148,61 @@ async fn test_pin_metadata_budget_exhaustion_reported() {
         "tiny budget must leave a visible intended-vs-pinned gap"
     );
 }
+
+#[tokio::test]
+async fn deletion_views_share_copy_pinned_metadata_until_the_last_reader_drops() {
+    let temp = tempfile::tempdir().unwrap();
+    let directory = MmapDirectory::new(temp.path());
+    let (schema, segment_id) = build_test_index(&directory).await;
+    let sparse = schema.get_field("sparse").unwrap();
+    let mut original = SegmentReader::open(&directory, SegmentId(segment_id), Arc::new(schema), 8)
+        .await
+        .unwrap();
+    original.apply_pin_policy(&PinPolicy {
+        budget_bytes: 64 * 1024 * 1024,
+        mode: PinMode::Copy,
+    });
+    assert!(original.memory_stats().pinned_metadata_bytes > 0);
+    let mut alive = crate::query::DocBitset::all(original.num_docs());
+    alive.clear(0);
+    let deletion =
+        crate::segment::deletion::write(&directory, SegmentId::new(), original.num_docs(), &alive)
+            .await
+            .unwrap();
+    let changed = original
+        .with_deletions(&directory, Some(deletion))
+        .await
+        .unwrap();
+    assert_eq!(
+        original
+            .bmp_index(sparse)
+            .unwrap()
+            .doc_map_ids_slice()
+            .as_ptr(),
+        changed
+            .bmp_index(sparse)
+            .unwrap()
+            .doc_map_ids_slice()
+            .as_ptr()
+    );
+    assert_eq!(
+        original.memory_stats().pinned_metadata_bytes,
+        changed.memory_stats().pinned_metadata_bytes
+    );
+    assert!(original.is_alive(0));
+    assert!(!changed.is_alive(0));
+    drop(original);
+    assert_eq!(changed.num_live_docs(), 299);
+    let restored = changed.with_deletions(&directory, None).await.unwrap();
+    assert!(restored.is_alive(0));
+    assert!(!changed.is_alive(0));
+    drop(changed);
+    assert_eq!(
+        crate::query::search_segment_with_count(&restored, &crate::query::AllQuery, 500)
+            .await
+            .unwrap()
+            .0
+            .len(),
+        300
+    );
+}

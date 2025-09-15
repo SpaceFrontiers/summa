@@ -422,3 +422,25 @@ async def test_mutations_preserve_keys_chunks_errors_deadlines_and_explicit_comm
         await client.delete_document("docs", "")
     with pytest.raises(ValueError, match="1000 documents"):
         await client.upsert_documents("docs", [{}] * 1001)
+
+
+@pytest.mark.asyncio
+async def test_large_singleton_upsert_is_sent_but_large_batch_is_rejected():
+    from unittest.mock import AsyncMock
+
+    from hermes_client_python import HermesClient
+    from hermes_client_python import hermes_pb2 as pb
+
+    client = HermesClient()
+    client._ensure_connected = lambda: None
+    client._index_stub = AsyncMock()
+    client._index_stub.UpsertDocuments.return_value = pb.DocumentMutationResponse(
+        accepted_count=1
+    )
+    document = {"id": "large", "body": "x" * (34 * 1024 * 1024)}
+    await client.upsert_document("docs", document)
+    request = client._index_stub.UpsertDocuments.call_args.args[0]
+    assert request.ByteSize() > 32 * 1024 * 1024
+    with pytest.raises(ValueError, match="32 MiB"):
+        await client.upsert_documents("docs", [document, {"id": "small"}])
+    assert client._index_stub.UpsertDocuments.call_count == 1

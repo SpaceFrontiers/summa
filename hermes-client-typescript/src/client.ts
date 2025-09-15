@@ -69,7 +69,7 @@ export class HermesClient {
       {
         // Match Python and fit bounded mutation requests and per-item errors.
         "grpc.max_receive_message_length": 50 * 1024 * 1024,
-        "grpc.max_send_message_length": 50 * 1024 * 1024,
+        "grpc.max_send_message_length": 200 * 1024 * 1024,
       },
     );
     const factory = createClientFactory().use(deadlineMiddleware);
@@ -234,8 +234,8 @@ export class HermesClient {
   }
 
   /** Stage complete replacements (inserts if absent); inspect errors, then commit.
-   * Each document needs its primary key. Only one pending replacement per key
-   * is allowed, including across calls. This is not a partial patch API.
+   * Each document needs its primary key; commit publishes its latest accepted
+   * replacement, including across calls. This is not a partial patch API.
    */
   async upsertDocuments(
     indexName: string,
