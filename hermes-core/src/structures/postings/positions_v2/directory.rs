@@ -57,7 +57,7 @@ pub(super) fn tag(index: &[u8], blocks: usize, block: usize) -> u16 {
     u16::from_le_bytes(index[at..at + 2].try_into().unwrap())
 }
 
-/// Call only after metadata admission. At most seven descriptors are scanned.
+/// Requires writer-produced or admitted metadata. Scans at most seven descriptors.
 #[inline]
 pub(super) fn entry(index: &[u8], blocks: usize, block: usize) -> (usize, u64) {
     let group = block / GROUP;

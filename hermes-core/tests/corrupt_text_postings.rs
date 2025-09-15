@@ -8,14 +8,13 @@ use hermes_core::query::TermQuery;
 use hermes_core::{Document, RamDirectory, SchemaBuilder};
 
 #[tokio::test(flavor = "current_thread")]
-async fn corrupt_replacement_postings_fail_even_when_old_reader_cached_validation() {
+async fn unsupported_posting_codec_fails_without_poisoning_old_reader() {
     let dir = RamDirectory::new();
     let mut schema = SchemaBuilder::default();
     let field = schema.add_text_field("text", true, false);
     let config = IndexConfig {
         num_threads: 1,
         num_indexing_threads: 1,
-        posting_validation_cache_bytes: 4096,
         ..Default::default()
     };
     let mut writer = IndexWriter::create(dir.clone(), schema.build(), config.clone())
@@ -37,16 +36,6 @@ async fn corrupt_replacement_postings_fail_even_when_old_reader_cached_validatio
     let expected = old_searcher
         .search_with_offset_and_count_sync(&query, 10, 0)
         .unwrap();
-    let memory = old_searcher.segment_readers()[0].memory_stats();
-    assert!(memory.posting_validation_cache_bytes > 0);
-    assert!(memory.posting_validation_cache_bytes <= config.posting_validation_cache_bytes);
-    let old_heap = memory.estimated_heap_bytes();
-    let mut without_validation = memory.clone();
-    without_validation.posting_validation_cache_bytes = 0;
-    assert_eq!(
-        old_heap - without_validation.estimated_heap_bytes(),
-        memory.posting_validation_cache_bytes
-    );
     let posts: Vec<_> = dir
         .list_files(Path::new(""))
         .await
@@ -83,11 +72,15 @@ async fn corrupt_replacement_postings_fail_even_when_old_reader_cached_validatio
         .await
         .unwrap_err();
     assert!(
-        sync_error.to_string().contains("exceeds 32 bits"),
+        sync_error
+            .to_string()
+            .contains("posting payload corruption"),
         "{sync_error}"
     );
     assert!(
-        async_error.to_string().contains("exceeds 32 bits"),
+        async_error
+            .to_string()
+            .contains("posting payload corruption"),
         "{async_error}"
     );
 }
@@ -171,7 +164,7 @@ async fn merge_rejects_corrupt_single_source_term_before_publishing_metadata() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn decoded_payload_corruption_fails_collection_instead_of_returning_partial_hits() {
+async fn unsupported_block_codec_fails_collection_instead_of_returning_partial_hits() {
     use hermes_core::query::{CountCollector, TopKCollector, collect_segment};
     for (sync, corrupt_block) in [(false, 0), (false, 1), (true, 0), (true, 1)] {
         for text in ["common", "\"common common\"", "common OR absent"] {
@@ -213,15 +206,11 @@ async fn decoded_payload_corruption_fails_collection_instead_of_returning_partia
                 .await
                 .unwrap()
                 .to_vec();
-            // Rounded raw gaps: zeroing the first gap creates a repeated ID.
-            // Headers, payload sizes and skip metadata stay structurally valid.
-            assert_eq!(bytes[6], 8);
             let pristine = hermes_core::structures::BlockPostingList::deserialize(&bytes).unwrap();
             let (offset, _, _) = pristine
                 .decode_block_doc_ids_only(corrupt_block, &mut Vec::new())
                 .unwrap();
-            assert_eq!(bytes[offset + 8], 1);
-            bytes[offset + 8] = 0;
+            bytes[offset + 6] = 0xe1;
             dir.write(&path, &bytes).await.unwrap();
             let index = Index::open(dir, config).await.unwrap();
             let reader = index.reader().await.unwrap();

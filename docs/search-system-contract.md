@@ -12,7 +12,7 @@ It is not a new storage format or permission to change public behavior.
 | `core/structures`                               | Encodings, validated byte views, scalar/SIMD primitives                                    | Schema dispatch, index publication, server settings       |
 | `core/directories`                              | Byte ownership, reads, persistence, cold I/O and cache policy                              | Ranking and document semantics                            |
 | `core/segment/builder`                          | Encode newly ingested documents using trained artifacts                                    | Publication and global model retraining                   |
-| `core/segment/reader`                           | Validate once at open; expose immutable segment views                                      | Per-request rebuilding of metadata                        |
+| `core/segment/reader`                           | Parse format envelopes; expose immutable segment views                                     | Per-request rebuilding of metadata                        |
 | `core/segment/merger`, `reorder`                | Write replacement segments; copy unchanged representations                                 | Metadata commit, lifecycle ownership, implicit retraining |
 | `core/merge/segment_manager`, `segment/tracker` | Claims, publication, scheduling, retirement, cleanup                                       | RPC concerns and scoring kernels                          |
 | `core/index`                                    | Writer generations, reader snapshots, search orchestration, shared resources               | Protocol types and duplicate storage implementations      |
@@ -88,7 +88,11 @@ References: [posting codecs](posting-codecs.md), [cold I/O](cold-io.md),
   query plan, not a reason to make every payload resident.
 - Reuse bounded query scratch and immutable reader state. Avoid per-hit hash
   maps, clones, and full sorts when dense IDs, borrowed slices, or bounded top-k
-  suffice. Check out-of-range/corrupt metadata once before infallible hot reads.
+  suffice. Normal text queries trust writer-produced posting and position contents. Parse
+  format envelopes and establish slice extents, without scanning directories or
+  checking decoded document order. Explicit deserialization and merge admission
+  retain integrity checks; ordinary search is not a corruption audit. Unsafe
+  kernels still require proven input/output extents and supported CPU features.
 - Use shared bounded search/background pools and I/O gates. Never create a pool
   per request/index reload or run unbounded CPU work on Tokio workers. Preserve
   the current-thread and WASM paths; `block_in_place` requires a multithread runtime.

@@ -70,7 +70,6 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         let resources = SearcherResources::new(
             term_cache_blocks,
             None,
-            0,
             STANDALONE_STORE_CACHE_BYTES,
             crate::default_search_threads(),
             4,

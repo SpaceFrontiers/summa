@@ -432,9 +432,7 @@ mod tests {
                 std::sync::Arc::new(|_| Box::pin(async { panic!("payload I/O before admission") })),
             ),
             reader.postings.positions_file().cloned(),
-            0,
-        )
-        .unwrap();
+        );
         let error = reader
             .reserve_candidate_text_reads(field, b"common", false, &mut 0)
             .await

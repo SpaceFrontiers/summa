@@ -9,7 +9,7 @@ use hermes_core::query::PhraseQuery;
 use hermes_core::{Document, RamDirectory, SchemaBuilder};
 
 #[tokio::test(flavor = "current_thread")]
-async fn corrupt_position_blocks_error_instead_of_becoming_missing_phrase_hits() {
+async fn query_position_views_trust_payloads_and_old_reader_retains_its_bytes() {
     let dir = RamDirectory::new();
     let mut schema = SchemaBuilder::default();
     let field = schema.add_text_field("text", true, false);
@@ -17,7 +17,6 @@ async fn corrupt_position_blocks_error_instead_of_becoming_missing_phrase_hits()
     let config = IndexConfig {
         num_threads: 1,
         num_indexing_threads: 1,
-        posting_validation_cache_bytes: 4096,
         ..Default::default()
     };
     let mut writer = IndexWriter::create(dir.clone(), schema.build(), config.clone())
@@ -40,10 +39,6 @@ async fn corrupt_position_blocks_error_instead_of_becoming_missing_phrase_hits()
         .search_with_offset_and_count_sync(&query, 10, 0)
         .unwrap();
     assert_eq!(expected.1, 5);
-    let cache_bytes = old_searcher.segment_readers()[0]
-        .memory_stats()
-        .posting_validation_cache_bytes;
-    assert!(cache_bytes > 0 && cache_bytes <= config.posting_validation_cache_bytes);
     let path = dir
         .list_files(Path::new(""))
         .await
@@ -65,15 +60,22 @@ async fn corrupt_position_blocks_error_instead_of_becoming_missing_phrase_hits()
     let index = Index::open(dir, config).await.unwrap();
     let reader = index.reader().await.unwrap();
     let searcher = reader.searcher().await.unwrap();
-    let sync = searcher.search_with_offset_and_count_sync(&query, 10, 0);
-    let asynchronous = searcher.search_with_offset_and_count(&query, 10, 0).await;
-    for result in [sync, asynchronous] {
-        let error = result.unwrap_err();
-        assert!(
-            error.to_string().contains("invalid position block"),
-            "{error}"
-        );
-    }
+    // Ordinary search opens the writer-owned view without auditing position blocks.
+    // Explicit PositionStream::open corruption coverage lives with the format.
+    let segment = &searcher.segment_readers()[0];
+    assert!(
+        segment
+            .get_positions(field, b"alpha")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        segment
+            .get_positions_sync(field, b"alpha")
+            .unwrap()
+            .is_some()
+    );
     let old_result = old_searcher
         .search_with_offset_and_count(&query, 10, 0)
         .await

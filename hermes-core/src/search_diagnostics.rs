@@ -75,16 +75,10 @@ pub struct QueryWork {
     pub single_blocks_scored: u64,
     /// Single-term MaxScore blocks skipped by score bounds.
     pub single_blocks_skipped: u64,
-    /// Posting lists structurally validated.
-    pub postings_admitted: u64,
-    /// Posting blocks examined by structural admission.
-    pub posting_blocks_admitted: u64,
-    /// Posting-list validation proof cache hits.
-    pub postings_proof_hits: u64,
-    /// Position streams structurally validated.
-    pub positions_admitted: u64,
-    /// Position-stream validation proof cache hits.
-    pub positions_proof_hits: u64,
+    /// Posting-list envelopes opened.
+    pub postings_opened: u64,
+    /// Position-stream envelopes opened.
+    pub positions_opened: u64,
 }
 
 impl QueryWork {
@@ -156,21 +150,8 @@ impl QueryWork {
         self.single_blocks_skipped = self
             .single_blocks_skipped
             .saturating_add(other.single_blocks_skipped);
-        self.postings_admitted = self
-            .postings_admitted
-            .saturating_add(other.postings_admitted);
-        self.posting_blocks_admitted = self
-            .posting_blocks_admitted
-            .saturating_add(other.posting_blocks_admitted);
-        self.postings_proof_hits = self
-            .postings_proof_hits
-            .saturating_add(other.postings_proof_hits);
-        self.positions_admitted = self
-            .positions_admitted
-            .saturating_add(other.positions_admitted);
-        self.positions_proof_hits = self
-            .positions_proof_hits
-            .saturating_add(other.positions_proof_hits);
+        self.postings_opened = self.postings_opened.saturating_add(other.postings_opened);
+        self.positions_opened = self.positions_opened.saturating_add(other.positions_opened);
     }
 }
 

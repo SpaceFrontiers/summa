@@ -18,8 +18,8 @@ The existing 16-byte footer stores block count, total values and POS4 magic.
 Descriptors follow checkpoints. A directory costs `12*ceil(blocks/8)+2*blocks`
 bytes instead of POS3's 16 bytes per block (header plus directory).
 
-Opening POS4 checks descriptors, checkpoint adjacency, exact payload extent and
-total values without reading payload bytes. Seeking needs at most seven local
+Explicit POS4 deserialization checks descriptors, checkpoint adjacency, exact
+payload extent and total values. Normal query opens trust those invariants. Seeking needs at most seven local
 descriptor additions after a checkpoint lookup. Fresh full-block streams retain
 direct logical cursor addressing. Copied short interior blocks remain legal.
 The existing position encoder owns both legacy and compact output. Merging
@@ -37,7 +37,8 @@ position cursors when the total position count fits u32; larger streams retain
 eight-byte cursors. This saves eight bytes per positioned block in the common
 case. Fixed-width structural admission only reads directory pages. Pfor sources
 retain the old layout for now because their exception framing lives in payloads.
-The SIMD first-gap check moves to the owning decoded-block content check.
+The SIMD first-gap check applies to explicitly deserialized lists, not trusted
+query views.
 
 Existing decoders receive the descriptor and borrowed payload; they do not
 materialize a legacy term-sized byte buffer. Compact descriptors share the
@@ -82,3 +83,19 @@ adds a native-produced compact SIMD/byte-norm fixture for WASM.
 Compare identical corpus and queries on ARM and x86, including latency, RSS,
 file-component bytes and ranking overlap. Size savings alone do not establish a
 speedup. Record retained and rejected experiments in the performance review.
+
+## Trusted query reads
+
+Normal segment reads trust Hermes writers for document order, skip bounds,
+position checkpoints and payload semantics. Opening a term parses its footer and
+constructs borrowed views; it does not scan every block, retain admission proofs,
+or verify decoded document order. This applies equally to sync, async and WASM.
+There is no full index scan at open and no posting validation cache setting.
+Explicit `BlockPostingList::deserialize` and `PositionStream::open` remain strict,
+as does merge admission. Altered index payloads are outside the ordinary search
+contract: search is not an integrity audit. Format versions, I/O failures and
+input/output extents needed by unsafe SIMD still have checked boundaries.
+The persisted encodings and writer bytes are unchanged. Posting opens still
+copy the small L1 arrays (one entry per eight blocks) into the existing search
+representation; removing validation does not eliminate that allocation. Position
+opens inspect only the footer and final checkpoint group (at most seven descriptors).

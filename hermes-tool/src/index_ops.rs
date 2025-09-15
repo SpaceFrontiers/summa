@@ -280,18 +280,16 @@ pub async fn reorder_index(
 }
 
 /// Read-side `IndexConfig` for `hermes-tool search`. Limits
-/// (`term_cache_blocks <= 65536`, validation budget <= 64 MiB, non-zero
+/// (`term_cache_blocks <= 65536`, non-zero
 /// search threads) are enforced by hermes-core when the index is opened.
 pub fn search_config(
     term_cache_blocks: usize,
     term_cache_bytes: Option<usize>,
-    posting_validation_cache_bytes: usize,
     search_threads: Option<usize>,
 ) -> IndexConfig {
     let mut config = IndexConfig {
         term_cache_blocks,
         term_cache_budget_bytes: term_cache_bytes,
-        posting_validation_cache_bytes,
         ..Default::default()
     };
     if let Some(threads) = search_threads {
@@ -888,17 +886,15 @@ mod tests {
         }
     }
 
-    /// `hermes-tool search --term-cache-blocks/--term-cache-bytes/
-    /// --posting-validation-cache-bytes` reach the index config unchanged and
+    /// `hermes-tool search --term-cache-blocks/--term-cache-bytes` reach the config and
     /// out-of-range values fail at open with hermes-core's message.
     #[tokio::test]
     async fn search_flags_reach_index_config_and_core_limits_apply() {
-        let config = search_config(1024, Some(0), 4096, Some(2));
+        let config = search_config(1024, Some(0), Some(2));
         assert_eq!(config.term_cache_blocks, 1024);
         assert_eq!(config.term_cache_budget_bytes, Some(0));
-        assert_eq!(config.posting_validation_cache_bytes, 4096);
         assert_eq!(config.num_threads, 2);
-        let defaults = search_config(256, None, 0, None);
+        let defaults = search_config(256, None, None);
         assert_eq!(defaults.term_cache_budget_bytes, None);
         assert_eq!(defaults.num_threads, IndexConfig::default().num_threads);
 
@@ -907,13 +903,7 @@ mod tests {
         init_index_from_sdl(path.clone(), "index rows { field body: text }".into())
             .await
             .unwrap();
-        for (config, needle) in [
-            (search_config(65_537, None, 0, None), "term_cache_blocks"),
-            (
-                search_config(256, None, 64 * 1024 * 1024 + 1, None),
-                "posting_validation_cache_bytes",
-            ),
-        ] {
+        for (config, needle) in [(search_config(65_537, None, None), "term_cache_blocks")] {
             let error = search_index(path.clone(), "body:x", 10, 0, config)
                 .await
                 .expect_err("out-of-range search option must fail at open");
@@ -924,7 +914,7 @@ mod tests {
             "body:x",
             10,
             0,
-            search_config(65_536, Some(0), 4096, Some(1)),
+            search_config(65_536, Some(0), Some(1)),
         )
         .await
         .unwrap();

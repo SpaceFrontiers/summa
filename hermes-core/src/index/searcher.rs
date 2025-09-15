@@ -23,7 +23,6 @@ use crate::segment::{SegmentSnapshot, SegmentTracker};
 pub(crate) struct SearcherResources {
     pub(crate) term_cache_blocks: usize,
     pub(crate) term_cache_budget_bytes: Option<usize>,
-    pub(crate) posting_validation_cache_bytes: usize,
     pub(crate) store_cache: Arc<crate::segment::SharedStoreCache>,
     pub(crate) bmp_io_gate: Arc<super::BmpIoGate>,
     pub(crate) bmp_io_concurrency: usize,
@@ -38,7 +37,6 @@ impl SearcherResources {
         Self::new(
             config.term_cache_blocks,
             config.term_cache_budget_bytes,
-            config.posting_validation_cache_bytes,
             config.store_cache_budget_bytes,
             config.num_threads,
             config.bmp_io_concurrency,
@@ -46,21 +44,17 @@ impl SearcherResources {
     }
 
     /// Validates every load-time limit once, before any segment or file is
-    /// touched: the dictionary block cap, the posting validation budget, and
+    /// touched: the dictionary block cap and
     /// the CPU/I-O widths. Later per-segment constructors re-check only what
     /// they own.
     pub(crate) fn new(
         term_cache_blocks: usize,
         term_cache_budget_bytes: Option<usize>,
-        posting_validation_cache_bytes: usize,
         store_cache_budget_bytes: usize,
         num_threads: usize,
         bmp_io_concurrency: usize,
     ) -> Result<Self> {
         super::validate_term_cache_blocks(term_cache_blocks)?;
-        crate::structures::postings::PostingListReader::validate_budget(
-            posting_validation_cache_bytes,
-        )?;
         if num_threads == 0 {
             return Err(crate::Error::Internal(
                 "IndexConfig.num_threads must be greater than zero".into(),
@@ -78,7 +72,6 @@ impl SearcherResources {
         Ok(Self {
             term_cache_blocks,
             term_cache_budget_bytes,
-            posting_validation_cache_bytes,
             store_cache: super::shared_store_cache(store_cache_budget_bytes),
             bmp_io_gate: super::shared_bmp_io_gate(bmp_io_concurrency),
             bmp_io_concurrency,
@@ -169,7 +162,6 @@ impl<D: Directory + 'static> Searcher<D> {
             &trained_vectors,
             resources.term_cache_blocks,
             resources.term_cache_budget_bytes,
-            resources.posting_validation_cache_bytes,
             Arc::clone(&resources.store_cache),
             &[],
             snapshot.deletions(),
@@ -213,7 +205,6 @@ impl<D: Directory + 'static> Searcher<D> {
             &trained_vectors,
             resources.term_cache_blocks,
             resources.term_cache_budget_bytes,
-            resources.posting_validation_cache_bytes,
             Arc::clone(&resources.store_cache),
             existing_segments,
             snapshot.deletions(),
@@ -272,7 +263,6 @@ impl<D: Directory + 'static> Searcher<D> {
             &trained_vectors,
             term_cache_blocks,
             None,
-            0,
             store_cache,
             &[],
             &deletions,
@@ -323,7 +313,6 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
         term_cache_budget_bytes: Option<usize>,
-        posting_validation_cache_bytes: usize,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
@@ -341,7 +330,6 @@ impl<D: Directory + 'static> Searcher<D> {
             trained_vectors,
             term_cache_blocks,
             term_cache_budget_bytes,
-            posting_validation_cache_bytes,
             store_cache,
             existing_segments,
             deletions,
@@ -370,7 +358,6 @@ impl<D: Directory + 'static> Searcher<D> {
         trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
         term_cache_budget_bytes: Option<usize>,
-        posting_validation_cache_bytes: usize,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
@@ -437,7 +424,6 @@ impl<D: Directory + 'static> Searcher<D> {
                         sch,
                         term_cache_blocks,
                         term_cache_budget_bytes,
-                        posting_validation_cache_bytes,
                         store_cache_directory_namespace,
                         store_cache,
                     )
@@ -504,7 +490,7 @@ impl<D: Directory + 'static> Searcher<D> {
             total_pin_intended = total_pin_intended.saturating_add(stats.pin_intended_bytes);
             log::info!(
                 "[searcher] index={} segment {:016x}: docs={}, heap_estimate={} \
-                 (term_cache={}, posting_validation_cache={}, store_cache={}, sparse_vectors={}, dense_vectors={}), \
+                 (term_cache={}, store_cache={}, sparse_vectors={}, dense_vectors={}), \
                  file_backed={} (term_bloom={}, sparse_vectors={}, dense_vectors={}), \
                  pinned_metadata={} of {} eligible \
                  (sparse_vectors={} of {}, dense_vectors={} of {})",
@@ -513,7 +499,6 @@ impl<D: Directory + 'static> Searcher<D> {
                 stats.num_docs,
                 crate::format_bytes(heap as u64),
                 crate::format_bytes(stats.term_dict_cache_bytes as u64),
-                crate::format_bytes(stats.posting_validation_cache_bytes as u64),
                 crate::format_bytes(stats.store_cache_bytes as u64),
                 crate::format_bytes(stats.sparse_heap_bytes as u64),
                 crate::format_bytes(stats.dense_heap_bytes as u64),

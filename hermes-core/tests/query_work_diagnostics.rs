@@ -20,7 +20,6 @@ async fn work_counts_distinguish_metadata_count_decoding_scoring_and_cached_posi
                 compact_text: compact,
                 quantized_norms: quantized,
                 posting_ratio_bounds: true,
-                posting_validation_cache_bytes: 262144,
                 num_threads: 1,
                 num_indexing_threads: 1,
                 merge_policy: Box::new(hermes_core::merge::NoMergePolicy),
@@ -122,12 +121,11 @@ async fn work_counts_distinguish_metadata_count_decoding_scoring_and_cached_posi
             assert_eq!(work.position_blocks, 6, "one decode per cached term block");
             assert_eq!(work.position_values, 600);
             assert_eq!(work.phrase_score_units, 0, "COUNT must not score phrases");
-            assert!(work.positions_admitted > 0);
+            assert!(work.positions_opened > 0);
             let mut repeated = CountCollector::new();
             let (result, warm) = capture(collect_segment(segment, &phrase, &mut repeated)).await;
             result.unwrap();
-            assert_eq!(warm.positions_admitted, 0);
-            assert_eq!(warm.positions_proof_hits, 2);
+            assert_eq!(warm.positions_opened, work.positions_opened);
             assert_eq!(warm.position_blocks, work.position_blocks);
         }
     }

@@ -11,7 +11,7 @@ as production latency.
 
 Structures own
 decoded block/value/byte counts, query scorers own score and pruning counts, and
-the immutable posting reader owns validation-cache counts.
+the posting reader counts envelope opens (`postings_opened`, `positions_opened`).
 
 ## Capture and cost model
 

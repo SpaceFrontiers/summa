@@ -284,16 +284,6 @@ pub struct PositionStream {
     compact: bool,
 }
 
-/// Admission proof for one immutable byte range, retained by its file owner.
-#[derive(Clone, Copy)]
-pub(super) struct PositionStreamLayout {
-    num_blocks: usize,
-    index_start: usize,
-    total: u64,
-    canonical_blocks: bool,
-    compact: bool,
-}
-
 #[derive(Default)]
 struct PositionBlockCache {
     index: Option<usize>,
@@ -314,38 +304,31 @@ impl PositionStream {
     }
 
     pub fn open(bytes: OwnedBytes) -> io::Result<Self> {
-        let layout = Self::validate_bytes(bytes.as_slice())?;
-        Ok(Self::from_validated_bytes(bytes, layout))
+        let (num_blocks, index_start, total) = Self::parse_layout(&bytes)?;
+        Self::validate_blocks(&bytes, total)?;
+        Ok(Self::from_layout(bytes, num_blocks, index_start, total))
     }
 
-    pub(super) fn validate_bytes(bytes: &[u8]) -> io::Result<PositionStreamLayout> {
-        let (num_blocks, index_start, total) = Self::parse_layout(bytes)?;
-        // Query iterators cannot return I/O errors. Reject malformed directories
-        // and block headers before they can be mistaken for absent phrase hits.
-        Self::validate_blocks(bytes, total)?;
+    /// Parse the envelope without auditing writer-produced directory or payload contents.
+    pub(super) fn open_for_query(bytes: OwnedBytes) -> io::Result<Self> {
+        let (num_blocks, index_start, total) = Self::parse_layout(&bytes)?;
+        Ok(Self::from_layout(bytes, num_blocks, index_start, total))
+    }
+
+    fn from_layout(bytes: OwnedBytes, num_blocks: usize, index_start: usize, total: u64) -> Self {
         // Freshly encoded streams keep every interior block full, retaining
         // the original O(1) cursor-to-block calculation. Only concatenated
         // streams with partial interior source tails need the index search.
         let canonical_blocks = num_blocks == 0
-            || Self::entry_for(bytes, index_start, num_blocks, num_blocks - 1).1
+            || Self::entry_for(&bytes, index_start, num_blocks, num_blocks - 1).1
                 == (num_blocks as u64 - 1) * POSITION_STREAM_BLOCK as u64;
-        Ok(PositionStreamLayout {
+        Self {
+            compact: directory::is_compact(&bytes),
+            bytes,
             num_blocks,
             index_start,
             total,
             canonical_blocks,
-            compact: directory::is_compact(bytes),
-        })
-    }
-
-    pub(super) fn from_validated_bytes(bytes: OwnedBytes, layout: PositionStreamLayout) -> Self {
-        Self {
-            bytes,
-            num_blocks: layout.num_blocks,
-            index_start: layout.index_start,
-            total: layout.total,
-            canonical_blocks: layout.canonical_blocks,
-            compact: layout.compact,
         }
     }
 
@@ -1007,6 +990,17 @@ mod compact_directory_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_position_open_rejects_overflowing_checkpoint_before_deriving_layout() {
+        let mut bytes = Vec::new();
+        let mut encoder = PositionStreamEncoder::new(&mut bytes).with_compact_directory();
+        encoder.push_values(&[1; 256]).unwrap();
+        encoder.finish().unwrap();
+        let (_, index_start, _) = PositionStream::parse_layout(&bytes).unwrap();
+        bytes[index_start + 4..index_start + 12].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(PositionStream::open(OwnedBytes::new(bytes)).is_err());
+    }
 
     #[test]
     fn position_decoding_overwrites_stale_values_across_lengths_and_codecs() {

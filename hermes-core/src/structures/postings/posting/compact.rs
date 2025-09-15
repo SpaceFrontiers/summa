@@ -216,6 +216,7 @@ impl PostingBlockSource {
         Ok(BlockPostingList {
             compact_headers: false,
             short_cursors: false,
+            verify_content: true,
             content_error: None,
             impacts,
             stream,

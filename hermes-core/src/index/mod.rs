@@ -367,10 +367,6 @@ pub struct IndexConfig {
     pub term_cache_budget_bytes: Option<usize>,
     /// Flush target for newly written term dictionaries; default 16 KiB.
     pub term_dict_block_size: crate::structures::SSTableBlockSize,
-    /// Shared per-segment byte budget for document/position posting validation on
-    /// immutable mmap/RAM handles. Default 0 disables reuse; maximum 64 MiB.
-    /// Old reader generations may overlap. Lazy handles always revalidate.
-    pub posting_validation_cache_bytes: usize,
     /// Process-wide byte budget for decompressed document-store blocks.
     ///
     /// Indexes opened with the same budget share one read-concurrent,
@@ -584,7 +580,6 @@ impl Default for IndexConfig {
             term_cache_blocks: 256,
             term_cache_budget_bytes: None,
             term_dict_block_size: crate::structures::SSTableBlockSize::default(),
-            posting_validation_cache_bytes: 0,
             // Stored bodies can be much larger than the writer's nominal
             // 16-KiB block target. Keep this process-wide and byte bounded so
             // segment fan-out cannot multiply it into tens of GiB.

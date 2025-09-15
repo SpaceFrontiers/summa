@@ -62,7 +62,6 @@ async fn mixed_posting_formats_preserve_scores_positions_and_deleted_rows_across
             num_threads: 1,
             num_indexing_threads: 1,
             posting_ratio_bounds: true,
-            posting_validation_cache_bytes: 4096,
             merge_policy: Box::new(hermes_core::merge::NoMergePolicy),
             ..Default::default()
         };

@@ -407,9 +407,6 @@ enum Commands {
         /// Optional per-segment decompressed dictionary cache byte cap (0 disables retention)
         #[arg(long)]
         term_cache_bytes: Option<usize>,
-        /// Shared per-segment document/position validation budget (maximum 64 MiB)
-        #[arg(long, default_value_t = 0)]
-        posting_validation_cache_bytes: usize,
     },
 
     /// Warm up slice cache and save to file
@@ -666,14 +663,9 @@ async fn main() -> Result<()> {
             offset,
             term_cache_blocks,
             term_cache_bytes,
-            posting_validation_cache_bytes,
         } => {
-            let config = index_ops::search_config(
-                term_cache_blocks,
-                term_cache_bytes,
-                posting_validation_cache_bytes,
-                search_threads,
-            );
+            let config =
+                index_ops::search_config(term_cache_blocks, term_cache_bytes, search_threads);
 
             if let Some(queries_file) = queries_file {
                 anyhow::ensure!(offset == 0, "--offset is not supported with --queries-file");

@@ -37,8 +37,6 @@ pub struct SegmentMemoryStats {
     pub num_docs: u32,
     /// Term dictionary block cache bytes
     pub term_dict_cache_bytes: usize,
-    /// Shared document/position validation table bytes; no decoded payloads.
-    pub posting_validation_cache_bytes: usize,
     /// Constant-sized first-failure record shared by this reader's posting cursors.
     pub posting_integrity_heap_bytes: usize,
     /// Heap bytes in this reader generation's immutable row visibility.
@@ -79,7 +77,6 @@ impl SegmentMemoryStats {
         self.deletion_bytes
             + self.row_stats_heap_bytes
             + self.term_dict_cache_bytes
-            + self.posting_validation_cache_bytes
             + self.posting_integrity_heap_bytes
             + self.store_cache_bytes
             + self.sparse_heap_bytes
@@ -1992,7 +1989,6 @@ impl SegmentReader {
             schema,
             term_cache_blocks,
             term_cache_budget_bytes,
-            0,
             dir as *const D as usize,
             Arc::new(super::SharedStoreCache::new(0)),
         )
@@ -2007,12 +2003,9 @@ impl SegmentReader {
         schema: Arc<Schema>,
         term_cache_blocks: usize,
         term_cache_budget_bytes: Option<usize>,
-        posting_validation_cache_bytes: usize,
         store_cache_directory_namespace: usize,
         store_cache: Arc<super::SharedStoreCache>,
     ) -> Result<Self> {
-        // `posting_validation_cache_bytes` is validated once at index load
-        // (`SearcherResources`) and by `PostingListReader::new` below.
         let files = SegmentFiles::new(segment_id.0);
 
         // Read metadata (small, always loaded)
@@ -2030,13 +2023,12 @@ impl SegmentReader {
         )
         .await?;
 
-        // Own both immutable text files under one bounded admission cache.
+        // Own both text files for borrowed query views.
         let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
         let postings = crate::structures::postings::PostingListReader::new(
             dir.open_lazy(&files.postings).await?,
             positions_handle,
-            posting_validation_cache_bytes,
-        )?;
+        );
 
         // Open store with lazy loading
         let store_handle = dir.open_lazy(&files.store).await?;
@@ -2586,7 +2578,6 @@ impl SegmentReader {
                 .map_or(0, |bits| bits.bits.len() * 8),
             num_docs: self.meta.num_docs,
             term_dict_cache_bytes,
-            posting_validation_cache_bytes: self.postings.heap_bytes(),
             posting_integrity_heap_bytes: self.postings.integrity_heap_bytes(),
             store_cache_bytes,
             sparse_heap_bytes,

@@ -14,13 +14,10 @@ Implemented and retained:
   length bounds, L1 bounds, ratio bounds, impact envelopes, group envelopes).
   The BM25 impact envelope is implemented (`posting/impacts.rs`), opt-in, and
   not a default.
-- Structural admission before any infallible read, plus a content check on
-  every decoded block (ids strictly increasing and spanning exactly the L0
-  range); a corrupt block ends the cursor with `log::error!`, never a panic or
-  an out-of-range id.
+- Query reads trust writer-produced directory and decoded-document invariants.
+  Explicit deserialization and merge admission retain structural checks.
 - In-block seeks: current/next-document probe, then a bounded binary search.
   Deferred term-frequency and position-prefix accounting on document movement.
-- Bounded validation-proof cache per segment (`posting_validation_cache_bytes`).
 - Bounded decoded-block intersections for conjunctions and phrase candidates;
   ordinary sparse seeks retain their existing policy. Fully overwriting decoders
   reuse initialized buffers. See posting block execution.
@@ -169,56 +166,41 @@ Metadata format **9** is required; formats 6 through 8 are upgraded on open (see
 what protects older readers from the position codec tag; individual block
 bytes are never converted.
 
-## Admission and content checks
+## Query trust and explicit integrity checks
 
-`BlockPostingList::deserialize` / `deserialize_zero_copy` and the
-`PostingListReader` validate structure before exposing infallible cursors:
-footer arithmetic, directory order and extents, every block header (count,
-first doc, codec, widths), payload extents, `Pfor` exception tables, cursor
-monotonicity, ratio finiteness and impact records. Cost is
-O(blocks + exceptions) reads with constant scratch; no posting is decoded.
-Merge admission (`concatenate_streaming`, `concatenate_blocks`) validates
-every source and its remapped ranges before writing a byte; mixing sources
-with and without position cursors is a corruption error.
+Normal segment queries trust Hermes-produced postings and positions. The owning
+`PostingListReader` parses the footer and constructs borrowed views without
+scanning block headers, directory ordering, pruning metadata or position blocks.
+Decoded document order and endpoints are not rechecked on this path. There is no
+full-index audit at open and no validation cache, lock, budget or CLI option.
 
-Structural checks cannot see a flipped payload bit. Every block decode
-therefore verifies the decoded ids are strictly increasing and equal the L0
-`first_doc`/`last_doc` at both ends (`verify_block_docs`). Rounded 8-bit gaps
-use an equivalent check: all raw gaps must be nonzero, and decoded endpoints
-must match the directory and remain ordered. At most 127 gaps of at most 255
-can wrap a u32 only once, which the endpoint check rejects. Other encodings
-check adjacent decoded IDs. This validates ordering, not arbitrary payload
-authenticity. On failure
-the infallible cursor stops and logs the block. Lists acquired from an immutable
-`PostingListReader` also record that failure in its shared, write-once integrity
-record. Native and async segment collectors, and term/phrase point scoring,
-check the record at their boundaries and return `Error::Corruption` instead of
-successful partial results. Later queries on that reader also fail; reopening
-creates an independent owner, and old healthy snapshots remain usable.
-`SegmentReader::check_posting_integrity` exposes the same check to low-level
-cursor callers. The record costs a constant number of bytes per segment and
-never retains payloads. `decode_block_doc_ids_checked` distinguishes out-of-range
-from corrupt for internal callers. Pinned by
-`content_corrupt_block_never_panics_or_truncates_silently` and the
-whole-list byte-flip / prefix-truncation sweep in
-`hermes-core/tests/corrupt_posting_content.rs`. Term frequencies have no
-directory bound and are not content-checked; a corrupt tf array cannot panic.
+Explicit `BlockPostingList::deserialize` / `deserialize_zero_copy` still check
+structure and decoded document order. `PositionStream::open` and merge admission
+also retain their strict checks. Their malformed-input tests remain applicable to
+those boundaries. Ordinary search is not an integrity audit of modified bytes.
+I/O failures and unsupported envelopes still fail. Decoders establish slice
+extents before unsafe kernels; detected posting decode errors retain the shared
+constant-sized first-failure record so collectors do not hide a known failure.
+Legacy document-indexed positions retain their existing materializing decoder.
 
 <a id="bounded-reuse-of-posting-validation"></a>
 
-### Validation proof cache
+### Footer flags describe stored layout
 
-`IndexConfig.posting_validation_cache_bytes` (default 0, max 64 MiB per
-segment) bounds a four-way table of `(start, end, footer/layout)` proofs
-owned by a segment’s immutable posting and position file handles (RAM or mmap).
-Keys distinguish the file kind as well as the range. A hit probes at most four
-entries under a read lock; insertion reuses an identical or empty entry before
-replacing a deterministically selected way. Partial sets honor the exact entry
-budget, and no per-query allocation is introduced. Lazy handles are
-always revalidated. No payload, decoded posting or query result is cached;
-failed validation never publishes a proof; replacement readers start empty.
-Validation on the full corpus costs 6–9 % relative to the unchecked prototype
-and is not optional.
+The unknown-bit mask is the compile-time constant `0xff`, one test per footer.
+The flags are format descriptors, not eight independent query-time decisions:
+
+| Flags                                | Why readers retain them                                                                                         |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| Position cursors / short cursors     | Positions can be absent; four-byte cursors are valid only when totals fit u32.                                  |
+| Length / L1 bounds                   | Existing lists encode bounds differently or omit group bounds.                                                  |
+| Ratio / impact / group impact bounds | Optional pruning sections trade extra metadata and build cost for tighter bounds; short lists may omit impacts. |
+| Compact headers                      | Compact streams relocate headers; Pfor currently retains inline exception framing.                              |
+
+New writers already choose short cursors when eligible under compact encoding.
+A default change cannot substitute for reading the flags of existing immutable
+segments. Forcing every section present would add bytes and break compatibility.
+No flag or writer default is changed by trusted query reads.
 
 ## Bounds metadata
 
@@ -301,7 +283,7 @@ opt-in experiment, not a default.
   the input placed before a protected page to catch over-reads.
 - `bitpacking4x::tests`: canonical four-lane bytes for every width and tail.
 - Integration: `tests/corrupt_posting_content.rs`, `tests/corrupt_text_postings.rs`,
-  `tests/corrupt_text_positions.rs`, `tests/posting_validation_resources.rs`,
+  `tests/corrupt_text_positions.rs`, `tests/posting_reader_resources.rs`,
   `tests/simd_posting_format.rs`, `tests/impact_ranked_collection.rs`,
   `tests/ratio_chunked_collection.rs`.
   sequential decode and skip-seek on the production container.

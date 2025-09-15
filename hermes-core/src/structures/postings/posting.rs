@@ -787,7 +787,9 @@ fn encode_block_arrays(
 pub struct BlockPostingList {
     compact_headers: bool,
     short_cursors: bool,
-    /// First content failure detected in this immutable segment reader.
+    /// Explicit deserialization checks decoded ordering; segment queries trust the writer.
+    verify_content: bool,
+    /// First decoding failure detected in this immutable segment reader.
     content_error: Option<std::sync::Arc<std::sync::OnceLock<usize>>>,
     /// Block data stream (packed blocks laid out sequentially).
     stream: OwnedBytes,
@@ -1056,6 +1058,7 @@ impl BlockPostingList {
         Ok(Self {
             compact_headers: false,
             short_cursors: false,
+            verify_content: true,
             content_error: None,
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
@@ -1246,7 +1249,7 @@ impl BlockPostingList {
     /// L1 is extracted into a `Vec<u32>` for SIMD-friendly access (tiny: ≤ N/8 entries).
     pub fn deserialize_zero_copy(raw: OwnedBytes) -> io::Result<Self> {
         let footer = Self::validate_bytes(&raw)?;
-        Ok(Self::from_validated_bytes(raw, footer))
+        Ok(Self::from_layout(raw, footer))
     }
 
     fn validate_bytes(raw: &[u8]) -> io::Result<Footer> {
@@ -1264,8 +1267,9 @@ impl BlockPostingList {
         Ok(footer)
     }
 
-    // Only the file-owning reader may reuse this private validated footer.
-    fn from_validated_bytes(raw: OwnedBytes, footer: Footer) -> Self {
+    // The footer proves section extents. The owning query reader trusts interior
+    // contents; explicit deserialization additionally validates them.
+    fn from_layout(raw: OwnedBytes, footer: Footer) -> Self {
         let ratios = footer
             .ratio_bounds
             .then(|| raw.slice(footer.cursors_end()..footer.ratios_end()));
@@ -1282,6 +1286,7 @@ impl BlockPostingList {
         Self {
             compact_headers: footer.compact_headers,
             short_cursors: footer.short_cursors,
+            verify_content: true,
             content_error: None,
             stream: raw.slice(0..footer.stream_len),
             l0_bytes: raw.slice(footer.l0_start()..footer.l1_start()),
@@ -1654,6 +1659,7 @@ impl BlockPostingList {
         Ok(Self {
             compact_headers: false,
             short_cursors: false,
+            verify_content: true,
             content_error: None,
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
@@ -2044,25 +2050,30 @@ impl BlockPostingList {
                 payload,
                 doc_ids,
             )?;
-            // Header 8 denotes Rounded with 8-bit raw gaps (no codec tag).
-            let byte_gaps = (header[6] == 8).then(|| &payload[..doc_ids.len() - 1]);
-            if header[6] >> PostingCodec::HEADER_SHIFT == PostingCodec::Simd4x as u8
-                && doc_ids.len() == BLOCK_SIZE
-                && !bitpacking4x::first_gap_is_zero(payload, header[6] & PostingCodec::WIDTH_MASK)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "SIMD posting first gap must be zero",
-                ));
-            }
-            let strict_gap_width = (header[6] >> PostingCodec::HEADER_SHIFT
-                == PostingCodec::Simd4x as u8)
-                .then_some(header[6] & PostingCodec::WIDTH_MASK);
-            if !verify_block_docs(doc_ids, first, last, byte_gaps, strict_gap_width) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("decoded doc ids leave the directory range {first}..={last}"),
-                ));
+            if self.verify_content {
+                // Header 8 denotes Rounded with 8-bit raw gaps (no codec tag).
+                let byte_gaps = (header[6] == 8).then(|| &payload[..doc_ids.len() - 1]);
+                if header[6] >> PostingCodec::HEADER_SHIFT == PostingCodec::Simd4x as u8
+                    && doc_ids.len() == BLOCK_SIZE
+                    && !bitpacking4x::first_gap_is_zero(
+                        payload,
+                        header[6] & PostingCodec::WIDTH_MASK,
+                    )
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SIMD posting first gap must be zero",
+                    ));
+                }
+                let strict_gap_width = (header[6] >> PostingCodec::HEADER_SHIFT
+                    == PostingCodec::Simd4x as u8)
+                    .then_some(header[6] & PostingCodec::WIDTH_MASK);
+                if !verify_block_docs(doc_ids, first, last, byte_gaps, strict_gap_width) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("decoded doc ids leave the directory range {first}..={last}"),
+                    ));
+                }
             }
             crate::observe::search_work!(
                 doc_blocks += 1,
@@ -2095,8 +2106,8 @@ impl BlockPostingList {
         let (codec, doc_width) = PostingCodec::from_header_byte(header[6])?;
         let header_len = if self.compact_headers { 0 } else { 8 };
         let state = if self.compact_headers { block_idx } else { pos };
-        if count == 0 {
-            return Err(invalid("empty posting block"));
+        if count == 0 || count > BLOCK_SIZE {
+            return Err(invalid("invalid posting block count"));
         }
 
         // Every decoder overwrites the complete output; retain initialized
@@ -2200,7 +2211,7 @@ impl BlockPostingList {
             }
             PostingCodec::Rounded => {
                 let rounded = simd::RoundedBitWidth::try_from_u8(tf_bits)
-                    .expect("rounded posting frequency width was validated at admission");
+                    .expect("invalid rounded posting frequency width");
                 simd::unpack_rounded(
                     &payload[..count * rounded.bytes_per_value()],
                     rounded,
@@ -2218,9 +2229,9 @@ impl BlockPostingList {
             }
             PostingCodec::Pfor => {
                 let len = pfor_payload_len(payload, count, tf_bits)
-                    .expect("patched posting frequency payload was validated at admission");
+                    .expect("invalid patched posting frequency payload");
                 unpack_pfor(&payload[..len], tf_bits, tfs, count)
-                    .expect("patched posting frequency table was validated at admission");
+                    .expect("invalid patched posting frequency table");
             }
         }
     }
