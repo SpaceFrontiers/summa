@@ -18,7 +18,7 @@ SCHEMA = """
 index test_bmp_reorder {
     field title: text<simple> [indexed, stored]
     field doc_id: u64 [indexed, stored]
-    field embedding: sparse_vector<bmp> [indexed, stored]
+    field embedding: sparse_vector<u32> [indexed<format: bmp, dims: 30000>, stored, reorder]
 }
 """
 
