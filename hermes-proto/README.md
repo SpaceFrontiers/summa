@@ -56,7 +56,11 @@ explicit `Commit`, and errors preserve original batch positions. Deleting a
 missing key is accepted; accepted count is not a count of removed rows.
 
 Requests are capped at 100,000 deletion keys / 8 MiB of key bytes, or 1,000
-replacement documents / 32 MiB of encoded protobuf. The shared Rust validation in
+replacement documents / 32 MiB of encoded protobuf. A single replacement may use
+up to 200 MiB, including the complete request envelope; clients must isolate it
+from ordinary batches. This matches the ingestion client transport ceiling without
+raising batch concurrency or the server mutation admission limit. Oversized
+requests fail before conversion, index lookup, or writer admission. The shared Rust validation in
 [mutations.rs](mutations.rs) is included beside generated bindings in both server
 and broker. See [row deletion](../docs/row-deletion.md) for pending-key constraints,
 broker routing, cancellation, and publication semantics.

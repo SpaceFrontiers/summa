@@ -81,6 +81,21 @@ Suggested starting budget: 150–300 MiB/segment depending on skip-section and
 dense-field metadata — enough for offsets, H, and BMP doc maps without ever
 pinning the corpus-sized D/E payloads.
 
+## Reader reload ownership
+
+Deletion-only commits must share immutable segment payloads, parsed metadata,
+term/store caches and pin owners with older searchers. Only the deletion bitmap
+and visibility views change; old searchers retain their original visibility.
+New segment opens are bounded to two concurrent readers, including deletion
+loading. Publication remains atomic: a failed or cancelled reload leaves the
+previous searcher usable.
+
+Reload memory is shared retained payloads + new segment payloads + per-generation
+visibility bitmaps (roughly one bit per physical row) + at most two opens' scratch.
+This bounds opening concurrency, not total index residency: the pin budget remains
+per segment and old replaced segments remain alive while queries hold snapshots.
+No stored format or pin-budget default changes are required.
+
 ## Phase 2 (implemented): cold-IO merge writes — see `docs/cold-io.md`
 
 Implemented cold output uses write-behind writeback/cache-drop on Linux and

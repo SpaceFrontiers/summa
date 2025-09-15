@@ -319,3 +319,26 @@ test("maximum deletion batches receive every error over real gRPC transport", as
     await server.shutdown();
   }
 });
+
+test("large singleton upsert crosses the client send limit over real gRPC", async () => {
+  const { createServer } = require("nice-grpc");
+  const { HermesClient, IndexServiceDefinition } = require("../dist/index.js");
+  const server = createServer({ "grpc.max_receive_message_length": 200 * 1024 * 1024 });
+  const body = "x".repeat(51 * 1024 * 1024);
+  server.add({ ...IndexServiceDefinition, methods: { upsertDocuments: IndexServiceDefinition.methods.upsertDocuments } }, {
+    upsertDocuments: async (request) => {
+      assert.equal(request.documents.length, 1);
+      assert.equal(request.documents[0].fields.find((entry) => entry.name === "body").value.text, body);
+      return { acceptedCount: 1, errors: [] };
+    },
+  });
+  const port = await server.listen("127.0.0.1:0");
+  const client = new HermesClient(`127.0.0.1:${port}`);
+  client.connect();
+  try {
+    await client.upsertDocument("docs", { id: "large", body });
+  } finally {
+    client.close();
+    await server.shutdown();
+  }
+});

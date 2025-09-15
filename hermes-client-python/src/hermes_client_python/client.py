@@ -96,7 +96,10 @@ class HermesClient:
         # Increase message size limits for large responses (e.g., loading content fields)
         options = [
             ("grpc.max_receive_message_length", 50 * 1024 * 1024),  # 50MB
-            ("grpc.max_send_message_length", 50 * 1024 * 1024),  # 50MB
+            (
+                "grpc.max_send_message_length",
+                200 * 1024 * 1024,
+            ),  # singleton upsert ceiling
         ]
         # Enable gzip compression for smaller message sizes over the wire
         self._channel = aio.insecure_channel(
@@ -335,8 +338,8 @@ class HermesClient:
         """Stage complete replacements, inserting missing keys. No partial patches.
 
         Each document must contain its primary key. Inspect per-item errors;
-        commit publishes accepted operations. At most one pending replacement
-        per key is allowed, including across calls.
+        commit publishes the latest accepted replacement for each key,
+        including multiple replacements across calls.
         """
         self._ensure_connected()
         if len(documents) > 1_000:
@@ -347,8 +350,9 @@ class HermesClient:
                 pb.NamedDocument(fields=_to_field_entries(doc)) for doc in documents
             ],
         )
-        if request.ByteSize() > 32 * 1024 * 1024:
-            raise ValueError("upsert request exceeds 32 MiB encoded bytes")
+        limit_mib = 200 if len(documents) == 1 else 32
+        if request.ByteSize() > limit_mib * 1024 * 1024:
+            raise ValueError(f"upsert request exceeds {limit_mib} MiB encoded bytes")
         response = await self._index_stub.UpsertDocuments(
             request, timeout=self._deadline(timeout)
         )

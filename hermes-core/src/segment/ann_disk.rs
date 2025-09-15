@@ -245,14 +245,15 @@ struct BinaryScanTask<'a> {
 
 /// Mmap-backed searchable ANN payload. Only the fixed-size run directory is
 /// heap-resident; all corpus-sized columns remain zero-copy file slices.
+#[derive(Clone)]
 pub(crate) struct AnnDiskIndex {
     pub(crate) alive_docs: Option<std::sync::Arc<crate::query::DocBitset>>,
     // Drop locks before the directory allocation they reference.
     #[cfg(feature = "native")]
-    heap_pins: crate::segment::pin::HeapPinSet,
+    heap_pins: std::sync::Arc<crate::segment::pin::HeapPinSet>,
     raw: OwnedBytes,
     header: AnnDiskHeader,
-    runs: Vec<AnnRun>,
+    runs: std::sync::Arc<Vec<AnnRun>>,
 }
 
 /// Cheap structural health of one ANN payload, computed from the in-memory
@@ -512,7 +513,7 @@ impl AnnDiskIndex {
             heap_pins: Default::default(),
             raw,
             header,
-            runs,
+            runs: std::sync::Arc::new(runs),
         })
     }
 
@@ -706,10 +707,15 @@ impl AnnDiskIndex {
         remaining: &mut u64,
         report: &mut crate::segment::pin::PinReport,
     ) {
-        let before = self.heap_pins.report();
-        self.heap_pins
-            .pin_slice(&self.runs, "ANN cluster-run directory", mode, remaining);
-        let after = self.heap_pins.report();
+        let Some(pins) = std::sync::Arc::get_mut(&mut self.heap_pins) else {
+            log::warn!("[pin] ANN directory already shared across reader generations");
+            return;
+        };
+        // Keep the allocation alive until the last shared pin guard is dropped.
+        pins.retain_owner(std::sync::Arc::clone(&self.runs));
+        let before = pins.report();
+        pins.pin_slice(&self.runs, "ANN cluster-run directory", mode, remaining);
+        let after = pins.report();
         report.intended_bytes += after.intended_bytes - before.intended_bytes;
         report.pinned_bytes += after.pinned_bytes - before.pinned_bytes;
         report.skipped_budget_bytes += after.skipped_budget_bytes - before.skipped_budget_bytes;
@@ -823,7 +829,7 @@ impl AnnDiskIndex {
         let mut ordinal_scores = Vec::new();
         let mut scores = [0.0f32; TQ_BLOCK_LANES];
 
-        for run in &self.runs {
+        for run in self.runs.iter() {
             let mut current_doc = None;
             let codes = &bytes[run.codes.clone()];
             for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
@@ -1474,7 +1480,7 @@ impl AnnDiskIndex {
 
         let mut collector = C::with_k(k);
         let mut scores = [0.0f32; TQ_BLOCK_LANES];
-        for run in &self.runs {
+        for run in self.runs.iter() {
             let codes = &bytes[run.codes.clone()];
             for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
                 tq_score_block(plan, block, &mut scores);
@@ -3602,6 +3608,44 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ann_visibility_clones_share_run_allocations_and_pin_lifetime() {
+        use std::sync::Arc;
+        let runs = [BuildRun {
+            cluster_id: 0,
+            doc_ids: &[0, 1],
+            ordinals: &[0, 0],
+            codes: &[0, 255],
+        }];
+        let mut bytes = Vec::new();
+        write_built_runs(binary_header(2), &runs, &mut bytes).unwrap();
+        let mut original =
+            AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 2).unwrap();
+        let mut report = crate::segment::pin::PinReport::default();
+        original.pin_lookup_directory(crate::segment::pin::PinMode::Copy, &mut 1024, &mut report);
+        assert!(report.pinned_bytes > 0);
+        let mut changed = original.clone();
+        let mut alive = crate::query::DocBitset::all(2);
+        alive.clear(0);
+        changed.alive_docs = Some(Arc::new(alive));
+        assert!(original.alive_docs.is_none());
+        assert!(Arc::ptr_eq(&original.runs, &changed.runs));
+        assert!(Arc::ptr_eq(&original.heap_pins, &changed.heap_pins));
+        assert_eq!(
+            original.raw.as_slice().as_ptr(),
+            changed.raw.as_slice().as_ptr()
+        );
+        let runs = Arc::downgrade(&original.runs);
+        let pins = Arc::downgrade(&original.heap_pins);
+        drop(original);
+        assert!(runs.upgrade().is_some());
+        assert!(pins.upgrade().is_some());
+        assert_eq!(changed.runs.len(), 1);
+        drop(changed);
+        assert!(pins.upgrade().is_none());
+        assert!(runs.upgrade().is_none());
+    }
+
     /// Compaction must produce a payload indistinguishable from a fresh
     /// build: one run per cluster, fragmentation 1.0, absolute doc IDs — and
     /// return exactly the results the byte-copy merge of the same sources
@@ -4536,7 +4580,7 @@ mod tests {
         let raw = disk.raw.as_slice();
         let mut reference = BoundedAnnCollector::<true, true>::new(k);
         let mut scores = [0.0f32; TQ_BLOCK_LANES];
-        for run in &disk.runs {
+        for run in disk.runs.iter() {
             let codes = &raw[run.codes.clone()];
             for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
                 tq_score_block(&plan, block, &mut scores);
@@ -4612,7 +4656,7 @@ mod tests {
         // enabling the reader to terminate the run at the first losing block.
         let block_bytes = tq_ivf_block_bytes(disk.header().code_size);
         let raw = disk.raw.as_slice();
-        for run in &disk.runs {
+        for run in disk.runs.iter() {
             let codes = &raw[run.codes.clone()];
             let mut previous_scale = f32::INFINITY;
             for (block_index, block) in codes.chunks_exact(block_bytes).enumerate() {
@@ -5099,7 +5143,7 @@ pub(crate) fn write_live_ann(
     let mut counts = Vec::with_capacity(source.runs.len());
     let mut header = source.header.clone();
     header.vector_count = 0;
-    for run in &source.runs {
+    for run in source.runs.iter() {
         check()?;
         let mut count = 0usize;
         for i in 0..run.count {

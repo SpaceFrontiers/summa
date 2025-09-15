@@ -89,7 +89,9 @@ accepted operations. A failed RPC can have an unknown outcome; callers must not
 blindly retry upserts before resolving/committing pending work.
 
 Deletion requests admit at most 100,000 keys and 8 MiB of key bytes. Replacement
-requests admit at most 1,000 documents and 32 MiB of encoded protobuf data. Both
+requests admit at most 1,000 documents and 32 MiB of encoded protobuf data.
+A singleton replacement may use 200 MiB including its request envelope; batch
+concurrency and mutation admission remain unchanged. Both
 server and broker check envelope limits before lookup, conversion or admission.
 The core's cumulative pending-key limits still apply across requests. Server
 mutation batches hold the existing exclusive writer lock through
