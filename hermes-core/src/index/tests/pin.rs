@@ -11,10 +11,13 @@ use crate::index::{Index, IndexConfig, IndexWriter};
 use crate::segment::pin::{PinMode, PinPolicy};
 use crate::segment::{SegmentId, SegmentReader};
 
-async fn build_test_index(dir: &MmapDirectory) -> (crate::dsl::Schema, u128) {
+async fn build_test_index(
+    dir: &MmapDirectory,
+    format: crate::structures::SparseFormat,
+) -> (crate::dsl::Schema, u128) {
     let mut sb = SchemaBuilder::default();
     let sparse_cfg = crate::structures::SparseVectorConfig {
-        format: crate::structures::SparseFormat::Bmp,
+        format,
         dims: Some(1024),
         max_weight: Some(5.0),
         ..Default::default()
@@ -48,74 +51,79 @@ async fn build_test_index(dir: &MmapDirectory) -> (crate::dsl::Schema, u128) {
 /// reported, and search results are unchanged afterwards.
 #[tokio::test]
 async fn test_pin_metadata_copy_mode_preserves_search() {
-    use crate::query::SparseVectorQuery;
+    for format in [
+        crate::structures::SparseFormat::Bmp,
+        crate::structures::SparseFormat::Seismic,
+    ] {
+        use crate::query::SparseVectorQuery;
 
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = MmapDirectory::new(tmp.path());
-    let (schema, seg_id) = build_test_index(&dir).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp.path());
+        let (schema, seg_id) = build_test_index(&dir, format).await;
 
-    let mut reader = SegmentReader::open(&dir, SegmentId(seg_id), Arc::new(schema.clone()), 64)
-        .await
-        .unwrap();
+        let mut reader = SegmentReader::open(&dir, SegmentId(seg_id), Arc::new(schema.clone()), 64)
+            .await
+            .unwrap();
 
-    let field = schema.get_field("sparse").unwrap();
-    let query = SparseVectorQuery::new(field, vec![(3, 1.0), (10, 1.0)]);
-    let before = crate::query::search_segment_with_count(&reader, &query, 10)
-        .await
-        .unwrap();
+        let field = schema.get_field("sparse").unwrap();
+        let query = SparseVectorQuery::new(field, vec![(3, 1.0), (10, 1.0)]);
+        let before = crate::query::search_segment_with_count(&reader, &query, 10)
+            .await
+            .unwrap();
 
-    // Generous budget: everything pinnable gets pinned
-    reader.apply_pin_policy(&PinPolicy {
-        budget_bytes: 64 * 1024 * 1024,
-        mode: PinMode::Copy,
-    });
-    let stats = reader.memory_stats();
-    assert!(stats.sparse_file_backed_bytes > 0);
-    assert!(stats.dense_file_backed_bytes > 0);
-    assert!(
-        stats.sparse_file_backed_bytes > stats.sparse_heap_bytes as u64,
-        "BMP corpus bytes must be reported as file-backed, not heap"
-    );
-    assert!(
-        stats.pinned_metadata_bytes > 0,
-        "BMP starts/doc-maps/E offsets/H grid + flat doc_ids should be pinnable"
-    );
-    assert!(stats.sparse_pinned_metadata_bytes > 0);
-    assert!(stats.dense_pinned_metadata_bytes > 0);
-    assert_eq!(
-        stats.pinned_metadata_bytes,
-        stats
-            .sparse_pinned_metadata_bytes
-            .saturating_add(stats.dense_pinned_metadata_bytes)
-    );
-    assert_eq!(
-        stats.pin_intended_bytes,
-        stats
-            .sparse_pin_intended_bytes
-            .saturating_add(stats.dense_pin_intended_bytes)
-    );
-    assert_eq!(
-        stats.pinned_metadata_bytes, stats.pin_intended_bytes,
-        "generous budget must pin everything eligible"
-    );
+        // Generous budget: everything pinnable gets pinned
+        reader.apply_pin_policy(&PinPolicy {
+            budget_bytes: 64 * 1024 * 1024,
+            mode: PinMode::Copy,
+        });
+        let stats = reader.memory_stats();
+        assert!(stats.sparse_file_backed_bytes > 0);
+        assert!(stats.dense_file_backed_bytes > 0);
+        assert!(
+            stats.sparse_file_backed_bytes > stats.sparse_heap_bytes as u64,
+            "Sparse corpus bytes must be reported as file-backed, not heap"
+        );
+        assert!(
+            stats.pinned_metadata_bytes > 0,
+            "Sparse directories and flat doc_ids should be pinnable"
+        );
+        assert!(stats.sparse_pinned_metadata_bytes > 0);
+        assert!(stats.dense_pinned_metadata_bytes > 0);
+        assert_eq!(
+            stats.pinned_metadata_bytes,
+            stats
+                .sparse_pinned_metadata_bytes
+                .saturating_add(stats.dense_pinned_metadata_bytes)
+        );
+        assert_eq!(
+            stats.pin_intended_bytes,
+            stats
+                .sparse_pin_intended_bytes
+                .saturating_add(stats.dense_pin_intended_bytes)
+        );
+        assert_eq!(
+            stats.pinned_metadata_bytes, stats.pin_intended_bytes,
+            "generous budget must pin everything eligible"
+        );
 
-    // Search still works on the heap-copied metadata
-    let after = crate::query::search_segment_with_count(&reader, &query, 10)
-        .await
-        .unwrap();
-    assert!(!before.0.is_empty(), "fixture must have competitive hits");
-    assert_eq!(before.1, after.1, "pinning must preserve scored count");
-    let hits = |results: Vec<crate::query::SearchResult>| {
-        results
-            .into_iter()
-            .map(|hit| (hit.doc_id, hit.score.to_bits()))
-            .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        hits(before.0),
-        hits(after.0),
-        "pinning must preserve exact ranking and scores"
-    );
+        // Search still works on the heap-copied metadata
+        let after = crate::query::search_segment_with_count(&reader, &query, 10)
+            .await
+            .unwrap();
+        assert!(!before.0.is_empty(), "fixture must have competitive hits");
+        assert_eq!(before.1, after.1, "pinning must preserve scored count");
+        let hits = |results: Vec<crate::query::SearchResult>| {
+            results
+                .into_iter()
+                .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            hits(before.0),
+            hits(after.0),
+            "pinning must preserve exact ranking and scores"
+        );
+    }
 }
 
 /// Budget exhaustion is respected and reported (fail-loud accounting).
@@ -123,7 +131,7 @@ async fn test_pin_metadata_copy_mode_preserves_search() {
 async fn test_pin_metadata_budget_exhaustion_reported() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = MmapDirectory::new(tmp.path());
-    let (schema, seg_id) = build_test_index(&dir).await;
+    let (schema, seg_id) = build_test_index(&dir, crate::structures::SparseFormat::Bmp).await;
 
     let mut reader = SegmentReader::open(&dir, SegmentId(seg_id), Arc::new(schema), 64)
         .await
@@ -150,10 +158,33 @@ async fn test_pin_metadata_budget_exhaustion_reported() {
 }
 
 #[tokio::test]
+async fn disabled_pinning_reports_eligible_sparse_metadata_without_allocating() {
+    for format in [
+        crate::structures::SparseFormat::Bmp,
+        crate::structures::SparseFormat::Seismic,
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = MmapDirectory::new(tmp.path());
+        let (schema, seg_id) = build_test_index(&dir, format).await;
+        let mut reader = SegmentReader::open(&dir, SegmentId(seg_id), Arc::new(schema), 64)
+            .await
+            .unwrap();
+        let before_heap = reader.memory_stats().sparse_heap_bytes;
+        reader.apply_pin_policy(&PinPolicy::disabled());
+        let stats = reader.memory_stats();
+        assert!(stats.sparse_pin_intended_bytes > 0);
+        assert!(stats.dense_pin_intended_bytes > 0);
+        assert_eq!(stats.pinned_metadata_bytes, 0);
+        assert_eq!(stats.sparse_heap_bytes, before_heap);
+    }
+}
+
+#[tokio::test]
 async fn deletion_views_share_copy_pinned_metadata_until_the_last_reader_drops() {
     let temp = tempfile::tempdir().unwrap();
     let directory = MmapDirectory::new(temp.path());
-    let (schema, segment_id) = build_test_index(&directory).await;
+    let (schema, segment_id) =
+        build_test_index(&directory, crate::structures::SparseFormat::Bmp).await;
     let sparse = schema.get_field("sparse").unwrap();
     let mut original = SegmentReader::open(&directory, SegmentId(segment_id), Arc::new(schema), 8)
         .await

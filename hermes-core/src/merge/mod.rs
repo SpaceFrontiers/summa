@@ -40,7 +40,7 @@ pub trait MergePolicy: Send + Sync + Debug {
     /// latency should take precedence over optional merge-time optimization.
     ///
     /// The segment manager uses this signal only when `reorder_on_merge` is
-    /// enabled: urgent merges block-copy BMP data and leave the merged output
+    /// enabled: urgent merges copy encoded text blocks and leave the merged output
     /// for the standalone optimizer. This avoids many long BP passes holding
     /// every merge slot while an ingestion burst keeps publishing segments.
     fn has_severe_backlog(&self, _segments: &[SegmentInfo]) -> bool {
@@ -188,13 +188,9 @@ impl TieredMergePolicy {
             max_merge_at_once: 24,
             tier_factor: 10.0,
             tier_floor: 50_000,
-            // 5M docs, not more: BP reorder cost scales with (doc, ordinal)
-            // sparse entries, not docs. A 20M-doc segment with multi-vector
-            // docs (~5 ordinals/doc observed in prod) reached ~95M BMP
-            // entries / 5.7B postings — beyond what the 600s BP time budget
-            // or the 24GB BP memory budget can converge, so the optimizer
-            // could never finish it. 5M docs keeps worst-case entries near
-            // ~25M, inside the budgets.
+            // Bound replacement work and resident per-document metadata. The
+            // historical five-million-document cap remains unchanged; tuning
+            // it requires mixed-field ingest and maintenance measurements.
             max_merged_docs: 5_000_000,
             floor_segment_docs: 50_000,
             oversized_threshold: 0.5,

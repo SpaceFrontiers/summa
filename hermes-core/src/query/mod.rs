@@ -20,6 +20,7 @@ pub const fn max_candidate_limit(result_window: usize) -> usize {
 mod all;
 mod bm25;
 pub(crate) mod bmp;
+pub(crate) use planner::bmp_executor_limit;
 mod boolean;
 mod boost;
 pub mod candidate_scoring;
@@ -31,16 +32,17 @@ pub use filtered::FilteredQuery;
 mod global_stats;
 mod phrase;
 mod planner;
-mod required_text;
-pub(crate) use planner::bmp_executor_limit;
 mod prefix;
 mod proximity;
 mod range;
+mod required_text;
 mod reranker;
 mod scoring;
 #[cfg(test)]
 mod scoring_tests;
+pub(crate) mod seismic;
 mod term;
+mod text_mapping;
 mod traits;
 mod vector;
 

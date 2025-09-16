@@ -66,7 +66,7 @@ impl MultiValueCombiner {
 
     /// Create LogSumExp combiner with default temperature (1.5)
     pub fn log_sum_exp() -> Self {
-        Self::LogSumExp { temperature: 1.5 }
+        Self::default()
     }
 
     /// Create LogSumExp combiner with custom temperature

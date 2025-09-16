@@ -119,6 +119,14 @@ pub struct TermDictReport {
 
 #[derive(Serialize)]
 pub struct SparseFieldReport {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clusters: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runs: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_terms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoded_bytes: Option<u64>,
     pub field: String,
     pub format: &'static str,
     pub vectors: u64,
@@ -140,6 +148,8 @@ pub struct DenseFieldReport {
     pub kind: &'static str,
     pub flat_vectors: usize,
     pub flat_bytes: u64,
+    pub exact_storage: &'static str,
+    pub exact_lookup_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ann: Option<AnnReport>,
     /// `--sample`: payload scan results.
@@ -294,15 +304,7 @@ async fn diagnose_segment(
     let segment_files = hermes_core::segment::SegmentFiles::new(meta.id);
     let mut files = BTreeMap::new();
     let mut store_bytes = 0u64;
-    for (kind, path) in [
-        ("terms", &segment_files.term_dict),
-        ("postings", &segment_files.postings),
-        ("positions", &segment_files.positions),
-        ("store", &segment_files.store),
-        ("sparse", &segment_files.sparse),
-        ("vectors", &segment_files.vectors),
-        ("fast", &segment_files.fast),
-    ] {
+    for (kind, path) in diagnostic_file_paths(&segment_files) {
         let size = std::fs::metadata(options.index.join(path))
             .map(|meta| meta.len())
             .unwrap_or(0);
@@ -310,7 +312,7 @@ async fn diagnose_segment(
             store_bytes = size;
         }
         if size > 0 {
-            files.insert(kind.to_string(), size);
+            *files.entry(kind.to_string()).or_default() += size;
         }
     }
 
@@ -339,6 +341,10 @@ async fn diagnose_segment(
         let vectors = u64::from(sparse.total_vectors);
         let postings = sparse.total_postings();
         sparse_fields.push(SparseFieldReport {
+            clusters: None,
+            runs: None,
+            pending_terms: None,
+            encoded_bytes: None,
             field: field_name(field_id),
             format: "maxscore",
             vectors,
@@ -378,6 +384,10 @@ async fn diagnose_segment(
             1.0 - (vectors as f64 / f64::from(bmp.num_virtual_docs))
         };
         sparse_fields.push(SparseFieldReport {
+            clusters: None,
+            runs: None,
+            pending_terms: None,
+            encoded_bytes: None,
             field: field_name(field_id),
             format: "bmp",
             vectors,
@@ -386,6 +396,23 @@ async fn diagnose_segment(
             blocks: Some(bmp.num_blocks),
             padding_ratio: Some(padding),
             dims_detail,
+        });
+    }
+    for (field_id, stats) in segment.seismic_stats() {
+        let vectors = u64::from(stats.total_vectors);
+        sparse_fields.push(SparseFieldReport {
+            field: field_name(field_id),
+            format: "seismic",
+            vectors,
+            postings: stats.nominations,
+            postings_per_vector: ratio(stats.nominations, vectors),
+            clusters: Some(stats.clusters),
+            runs: Some(stats.runs),
+            pending_terms: Some(stats.pending_terms),
+            encoded_bytes: Some(stats.encoded_bytes),
+            blocks: None,
+            padding_ratio: None,
+            dims_detail: None,
         });
     }
     sparse_fields.sort_by(|a, b| a.field.cmp(&b.field));
@@ -440,7 +467,13 @@ async fn diagnose_segment(
             field: name,
             kind,
             flat_vectors: flat.num_vectors,
-            flat_bytes: (flat.num_vectors * flat.vector_byte_size()) as u64,
+            flat_bytes: if flat.is_ann_backed() {
+                0
+            } else {
+                (flat.num_vectors * flat.vector_byte_size()) as u64
+            },
+            exact_storage: if flat.is_ann_backed() { "ann" } else { "flat" },
+            exact_lookup_bytes: flat.exact_lookup_bytes(),
             ann: ann.map(AnnReport::from),
             sample,
             probe_cost,
@@ -575,6 +608,23 @@ async fn sample_flat_vectors(
     })
 }
 
+/// Group independently owned Seismic components under the sparse file kind.
+fn diagnostic_file_paths(
+    files: &hermes_core::segment::SegmentFiles,
+) -> impl Iterator<Item = (&'static str, std::path::PathBuf)> + '_ {
+    [
+        ("terms", files.term_dict.clone()),
+        ("postings", files.postings.clone()),
+        ("positions", files.positions.clone()),
+        ("store", files.store.clone()),
+        ("sparse", files.sparse.clone()),
+        ("vectors", files.vectors.clone()),
+        ("fast", files.fast.clone()),
+    ]
+    .into_iter()
+    .chain(files.seismic_partitions().map(|path| ("sparse", path)))
+}
+
 /// Page-cache residency per segment file via `mincore(2)`.
 ///
 /// Answers "is this index actually in RAM" — the difference between a 15 ms
@@ -588,15 +638,7 @@ fn measure_residency(
 
     let mut out = BTreeMap::new();
     let files = hermes_core::segment::SegmentFiles::new(segment_id);
-    for (kind, path) in [
-        ("terms", &files.term_dict),
-        ("postings", &files.postings),
-        ("positions", &files.positions),
-        ("store", &files.store),
-        ("sparse", &files.sparse),
-        ("vectors", &files.vectors),
-        ("fast", &files.fast),
-    ] {
+    for (kind, path) in diagnostic_file_paths(&files) {
         let full = index_path.join(path);
         let Ok(file) = std::fs::File::open(&full) else {
             continue;
@@ -634,13 +676,12 @@ fn measure_residency(
             }
         };
         unsafe { libc::munmap(mapped, len) };
-        out.insert(
-            kind.to_string(),
-            Residency {
-                resident_bytes: (resident_pages * page).min(len) as u64,
-                file_bytes: len as u64,
-            },
-        );
+        let residency = out.entry(kind.to_string()).or_insert(Residency {
+            resident_bytes: 0,
+            file_bytes: 0,
+        });
+        residency.resident_bytes += (resident_pages * page).min(len) as u64;
+        residency.file_bytes += len as u64;
     }
     out
 }
@@ -783,6 +824,14 @@ fn print_human(report: &Report) {
             if let (Some(blocks), Some(padding)) = (sparse.blocks, sparse.padding_ratio) {
                 print!(" blocks={blocks} padding={:.1}%", 100.0 * padding);
             }
+            if let (Some(clusters), Some(runs), Some(pending), Some(bytes)) = (
+                sparse.clusters,
+                sparse.runs,
+                sparse.pending_terms,
+                sparse.encoded_bytes,
+            ) {
+                print!(" clusters={clusters} runs={runs} pending_terms={pending} bytes={bytes}");
+            }
             println!();
             if let Some(dims) = &sparse.dims_detail {
                 println!(
@@ -803,8 +852,13 @@ fn print_human(report: &Report) {
         }
         for dense in &segment.dense_fields {
             print!(
-                "  dense {:31} [{}] flat={} ({} B)",
-                dense.field, dense.kind, dense.flat_vectors, dense.flat_bytes
+                "  dense {:31} [{}] vectors={} exact={} flat={} B lookup={} B",
+                dense.field,
+                dense.kind,
+                dense.flat_vectors,
+                dense.exact_storage,
+                dense.flat_bytes,
+                dense.exact_lookup_bytes
             );
             if let Some(ann) = &dense.ann {
                 print!(
@@ -919,6 +973,64 @@ fn print_human(report: &Report) {
 mod tests {
     use super::*;
     use hermes_core::{Document, IndexWriter, SchemaBuilder};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn diagnose_includes_nomination_partitions_in_sparse_bytes_and_residency() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut schema = SchemaBuilder::default();
+        let field = schema.add_sparse_vector_field_with_config(
+            "seismic",
+            true,
+            false,
+            hermes_core::structures::SparseVectorConfig {
+                format: hermes_core::structures::SparseFormat::Seismic,
+                ..Default::default()
+            },
+        );
+        let mut writer = IndexWriter::create(
+            MmapDirectory::new(tmp.path()),
+            schema.build(),
+            IndexConfig::default(),
+        )
+        .await
+        .unwrap();
+        for dim in 0..32 {
+            let mut doc = Document::new();
+            doc.add_sparse_vector(field, vec![(dim, 1.0), (64, 0.5)]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        drop(writer);
+        let report = build_report(&DiagnoseOptions {
+            index: tmp.path().to_path_buf(),
+            json: false,
+            sample: None,
+            probe_cost: None,
+            residency: cfg!(unix),
+            terms: None,
+            sparse_stats: false,
+        })
+        .await
+        .unwrap();
+        assert_eq!(report.segments.len(), 1);
+        let segment = &report.segments[0];
+        let files =
+            hermes_core::segment::SegmentFiles::new(u128::from_str_radix(&segment.id, 16).unwrap());
+        let root_bytes = std::fs::metadata(tmp.path().join(&files.sparse))
+            .unwrap()
+            .len();
+        let nomination_bytes: u64 = files
+            .seismic_partitions()
+            .map(|path| std::fs::metadata(tmp.path().join(path)).unwrap().len())
+            .sum();
+        assert!(nomination_bytes > 0);
+        assert_eq!(segment.files["sparse"], root_bytes + nomination_bytes);
+        #[cfg(unix)]
+        assert_eq!(
+            segment.residency.as_ref().unwrap()["sparse"].file_bytes,
+            root_bytes + nomination_bytes,
+        );
+    }
 
     /// End-to-end reproduction of the production incident shape: a binary
     /// field where 25% of vectors are all-zero. The cheap tier must show the

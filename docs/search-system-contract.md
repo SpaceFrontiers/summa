@@ -12,7 +12,7 @@ It is not a new storage format or permission to change public behavior.
 | `core/structures`                               | Encodings, validated byte views, scalar/SIMD primitives                                    | Schema dispatch, index publication, server settings       |
 | `core/directories`                              | Byte ownership, reads, persistence, cold I/O and cache policy                              | Ranking and document semantics                            |
 | `core/segment/builder`                          | Encode newly ingested documents using trained artifacts                                    | Publication and global model retraining                   |
-| `core/segment/reader`                           | Validate once at open; expose immutable segment views                                      | Per-request rebuilding of metadata                        |
+| `core/segment/reader`                           | Parse format envelopes; expose immutable segment views                                     | Per-request rebuilding of metadata                        |
 | `core/segment/merger`, `reorder`                | Write replacement segments; copy unchanged representations                                 | Metadata commit, lifecycle ownership, implicit retraining |
 | `core/merge/segment_manager`, `segment/tracker` | Claims, publication, scheduling, retirement, cleanup                                       | RPC concerns and scoring kernels                          |
 | `core/index`                                    | Writer generations, reader snapshots, search orchestration, shared resources               | Protocol types and duplicate storage implementations      |
@@ -50,13 +50,15 @@ Default merge cost should be sequential bytes copied plus compact metadata
 remapping, with bounded scratch. It must not scale heap use with document or
 posting count merely to reconstruct existing values.
 
-| Representation         | Normal merge                                                  | Necessary exceptions                                                                                             |
-| ---------------------- | ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| BM25 external postings | Stream encoded blocks; patch doc bases and skip metadata      | Inline/mixed terms need bounded decode/re-encode; positions and chunk maps need offset remapping                 |
-| Fast fields            | Stack encoded blocks and local dictionaries                   | Absent source column needs a compact missing-value block, not a document-sized array                             |
-| Stored fields          | Copy compressed blocks                                        | Segment-specific zstd dictionaries currently require streaming recompression                                     |
-| BMP                    | Copy payload blocks/maps; patch doc IDs and hierarchy offsets | Explicit field/index reorder policy may run budgeted BP; interior padding remains distinguishable from real docs |
-| Trained ANN            | Copy compatible encoded runs with doc/ordinal remapping       | Reject incompatible global generations/codebooks; training belongs outside merge                                 |
+| Representation         | Normal merge                                                                     | Necessary exceptions                                                                                                |
+| ---------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| BM25 external postings | Stream encoded blocks; patch doc bases and skip metadata                         | Inline/mixed terms need bounded decode/re-encode; positions and chunk maps need offset remapping                    |
+| Fast fields            | Stack encoded blocks and local dictionaries                                      | Absent source column needs a compact missing-value block, not a document-sized array                                |
+| Stored fields          | Copy compressed blocks                                                           | Segment-specific zstd dictionaries currently require streaming recompression                                        |
+| BMP sparse             | Copy compatible encoded blocks and forward values; remap block/document metadata | Different weight scales or vocabulary layouts require explicit format-aware conversion; bounded reorder is separate |
+| MaxScore sparse        | Merge through the existing sparse posting codec                                  | Posting list ordering and block boundaries require bounded decode/re-encode                                         |
+| Seismic sparse         | Copy encoded runs and remap logical row/document directories                     | Explicit bounded maintenance rebuilds selected nomination terms; exact forward values remain single-copy            |
+| Trained ANN            | Copy compatible encoded runs with doc/ordinal remapping                          | Reject incompatible global generations/codebooks; training belongs outside merge                                    |
 
 Use `streaming_writer_cold` for bulk merge/reorder output. Prefer bounded
 kernel-assisted ranges where available; handle short writes, interruption, and
@@ -83,12 +85,20 @@ References: [posting codecs](posting-codecs.md), [cold I/O](cold-io.md),
   The [Linux mlock contract](https://man7.org/linux/man-pages/man2/mlock.2.html)
   also specifies page rounding and non-stacking locks; account for these when
   changing pin ownership or interpreting byte budgets.
-- Keep BMP D/E payloads, compressed ANN runs, and exact vectors evictable.
+- Seismic summary payloads are trusted immutable writer output. Normal opening
+  does not scan them, and summary views do not revalidate their format, lengths
+  or decoded IDs. Writer/codec tests own those guarantees. Index-envelope
+  compatibility and directory ownership remain separate from payload decoding.
+- Keep Seismic nomination payloads, compressed ANN runs, and exact vectors evictable.
   Prefetch only selected bounded ranges; a deliberate flat scan is an explicit
   query plan, not a reason to make every payload resident.
 - Reuse bounded query scratch and immutable reader state. Avoid per-hit hash
   maps, clones, and full sorts when dense IDs, borrowed slices, or bounded top-k
-  suffice. Check out-of-range/corrupt metadata once before infallible hot reads.
+  suffice. Normal text queries trust writer-produced posting and position contents. Parse
+  format envelopes and establish slice extents, without scanning directories or
+  checking decoded document order. Explicit deserialization and merge admission
+  retain integrity checks; ordinary search is not a corruption audit. Unsafe
+  kernels still require proven input/output extents and supported CPU features.
 - Use shared bounded search/background pools and I/O gates. Never create a pool
   per request/index reload or run unbounded CPU work on Tokio workers. Preserve
   the current-thread and WASM paths; `block_in_place` requires a multithread runtime.
@@ -154,7 +164,8 @@ python3 scripts/check_search.py check --plan
 
 `contracts` checks dependency ownership and documentation links without building.
 `check` also runs formatting, focused Clippy, core/server/broker/tool tests with
-metrics, and the native-without-sync compile boundary. `full` adds API docs,
+metrics, native-without-sync, and standalone broker compilation with core writers
+disabled. Checks treat compiler warnings as errors. `full` adds API docs,
 portable core compilation, and broker end-to-end tests against a real server.
 CI retains the wider workspace, GPU, client, and WASM checks; the focused harness
 does not replace those. Every run saves commands, status, logs and environment

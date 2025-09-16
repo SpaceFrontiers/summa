@@ -30,16 +30,18 @@ const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 /// [`OLDEST_MIGRATABLE_FORMAT_VERSION`]). Anything else is a clean rebuild
 /// boundary; serde_json would otherwise silently drop fields it does not know
 /// and a later save could destructively rewrite index state.
-pub const INDEX_META_FORMAT_VERSION: u32 = 8;
+pub const INDEX_META_FORMAT_VERSION: u32 = 9;
 
 /// Oldest metadata.json format `load` upgrades in place.
 ///
-/// Format 8 protects the optional content-hash field marker from older writers.
-/// Format 7 only added the optional per-segment `deletions` entry, so format
-/// 6 metadata (1.8.121..=1.8.133) describes the same segment layout. The
+/// Format 9 adds optional SIMD blocks, compact posting/position directories
+/// and byte norms; older encodings retain their scoring semantics. Format 8
+/// protects the optional content-hash field marker from older writers. Format 7 added the optional per-segment `deletions` entry,
+/// so format 6 metadata (1.8.121..=1.8.133) is also readable. The
 /// upgrade is loud and one-way: the writer persists the new stamp on open so
-/// a format 6 build can never reopen the file and silently drop deletion
-/// generations. Segment-level breaks inside the format 6 window (BMP blob
+/// older builds cannot reopen the index and misread position codec tags or
+/// drop deletion generations. No encoded blocks are rewritten by migration.
+/// Segment-level breaks inside the format 6 window (BMP blob
 /// magic BMP9 -> BMPA in 1.8.125) are still refused at segment open.
 pub const OLDEST_MIGRATABLE_FORMAT_VERSION: u32 = 6;
 
@@ -62,6 +64,10 @@ pub enum VectorIndexState {
         /// Number of clusters used
         num_clusters: usize,
     },
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 fn default_true() -> bool {
@@ -97,6 +103,20 @@ pub struct SegmentMetaInfo {
     /// optimizer can impose a hard follow-up bound instead of rewriting forever.
     #[serde(default)]
     pub bp_unconverged_passes: u32,
+    /// Terms whose copied Seismic nominations still span multiple runs.
+    #[serde(default)]
+    pub seismic_pending_terms: u32,
+    /// Published partial-maintenance passes in this replacement lineage. Used
+    /// to distinguish initial work from cooldown-paced follow-ups, not as a cap.
+    #[serde(default)]
+    pub seismic_maintenance_passes: u32,
+    /// Consecutive published maintenance passes that did not reduce Seismic
+    /// nomination debt. Progress resets this count; the optimizer bounds stalls.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seismic_no_progress_passes: u32,
+    /// Binary ANN leaves with multiple copied runs require lossless coalescing.
+    #[serde(default)]
+    pub ann_fragmented: bool,
 }
 
 impl SegmentMetaInfo {
@@ -246,6 +266,10 @@ impl IndexMetadata {
                 reordered: false,
                 bp_converged: true,
                 bp_unconverged_passes: 0,
+                seismic_pending_terms: 0,
+                seismic_maintenance_passes: 0,
+                seismic_no_progress_passes: 0,
+                ann_fragmented: false,
             },
         );
     }
@@ -270,6 +294,10 @@ impl IndexMetadata {
                 reordered,
                 bp_converged,
                 bp_unconverged_passes: 0,
+                seismic_pending_terms: 0,
+                seismic_maintenance_passes: 0,
+                seismic_no_progress_passes: 0,
+                ann_fragmented: false,
             },
         );
     }
@@ -475,7 +503,7 @@ impl IndexMetadata {
     fn deserialize_versioned(bytes: &[u8]) -> Result<(Self, Option<u32>)> {
         let mut meta: Self =
             serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
-        meta.schema.validate_content_hash()?;
+        meta.schema.validate()?;
         crate::dsl::reject_removed_vector_index_types(&meta.schema).map_err(Error::Schema)?;
         let migrated_from = if meta.version == INDEX_META_FORMAT_VERSION {
             None
@@ -525,8 +553,8 @@ impl IndexMetadata {
             meta.save(dir).await?;
             log::warn!(
                 "[metadata_migration] metadata.json format version {from} upgraded to \
-                 {INDEX_META_FORMAT_VERSION} and persisted ({} segment(s)); builds before \
-                 1.8.134 can no longer open this index. Segments from builds before 1.8.125 \
+                 {INDEX_META_FORMAT_VERSION} and persisted ({} segment(s)); builds that do not \
+                 support format {INDEX_META_FORMAT_VERSION} can no longer open this index. Segments from builds before 1.8.125 \
                  fail at segment open and need a rebuild; segments without .rowstats cannot \
                  be compacted until they are merged",
                 meta.segment_metas.len()
@@ -1194,6 +1222,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_migration_preserves_format_6_and_7_metadata_bytes() {
+        use crate::directories::Directory;
+        for version in [6, 7] {
+            let directory = crate::directories::RamDirectory::new();
+            let mut metadata = IndexMetadata::new(test_schema());
+            metadata.version = version;
+            metadata.add_segment("kept".into(), 7);
+            metadata.save(&directory).await.unwrap();
+            let before = directory
+                .open_read(Path::new(INDEX_META_FILENAME))
+                .await
+                .unwrap()
+                .read_bytes()
+                .await
+                .unwrap();
+            let (loaded, migrated) = IndexMetadata::load_reporting_migration(&directory)
+                .await
+                .unwrap();
+            assert_eq!(migrated, Some(version));
+            assert_eq!(loaded.version, INDEX_META_FORMAT_VERSION);
+            assert_eq!(loaded.segment_metas["kept"].num_docs, 7);
+            let after = directory
+                .open_read(Path::new(INDEX_META_FILENAME))
+                .await
+                .unwrap()
+                .read_bytes()
+                .await
+                .unwrap();
+            assert_eq!(after.as_slice(), before.as_slice());
+            loaded.save(&directory).await.unwrap();
+            assert_eq!(
+                IndexMetadata::load_reporting_migration(&directory)
+                    .await
+                    .unwrap()
+                    .1,
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn load_migrates_previous_metadata_to_the_current_format() {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(test_schema());
@@ -1208,7 +1277,7 @@ mod tests {
 
         let (loaded, migrated_from) = IndexMetadata::load_reporting_migration(&directory)
             .await
-            .expect("older metadata uses compatible segment payloads");
+            .expect("the previous format remains readable");
         assert_eq!(migrated_from, Some(INDEX_META_FORMAT_VERSION - 1));
         assert_eq!(loaded.version, INDEX_META_FORMAT_VERSION);
         assert_eq!(loaded.segment_metas["kept"].num_docs, 7);
@@ -1263,7 +1332,7 @@ mod tests {
 
         let error = IndexMetadata::load(&directory)
             .await
-            .expect_err("metadata two formats old must be refused")
+            .expect_err("metadata predating compatible position streams must be refused")
             .to_string();
         assert!(
             error.contains(&format!("version {}", OLDEST_MIGRATABLE_FORMAT_VERSION - 1)),

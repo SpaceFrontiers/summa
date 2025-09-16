@@ -88,16 +88,16 @@ test("query conversion retains recursive fusion configuration", () => {
   );
 });
 
-test("sparse query conversion preserves optional LSP gamma presence", () => {
+test("sparse query conversion preserves optional exhaustive presence", () => {
   const unset = buildQuery({
     sparseVector: { field: "embedding" },
   });
-  assert.equal(unset.sparseVector.lspGamma, undefined);
+  assert.equal(unset.sparseVector.exhaustive, undefined);
 
   const exhaustive = buildQuery({
-    sparseVector: { field: "embedding", lspGamma: 0 },
+    sparseVector: { field: "embedding", exhaustive: false },
   });
-  assert.equal(exhaustive.sparseVector.lspGamma, 0);
+  assert.equal(exhaustive.sparseVector.exhaustive, false);
 });
 
 test("named scoring branches retain scopes, eligibility and omission of RRF weights", () => {
@@ -318,6 +318,26 @@ test("maximum deletion batches receive every error over real gRPC transport", as
     client.close();
     await server.shutdown();
   }
+});
+
+
+test("sparse backend controls preserve omission and explicit zero on wire", () => {
+  const { Query } = require("../dist/generated/hermes.js");
+  const roundTrip = (input) => Query.decode(Query.encode(buildQuery(input)).finish()).sparseVector;
+  const omitted = roundTrip({ sparseVector: { field: "sparse" } });
+  assert.equal(omitted.heapFactor, 0);
+  for (const option of ["lspGamma", "seismicCut", "seismicFactor", "exhaustive"]) {
+    assert.equal(omitted[option], undefined);
+  }
+  const explicit = roundTrip({ sparseVector: {
+    field: "sparse", indices: [1], values: [2], heapFactor: 0.8,
+    lspGamma: 0, seismicCut: 10, seismicFactor: 0, exhaustive: false,
+  } });
+  assert.ok(Math.abs(explicit.heapFactor - 0.8) < 1e-6);
+  assert.equal(explicit.lspGamma, 0);
+  assert.equal(explicit.seismicCut, 10);
+  assert.equal(explicit.seismicFactor, 0);
+  assert.equal(explicit.exhaustive, false);
 });
 
 test("large singleton upsert crosses the client send limit over real gRPC", async () => {

@@ -1834,10 +1834,10 @@ async fn phrase_query_matches_consecutive_stemmed_terms() {
         .unwrap();
     assert_eq!(hits(response), vec![0, 2]);
 
-    // Without positions the phrase degrades to an AND of the terms.
-    let response = index
+    // Missing token positions cannot establish adjacency.
+    let error = index
         .search(&phrase(flat, "quick brown", 0), 10)
         .await
-        .unwrap();
-    assert_eq!(hits(response), vec![0, 1, 2]);
+        .unwrap_err();
+    assert!(error.to_string().contains("token positions"));
 }

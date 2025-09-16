@@ -13,7 +13,7 @@ import pytest_asyncio
 
 INDEX_NAME = "test_bmp_reorder"
 
-# BMP sparse vector schema with two fields to test multi-field reorder
+# Explicit BMP field exercises the sparse BP reorder lifecycle.
 SCHEMA = """
 index test_bmp_reorder {
     field title: text<simple> [indexed, stored]

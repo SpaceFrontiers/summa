@@ -166,6 +166,25 @@ mod imp {
             .record(superblocks_evaluated as f64);
     }
 
+    /// Seismic candidate traversal completed for one segment and field.
+    pub fn seismic_query(
+        index: &str,
+        field: &str,
+        secs: f64,
+        clusters: usize,
+        documents: usize,
+        truncated: bool,
+    ) {
+        let index = shared_label(index);
+        let field = shared_label(field);
+        metrics::histogram!("hermes_seismic_query_duration_seconds", "index" => index.clone(), "field" => field.clone()).record(secs);
+        metrics::counter!("hermes_seismic_clusters_total", "index" => index.clone(), "field" => field.clone()).increment(clusters as u64);
+        metrics::counter!("hermes_seismic_documents_total", "index" => index.clone(), "field" => field.clone()).increment(documents as u64);
+        if truncated {
+            metrics::counter!("hermes_seismic_budget_truncations_total", "index" => index, "field" => field).increment(1);
+        }
+    }
+
     /// Sparse DAAT MaxScore executor finished one query.
     pub fn maxscore_query(index: &str, field: &str, secs: f64, docs_returned: usize) {
         let index = shared_label(index);
@@ -188,9 +207,8 @@ mod imp {
 
     /// Dense rerank phase finished (resolve + read + score).
     ///
-    /// `resolve_secs` is the doc→flat-index indirection cost: like BMP's doc
-    /// map, ANN results carry doc ids that must be mapped back to physical
-    /// vector slots because the flat store is NOT reordered.
+    /// `resolve_secs` measures logical document/ordinal lookup before reading
+    /// exact vector codes from their owning flat or ANN storage.
     pub fn dense_rerank(
         index: &str,
         field: &str,
@@ -372,6 +390,8 @@ mod imp {
         _: usize,
     ) {
     }
+    #[inline(always)]
+    pub fn seismic_query(_: &str, _: &str, _: f64, _: usize, _: usize, _: bool) {}
     #[inline(always)]
     pub fn maxscore_query(_: &str, _: &str, _: f64, _: usize) {}
     #[inline(always)]
@@ -623,3 +643,19 @@ mod integrity_imp {
 }
 
 pub(crate) use integrity_imp::*;
+
+// Unlike production metrics, diagnostic counters may run inside hot loops.
+// Both the calls and argument evaluation disappear from normal builds.
+#[cfg(feature = "query-diagnostics")]
+macro_rules! search_work {
+    ($($field:ident += $value:expr),+ $(,)?) => {
+        crate::search_diagnostics::update(|work| {
+            $(work.$field = work.$field.saturating_add(($value) as u64);)+
+        });
+    };
+}
+#[cfg(not(feature = "query-diagnostics"))]
+macro_rules! search_work {
+    ($($field:ident += $value:expr),+ $(,)?) => {};
+}
+pub(crate) use search_work;

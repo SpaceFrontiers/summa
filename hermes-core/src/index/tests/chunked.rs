@@ -30,7 +30,15 @@ fn chunked_schema() -> Fields {
     );
     sb.set_chunked(content, true);
     sb.set_positions(content, PositionMode::TokenPosition);
-    let sparse = sb.add_sparse_vector_field("sparse", true, false);
+    let sparse = sb.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        false,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     Fields {
         schema: sb.build(),
         content,
@@ -908,14 +916,22 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
     // order, so results are compared by this rather than by doc id.
     let number = sb.add_u64_field("n", false, false);
     sb.set_fast(number, true);
+    let marker = sb.add_text_field("marker", true, false);
     let schema = sb.build();
 
     // Two interleaved topical clusters: even documents use vocabulary A,
     // odd documents vocabulary B, so BP has an obvious better order.
     let dir = RamDirectory::new();
-    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), IndexConfig::default())
-        .await
-        .unwrap();
+    let mut writer = IndexWriter::create(
+        dir.clone(),
+        schema.clone(),
+        IndexConfig {
+            term_dict_block_size: crate::structures::SSTableBlockSize::try_from(512).unwrap(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let vocab_a = [
         "quantum",
         "lattice",
@@ -952,6 +968,14 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
         doc.add_text(languages, "en");
         doc.add_text(kind, if d % 3 == 0 { "book" } else { "article" });
         doc.add_u64(number, u64::from(d));
+        doc.add_text(
+            marker,
+            format!(
+                "marker{}{}",
+                char::from(b'a' + (d / 26) as u8),
+                char::from(b'a' + (d % 26) as u8)
+            ),
+        );
         for chunk in &chunks {
             doc.add_text(content, chunk);
         }
@@ -1077,6 +1101,10 @@ async fn chunked_text_field_reorders_through_its_chunk_map() {
     let searcher = reader.searcher().await.unwrap();
     let segments = searcher.segment_readers();
     assert_eq!(segments.len(), 1);
+    assert!(
+        segments[0].term_dict_stats().num_blocks > 8,
+        "text reorder lost the 512-byte dictionary target"
+    );
     let map = segments[0].chunk_map(content).unwrap();
     assert_eq!(map.num_chunks(), 1200);
     let doc_ids: Vec<u32> = (0..map.num_chunks()).map(|v| map.doc_id(v)).collect();

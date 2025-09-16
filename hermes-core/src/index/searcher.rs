@@ -22,29 +22,47 @@ use crate::segment::{SegmentSnapshot, SegmentTracker};
 #[derive(Clone)]
 pub(crate) struct SearcherResources {
     pub(crate) term_cache_blocks: usize,
+    pub(crate) term_cache_budget_bytes: Option<usize>,
     pub(crate) store_cache: Arc<crate::segment::SharedStoreCache>,
-    pub(crate) bmp_io_gate: Arc<super::BmpIoGate>,
-    pub(crate) bmp_io_concurrency: usize,
+    pub(crate) sparse_io_gate: Arc<super::SparseIoGate>,
+    pub(crate) sparse_io_concurrency: usize,
     #[cfg(feature = "sync")]
     pub(crate) search_pool: Arc<rayon::ThreadPool>,
 }
 
 #[cfg(feature = "native")]
 impl SearcherResources {
+    /// Cache and CPU policy of an `Index` opened with `config`.
+    pub(crate) fn from_config(config: &super::IndexConfig) -> Result<Self> {
+        Self::new(
+            config.term_cache_blocks,
+            config.term_cache_budget_bytes,
+            config.store_cache_budget_bytes,
+            config.num_threads,
+            config.sparse_io_concurrency,
+        )
+    }
+
+    /// Validates every load-time limit once, before any segment or file is
+    /// touched: the dictionary block cap and
+    /// the CPU/I-O widths. Later per-segment constructors re-check only what
+    /// they own.
     pub(crate) fn new(
         term_cache_blocks: usize,
+        term_cache_budget_bytes: Option<usize>,
         store_cache_budget_bytes: usize,
         num_threads: usize,
-        bmp_io_concurrency: usize,
+        sparse_io_concurrency: usize,
     ) -> Result<Self> {
+        super::validate_term_cache_blocks(term_cache_blocks)?;
         if num_threads == 0 {
             return Err(crate::Error::Internal(
                 "IndexConfig.num_threads must be greater than zero".into(),
             ));
         }
-        if bmp_io_concurrency == 0 {
+        if sparse_io_concurrency == 0 {
             return Err(crate::Error::Internal(
-                "IndexConfig.bmp_io_concurrency must be greater than zero".into(),
+                "IndexConfig.sparse_io_concurrency must be greater than zero".into(),
             ));
         }
 
@@ -53,9 +71,10 @@ impl SearcherResources {
 
         Ok(Self {
             term_cache_blocks,
+            term_cache_budget_bytes,
             store_cache: super::shared_store_cache(store_cache_budget_bytes),
-            bmp_io_gate: super::shared_bmp_io_gate(bmp_io_concurrency),
-            bmp_io_concurrency,
+            sparse_io_gate: super::shared_sparse_io_gate(sparse_io_concurrency),
+            sparse_io_concurrency,
             #[cfg(feature = "sync")]
             search_pool,
         })
@@ -93,9 +112,9 @@ pub struct Searcher<D: Directory + 'static> {
     search_pool: Arc<rayon::ThreadPool>,
     /// Shared random-I/O gate and per-query wave width for BMP.
     #[cfg(feature = "native")]
-    bmp_io_gate: Arc<super::BmpIoGate>,
+    sparse_io_gate: Arc<super::SparseIoGate>,
     #[cfg(feature = "native")]
-    bmp_io_concurrency: usize,
+    sparse_io_concurrency: usize,
 }
 
 impl<D: Directory + 'static> Searcher<D> {
@@ -142,6 +161,7 @@ impl<D: Directory + 'static> Searcher<D> {
             snapshot.segment_ids(),
             &trained_vectors,
             resources.term_cache_blocks,
+            resources.term_cache_budget_bytes,
             Arc::clone(&resources.store_cache),
             &[],
             snapshot.deletions(),
@@ -161,8 +181,8 @@ impl<D: Directory + 'static> Searcher<D> {
             total_docs,
             #[cfg(feature = "sync")]
             search_pool: resources.search_pool,
-            bmp_io_gate: resources.bmp_io_gate,
-            bmp_io_concurrency: resources.bmp_io_concurrency,
+            sparse_io_gate: resources.sparse_io_gate,
+            sparse_io_concurrency: resources.sparse_io_concurrency,
         })
     }
 
@@ -184,6 +204,7 @@ impl<D: Directory + 'static> Searcher<D> {
             snapshot.segment_ids(),
             &trained_vectors,
             resources.term_cache_blocks,
+            resources.term_cache_budget_bytes,
             Arc::clone(&resources.store_cache),
             existing_segments,
             snapshot.deletions(),
@@ -203,8 +224,8 @@ impl<D: Directory + 'static> Searcher<D> {
             total_docs,
             #[cfg(feature = "sync")]
             search_pool: resources.search_pool,
-            bmp_io_gate: resources.bmp_io_gate,
-            bmp_io_concurrency: resources.bmp_io_concurrency,
+            sparse_io_gate: resources.sparse_io_gate,
+            sparse_io_concurrency: resources.sparse_io_concurrency,
         })
     }
 
@@ -241,6 +262,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             &trained_vectors,
             term_cache_blocks,
+            None,
             store_cache,
             &[],
             &deletions,
@@ -256,9 +278,9 @@ impl<D: Directory + 'static> Searcher<D> {
         #[cfg(feature = "sync")]
         let search_pool = super::shared_search_pool(crate::default_search_threads())?;
         #[cfg(feature = "native")]
-        let bmp_io_concurrency = 4;
+        let sparse_io_concurrency = 4;
         #[cfg(feature = "native")]
-        let bmp_io_gate = super::shared_bmp_io_gate(bmp_io_concurrency);
+        let sparse_io_gate = super::shared_sparse_io_gate(sparse_io_concurrency);
 
         let _ = directory; // suppress unused warning on wasm
         Ok(Self {
@@ -276,9 +298,9 @@ impl<D: Directory + 'static> Searcher<D> {
             #[cfg(feature = "sync")]
             search_pool,
             #[cfg(feature = "native")]
-            bmp_io_gate,
+            sparse_io_gate,
             #[cfg(feature = "native")]
-            bmp_io_concurrency,
+            sparse_io_concurrency,
         })
     }
 
@@ -290,6 +312,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
+        term_cache_budget_bytes: Option<usize>,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
@@ -306,6 +329,7 @@ impl<D: Directory + 'static> Searcher<D> {
             segment_ids,
             trained_vectors,
             term_cache_blocks,
+            term_cache_budget_bytes,
             store_cache,
             existing_segments,
             deletions,
@@ -333,6 +357,7 @@ impl<D: Directory + 'static> Searcher<D> {
         segment_ids: &[String],
         trained_vectors: &Arc<TrainedVectorStructures>,
         term_cache_blocks: usize,
+        term_cache_budget_bytes: Option<usize>,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
@@ -417,6 +442,7 @@ impl<D: Directory + 'static> Searcher<D> {
                                 sid,
                                 Arc::clone(schema),
                                 term_cache_blocks,
+                                term_cache_budget_bytes,
                                 store_cache_directory_namespace,
                                 store_cache,
                             )
@@ -835,7 +861,8 @@ impl<D: Directory + 'static> Searcher<D> {
         if retrieval_depth == 0 {
             return Ok(empty());
         }
-        let crate::query::QueryDecomposition::SparseTerms(infos) = query.lsp_decomposition() else {
+        let crate::query::QueryDecomposition::SparseTerms(infos) = query.sparse_decomposition()
+        else {
             return Ok(empty());
         };
         let Some(&first) = infos.first() else {
@@ -1050,7 +1077,7 @@ impl<D: Directory + 'static> Searcher<D> {
     fn bmp_wave_width(&self) -> usize {
         #[cfg(feature = "native")]
         {
-            self.bmp_io_concurrency
+            self.sparse_io_concurrency
         }
         #[cfg(not(feature = "native"))]
         {
@@ -1126,21 +1153,21 @@ impl<D: Directory + 'static> Searcher<D> {
             (0..self.segments.len()).collect()
         };
         #[cfg(feature = "native")]
-        let bmp_io_gate = Arc::clone(&self.bmp_io_gate);
+        let sparse_io_gate = Arc::clone(&self.sparse_io_gate);
         let run_segment = |segment_index: usize| {
             let text_stats = text_stats.clone();
             let segment = Arc::clone(&self.segments[segment_index]);
             let lsp_plan = lsp_plans[segment_index].clone();
             let shared = shared.clone();
             #[cfg(feature = "native")]
-            let bmp_io_gate = Arc::clone(&bmp_io_gate);
+            let sparse_io_gate = Arc::clone(&sparse_io_gate);
             async move {
                 if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
                     return Ok((Vec::new(), 0u32));
                 }
                 #[cfg(feature = "native")]
                 let _io_permit = if lsp_plan.is_some() {
-                    Some(bmp_io_gate.acquire_async().await)
+                    Some(sparse_io_gate.acquire_async().await)
                 } else {
                     None
                 };
@@ -1279,13 +1306,17 @@ impl<D: Directory + 'static> Searcher<D> {
 
         let lsp_plans = self.prepare_global_lsp(query, fetch_limit, true)?;
         let shared = crate::query::SharedThreshold::for_limit(fetch_limit).with_deadline(deadline);
+        #[cfg(feature = "query-diagnostics")]
+        let diagnostic_context = crate::search_diagnostics::WorkContext::current();
         let run_segment = |segment_index: &usize| {
+            #[cfg(feature = "query-diagnostics")]
+            let _diagnostic_scope = diagnostic_context.as_ref().map(|context| context.enter());
             let segment = &self.segments[*segment_index];
             let lsp_plan = lsp_plans[*segment_index].clone();
             if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
                 return Ok((Vec::new(), 0u32));
             }
-            let _io_permit = lsp_plan.as_ref().map(|_| self.bmp_io_gate.acquire());
+            let _io_permit = lsp_plan.as_ref().map(|_| self.sparse_io_gate.acquire());
             let sid = segment.meta().id;
             let (mut results, segment_seen) = crate::query::search_segment_shared_sync_planned(
                 segment.as_ref(),

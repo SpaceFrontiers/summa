@@ -118,6 +118,14 @@ pub(crate) struct JsSparseVectorQuery {
     values: Vec<f32>,
     #[serde(default)]
     heap_factor: Option<f32>,
+    #[serde(default)]
+    lsp_gamma: Option<usize>,
+    #[serde(default)]
+    seismic_cut: Option<usize>,
+    #[serde(default)]
+    seismic_factor: Option<f32>,
+    #[serde(default)]
+    exhaustive: Option<bool>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -585,8 +593,34 @@ pub(crate) fn convert_query(
             .map(|(&i, &v)| (i, v))
             .collect();
         let mut query = SparseVectorQuery::new(field, vector);
-        if let Some(hf) = sq.heap_factor {
-            query = query.with_heap_factor(hf);
+        if let Some(config) = schema
+            .get_field_entry(field)
+            .and_then(|entry| entry.sparse_vector_config.as_ref())
+            .and_then(|config| config.query_config.as_ref())
+        {
+            if let Some(gamma) = config.lsp_gamma {
+                query = query.with_lsp_gamma(gamma);
+            }
+            query = query
+                .with_heap_factor(config.heap_factor)
+                .with_seismic_cut(config.seismic_cut)
+                .with_seismic_factor(config.seismic_factor)
+                .with_exhaustive(config.exhaustive);
+        }
+        if let Some(factor) = sq.heap_factor {
+            query = query.with_heap_factor(factor);
+        }
+        if let Some(gamma) = sq.lsp_gamma {
+            query = query.with_lsp_gamma(gamma);
+        }
+        if let Some(cut) = sq.seismic_cut {
+            query = query.with_seismic_cut(cut);
+        }
+        if let Some(factor) = sq.seismic_factor {
+            query = query.with_seismic_factor(factor);
+        }
+        if let Some(exhaustive) = sq.exhaustive {
+            query = query.with_exhaustive(exhaustive);
         }
         return Ok(Box::new(query));
     }

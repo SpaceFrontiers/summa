@@ -61,14 +61,14 @@ index articles {
 
 Attributes control how fields are processed and stored:
 
-| Attribute      | Description                                                                                                                                                                                                                        |
-| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `indexed`      | Field is indexed for searching                                                                                                                                                                                                     |
-| `stored`       | Field value is stored and can be retrieved                                                                                                                                                                                         |
-| `content_hash` | Stored scalar fingerprint for unchanged upserts; requires a primary key                                                                                                                                                            |
-| `primary`      | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                                       |
-| `fast`         | Field is a fast field (column-oriented storage for range queries)                                                                                                                                                                  |
-| `reorder`      | Opt a BMP sparse or indexed chunked-text field into BP reordering. Both support standalone/optimizer passes; merge-time BP applies to BMP sparse fields. See [field-level reordering](lexical-vertical.md#field-level-reordering). |
+| Attribute      | Description                                                                                                                                                                                                            |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `indexed`      | Field is indexed for searching                                                                                                                                                                                         |
+| `stored`       | Field value is stored and can be retrieved                                                                                                                                                                             |
+| `content_hash` | Stored scalar fingerprint for unchanged upserts; requires a primary key                                                                                                                                                |
+| `primary`      | Field is the primary key (enforces uniqueness, deduplicates)                                                                                                                                                           |
+| `fast`         | Field is a fast field (column-oriented storage for range queries)                                                                                                                                                      |
+| `reorder`      | Opt an indexed BMP sparse or text field (plain or chunked) into BP reordering. Sparse Seismic maintenance is scheduled from nomination debt. See [field-level reordering](lexical-vertical.md#field-level-reordering). |
 
 Index-level options (inside the `index { ... }` block):
 
@@ -92,10 +92,10 @@ See [candidate rescoring](candidate-rescoring.md) for scoring and memory bounds.
 
 ```sdl
 index articles {
-    reorder_on_merge: true   # BP-reorder `reorder`-attributed BMP fields inside merges.
+    reorder_on_merge: true   # Apply configured text reorder policy during merge.
                              # Absent = disabled: merges block-copy and the background
                              # optimizer reorders afterwards.
-    field splade: sparse_vector<...> [indexed, reorder]
+    field body: text<simple> [indexed, reorder]
 }
 ```
 
@@ -218,10 +218,12 @@ field content: text<lex(by: languages, default: en, stop_words: true)> [indexed<
   boundaries (`float-zero` → `float`, `zero`), bigrams runs of Han, Hiragana
   and Katakana, and folds diacritics of Latin, Cyrillic and Greek tokens
   after stemming.
-- `reorder` on a chunked text field lets the reorder pass permute the
-  field's virtual chunk ids with Recursive Graph Bisection over the field's
-  own postings (smaller postings, tighter block bounds). Only that field's
-  postings, positions and chunk map are rewritten; document ids never move.
+- `reorder` on indexed text lets the reorder pass permute the field's virtual
+  units with Recursive Graph Bisection over its own postings (smaller postings,
+  tighter block bounds). Plain and chunked text are supported. Only that field's
+  postings, positions and unit map are rewritten; logical document IDs never
+  move. The attribute also supports indexed BMP sparse fields. Seismic and binary ANN
+  maintenance follow their own debt automatically; other field types reject it.
 - Each token is stemmed with the first hinted language whose script matches
   the token (Snowball stemmers are script-local), so Cyrillic and Latin text
   in one document both stem correctly; same-script languages use the first
@@ -528,7 +530,7 @@ parameters.
 
 ## Sparse Vectors
 
-Sparse vector fields store learned sparse representations (SPLADE, uniCOIL, etc.) using an inverted index with quantized weights. They support the same Block-Max MaxScore query pipeline as BM25 text fields.
+Sparse vector fields store learned sparse representations (SPLADE, uniCOIL, etc.) using an inverted index with quantized weights. BMP is the default. Explicit `format: maxscore` selects the shared Block-Max MaxScore query pipeline; `format: seismic` selects geometric approximate nomination with exact forward scoring. BMP uses UInt8 impacts; the `quantization` setting selects stored precision for MaxScore and Seismic.
 
 ### Syntax
 
@@ -603,6 +605,50 @@ Sparse posting lists support configurable weight quantization and pruning via `S
 | `splade`       | UInt8        | disabled                              |
 
 These are configured programmatically, not in SDL.
+
+### Seismic Format Options
+
+```sdl
+field embedding: sparse_vector<u32> [indexed<format: seismic, quantization: float32,
+    seismic_postings: 4096, seismic_cluster_size: 64,
+    seismic_summary_energy: 0.4,
+    query<seismic_cut: 10, seismic_factor: 0.85, exhaustive: false>>]
+```
+
+For Seismic, the default is approximate nomination followed by exact candidate scoring.
+`query<exhaustive: true>` scans the same forward values exhaustively. Query
+configuration applies to both query-language and vector API searches. Sparse
+queries have at most64 effective dimensions; query pruning changes nominations,
+while candidate scores use the full bounded query.
+
+- `seismic_postings`: maximum retained postings per term in a new run,1–65536.
+- `seismic_cluster_size`: target cluster size,1–`seismic_postings`.
+- `seismic_summary_energy`: retained summary magnitude fraction,(0,1].
+- `seismic_cut`: nomination query dimensions,1–64.
+- `seismic_factor`: summary pruning factor,[0,1]. Approximate recall must be
+  measured on representative queries; exact scoring does not make nominations exact.
+
+`quantization` selects Float32 (default), Float16, UInt8 or UInt4 storage using
+the shared sparse weight codecs. Exact scoring refers to these stored values.
+`dims` optionally bounds vocabulary IDs. Forward values are mandatory; retrieval,
+all ordinal combiners, backfill and maintenance use this one encoded copy.
+
+### Document Mass Cropping
+
+`doc_mass` optionally retains the strongest coordinates covering the requested
+fraction of each vector's absolute weight mass. This destructively changes the
+stored vector. `weight_threshold` and `pruning` are also quality-sensitive;
+measure recall before enabling them. Vectors with at most `min_terms` entries
+are protected from mass cropping.
+
+```sdl
+field embedding: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
+```
+
+Ordinary merge copies encoded runs without clustering. The existing background
+optimizer services nomination fragmentation in bounded term passes; retained
+reader generations remain valid across replacement. `hermes-tool diagnose`
+reports nominations, clusters, runs, encoded bytes and pending term debt.
 
 ## JSON Fields
 

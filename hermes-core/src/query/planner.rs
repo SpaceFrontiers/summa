@@ -46,7 +46,7 @@ pub(super) fn prepare_text_maxscore(
     let infos: Vec<_> = should
         .iter()
         .filter_map(|q| match q.decompose() {
-            super::QueryDecomposition::TextTerm(info) => Some(info),
+            super::QueryDecomposition::TextTerm(info) if info.global_stats.is_none() => Some(info),
             _ => None,
         })
         .collect();
@@ -54,7 +54,7 @@ pub(super) fn prepare_text_maxscore(
         return None;
     }
     let field = infos[0].field;
-    if !infos.iter().all(|t| t.field == field) {
+    if !infos.iter().all(|t| t.field == field) || !text_maxscore_allowed(reader, field, false) {
         return None;
     }
     let avg_field_len = global_stats
@@ -209,6 +209,13 @@ pub(super) fn text_maxscore_allowed(
     field: crate::Field,
     collect_positions: bool,
 ) -> bool {
+    if !reader
+        .schema()
+        .get_field_entry(field)
+        .is_some_and(|entry| entry.indexed)
+    {
+        return false;
+    }
     if !collect_positions || reader.is_chunked_field(field) {
         return true;
     }
@@ -251,14 +258,22 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
             reader.meta().id,
         )));
     };
-    let over_fetch = if proximity.is_some() {
-        CHUNKED_TEXT_OVER_FETCH_FACTOR * super::proximity::PROXIMITY_OVER_FETCH as f32
+    let has_proximity = proximity.is_some();
+    let document_units = chunk_map.is_document_map();
+    let over_fetch = if document_units {
+        1.0
     } else {
         CHUNKED_TEXT_OVER_FETCH_FACTOR
+    } * if proximity.is_some() {
+        super::proximity::PROXIMITY_OVER_FETCH as f32
+    } else {
+        1.0
     };
-    let executor_limit = bounded_sparse_executor_limit(limit, over_fetch)
-        .min(chunk_map.num_chunks() as usize)
-        .max(1);
+    let executor_limit = if document_units && proximity.is_none() {
+        limit.min(chunk_map.num_chunks() as usize)
+    } else {
+        bounded_sparse_executor_limit(limit, over_fetch).min(chunk_map.num_chunks() as usize)
+    };
     let idfs: Vec<f32> = posting_lists.iter().map(|(_, idf)| *idf).collect();
     let params = super::Bm25Params::for_field(reader.schema(), field);
     let mut executor = MaxScoreExecutor::text_chunked(
@@ -273,6 +288,9 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
         reader.schema().index_label(),
         reader.schema().get_field_name(field).unwrap_or("?"),
     );
+    if document_units {
+        executor = executor.with_document_map(chunk_map);
+    }
     if let Some(predicate) = predicate {
         // The executor walks virtual chunk ids; filters are per document.
         executor = executor.with_predicate(Box::new(move |vid| predicate(chunk_map.doc_id(vid))));
@@ -281,6 +299,17 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
     let mut raw = executor.execute_sync()?;
     if let Some((config, terms)) = proximity {
         let terms: Vec<(Vec<u8>, f32)> = terms.into_iter().zip(idfs).collect();
+        if document_units {
+            for hit in &mut raw {
+                hit.doc_id = chunk_map
+                    .slots_for_document(hit.doc_id)
+                    .next()
+                    .ok_or_else(|| {
+                        crate::Error::Corruption("document missing from text map".into())
+                    })?
+                    .1;
+            }
+        }
         super::proximity::rescore_sync(
             reader,
             field,
@@ -291,6 +320,16 @@ pub(crate) fn finish_chunked_text_maxscore<'a>(
             config,
             &mut raw,
         )?;
+    }
+    if document_units {
+        if has_proximity {
+            for hit in &mut raw {
+                hit.doc_id = chunk_map.doc_id(hit.doc_id);
+            }
+        }
+        raw.sort_unstable_by(|a, b| b.score.total_cmp(&a.score).then(a.doc_id.cmp(&b.doc_id)));
+        raw.truncate(limit);
+        return Ok(Box::new(TopKResultScorer::new(raw)));
     }
     let combined = crate::segment::combine_ordinal_results(
         raw.into_iter().map(|hit| {
@@ -330,6 +369,7 @@ pub(super) fn prepare_per_field_grouping(
 
     for (i, q) in should.iter().enumerate() {
         if let super::QueryDecomposition::TextTerm(info) = q.decompose()
+            && info.global_stats.is_none()
             && text_maxscore_allowed(reader, info.field, collect_positions)
         {
             field_groups.entry(info.field).or_default().push((i, info));
@@ -569,9 +609,12 @@ fn build_sparse_bmp_results_inner(
         (candidate_terms, scoring_terms)
     };
     let executor_limit = bmp_executor_limit(limit, info.over_fetch_factor, bmp);
-    let lsp_gamma = info
-        .lsp_gamma
-        .unwrap_or_else(|| super::bmp::recommended_lsp_gamma(executor_limit));
+    let lsp_gamma = if info.exhaustive {
+        0
+    } else {
+        info.lsp_gamma
+            .unwrap_or_else(|| super::bmp::recommended_lsp_gamma(executor_limit))
+    };
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     // The per-segment `limit` may already be clamped to the segment's doc
     // count, so validate the heap depth against the *query* window carried by
@@ -649,8 +692,17 @@ pub(super) fn extract_all_sparse_infos(
     if all.is_empty() {
         return None;
     }
-    let field = all[0].field;
-    if !all.iter().all(|i| i.field == field) {
+    let first = all[0];
+    if !all.iter().all(|info| {
+        info.field == first.field
+            && info.heap_factor == first.heap_factor
+            && info.over_fetch_factor == first.over_fetch_factor
+            && info.lsp_gamma == first.lsp_gamma
+            && info.combiner == first.combiner
+            && info.seismic_cut == first.seismic_cut
+            && info.seismic_factor == first.seismic_factor
+            && info.exhaustive == first.exhaustive
+    }) {
         return None;
     }
     Some(all)
@@ -987,38 +1039,67 @@ impl Scorer for BitsetFillScorer<'_> {
     }
 }
 
-/// Scorer that iterates over pre-computed top-k results
+/// Text executor results, handed directly to standalone collection or lazily
+/// ordered by document ID when composed with another scorer.
 pub(super) struct TopKResultScorer {
     results: Vec<ScoredDoc>,
     position: usize,
+    head: usize,
+    doc_ordered: bool,
+    exact_count: Option<u64>,
 }
 
 impl TopKResultScorer {
-    pub(super) fn new(mut results: Vec<ScoredDoc>) -> Self {
-        // Sort by doc_id ascending — required for DocSet seek() correctness
-        results.sort_unstable_by_key(|r| r.doc_id);
+    pub(super) fn new(results: Vec<ScoredDoc>) -> Self {
+        let head = results
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, r)| r.doc_id)
+            .map_or(0, |(i, _)| i);
         Self {
             results,
             position: 0,
+            head,
+            doc_ordered: false,
+            exact_count: None,
         }
+    }
+
+    pub(super) fn with_exact_count(mut self, count: u64) -> Self {
+        self.exact_count = Some(count);
+        self
+    }
+
+    fn ensure_doc_order(&mut self) {
+        if !self.doc_ordered {
+            self.results.sort_unstable_by_key(|r| r.doc_id);
+            self.doc_ordered = true;
+            self.head = 0;
+        }
+    }
+
+    fn current(&self) -> Option<&ScoredDoc> {
+        self.results.get(if self.doc_ordered {
+            self.position
+        } else {
+            self.head
+        })
     }
 }
 
 impl super::docset::DocSet for TopKResultScorer {
     fn doc(&self) -> DocId {
-        if self.position < self.results.len() {
-            self.results[self.position].doc_id
-        } else {
-            TERMINATED
-        }
+        self.current().map_or(TERMINATED, |r| r.doc_id)
     }
 
     fn advance(&mut self) -> DocId {
-        self.position += 1;
+        self.ensure_doc_order();
+        self.position = (self.position + 1).min(self.results.len());
         self.doc()
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
+        self.ensure_doc_order();
         let remaining = &self.results[self.position..];
         self.position += remaining.partition_point(|r| r.doc_id < target);
         self.doc()
@@ -1030,21 +1111,209 @@ impl super::docset::DocSet for TopKResultScorer {
 }
 
 impl Scorer for TopKResultScorer {
+    fn exact_ranked_count(&self) -> Option<u64> {
+        self.exact_count
+    }
+
     fn score(&self) -> Score {
-        if self.position < self.results.len() {
-            self.results[self.position].score
-        } else {
-            0.0
+        self.current().map_or(0.0, |r| r.score)
+    }
+
+    fn precomputed_top_k(
+        &mut self,
+        limit: usize,
+        _collect_positions: bool,
+    ) -> Option<(Vec<super::SearchResult>, u32)> {
+        if self.doc_ordered || self.position != 0 {
+            return None;
         }
+        let mut results = std::mem::take(&mut self.results);
+        let total_seen = results.len() as u32;
+        results.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.doc_id.cmp(&b.doc_id))
+        });
+        results.truncate(limit);
+        Some((
+            results
+                .into_iter()
+                .map(|r| super::SearchResult {
+                    doc_id: r.doc_id,
+                    score: r.score,
+                    segment_id: 0,
+                    positions: Vec::new(),
+                })
+                .collect(),
+            total_seen,
+        ))
     }
 }
 
-// Sparse executors share `crate::query::vector::VectorResultScorer` with the
+/// Shared Seismic/BMP dispatch for sparse vector and term entry points.
+/// MaxScore keeps its async/sync cursor loading with the caller.
+pub(crate) fn build_sparse_memory_scorer<'a>(
+    infos: &[SparseTermQueryInfo],
+    reader: &'a SegmentReader,
+    limit: usize,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
+    let Some(info) = infos.first() else {
+        return Ok(Some(Box::new(EmptyScorer)));
+    };
+    if options.complete_text_matches
+        && let Some(scorer) = super::seismic::required_scorer(reader, info.field, infos, options)?
+    {
+        return Ok(Some(scorer));
+    }
+    if let Some((raw, info)) = build_sparse_results(infos, reader, limit, options)? {
+        return Ok(Some(sparse_result_scorer(raw, info.field)));
+    }
+    Ok(build_sparse_bmp_results(infos, reader, limit, options)?
+        .map(|(raw, info)| combine_sparse_results(raw, info.combiner, info.field, limit)))
+}
+
+// Sparse executors share `crate::query::vector::VectorResultScorer` with
 // dense queries (see `combine_sparse_results`).
+
+pub(crate) fn build_sparse_results(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<(Vec<crate::segment::VectorSearchResult>, SparseTermQueryInfo)>> {
+    if let Some(filter) = &options.eligibility {
+        build_sparse_results_inner(
+            infos,
+            reader,
+            limit,
+            Some(&|doc| filter.contains(doc)),
+            options,
+        )
+    } else {
+        build_sparse_results_inner(infos, reader, limit, None, options)
+    }
+}
+
+/// Execute sparse search with a document predicate filter.
+///
+/// The predicate is applied during sparse scoring (not post-filter), ensuring
+/// the collector only contains valid documents and the threshold evolves correctly.
+pub(crate) fn build_sparse_results_filtered(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    predicate: &dyn Fn(crate::DocId) -> bool,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<(Vec<crate::segment::VectorSearchResult>, SparseTermQueryInfo)>> {
+    if let Some(filter) = &options.eligibility {
+        build_sparse_results_inner(
+            infos,
+            reader,
+            limit,
+            Some(&|doc| filter.contains(doc) && predicate(doc)),
+            options,
+        )
+    } else {
+        build_sparse_results_inner(infos, reader, limit, Some(predicate), options)
+    }
+}
+
+fn build_sparse_results_inner(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    predicate: Option<&dyn Fn(crate::DocId) -> bool>,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<(Vec<crate::segment::VectorSearchResult>, SparseTermQueryInfo)>> {
+    let Some(&info) = infos.first() else {
+        return Ok(None);
+    };
+    let Some(index) = reader.seismic_index(info.field) else {
+        return Ok(None);
+    };
+    let allowed = |doc| reader.is_alive(doc) && predicate.is_none_or(|predicate| predicate(doc));
+    let results = super::seismic::execute(
+        index,
+        infos,
+        limit,
+        &allowed,
+        options,
+        predicate.is_some() || reader.alive_docs().is_some(),
+        (
+            reader.schema().index_label(),
+            reader.schema().get_field_name(info.field).unwrap_or("?"),
+        ),
+    )?;
+    Ok(Some((results, info)))
+}
+
+/// Wrap document-level scores whose ordinals were combined before top-k.
+pub(crate) fn sparse_result_scorer<'a>(
+    results: Vec<crate::segment::VectorSearchResult>,
+    field: crate::Field,
+) -> Box<dyn Scorer + 'a> {
+    Box::new(super::vector::VectorResultScorer::new(results, field.0))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_ranked_handoff_matches_collector_and_doc_order_composition() {
+        use crate::query::{Collector, TopKCollector, docset::DocSet};
+        let entries = [(40, 3.0), (5, 2.0), (17, 3.0), (22, 0.0)];
+        let ranked = || {
+            entries
+                .iter()
+                .map(|&(doc_id, score)| ScoredDoc {
+                    doc_id,
+                    score,
+                    ordinal: 0,
+                })
+                .collect()
+        };
+        for limit in [0, 1, 3, 4, 10] {
+            for positions in [false, true] {
+                let mut driven = TopKResultScorer::new(ranked());
+                let mut collector = if positions {
+                    TopKCollector::with_positions(limit)
+                } else {
+                    TopKCollector::new(limit)
+                };
+                while driven.doc() != TERMINATED {
+                    collector.collect(driven.doc(), driven.score(), &[]);
+                    driven.advance();
+                }
+                let expected = collector.into_results_with_count();
+                let mut direct = TopKResultScorer::new(ranked());
+                let actual = direct.precomputed_top_k(limit, positions).unwrap();
+                assert_eq!(actual.1, expected.1);
+                assert_eq!(actual.0.len(), expected.0.len());
+                for (a, b) in actual.0.iter().zip(&expected.0) {
+                    assert_eq!(a.doc_id, b.doc_id);
+                    assert_eq!(a.score.to_bits(), b.score.to_bits());
+                    assert_eq!(a.segment_id, b.segment_id);
+                    assert!(a.positions.is_empty());
+                }
+                assert_eq!(direct.doc(), TERMINATED);
+                assert_eq!(direct.advance(), TERMINATED);
+            }
+        }
+        let mut scorer = TopKResultScorer::new(ranked());
+        assert_eq!((scorer.doc(), scorer.score()), (5, 2.0));
+        assert_eq!(scorer.seek(6), 17);
+        assert!(scorer.precomputed_top_k(10, false).is_none());
+        assert_eq!(scorer.advance(), 22);
+        assert_eq!(scorer.seek(40), 40);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(scorer.advance(), TERMINATED);
+        assert_eq!(scorer.seek(TERMINATED), TERMINATED);
+        let mut empty = TopKResultScorer::new(Vec::new());
+        assert_eq!(empty.doc(), TERMINATED);
+        assert_eq!(empty.precomputed_top_k(10, true).unwrap().1, 0);
+    }
 
     #[test]
     fn bmp_single_value_limit_does_not_overfetch() {
@@ -1054,11 +1323,27 @@ mod tests {
     }
 
     #[test]
+    fn exact_ranked_count_requests_never_escape_into_nested_clauses() {
+        let options = super::super::ScorerOptions {
+            physical_text_field: None,
+            complete_text_matches: true,
+            ranked_count_limit: Some(17),
+            ..Default::default()
+        };
+        assert_eq!(options.without_threshold().ranked_count_limit, None);
+        assert_eq!(options.for_required_clause().ranked_count_limit, None);
+        assert!(options.for_required_clause().complete_text_matches);
+    }
+
+    #[test]
     fn bmp_threshold_is_only_used_in_final_score_space() {
         let shared = super::super::SharedThreshold::new();
         shared.raise(7.0);
         let options = super::super::ScorerOptions {
+            physical_text_field: None,
             complete_text_matches: false,
+            ranked_count_limit: None,
+            skip_scoring_setup: false,
             eligibility: None,
             collect_positions: false,
             initial_threshold: 5.0,
@@ -1088,7 +1373,10 @@ mod tests {
     fn bmp_threshold_from_a_clamped_heap_is_never_published() {
         let shared = super::super::SharedThreshold::new();
         let options = super::super::ScorerOptions {
+            physical_text_field: None,
             complete_text_matches: false,
+            ranked_count_limit: None,
+            skip_scoring_setup: false,
             eligibility: None,
             collect_positions: false,
             initial_threshold: 0.0,

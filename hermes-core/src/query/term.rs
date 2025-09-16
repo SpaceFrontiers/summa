@@ -148,7 +148,7 @@ pub(super) fn compute_term_idf(
 //   $($aw)*          – .await  (present for async, absent for sync)
 macro_rules! term_plan {
     ($field:expr, $term:expr, $global_stats:expr, $reader:expr, $limit:expr,
-     $load_positions:expr, $eligibility:expr, $budget:expr, $complete:expr, $get_postings_fn:ident, $get_positions_fn:ident
+     $load_positions:expr, $eligibility:expr, $budget:expr, $complete:expr, $skip_scoring_setup:expr, $initial_threshold:expr, $physical_field:expr, $get_postings_fn:ident, $get_positions_fn:ident
      $(, $aw:tt)*) => {{
         let field: Field = $field;
         let term: &[u8] = $term;
@@ -173,13 +173,36 @@ macro_rules! term_plan {
         let postings = reader.$get_postings_fn(field, term) $(. $aw)* ?;
 
         match postings {
+            Some(posting_list) if reader.chunk_map(field).is_some_and(|map| map.is_document_map())
+                && ($complete || $load_positions || $physical_field == Some(field)) => {
+                let map = reader.chunk_map(field).unwrap();
+                let (idf, avg_field_len) = compute_term_idf(&posting_list, field, reader, global_stats, term);
+                let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0)
+                    .with_params(super::Bm25Params::for_field(reader.schema(), field));
+                scorer.chunk_lengths = Some(map.clone());
+                scorer.budget = budget.cloned();
+                if $load_positions && let Some(positions) = reader.$get_positions_fn(field, term) $(. $aw)* ? {
+                    scorer = scorer.with_positions(field.0, positions);
+                }
+                if $physical_field == Some(field) {
+                    return Ok(Box::new(scorer) as Box<dyn Scorer + '_>);
+                }
+                let scorer = super::required_text::mapped_documents(
+                    scorer, map.clone(), reader.num_docs(), budget.cloned(),
+                    |scorer, slot| scorer.iterator.seek_physical(slot),
+                )?;
+                Ok(super::filtered::filtered(scorer, $eligibility.clone()))
+            }
             // Chunked field: postings are keyed by virtual chunk id. Score the
             // chunks, fold them back to documents and report the ordinals.
-            Some(posting_list) if reader.is_chunked_field(field) => {
+            Some(posting_list) if reader.has_text_mapping(field) => {
                 let (idf, avg_field_len) =
                     compute_term_idf(&posting_list, field, reader, global_stats, term);
                 if $complete {
-                    return complete_text_scorer(vec![(posting_list, idf)], avg_field_len, reader, field, budget.cloned(), $eligibility.clone());
+                    return complete_text_scorer(vec![(posting_list, idf)], avg_field_len, reader, field, &super::ScorerOptions {
+                        shared_threshold: budget.cloned(), eligibility: $eligibility.clone(),
+                        skip_scoring_setup: $skip_scoring_setup, ..Default::default()
+                    });
                 }
                 super::planner::finish_chunked_text_maxscore(
                     vec![(posting_list, idf)],
@@ -200,6 +223,30 @@ macro_rules! term_plan {
                 let (idf, avg_field_len) =
                     compute_term_idf(&posting_list, field, reader, global_stats, term);
 
+                // Ranked term requests can use the same block bounds as a text
+                // union. Complete membership and positioned callers keep a cursor.
+                if !$complete && !$load_positions && posting_list.has_ratio_bounds() && posting_list.num_blocks() > 1
+                    && limit < posting_list.doc_count() as usize
+                {
+                    return super::planner::finish_text_maxscore(
+                        vec![(posting_list, idf)],
+                        avg_field_len,
+                        reader.doc_lengths(field),
+                        limit,
+                        &std::cell::Cell::new($initial_threshold),
+                        reader,
+                        field,
+                        $eligibility.as_ref().map(|filter| {
+                            let filter = filter.clone();
+                            Box::new(move |doc| filter.contains(doc)) as super::DocPredicate<'_>
+                        }),
+                        super::Bm25Params::for_field(reader.schema(), field),
+                        None,
+                        1.0,
+                        budget,
+                    );
+                }
+
                 let positions = if $load_positions {
                     reader.$get_positions_fn(field, term) $(. $aw)* ?
                 } else {
@@ -210,7 +257,7 @@ macro_rules! term_plan {
                     .with_params(super::Bm25Params::for_field(reader.schema(), field));
                 scorer.budget = budget.filter(|b| b.deadline().is_some()).cloned();
                 if let Some(lengths) = reader.doc_lengths(field) {
-                    scorer = scorer.with_doc_lengths(lengths.clone());
+                    scorer = scorer.with_doc_lengths(lengths.clone(), $skip_scoring_setup);
                 }
                 if let Some(pos) = positions {
                     scorer = scorer.with_positions(field.0, pos);
@@ -230,6 +277,16 @@ macro_rules! term_plan {
 }
 
 impl Query for TermQuery {
+    fn physical_text_field(&self, reader: &SegmentReader, complete: bool) -> Option<Field> {
+        let entry = reader.schema().get_field_entry(self.field)?;
+        (complete
+            && entry.indexed
+            && !entry.fast
+            && reader
+                .chunk_map(self.field)
+                .is_some_and(|map| map.is_document_map()))
+        .then_some(self.field)
+    }
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         self.scorer_with_options(reader, limit, super::ScorerOptions::with_positions())
     }
@@ -258,6 +315,9 @@ impl Query for TermQuery {
                 options.eligibility,
                 options.shared_threshold.as_ref(),
                 options.complete_text_matches,
+                options.skip_scoring_setup,
+                options.initial_threshold,
+                options.physical_text_field,
                 get_postings,
                 get_positions,
                 await
@@ -268,12 +328,7 @@ impl Query for TermQuery {
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         let field = self.field;
         let term = self.term.clone();
-        Box::pin(async move {
-            match reader.get_postings(field, &term).await? {
-                Some(list) => Ok(list.doc_count()),
-                None => Ok(0),
-            }
-        })
+        Box::pin(async move { reader.text_doc_freq(field, &term).await })
     }
 
     #[cfg(feature = "sync")]
@@ -306,6 +361,9 @@ impl Query for TermQuery {
             options.eligibility,
             options.shared_threshold.as_ref(),
             options.complete_text_matches,
+            options.skip_scoring_setup,
+            options.initial_threshold,
+            options.physical_text_field,
             get_postings_sync,
             get_positions_sync
         )
@@ -335,7 +393,7 @@ impl Query for TermQuery {
     #[cfg(feature = "sync")]
     fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {
         // Chunked postings count chunks, not documents.
-        if reader.is_chunked_field(self.field) {
+        if reader.has_text_mapping(self.field) {
             return None;
         }
         // Exact: the posting list header carries the doc count.
@@ -367,7 +425,7 @@ impl Query for TermQuery {
         #[cfg(feature = "sync")]
         {
             // Chunked postings use chunk ids, not document ids.
-            if reader.is_chunked_field(self.field) {
+            if reader.has_text_mapping(self.field) {
                 return None;
             }
             let Some(pl) = reader.get_postings_sync(self.field, &self.term).ok()? else {
@@ -403,6 +461,7 @@ impl Query for TermQuery {
             weight: 1.0,
             field: self.field,
             term: self.term.clone(),
+            global_stats: self.global_stats.clone(),
         })
     }
 }
@@ -410,6 +469,8 @@ impl Query for TermQuery {
 struct TermScorer {
     budget: Option<super::SharedThreshold>,
     iterator: crate::structures::BlockPostingIterator<'static>,
+    /// Physical posting cardinality for conjunction planning, not a live hit count.
+    doc_count: u32,
     idf: f32,
     /// Average field length for this field
     avg_field_len: f32,
@@ -424,6 +485,7 @@ struct TermScorer {
     chunk_lengths: Option<crate::segment::chunk_map::ChunkMap>,
     /// Per-field k1/b.
     params: super::Bm25Params,
+    normalization: Option<Box<super::bm25::NormTable>>,
 }
 
 impl TermScorer {
@@ -435,6 +497,7 @@ impl TermScorer {
     ) -> Self {
         Self {
             budget: None,
+            doc_count: posting_list.doc_count(),
             iterator: posting_list.into_iterator(),
             idf,
             avg_field_len,
@@ -444,17 +507,40 @@ impl TermScorer {
             lengths: None,
             chunk_lengths: None,
             params: super::Bm25Params::default(),
+            normalization: None,
         }
     }
 
     /// Score with the field's BM25 parameters.
     pub fn with_params(mut self, params: super::Bm25Params) -> Self {
         self.params = params;
+        if self
+            .lengths
+            .as_ref()
+            .is_some_and(|lengths| lengths.is_quantized())
+        {
+            self.normalization = Some(Box::new(super::bm25::NormTable::new(
+                params,
+                self.avg_field_len,
+            )));
+        }
         self
     }
 
     /// Score with the field's persisted per-document lengths.
-    pub fn with_doc_lengths(mut self, lengths: crate::segment::chunk_map::DocLengths) -> Self {
+    fn with_doc_lengths(
+        mut self,
+        lengths: crate::segment::chunk_map::DocLengths,
+        skip_scoring_setup: bool,
+    ) -> Self {
+        if lengths.is_quantized() && !skip_scoring_setup {
+            self.normalization = Some(Box::new(super::bm25::NormTable::new(
+                self.params,
+                self.avg_field_len,
+            )));
+        } else {
+            self.normalization = None;
+        }
         self.lengths = Some(lengths);
         self
     }
@@ -468,9 +554,143 @@ impl TermScorer {
         self.positions = Some(positions);
         self
     }
+
+    fn score_batch_values(&self, docs: &[DocId], tfs: &[u32], scores: &mut [Score]) {
+        let lengths = self
+            .chunk_lengths
+            .as_ref()
+            .map(super::scoring::LengthSource::Chunks)
+            .or_else(|| {
+                self.lengths
+                    .as_ref()
+                    .map(super::scoring::LengthSource::Docs)
+            });
+        super::scoring::score_text_run(
+            self.params,
+            self.idf,
+            self.avg_field_len,
+            lengths,
+            self.normalization.as_deref(),
+            docs,
+            tfs,
+            scores,
+        );
+    }
+
+    fn score_window<const ACCUMULATE: bool>(
+        &mut self,
+        base: DocId,
+        scores: &mut [Score; super::docset::DOC_WINDOW_SIZE as usize],
+        bits: &mut super::docset::DocWindow,
+    ) {
+        use super::docset::DocSet;
+        if self.seek(base) == TERMINATED {
+            return;
+        }
+        let end = base.saturating_add(super::docset::DOC_WINDOW_SIZE);
+        let mut lengths = [0u32; crate::structures::postings::POSTING_BLOCK_SIZE];
+        let mut values = [0.0; crate::structures::postings::POSTING_BLOCK_SIZE];
+        let params = self.params;
+        let idf = self.idf;
+        let avg_len = self.avg_field_len;
+        let boost = self.field_boost;
+        let length_source = self
+            .chunk_lengths
+            .as_ref()
+            .map(super::scoring::LengthSource::Chunks)
+            .or_else(|| {
+                self.lengths
+                    .as_ref()
+                    .map(super::scoring::LengthSource::Docs)
+            });
+        let budget = &self.budget;
+        let normalization = self.normalization.as_deref();
+        self.iterator.visit_postings_until(end, |docs, tfs| {
+            crate::observe::search_work!(score_batches += 1);
+            if budget
+                .as_ref()
+                .is_some_and(super::SharedThreshold::stop_if_expired)
+            {
+                return false;
+            }
+            if let (Some(super::scoring::LengthSource::Docs(norms)), Some(table)) =
+                (length_source, normalization)
+            {
+                crate::observe::search_work!(lookup_score_units += docs.len());
+                table.score_batch(
+                    params,
+                    idf,
+                    avg_len,
+                    boost,
+                    docs.iter().map(|&doc| norms.norm_code(doc)),
+                    tfs,
+                    &mut values[..docs.len()],
+                );
+            } else {
+                crate::observe::search_work!(exact_score_units += docs.len());
+                if let Some(source) = length_source {
+                    source.gather_lengths(docs, &mut lengths[..docs.len()]);
+                } else {
+                    lengths[..docs.len()].copy_from_slice(tfs);
+                }
+                // Independent canonical scores over contiguous inputs. Missing
+                // lengths retain the scalar scorer's TF fallback.
+                for i in 0..docs.len() {
+                    let tf = tfs[i] as f32;
+                    let len = if lengths[i] == 0 {
+                        tf
+                    } else {
+                        lengths[i] as f32
+                    };
+                    values[i] = params.score_boosted(tf, idf, len, avg_len, boost);
+                }
+            }
+            for (i, &doc) in docs.iter().enumerate() {
+                let offset = (doc - base) as usize;
+                if ACCUMULATE {
+                    scores[offset] += values[i];
+                } else {
+                    scores[offset] = values[i];
+                }
+                bits[offset / 64] |= 1u64 << (offset % 64);
+            }
+            true
+        });
+    }
 }
 
 impl super::docset::DocSet for TermScorer {
+    fn supports_doc_batches(&self) -> bool {
+        self.budget.is_none()
+    }
+
+    fn fill_doc_batch(&mut self, docs: &mut super::docset::DocBatch) -> usize {
+        if self.budget.is_some() {
+            return super::docset::fill_batch(self, docs);
+        }
+        self.iterator.fill_doc_batch(docs)
+    }
+
+    fn retain_doc_batch(&mut self, docs: &mut super::docset::DocBatch, len: usize) -> usize {
+        assert!(len <= docs.len());
+        if self.budget.is_some() {
+            return super::docset::retain_batch(self, docs, len);
+        }
+        self.iterator.retain_doc_batch(&mut docs[..len])
+    }
+
+    fn supports_doc_windows(&self) -> bool {
+        true
+    }
+
+    fn fill_doc_window(&mut self, base: DocId, bits: &mut super::docset::DocWindow) {
+        if self.doc() == TERMINATED {
+            bits.fill(0);
+            return;
+        }
+        self.iterator.fill_doc_window(base, bits);
+    }
+
     fn doc(&self) -> DocId {
         if self
             .budget
@@ -486,18 +706,29 @@ impl super::docset::DocSet for TermScorer {
         if self.doc() == TERMINATED {
             return TERMINATED;
         }
-        self.iterator.advance()
+        let doc = self.iterator.advance();
+        if self.positions.is_some() {
+            // Commit the position prefix now so the immutable
+            // `position_cursor()` used by `matched_positions` is O(1).
+            self.iterator.position_cursor_mut();
+        }
+        doc
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
         if self.doc() == TERMINATED {
             return TERMINATED;
         }
-        self.iterator.seek(target)
+        let doc = self.iterator.seek(target);
+        if self.positions.is_some() {
+            // See `advance`: commit the position prefix eagerly.
+            self.iterator.position_cursor_mut();
+        }
+        doc
     }
 
     fn size_hint(&self) -> u32 {
-        0
+        self.doc_count
     }
 }
 
@@ -607,9 +838,93 @@ impl Scorer for FastFieldTextScorer<'_> {
 }
 
 impl Scorer for TermScorer {
+    fn supports_score_batches(&self) -> bool {
+        self.budget.is_none() && self.field_boost == 1.0
+    }
+
+    fn fill_score_batch(
+        &mut self,
+        docs: &mut super::docset::DocBatch,
+        scores: &mut super::ScoreBatch,
+    ) -> usize {
+        if !self.supports_score_batches() {
+            return super::traits::fill_score_batch_scalar(self, docs, scores);
+        }
+        let mut tfs = [0; super::docset::DOC_BATCH_SIZE];
+        let count = self.iterator.fill_scored_doc_batch(docs, &mut tfs);
+        self.score_batch_values(&docs[..count], &tfs[..count], &mut scores[..count]);
+        count
+    }
+
+    fn score_batch_matches(
+        &mut self,
+        docs: &super::docset::DocBatch,
+        len: usize,
+        scores: &mut super::ScoreBatch,
+        matches: &mut super::ScoreBatchMask,
+    ) {
+        assert!(len <= docs.len());
+        if !self.supports_score_batches() {
+            return super::traits::score_batch_matches_scalar(self, docs, len, scores, matches);
+        }
+        matches.fill(0);
+        let mut retained = *docs;
+        let mut tfs = [0; super::docset::DOC_BATCH_SIZE];
+        let count = self
+            .iterator
+            .retain_scored_doc_batch(&mut retained[..len], &mut tfs[..len]);
+        let mut values = [0.0; super::docset::DOC_BATCH_SIZE];
+        self.score_batch_values(&retained[..count], &tfs[..count], &mut values[..count]);
+        let mut input = 0;
+        for i in 0..count {
+            while docs[input] < retained[i] {
+                input += 1;
+            }
+            scores[input] = values[i];
+            matches[input / 64] |= 1 << (input % 64);
+        }
+    }
+
+    fn supports_score_windows(&self) -> bool {
+        self.doc_count > crate::structures::postings::POSTING_BLOCK_SIZE as u32
+    }
+
+    fn fill_score_window(
+        &mut self,
+        base: DocId,
+        scores: &mut [Score; super::docset::DOC_WINDOW_SIZE as usize],
+        bits: &mut super::docset::DocWindow,
+    ) {
+        bits.fill(0);
+        self.score_window::<false>(base, scores, bits);
+    }
+
+    fn accumulate_score_window(
+        &mut self,
+        base: DocId,
+        scores: &mut [Score; super::docset::DOC_WINDOW_SIZE as usize],
+        bits: &mut super::docset::DocWindow,
+    ) {
+        self.score_window::<true>(base, scores, bits);
+    }
+
     fn score(&self) -> Score {
         let tf = self.iterator.term_freq() as f32;
+        if let (Some(lengths), Some(table)) = (&self.lengths, &self.normalization)
+            && self.chunk_lengths.is_none()
+        {
+            crate::observe::search_work!(lookup_score_units += 1);
+            return table.score_boosted(
+                self.params,
+                tf,
+                self.idf,
+                lengths.norm_code(self.iterator.doc()),
+                self.avg_field_len,
+                self.field_boost,
+            );
+        }
         // Persisted field length when the segment has norms; otherwise `tf`
+        crate::observe::search_work!(exact_score_units += 1);
         // stands in for the length (legacy segments).
         let doc_len = self
             .chunk_lengths
@@ -654,9 +969,12 @@ pub(super) fn complete_text_scorer<'a>(
     avg_field_len: f32,
     reader: &'a SegmentReader,
     field: Field,
-    budget: Option<super::SharedThreshold>,
-    eligibility: Option<Arc<super::DocBitset>>,
+    options: &super::ScorerOptions,
 ) -> crate::Result<Box<dyn Scorer + 'a>> {
+    let budget = options.shared_threshold.clone();
+    let eligibility = options.eligibility.clone();
+    let skip_scoring_setup = options.skip_scoring_setup;
+    let physical = options.physical_text_field == Some(field);
     if postings.is_empty()
         || budget
             .as_ref()
@@ -665,12 +983,12 @@ pub(super) fn complete_text_scorer<'a>(
         return Ok(Box::new(EmptyScorer));
     }
     let map = reader.chunk_map(field);
-    if reader.is_chunked_field(field) && map.is_none() {
+    if reader.has_text_mapping(field) && map.is_none() {
         return Err(crate::Error::Corruption(
             "chunked text has postings without a chunk map".into(),
         ));
     }
-    if map.is_some_and(|map| !map.is_doc_ordered()) {
+    if !physical && map.is_some_and(|map| !map.is_doc_ordered()) {
         return super::required_text::scorer(
             postings,
             avg_field_len,
@@ -685,15 +1003,18 @@ pub(super) fn complete_text_scorer<'a>(
         let mut scorer = TermScorer::new(posting, idf, avg_field_len, 1.0)
             .with_params(super::Bm25Params::for_field(reader.schema(), field));
         scorer.chunk_lengths = map.cloned();
-        scorer.lengths = reader.doc_lengths(field).cloned();
+        if let Some(lengths) = reader.doc_lengths(field) {
+            scorer = scorer.with_doc_lengths(lengths.clone(), skip_scoring_setup);
+        }
         scorer.budget = budget.clone();
         terms.push(Box::new(scorer));
     }
     let scorer = super::boolean::BooleanScorer::disjunction(terms);
     let scorer: Box<dyn Scorer + 'a> = match map {
-        Some(map) => {
+        Some(map) if !map.is_document_map() => {
             super::phrase::fold_chunked_phrase_scorer(scorer, map.clone(), field.0, budget)
         }
+        Some(_) => Box::new(scorer),
         None => Box::new(scorer),
     };
     Ok(super::filtered::filtered(scorer, eligibility))
@@ -708,6 +1029,7 @@ pub(super) async fn score_term_candidates(
     stats: Option<&Arc<GlobalStats>>,
     scratch: &mut crate::structures::postings::PostingDecodeScratch,
 ) -> crate::Result<Vec<f32>> {
+    reader.check_posting_integrity()?;
     let mut scores = vec![0.0; targets.len()];
     let Some(&first_target) = targets.first() else {
         return Ok(scores);
@@ -735,5 +1057,228 @@ pub(super) async fn score_term_candidates(
         }
         cursor.recycle(scratch);
     }
+    reader.check_posting_integrity()?;
     Ok(scores)
+}
+
+#[cfg(test)]
+mod score_window_tests {
+    use super::*;
+    use crate::query::DocSet;
+    use crate::segment::chunk_map::DocLengths;
+    use crate::structures::postings::{PostingCodec, PostingList};
+
+    #[test]
+    fn compact_term_scores_preserve_scalar_bits_membership_and_resume() {
+        let mut list = PostingList::new();
+        for i in 0..701u32 {
+            list.push(i * 11 + 1, [0, 1, 3, 65536, u32::MAX][i as usize % 5]);
+        }
+        let lengths = DocLengths::from_lengths(
+            &(0..7800)
+                .map(|i| [0, 1, 97, 65535][i % 4])
+                .collect::<Vec<_>>(),
+        );
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let postings = BlockPostingList::from_posting_list_with_codec(&list, codec).unwrap();
+            for with_lengths in [false, true] {
+                for boost in [0.0, 0.5, 1.0, 2.5] {
+                    for params in [
+                        super::super::Bm25Params { k1: 0.0, b: 0.0 },
+                        super::super::Bm25Params::default(),
+                        super::super::Bm25Params { k1: 14.3, b: 1.0 },
+                    ] {
+                        let build = || {
+                            let mut scorer =
+                                TermScorer::new(postings.clone(), 2.713, 503.17, boost)
+                                    .with_params(params);
+                            if with_lengths {
+                                scorer.lengths = Some(lengths.clone());
+                            }
+                            scorer
+                        };
+                        let mut scalar = build();
+                        let mut batch = build();
+                        assert_eq!(batch.supports_score_batches(), boost == 1.0);
+                        let mut docs = [0; super::super::docset::DOC_BATCH_SIZE];
+                        let mut scores = [f32::NAN; super::super::docset::DOC_BATCH_SIZE];
+                        scalar.seek(121);
+                        batch.seek(121);
+                        while batch.doc() != TERMINATED {
+                            let len = batch.fill_score_batch(&mut docs, &mut scores);
+                            assert!(len > 0);
+                            for i in 0..len {
+                                assert_eq!(docs[i], scalar.doc());
+                                assert_eq!(
+                                    scores[i].to_bits(),
+                                    scalar.score().to_bits(),
+                                    "{codec:?} boost={boost} doc={}",
+                                    docs[i]
+                                );
+                                scalar.advance();
+                            }
+                            assert_eq!(batch.doc(), scalar.doc());
+                        }
+                        let mut scalar = build();
+                        let mut batch = build();
+                        for start in (0..8000u32).step_by(128) {
+                            let docs = std::array::from_fn(|i| start + i as u32);
+                            let mut bits = [u64::MAX; 2];
+                            batch.score_batch_matches(&docs, docs.len(), &mut scores, &mut bits);
+                            for (i, &doc) in docs.iter().enumerate() {
+                                let found = scalar.seek(doc) == doc;
+                                assert_eq!(bits[i / 64] & (1 << (i % 64)) != 0, found);
+                                if found {
+                                    assert_eq!(scores[i].to_bits(), scalar.score().to_bits());
+                                }
+                            }
+                            assert_eq!(batch.doc(), scalar.doc());
+                        }
+                    }
+                }
+            }
+        }
+        let mut timed = TermScorer::new(
+            BlockPostingList::from_posting_list(&list).unwrap(),
+            1.0,
+            1.0,
+            1.0,
+        );
+        timed.budget = Some(super::super::SharedThreshold::new());
+        assert!(!timed.supports_score_batches());
+    }
+
+    #[test]
+    fn replacement_term_windows_clear_stale_hits_and_stop_at_deadlines() {
+        let mut list = PostingList::new();
+        for doc in [0, 4095, 4096, 8192, TERMINATED - 1] {
+            list.push(doc, 1);
+        }
+        let postings = BlockPostingList::from_posting_list(&list).unwrap();
+        let mut scalar = TermScorer::new(postings.clone(), -0.0, 10.0, 1.0);
+        let mut batched = TermScorer::new(postings.clone(), -0.0, 10.0, 1.0);
+        let mut scores = Box::new([f32::NAN; super::super::docset::DOC_WINDOW_SIZE as usize]);
+        let mut bits = [u64::MAX; super::super::docset::DOC_WINDOW_WORDS];
+        for base in [
+            0,
+            4096,
+            8192,
+            TERMINATED - super::super::docset::DOC_WINDOW_SIZE,
+        ] {
+            bits.fill(u64::MAX);
+            scores.fill(f32::NAN);
+            batched.fill_score_window(base, &mut scores, &mut bits);
+            scalar.seek(base);
+            let end = base.saturating_add(super::super::docset::DOC_WINDOW_SIZE);
+            while scalar.doc() < end {
+                let offset = (scalar.doc() - base) as usize;
+                assert_ne!(bits[offset / 64] & (1u64 << (offset % 64)), 0);
+                assert_eq!(scores[offset].to_bits(), scalar.score().to_bits());
+                bits[offset / 64] &= !(1u64 << (offset % 64));
+                scalar.advance();
+            }
+            assert!(bits.iter().all(|&word| word == 0));
+            assert_eq!(batched.doc(), scalar.doc());
+        }
+        assert_eq!(batched.doc(), TERMINATED);
+        let mut expired = TermScorer::new(postings, 1.0, 10.0, 1.0);
+        let budget = super::super::SharedThreshold::for_limit(1)
+            .with_deadline(Some(std::time::Instant::now()));
+        expired.budget = Some(budget.clone());
+        bits.fill(u64::MAX);
+        expired.fill_score_window(0, &mut scores, &mut bits);
+        assert!(bits.iter().all(|&word| word == 0));
+        assert_eq!(expired.doc(), TERMINATED);
+        assert!(budget.truncated());
+    }
+
+    #[test]
+    fn term_score_runs_preserve_scalar_bits_with_boosts_lengths_and_legacy_fallback() {
+        let mut list = PostingList::new();
+        for i in 0..327u32 {
+            list.push(i * 11, [1, 3, 127, 65535, 65536, u32::MAX][i as usize % 6]);
+        }
+        let lengths = DocLengths::from_lengths(
+            &(0..3600)
+                .map(|i| [0, 1, 97, 65535][i % 4])
+                .collect::<Vec<_>>(),
+        );
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let postings = BlockPostingList::from_posting_list_with_codec(&list, codec).unwrap();
+            for with_lengths in [false, true] {
+                for params in [
+                    super::super::Bm25Params { k1: 0.0, b: 0.0 },
+                    super::super::Bm25Params::default(),
+                    super::super::Bm25Params { k1: 14.3, b: 1.0 },
+                ] {
+                    for boost in [0.0, 0.5, 1.0, 2.5] {
+                        for avg in [0.0, 1.0, 503.17] {
+                            for idf in [-0.0, 0.001, 10.0] {
+                                let build = || {
+                                    let mut scorer =
+                                        TermScorer::new(postings.clone(), idf, avg, boost)
+                                            .with_params(params);
+                                    if with_lengths {
+                                        scorer.lengths = Some(lengths.clone());
+                                    }
+                                    scorer
+                                };
+                                for replace in [false, true] {
+                                    let mut scalar = build();
+                                    let mut batched = build();
+                                    let base = 121;
+                                    scalar.seek(base);
+                                    batched.seek(base);
+                                    let mut scores = Box::new(
+                                        [0.0; super::super::docset::DOC_WINDOW_SIZE as usize],
+                                    );
+                                    let mut bits = [if replace { u64::MAX } else { 0 };
+                                        super::super::docset::DOC_WINDOW_WORDS];
+                                    if replace {
+                                        scores.fill(f32::NAN);
+                                        batched.fill_score_window(base, &mut scores, &mut bits);
+                                    } else {
+                                        batched.accumulate_score_window(
+                                            base,
+                                            &mut scores,
+                                            &mut bits,
+                                        );
+                                    }
+                                    while scalar.doc() != TERMINATED {
+                                        let offset = (scalar.doc() - base) as usize;
+                                        assert_ne!(bits[offset / 64] & (1u64 << (offset % 64)), 0);
+                                        let expected = if replace {
+                                            scalar.score()
+                                        } else {
+                                            0.0 + scalar.score()
+                                        };
+                                        assert_eq!(
+                                            scores[offset].to_bits(),
+                                            expected.to_bits(),
+                                            "codec={codec:?} lengths={with_lengths} params={params:?} boost={boost} avg={avg} idf={idf} doc={}",
+                                            scalar.doc()
+                                        );
+                                        bits[offset / 64] &= !(1u64 << (offset % 64));
+                                        scalar.advance();
+                                    }
+                                    assert!(bits.iter().all(|word| *word == 0));
+                                    assert_eq!(batched.doc(), TERMINATED);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }

@@ -69,6 +69,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         const STANDALONE_STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
         let resources = SearcherResources::new(
             term_cache_blocks,
+            None,
             STANDALONE_STORE_CACHE_BYTES,
             crate::default_search_threads(),
             4,

@@ -188,7 +188,7 @@ impl Scorer for RequiredTextScorer {
         self.score
     }
     fn matched_positions(&self) -> Option<MatchedPositions> {
-        if self.doc() == TERMINATED {
+        if self.doc() == TERMINATED || self.map.is_document_map() {
             return None;
         }
         Some(vec![(
@@ -200,5 +200,116 @@ impl Scorer for RequiredTextScorer {
                 })
                 .collect(),
         )])
+    }
+}
+
+/// Translate complete plain-text traversal into logical document order. Only
+/// membership is materialized; scores and token positions stay with the original
+/// scorer and are probed using its retained, bounded physical cursor buffers.
+pub(super) fn mapped_documents<'a, S, F>(
+    mut inner: S,
+    map: ChunkMap,
+    num_docs: u32,
+    budget: Option<SharedThreshold>,
+    seek: F,
+) -> crate::Result<Box<dyn Scorer + 'a>>
+where
+    S: Scorer + 'a,
+    F: Fn(&mut S, DocId) -> DocId + Send + Sync + 'a,
+{
+    if map.is_doc_ordered() {
+        return Ok(Box::new(inner));
+    }
+    if num_docs as usize > super::filtered::MAX_FILTER_BITMAP_DOCS {
+        return Err(crate::Error::Query(
+            "mapped text exceeds the 16 MiB document bitmap budget".into(),
+        ));
+    }
+    let mut matches = DocBitset::new(num_docs);
+    let mut visited = 0usize;
+    while inner.doc() != TERMINATED {
+        if visited.is_multiple_of(1024)
+            && budget
+                .as_ref()
+                .is_some_and(SharedThreshold::stop_if_expired)
+        {
+            return Ok(Box::new(EmptyScorer));
+        }
+        matches.set(map.doc_id(inner.doc()));
+        inner.advance();
+        visited += 1;
+    }
+    let mut scorer = DocumentMappedScorer {
+        inner,
+        map,
+        matches,
+        seek,
+        budget,
+        current: TERMINATED,
+    };
+    scorer.position(0);
+    Ok(Box::new(scorer))
+}
+
+struct DocumentMappedScorer<S, F> {
+    inner: S,
+    map: ChunkMap,
+    matches: DocBitset,
+    seek: F,
+    budget: Option<SharedThreshold>,
+    current: DocId,
+}
+
+impl<S: Scorer, F: Fn(&mut S, DocId) -> DocId> DocumentMappedScorer<S, F> {
+    fn position(&mut self, target: DocId) {
+        self.current = TERMINATED;
+        if self
+            .budget
+            .as_ref()
+            .is_some_and(SharedThreshold::stop_if_expired)
+        {
+            return;
+        }
+        let Some(doc) = self.matches.next_set_bit(target) else {
+            return;
+        };
+        let (_, slot) = self
+            .map
+            .slots_for_document(doc)
+            .next()
+            .expect("validated document map");
+        if (self.seek)(&mut self.inner, slot) == slot {
+            self.current = doc;
+        }
+    }
+}
+
+impl<S: Scorer, F: Fn(&mut S, DocId) -> DocId + Send + Sync> DocSet for DocumentMappedScorer<S, F> {
+    fn doc(&self) -> DocId {
+        self.current
+    }
+    fn advance(&mut self) -> DocId {
+        if self.current != TERMINATED {
+            self.position(self.current + 1);
+        }
+        self.current
+    }
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target > self.current {
+            self.position(target);
+        }
+        self.current
+    }
+    fn size_hint(&self) -> u32 {
+        self.inner.size_hint()
+    }
+}
+
+impl<S: Scorer, F: Fn(&mut S, DocId) -> DocId + Send + Sync> Scorer for DocumentMappedScorer<S, F> {
+    fn score(&self) -> Score {
+        self.inner.score()
+    }
+    fn matched_positions(&self) -> Option<MatchedPositions> {
+        self.inner.matched_positions()
     }
 }

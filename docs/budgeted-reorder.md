@@ -240,3 +240,5 @@ automatic compaction may run globally, followed by a separate completion cooldow
 It does not reset exhausted BP attempt counts or consume a BP attempt. Filtering a
 previously reordered BMP layout invalidates convergence while retaining its order,
 so any allowed follow-up BP uses the existing bounded deepening policy.
+
+## Seismic follow-up accounting

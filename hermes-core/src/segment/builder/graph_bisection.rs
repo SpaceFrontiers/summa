@@ -104,7 +104,7 @@ fn count_frequencies_bounded<T: FrequencyParallelSafe>(
 
 /// Retain the lowest-frequency eligible dimensions while the frequency table
 /// is live. Both record- and block-level builders use the same bounded policy.
-fn select_frequency_candidates(
+pub(crate) fn select_frequency_candidates(
     frequencies: &[u32],
     min_frequency: usize,
     max_frequency: usize,
@@ -143,25 +143,26 @@ fn select_frequency_candidates(
     (selected, capacity < eligible_count)
 }
 
-struct CandidateFit {
-    estimated_bytes: usize,
-    retained_postings: usize,
-    dropped: usize,
+pub(crate) struct CandidateFit {
+    pub(crate) estimated_bytes: usize,
+    pub(crate) retained_postings: usize,
+    pub(crate) dropped: usize,
 }
 
 /// Apply the shared forward-index memory model, preferring low-frequency
 /// dimensions because they add the least CSR storage and the strongest
 /// clustering signal.
-fn fit_candidates_to_budget(
+pub(crate) fn fit_candidates_to_budget(
     candidates: &mut Vec<(u32, usize)>,
     fixed_bytes: usize,
     memory_budget_bytes: usize,
+    posting_bytes: usize,
 ) -> CandidateFit {
     let total_postings = candidates.iter().fold(0usize, |total, (_, frequency)| {
         total.saturating_add(*frequency)
     });
     let estimated_bytes = total_postings
-        .saturating_mul(std::mem::size_of::<u32>())
+        .saturating_mul(posting_bytes)
         .saturating_add(fixed_bytes)
         .saturating_add(candidates.len().saturating_mul(CANDIDATE_ENTRY_BYTES))
         .saturating_add(term_degree_bytes(candidates.len()));
@@ -179,7 +180,7 @@ fn fit_candidates_to_budget(
     let mut keep = 0usize;
     for &(_, frequency) in candidates.iter() {
         let term_bytes = frequency
-            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_mul(posting_bytes)
             .saturating_add(TERM_DEGREE_VALUE_BYTES + 1)
             .saturating_add(CANDIDATE_ENTRY_BYTES);
         if term_bytes > memory_budget_bytes.saturating_sub(used_bytes) {
@@ -473,8 +474,10 @@ impl ForwardIndex {
         memory_budget_bytes: usize,
         budget_limited: bool,
     ) -> Self {
-        let non_degree_bytes =
-            terms.len() * std::mem::size_of::<u32>() + offsets.len() * std::mem::size_of::<u64>();
+        let non_degree_bytes = terms
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(offsets.len().saturating_sub(1).saturating_mul(32));
         let lanes = parallel_bisect_lanes(memory_budget_bytes, non_degree_bytes, num_terms);
         Self {
             terms,
@@ -801,7 +804,12 @@ pub(crate) fn build_forward_index_from_bmps_with_maps(
     let fixed_bytes = entity_scratch_bytes
         .saturating_add(remap_bytes)
         .saturating_add(jobs_bytes);
-    let fit = fit_candidates_to_budget(&mut eligible, fixed_bytes, memory_budget_bytes);
+    let fit = fit_candidates_to_budget(
+        &mut eligible,
+        fixed_bytes,
+        memory_budget_bytes,
+        std::mem::size_of::<u32>(),
+    );
     if fit.dropped > 0 {
         budget_limited = true;
         log::warn!(
@@ -1058,7 +1066,12 @@ pub(crate) fn build_forward_index_from_blocks(
     let fixed_bytes = entity_scratch_bytes
         .saturating_add(remap_bytes)
         .saturating_add(blocks_bytes);
-    let fit = fit_candidates_to_budget(&mut eligible, fixed_bytes, memory_budget_bytes);
+    let fit = fit_candidates_to_budget(
+        &mut eligible,
+        fixed_bytes,
+        memory_budget_bytes,
+        std::mem::size_of::<u32>(),
+    );
     if fit.dropped > 0 {
         budget_limited = true;
         log::warn!(

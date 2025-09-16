@@ -49,6 +49,7 @@ const DROP_WINDOW: u64 = 64 * 1024 * 1024;
 pub(crate) struct ColdStreamingWriter {
     file: std::fs::File,
     buf: Vec<u8>,
+    buffer_limit: usize,
     /// Bytes flushed to the fd.
     written: u64,
     /// Start of the region whose writeback has not been initiated yet.
@@ -63,6 +64,14 @@ pub(crate) struct ColdStreamingWriter {
 
 impl ColdStreamingWriter {
     pub(crate) fn new(file: std::fs::File, label: std::sync::Arc<str>) -> Self {
+        Self::with_capacity(file, label, BUF_SIZE)
+    }
+
+    pub(crate) fn with_capacity(
+        file: std::fs::File,
+        label: std::sync::Arc<str>,
+        buffer_capacity: usize,
+    ) -> Self {
         log_mode_once();
         #[cfg(target_os = "macos")]
         {
@@ -75,9 +84,11 @@ impl ColdStreamingWriter {
                 );
             }
         }
+        let buffer_limit = buffer_capacity.clamp(1, BUF_SIZE);
         Self {
             file,
-            buf: Vec::with_capacity(BUF_SIZE),
+            buf: Vec::with_capacity(buffer_limit),
+            buffer_limit,
             written: 0,
             writeback_cursor: 0,
             drop_cursor: 0,
@@ -157,10 +168,10 @@ impl ColdStreamingWriter {
 
 impl io::Write for ColdStreamingWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if self.buf.len() + data.len() > BUF_SIZE {
+        if data.len() > self.buffer_limit - self.buf.len() {
             self.flush_buf()?;
         }
-        if data.len() >= BUF_SIZE {
+        if data.len() >= self.buffer_limit {
             // Large write: send straight to the fd.
             self.file.write_all(data)?;
             self.written += data.len() as u64;
@@ -251,6 +262,29 @@ mod tests {
         let got = std::fs::read(&path).unwrap();
         assert_eq!(got.len(), expected.len());
         assert_eq!(got, expected, "cold writer corrupted the byte stream");
+    }
+
+    #[test]
+    fn small_cold_buffers_preserve_bytes_and_bound_retained_scratch() {
+        for capacity in [0, 1, 31, 64 * 1024] {
+            let output = tempfile::NamedTempFile::new().unwrap();
+            let mut writer = ColdStreamingWriter::with_capacity(
+                output.reopen().unwrap(),
+                std::sync::Arc::from("test"),
+                capacity,
+            );
+            let mut expected = Vec::new();
+            for len in [3, 29, 31, 32, 65_535, 65_536, 65_537, 7] {
+                let bytes: Vec<_> = (0..len).map(|i| (i % 251) as u8).collect();
+                writer.write_all(&bytes).unwrap();
+                expected.extend_from_slice(&bytes);
+                assert!(writer.buf.len() <= capacity.max(1));
+                assert_eq!(writer.buffer_limit, capacity.max(1));
+                assert_eq!(writer.bytes_written(), expected.len() as u64);
+            }
+            Box::new(writer).finish().unwrap();
+            assert_eq!(std::fs::read(output.path()).unwrap(), expected);
+        }
     }
 
     #[cfg(target_os = "linux")]

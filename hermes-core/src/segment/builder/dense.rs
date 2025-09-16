@@ -334,42 +334,19 @@ pub(super) fn build_vectors_streaming(
 
     // Stream binary dense vector fields (packed bits, Hamming distance)
     for ((field_id, builder), data_size) in binary_fields.into_iter().zip(binary_field_sizes) {
-        let data_offset = current_offset;
         #[cfg(feature = "native")]
         let num_vectors = builder.len();
-
-        FlatVectorData::serialize_binary_from_bits_streaming(
-            builder.dim_bits,
-            &builder.vectors,
-            &builder.doc_ids,
-            writer,
-        )
-        .map_err(crate::Error::Io)?;
-
-        let data_size = u64::try_from(data_size)
-            .map_err(|_| crate::Error::Internal("binary flat vector size exceeds u64".into()))?;
-        current_offset = current_offset
-            .checked_add(data_size)
-            .ok_or_else(|| crate::Error::Internal("vector output offset exceeds u64".into()))?;
-        toc.push(DenseVectorTocEntry {
-            field_id,
-            index_type: super::super::ann_build::FLAT_TYPE,
-            offset: data_offset,
-            size: data_size,
-        });
-
-        let pad = (8 - (current_offset % 8)) % 8;
-        if pad > 0 {
-            writer.write_all(&[0u8; 8][..pad as usize])?;
-            current_offset = current_offset.checked_add(pad).ok_or_else(|| {
-                crate::Error::Internal("vector output padding exceeds u64".into())
-            })?;
-        }
+        #[cfg(feature = "native")]
+        let exact_size;
+        #[cfg(not(feature = "native"))]
+        let exact_size: Option<u64> = None;
 
         // Binary IVF payload (native only): assignment uses the same global
         // quantizer generation as every other segment.
         #[cfg(feature = "native")]
         {
+            let mut locations = crate::segment::vector_locations::ExactLocations::default();
+            let mut ann_len = None;
             let binary_config = schema
                 .get_field_entry(Field(field_id))
                 .and_then(|e| e.binary_dense_vector_config.as_ref());
@@ -395,8 +372,10 @@ pub(super) fn build_vectors_streaming(
                     &index,
                     cfg.ivf_routing,
                     &mut output,
+                    Some(&mut locations),
                 )
                 .map_err(crate::Error::Io)?;
+                ann_len = Some(blob_len);
                 current_offset = current_offset.checked_add(blob_len).ok_or_else(|| {
                     crate::Error::Internal("binary IVF output offset exceeds u64".into())
                 })?;
@@ -445,8 +424,13 @@ pub(super) fn build_vectors_streaming(
                 payload_builder.add_batch(&builder.doc_ids, &builder.vectors)?;
                 let payload = payload_builder.finish(doc_count)?;
                 let blob_offset = current_offset;
-                let blob_len = crate::segment::ann_disk::write_built_scann(&payload, &mut *writer)
-                    .map_err(crate::Error::Io)?;
+                let blob_len = crate::segment::ann_disk::write_built_scann(
+                    &payload,
+                    &mut *writer,
+                    Some(&mut locations),
+                )
+                .map_err(crate::Error::Io)?;
+                ann_len = Some(blob_len);
                 current_offset = current_offset.checked_add(blob_len).ok_or_else(|| {
                     crate::Error::Internal("binary ScaNN output offset exceeds u64".into())
                 })?;
@@ -463,6 +447,56 @@ pub(super) fn build_vectors_streaming(
                         crate::Error::Internal("vector output padding exceeds u64".into())
                     })?;
                 }
+            }
+            exact_size = ann_len
+                .map(|ann_len| {
+                    locations.write(builder.dim_bits, builder.len(), ann_len, writer, None)
+                })
+                .transpose()?;
+        }
+        if let Some(size) = exact_size {
+            toc.push(DenseVectorTocEntry {
+                field_id,
+                index_type: super::super::ann_build::EXACT_LOCATIONS_TYPE,
+                offset: current_offset,
+                size,
+            });
+            current_offset = current_offset
+                .checked_add(size)
+                .ok_or_else(|| crate::Error::Internal("vector lookup offset overflow".into()))?;
+            let pad = (8 - current_offset % 8) % 8;
+            writer.write_all(&[0u8; 8][..pad as usize])?;
+            current_offset += pad;
+        } else {
+            let data_offset = current_offset;
+
+            FlatVectorData::serialize_binary_from_bits_streaming(
+                builder.dim_bits,
+                &builder.vectors,
+                &builder.doc_ids,
+                writer,
+            )
+            .map_err(crate::Error::Io)?;
+
+            let data_size = u64::try_from(data_size).map_err(|_| {
+                crate::Error::Internal("binary flat vector size exceeds u64".into())
+            })?;
+            current_offset = current_offset
+                .checked_add(data_size)
+                .ok_or_else(|| crate::Error::Internal("vector output offset exceeds u64".into()))?;
+            toc.push(DenseVectorTocEntry {
+                field_id,
+                index_type: super::super::ann_build::FLAT_TYPE,
+                offset: data_offset,
+                size: data_size,
+            });
+
+            let pad = (8 - (current_offset % 8)) % 8;
+            if pad > 0 {
+                writer.write_all(&[0u8; 8][..pad as usize])?;
+                current_offset = current_offset.checked_add(pad).ok_or_else(|| {
+                    crate::Error::Internal("vector output padding exceeds u64".into())
+                })?;
             }
         }
     }

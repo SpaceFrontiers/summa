@@ -9,6 +9,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Cursor, Read, Write};
 
 use super::config::WeightQuantization;
+use super::weights::{decode_weights_into, encode_weights};
 use crate::DocId;
 use crate::directories::OwnedBytes;
 use crate::structures::postings::TERMINATED;
@@ -1000,117 +1001,6 @@ fn bits_needed_u16(val: u16) -> u8 {
 // ============================================================================
 // Weight encoding/decoding
 // ============================================================================
-
-fn encode_weights(weights: &[f32], quant: WeightQuantization) -> io::Result<Vec<u8>> {
-    let encoded_len = match quant {
-        WeightQuantization::Float32 => weights.len().saturating_mul(4),
-        WeightQuantization::Float16 => weights.len().saturating_mul(2),
-        WeightQuantization::UInt8 => 8usize.saturating_add(weights.len()),
-        WeightQuantization::UInt4 => 8usize.saturating_add(weights.len().div_ceil(2)),
-    };
-    let mut data = Vec::with_capacity(encoded_len);
-    match quant {
-        WeightQuantization::Float32 => {
-            for &w in weights {
-                data.write_f32::<LittleEndian>(w)?;
-            }
-        }
-        WeightQuantization::Float16 => {
-            use half::f16;
-            for &w in weights {
-                data.write_u16::<LittleEndian>(f16::from_f32(w).to_bits())?;
-            }
-        }
-        WeightQuantization::UInt8 => {
-            let min = weights.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let range = max - min;
-            let scale = if range < f32::EPSILON {
-                1.0
-            } else {
-                range / 255.0
-            };
-            data.write_f32::<LittleEndian>(scale)?;
-            data.write_f32::<LittleEndian>(min)?;
-            for &w in weights {
-                data.write_u8(((w - min) / scale).round() as u8)?;
-            }
-        }
-        WeightQuantization::UInt4 => {
-            let min = weights.iter().copied().fold(f32::INFINITY, f32::min);
-            let max = weights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let range = max - min;
-            let scale = if range < f32::EPSILON {
-                1.0
-            } else {
-                range / 15.0
-            };
-            data.write_f32::<LittleEndian>(scale)?;
-            data.write_f32::<LittleEndian>(min)?;
-            let mut i = 0;
-            while i < weights.len() {
-                let q1 = ((weights[i] - min) / scale).round() as u8 & 0x0F;
-                let q2 = if i + 1 < weights.len() {
-                    ((weights[i + 1] - min) / scale).round() as u8 & 0x0F
-                } else {
-                    0
-                };
-                data.write_u8((q2 << 4) | q1)?;
-                i += 2;
-            }
-        }
-    }
-    Ok(data)
-}
-
-fn decode_weights_into(data: &[u8], quant: WeightQuantization, count: usize, out: &mut Vec<f32>) {
-    match quant {
-        WeightQuantization::Float32 => {
-            out.reserve(count);
-            for chunk in data[..count * 4].as_chunks::<4>().0 {
-                out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-            }
-        }
-        WeightQuantization::Float16 => {
-            // Bulk convert: read u16 bits → f16 → batch convert_to_f32_slice
-            // Uses SIMD F16C on x86_64 when available (half 2.x auto-detects)
-            use half::f16;
-            use half::slice::HalfFloatSliceExt;
-            let byte_count = count * 2;
-            let src = &data[..byte_count];
-            let mut f16_buf = [f16::ZERO; MAX_BLOCK_SIZE];
-            for (value, chunk) in f16_buf[..count].iter_mut().zip(src.as_chunks::<2>().0) {
-                *value = f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]]));
-            }
-            let start = out.len();
-            out.resize(start + count, 0.0);
-            f16_buf[..count].convert_to_f32_slice(&mut out[start..start + count]);
-        }
-        WeightQuantization::UInt8 => {
-            let mut cursor = Cursor::new(data);
-            let scale = cursor.read_f32::<LittleEndian>().unwrap_or(1.0);
-            let min_val = cursor.read_f32::<LittleEndian>().unwrap_or(0.0);
-            let offset = cursor.position() as usize;
-            out.resize(count, 0.0);
-            simd::dequantize_uint8(&data[offset..], out, scale, min_val, count);
-        }
-        WeightQuantization::UInt4 => {
-            let mut cursor = Cursor::new(data);
-            let scale = cursor.read_f32::<LittleEndian>().unwrap_or(1.0);
-            let min = cursor.read_f32::<LittleEndian>().unwrap_or(0.0);
-            let mut i = 0;
-            while i < count {
-                let byte = cursor.read_u8().unwrap_or(0);
-                out.push((byte & 0x0F) as f32 * scale + min);
-                i += 1;
-                if i < count {
-                    out.push((byte >> 4) as f32 * scale + min);
-                    i += 1;
-                }
-            }
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

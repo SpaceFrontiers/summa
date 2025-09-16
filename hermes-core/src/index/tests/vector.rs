@@ -308,7 +308,15 @@ async fn test_needle_sparse_vector() {
 
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
-    let sparse = sb.add_sparse_vector_field("sparse", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        true,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     let schema = sb.build();
 
     let dir = RamDirectory::new();
@@ -395,7 +403,15 @@ async fn test_needle_sparse_vector_multi_segment_merge() {
 
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
-    let sparse = sb.add_sparse_vector_field("sparse", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        true,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     let schema = sb.build();
 
     let dir = RamDirectory::new();
@@ -843,7 +859,15 @@ async fn test_needle_combined_all_modalities() {
     let mut sb = SchemaBuilder::default();
     let title = sb.add_text_field("title", true, true);
     let body = sb.add_text_field("body", true, true);
-    let sparse = sb.add_sparse_vector_field("sparse", true, true);
+    let sparse = sb.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        true,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     let embedding = sb.add_dense_vector_field_with_config(
         "embedding",
         true,
@@ -1349,15 +1373,17 @@ async fn test_binary_ivf_end_to_end() {
     );
 }
 
-/// The merge and reorder compaction policies together: every binary merge
-/// compacts — a 2-way merge that byte-copy would leave at fragmentation 2.0
-/// comes out at one extent per cluster with identical scores — and the
-/// explicit reorder pass (the external `reorder` API) keeps an already
-/// compact segment at 1.0. (Reorder healing a *legacy* fragmented payload,
-/// which merges can no longer produce, is pinned at the unit level in
-/// `ann_disk::tests::compacted_merge_matches_byte_copy_and_resets_fragmentation`.)
+/// Ordinary binary merges preserve immutable extents and lookup blocks.
+/// Standalone reorder coalesces runs while preserving exact codes and scores.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_merge_and_reorder_keep_binary_ann_runs_compact() {
+async fn test_copy_merge_fragments_binary_ann_and_reorder_coalesces_without_reencoding() {
+    for with_sparse in [false, true] {
+        binary_reorder_preserves_exact_vectors(with_sparse).await;
+    }
+}
+
+async fn binary_reorder_preserves_exact_vectors(with_sparse: bool) {
+    use crate::directories::Directory;
     use crate::dsl::BinaryDenseVectorConfig;
     use crate::query::BinaryDenseVectorQuery;
 
@@ -1368,15 +1394,19 @@ async fn test_merge_and_reorder_keep_binary_ann_runs_compact() {
     let title = sb.add_text_field("title", true, true);
     let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
     let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
-    // A reorder-enabled BMP sparse field so the reorder pass has its usual
-    // BP work to do alongside the ANN compaction.
-    let sparse = sb.add_sparse_vector_field_with_config(
-        "sparse",
-        true,
-        false,
-        crate::structures::SparseVectorConfig::splade_bmp(),
-    );
-    sb.set_reorder(sparse, true);
+    // Sparse maintenance shares the pass with ANN coalescing and does not
+    // require a text reorder flag.
+    let sparse = with_sparse.then(|| {
+        sb.add_sparse_vector_field_with_config(
+            "sparse",
+            true,
+            false,
+            crate::structures::SparseVectorConfig {
+                format: crate::structures::SparseFormat::Seismic,
+                ..Default::default()
+            },
+        )
+    });
     let schema = sb.build();
 
     let dir = RamDirectory::new();
@@ -1390,7 +1420,9 @@ async fn test_merge_and_reorder_keep_binary_ann_runs_compact() {
             doc.add_text(title, format!("doc {} hemoglobin", offset + i));
             let value = (offset + i) as u8 | 0x01;
             doc.add_binary_dense_vector(bvec, vec![value; byte_len]);
-            doc.add_sparse_vector(sparse, vec![(0, 1.0), (1 + (i % 5), 0.5)]);
+            if let Some(sparse) = sparse {
+                doc.add_sparse_vector(sparse, vec![(0, 1.0), (1 + (i % 5), 0.5)]);
+            }
             writer.add_document(doc).unwrap();
         }
     };
@@ -1399,8 +1431,7 @@ async fn test_merge_and_reorder_keep_binary_ann_runs_compact() {
     writer.build_vector_index().await.unwrap();
     add_batch(&mut writer, 100);
     writer.commit().await.unwrap();
-    // Merge the two ANN-bearing segments: byte-copy would leave two extents
-    // per cluster; the merge compaction policy rewrites cluster-major.
+    // Merge preserves each source extent; directories carry the new bases.
     writer.force_merge().await.unwrap();
 
     let fragmentation_of = |segments: &[std::sync::Arc<crate::segment::SegmentReader>]| {
@@ -1411,10 +1442,16 @@ async fn test_merge_and_reorder_keep_binary_ann_runs_compact() {
             .fold(0.0f64, f64::max)
     };
     let index = Index::open(dir.clone(), config.clone()).await.unwrap();
-    let before = fragmentation_of(&index.segment_readers().await.unwrap());
+    let old_segments = index.segment_readers().await.unwrap();
+    let old_exact = old_segments[0].flat_vectors().get(&bvec.0).unwrap();
+    let old_codes = old_exact
+        .read_vectors_batch(0, old_exact.num_vectors)
+        .await
+        .unwrap();
+    let before = fragmentation_of(&old_segments);
     assert!(
-        (before - 1.0).abs() < 1e-9,
-        "every binary merge must compact to one extent per cluster, got {before}"
+        before > 1.0,
+        "copy merge must retain source extents, got {before}"
     );
     let needle = vec![0x0f_u8 | 0x01; byte_len];
     let reader = index.reader().await.unwrap();
@@ -1425,16 +1462,59 @@ async fn test_merge_and_reorder_keep_binary_ann_runs_compact() {
         .unwrap();
     drop(searcher);
 
-    // The external reorder API: BP-reorders the sparse field; the binary ANN
-    // payload is already compact and must stay that way.
+    // The external reorder API coalesces binary runs alongside sparse BP.
+    writer.reorder().await.unwrap();
+    // A second pass must retain the already contiguous vector file verbatim.
+    let first_pass = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let first_segments = first_pass.segment_readers().await.unwrap();
+    let vector_file = crate::segment::SegmentFiles::new(first_segments[0].meta().id).vectors;
+    let first_bytes = dir
+        .open_read(&vector_file)
+        .await
+        .unwrap()
+        .read_bytes()
+        .await
+        .unwrap();
     writer.reorder().await.unwrap();
     drop(writer);
 
-    let index = Index::open(dir, config).await.unwrap();
-    let after = fragmentation_of(&index.segment_readers().await.unwrap());
+    let index = Index::open(dir.clone(), config).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    let after = fragmentation_of(&segments);
+    let exact = segments[0].flat_vectors().get(&bvec.0).unwrap();
+    assert_eq!(
+        old_codes.as_slice(),
+        exact
+            .read_vectors_batch(0, exact.num_vectors)
+            .await
+            .unwrap()
+            .as_slice()
+    );
+    assert_eq!(
+        old_codes.as_slice(),
+        old_exact
+            .read_vectors_batch(0, old_exact.num_vectors)
+            .await
+            .unwrap()
+            .as_slice()
+    );
+    for row in 0..exact.num_vectors {
+        assert_eq!(old_exact.get_doc_id(row), exact.get_doc_id(row));
+    }
+    let vector_file = crate::segment::SegmentFiles::new(segments[0].meta().id).vectors;
+    assert_eq!(
+        first_bytes.as_slice(),
+        dir.open_read(&vector_file)
+            .await
+            .unwrap()
+            .read_bytes()
+            .await
+            .unwrap()
+            .as_slice()
+    );
     assert!(
         (after - 1.0).abs() < 1e-9,
-        "reorder must keep ANN runs at one extent per cluster, got {after}"
+        "reorder must coalesce ANN runs: {before} -> {after}"
     );
     let reader = index.reader().await.unwrap();
     let searcher = reader.searcher().await.unwrap();
@@ -2485,4 +2565,220 @@ async fn test_dense_query_on_binary_field_errors_instead_of_empty() {
         message.contains("dense_vector") || message.contains("BinaryDenseVectorQuery"),
         "error must name the capability mismatch, got: {message}"
     );
+}
+
+#[tokio::test]
+async fn binary_ann_stores_exact_codes_once_after_training() {
+    use crate::directories::Directory;
+    use crate::dsl::BinaryDenseVectorConfig;
+    let mut schema = SchemaBuilder::default();
+    let field = schema.add_binary_dense_vector_field_with_config(
+        "bits",
+        true,
+        true,
+        BinaryDenseVectorConfig::new(256).with_ivf(Some(4), 4),
+    );
+    let dir = RamDirectory::new();
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    for i in 0..128u8 {
+        let mut doc = Document::new();
+        doc.add_binary_dense_vector(field, vec![i; 32]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.build_vector_index().await.unwrap();
+    let index = Index::open(dir.clone(), config).await.unwrap();
+    for segment in index.segment_readers().await.unwrap() {
+        let files = crate::segment::SegmentFiles::new(segment.meta().id);
+        let handle = dir.open_lazy(&files.vectors).await.unwrap();
+        let bytes = handle.read_bytes_range(0..handle.len()).await.unwrap();
+        let end = bytes.len() - 16;
+        let offset = u64::from_le_bytes(bytes[end..end + 8].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(bytes[end + 8..end + 12].try_into().unwrap());
+        let entries = crate::segment::format::read_dense_toc(&bytes[offset..end], count).unwrap();
+        assert!(
+            entries.iter().any(|entry| entry.index_type == 11),
+            "binary ANN must include an exact-code lookup"
+        );
+        assert!(
+            !entries.iter().any(|entry| entry.index_type == 4),
+            "binary ANN must not duplicate exact codes in flat storage"
+        );
+    }
+}
+
+async fn binary_single_copy_lifecycle() {
+    use crate::dsl::BinaryDenseVectorConfig;
+    use crate::dsl::VectorIndexAlter;
+    use crate::query::{BinaryDenseVectorQuery, MultiValueCombiner};
+
+    let mut schema = SchemaBuilder::default();
+    let id = schema.add_text_field("id", true, true);
+    schema.set_primary_key(id);
+    let config = BinaryDenseVectorConfig::new(256).with_ivf(Some(4), 4);
+    // No stored-field copy: hydration must use the exact-vector owner.
+    let field =
+        schema.add_binary_dense_vector_field_with_config("bits", true, false, config.clone());
+    schema.set_multi(field, true);
+    let index = Index::create(
+        RamDirectory::new(),
+        schema.build(),
+        IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            num_indexing_threads: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+    writer.init_primary_key_dedup().await.unwrap();
+    for doc_id in 0..128u8 {
+        let mut doc = Document::new();
+        doc.add_text(id, doc_id.to_string());
+        if !doc_id.is_multiple_of(7) {
+            doc.add_binary_dense_vector(field, vec![doc_id; 32]);
+            doc.add_binary_dense_vector(field, vec![!doc_id; 32]);
+        }
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let retained = index.segment_readers().await.unwrap();
+    let original = retained[0].flat_vectors()[&field.0]
+        .read_vectors_batch(0, 218)
+        .await
+        .unwrap();
+    let mut retained_ann = None;
+    for stage in 0..5 {
+        match stage {
+            0 => {
+                writer.build_vector_index().await.unwrap();
+            }
+            1 => {
+                writer.retrain_vector_index().await.unwrap();
+            }
+            2 => {
+                // Existing ALTER semantics defer to flat storage when the
+                // requested ANN geometry needs more training rows.
+                let flat = BinaryDenseVectorConfig::new(256).with_target_vectors(1_000_000_000);
+                writer
+                    .alter_vector_index(field, VectorIndexAlter::Binary(flat))
+                    .await
+                    .unwrap();
+            }
+            3 => {
+                writer
+                    .alter_vector_index(field, VectorIndexAlter::Binary(config.clone()))
+                    .await
+                    .unwrap();
+            }
+            4 => {
+                for doc_id in (0..128u32).step_by(3) {
+                    writer.delete_primary_key(&doc_id.to_string()).unwrap();
+                }
+                writer.commit().await.unwrap();
+                writer.compact(16 * 1024 * 1024).await.unwrap();
+            }
+            _ => unreachable!(),
+        }
+        index.reader().await.unwrap().reload().await.unwrap();
+        let segments = index.segment_readers().await.unwrap();
+        if stage == 0 {
+            retained_ann = Some(segments[0].clone());
+        }
+        for segment in &segments {
+            let exact = &segment.flat_vectors()[&field.0];
+            assert_eq!(exact.is_ann_backed(), stage != 2, "stage {stage}");
+            for row in 0..exact.num_vectors {
+                let (doc_id, ordinal) = exact.get_doc_id(row);
+                let doc = segment.doc(doc_id).await.unwrap().unwrap();
+                let value: u8 = doc
+                    .get_first(id)
+                    .unwrap()
+                    .as_text()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let expected = if ordinal == 0 { value } else { !value };
+                assert_eq!(
+                    exact.read_vectors_batch(row, 1).await.unwrap().as_slice(),
+                    vec![expected; 32]
+                );
+            }
+        }
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        for combiner in [
+            MultiValueCombiner::Max,
+            MultiValueCombiner::Sum,
+            MultiValueCombiner::Avg,
+            MultiValueCombiner::LogSumExp { temperature: 1.5 },
+            MultiValueCombiner::WeightedTopK { k: 2, decay: 0.7 },
+        ] {
+            let hits = searcher
+                .search(
+                    &BinaryDenseVectorQuery::new(field, vec![0; 32]).with_combiner(combiner),
+                    128,
+                )
+                .await
+                .unwrap();
+            let expected_count = (0..128u8)
+                .filter(|doc| !doc.is_multiple_of(7) && (stage != 4 || !doc.is_multiple_of(3)))
+                .count();
+            assert_eq!(hits.len(), expected_count, "stage {stage}, {combiner:?}");
+            for hit in hits {
+                let doc = searcher
+                    .doc(hit.segment_id, hit.doc_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let value: u8 = doc
+                    .get_first(id)
+                    .unwrap()
+                    .as_text()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                let score = 1.0 - value.count_ones() as f32 / 8.0;
+                let expected = combiner.combine(&[(0, score), (1, 1.0 - score)]);
+                assert!(
+                    (hit.score - expected).abs() < 1e-6,
+                    "stage {stage}: {} != {expected}",
+                    hit.score
+                );
+            }
+        }
+        assert_eq!(
+            retained_ann.as_ref().unwrap().flat_vectors()[&field.0]
+                .read_vectors_batch(0, 218)
+                .await
+                .unwrap()
+                .as_slice(),
+            original.as_slice()
+        );
+        assert_eq!(
+            retained[0].flat_vectors()[&field.0]
+                .read_vectors_batch(0, 218)
+                .await
+                .unwrap()
+                .as_slice(),
+            original.as_slice()
+        );
+    }
+}
+
+#[tokio::test]
+async fn binary_single_copy_preserves_alter_retrain_compaction_and_all_combiners_async() {
+    binary_single_copy_lifecycle().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binary_single_copy_preserves_alter_retrain_compaction_and_all_combiners_sync() {
+    binary_single_copy_lifecycle().await;
 }

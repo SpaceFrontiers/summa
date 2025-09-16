@@ -10,15 +10,19 @@ directory. Package READMEs below document each executable or library.
 ## Search engineering and performance
 
 - [Search system engineering contract](search-system-contract.md)
+- [Lucene 11 performance research](lucene-11-performance-research.md): pinned source findings and Hermes experiments.
 
 ## Schema, text search, and query behavior
 
 - [Hermes Schema Definition Language (SDL)](schema.md)
+- [Query language](query-language.md): required/prohibited clauses, precedence, and strict parsing.
 - [Dynamic per-document stemming and wire-level phrase queries](dynamic-tokenizer-and-phrase.md)
 - [Chunked text fields: BM25 over passages with ordinals](chunked-text-fields.md)
 - [BM25 over equal-length chunks](chunked-bm25.md)
 - [Lexical vertical: positions, pruning, reordering, tokenization](lexical-vertical.md)
 - [Posting block codecs](posting-codecs.md)
+- [Compact text storage and quantized norms](compact-text-format.md): versioned opt-in formats, normalization and compatibility.
+- [MaxScore text reordering: design and implementation status](maxscore-text-reordering.md)
 - [Hermes Web UX Configuration DSL](ux-config.md)
 
 ## Storage, operations, and distributed search
@@ -30,6 +34,8 @@ directory. Package READMEs below document each executable or library.
 - [Index diagnostics](diagnostics.md)
 - [Prometheus Metrics](metrics.md)
 - [Document store v3](document-store-v3.md)
+- [Owned byte views and their safety contract](owned-byte-views.md)
+- [Posting block execution and Tantivy comparison](search-block-execution.md)
 - [Hot-Metadata Pinning (meta/data residency split)](hot-metadata-pinning.md)
 - [Cold IO for merges (hot-metadata-pinning Phase 2)](cold-io.md)
 - [Merge-Time BP Reordering](merge-time-reorder.md)
@@ -39,9 +45,12 @@ directory. Package READMEs below document each executable or library.
 ## Vector retrieval and compression
 
 - [Streaming ScaNN index](scann-streaming-index.md)
+- [Single-copy binary ANN storage and streaming merge](binary-vector-storage.md)
 - [FastScan layout v2 for float ScaNN leaves](fast-scan-layout-v2.md)
 - [TurboQuant (TQ) — training-free dense ANN codec](turboquant-quantization.md)
 - [Unified Dense IVF Architecture](unified-vector-quantization.md)
+- [Seismic sparse indexing](seismic-sparse-index.md) — optional third sparse algorithm alongside default BMP and MaxScore; exact values, copy merges and bounded maintenance.
+- [Compact Seismic summaries](seismic-compact-summaries.md) — measured lossless directory compression, memory/latency tradeoffs and deferred locality experiments.
 - [Forward values in BMP search passes: research and experiment](bmp-forward-search.md)
 - [BMP forward values and format compatibility](bmp-forward-index.md)
 - [BMP LSP/0 and Maximum-Grid Compression](bmp-grid-compression.md)
@@ -84,6 +93,13 @@ directory. Package READMEs below document each executable or library.
 - [hermes-web](../hermes-web/README.md)
 
 ## Keeping documentation current
+
+- [Text index formats and memory comparison](text-format-comparison.md)
+
+- [Query work diagnostics](query-work-diagnostics.md): separate traversal volume from per-unit cost.
+- [Pruning and scoring setup fixes](search-pruning-fixes.md): count-aware norm setup, prepared bounds and packed decoding.
+
+
 
 ## Additional guides
 

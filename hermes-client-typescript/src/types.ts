@@ -149,8 +149,10 @@ export interface SparseVectorQuery {
   /** Raw text (tokenized server-side if tokenizer configured) */
   text?: string;
   combiner?: Combiner;
-  /** Approximate search factor (1.0 = exact, 0.8 = ~20% faster) */
+  /** BMP/MaxScore pruning factor (0 = schema default, 1 = exact). */
   heapFactor?: number;
+  /** BMP superblock cap; unset is depth-derived, zero is exhaustive. */
+  lspGamma?: number;
   /** Temperature for LogSumExp combiner (default: 1.5) */
   combinerTemperature?: number;
   /** K for WeightedTopK combiner (default: 5) */
@@ -163,8 +165,10 @@ export interface SparseVectorQuery {
   maxQueryDims?: number;
   /** Fraction of query dims to keep (0-1, e.g. 0.1 = top 10%) */
   pruning?: number;
-  /** LSP/0 gamma (unset = depth-derived, 0 = exhaustive) */
-  lspGamma?: number;
+  /** Query dimensions used for Seismic nomination (1..64). */
+  seismicCut?: number;
+  seismicFactor?: number;
+  exhaustive?: boolean;
 }
 
 export interface DenseVectorQuery {

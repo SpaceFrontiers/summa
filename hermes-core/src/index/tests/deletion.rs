@@ -258,7 +258,7 @@ async fn automatic_compaction_obeys_ratio_and_shared_maintenance_capacity() {
 }
 
 #[tokio::test]
-async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claiming_convergence() {
+async fn compaction_keeps_sparse_ordinals_visibility_and_independent_maintenance_history() {
     let mut schema = SchemaBuilder::default();
     let id = schema.add_text_field("id", true, true);
     schema.set_primary_key(id);
@@ -267,14 +267,12 @@ async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claimi
         true,
         false,
         crate::structures::SparseVectorConfig {
-            format: crate::structures::SparseFormat::Bmp,
-            bmp_block_size: 32,
+            format: crate::structures::SparseFormat::Seismic,
             dims: Some(64),
             ..Default::default()
         },
     );
     schema.set_multi(sparse, true);
-    schema.set_reorder(sparse, true);
     let index = Index::create(
         RamDirectory::new(),
         schema.build(),
@@ -296,28 +294,6 @@ async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claimi
     }
     writer.commit().await.unwrap();
     writer.reorder().await.unwrap();
-    // Start with interrupted BP debt so compaction must retain the attempt
-    // count and preserve its actual current virtual order.
-    let source = writer.segment_manager().get_segment_ids().await[0].clone();
-    writer
-        .segment_manager()
-        .reorder_single_segment(
-            &source,
-            None,
-            crate::segment::BpBudget {
-                time_budget: Some(std::time::Duration::ZERO),
-                ..crate::segment::BpBudget::full()
-            },
-        )
-        .await
-        .unwrap();
-    let before_info = writer
-        .segment_manager()
-        .read_metadata(|m| m.segment_metas.values().next().unwrap().clone())
-        .await;
-    assert!(before_info.reordered);
-    assert!(!before_info.bp_converged);
-    assert_eq!(before_info.bp_unconverged_passes, 1);
     for i in (0..131).step_by(3) {
         writer.delete_primary_key(&i.to_string()).unwrap();
     }
@@ -347,14 +323,17 @@ async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claimi
         before_info.deletions, mask,
         "field reorder must retain the exact row visibility generation"
     );
-    assert_eq!(before_info.bp_unconverged_passes, 2);
+    assert_eq!(before_info.bp_unconverged_passes, 0);
     let reader = index.reader().await.unwrap();
     reader.reload().await.unwrap();
     let before = reader.searcher().await.unwrap();
     let segment = &before.segment_readers()[0];
-    let bmp = &segment.bmp_indexes()[&sparse.0];
-    let expected: Vec<_> = (0..bmp.num_virtual_docs)
-        .map(|v| bmp.virtual_to_doc(v))
+    let seismic = segment.seismic_index(sparse).unwrap();
+    let expected: Vec<_> = (0..seismic.len())
+        .map(|row| {
+            let key = seismic.key(row);
+            (key.doc, key.ordinal)
+        })
         .filter(|(doc, _)| *doc != u32::MAX && segment.is_alive(*doc))
         .map(|(doc, ordinal)| {
             (
@@ -372,9 +351,12 @@ async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claimi
     reader.reload().await.unwrap();
     let after = reader.searcher().await.unwrap();
     let segment = &after.segment_readers()[0];
-    let bmp = &segment.bmp_indexes()[&sparse.0];
-    let actual: Vec<_> = (0..bmp.num_virtual_docs)
-        .map(|v| bmp.virtual_to_doc(v))
+    let seismic = segment.seismic_index(sparse).unwrap();
+    let actual: Vec<_> = (0..seismic.len())
+        .map(|row| {
+            let key = seismic.key(row);
+            (key.doc, key.ordinal)
+        })
         .filter(|(doc, _)| *doc != u32::MAX)
         .map(|(doc, ordinal)| {
             (
@@ -394,7 +376,7 @@ async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claimi
         .read_metadata(|m| m.segment_metas.values().next().unwrap().clone())
         .await;
     assert!(after_info.reordered);
-    assert!(!after_info.bp_converged);
+    assert!(after_info.bp_converged);
     assert_eq!(
         after_info.bp_unconverged_passes,
         before_info.bp_unconverged_passes
@@ -416,8 +398,8 @@ async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claimi
         .await;
     assert!(filtered.reordered);
     assert!(
-        !filtered.bp_converged,
-        "filtering changes converged BMP blocks"
+        filtered.bp_converged,
+        "sparse compaction does not create text BP debt"
     );
     assert_eq!(
         filtered.bp_unconverged_passes, 0,
@@ -814,7 +796,11 @@ async fn deleted_dense_neighbours_do_not_consume_top_k_slots() {
 async fn compaction_preserves_chunk_ordinals_positions_and_sparse_vector_scores() {
     use crate::query::{MultiValueCombiner, SparseVectorQuery, TermQuery};
     use crate::structures::{SparseFormat, SparseVectorConfig, WeightQuantization};
-    for format in [SparseFormat::Bmp, SparseFormat::MaxScore] {
+    for format in [
+        SparseFormat::Bmp,
+        SparseFormat::MaxScore,
+        SparseFormat::Seismic,
+    ] {
         let mut schema = SchemaBuilder::default();
         let id = schema.add_text_field("id", true, true);
         schema.set_fast(id, true);
@@ -829,7 +815,6 @@ async fn compaction_preserves_chunk_ordinals_positions_and_sparse_vector_scores(
             SparseVectorConfig {
                 format,
                 weight_quantization: WeightQuantization::UInt8,
-                bmp_block_size: 64,
                 dims: Some(128),
                 ..Default::default()
             },
@@ -869,7 +854,7 @@ async fn compaction_preserves_chunk_ordinals_positions_and_sparse_vector_scores(
         let before = reader.searcher().await.unwrap();
         let query = SparseVectorQuery::new(sparse, vec![(1, 1.0), (2, 0.5)])
             .with_combiner(MultiValueCombiner::Sum)
-            .with_lsp_gamma(0);
+            .with_exhaustive(true);
         let reference = before.search(&query, 200).await.unwrap();
         assert_eq!(reference.len(), 43, "{format:?}");
         let mut expected = std::collections::BTreeMap::new();
@@ -934,6 +919,174 @@ async fn compaction_preserves_chunk_ordinals_positions_and_sparse_vector_scores(
 }
 
 #[tokio::test]
+async fn compaction_keeps_bmp_record_order_and_reordering_history_without_claiming_convergence() {
+    let mut schema = SchemaBuilder::default();
+    let id = schema.add_text_field("id", true, true);
+    schema.set_primary_key(id);
+    let sparse = schema.add_sparse_vector_field_with_config(
+        "v",
+        true,
+        false,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::Bmp,
+            bmp_block_size: 32,
+            dims: Some(64),
+            ..Default::default()
+        },
+    );
+    schema.set_multi(sparse, true);
+    schema.set_reorder(sparse, true);
+    let index = Index::create(
+        RamDirectory::new(),
+        schema.build(),
+        IndexConfig {
+            merge_policy: Box::new(crate::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+    writer.init_primary_key_dedup().await.unwrap();
+    for i in 0..131 {
+        let mut doc = Document::new();
+        doc.add_text(id, i.to_string());
+        doc.add_sparse_vector(sparse, vec![(i % 8, 1.0), (20, 0.5)]);
+        doc.add_sparse_vector(sparse, vec![(8 + i % 8, 1.5), (21, 0.25)]);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.reorder().await.unwrap();
+    // Start with interrupted BP debt so compaction must retain the attempt
+    // count and preserve its actual current virtual order.
+    let source = writer.segment_manager().get_segment_ids().await[0].clone();
+    writer
+        .segment_manager()
+        .reorder_single_segment(
+            &source,
+            None,
+            crate::segment::BpBudget {
+                time_budget: Some(std::time::Duration::ZERO),
+                ..crate::segment::BpBudget::full()
+            },
+        )
+        .await
+        .unwrap();
+    let before_info = writer
+        .segment_manager()
+        .read_metadata(|m| m.segment_metas.values().next().unwrap().clone())
+        .await;
+    assert!(before_info.reordered);
+    assert!(!before_info.bp_converged);
+    assert_eq!(before_info.bp_unconverged_passes, 1);
+    for i in (0..131).step_by(3) {
+        writer.delete_primary_key(&i.to_string()).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let mask = writer
+        .segment_manager()
+        .read_metadata(|m| m.segment_metas.values().next().unwrap().deletions.clone())
+        .await;
+    let source = writer.segment_manager().get_segment_ids().await[0].clone();
+    writer
+        .segment_manager()
+        .reorder_single_segment(
+            &source,
+            None,
+            crate::segment::BpBudget {
+                time_budget: Some(std::time::Duration::ZERO),
+                ..crate::segment::BpBudget::full()
+            },
+        )
+        .await
+        .unwrap();
+    let before_info = writer
+        .segment_manager()
+        .read_metadata(|m| m.segment_metas.values().next().unwrap().clone())
+        .await;
+    assert_eq!(
+        before_info.deletions, mask,
+        "field reorder must retain the exact row visibility generation"
+    );
+    assert_eq!(before_info.bp_unconverged_passes, 2);
+    let reader = index.reader().await.unwrap();
+    reader.reload().await.unwrap();
+    let before = reader.searcher().await.unwrap();
+    let segment = &before.segment_readers()[0];
+    let bmp = &segment.bmp_indexes()[&sparse.0];
+    let expected: Vec<_> = (0..bmp.num_virtual_docs)
+        .map(|v| bmp.virtual_to_doc(v))
+        .filter(|(doc, _)| *doc != u32::MAX && segment.is_alive(*doc))
+        .map(|(doc, ordinal)| {
+            (
+                segment
+                    .fast_field(id.0)
+                    .unwrap()
+                    .get_text(doc)
+                    .unwrap()
+                    .to_owned(),
+                ordinal,
+            )
+        })
+        .collect();
+    writer.compact(32 * 1024 * 1024).await.unwrap();
+    reader.reload().await.unwrap();
+    let after = reader.searcher().await.unwrap();
+    let segment = &after.segment_readers()[0];
+    let bmp = &segment.bmp_indexes()[&sparse.0];
+    let actual: Vec<_> = (0..bmp.num_virtual_docs)
+        .map(|v| bmp.virtual_to_doc(v))
+        .filter(|(doc, _)| *doc != u32::MAX)
+        .map(|(doc, ordinal)| {
+            (
+                segment
+                    .fast_field(id.0)
+                    .unwrap()
+                    .get_text(doc)
+                    .unwrap()
+                    .to_owned(),
+                ordinal,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected);
+    let after_info = writer
+        .segment_manager()
+        .read_metadata(|m| m.segment_metas.values().next().unwrap().clone())
+        .await;
+    assert!(after_info.reordered);
+    assert!(!after_info.bp_converged);
+    assert_eq!(
+        after_info.bp_unconverged_passes,
+        before_info.bp_unconverged_passes
+    );
+    writer.reorder().await.unwrap();
+    let converged = writer
+        .segment_manager()
+        .read_metadata(|m| m.segment_metas.values().next().unwrap().clone())
+        .await;
+    assert!(converged.reordered && converged.bp_converged);
+    assert_eq!(converged.bp_unconverged_passes, 0);
+    assert_eq!(converged.num_deleted_docs(), 0);
+    writer.delete_primary_key("1").unwrap();
+    writer.commit().await.unwrap();
+    writer.compact(32 * 1024 * 1024).await.unwrap();
+    let filtered = writer
+        .segment_manager()
+        .read_metadata(|m| m.segment_metas.values().next().unwrap().clone())
+        .await;
+    assert!(filtered.reordered);
+    assert!(
+        !filtered.bp_converged,
+        "filtering changes converged BMP blocks"
+    );
+    assert_eq!(
+        filtered.bp_unconverged_passes, 0,
+        "compaction is not a BP attempt"
+    );
+}
+
+#[tokio::test]
 async fn deletion_reload_shares_payloads_and_preserves_old_text_and_ann_visibility() {
     use crate::directories::{Directory, DirectoryWriter};
     use crate::dsl::{DenseVectorConfig, VectorIndexType};
@@ -972,6 +1125,16 @@ async fn deletion_reload_shares_payloads_and_preserves_old_text_and_ann_visibili
             ..Default::default()
         },
     );
+    let seismic = schema.add_sparse_vector_field_with_config(
+        "seismic",
+        true,
+        false,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::Seismic,
+            dims: Some(32),
+            ..Default::default()
+        },
+    );
     let index = Index::create(
         dir.clone(),
         schema.build(),
@@ -990,6 +1153,7 @@ async fn deletion_reload_shares_payloads_and_preserves_old_text_and_ann_visibili
         doc.add_text(body, "present");
         doc.add_dense_vector(dense, vec![1.0 + row as f32; 8]);
         doc.add_sparse_vector(sparse, vec![(row % 32, 1.0)]);
+        doc.add_sparse_vector(seismic, vec![(1, 1.0 + row as f32)]);
         writer.add_document(doc).unwrap();
     }
     writer.commit().await.unwrap();
@@ -1059,6 +1223,20 @@ async fn deletion_reload_shares_payloads_and_preserves_old_text_and_ann_visibili
                 .len(),
             count
         );
+        let seismic_query = crate::query::SparseVectorQuery::new(seismic, vec![(1, 1.0)]);
+        let seismic_hits = snapshot.search(&seismic_query, 100).await.unwrap();
+        let async_seismic_hits = crate::query::search_segment_with_count(
+            &snapshot.segment_readers()[0],
+            &seismic_query,
+            100,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(seismic_hits.len(), count);
+        assert_eq!(async_seismic_hits.len(), count);
+        assert_eq!(seismic_hits[0].doc_id, 64);
+        assert_eq!(seismic_hits[0].score, 65.0);
         let query = DenseVectorQuery::new(dense, vec![1.0; 8]);
         let hits = snapshot.search(&query, 100).await.unwrap();
         assert_eq!(hits.len(), count);

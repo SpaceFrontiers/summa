@@ -13,10 +13,9 @@ pub(crate) mod bmp_forward;
 pub(crate) mod bmp_grid;
 #[cfg(any(feature = "native", feature = "wasm"))]
 mod builder;
-#[cfg(all(test, feature = "native"))]
-pub(crate) use builder::bmp::build_bmp_blob;
 pub mod chunk_map;
 pub(crate) mod deletion;
+pub(crate) mod norms;
 pub use deletion::DeletionMeta;
 pub(crate) mod format;
 pub(crate) mod logical_address;
@@ -27,6 +26,9 @@ pub(crate) mod reader;
 pub(crate) mod reorder;
 #[cfg(feature = "native")]
 pub(crate) mod row_map;
+pub(crate) mod seismic;
+#[cfg(any(feature = "native", feature = "wasm"))]
+mod sparse_partitions;
 mod store;
 #[cfg(feature = "native")]
 pub(crate) mod text_reorder;
@@ -34,6 +36,7 @@ pub(crate) mod text_reorder;
 mod tracker;
 mod types;
 mod vector_data;
+mod vector_locations;
 
 #[cfg(test)]
 pub(crate) use builder::graph_bisection::build_forward_index_from_bmps;
@@ -60,7 +63,7 @@ pub use store::*;
 #[cfg(feature = "native")]
 pub use tracker::{PublishedIndexGeneration, SegmentSnapshot, SegmentTracker};
 pub use types::{
-    FieldStats, ScannTrainedArtifactBytes, SegmentFiles, SegmentId, SegmentMeta,
+    FieldStats, ScannTrainedArtifactBytes, SegmentFiles, SegmentId, SegmentMeta, SeismicStats,
     TrainedVectorStructures,
 };
 pub use vector_data::{FlatVectorData, LazyFlatVectorData, dequantize_raw};

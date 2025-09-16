@@ -235,3 +235,40 @@ refresh even after client cancellation. CLI row-mutation and merge commands stop
 workers, release writer snapshots, and await core cleanup before exiting their
 runtime, on both successful and failed maintenance. See
 [row deletion](row-deletion.md) for the API and ordering rules.
+
+## Background maintenance eligibility
+
+The background optimizer must consider binary IVF/ScaNN fields independently of
+the `reorder` schema attribute. Their ordinary merges preserve encoded runs, and
+standalone maintenance coalesces those runs through the existing dense writer.
+The same optimizer slots, source/output claims, replacement publication and
+reader retirement apply; no separate ANN scheduler is introduced. BP-specific
+`has_reorder_fields` remains a schema query for BP, while background maintenance
+eligibility also includes fields that accumulate encoded-run fragmentation.
+
+Seismic maintenance records pending nomination terms, successful partial passes,
+and consecutive no-progress passes separately from BP convergence. Publication
+reads the output's debt before committing: lower debt resets the stall counter;
+unchanged debt increments it. Failed or cancelled publication changes no counter.
+Copy merges with new inputs reset stale stall history; unchanged single-source
+replacement preserves it. Follow-ups use the existing cooldown/concurrency gates
+and limit consecutive stalls, allowing productive work beyond the total-pass
+threshold. Seismic debt is not hidden by an exhausted BMP scheduling limit.
+Zero debt clears the Seismic counters. Normal merge copies encoded runs.
+
+Candidate selection reads persisted debt only: binary ANN fragmentation and
+Seismic pending terms. Fresh vector-only segments with no debt do not publish
+a replacement merely because their schema supports maintenance. Text fields
+that request BP retain their first-pass scheduling. Coalesced ANN outputs clear
+the fragmentation bit during the same validated replacement transaction.
+
+### Automatic maintenance without redundant BP
+
+`optimize_single_segment` and explicit `reorder_single_segment` share one claimed
+replacement implementation. Automatic work derives BP eligibility from the
+claimed source metadata: initial BP work or unconverged BP below its existing
+pass limit runs; already completed/capped BP is retained. A maintenance-only
+replacement preserves BP flags and counters while publishing ANN/Seismic debt
+and a new generation. Text/BMP files use the same immutable clone path; explicit
+manual reorder still requests its usual full field work. This prevents productive
+Seismic follow-ups from repeatedly reordering unrelated completed fields.

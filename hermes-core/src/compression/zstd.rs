@@ -170,23 +170,48 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     })
 }
 
+/// The stable first-frame size is a capacity hint, not validation. A stream
+/// can contain more frames, so a short bulk attempt still needs the bounded
+/// streaming fallback. Unknown sizes never reserve the entire safety limit.
+fn limited_bulk_capacity(data: &[u8], max_output: usize) -> io::Result<usize> {
+    match zstd::zstd_safe::get_frame_content_size(data) {
+        Ok(Some(size)) => {
+            let size = usize::try_from(size).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decompressed size exceeds address space",
+                )
+            })?;
+            if size > max_output {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "decompressed data exceeds configured limit",
+                ));
+            }
+            Ok(size)
+        }
+        // Let the actual decoder report malformed/truncated input. Empty and
+        // size-less streams retain their existing library-defined semantics.
+        Ok(None) | Err(_) => Ok(max_output.min(DECOMPRESS_CAPACITY)),
+    }
+}
+
 /// Decompress while rejecting output larger than `max_output` bytes.
 ///
 /// Index files are trusted only after validation. Using an explicit bound at
 /// compressed block boundaries prevents a tiny corrupt frame from expanding
 /// until the process runs out of memory.
 pub fn decompress_limited(data: &[u8], max_output: usize) -> io::Result<Vec<u8>> {
+    let capacity = limited_bulk_capacity(data, max_output)?;
     thread_local! {
         static DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> =
             std::cell::RefCell::new(zstd::bulk::Decompressor::new().unwrap());
     }
     DECOMPRESSOR.with(|dc| {
-        dc.borrow_mut()
-            .decompress(data, limited_capacity(data, max_output))
-            .or_else(|_| {
-                let decoder = zstd::Decoder::new(data)?;
-                read_limited(decoder, max_output)
-            })
+        dc.borrow_mut().decompress(data, capacity).or_else(|_| {
+            let decoder = zstd::Decoder::new(data)?;
+            read_limited(decoder, max_output)
+        })
     })
 }
 
@@ -232,6 +257,7 @@ pub fn decompress_with_dict_limited(
     dict: &CompressionDict,
     max_output: usize,
 ) -> io::Result<Vec<u8>> {
+    let capacity = limited_bulk_capacity(data, max_output)?;
     thread_local! {
         static DICT_DC: std::cell::RefCell<Option<(u64, zstd::bulk::Decompressor<'static>)>> =
             const { std::cell::RefCell::new(None) };
@@ -248,24 +274,12 @@ pub fn decompress_with_dict_limited(
         slot.as_mut()
             .unwrap()
             .1
-            .decompress(data, limited_capacity(data, max_output))
+            .decompress(data, capacity)
             .or_else(|_| {
                 let decoder = zstd::Decoder::with_dictionary(data, dict.as_bytes())?;
                 read_limited(decoder, max_output)
             })
     })
-}
-
-// zstd::bulk::Decompressor reserves the requested capacity when its optional
-// experimental upper-bound feature is disabled. The safety limit is not a
-// capacity hint: retaining 256 MiB for a 16 KiB block also defeats store caching.
-fn limited_capacity(data: &[u8], max_output: usize) -> usize {
-    zstd::zstd_safe::get_frame_content_size(data)
-        .ok()
-        .flatten()
-        .and_then(|size| usize::try_from(size).ok())
-        .unwrap_or(DECOMPRESS_CAPACITY)
-        .min(max_output)
 }
 
 fn read_limited(mut reader: impl Read, max_output: usize) -> io::Result<Vec<u8>> {
@@ -368,6 +382,35 @@ mod tests {
     }
 
     #[test]
+    fn test_limited_dictionary_decompression_rejects_oversized_output() {
+        let dict = CompressionDict::from_bytes(b"seven seven seven ".repeat(64));
+        let data = b"seven ".repeat(1024);
+        let compressed = compress_with_dict(&data, CompressionLevel::default(), &dict).unwrap();
+        // Known content size: rejected before any decompression buffer grows.
+        assert!(decompress_with_dict_limited(&compressed, &dict, 1024).is_err());
+        assert!(decompress_with_dict_limited(&compressed, &dict, data.len() - 1).is_err());
+        assert_eq!(
+            decompress_with_dict_limited(&compressed, &dict, data.len()).unwrap(),
+            data
+        );
+        // Unknown content size: the streaming fallback enforces the same cap.
+        let mut encoder = zstd::Encoder::with_dictionary(Vec::new(), 3, dict.as_bytes()).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        std::io::Write::write_all(&mut encoder, &data).unwrap();
+        let unknown = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&unknown).unwrap(),
+            None
+        );
+        assert!(decompress_with_dict_limited(&unknown, &dict, 1024).is_err());
+        assert!(decompress_with_dict_limited(&unknown, &dict, data.len() - 1).is_err());
+        assert_eq!(
+            decompress_with_dict_limited(&unknown, &dict, data.len()).unwrap(),
+            data
+        );
+    }
+
+    #[test]
     fn test_dictionary_cache_identity_is_stable_and_unique() {
         let first = CompressionDict::from_bytes(b"first dictionary material".repeat(16));
         let first_clone = first.clone();
@@ -383,6 +426,150 @@ mod tests {
                 decompress_with_dict_limited(&compressed, dict, payload.len()).unwrap(),
                 payload
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod bounded_capacity_tests {
+    use super::*;
+
+    #[test]
+    fn small_bounded_zstd_frames_do_not_reserve_the_entire_safety_limit() {
+        let payload = b"small independently compressed dictionary block".repeat(20);
+        let encoded = compress(&payload, CompressionLevel::BETTER).unwrap();
+        let decoded = decompress_limited(&encoded, 64 * 1024 * 1024).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(
+            decoded.capacity() <= 4096,
+            "capacity={}",
+            decoded.capacity()
+        );
+    }
+
+    #[test]
+    fn small_dictionary_frames_do_not_reserve_the_entire_safety_limit() {
+        let dict = CompressionDict::from_bytes(b"dictionary material for small blocks".repeat(20));
+        let payload = b"dictionary material for small blocks and metadata".repeat(20);
+        let encoded = compress_with_dict(&payload, CompressionLevel::BETTER, &dict).unwrap();
+        let decoded = decompress_with_dict_limited(&encoded, &dict, 64 * 1024 * 1024).unwrap();
+        assert_eq!(decoded, payload);
+        assert!(
+            decoded.capacity() <= 4096,
+            "capacity={}",
+            decoded.capacity()
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_frame_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn assert_plain_and_dictionary(encoded: &[u8], expected: &[u8], dict: &CompressionDict) {
+        assert_eq!(
+            decompress_limited(encoded, expected.len()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            decompress_with_dict_limited(encoded, dict, expected.len()).unwrap(),
+            expected
+        );
+        if !expected.is_empty() {
+            assert!(decompress_limited(encoded, expected.len() - 1).is_err());
+            assert!(decompress_with_dict_limited(encoded, dict, expected.len() - 1).is_err());
+        }
+    }
+
+    #[test]
+    fn bounded_zstd_decoding_preserves_empty_unknown_size_and_concatenated_frames() {
+        let dict = CompressionDict::from_bytes(Vec::new());
+        let empty = compress(&[], CompressionLevel::FAST).unwrap();
+        assert_plain_and_dictionary(&empty, &[], &dict);
+        let payload = vec![77u8; DECOMPRESS_CAPACITY * 2 + 17];
+        let mut encoder = zstd::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        encoder.write_all(&payload).unwrap();
+        let unknown = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&unknown).unwrap(),
+            None
+        );
+        assert_eq!(
+            limited_bulk_capacity(&unknown, 64 * 1024 * 1024).unwrap(),
+            DECOMPRESS_CAPACITY
+        );
+        assert_plain_and_dictionary(&unknown, &payload, &dict);
+        let first = compress(b"first", CompressionLevel::FAST).unwrap();
+        let second = compress(b"second", CompressionLevel::FAST).unwrap();
+        let joined = [first.as_slice(), second.as_slice()].concat();
+        assert_eq!(zstd::decode_all(joined.as_slice()).unwrap(), b"firstsecond");
+        assert_plain_and_dictionary(&joined, b"firstsecond", &dict);
+        // Skippable frame is a standard Zstd frame with an eight-byte header.
+        let skipped = [
+            0x184D2A50u32.to_le_bytes().as_slice(),
+            3u32.to_le_bytes().as_slice(),
+            b"tag",
+            second.as_slice(),
+        ]
+        .concat();
+        assert_eq!(zstd::decode_all(skipped.as_slice()).unwrap(), b"second");
+        assert_plain_and_dictionary(&skipped, b"second", &dict);
+    }
+
+    #[test]
+    fn bounded_zstd_decoding_does_not_hide_truncation_checksum_or_trailing_corruption() {
+        let payload = b"known size does not prove frame integrity".repeat(100);
+        let mut encoder = zstd::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.include_checksum(true).unwrap();
+        encoder.write_all(&payload).unwrap();
+        let good = encoder.finish().unwrap();
+        let mut bad_checksum = good.clone();
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(b"bad trailing frame");
+        for broken in [
+            &good[..good.len() - 1],
+            bad_checksum.as_slice(),
+            trailing.as_slice(),
+        ] {
+            assert!(zstd::decode_all(broken).is_err());
+            assert!(decompress_limited(broken, payload.len()).is_err());
+            let dict = CompressionDict::from_bytes(Vec::new());
+            assert!(decompress_with_dict_limited(broken, &dict, payload.len()).is_err());
+            assert_eq!(decompress_limited(&good, payload.len()).unwrap(), payload);
+            assert_eq!(
+                decompress_with_dict_limited(&good, &dict, payload.len()).unwrap(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_dictionary_decoding_preserves_concatenation_and_dictionary_switches() {
+        let first = CompressionDict::from_bytes(b"first raw dictionary contents".repeat(20));
+        let second = CompressionDict::from_bytes(b"second raw dictionary contents".repeat(20));
+        for dict in [&first, &second, &first] {
+            let a = compress_with_dict(
+                b"first raw dictionary contents",
+                CompressionLevel::FAST,
+                dict,
+            )
+            .unwrap();
+            let b = compress_with_dict(
+                b"second raw dictionary contents",
+                CompressionLevel::FAST,
+                dict,
+            )
+            .unwrap();
+            let joined = [a, b].concat();
+            let expected = b"first raw dictionary contentssecond raw dictionary contents";
+            assert_eq!(
+                decompress_with_dict_limited(&joined, dict, expected.len()).unwrap(),
+                expected
+            );
+            assert!(decompress_with_dict_limited(&joined, dict, expected.len() - 1).is_err());
         }
     }
 }

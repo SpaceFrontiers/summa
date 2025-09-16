@@ -2,7 +2,7 @@
 //!
 //! Runs as a set of tokio tasks bounded by a whole-pass semaphore. Periodically scans
 //! all indexes for segments that haven't been reordered and applies Recursive
-//! Graph Bisection (BP) to improve BMP block clustering.
+//! Graph Bisection for text, ANN run compaction, and bounded Seismic maintenance.
 //!
 //! Compaction also considers indexes without reorder fields.
 
@@ -36,14 +36,13 @@ pub struct OptimizerConfig {
     /// Depth cap for large segments: stop bisection at partitions of this
     /// many vectors. 256 is one default LSP superblock (8 × 32 vectors).
     pub partial_min_partition_docs: usize,
-    /// Minimum wait between follow-up passes on a segment whose previous
-    /// pass hit its wall-clock budget (`bp_converged == false`). Each
-    /// follow-up warm-starts from the previous order and deepens.
+    /// Minimum wait between follow-up BP or Seismic maintenance passes,
+    /// measured from completion across replacement segment IDs.
     pub unconverged_cooldown: Duration,
-    /// Optimizer follow-up threshold for budget-exhausted rewrites in one
-    /// replacement lineage. Without it, a segment that can never beat
-    /// `time_budget` is rewritten forever by the optimizer, continually
-    /// consuming all BP workers and disk I/O.
+    /// Follow-up threshold for budget-exhausted BMP rewrites or consecutive
+    /// Seismic passes that retire no terms. Productive Seismic passes reset
+    /// their stall count and remain eligible until fragmentation reaches zero.
+    /// Zero disables follow-up maintenance for both backends.
     pub max_unconverged_passes: u32,
     /// Deleted / physical row threshold; zero disables automatic compaction.
     pub compaction_deleted_ratio: f64,
@@ -276,7 +275,7 @@ async fn scan_and_optimize(
             .into_iter()
             .map(|(id, docs, _)| (id, docs, false, true))
             .collect();
-        if index.schema().has_reorder_fields() {
+        if index.schema().has_background_maintenance_fields() {
             let mut fresh = segment_manager.unreordered_segments().await;
             fresh.sort_unstable_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
             candidates.extend(
@@ -290,10 +289,9 @@ async fn scan_and_optimize(
         // Deepening is cooldown-paced but NOT starved by fresh work: under
         // continuous ingestion fresh segments arrive every commit, so a
         // "only when idle" rule would postpone deepening indefinitely. One
-        // budget-truncated segment per cooldown window (each follow-up is a
-        // full segment rewrite; it warm-starts from the previous order and
-        // deepens toward block-granularity).
-        let mut unconverged = if index.schema().has_reorder_fields() {
+        // incomplete segment per cooldown window. BP deepens its ordering;
+        // Seismic consolidates a partition while reusing unchanged files.
+        let mut unconverged = if index.schema().has_background_maintenance_fields() {
             segment_manager
                 .unconverged_segments_below(config.max_unconverged_passes)
                 .await
@@ -308,9 +306,10 @@ async fn scan_and_optimize(
             // scheduler slot exists; merely discovering a candidate must not
             // start its cooldown.
             debug!(
-                "[optimizer] segment {} has used {}/{} unconverged pass(es)",
+                "[optimizer] segment {} has used {}/{} bounded follow-up attempts (BP partial passes or Seismic consecutive stalls)",
                 id, attempts, config.max_unconverged_passes,
             );
+            candidates.retain(|(candidate, _, _, _)| candidate != &id);
             candidates.insert(0, (id, docs, true, false));
         }
 
@@ -402,6 +401,7 @@ async fn scan_and_optimize(
                 BpBudget::full()
             };
 
+            let max_bp_passes = config.max_unconverged_passes;
             let compaction_threshold = config.compaction_deleted_ratio;
             let compaction_memory_budget = config.compaction_memory_budget;
             tasks.spawn(async move {
@@ -416,7 +416,7 @@ async fn scan_and_optimize(
                 let result = if is_compaction {
                     sm.compact_segment_if_eligible(&sid, compaction_threshold, compaction_memory_budget).await
                 } else {
-                    sm.reorder_single_segment(&sid, Some(pool), budget).await
+                    sm.optimize_single_segment(&sid, Some(pool), budget, max_bp_passes).await
                 };
                 match result {
                     Ok(true) => {
@@ -572,6 +572,339 @@ mod tests {
             assert_eq!(searcher.num_docs(), 1);
             assert_eq!(searcher.segment_readers()[0].num_docs(), 1);
         }
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn optimizer_coalesces_binary_ann_without_reorder_fields() {
+        use hermes_core::dsl::BinaryDenseVectorConfig;
+
+        let root = tempfile::tempdir().unwrap();
+        let registry = IndexRegistry::new(
+            root.path().to_owned(),
+            hermes_core::IndexConfig {
+                merge_policy: Box::new(hermes_core::NoMergePolicy),
+                ..Default::default()
+            },
+        );
+        let mut schema = hermes_core::SchemaBuilder::default();
+        let vector = schema.add_binary_dense_vector_field_with_config(
+            "vector",
+            true,
+            false,
+            BinaryDenseVectorConfig::new(64).with_ivf(Some(4), 4),
+        );
+        let schema = schema.build();
+        assert!(!schema.has_reorder_fields());
+        registry.create_index("binary", schema).await.unwrap();
+        let writer = registry.get_writer("binary").await.unwrap();
+        {
+            let mut writer = writer.write().await;
+            for batch in 0..2 {
+                for row in 0..64u8 {
+                    let mut doc = hermes_core::Document::new();
+                    doc.add_binary_dense_vector(vector, vec![row | (batch * 64); 8]);
+                    writer.add_document(doc).unwrap();
+                }
+                writer.commit().await.unwrap();
+                if batch == 0 {
+                    writer.build_vector_index().await.unwrap();
+                }
+            }
+            writer.force_merge().await.unwrap();
+        }
+        let index = registry.get_or_open_index("binary").await.unwrap();
+        let reader = index.reader().await.unwrap();
+        reader.reload().await.unwrap();
+        let old_searcher = reader.searcher().await.unwrap();
+        let old_segment = &old_searcher.segment_readers()[0];
+        let old_id = old_segment.meta().id;
+        assert!(old_segment.ann_health(vector).unwrap().fragmentation() > 1.0);
+        let exact = old_segment.flat_vectors().get(&vector.0).unwrap();
+        let before = exact
+            .read_vectors_batch(0, exact.num_vectors)
+            .await
+            .unwrap();
+
+        let config = OptimizerConfig {
+            threads: 1,
+            concurrent_passes: 1,
+            scan_interval: Duration::from_secs(60),
+            large_segment_docs: 1000,
+            time_budget: Duration::from_secs(1),
+            partial_min_partition_docs: 256,
+            unconverged_cooldown: Duration::from_secs(60),
+            max_unconverged_passes: 3,
+            compaction_deleted_ratio: 0.0,
+            compaction_cooldown: Duration::from_secs(60),
+            compaction_memory_budget: 16 * 1024 * 1024,
+        };
+        let slots = Arc::new(Semaphore::new(1));
+        let deepening = Arc::new(CooldownGate::default());
+        let compaction = Arc::new(CooldownGate::default());
+        let mut next = 0;
+        let mut tasks = JoinSet::new();
+        scan_and_optimize(
+            &registry,
+            &slots,
+            &config,
+            &deepening,
+            &compaction,
+            &mut next,
+            &mut tasks,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "ANN debt must be eligible without BP fields"
+        );
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        let searcher = reader.searcher().await.unwrap();
+        let segment = &searcher.segment_readers()[0];
+        assert_ne!(segment.meta().id, old_id);
+        assert_eq!(segment.ann_health(vector).unwrap().fragmentation(), 1.0);
+        let after = segment.flat_vectors().get(&vector.0).unwrap();
+        assert_eq!(
+            before.as_slice(),
+            after
+                .read_vectors_batch(0, after.num_vectors)
+                .await
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(
+            before.as_slice(),
+            exact
+                .read_vectors_batch(0, exact.num_vectors)
+                .await
+                .unwrap()
+                .as_slice(),
+            "a reader held across replacement must retain its source vectors"
+        );
+        scan_and_optimize(
+            &registry,
+            &slots,
+            &config,
+            &deepening,
+            &compaction,
+            &mut next,
+            &mut tasks,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tasks.is_empty(),
+            "converged ANN must not be rewritten on every scan"
+        );
+        drop(searcher);
+        drop(old_searcher);
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn optimizer_finishes_productive_seismic_debt_beyond_three_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = IndexRegistry::new(
+            root.path().to_owned(),
+            hermes_core::IndexConfig {
+                merge_policy: Box::new(hermes_core::NoMergePolicy),
+                ..Default::default()
+            },
+        );
+        let mut schema = hermes_core::SchemaBuilder::default();
+        let field = schema.add_sparse_vector_field_with_config(
+            "sparse",
+            true,
+            false,
+            hermes_core::structures::SparseVectorConfig {
+                format: hermes_core::structures::SparseFormat::Seismic,
+                dims: Some(16),
+                ..Default::default()
+            },
+        );
+        registry
+            .create_index("seismic", schema.build())
+            .await
+            .unwrap();
+        let writer = registry.get_writer("seismic").await.unwrap();
+        let manager = {
+            let mut writer = writer.write().await;
+            for _ in 0..2 {
+                let mut document = hermes_core::Document::new();
+                document.add_sparse_vector(field, (0..16).map(|dim| (dim, 1.0)).collect());
+                writer.add_document(document).unwrap();
+                writer.commit().await.unwrap();
+            }
+            writer.force_merge().await.unwrap();
+            Arc::clone(writer.segment_manager())
+        };
+        let index = registry.get_or_open_index("seismic").await.unwrap();
+        let reader = index.reader().await.unwrap();
+        let config = OptimizerConfig {
+            threads: 1,
+            concurrent_passes: 1,
+            scan_interval: Duration::from_secs(60),
+            large_segment_docs: 1000,
+            time_budget: Duration::from_secs(1),
+            partial_min_partition_docs: 256,
+            unconverged_cooldown: Duration::ZERO,
+            max_unconverged_passes: 3,
+            compaction_deleted_ratio: 0.0,
+            compaction_cooldown: Duration::from_secs(60),
+            compaction_memory_budget: 16 * 1024 * 1024,
+        };
+        let slots = Arc::new(Semaphore::new(1));
+        let deepening = Arc::new(CooldownGate::default());
+        let compaction = Arc::new(CooldownGate::default());
+        let mut next = 0;
+        let mut tasks = JoinSet::new();
+        for remaining in (0..16).rev() {
+            scan_and_optimize(
+                &registry,
+                &slots,
+                &config,
+                &deepening,
+                &compaction,
+                &mut next,
+                &mut tasks,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                tasks.len(),
+                1,
+                "productive Seismic maintenance stopped with debt"
+            );
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+            let searcher = reader.searcher().await.unwrap();
+            assert_eq!(
+                searcher.segment_readers()[0]
+                    .seismic_stats()
+                    .into_iter()
+                    .find(|(field_id, _)| *field_id == field.0)
+                    .unwrap()
+                    .1
+                    .pending_terms,
+                remaining
+            );
+            if remaining > 0 && remaining < 15 {
+                let mut paced = config.clone();
+                paced.unconverged_cooldown = Duration::from_secs(60);
+                scan_and_optimize(
+                    &registry,
+                    &slots,
+                    &paced,
+                    &deepening,
+                    &compaction,
+                    &mut next,
+                    &mut tasks,
+                )
+                .await
+                .unwrap();
+                assert!(tasks.is_empty(), "productive passes must respect cooldown");
+            }
+        }
+        assert!(manager.unconverged_segments_below(3).await.is_empty());
+        scan_and_optimize(
+            &registry,
+            &slots,
+            &config,
+            &deepening,
+            &compaction,
+            &mut next,
+            &mut tasks,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tasks.is_empty(),
+            "zero-debt Seismic must leave the maintenance queue"
+        );
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn optimizer_does_not_replace_fresh_converged_sparse_or_binary_ann() {
+        use hermes_core::dsl::BinaryDenseVectorConfig;
+        let root = tempfile::tempdir().unwrap();
+        let registry = IndexRegistry::new(
+            root.path().to_owned(),
+            hermes_core::IndexConfig {
+                merge_policy: Box::new(hermes_core::NoMergePolicy),
+                ..Default::default()
+            },
+        );
+        let mut schema = hermes_core::SchemaBuilder::default();
+        let binary = schema.add_binary_dense_vector_field_with_config(
+            "binary",
+            true,
+            false,
+            BinaryDenseVectorConfig::new(64).with_ivf(Some(4), 4),
+        );
+        let sparse = schema.add_sparse_vector_field_with_config(
+            "sparse",
+            true,
+            false,
+            hermes_core::structures::SparseVectorConfig::default(),
+        );
+        registry
+            .create_index("fresh", schema.build())
+            .await
+            .unwrap();
+        let writer = registry.get_writer("fresh").await.unwrap();
+        let manager = {
+            let mut writer = writer.write().await;
+            for row in 0..64u8 {
+                let mut document = hermes_core::Document::new();
+                document.add_binary_dense_vector(binary, vec![row; 8]);
+                document.add_sparse_vector(sparse, vec![(0, row as f32 + 1.0)]);
+                writer.add_document(document).unwrap();
+            }
+            writer.commit().await.unwrap();
+            writer.build_vector_index().await.unwrap();
+            Arc::clone(writer.segment_manager())
+        };
+        let before = manager.get_segment_ids().await;
+        let config = OptimizerConfig {
+            threads: 1,
+            concurrent_passes: 1,
+            scan_interval: Duration::from_secs(60),
+            large_segment_docs: 1000,
+            time_budget: Duration::from_secs(1),
+            partial_min_partition_docs: 256,
+            unconverged_cooldown: Duration::from_secs(60),
+            max_unconverged_passes: 3,
+            compaction_deleted_ratio: 0.0,
+            compaction_cooldown: Duration::from_secs(60),
+            compaction_memory_budget: 16 * 1024 * 1024,
+        };
+        let slots = Arc::new(Semaphore::new(1));
+        let deepening = Arc::new(CooldownGate::default());
+        let compaction = Arc::new(CooldownGate::default());
+        let mut next = 0;
+        let mut tasks = JoinSet::new();
+        scan_and_optimize(
+            &registry,
+            &slots,
+            &config,
+            &deepening,
+            &compaction,
+            &mut next,
+            &mut tasks,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tasks.is_empty(),
+            "maintenance must not rewrite fresh indexes with no encoded-run debt"
+        );
+        assert_eq!(manager.get_segment_ids().await, before);
         registry.shutdown().await.unwrap();
     }
 

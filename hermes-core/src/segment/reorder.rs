@@ -1,8 +1,8 @@
 //! Standalone segment reorder via Recursive Graph Bisection (BP).
 //!
-//! Copies unchanged segment files (postings, store, fast, dense vectors)
-//! and rebuilds the sparse file with reordered BMP blocks. Non-BMP sparse
-//! fields (MaxScore) are identity-copied.
+//! Copies unchanged segment files and coalesces fragmented binary ANN clusters.
+//! Reorders configured text/BMP fields and repairs bounded Seismic nomination
+//! debt. MaxScore sparse fields are identity-copied.
 //!
 //! Background optimization is decoupled from the merge path. Merge-time
 //! reordering is optional; when enabled, both paths share the same bounded
@@ -989,7 +989,7 @@ fn block_coherence(
 /// Reorder a single segment's BMP data via Recursive Graph Bisection (BP).
 ///
 /// Creates a new segment with reordered BMP blocks for better pruning.
-/// Non-BMP fields are copied unchanged via streaming file copy.
+/// Independent Seismic and ANN maintenance share the same publication owner.
 ///
 /// `rayon_pool`: optional bounded thread pool for BP computation. When `Some`,
 /// all rayon parallel work (gain computation, recursive bisection) runs on this
@@ -1000,6 +1000,10 @@ fn block_coherence(
 /// false iff the BP wall-clock budget ended a field's pass early (the output
 /// is still valid and better-ordered than the input; a later pass warm-starts
 /// from it and deepens).
+///
+/// `run_bp` comes from the claimed source's maintenance policy. When false,
+/// text and BMP payloads are cloned unchanged while independent Seismic/ANN
+/// work proceeds; manual reorder callers always pass true.
 ///
 /// `granularity`: callers deepening an unconverged segment must pass
 /// `BpGranularity::Records` — `Auto` would measure the partial pass's
@@ -1012,15 +1016,27 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     source_id: SegmentId,
     output_id: SegmentId,
     term_cache_blocks: usize,
+    term_cache_budget_bytes: Option<usize>,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    run_bp: bool,
     granularity: BpGranularity,
     optimization: crate::structures::IndexOptimization,
     posting_codec: crate::structures::PostingCodec,
+    trained: Option<&TrainedVectorStructures>,
+    term_dict_block_size: crate::structures::SSTableBlockSize,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
+    alive: Option<Arc<crate::query::DocBitset>>,
 ) -> Result<(String, u32, bool)> {
-    let reader = SegmentReader::open(dir, source_id, Arc::clone(schema), term_cache_blocks).await?;
+    let reader = SegmentReader::open_with_term_cache_budget(
+        dir,
+        source_id,
+        Arc::clone(schema),
+        term_cache_blocks,
+        term_cache_budget_bytes,
+    )
+    .await?;
     let num_docs = reader.num_docs();
 
     let src_files = SegmentFiles::new(source_id.0);
@@ -1034,22 +1050,32 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         schema.index_label(),
     );
 
-    // Copy unchanged segment files. The vectors file is cloned verbatim:
-    // every binary merge already compacts its ANN payload to one extent per
-    // cluster, so a segment reaching reorder is at fragmentation 1.0 and
-    // there is nothing to rewrite.
-    // Chunked text fields with the `reorder` attribute get their own BP
+    let rewrite_vectors = reader.vector_indexes().iter().any(|(&field, index)| {
+        matches!(
+            index,
+            super::VectorIndex::BinaryIvf(_) | super::VectorIndex::ScannBinary(_)
+        ) && reader
+            .ann_health(crate::dsl::Field(field))
+            .is_some_and(|h| h.fragmentation() > 1.0)
+    });
+    // Copy unchanged segment files; binary ANN coalescing uses the shared
+    // dense writer only when a cluster has multiple runs.
+    // Indexed text fields with the `reorder` attribute get their own BP
     // order over their virtual ids; when any is planned the text files are
     // rewritten instead of cloned (`text_reorder.rs`).
-    let text_plans = super::text_reorder::plan_text_reorders(
-        &reader,
-        schema,
-        memory_budget,
-        bp_budget,
-        cancellation.as_deref(),
-        rayon_pool.clone(),
-    )
-    .await?;
+    let text_plans = if run_bp {
+        super::text_reorder::plan_text_reorders(
+            &reader,
+            schema,
+            memory_budget,
+            bp_budget,
+            cancellation.as_deref(),
+            rayon_pool.clone(),
+        )
+        .await?
+    } else {
+        Vec::new()
+    };
     let rewrite_text = !text_plans.is_empty();
     let upgrade_chunks = reader
         .chunk_maps()
@@ -1095,7 +1121,10 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         if cancellation_requested(cancellation.as_deref()) {
             return Err(crate::Error::IndexClosed);
         }
-        if (rewrite_text && text_file(src)) || (upgrade_chunks && src == &src_files.chunks) {
+        if (rewrite_text && text_file(src))
+            || (upgrade_chunks && src == &src_files.chunks)
+            || (rewrite_vectors && src == &src_files.vectors)
+        {
             continue;
         }
         clone_segment_file(
@@ -1120,7 +1149,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
             &dst_files,
             schema,
             &text_plans,
-            (optimization, posting_codec),
+            (optimization, posting_codec, term_dict_block_size),
             memory_budget,
             cancellation.as_deref(),
         )
@@ -1141,6 +1170,24 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         )
         .await?;
     }
+    // Text plans no longer overlap the BMP graph scratch budget.
+    drop(text_plans);
+    if rewrite_vectors {
+        let mut merger =
+            SegmentMerger::new(Arc::clone(schema)).with_bp_memory_budget(memory_budget);
+        if let Some(cancel) = &cancellation {
+            merger = merger.with_cancellation(Arc::clone(cancel));
+        }
+        merger
+            .merge_dense_vectors(
+                dir,
+                std::slice::from_ref(&reader),
+                &dst_files,
+                trained,
+                super::merger::AnnWriteMode::Reorder,
+            )
+            .await?;
+    }
     // Rebuild sparse file with reordered BMP data
     let bp_converged = reorder_sparse_file(
         dir,
@@ -1149,9 +1196,11 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         schema,
         memory_budget,
         bp_budget,
+        run_bp,
         cancellation,
         granularity,
         rayon_pool,
+        alive.as_deref(),
     )
     .await?;
     // Write new meta with output segment ID
@@ -1229,11 +1278,23 @@ pub async fn rewrite_vector_segment<D: Directory + DirectoryWriter>(
         (
             &src_files.sparse,
             &dst_files.sparse,
-            !reader.sparse_indexes().is_empty() || !reader.bmp_indexes().is_empty(),
+            !reader.sparse_indexes().is_empty()
+                || !reader.bmp_indexes().is_empty()
+                || !reader.seismic_indexes().is_empty(),
         ),
     ] {
         clone_segment_file(dir, target_schema.index_label(), src, dst, required, None).await?;
     }
+
+    clone_seismic_partitions(
+        dir,
+        &reader,
+        &dst_files,
+        target_schema.index_label(),
+        None,
+        None,
+    )
+    .await?;
 
     let merger = SegmentMerger::new(Arc::clone(target_schema)).with_background_pool(rayon_pool);
     let vector_bytes = merger
@@ -1364,6 +1425,129 @@ async fn clone_segment_file<D: Directory + DirectoryWriter>(
     Ok(())
 }
 
+/// Clone immutable nomination partitions under the replacement segment owner.
+async fn clone_seismic_partitions<D: Directory + DirectoryWriter>(
+    dir: &D,
+    reader: &SegmentReader,
+    output: &SegmentFiles,
+    index_label: &str,
+    except: Option<usize>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    if reader.seismic_indexes().is_empty() {
+        return Ok(());
+    }
+    let source = SegmentFiles::new(reader.meta().id);
+    for partition in 0..super::seismic::PARTITIONS {
+        if except == Some(partition) {
+            continue;
+        }
+        clone_segment_file(
+            dir,
+            index_label,
+            &source.seismic_partition(partition),
+            &output.seismic_partition(partition),
+            true,
+            cancellation,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Consolidate one shared term partition; retain all other immutable files.
+#[allow(clippy::too_many_arguments)]
+async fn maintain_seismic_partitions<D: Directory + DirectoryWriter>(
+    dir: &D,
+    reader: &SegmentReader,
+    output: &SegmentFiles,
+    schema: &Schema,
+    memory_budget: usize,
+    budget: crate::segment::BpBudget,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+    alive: Option<&crate::query::DocBitset>,
+) -> Result<()> {
+    if reader.seismic_indexes().is_empty() {
+        return Ok(());
+    }
+    let selected = if budget.time_budget.is_some_and(|limit| limit.is_zero()) {
+        None
+    } else {
+        (0..super::seismic::PARTITIONS)
+            .map(|partition| {
+                let (terms, bytes) = reader
+                    .seismic_indexes()
+                    .values()
+                    .map(|index| index.partition_maintenance_priority(partition))
+                    .fold(
+                        (0u64, 0u64),
+                        |(terms, bytes), (field_terms, field_bytes)| {
+                            (
+                                terms + u64::from(field_terms),
+                                bytes.saturating_add(field_bytes),
+                            )
+                        },
+                    );
+                (terms, bytes, partition)
+            })
+            .filter(|&(terms, _, _)| terms > 0)
+            .max_by_key(|&(terms, bytes, partition)| (terms, bytes, std::cmp::Reverse(partition)))
+            .map(|(_, _, partition)| partition)
+    };
+    clone_seismic_partitions(
+        dir,
+        reader,
+        output,
+        schema.index_label(),
+        selected,
+        cancellation,
+    )
+    .await?;
+    let Some(partition) = selected else {
+        return Ok(());
+    };
+    check_cancellation(cancellation)?;
+    let mut writers =
+        super::sparse_partitions::SparsePartitionWriters::create(dir, output, |id| id == partition)
+            .await?;
+    let started = std::time::Instant::now();
+    let admitted = std::cell::Cell::new(false);
+    for (field, entry) in schema.fields() {
+        let Some(index) = reader.seismic_index(field) else {
+            continue;
+        };
+        check_cancellation(cancellation)?;
+        let config = entry.sparse_vector_config.clone().unwrap_or_default();
+        let available = memory_budget.saturating_sub(writers.scratch_bytes());
+        let (bytes, _) = super::merger::block_in_place_if_multithread(|| {
+            super::seismic::write_maintained_partition(
+                index,
+                partition,
+                &config,
+                &|| {
+                    !admitted.replace(true)
+                        || budget
+                            .time_budget
+                            .is_none_or(|limit| started.elapsed() < limit)
+                },
+                available,
+                &|doc| alive.is_none_or(|mask| mask.contains(doc)),
+                &|| check_cancellation(cancellation),
+                writers.writer(partition),
+            )
+        })?;
+        writers.record_field(
+            partition,
+            field.0,
+            index.total_vectors(),
+            index.quantization(),
+            bytes,
+        );
+    }
+    writers.finish()?;
+    Ok(())
+}
+
 /// Rebuild the sparse file with reordered BMP data.
 ///
 /// - BMP fields: run BP reorder and write new blob
@@ -1377,9 +1561,11 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
     schema: &Schema,
     memory_budget: usize,
     bp_budget: crate::segment::BpBudget,
+    run_bp: bool,
     cancellation: Option<Arc<std::sync::atomic::AtomicBool>>,
     granularity: BpGranularity,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
+    alive: Option<&crate::query::DocBitset>,
 ) -> Result<bool> {
     let sparse_fields: Vec<_> = schema
         .fields()
@@ -1400,26 +1586,36 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
 
     // Check if there's any BMP data to reorder. Per-field gate: only fields
     // with the `reorder` schema attribute get BP; others are copied unchanged.
-    let has_bmp_data = sparse_fields.iter().any(|(field, config, reorder, _)| {
-        *reorder
-            && config.as_ref().map(|c| c.format) == Some(SparseFormat::Bmp)
-            && reader.bmp_indexes().get(&field.0).is_some()
-    });
+    let has_bmp_data = run_bp
+        && sparse_fields.iter().any(|(field, config, reorder, _)| {
+            *reorder
+                && config.as_ref().map(|c| c.format) == Some(SparseFormat::Bmp)
+                && reader.bmp_indexes().get(&field.0).is_some()
+        });
 
     // Sparse files are legitimately absent when the schema has sparse fields
     // but this segment contains no sparse values. Do not turn that valid
     // optional-file case into a required-copy corruption error.
-    if reader.sparse_indexes().is_empty() && reader.bmp_indexes().is_empty() {
+    if reader.sparse_indexes().is_empty()
+        && reader.bmp_indexes().is_empty()
+        && reader.seismic_indexes().is_empty()
+    {
         return Ok(true);
     }
 
+    maintain_seismic_partitions(
+        dir,
+        reader,
+        dst_files,
+        schema,
+        memory_budget,
+        bp_budget,
+        cancellation.as_deref(),
+        alive,
+    )
+    .await?;
     if !has_bmp_data {
-        // No BMP field wants reordering — just copy the sparse file as-is
-        log::info!(
-            "[reorder] index={} segment {:x}: no BMP field has the `reorder` schema attribute — sparse file copied unchanged",
-            schema.index_label(),
-            reader.meta().id,
-        );
+        // Exact-forward bytes do not change during nomination maintenance.
         let src_files = SegmentFiles::new(reader.meta().id);
         clone_segment_file(
             dir,
@@ -1433,6 +1629,7 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
         return Ok(true);
     }
 
+    // Seismic debt has its own persisted scheduling state; this flag tracks BMP.
     let mut all_converged = true;
     let scratch_path = dir.local_path(&dst_files.sparse).unwrap_or_else(|| {
         std::env::temp_dir().join(
@@ -1465,6 +1662,26 @@ async fn reorder_sparse_file<D: Directory + DirectoryWriter>(
             .as_ref()
             .map(|c| c.weight_quantization)
             .unwrap_or(crate::structures::WeightQuantization::Float32);
+
+        if format == SparseFormat::Seismic {
+            let Some(index) = reader.seismic_index(*field) else {
+                continue;
+            };
+            let offset = writer.offset();
+            let bytes = super::merger::block_in_place_if_multithread(|| {
+                crate::segment::seismic::write_sources(&[(index, 0)], &mut writer, &|| {
+                    check_cancellation(cancellation.as_deref())
+                })
+            })?;
+            field_tocs.push(SparseFieldToc::seismic(
+                field.0,
+                index.total_vectors(),
+                offset,
+                bytes,
+                index.quantization(),
+            ));
+            continue;
+        }
 
         if format == SparseFormat::Bmp {
             if let Some(bmp_idx) = reader.bmp_indexes().get(&field.0) {

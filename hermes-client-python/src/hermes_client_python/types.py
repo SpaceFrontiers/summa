@@ -61,13 +61,16 @@ class SparseVectorQuery(TypedDict, total=False):
     text: str
     combiner: Combiner
     heap_factor: float
+    lsp_gamma: int
     combiner_temperature: float
     combiner_top_k: int
     combiner_decay: float
     weight_threshold: float
     max_query_dims: int
     pruning: float
-    lsp_gamma: int
+    seismic_cut: int
+    seismic_factor: float
+    exhaustive: bool
 
 
 class DenseVectorQuery(TypedDict, total=False):

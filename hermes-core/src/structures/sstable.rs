@@ -17,6 +17,8 @@
 //! 4. **Configurable Compression Level**: Levels 1-22 for space/speed tradeoff
 //!
 //! 5. **Bloom Filter**: Fast negative lookups to skip unnecessary I/O
+#[cfg(test)]
+mod dictionary_config_tests;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use parking_lot::RwLock;
@@ -41,6 +43,54 @@ pub const RESTART_INTERVAL: usize = 16;
 
 /// Block size for SSTable (16KB default)
 pub const BLOCK_SIZE: usize = 16 * 1024;
+
+/// Validated flush target for an STB5 data block. A single entry and its
+/// restart trailer may exceed the target, but never the reader safety limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SSTableBlockSize(usize);
+
+impl SSTableBlockSize {
+    pub fn bytes(self) -> usize {
+        self.0
+    }
+}
+
+impl std::str::FromStr for SSTableBlockSize {
+    type Err = io::Error;
+
+    fn from_str(value: &str) -> io::Result<Self> {
+        let bytes = value
+            .parse::<usize>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Self::try_from(bytes)
+    }
+}
+
+impl std::fmt::Display for SSTableBlockSize {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.bytes().fmt(formatter)
+    }
+}
+
+impl Default for SSTableBlockSize {
+    fn default() -> Self {
+        Self(BLOCK_SIZE)
+    }
+}
+
+impl TryFrom<usize> for SSTableBlockSize {
+    type Error = io::Error;
+
+    fn try_from(bytes: usize) -> io::Result<Self> {
+        if !(512..=1024 * 1024).contains(&bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSTable block target must be in 512..=1048576 bytes",
+            ));
+        }
+        Ok(Self(bytes))
+    }
+}
 
 /// Default dictionary size (64KB)
 pub const DEFAULT_DICT_SIZE: usize = 64 * 1024;
@@ -267,21 +317,14 @@ impl BloomFilter {
 
     /// Add a key to the filter
     pub fn insert(&mut self, key: &[u8]) {
-        let (h1, h2) = self.hash_pair(key);
-        for i in 0..self.num_hashes {
-            let bit_pos = self.get_bit_pos(h1, h2, i);
-            let word_idx = bit_pos / 64;
-            let bit_idx = bit_pos % 64;
-            if word_idx < self.bits.len() {
-                self.bits.set_bit(word_idx, bit_idx);
-            }
-        }
+        let (h1, h2) = bloom_hash_pair(key);
+        self.insert_hashed(h1, h2);
     }
 
     /// Check if a key might be in the filter
     /// Returns false if definitely not present, true if possibly present
     pub fn may_contain(&self, key: &[u8]) -> bool {
-        let (h1, h2) = self.hash_pair(key);
+        let (h1, h2) = bloom_hash_pair(key);
         for i in 0..self.num_hashes {
             let bit_pos = self.get_bit_pos(h1, h2, i);
             let word_idx = bit_pos / 64;
@@ -308,20 +351,6 @@ impl BloomFilter {
                 self.bits.set_bit(word_idx, bit_idx);
             }
         }
-    }
-
-    /// Compute two hash values using FNV-1a variant (single pass over key bytes)
-    #[inline]
-    fn hash_pair(&self, key: &[u8]) -> (u64, u64) {
-        let mut h1: u64 = 0xcbf29ce484222325;
-        let mut h2: u64 = 0x84222325cbf29ce4;
-        for &byte in key {
-            h1 ^= byte as u64;
-            h1 = h1.wrapping_mul(0x100000001b3);
-            h2 = h2.wrapping_mul(0x100000001b3);
-            h2 ^= byte as u64;
-        }
-        (h1, h2)
     }
 
     /// Get bit position for hash iteration i using double hashing
@@ -392,7 +421,7 @@ fn validate_bloom_header(
 }
 
 /// Compute bloom filter hash pair for a key (standalone, no BloomFilter needed).
-/// Uses the same FNV-1a double-hashing as BloomFilter::hash_pair (single pass).
+/// Shared by in-memory insertion, lookup and streaming construction (single pass).
 #[inline]
 fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     let mut h1: u64 = 0xcbf29ce484222325;
@@ -856,11 +885,18 @@ pub struct SSTableStats {
     pub bloom_filter_size: usize,
     /// Compression dictionary size in bytes.
     pub dictionary_size: usize,
+    /// Decompressed blocks that were served but never retained by the block
+    /// cache because retention is disabled (`cache_blocks == 0` or a zero
+    /// byte budget) or the block alone exceeds the byte budget. A non-zero
+    /// value on a hot table means every lookup re-decompresses.
+    pub cache_insert_bypasses: u64,
 }
 
 /// SSTable writer configuration
 #[derive(Debug, Clone)]
 pub struct SSTableWriterConfig {
+    /// Target uncompressed entry bytes per block; default 16 KiB.
+    pub block_size: SSTableBlockSize,
     /// Compression level (1-22, higher = better compression but slower)
     pub compression_level: CompressionLevel,
     /// Whether to train and use a dictionary for compression
@@ -885,6 +921,7 @@ impl SSTableWriterConfig {
         use crate::structures::IndexOptimization;
         match optimization {
             IndexOptimization::Adaptive => Self {
+                block_size: SSTableBlockSize::default(),
                 compression_level: CompressionLevel::BETTER, // Level 9
                 use_dictionary: false,
                 dict_size: DEFAULT_DICT_SIZE,
@@ -892,6 +929,7 @@ impl SSTableWriterConfig {
                 bloom_bits_per_key: BLOOM_BITS_PER_KEY,
             },
             IndexOptimization::SizeOptimized => Self {
+                block_size: SSTableBlockSize::default(),
                 compression_level: CompressionLevel::MAX, // Level 22
                 use_dictionary: true,
                 dict_size: DEFAULT_DICT_SIZE,
@@ -899,6 +937,7 @@ impl SSTableWriterConfig {
                 bloom_bits_per_key: BLOOM_BITS_PER_KEY,
             },
             IndexOptimization::PerformanceOptimized => Self {
+                block_size: SSTableBlockSize::default(),
                 compression_level: CompressionLevel::FAST, // Level 1
                 use_dictionary: false,
                 dict_size: DEFAULT_DICT_SIZE,
@@ -943,7 +982,47 @@ pub struct SSTableWriter<W: Write, V: SSTableValue> {
     block_restarts: Vec<u32>,
     /// Entries written into the current block so far.
     block_entry_count: usize,
+    /// An insert failure may leave a partial entry or output write. Never finish it.
+    failed: bool,
     _phantom: std::marker::PhantomData<V>,
+}
+
+/// The canonical value serializer writes through this view so an oversized or
+/// streaming value cannot grow scratch beyond the reader's block limit.
+struct BlockEntryWriter<'a> {
+    buffer: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl Write for BlockEntryWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let needed = self
+            .buffer
+            .len()
+            .checked_add(bytes.len())
+            .filter(|&n| n <= self.limit)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "SSTable entry exceeds the reader block safety limit",
+                )
+            })?;
+        if needed > self.buffer.capacity() {
+            // Preserve amortized growth without Vec's doubling beyond the cap.
+            let capacity = needed
+                .max(self.buffer.capacity().saturating_mul(2))
+                .min(self.limit);
+            self.buffer
+                .try_reserve_exact(capacity - self.buffer.len())
+                .map_err(io::Error::other)?;
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
@@ -956,7 +1035,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
     pub fn with_config(writer: W, config: SSTableWriterConfig) -> Self {
         Self {
             writer,
-            block_buffer: Vec::with_capacity(BLOCK_SIZE),
+            block_buffer: Vec::with_capacity(config.block_size.bytes()),
             prev_key: Vec::new(),
             index: Vec::new(),
             current_offset: 0,
@@ -967,6 +1046,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             bloom_hashes: Vec::new(),
             block_restarts: Vec::new(),
             block_entry_count: 0,
+            failed: false,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -979,7 +1059,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
     ) -> Self {
         Self {
             writer,
-            block_buffer: Vec::with_capacity(BLOCK_SIZE),
+            block_buffer: Vec::with_capacity(config.block_size.bytes()),
             prev_key: Vec::new(),
             index: Vec::new(),
             current_offset: 0,
@@ -990,11 +1070,32 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             bloom_hashes: Vec::new(),
             block_restarts: Vec::new(),
             block_entry_count: 0,
+            failed: false,
             _phantom: std::marker::PhantomData,
         }
     }
 
     pub fn insert(&mut self, key: &[u8], value: &V) -> io::Result<()> {
+        if self.failed {
+            return Err(io::Error::other(
+                "SSTable writer failed during an earlier insert",
+            ));
+        }
+        // Leave the writer poisoned on error or unwinding from a value serializer.
+        self.failed = true;
+        self.insert_entry(key, value)?;
+        self.failed = false;
+        Ok(())
+    }
+
+    fn insert_entry(&mut self, key: &[u8], value: &V) -> io::Result<()> {
+        if key.len() > MAX_SSTABLE_BLOCK_BYTES || self.block_buffer.len() > MAX_SSTABLE_BLOCK_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSTable entry exceeds the reader block safety limit",
+            ));
+        }
         if self.block_first_key.is_none() {
             self.block_first_key = Some(key.to_vec());
         }
@@ -1015,17 +1116,22 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
         };
         let suffix = &key[prefix_len..];
 
-        write_vint(&mut self.block_buffer, prefix_len as u64)?;
-        write_vint(&mut self.block_buffer, suffix.len() as u64)?;
-        self.block_buffer.extend_from_slice(suffix);
-        value.serialize(&mut self.block_buffer)?;
+        let trailer_bytes = self.block_restarts.len() * 4 + 4;
+        let mut entry = BlockEntryWriter {
+            buffer: &mut self.block_buffer,
+            limit: MAX_SSTABLE_BLOCK_BYTES - trailer_bytes,
+        };
+        write_vint(&mut entry, prefix_len as u64)?;
+        write_vint(&mut entry, suffix.len() as u64)?;
+        entry.write_all(suffix)?;
+        value.serialize(&mut entry)?;
 
         self.prev_key.clear();
         self.prev_key.extend_from_slice(key);
         self.num_entries += 1;
         self.block_entry_count += 1;
 
-        if self.block_buffer.len() >= BLOCK_SIZE {
+        if self.block_buffer.len() >= self.config.block_size.bytes() {
             self.flush_block()?;
         }
 
@@ -1038,6 +1144,20 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             return Ok(());
         }
 
+        let trailer_bytes = self
+            .block_restarts
+            .len()
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(4));
+        if trailer_bytes
+            .and_then(|bytes| self.block_buffer.len().checked_add(bytes))
+            .is_none_or(|bytes| bytes > MAX_SSTABLE_BLOCK_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSTable block including restart trailer exceeds the reader safety limit",
+            ));
+        }
         // v5 trailer: restart offsets then their count.
         for offset in &self.block_restarts {
             self.block_buffer.extend_from_slice(&offset.to_le_bytes());
@@ -1075,6 +1195,9 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
     }
 
     pub fn finish(mut self) -> io::Result<W> {
+        if self.failed {
+            return Err(io::Error::other("cannot finish a failed SSTable writer"));
+        }
         // Flush any remaining data
         self.flush_block()?;
 
@@ -1182,9 +1305,6 @@ pub struct AsyncSSTableReader<V: SSTableValue> {
     bloom_filter: Option<BloomFilter>,
     /// Compression dictionary (optional)
     dictionary: Option<CompressionDict>,
-    /// Compression level used
-    #[allow(dead_code)]
-    compression_level: CompressionLevel,
     _phantom: std::marker::PhantomData<V>,
 }
 
@@ -1264,29 +1384,45 @@ impl<'b> BlockParts<'b> {
 /// Bounded block cache with a contention-free read path.
 ///
 /// Normal reads use [`BlockCache::peek`] under a shared lock and deliberately
-/// do not promote hits, so normal eviction order is insertion order. `get()`
-/// still promotes entries for exclusive warm-up and race-resolution paths.
+/// do not promote hits, so normal eviction order is insertion order.
+/// Duplicate insertions still promote entries during race resolution.
 struct BlockCache {
     blocks: FxHashMap<u64, Arc<[u8]>>,
     lru_order: std::collections::VecDeque<u64>,
     max_blocks: usize,
+    max_bytes: Option<usize>,
+    retained_bytes: usize,
+    /// Insertions dropped without retention (disabled cache or oversized
+    /// block); surfaced through [`SSTableStats::cache_insert_bypasses`].
+    insert_bypasses: u64,
 }
 
+/// Hard upper bound on retained blocks per table, matching the CLI cap.
+///
+/// The order deque is pre-sized from the configured block cap, so an
+/// unbounded value would otherwise reserve gigabytes or abort with a capacity
+/// overflow. Requests above this are clamped with a warning.
+pub const MAX_CACHE_BLOCKS: usize = 65_536;
+
 impl BlockCache {
-    fn new(max_blocks: usize) -> Self {
+    fn new(max_blocks: usize, max_bytes: Option<usize>) -> Self {
+        let max_blocks = if max_bytes == Some(0) { 0 } else { max_blocks };
+        if max_blocks > MAX_CACHE_BLOCKS {
+            log::warn!(
+                "SSTable block cache cap {max_blocks} exceeds the {MAX_CACHE_BLOCKS} block \
+                 maximum; clamping"
+            );
+        }
+        let max_blocks = max_blocks.min(MAX_CACHE_BLOCKS);
         Self {
             blocks: FxHashMap::default(),
-            lru_order: std::collections::VecDeque::with_capacity(max_blocks),
+            lru_order: std::collections::VecDeque::with_capacity(
+                max_blocks.min(max_bytes.unwrap_or(usize::MAX)),
+            ),
             max_blocks,
-        }
-    }
-
-    fn get(&mut self, offset: u64) -> Option<Arc<[u8]>> {
-        if self.blocks.contains_key(&offset) {
-            self.promote(offset);
-            self.blocks.get(&offset).map(Arc::clone)
-        } else {
-            None
+            max_bytes,
+            retained_bytes: 0,
+            insert_bypasses: 0,
         }
     }
 
@@ -1297,19 +1433,33 @@ impl BlockCache {
 
     fn insert(&mut self, offset: u64, block: Arc<[u8]>) {
         if self.max_blocks == 0 {
+            self.insert_bypasses += 1;
             return;
         }
         if self.blocks.contains_key(&offset) {
             self.promote(offset);
             return;
         }
-        while self.blocks.len() >= self.max_blocks {
-            if let Some(evict_offset) = self.lru_order.pop_front() {
-                self.blocks.remove(&evict_offset);
-            } else {
-                break;
-            }
+        if self.max_bytes.is_some_and(|budget| block.len() > budget) {
+            self.insert_bypasses += 1;
+            return;
         }
+        while self.blocks.len() >= self.max_blocks
+            || self
+                .max_bytes
+                .is_some_and(|budget| self.retained_bytes > budget - block.len())
+        {
+            let evict_offset = self
+                .lru_order
+                .pop_front()
+                .expect("cache order missing block");
+            let removed = self
+                .blocks
+                .remove(&evict_offset)
+                .expect("cache block missing from order");
+            self.retained_bytes -= removed.len();
+        }
+        self.retained_bytes += block.len();
         self.blocks.insert(offset, block);
         self.lru_order.push_back(offset);
     }
@@ -1324,11 +1474,32 @@ impl BlockCache {
 }
 
 impl<V: SSTableValue> AsyncSSTableReader<V> {
+    /// Upper bound on compressed bytes read by one
+    /// [`Self::prefetch_leading_blocks`] call. Blocks past this leading range
+    /// are not warmed and load on demand.
+    pub const PREFETCH_LEADING_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+    /// Number of tables whose leading-block prefetch a merge issues
+    /// concurrently (bounded I/O fan-out; each read is itself capped by
+    /// [`Self::PREFETCH_LEADING_MAX_BYTES`]).
+    pub const PREFETCH_LEADING_FANOUT: usize = 4;
+
     /// Open an SSTable from a FileHandle
     /// Only loads the footer and index into memory, data blocks fetched on-demand
     ///
     /// Uses FST-based (native) or mmap'd block index (no heap allocation for keys)
     pub async fn open(file_handle: FileHandle, cache_blocks: usize) -> io::Result<Self> {
+        Self::open_with_cache_budget(file_handle, cache_blocks, None).await
+    }
+
+    /// Open with both a block-count cap and an optional cap on retained
+    /// decompressed block bytes. Oversized blocks are read without retention.
+    /// In-flight readers and hash/deque metadata are outside this byte cap.
+    pub async fn open_with_cache_budget(
+        file_handle: FileHandle,
+        cache_blocks: usize,
+        cache_budget_bytes: Option<usize>,
+    ) -> io::Result<Self> {
         let file_len = file_handle.len();
         if file_len < 37 {
             return Err(io::Error::new(
@@ -1348,7 +1519,9 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         let num_entries = reader.read_u64::<LittleEndian>()?;
         let bloom_offset = reader.read_u64::<LittleEndian>()?;
         let dict_offset = reader.read_u64::<LittleEndian>()?;
-        let compression_level = CompressionLevel(reader.read_u8()? as i32);
+        // The footer records the writer's compression level; readers only
+        // need to skip the byte, zstd frames carry their own parameters.
+        let _compression_level = reader.read_u8()?;
         let magic = reader.read_u32::<LittleEndian>()?;
 
         if magic != SSTABLE_MAGIC {
@@ -1537,10 +1710,9 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             data_slice,
             block_index,
             num_entries,
-            cache: RwLock::new(BlockCache::new(cache_blocks)),
+            cache: RwLock::new(BlockCache::new(cache_blocks, cache_budget_bytes)),
             bloom_filter,
             dictionary,
-            compression_level,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -1564,6 +1736,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 .map(|b| b.size_bytes())
                 .unwrap_or(0),
             dictionary_size: self.dictionary.as_ref().map(|d| d.len()).unwrap_or(0),
+            cache_insert_bypasses: self.cache.read().insert_bypasses,
         }
     }
 
@@ -1578,12 +1751,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
     /// the configured writer block size: compression dictionaries and boundary
     /// blocks make the retained size variable.
     pub fn cached_bytes(&self) -> usize {
-        self.cache
-            .read()
-            .blocks
-            .values()
-            .map(|block| block.len())
-            .sum()
+        self.cache.read().retained_bytes
     }
 
     /// Look up a key (async - may need to load block)
@@ -1677,8 +1845,8 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
     /// Preload all data blocks into memory
     ///
-    /// Call this after open() to eliminate all I/O during subsequent lookups.
-    /// Useful when the SSTable is small enough to fit in memory.
+    /// Retention respects configured cache caps; later lookups can still miss
+    /// when the table does not fit. Each read uses the normal bounded decoder.
     pub async fn preload_all_blocks(&self) -> io::Result<()> {
         for block_idx in 0..self.block_index.len() {
             self.load_block(block_idx).await?;
@@ -1686,52 +1854,72 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         Ok(())
     }
 
-    /// Prefetch all data blocks via a single bulk I/O operation.
+    /// Warm the leading blocks with one bounded bulk read.
     ///
-    /// Reads the entire compressed data section in one call, then decompresses
-    /// each block and populates the cache. This turns N individual reads into 1.
-    /// Cache capacity is expanded to hold all blocks.
-    pub async fn prefetch_all_data_bulk(&self) -> io::Result<()> {
+    /// At most [`Self::PREFETCH_LEADING_MAX_BYTES`] compressed bytes are read.
+    /// Configured block/byte caps are never expanded, existing entries are
+    /// not evicted for prefetch, and disabled retention performs no payload
+    /// I/O. Later iteration still loads every remaining block normally. One
+    /// decompression is bounded by the existing 64 MiB reader limit,
+    /// separately from the retained cache budget.
+    pub async fn prefetch_leading_blocks(&self) -> io::Result<()> {
         let num_blocks = self.block_index.len();
-        if num_blocks == 0 {
-            return Ok(());
-        }
-
-        // Find total data extent
-        let mut max_end: u64 = 0;
-        for i in 0..num_blocks {
-            if let Some(addr) = self.block_index.get_addr(i) {
-                let end = addr.offset.checked_add(addr.length as u64).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable block range overflow")
-                })?;
-                max_end = max_end.max(end);
+        let max_blocks = {
+            let cache = self.cache.read();
+            if cache.blocks.len() >= cache.max_blocks
+                || cache
+                    .max_bytes
+                    .is_some_and(|budget| cache.retained_bytes >= budget)
+            {
+                log::debug!("SSTable bulk prefetch skipped: cache retention capacity exhausted");
+                return Ok(());
             }
-        }
-
-        // Single bulk read of entire data section
-        let all_data = self.data_slice.read_bytes_range(0..max_end).await?;
-        let buf = all_data.as_slice();
-
-        // Expand cache and decompress all blocks
-        let mut cache = self.cache.write();
-        cache.max_blocks = cache.max_blocks.max(num_blocks);
-        for i in 0..num_blocks {
-            let addr = self.block_index.get_addr(i).unwrap();
-            if cache.get(addr.offset).is_some() {
-                continue;
-            }
-            let start = usize::try_from(addr.offset).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "SSTable block offset too large")
+            cache.max_blocks
+        };
+        let mut start = self.data_slice.len();
+        let mut end = 0;
+        let mut planned = 0;
+        for i in 0..num_blocks.min(max_blocks) {
+            let addr = self.block_index.get_addr(i).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "SSTable prefetch block missing")
             })?;
-            let end = addr
+            let block_end = addr
                 .offset
                 .checked_add(addr.length as u64)
-                .and_then(|end| usize::try_from(end).ok())
+                .filter(|end| *end <= self.data_slice.len())
                 .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "SSTable block range overflow")
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SSTable prefetch block out of bounds",
+                    )
                 })?;
-            let compressed = buf.get(start..end).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "SSTable block is truncated")
+            let next_start = start.min(addr.offset);
+            let next_end = end.max(block_end);
+            if next_end - next_start > Self::PREFETCH_LEADING_MAX_BYTES {
+                break;
+            }
+            start = next_start;
+            end = next_end;
+            planned += 1;
+        }
+        if planned == 0 {
+            log::debug!("SSTable bulk prefetch skipped: no block fits the bounded input range");
+            return Ok(());
+        }
+        let all_data = self.data_slice.read_bytes_range(start..end).await?;
+        let mut inserted = 0;
+        for i in 0..planned {
+            let addr = self.block_index.get_addr(i).unwrap();
+            if self.cache.read().blocks.contains_key(&addr.offset) {
+                continue;
+            }
+            let begin = (addr.offset - start) as usize;
+            let limit = begin + addr.length as usize;
+            let compressed = all_data.get(begin..limit).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "SSTable prefetch range is truncated",
+                )
             })?;
             let decompressed = if let Some(ref dict) = self.dictionary {
                 crate::compression::decompress_with_dict_limited(
@@ -1742,9 +1930,23 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             } else {
                 crate::compression::decompress_limited(compressed, MAX_SSTABLE_BLOCK_BYTES)?
             };
+            let mut cache = self.cache.write();
+            if cache.blocks.contains_key(&addr.offset) {
+                continue;
+            }
+            if cache.blocks.len() >= cache.max_blocks
+                || cache.max_bytes.is_some_and(|budget| {
+                    decompressed.len() > budget.saturating_sub(cache.retained_bytes)
+                })
+            {
+                break;
+            }
             cache.insert(addr.offset, Arc::from(decompressed));
+            inserted += 1;
         }
-
+        log::debug!(
+            "SSTable bulk prefetch planned {planned}/{num_blocks} blocks, retained {inserted} new blocks within cache caps"
+        );
         Ok(())
     }
 

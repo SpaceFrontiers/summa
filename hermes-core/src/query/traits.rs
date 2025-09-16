@@ -14,6 +14,43 @@ pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 
 #[cfg(target_arch = "wasm32")]
 pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 'a>>> + 'a>>;
 
+/// Exact scores corresponding to one compact posting batch.
+pub type ScoreBatch = [Score; super::docset::DOC_BATCH_SIZE];
+pub type ScoreBatchMask = [u64; super::docset::DOC_BATCH_SIZE / 64];
+
+pub(super) fn fill_score_batch_scalar<S: Scorer + ?Sized>(
+    scorer: &mut S,
+    docs: &mut super::docset::DocBatch,
+    scores: &mut ScoreBatch,
+) -> usize {
+    let mut count = 0;
+    let mut doc = scorer.doc();
+    while count < docs.len() && doc != crate::structures::TERMINATED {
+        docs[count] = doc;
+        scores[count] = scorer.score();
+        count += 1;
+        doc = scorer.advance();
+    }
+    count
+}
+
+pub(super) fn score_batch_matches_scalar<S: Scorer + ?Sized>(
+    scorer: &mut S,
+    docs: &super::docset::DocBatch,
+    len: usize,
+    scores: &mut ScoreBatch,
+    matches: &mut ScoreBatchMask,
+) {
+    assert!(len <= docs.len());
+    matches.fill(0);
+    for i in 0..len {
+        if scorer.seek(docs[i]) == docs[i] {
+            scores[i] = scorer.score();
+            matches[i / 64] |= 1 << (i % 64);
+        }
+    }
+}
+
 /// Options that affect scorer construction rather than scoring semantics.
 ///
 /// Position postings can be much larger than the top-k result itself. Keeping
@@ -22,8 +59,17 @@ pub type ScorerFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<dyn Scorer + 
 /// load their own internal data.
 #[derive(Debug, Clone, Default)]
 pub struct ScorerOptions {
+    /// Internal collection scope: children traverse this field's physical IDs.
+    /// Only an opted-in query tree may receive this; collection owns translation.
+    pub(crate) physical_text_field: Option<crate::Field>,
     /// Required text clauses must expose membership before any top-k cutoff.
     pub(crate) complete_text_matches: bool,
+    /// A top-level collector may accept bounded ranked hits plus exact count.
+    /// Nested clauses must still expose complete membership.
+    pub(crate) ranked_count_limit: Option<usize>,
+    /// Membership-only collection can skip optional scoring setup. Scoring
+    /// remains valid if a nested consumer requests it (canonical fallback).
+    pub(crate) skip_scoring_setup: bool,
     /// Eligibility pushed into candidate collectors; never a scoring feature.
     pub(crate) eligibility: Option<std::sync::Arc<DocBitset>>,
     pub collect_positions: bool,
@@ -49,7 +95,10 @@ pub struct ScorerOptions {
 impl ScorerOptions {
     pub const fn with_positions() -> Self {
         Self {
+            physical_text_field: None,
             complete_text_matches: false,
+            ranked_count_limit: None,
+            skip_scoring_setup: false,
             eligibility: None,
             collect_positions: true,
             initial_threshold: 0.0,
@@ -64,7 +113,10 @@ impl ScorerOptions {
     /// space.
     pub fn without_threshold(&self) -> Self {
         Self {
+            physical_text_field: self.physical_text_field,
             complete_text_matches: self.complete_text_matches,
+            ranked_count_limit: None,
+            skip_scoring_setup: self.skip_scoring_setup,
             eligibility: self.eligibility.clone(),
             collect_positions: self.collect_positions,
             initial_threshold: 0.0,
@@ -259,6 +311,9 @@ pub struct TermQueryInfo {
     /// of a de-duplicated match); scales the term's idf, hence its scores
     /// and bounds alike. 1.0 = plain.
     pub weight: f32,
+    /// Query-owned statistics override the parent's IDF and average length.
+    /// Grouping that cannot preserve them must retain the original scorer.
+    pub global_stats: Option<std::sync::Arc<super::GlobalStats>>,
 }
 
 /// Info for MaxScore-optimizable sparse term queries
@@ -283,6 +338,9 @@ pub struct SparseTermQueryInfo {
     pub over_fetch_factor: f32,
     /// LSP/0 γ. None is depth-derived; Some(0) is exhaustive.
     pub lsp_gamma: Option<usize>,
+    pub seismic_cut: usize,
+    pub seismic_factor: f32,
+    pub exhaustive: bool,
 }
 
 /// Decomposition of a query for MaxScore optimization.
@@ -377,11 +435,19 @@ macro_rules! define_query_traits {
                 QueryDecomposition::Opaque
             }
 
+            /// Opt into one field-local physical address space for collection.
+            /// Every child must honor the internal scorer scope. Unknown/custom
+            /// queries retain logical IDs. Ranked term/union executors may keep
+            /// their existing mapping by opting in only for complete streams.
+            fn physical_text_field(&self, _reader: &SegmentReader, _complete: bool) -> Option<crate::Field> {
+                None
+            }
+
             /// Sparse terms for query-global BMP superblock planning only.
             /// Unlike scoring decomposition, this never replaces a query's
             /// scorer. A filter wrapper may expose its inner sparse query here
             /// while remaining opaque to Boolean scoring optimizations.
-            fn lsp_decomposition(&self) -> QueryDecomposition {
+            fn sparse_decomposition(&self) -> QueryDecomposition {
                 self.decompose()
             }
 
@@ -444,6 +510,32 @@ macro_rules! define_query_traits {
                 None
             }
 
+            /// A term with identical membership for count-only collection.
+            /// This does not change scoring decomposition. The collector must
+            /// still account for deleted rows, chunks and missing metadata.
+            fn count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
+                match self.decompose() {
+                    QueryDecomposition::TextTerm(info) => Some(info),
+                    _ => None,
+                }
+            }
+
+            /// A term-equivalent cardinality alongside an exact score-only
+            /// text rank plan. Unlike the count-only hint, opaque/custom plans
+            /// do not opt in automatically. The collector still validates the
+            /// indexed document space, deletions, mappings and cardinality gate.
+            fn ranked_count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
+                match self.decompose() {
+                    QueryDecomposition::TextTerm(info) => Some(info),
+                    _ => None,
+                }
+            }
+
+            /// Opt into top-level bounded conjunction results with an exact
+            /// count. Wrappers must not inherit this automatically: they may
+            /// consume or hide a child's cardinality. Defaults to streaming.
+            fn supports_ranked_conjunction_count(&self) -> bool { false }
+
             /// For a query that is a pure disjunction of sub-queries (a Boolean
             /// query with only SHOULD clauses and no boost), the clauses.
             ///
@@ -462,14 +554,118 @@ macro_rules! define_query_traits {
             /// Score for current document
             fn score(&self) -> Score;
 
+            /// Opt into final-score bounds before candidate confirmation.
+            /// Only a top-level ranked collector may use this to omit matches;
+            /// complete collectors and enclosing scorers retain exact traversal.
+            fn supports_candidate_score_bounds(&self) -> bool { false }
+
+            /// Conservative upper bound on `score()` if the current candidate
+            /// confirms. Must include floating-point rounding and use this
+            /// scorer's final score space. The default never excludes a score.
+            fn candidate_score_upper_bound(&self) -> Score { Score::INFINITY }
+
+            /// Whether this scorer's batches remain useful when every match
+            /// needs a predicate check. Composite scorers can amortize child
+            /// traversal; leaf bitmap production alone may cost more than a
+            /// scalar pass once filtering visits every set bit again.
+            fn supports_filtered_windows(&self) -> bool { false }
+
+            /// Whether compact exact-score batches amortize this scorer's work.
+            fn supports_score_batches(&self) -> bool { false }
+
+            /// Consume a sorted exact prefix, leaving the first unconsumed match.
+            /// Scores correspond to docs[..returned_len]; zero means exhausted.
+            fn fill_score_batch(&mut self, docs: &mut super::docset::DocBatch, scores: &mut ScoreBatch) -> usize {
+                fill_score_batch_scalar(self, docs, scores)
+            }
+
+            /// Probe sorted unique docs[..len] without changing their order.
+            /// Set membership bits index the input and its exact final scores.
+            /// The cursor remains at or beyond the last probe.
+            fn score_batch_matches(&mut self, docs: &super::docset::DocBatch, len: usize,
+                scores: &mut ScoreBatch, matches: &mut ScoreBatchMask) {
+                score_batch_matches_scalar(self, docs, len, scores, matches)
+            }
+
+            /// Whether score-only collection benefits from bounded score windows.
+            /// Positions still require ordinary per-document collection.
+            fn supports_score_windows(&self) -> bool { false }
+
+            /// Add each exact match's final score in a forward-only document window.
+            /// Existing values and membership bits are retained. A nested scorer
+            /// contributes its complete score once, preserving its summation order.
+            /// The cursor ends at the first match after the interval. Previously
+            /// consumed matches stay consumed, just as with `fill_doc_window`.
+            fn accumulate_score_window(
+                &mut self,
+                base: DocId,
+                scores: &mut [Score; super::docset::DOC_WINDOW_SIZE as usize],
+                bits: &mut super::docset::DocWindow,
+            ) {
+                let end = base.saturating_add(super::docset::DOC_WINDOW_SIZE);
+                let mut doc = self.seek(base);
+                while doc < end {
+                    let offset = (doc - base) as usize;
+                    scores[offset] += self.score();
+                    bits[offset / 64] |= 1u64 << (offset % 64);
+                    doc = self.advance();
+                }
+            }
+
+            /// Replace a bounded window of exact scores and membership. Only
+            /// advertised through `supports_score_windows` when it is beneficial.
+            fn fill_score_window(
+                &mut self,
+                base: DocId,
+                scores: &mut [Score; super::docset::DOC_WINDOW_SIZE as usize],
+                bits: &mut super::docset::DocWindow,
+            ) {
+                scores.fill(0.0);
+                bits.fill(0);
+                let end = base.saturating_add(super::docset::DOC_WINDOW_SIZE);
+                let mut doc = self.seek(base);
+                while doc < end {
+                    let offset = (doc - base) as usize;
+                    scores[offset] = self.score();
+                    bits[offset / 64] |= 1u64 << (offset % 64);
+                    doc = self.advance();
+                }
+            }
+
+            /// Move to the next candidate for a two-phase conjunction. Candidates
+            /// may be false positives: the caller must call `confirm_candidate`
+            /// before consuming scores or positions. Ordinary DocSet traversal
+            /// remains exact, including after candidate traversal. The default
+            /// simply advances the exact stream.
+            fn advance_candidate(&mut self) -> DocId {
+                self.advance()
+            }
+
+            /// Seek a candidate at or beyond `target`, without skipping any
+            /// possible exact match. See `advance_candidate` for the protocol.
+            fn seek_candidate(&mut self, target: DocId) -> DocId {
+                self.seek(target)
+            }
+
+            /// Exactly verify the current candidate without advancing it.
+            /// Repeated calls must agree unless cancellation ends the stream.
+            /// Only a true result permits consuming its score/positions.
+            fn confirm_candidate(&mut self) -> bool {
+                self.doc() != crate::structures::TERMINATED
+            }
+
             /// Get matched positions for the current document (if available)
             /// Returns (field_id, positions) pairs where positions are encoded as per PositionMode
             fn matched_positions(&self) -> Option<MatchedPositions> {
                 None
             }
 
+            /// Exact cardinality supplied only for an explicit top-level ranked
+            /// count request. Ordinary streams and ranked scorers return None.
+            fn exact_ranked_count(&self) -> Option<u64> { None }
+
             /// Standalone fast path for scorers that wrap an already ranked
-            /// top-k list (vector executors). When this query is the top-level
+            /// top-k list (text and vector executors). When this query is the top-level
             /// query of a segment search, the caller may take the ranked list
             /// directly instead of walking the DocSet and re-collecting it:
             /// the result must be exactly what a `TopKCollector` of size
@@ -528,12 +724,16 @@ impl Query for Box<dyn Query> {
         (**self).text_terms(out)
     }
 
+    fn physical_text_field(&self, reader: &SegmentReader, complete: bool) -> Option<crate::Field> {
+        (**self).physical_text_field(reader, complete)
+    }
+
     fn decompose(&self) -> QueryDecomposition {
         (**self).decompose()
     }
 
-    fn lsp_decomposition(&self) -> QueryDecomposition {
-        (**self).lsp_decomposition()
+    fn sparse_decomposition(&self) -> QueryDecomposition {
+        (**self).sparse_decomposition()
     }
 
     fn is_filter(&self) -> bool {
@@ -550,6 +750,18 @@ impl Query for Box<dyn Query> {
 
     fn should_children(&self) -> Option<&[std::sync::Arc<dyn Query>]> {
         (**self).should_children()
+    }
+
+    fn count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
+        (**self).count_equivalent_term()
+    }
+
+    fn ranked_count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
+        (**self).ranked_count_equivalent_term()
+    }
+
+    fn supports_ranked_conjunction_count(&self) -> bool {
+        (**self).supports_ranked_conjunction_count()
     }
 
     fn bitset_cardinality_estimate(&self, reader: &SegmentReader) -> Option<u64> {

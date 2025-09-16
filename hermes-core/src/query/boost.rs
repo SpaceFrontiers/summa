@@ -28,6 +28,21 @@ impl std::fmt::Display for BoostQuery {
     }
 }
 
+/// Options for the inner scorer of a boosted query. A boost other than one
+/// changes the score space, so the outer threshold must not be applied. A
+/// non-positive boost reverses or flattens the inner order, so a ranked
+/// handoff pre-truncated by positive BM25 order would return the wrong
+/// candidates; request the complete stream instead.
+fn boosted_inner_options(boost: f32, options: super::ScorerOptions) -> super::ScorerOptions {
+    if boost == 1.0 {
+        options
+    } else if boost <= 0.0 {
+        options.for_required_clause()
+    } else {
+        options.without_threshold()
+    }
+}
+
 impl BoostQuery {
     pub fn new(query: impl Query + 'static, boost: f32) -> Self {
         Self {
@@ -38,6 +53,10 @@ impl BoostQuery {
 }
 
 impl Query for BoostQuery {
+    fn physical_text_field(&self, reader: &SegmentReader, complete: bool) -> Option<crate::Field> {
+        self.inner
+            .physical_text_field(reader, complete || self.boost <= 0.0)
+    }
     fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
         self.inner.candidate_query()?.boosted(self.boost)
     }
@@ -60,11 +79,7 @@ impl Query for BoostQuery {
                     "boost must be a finite number".to_string(),
                 ));
             }
-            let inner_options = if boost == 1.0 {
-                options
-            } else {
-                options.without_threshold()
-            };
+            let inner_options = boosted_inner_options(boost, options);
             let inner_scorer = inner
                 .scorer_with_options(reader, limit, inner_options)
                 .await?;
@@ -96,11 +111,7 @@ impl Query for BoostQuery {
                 "boost must be a finite number".to_string(),
             ));
         }
-        let inner_options = if self.boost == 1.0 {
-            options
-        } else {
-            options.without_threshold()
-        };
+        let inner_options = boosted_inner_options(self.boost, options);
         let inner_scorer = self
             .inner
             .scorer_sync_with_options(reader, limit, inner_options)?;

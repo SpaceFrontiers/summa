@@ -6,24 +6,26 @@ use serde::{Deserialize, Serialize};
 ///
 /// Determines the on-disk layout and query execution strategy:
 /// - **MaxScore**: Per-dimension variable-size blocks (DAAT — document-at-a-time).
-///   Default, optimal for general sparse retrieval with block-max pruning.
-/// - **Bmp**: Fixed doc_id range blocks (BAAT — block-at-a-time).
+///   Supports general sparse retrieval with block-max pruning.
+/// - **Bmp** (default): Fixed doc_id range blocks (BAAT — block-at-a-time).
 ///   Based on Mallia, Suel & Tonellotto (SIGIR 2024). Divides the document
 ///   space into fixed-size blocks and processes them in decreasing upper-bound
 ///   order, enabling aggressive early termination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SparseFormat {
     /// Per-dimension variable-size blocks (existing format, DAAT MaxScore)
-    #[default]
     MaxScore,
     /// Fixed doc_id range blocks (BMP, BAAT block-at-a-time)
+    #[default]
     Bmp,
+    /// Geometric summaries nominate candidates; exact forward values score them.
+    Seismic,
 }
 
-impl SparseFormat {
-    fn is_default(&self) -> bool {
-        *self == Self::MaxScore
-    }
+// Metadata written before BMP became the constructor default omitted MaxScore.
+// Keep that serialized meaning stable; new writers always name their backend.
+fn legacy_sparse_format() -> SparseFormat {
+    SparseFormat::MaxScore
 }
 
 /// Size of the index (term/dimension ID) in sparse vectors
@@ -65,22 +67,21 @@ impl IndexSize {
 
 /// Quantization format for sparse vector weights
 ///
-/// Research-validated compression/effectiveness trade-offs (Pati, 2025):
-/// - **UInt8**: 4x compression, ~1-2% nDCG@10 loss (RECOMMENDED for production)
-/// - **Float16**: 2x compression, <1% nDCG@10 loss
-/// - **Float32**: No compression, baseline effectiveness
-/// - **UInt4**: 8x compression, ~3-5% nDCG@10 loss (experimental)
+/// Float32 preserves input precision. Smaller weight representations trade
+/// precision for payload size; retrieval quality depends on the workload and
+/// must be measured. Integer encodings also store per-vector scale and offset,
+/// so total index-size savings differ from the ratio of weight widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum WeightQuantization {
     /// Full 32-bit float precision
     #[default]
     Float32 = 0,
-    /// 16-bit float (half precision) - 2x compression, <1% effectiveness loss
+    /// 16-bit float (half precision), two bytes per weight
     Float16 = 1,
-    /// 8-bit unsigned integer with scale factor - 4x compression, ~1-2% effectiveness loss (RECOMMENDED)
+    /// 8-bit integer codes with per-vector scale and offset
     UInt8 = 2,
-    /// 4-bit unsigned integer with scale factor (packed, 2 per byte) - 8x compression, ~3-5% effectiveness loss
+    /// 4-bit integer codes (two per byte) with per-vector scale and offset
     UInt4 = 3,
 }
 
@@ -114,7 +115,7 @@ pub enum QueryWeighting {
     #[default]
     One,
     /// Terms weighted by IDF (inverse document frequency) from global index statistics
-    /// Uses ln(N/df) where N = total docs, df = docs containing dimension
+    /// Uses ln(N/df), where N counts field values and df counts values containing the dimension
     Idf,
     /// Terms weighted by pre-computed IDF from model's idf.json file
     /// Loaded from HuggingFace model repo. No fallback to global stats.
@@ -175,6 +176,22 @@ pub struct SparseQueryConfig {
     /// schedule from retrieval depth; `Some(0)` requests exhaustive traversal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsp_gamma: Option<usize>,
+    /// Number of query dimensions used to nominate Seismic candidates.
+    #[serde(default = "default_seismic_cut")]
+    pub seismic_cut: usize,
+    /// Summary pruning factor for Seismic candidate generation.
+    #[serde(default = "default_seismic_factor")]
+    pub seismic_factor: f32,
+    /// Scan shared forward values exhaustively, bypassing approximate nominations.
+    #[serde(default)]
+    pub exhaustive: bool,
+}
+
+fn default_seismic_cut() -> usize {
+    10
+}
+fn default_seismic_factor() -> f32 {
+    0.85
 }
 
 fn default_heap_factor() -> f32 {
@@ -192,7 +209,50 @@ impl Default for SparseQueryConfig {
             pruning: None,
             min_query_dims: 4,
             lsp_gamma: None,
+            seismic_cut: default_seismic_cut(),
+            seismic_factor: default_seismic_factor(),
+            exhaustive: false,
         }
+    }
+}
+
+/// Bounded Seismic build policy. Merge copies runs without rebuilding them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SeismicConfig {
+    /// Maximum retained nominations per term in a newly built run.
+    pub postings: usize,
+    /// Target number of nominations per geometric cluster.
+    pub cluster_size: usize,
+    /// Fraction of summary magnitude retained for candidate ranking.
+    pub summary_energy: f32,
+}
+
+impl Default for SeismicConfig {
+    fn default() -> Self {
+        Self {
+            postings: 4096,
+            cluster_size: 64,
+            summary_energy: 0.4,
+        }
+    }
+}
+
+impl SeismicConfig {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.postings == 0 || self.postings > 65_536 {
+            return Err("seismic postings must be in 1..=65536".into());
+        }
+        if self.cluster_size == 0 || self.cluster_size > self.postings {
+            return Err("seismic cluster_size must be in 1..=postings".into());
+        }
+        if !self.summary_energy.is_finite()
+            || !(0.0..=1.0).contains(&self.summary_energy)
+            || self.summary_energy == 0.0
+        {
+            return Err("seismic summary_energy must be in (0, 1]".into());
+        }
+        Ok(())
     }
 }
 
@@ -206,9 +266,11 @@ impl Default for SparseQueryConfig {
 /// production default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseVectorConfig {
-    /// Index format: MaxScore (DAAT) or BMP (BAAT)
-    #[serde(default, skip_serializing_if = "SparseFormat::is_default")]
+    /// Index format: BMP (default), MaxScore, or Seismic
+    #[serde(default = "legacy_sparse_format")]
     pub format: SparseFormat,
+    #[serde(default)]
+    pub seismic: SeismicConfig,
     /// Size of dimension/term indices
     pub index_size: IndexSize,
     /// Quantization for weights (see WeightQuantization docs for trade-offs)
@@ -333,7 +395,8 @@ fn default_min_terms() -> usize {
 impl Default for SparseVectorConfig {
     fn default() -> Self {
         Self {
-            format: SparseFormat::MaxScore,
+            format: SparseFormat::Bmp,
+            seismic: SeismicConfig::default(),
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
@@ -367,6 +430,7 @@ impl SparseVectorConfig {
     pub fn splade() -> Self {
         Self {
             format: SparseFormat::MaxScore,
+            seismic: SeismicConfig::default(),
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt8,
             weight_threshold: 0.01, // Remove ~30-50% of low-weight postings
@@ -385,6 +449,9 @@ impl SparseVectorConfig {
                 pruning: None,
                 min_query_dims: 4,
                 lsp_gamma: None,
+                seismic_cut: default_seismic_cut(),
+                seismic_factor: default_seismic_factor(),
+                exhaustive: false,
             }),
 
             dims: None,
@@ -402,6 +469,7 @@ impl SparseVectorConfig {
     pub fn splade_bmp() -> Self {
         Self {
             format: SparseFormat::Bmp,
+            seismic: SeismicConfig::default(),
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt8,
             weight_threshold: 0.01,
@@ -420,6 +488,9 @@ impl SparseVectorConfig {
                 pruning: None,
                 min_query_dims: 4,
                 lsp_gamma: None,
+                seismic_cut: default_seismic_cut(),
+                seismic_factor: default_seismic_factor(),
+                exhaustive: false,
             }),
 
             dims: Some(105879),
@@ -431,14 +502,13 @@ impl SparseVectorConfig {
     /// Compact config: Maximum compression (experimental)
     ///
     /// Uses aggressive UInt4 quantization for smallest possible index size.
-    /// Expected trade-offs:
-    /// - Index size: ~10-15% of Float32 baseline
-    /// - Effectiveness: ~3-5% nDCG@10 loss
+    /// Measure payload size and retrieval quality on the target workload.
     ///
     /// Recommended for: Memory-constrained environments, cache-heavy workloads
     pub fn compact() -> Self {
         Self {
             format: SparseFormat::MaxScore,
+            seismic: SeismicConfig::default(),
             index_size: IndexSize::U16,
             weight_quantization: WeightQuantization::UInt4,
             weight_threshold: 0.02, // Slightly higher threshold for UInt4
@@ -457,6 +527,9 @@ impl SparseVectorConfig {
                 pruning: Some(0.15),      // Keep top 15% of query dims
                 min_query_dims: 4,
                 lsp_gamma: None,
+                seismic_cut: default_seismic_cut(),
+                seismic_factor: default_seismic_factor(),
+                exhaustive: false,
             }),
 
             dims: None,
@@ -471,6 +544,7 @@ impl SparseVectorConfig {
     pub fn full_precision() -> Self {
         Self {
             format: SparseFormat::MaxScore,
+            seismic: SeismicConfig::default(),
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float32,
             weight_threshold: 0.0,
@@ -491,15 +565,13 @@ impl SparseVectorConfig {
     /// Conservative config: Mild optimizations, minimal effectiveness loss
     ///
     /// Balances compression and effectiveness with conservative defaults.
-    /// Expected trade-offs:
-    /// - Index size: ~40-50% of Float32 baseline
-    /// - Query latency: ~20-30% faster
-    /// - Effectiveness: <1% nDCG@10 loss
+    /// Measure payload size, latency and retrieval quality on the target workload.
     ///
     /// Recommended for: Production deployments prioritizing effectiveness
     pub fn conservative() -> Self {
         Self {
             format: SparseFormat::MaxScore,
+            seismic: SeismicConfig::default(),
             index_size: IndexSize::U32,
             weight_quantization: WeightQuantization::Float16,
             weight_threshold: 0.005, // Minimal pruning
@@ -518,6 +590,9 @@ impl SparseVectorConfig {
                 pruning: None,            // No fraction-based pruning
                 min_query_dims: 4,
                 lsp_gamma: None,
+                seismic_cut: default_seismic_cut(),
+                seismic_factor: default_seismic_factor(),
+                exhaustive: false,
             }),
 
             dims: None,
@@ -548,13 +623,21 @@ impl SparseVectorConfig {
 
     /// Bytes per entry (index + weight)
     pub fn bytes_per_entry(&self) -> f32 {
-        self.index_size.bytes() as f32 + self.weight_quantization.bytes_per_weight()
+        let dimension_bytes = if self.format == SparseFormat::Seismic {
+            4
+        } else {
+            self.index_size.bytes()
+        };
+        dimension_bytes as f32 + self.weight_quantization.bytes_per_weight()
     }
 
     /// Serialize config to a single byte.
     ///
     /// Layout: bits 7-4 = IndexSize, bit 3 = format (0=MaxScore, 1=BMP), bits 2-0 = WeightQuantization
     pub fn to_byte(&self) -> u8 {
+        if self.format == SparseFormat::Seismic {
+            return 0x50 | self.weight_quantization as u8;
+        }
         let format_bit = if self.format == SparseFormat::Bmp {
             0x08
         } else {
@@ -568,6 +651,17 @@ impl SparseVectorConfig {
     /// Note: weight_threshold, block_size, bmp_block_size, and query_config are not
     /// serialized in the byte — they come from the schema.
     pub fn from_byte(b: u8) -> Option<Self> {
+        if b & 0xfc == 0x50 {
+            return Some(Self {
+                format: SparseFormat::Seismic,
+                index_size: IndexSize::U32,
+                weight_quantization: WeightQuantization::from_u8(b & 3)?,
+                ..Default::default()
+            });
+        }
+        if b & 0xc0 != 0 {
+            return None;
+        }
         let index_size = IndexSize::from_u8((b >> 4) & 0x03)?;
         let format = if b & 0x08 != 0 {
             SparseFormat::Bmp
@@ -577,6 +671,7 @@ impl SparseVectorConfig {
         let weight_quantization = WeightQuantization::from_u8(b & 0x07)?;
         Some(Self {
             format,
+            seismic: SeismicConfig::default(),
             index_size,
             weight_quantization,
             weight_threshold: 0.0,
@@ -762,5 +857,86 @@ impl From<SparseVector> for Vec<(u32, f32)> {
             .into_iter()
             .map(|e| (e.dim_id, e.weight))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod seismic_config_tests {
+    use super::*;
+
+    #[test]
+    fn sparse_default_uses_bmp_with_bounded_seismic_settings() {
+        let config = SparseVectorConfig::default();
+        assert_eq!(config.format, SparseFormat::Bmp);
+        config.seismic.validate().unwrap();
+        let query = SparseQueryConfig::default();
+        assert!(!query.exhaustive);
+        assert_eq!(query.seismic_cut, 10);
+        let restored: SparseVectorConfig =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(restored.format, SparseFormat::Bmp);
+    }
+
+    #[test]
+    fn every_sparse_format_roundtrips_independently_of_the_default() {
+        for format in [
+            SparseFormat::Bmp,
+            SparseFormat::MaxScore,
+            SparseFormat::Seismic,
+        ] {
+            for weight_quantization in [
+                WeightQuantization::Float32,
+                WeightQuantization::Float16,
+                WeightQuantization::UInt8,
+                WeightQuantization::UInt4,
+            ] {
+                let config = SparseVectorConfig {
+                    format,
+                    weight_quantization,
+                    ..Default::default()
+                };
+                let decoded = SparseVectorConfig::from_byte(config.to_byte()).unwrap();
+                assert_eq!(decoded.format, format);
+                assert_eq!(decoded.weight_quantization, weight_quantization);
+                let json = serde_json::to_vec(&config).unwrap();
+                assert_eq!(
+                    serde_json::from_slice::<SparseVectorConfig>(&json).unwrap(),
+                    config
+                );
+            }
+        }
+        assert!(SparseVectorConfig::from_byte(0x90).is_none());
+    }
+
+    #[test]
+    fn seismic_build_settings_reject_unbounded_or_nonfinite_work() {
+        for config in [
+            SeismicConfig {
+                postings: 0,
+                ..SeismicConfig::default()
+            },
+            SeismicConfig {
+                postings: 65_537,
+                ..SeismicConfig::default()
+            },
+            SeismicConfig {
+                cluster_size: 0,
+                ..SeismicConfig::default()
+            },
+            SeismicConfig {
+                cluster_size: 4097,
+                ..SeismicConfig::default()
+            },
+            SeismicConfig {
+                summary_energy: f32::NAN,
+                ..SeismicConfig::default()
+            },
+            SeismicConfig {
+                summary_energy: 0.0,
+                ..SeismicConfig::default()
+            },
+        ] {
+            assert!(config.validate().is_err());
+        }
     }
 }

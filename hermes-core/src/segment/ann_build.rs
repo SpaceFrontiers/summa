@@ -8,6 +8,8 @@
 /// recognizes it to fail with an actionable message. Never reuse it.
 pub const LEGACY_IVF_PQ_TYPE: u8 = 2;
 pub const FLAT_TYPE: u8 = 4;
+/// Document lookup into the same field's exact binary ANN codes.
+pub const EXACT_LOCATIONS_TYPE: u8 = 11;
 /// Binary IVF payload backed by an index-level global quantizer.
 pub const BINARY_IVF_TYPE: u8 = 6;
 /// TurboQuant flat payload; training-free, no global artifacts.
@@ -219,7 +221,8 @@ pub(crate) fn build_scann_ah(
     builder.add_batch(doc_id_ordinals, vectors)?;
     let payload = builder.finish(doc_count)?;
     let mut bytes = Vec::new();
-    crate::segment::ann_disk::write_built_scann(&payload, &mut bytes).map_err(crate::Error::Io)?;
+    crate::segment::ann_disk::write_built_scann(&payload, &mut bytes, None)
+        .map_err(crate::Error::Io)?;
     Ok(bytes)
 }
 
@@ -586,7 +589,7 @@ mod tests {
         monolithic.add_batch(&labels, &codes).unwrap();
         assert_eq!(payload, monolithic.finish(64).unwrap());
         let mut bytes = Vec::new();
-        crate::segment::ann_disk::write_built_scann(&payload, &mut bytes).unwrap();
+        crate::segment::ann_disk::write_built_scann(&payload, &mut bytes, None).unwrap();
         let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannBinary, 64).unwrap();
         assert_eq!(
             disk.header().vector_count,

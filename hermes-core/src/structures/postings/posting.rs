@@ -6,19 +6,29 @@
 //! - `Rounded` (default): widths rounded to 0/8/16/32 bits, SIMD widening
 //! - `Packed`: exact bit widths (BP128 style)
 //! - `Pfor`: exact width with patched exceptions (OptP4D style)
+//! - `Simd4x`: four-lane library packing and integrated strict document deltas
 //!
 //! The codec is stored per block in the header, so a single list (for example
 //! the output of a merge) may mix codecs.
+
+mod impacts;
+mod reader;
+mod validation;
+use impacts::{ImpactBuilder, ImpactTable};
+
+pub(crate) use reader::PostingListReader;
+
 #[cfg(feature = "native")]
 mod compact;
 #[cfg(feature = "native")]
 pub(crate) use compact::{PostingBlockSource, PostingStreamWriter};
 
 use byteorder::{LittleEndian, WriteBytesExt};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
-use super::opt_p4d::{find_optimal_bit_width, pack_with_exceptions, unpack_with_exceptions};
-use super::posting_common::{read_vint, write_vint};
+use super::bitpacking4x;
+use super::horizontal_bp128::{pack_block_n as pack_bits, unpack_block_n as unpack_bits};
+use super::opt_p4d::{find_optimal_bit_width, pack_with_exceptions};
 use crate::DocId;
 use crate::directories::OwnedBytes;
 use crate::structures::simd;
@@ -37,6 +47,9 @@ pub enum PostingCodec {
     /// Exact width with up to 10 % patched exceptions (OptP4D style):
     /// smallest, ~30 % slower decoding than `Rounded`.
     Pfor = 2,
+    /// Library SIMD packing of full blocks with exact horizontal tails.
+    /// Documents use gap-minus-one values; positions use the same block policy.
+    Simd4x = 3,
 }
 
 impl PostingCodec {
@@ -44,21 +57,16 @@ impl PostingCodec {
     const HEADER_SHIFT: u32 = 6;
     const WIDTH_MASK: u8 = 0x3F;
 
+    /// The two-bit id field is fully assigned. A fifth codec cannot be
+    /// signalled in the block header: it needs a footer flag plus an
+    /// `INDEX_META_FORMAT_VERSION` bump (see `docs/posting-codecs.md`).
     fn from_header_byte(doc_bits: u8) -> io::Result<(Self, u8)> {
         let width = doc_bits & Self::WIDTH_MASK;
         let codec = match doc_bits >> Self::HEADER_SHIFT {
             0 => PostingCodec::Rounded,
             1 => PostingCodec::Packed,
             2 => PostingCodec::Pfor,
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "posting block uses unknown codec id {other}; the index was written by a \
-                         newer Hermes"
-                    ),
-                ));
-            }
+            _ => PostingCodec::Simd4x,
         };
         if width > 32 {
             return Err(io::Error::new(
@@ -67,6 +75,16 @@ impl PostingCodec {
             ));
         }
         Ok((codec, width))
+    }
+
+    /// The four-lane kernel requires a full block. Existing rounded tails
+    /// avoid scalar bit extraction on short runs preserved by normal merge.
+    pub(super) fn for_count(self, count: usize) -> Self {
+        if self == Self::Simd4x && count < BLOCK_SIZE {
+            Self::Rounded
+        } else {
+            self
+        }
     }
 
     fn header_byte(self, width: u8) -> u8 {
@@ -78,6 +96,7 @@ impl PostingCodec {
             "rounded" | "default" => Some(PostingCodec::Rounded),
             "packed" | "bp128" | "exact" => Some(PostingCodec::Packed),
             "pfor" | "optp4d" | "patched" => Some(PostingCodec::Pfor),
+            "simd4x" => Some(PostingCodec::Simd4x),
             _ => None,
         }
     }
@@ -89,6 +108,7 @@ impl std::fmt::Display for PostingCodec {
             PostingCodec::Rounded => "rounded",
             PostingCodec::Packed => "packed",
             PostingCodec::Pfor => "pfor",
+            PostingCodec::Simd4x => "simd4x",
         })
     }
 }
@@ -98,66 +118,6 @@ impl std::fmt::Display for PostingCodec {
 #[inline]
 fn packed_bytes(count: usize, width: u8) -> usize {
     (count * width as usize).div_ceil(8)
-}
-
-/// Pack `values` at `width` bits each (little-endian bit order) into `out`.
-fn pack_bits(values: &[u32], width: u8, out: &mut Vec<u8>) {
-    if width == 0 || values.is_empty() {
-        return;
-    }
-    if width == 32 {
-        for &v in values {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        return;
-    }
-    let start = out.len();
-    out.resize(start + packed_bytes(values.len(), width), 0);
-    let dst = &mut out[start..];
-    let mut bit_pos = 0usize;
-    for &v in values {
-        let mut acc = (v as u64) << (bit_pos & 7);
-        let mut byte = bit_pos >> 3;
-        let mut remaining = (bit_pos & 7) + width as usize;
-        while remaining > 0 {
-            dst[byte] |= acc as u8;
-            acc >>= 8;
-            byte += 1;
-            remaining = remaining.saturating_sub(8);
-        }
-        bit_pos += width as usize;
-    }
-}
-
-/// Unpack `count` values of `width` bits from `input` into `out`.
-///
-/// Reads stay inside `input` (no over-read past the block), so this is safe
-/// on the last block of a mapped stream.
-fn unpack_bits(input: &[u8], width: u8, out: &mut [u32], count: usize) {
-    match width {
-        0 => out[..count].fill(0),
-        8 => simd::unpack_8bit(input, out, count),
-        16 => simd::unpack_16bit(input, out, count),
-        32 => simd::unpack_32bit(input, out, count),
-        _ => {
-            let mask = (1u64 << width) - 1;
-            let mut bit_pos = 0usize;
-            for slot in out[..count].iter_mut() {
-                let byte = bit_pos >> 3;
-                let word = if byte + 8 <= input.len() {
-                    u64::from_le_bytes(input[byte..byte + 8].try_into().unwrap())
-                } else {
-                    let mut word = 0u64;
-                    for (i, &b) in input[byte..].iter().enumerate() {
-                        word |= (b as u64) << (i * 8);
-                    }
-                    word
-                };
-                *slot = ((word >> (bit_pos & 7)) & mask) as u32;
-                bit_pos += width as usize;
-            }
-        }
-    }
 }
 
 // ── Patched packing (Pfor codec) ─────────────────────────────────────────
@@ -183,48 +143,32 @@ fn pfor_payload_len(input: &[u8], count: usize, width: u8) -> io::Result<usize> 
     Ok(1 + packed_bytes(count, width) + n_exceptions * 5)
 }
 
+/// Decode one `Pfor` array: the packed low bits, then each `(pos, high)`
+/// exception patched in place straight from the table. No per-decode scratch.
 fn unpack_pfor(input: &[u8], width: u8, out: &mut [u32], count: usize) -> io::Result<()> {
     let n_exceptions = *input
         .first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "posting block truncated"))?
         as usize;
-    let packed_len = packed_bytes(count, width);
-    let table_at = 1 + packed_len;
-    if input.len() < table_at + n_exceptions * 5 {
+    let table_at = 1 + packed_bytes(count, width);
+    let table_end = table_at + n_exceptions * 5;
+    if input.len() < table_end {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "posting block exception table truncated",
         ));
     }
-    let packed = &input[1..table_at];
-    let mut exceptions: [(u8, u32); 128] = [(0, 0); 128];
-    for (i, entry) in input[table_at..table_at + n_exceptions * 5]
-        .chunks_exact(5)
-        .enumerate()
-        .take(128)
-    {
-        exceptions[i] = (
-            entry[0],
-            u32::from_le_bytes([entry[1], entry[2], entry[3], entry[4]]),
-        );
-    }
-    if width == 0 {
-        // No low bits: every non-zero value is an exception carrying the value.
-        out[..count].fill(0);
-        for &(pos, value) in &exceptions[..n_exceptions.min(128)] {
-            if (pos as usize) < count {
-                out[pos as usize] = value;
+    let out = &mut out[..count];
+    unpack_bits(&input[1..table_at], width, out, count);
+    if width < 32 {
+        for entry in input[table_at..table_end].chunks_exact(5) {
+            let pos = entry[0] as usize;
+            let high = u32::from_le_bytes([entry[1], entry[2], entry[3], entry[4]]);
+            if pos < count {
+                out[pos] |= high << width;
             }
         }
-        return Ok(());
     }
-    unpack_with_exceptions(
-        packed,
-        width,
-        &exceptions[..n_exceptions.min(128)],
-        count,
-        out,
-    );
     Ok(())
 }
 
@@ -288,40 +232,6 @@ impl PostingList {
     pub fn iter(&self) -> impl Iterator<Item = &Posting> {
         self.postings.iter()
     }
-
-    /// Serialize to bytes using delta encoding and varint
-    pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Write number of postings
-        write_vint(writer, self.postings.len() as u64)?;
-
-        let mut prev_doc_id = 0u32;
-        for posting in &self.postings {
-            // Delta encode doc_id
-            let delta = posting.doc_id - prev_doc_id;
-            write_vint(writer, delta as u64)?;
-            write_vint(writer, posting.term_freq as u64)?;
-            prev_doc_id = posting.doc_id;
-        }
-
-        Ok(())
-    }
-
-    /// Deserialize from bytes
-    pub fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
-        let count = read_vint(reader)? as usize;
-        let mut postings = Vec::with_capacity(count);
-
-        let mut prev_doc_id = 0u32;
-        for _ in 0..count {
-            let delta = read_vint(reader)? as u32;
-            let term_freq = read_vint(reader)? as u32;
-            let doc_id = prev_doc_id + delta;
-            postings.push(Posting { doc_id, term_freq });
-            prev_doc_id = doc_id;
-        }
-
-        Ok(Self { postings })
-    }
 }
 
 /// Iterator over posting list that supports seeking
@@ -364,6 +274,7 @@ impl<'a> PostingListIterator<'a> {
 
     /// Seek to first doc_id >= target (binary search on remaining postings)
     pub fn seek(&mut self, target: DocId) -> DocId {
+        crate::observe::search_work!(posting_seeks += 1);
         let remaining = &self.postings[self.position..];
         let offset = remaining.partition_point(|p| p.doc_id < target);
         self.position += offset;
@@ -425,6 +336,53 @@ const FLAG_LEN_BOUNDS: u32 = 2;
 /// the group's blocks), so an executor can skip eight blocks at once.
 const FLAG_L1_BOUNDS: u32 = 4;
 
+/// Optional downward-rounded length/TF minima, L0 then L1, after cursors.
+const FLAG_RATIO_BOUNDS: u32 = 8;
+
+/// Optional complete frequency/length envelopes after ratio metadata.
+const FLAG_IMPACT_BOUNDS: u32 = 16;
+/// Combined impact directory: L0 records followed by L1 group records.
+const FLAG_GROUP_IMPACT_BOUNDS: u32 = 32;
+const FLAG_COMPACT_HEADERS: u32 = 64;
+const FLAG_SHORT_CURSORS: u32 = 128;
+
+fn append_ratio_groups(ratios: &mut Vec<u8>, blocks: usize) {
+    for start in (0..blocks).step_by(L1_INTERVAL) {
+        let ratio = (start..(start + L1_INTERVAL).min(blocks))
+            .map(|i| read_ratio(ratios, i))
+            .fold(f32::INFINITY, f32::min);
+        ratios.extend_from_slice(&ratio.to_le_bytes());
+    }
+}
+
+#[inline]
+fn read_ratio(bytes: &[u8], index: usize) -> f32 {
+    let at = index * 4;
+    f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+fn validate_ratios(bytes: &[u8]) -> io::Result<()> {
+    if bytes.chunks_exact(4).any(|value| {
+        let ratio = f32::from_le_bytes(value.try_into().unwrap());
+        !ratio.is_finite() || ratio < 0.0
+    }) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid posting ratio bound",
+        ));
+    }
+    Ok(())
+}
+
+fn lower_length_ratio(length: u32, tf: u32) -> f32 {
+    if tf == 0 {
+        return 0.0;
+    }
+    // f64 represents both inputs exactly. One f32 step down covers division
+    // and conversion rounding, including an exactly representable quotient.
+    ((length as f64 / tf as f64) as f32).next_down().max(0.0)
+}
+
 /// Superblock bounds derived from packed L0 words: per `L1_INTERVAL` group
 /// the maximum `max_tf` and minimum `min_len` of its blocks.
 fn group_bounds_from_l0(l0: &[u8], l0_count: usize) -> Vec<u32> {
@@ -468,7 +426,10 @@ fn unpack_bounds(word: u32, packed: bool) -> (u32, Option<u32>) {
 const CURSOR_SIZE: usize = 8;
 
 /// Parsed footer of either format plus the derived section layout.
+#[derive(Clone, Copy)]
 struct Footer {
+    compact_headers: bool,
+    short_cursors: bool,
     stream_len: usize,
     l0_count: usize,
     l1_count: usize,
@@ -478,6 +439,9 @@ struct Footer {
     has_cursors: bool,
     len_bounds: bool,
     l1_bounds: bool,
+    ratio_bounds: bool,
+    impact_bounds: bool,
+    group_impact_bounds: bool,
     min_len: u32,
 }
 
@@ -520,7 +484,25 @@ impl Footer {
         } else {
             (0, 0, 0)
         };
+        if flags
+            & !(FLAG_POS_CURSORS
+                | FLAG_LEN_BOUNDS
+                | FLAG_L1_BOUNDS
+                | FLAG_RATIO_BOUNDS
+                | FLAG_IMPACT_BOUNDS
+                | FLAG_GROUP_IMPACT_BOUNDS
+                | FLAG_COMPACT_HEADERS
+                | FLAG_SHORT_CURSORS)
+            != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown posting footer flags",
+            ));
+        }
         let footer = Self {
+            compact_headers: flags & FLAG_COMPACT_HEADERS != 0,
+            short_cursors: flags & FLAG_SHORT_CURSORS != 0,
             stream_len,
             l0_count,
             l1_count,
@@ -530,10 +512,26 @@ impl Footer {
             has_cursors: flags & FLAG_POS_CURSORS != 0,
             len_bounds: flags & FLAG_LEN_BOUNDS != 0,
             l1_bounds: flags & FLAG_L1_BOUNDS != 0,
+            ratio_bounds: flags & FLAG_RATIO_BOUNDS != 0,
+            impact_bounds: flags & FLAG_IMPACT_BOUNDS != 0,
+            group_impact_bounds: flags & FLAG_GROUP_IMPACT_BOUNDS != 0,
             min_len,
         };
+        if footer.short_cursors && (!footer.has_cursors || footer.total_positions > u32::MAX as u64)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid short position cursors",
+            ));
+        }
+        if footer.group_impact_bounds && (!footer.impact_bounds || !footer.l1_bounds) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "group impacts require L0 impacts and L1 bounds",
+            ));
+        }
         let end = l0_count
-            .checked_mul(L0_SIZE)
+            .checked_mul(L0_SIZE + if footer.compact_headers { 4 } else { 0 })
             .and_then(|n| {
                 l1_count
                     .checked_mul(L1_SIZE + if footer.l1_bounds { 4 } else { 0 })
@@ -541,14 +539,46 @@ impl Footer {
             })
             .and_then(|n| {
                 l0_count
-                    .checked_mul(if footer.has_cursors { CURSOR_SIZE } else { 0 })
+                    .checked_mul(if footer.has_cursors {
+                        footer.cursor_size()
+                    } else {
+                        0
+                    })
                     .and_then(|m| n.checked_add(m))
             })
+            .and_then(|n| {
+                if footer.ratio_bounds {
+                    l0_count
+                        .checked_add(l1_count)
+                        .and_then(|m| m.checked_mul(4))
+                        .and_then(|m| n.checked_add(m))
+                } else {
+                    Some(n)
+                }
+            })
             .and_then(|n| n.checked_add(stream_len));
-        if end.is_none_or(|end| end > total_len.saturating_sub(raw.len() - f)) {
+        let footer_offset = total_len.saturating_sub(raw.len() - f);
+        if end.is_none_or(|end| {
+            if footer.impact_bounds {
+                !footer.len_bounds
+                    || !footer.ratio_bounds
+                    || l0_count
+                        .checked_add(if footer.group_impact_bounds {
+                            l1_count
+                        } else {
+                            0
+                        })
+                        .and_then(|n| n.checked_add(1))
+                        .and_then(|n| n.checked_mul(4))
+                        .and_then(|n| n.checked_add(end))
+                        .is_none_or(|minimum| minimum > footer_offset)
+            } else {
+                end != footer_offset
+            }
+        }) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "posting list sections exceed the footer offset",
+                "posting list sections do not match the footer offset",
             ));
         }
         Ok(footer)
@@ -557,19 +587,46 @@ impl Footer {
     fn l0_start(&self) -> usize {
         self.stream_len
     }
+    fn impact_record_count(&self) -> usize {
+        self.l0_count
+            + if self.group_impact_bounds {
+                self.l1_count
+            } else {
+                0
+            }
+    }
     fn l0_end(&self) -> usize {
         self.l0_start() + self.l0_count * L0_SIZE
     }
+    fn l1_start(&self) -> usize {
+        self.l0_end()
+            + if self.compact_headers {
+                self.l0_count * 4
+            } else {
+                0
+            }
+    }
+    fn cursor_size(&self) -> usize {
+        if self.short_cursors { 4 } else { CURSOR_SIZE }
+    }
     fn l1_end(&self) -> usize {
-        self.l0_end() + self.l1_count * L1_SIZE
+        self.l1_start() + self.l1_count * L1_SIZE
     }
     fn l1_bounds_end(&self) -> usize {
         self.l1_end() + if self.l1_bounds { self.l1_count * 4 } else { 0 }
     }
+    fn ratios_end(&self) -> usize {
+        self.cursors_end()
+            + if self.ratio_bounds {
+                (self.l0_count + self.l1_count) * 4
+            } else {
+                0
+            }
+    }
     fn cursors_end(&self) -> usize {
         self.l1_bounds_end()
             + if self.has_cursors {
-                self.l0_count * CURSOR_SIZE
+                self.l0_count * self.cursor_size()
             } else {
                 0
             }
@@ -590,6 +647,48 @@ fn read_l0(bytes: &[u8], idx: usize) -> (u32, u32, u32, u32) {
     let offset = u32::from_le_bytes([b[8], b[9], b[10], b[11]]);
     let bounds = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
     (first_doc, last_doc, offset, bounds)
+}
+
+/// Content check that structural admission cannot make without decoding:
+/// a block's ids must be strictly increasing and span exactly its L0 range.
+/// Branch-free so the 128-value pass vectorises on the decode path.
+#[inline]
+fn verify_block_docs(
+    docs: &[u32],
+    first: u32,
+    last: u32,
+    byte_gaps: Option<&[u8]>,
+    strict_gap_width: Option<u8>,
+) -> bool {
+    let ordered = if strict_gap_width.is_some_and(|width| width <= 25) {
+        // Gap-minus-one guarantees positive gaps. At most 127 gaps of at
+        // most 2^25 sum to less than 2^32: a wrap would put the endpoint
+        // below the start. Ordered matching endpoints prove every prefix.
+        // Full blocks' reserved first gap is checked before this call.
+        debug_assert!(docs.len() <= BLOCK_SIZE);
+        true
+    } else if let Some(gaps) = byte_gaps {
+        // At most 127 byte-sized gaps: their sum cannot wrap a u32 more than
+        // once. Nonzero gaps and matching ordered endpoints therefore prove
+        // strict ordering without re-reading the decoded u32 array.
+        debug_assert_eq!(gaps.len() + 1, docs.len());
+        let mut nonzero = true;
+        for &gap in gaps {
+            nonzero &= gap != 0;
+        }
+        nonzero
+    } else {
+        let mut ordered = true;
+        for pair in docs.windows(2) {
+            ordered &= pair[0] < pair[1];
+        }
+        ordered
+    };
+    ordered
+        && first <= last
+        && last != TERMINATED
+        && docs.first() == Some(&first)
+        && docs.last() == Some(&last)
 }
 
 /// Write a compact L0 entry.
@@ -629,7 +728,12 @@ fn encode_block_arrays(
     tfs: &[u32],
     stream: &mut Vec<u8>,
 ) -> EncodedBlock {
+    let codec = codec.for_count(tfs.len());
     match codec {
+        PostingCodec::Simd4x => EncodedBlock {
+            doc_bits: codec.header_byte(bitpacking4x::encode_gaps(deltas, stream)),
+            tf_bits: bitpacking4x::encode(tfs, stream),
+        },
         PostingCodec::Rounded => {
             let max_delta = deltas.iter().copied().max().unwrap_or(0);
             let doc_bits = simd::round_bit_width(simd::bits_needed(max_delta));
@@ -681,10 +785,17 @@ fn encode_block_arrays(
 
 #[derive(Debug, Clone)]
 pub struct BlockPostingList {
+    compact_headers: bool,
+    short_cursors: bool,
+    /// Explicit deserialization checks decoded ordering; segment queries trust the writer.
+    verify_content: bool,
+    /// First decoding failure detected in this immutable segment reader.
+    content_error: Option<std::sync::Arc<std::sync::OnceLock<usize>>>,
     /// Block data stream (packed blocks laid out sequentially).
     stream: OwnedBytes,
     /// Level-0 skip entries: `(first_doc, last_doc, offset, max_weight)` × `l0_count`.
-    /// 16 bytes per entry. Supports O(1) random access by block index.
+    /// 16 bytes per entry, followed by compact descriptors when present.
+    /// Supports O(1) random access without another reference-counted slice.
     l0_bytes: OwnedBytes,
     /// Number of blocks (= number of L0 entries).
     l0_count: usize,
@@ -694,6 +805,10 @@ pub struct BlockPostingList {
     /// Packed `(max_tf, min_len)` per L1 group (superblock bounds); empty
     /// for legacy lists.
     l1_bounds: Vec<u32>,
+    /// Optional L0 then L1 length/TF ratio minima, borrowed from index bytes.
+    ratios: Option<OwnedBytes>,
+    /// Validated borrowed offsets and compact integer envelope records.
+    impacts: Option<ImpactTable>,
     /// Total posting count.
     doc_count: u32,
     /// Max TF across all blocks.
@@ -727,7 +842,7 @@ impl BlockPostingList {
     /// [packed tfs: count × bytes_per_value(tf_bits)]
     /// ```
     pub fn from_posting_list(list: &PostingList) -> io::Result<Self> {
-        Self::build(list, false, None, PostingCodec::Rounded)
+        Self::build(list, false, None, PostingCodec::Rounded, false, false)
     }
 
     /// Build a list using an explicit per-block codec.
@@ -735,15 +850,7 @@ impl BlockPostingList {
         list: &PostingList,
         codec: PostingCodec,
     ) -> io::Result<Self> {
-        Self::build(list, false, None, codec)
-    }
-
-    /// Like [`Self::from_posting_list`], for a term whose positions are
-    /// stored as a v2 stream: every block records how many positions precede
-    /// it (the cumulative term frequency), so a reader can address the
-    /// stream from the doc postings alone.
-    pub fn from_posting_list_with_positions(list: &PostingList) -> io::Result<Self> {
-        Self::build(list, true, None, PostingCodec::Rounded)
+        Self::build(list, false, None, codec, false, false)
     }
 
     /// Build with position cursors on demand and, when `length_of` is given,
@@ -755,7 +862,14 @@ impl BlockPostingList {
         with_positions: bool,
         length_of: Option<&dyn Fn(DocId) -> u32>,
     ) -> io::Result<Self> {
-        Self::build(list, with_positions, length_of, PostingCodec::Rounded)
+        Self::build(
+            list,
+            with_positions,
+            length_of,
+            PostingCodec::Rounded,
+            false,
+            false,
+        )
     }
 
     /// Build with the complete physical layout policy used by index writers.
@@ -765,7 +879,34 @@ impl BlockPostingList {
         length_of: Option<&dyn Fn(DocId) -> u32>,
         codec: PostingCodec,
     ) -> io::Result<Self> {
-        Self::build(list, with_positions, length_of, codec)
+        Self::build(list, with_positions, length_of, codec, false, false)
+    }
+
+    /// Build optional score-independent ratio bounds, retaining the existing codec.
+    pub fn from_posting_list_with_ratio_bounds(
+        list: &PostingList,
+        with_positions: bool,
+        length_of: Option<&dyn Fn(DocId) -> u32>,
+        codec: PostingCodec,
+    ) -> io::Result<Self> {
+        Self::build(list, with_positions, length_of, codec, true, false)
+    }
+
+    /// Build complete, bounded frequency/length envelopes for multi-block lists.
+    /// Implies ratio bounds and requires the effective scoring-length callback.
+    pub fn from_posting_list_with_impact_bounds(
+        list: &PostingList,
+        with_positions: bool,
+        length_of: Option<&dyn Fn(DocId) -> u32>,
+        codec: PostingCodec,
+    ) -> io::Result<Self> {
+        if length_of.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "impact bounds require scoring lengths",
+            ));
+        }
+        Self::build(list, with_positions, length_of, codec, true, true)
     }
 
     fn build(
@@ -773,7 +914,27 @@ impl BlockPostingList {
         with_positions: bool,
         length_of: Option<&dyn Fn(DocId) -> u32>,
         codec: PostingCodec,
+        ratio_bounds: bool,
+        impact_bounds: bool,
     ) -> io::Result<Self> {
+        // Persisted scoring lengths saturate at `MAX_CHUNK_LENGTH`. A ratio or
+        // envelope derived from a longer raw length would be over-tight, so
+        // the constructor caps here rather than trusting every caller to.
+        let capped = |id: DocId| {
+            length_of
+                .map_or(0, |length_of| length_of(id))
+                .min(crate::segment::chunk_map::MAX_CHUNK_LENGTH)
+        };
+        let length_of: Option<&dyn Fn(DocId) -> u32> = if ratio_bounds {
+            length_of.map(|_| &capped as &dyn Fn(DocId) -> u32)
+        } else {
+            length_of
+        };
+        let mut ratios = (ratio_bounds && length_of.is_some()).then(Vec::new);
+        let mut impacts = (impact_bounds && length_of.is_some() && list.len() > BLOCK_SIZE)
+            .then(|| ImpactBuilder::with_groups(list.len().div_ceil(BLOCK_SIZE)))
+            .transpose()?;
+        let mut points = [(0u32, 0u32); BLOCK_SIZE];
         let mut stream: Vec<u8> = Vec::new();
         let mut l0_buf: Vec<u8> = Vec::new();
         let mut l1_docs: Vec<u32> = Vec::new();
@@ -842,6 +1003,27 @@ impl BlockPostingList {
                     .unwrap_or(1)
             });
             list_min_len = list_min_len.min(block_min_len);
+            if let Some(ratios) = &mut ratios {
+                let ratio = block
+                    .iter()
+                    .map(|p| lower_length_ratio(length_of.unwrap()(p.doc_id).max(1), p.term_freq))
+                    .fold(f32::INFINITY, f32::min);
+                ratios.extend_from_slice(&ratio.to_le_bytes());
+            }
+            if let Some(impacts) = &mut impacts {
+                for (point, posting) in points.iter_mut().zip(block) {
+                    let length = length_of.unwrap()(posting.doc_id);
+                    *point = (
+                        posting.term_freq,
+                        if length == 0 {
+                            posting.term_freq
+                        } else {
+                            length
+                        },
+                    );
+                }
+                impacts.append_points(&mut points[..count])?;
+            }
             write_l0(
                 &mut l0_buf,
                 base_doc_id,
@@ -869,13 +1051,27 @@ impl BlockPostingList {
             l1_docs.push(last_doc);
         }
         let l1_bounds = group_bounds_from_l0(&l0_buf, l0_count);
+        if let Some(ratios) = &mut ratios {
+            append_ratio_groups(ratios, l0_count);
+        }
 
         Ok(Self {
+            compact_headers: false,
+            short_cursors: false,
+            verify_content: true,
+            content_error: None,
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
             l0_count,
             l1_docs,
             l1_bounds,
+            ratios: ratios.map(OwnedBytes::new),
+            impacts: if let Some(mut impacts) = impacts {
+                impacts.append_groups_with(l0_count, |_| Ok(None))?;
+                impacts.finish()
+            } else {
+                None
+            },
             doc_count: postings.len() as u32,
             max_tf,
             pos_cursors: with_positions.then(|| OwnedBytes::new(cursors)),
@@ -902,20 +1098,83 @@ impl BlockPostingList {
     ///          + total_positions(8) + flags(4) + min_len(4) + magic(4) = 44 bytes]
     /// ```
     pub fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&self.stream)?;
-        writer.write_all(&self.l0_bytes)?;
+        self.serialize_layout(writer, self.compact_headers)
+    }
+
+    /// Representation policy retained by explicit field reordering.
+    #[cfg(all(feature = "native", test))]
+    pub(crate) fn has_compact_headers(&self) -> bool {
+        self.compact_headers
+    }
+
+    /// Separate fixed-width block metadata from payload pages. Pfor retains
+    /// its existing framing because exception structure lives in the payload.
+    pub fn serialize_compact<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let compact =
+            (0..self.num_blocks()).all(|i| self.block_codec(i) != Some(PostingCodec::Pfor));
+        self.serialize_layout(writer, compact)
+    }
+
+    fn serialize_layout<W: Write>(&self, writer: &mut W, compact: bool) -> io::Result<()> {
+        let source_header = if self.compact_headers { 0 } else { 8 };
+        let output_header = if compact { 0 } else { 8 };
+        let output_offset =
+            |offset: usize, block: usize| offset - block * source_header + block * output_header;
+        let stream_len = output_offset(self.stream.len(), self.num_blocks());
+        if compact == self.compact_headers {
+            writer.write_all(&self.stream)?;
+        } else {
+            for i in 0..self.num_blocks() {
+                if !compact {
+                    writer.write_all(&self.block_header(i))?;
+                }
+                writer.write_all(self.block_payload(i))?;
+            }
+        }
+        for i in 0..self.num_blocks() {
+            let (first, last, offset, bounds) = self.read_l0_entry(i);
+            writer.write_u32::<LittleEndian>(first)?;
+            writer.write_u32::<LittleEndian>(last)?;
+            writer.write_u32::<LittleEndian>(
+                u32::try_from(output_offset(offset as usize, i))
+                    .map_err(|_| io::Error::other("posting stream offset overflow"))?,
+            )?;
+            writer.write_u32::<LittleEndian>(bounds)?;
+        }
+        if compact {
+            for i in 0..self.num_blocks() {
+                let header = self.block_header(i);
+                writer.write_all(&header[..2])?;
+                writer.write_all(&header[6..])?;
+            }
+        }
         for &doc in &self.l1_docs {
             writer.write_u32::<LittleEndian>(doc)?;
         }
         for &bounds in &self.l1_bounds {
             writer.write_u32::<LittleEndian>(bounds)?;
         }
-        if let Some(cursors) = &self.pos_cursors {
-            writer.write_all(cursors)?;
+        let short_cursors =
+            compact && self.pos_cursors.is_some() && self.total_positions <= u32::MAX as u64;
+        if self.pos_cursors.is_some() {
+            for i in 0..self.num_blocks() {
+                let cursor = self.pos_cursor(i).unwrap();
+                if short_cursors {
+                    writer.write_u32::<LittleEndian>(cursor as u32)?;
+                } else {
+                    writer.write_u64::<LittleEndian>(cursor)?;
+                }
+            }
+        }
+        if let Some(ratios) = &self.ratios {
+            writer.write_all(ratios)?;
+        }
+        if let Some(impacts) = &self.impacts {
+            writer.write_all(impacts.bytes())?;
         }
         Self::write_footer(
             writer,
-            self.stream.len() as u64,
+            stream_len as u64,
             self.l0_count,
             self.l1_docs.len(),
             self.doc_count,
@@ -924,6 +1183,11 @@ impl BlockPostingList {
             self.pos_cursors.is_some(),
             self.len_bounds.then_some(self.min_len),
             !self.l1_bounds.is_empty(),
+            self.ratios.is_some(),
+            self.impacts.is_some(),
+            self.has_group_impact_bounds(),
+            if compact { FLAG_COMPACT_HEADERS } else { 0 }
+                | if short_cursors { FLAG_SHORT_CURSORS } else { 0 },
         )
     }
 
@@ -939,6 +1203,10 @@ impl BlockPostingList {
         has_cursors: bool,
         min_len: Option<u32>,
         l1_bounds: bool,
+        ratio_bounds: bool,
+        impact_bounds: bool,
+        group_impact_bounds: bool,
+        layout_flags: u32,
     ) -> io::Result<()> {
         writer.write_u64::<LittleEndian>(stream_len)?;
         writer.write_u32::<LittleEndian>(l0_count as u32)?;
@@ -946,7 +1214,7 @@ impl BlockPostingList {
         writer.write_u32::<LittleEndian>(doc_count)?;
         writer.write_u32::<LittleEndian>(max_tf)?;
         writer.write_u64::<LittleEndian>(total_positions)?;
-        let mut flags = 0u32;
+        let mut flags = layout_flags;
         if has_cursors {
             flags |= FLAG_POS_CURSORS;
         }
@@ -955,6 +1223,15 @@ impl BlockPostingList {
         }
         if l1_bounds {
             flags |= FLAG_L1_BOUNDS;
+        }
+        if ratio_bounds {
+            flags |= FLAG_RATIO_BOUNDS;
+        }
+        if impact_bounds {
+            flags |= FLAG_IMPACT_BOUNDS;
+        }
+        if group_impact_bounds {
+            flags |= FLAG_GROUP_IMPACT_BOUNDS;
         }
         writer.write_u32::<LittleEndian>(flags)?;
         writer.write_u32::<LittleEndian>(min_len.unwrap_or(0))?;
@@ -971,8 +1248,32 @@ impl BlockPostingList {
     /// Stream, L0 and cursors are sliced from the source without copying.
     /// L1 is extracted into a `Vec<u32>` for SIMD-friendly access (tiny: ≤ N/8 entries).
     pub fn deserialize_zero_copy(raw: OwnedBytes) -> io::Result<Self> {
-        let footer = Footer::parse(raw.as_slice())?;
-        let l1_docs = Self::extract_l1_docs(&raw[footer.l0_end()..], footer.l1_count);
+        let footer = Self::validate_bytes(&raw)?;
+        Ok(Self::from_layout(raw, footer))
+    }
+
+    fn validate_bytes(raw: &[u8]) -> io::Result<Footer> {
+        let footer = Footer::parse(raw)?;
+        validation::validate_list(raw, &footer)?;
+        if footer.ratio_bounds {
+            validate_ratios(&raw[footer.cursors_end()..footer.ratios_end()])?;
+        }
+        if footer.impact_bounds {
+            ImpactTable::validate(
+                &raw[footer.ratios_end()..raw.len() - FOOTER_V2_SIZE],
+                footer.impact_record_count(),
+            )?;
+        }
+        Ok(footer)
+    }
+
+    // The footer proves section extents. The owning query reader trusts interior
+    // contents; explicit deserialization additionally validates them.
+    fn from_layout(raw: OwnedBytes, footer: Footer) -> Self {
+        let ratios = footer
+            .ratio_bounds
+            .then(|| raw.slice(footer.cursors_end()..footer.ratios_end()));
+        let l1_docs = Self::extract_l1_docs(&raw[footer.l1_start()..], footer.l1_count);
         let l1_bounds = if footer.l1_bounds {
             Self::extract_l1_docs(&raw[footer.l1_end()..], footer.l1_count)
         } else {
@@ -982,25 +1283,116 @@ impl BlockPostingList {
             .has_cursors
             .then(|| raw.slice(footer.l1_bounds_end()..footer.cursors_end()));
 
-        Ok(Self {
+        Self {
+            compact_headers: footer.compact_headers,
+            short_cursors: footer.short_cursors,
+            verify_content: true,
+            content_error: None,
             stream: raw.slice(0..footer.stream_len),
-            l0_bytes: raw.slice(footer.l0_start()..footer.l0_end()),
+            l0_bytes: raw.slice(footer.l0_start()..footer.l1_start()),
             l0_count: footer.l0_count,
             l1_docs,
             l1_bounds,
+            ratios,
+            impacts: footer.impact_bounds.then(|| {
+                ImpactTable::from_validated(
+                    raw.slice(footer.ratios_end()..raw.len() - FOOTER_V2_SIZE),
+                    footer.impact_record_count(),
+                )
+            }),
             doc_count: footer.doc_count,
             max_tf: footer.max_tf,
             pos_cursors,
             total_positions: footer.total_positions,
             len_bounds: footer.len_bounds,
             min_len: footer.min_len,
-        })
+        }
     }
 
     /// Minimum scoring-unit length over the list, when the list stores
     /// length bounds (`None` for legacy lists).
     pub fn min_len(&self) -> Option<u32> {
         self.len_bounds.then_some(self.min_len)
+    }
+
+    /// Whether optional ratio bounds are present (zero entries mean unknown).
+    pub fn has_ratio_bounds(&self) -> bool {
+        self.ratios.is_some()
+    }
+
+    /// Whether the list stores an impact directory, including unknown records.
+    pub fn has_impact_bounds(&self) -> bool {
+        self.impacts.is_some()
+    }
+
+    /// Envelope diagnostics: absent directory/out-of-range is `None`; an unknown
+    /// record is `Some(0)`; a populated record has 1–8 complete frontier points.
+    pub fn block_impact_point_count(&self, block: usize) -> Option<usize> {
+        if block >= self.l0_count {
+            return None;
+        }
+        self.impacts
+            .as_ref()?
+            .record(block)
+            .map(|r| r.first().copied().unwrap_or(0) as usize)
+    }
+
+    /// Whether the optional table also stores group envelopes.
+    pub fn has_group_impact_bounds(&self) -> bool {
+        self.impacts
+            .as_ref()
+            .is_some_and(|t| t.record_count() > self.l0_count)
+    }
+
+    /// Point count for the group containing this block; zero means unknown.
+    #[cfg(test)]
+    pub fn group_impact_point_count(&self, block: usize) -> Option<usize> {
+        if block >= self.l0_count {
+            return None;
+        }
+        self.impacts
+            .as_ref()?
+            .record(self.l0_count + block / L1_INTERVAL)
+            .map(|r| r.first().copied().unwrap_or(0) as usize)
+    }
+
+    pub(crate) fn group_impact_minimum(
+        &self,
+        block: usize,
+        reciprocal: f64,
+        ratio: f64,
+    ) -> Option<f64> {
+        if block >= self.l0_count {
+            return None;
+        }
+        self.impacts
+            .as_ref()?
+            .minimum(self.l0_count + block / L1_INTERVAL, reciprocal, ratio)
+    }
+
+    pub(crate) fn block_impact_minimum(
+        &self,
+        block: usize,
+        reciprocal: f64,
+        ratio: f64,
+    ) -> Option<f64> {
+        if block >= self.l0_count {
+            return None;
+        }
+        self.impacts.as_ref()?.minimum(block, reciprocal, ratio)
+    }
+
+    /// Conservative minimum length/TF for a block, or zero if unavailable.
+    pub(crate) fn block_length_ratio(&self, block: usize) -> f32 {
+        self.ratios
+            .as_ref()
+            .map_or(0.0, |ratios| read_ratio(ratios, block))
+    }
+
+    pub(crate) fn group_length_ratio(&self, block: usize) -> f32 {
+        self.ratios.as_ref().map_or(0.0, |ratios| {
+            read_ratio(ratios, self.l0_count + block / L1_INTERVAL)
+        })
     }
 
     /// `(max_tf, min_len)` of a block; `min_len` is `None` for legacy lists.
@@ -1010,7 +1402,15 @@ impl BlockPostingList {
             return None;
         }
         let (_, _, _, word) = self.read_l0_entry(block_idx);
-        Some(unpack_bounds(word, self.len_bounds))
+        let (max_tf, min_len) = unpack_bounds(word, self.len_bounds);
+        // A packed maximum can saturate; the full-width list maximum remains
+        // a conservative bound. Never interpret saturation as an actual TF.
+        let max_tf = if self.len_bounds && max_tf == u16::MAX as u32 {
+            max_tf.max(self.max_tf)
+        } else {
+            max_tf
+        };
+        Some((max_tf, min_len))
     }
 
     /// `(max_tf, min_len)` over the L1 group (`L1_INTERVAL` blocks) that
@@ -1022,6 +1422,11 @@ impl BlockPostingList {
         }
         let word = *self.l1_bounds.get(block_idx / L1_INTERVAL)?;
         let (max_tf, min_len) = unpack_bounds(word, true);
+        let max_tf = if max_tf == u16::MAX as u32 {
+            max_tf.max(self.max_tf)
+        } else {
+            max_tf
+        };
         Some((max_tf, min_len.unwrap_or(1)))
     }
 
@@ -1054,6 +1459,30 @@ impl BlockPostingList {
         self.pos_cursors.is_some()
     }
 
+    #[inline]
+    fn block_header(&self, block: usize) -> [u8; 8] {
+        let (first, _, offset, _) = self.read_l0_entry(block);
+        if self.compact_headers {
+            let headers = &self.l0_bytes[self.l0_count * L0_SIZE..];
+            let mut header = [0; 8];
+            header[..2].copy_from_slice(&headers[block * 4..block * 4 + 2]);
+            header[2..6].copy_from_slice(&first.to_le_bytes());
+            header[6..].copy_from_slice(&headers[block * 4 + 2..block * 4 + 4]);
+            header
+        } else {
+            self.stream[offset as usize..offset as usize + 8]
+                .try_into()
+                .unwrap()
+        }
+    }
+
+    #[inline]
+    fn block_payload(&self, block: usize) -> &[u8] {
+        let offset = self.read_l0_entry(block).2 as usize;
+        let header = if self.compact_headers { 0 } else { 8 };
+        &self.stream[offset + header..offset + self.block_len(block)]
+    }
+
     /// Number of values in the term's position stream (0 without cursors).
     pub fn total_positions(&self) -> u64 {
         self.total_positions
@@ -1063,10 +1492,15 @@ impl BlockPostingList {
     #[inline]
     pub fn pos_cursor(&self, block_idx: usize) -> Option<u64> {
         let cursors = self.pos_cursors.as_ref()?;
-        let p = block_idx * CURSOR_SIZE;
-        cursors
-            .get(p..p + CURSOR_SIZE)
-            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        let size = if self.short_cursors { 4 } else { CURSOR_SIZE };
+        let p = block_idx * size;
+        cursors.get(p..p + size).map(|b| {
+            if self.short_cursors {
+                u64::from(u32::from_le_bytes(b.try_into().unwrap()))
+            } else {
+                u64::from_le_bytes(b.try_into().unwrap())
+            }
+        })
     }
 
     /// Extract L1 last_doc values from raw LE bytes into a Vec<u32>.
@@ -1101,11 +1535,49 @@ impl BlockPostingList {
     /// Concatenate blocks from multiple posting lists with doc_id remapping.
     /// This is O(num_blocks) instead of O(num_postings).
     pub fn concatenate_blocks(sources: &[(BlockPostingList, u32)]) -> io::Result<Self> {
+        // Admission precedes all output allocation/copying; typed sources have
+        // already validated payloads, but their requested rebasing is new.
+        let mut previous_last = None;
+        let mut total_docs = 0u32;
+        let mut total_positions = 0u64;
+        for (source, offset) in sources {
+            validation::validate_remap(
+                &source.l0_bytes,
+                source.l0_count,
+                *offset,
+                &mut previous_last,
+            )?;
+            total_docs = total_docs.checked_add(source.doc_count).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "merged posting count overflow")
+            })?;
+            total_positions = total_positions
+                .checked_add(source.total_positions)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "merged position cursor overflow",
+                    )
+                })?;
+        }
         let mut stream: Vec<u8> = Vec::new();
         let mut l0_buf: Vec<u8> = Vec::new();
         let mut l1_docs: Vec<u32> = Vec::new();
         let mut l0_count = 0usize;
-        let mut total_docs = 0u32;
+        let mut ratios = sources
+            .iter()
+            .any(|(s, _)| s.has_ratio_bounds())
+            .then(Vec::new);
+        let mut impacts = if sources.iter().any(|(s, _)| s.has_impact_bounds()) {
+            let blocks = sources
+                .iter()
+                .try_fold(0usize, |n, (s, _)| n.checked_add(s.num_blocks()))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "impact block count overflow")
+                })?;
+            Some(ImpactBuilder::with_groups(blocks)?)
+        } else {
+            None
+        };
         let mut max_tf = 0u32;
         let all_cursors = sources.iter().all(|(s, _)| s.has_position_cursors());
         if !all_cursors && sources.iter().any(|(s, _)| s.has_position_cursors()) {
@@ -1122,17 +1594,27 @@ impl BlockPostingList {
             max_tf = max_tf.max(source.max_tf);
             min_len = min_len.min(source.min_len().unwrap_or(1));
             for block_idx in 0..source.num_blocks() {
+                if let Some(impacts) = &mut impacts {
+                    impacts.append(
+                        source
+                            .impacts
+                            .as_ref()
+                            .and_then(|t| t.record(block_idx))
+                            .unwrap_or(&[]),
+                    )?;
+                }
+                if let Some(ratios) = &mut ratios {
+                    ratios.extend_from_slice(&source.block_length_ratio(block_idx).to_le_bytes());
+                }
                 if all_cursors {
                     let cursor = source.pos_cursor(block_idx).unwrap_or(0) + positions_before;
                     cursors.extend_from_slice(&cursor.to_le_bytes());
                 }
-                let (first_doc, last_doc, offset, word) = source.read_l0_entry(block_idx);
+                let (first_doc, last_doc, _, word) = source.read_l0_entry(block_idx);
                 let (block_max_tf, block_min_len) = unpack_bounds(word, source.len_bounds);
                 let bounds = pack_bounds(block_max_tf, block_min_len.unwrap_or(1));
-                let blk_size = source.block_len(block_idx);
-                let block_bytes = &source.stream[offset as usize..offset as usize + blk_size];
-
-                let count = u16::from_le_bytes(block_bytes[0..2].try_into().unwrap());
+                let header = source.block_header(block_idx);
+                let count = u16::from_le_bytes(header[..2].try_into().unwrap());
                 if stream.len() > u32::MAX as usize {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1144,7 +1626,8 @@ impl BlockPostingList {
                 // Write patched header + copy packed arrays verbatim
                 stream.write_u16::<LittleEndian>(count)?;
                 stream.write_u32::<LittleEndian>(first_doc + doc_offset)?;
-                stream.extend_from_slice(&block_bytes[6..]);
+                stream.extend_from_slice(&header[6..]);
+                stream.extend_from_slice(source.block_payload(block_idx));
 
                 let new_last = last_doc + doc_offset;
                 write_l0(
@@ -1155,7 +1638,6 @@ impl BlockPostingList {
                     bounds,
                 );
                 l0_count += 1;
-                total_docs += count as u32;
 
                 if l0_count.is_multiple_of(L1_INTERVAL) {
                     l1_docs.push(new_last);
@@ -1170,17 +1652,50 @@ impl BlockPostingList {
             l1_docs.push(last_doc);
         }
         let l1_bounds = group_bounds_from_l0(&l0_buf, l0_count);
+        if let Some(ratios) = &mut ratios {
+            append_ratio_groups(ratios, l0_count);
+        }
 
         Ok(Self {
+            compact_headers: false,
+            short_cursors: false,
+            verify_content: true,
+            content_error: None,
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
             l0_count,
             l1_docs,
             l1_bounds,
+            ratios: ratios.map(OwnedBytes::new),
+            impacts: if let Some(mut impacts) = impacts {
+                let mut source = 0;
+                let mut base = 0;
+                impacts.append_groups_with(l0_count, |range| {
+                    while base + sources[source].0.num_blocks() <= range.start {
+                        base += sources[source].0.num_blocks();
+                        source += 1;
+                    }
+                    let list = &sources[source].0;
+                    let local = range.start - base;
+                    let record = if local.is_multiple_of(L1_INTERVAL)
+                        && range.end - base == (local + L1_INTERVAL).min(list.num_blocks())
+                    {
+                        list.impacts
+                            .as_ref()
+                            .and_then(|t| t.record(list.l0_count + local / L1_INTERVAL))
+                    } else {
+                        None
+                    };
+                    Ok(record)
+                })?;
+                impacts.finish()
+            } else {
+                None
+            },
             doc_count: total_docs,
             max_tf,
             pos_cursors: all_cursors.then(|| OwnedBytes::new(cursors)),
-            total_positions: if all_cursors { positions_before } else { 0 },
+            total_positions: if all_cursors { total_positions } else { 0 },
             len_bounds: true,
             min_len: if min_len == u32::MAX { 1 } else { min_len },
         })
@@ -1197,9 +1712,9 @@ impl BlockPostingList {
     ///
     /// Returns `(doc_count, bytes_written)`.
     ///
-    /// Returns `Error::Corruption` if any source is shorter than its footer:
-    /// metas are paired with sources positionally, so a short/corrupt source
-    /// must fail loudly instead of misassigning every subsequent source.
+    /// Preflights all source headers/directories and remapped document ranges
+    /// before writing. Corrupt sources, overlapping ranges, or arithmetic
+    /// overflow return `Error::Corruption`, including the single-source copy path.
     pub fn concatenate_streaming<W: Write>(
         sources: &[(&[u8], u32)], // (serialized_bytes, doc_offset)
         writer: &mut W,
@@ -1208,14 +1723,33 @@ impl BlockPostingList {
         let mut total_docs = 0u32;
         let mut merged_max_tf = 0u32;
         let mut merged_min_len = u32::MAX;
+        let mut previous_last = None;
+        let mut total_positions = 0u64;
 
-        for (source_index, (raw, _)) in sources.iter().enumerate() {
-            let footer = Footer::parse(raw).map_err(|e| {
+        for (source_index, (raw, offset)) in sources.iter().enumerate() {
+            let invalid_source = |error: io::Error| {
                 crate::Error::Corruption(format!(
-                    "posting list source {source_index} has an invalid footer: {e}"
+                    "posting list source {source_index} is invalid: {error}"
                 ))
-            })?;
-            total_docs += footer.doc_count;
+            };
+            // The zero-offset copy shortcut also needs validated payloads.
+            // This checks headers/directories; it never decodes postings.
+            let footer = Self::validate_bytes(raw).map_err(invalid_source)?;
+            validation::validate_remap(
+                &raw[footer.l0_start()..footer.l0_end()],
+                footer.l0_count,
+                *offset,
+                &mut previous_last,
+            )
+            .map_err(invalid_source)?;
+            total_docs = total_docs
+                .checked_add(footer.doc_count)
+                .ok_or_else(|| crate::Error::Corruption("merged posting count overflow".into()))?;
+            total_positions = total_positions
+                .checked_add(footer.total_positions)
+                .ok_or_else(|| {
+                    crate::Error::Corruption("merged position cursor overflow".into())
+                })?;
             merged_max_tf = merged_max_tf.max(footer.max_tf);
             merged_min_len = merged_min_len.min(if footer.len_bounds { footer.min_len } else { 1 });
             metas.push(footer);
@@ -1228,6 +1762,9 @@ impl BlockPostingList {
             return Ok((metas[0].doc_count, sources[0].0.len()));
         }
 
+        let compact_output = !metas.is_empty() && metas.iter().all(|meta| meta.compact_headers);
+        let short_cursors = compact_output && total_positions <= u32::MAX as u64;
+        let mut out_headers = Vec::new();
         let all_cursors = metas.iter().all(|m| m.has_cursors);
         if !all_cursors && metas.iter().any(|m| m.has_cursors) {
             return Err(crate::Error::Corruption(
@@ -1237,6 +1774,16 @@ impl BlockPostingList {
 
         // Phase 1: Stream block data, reading L0 entries on-the-fly.
         // Accumulate output L0 + L1 + cursors (bounded).
+        let mut out_impacts = if metas.iter().any(|m| m.impact_bounds) {
+            let blocks = metas
+                .iter()
+                .try_fold(0usize, |n, m| n.checked_add(m.l0_count))
+                .ok_or_else(|| crate::Error::Corruption("impact block count overflow".into()))?;
+            Some(ImpactBuilder::with_groups(blocks)?)
+        } else {
+            None
+        };
+        let mut out_ratios = metas.iter().any(|m| m.ratio_bounds).then(Vec::new);
         let mut out_l0: Vec<u8> = Vec::new();
         let mut out_l1_docs: Vec<u32> = Vec::new();
         let mut out_cursors: Vec<u8> = Vec::new();
@@ -1252,14 +1799,44 @@ impl BlockPostingList {
             let cursors_base = meta.l1_bounds_end();
 
             for i in 0..meta.l0_count {
+                if let Some(impacts) = &mut out_impacts {
+                    let record = if meta.impact_bounds {
+                        ImpactTable::record_from_validated(
+                            &raw[meta.ratios_end()..raw.len() - FOOTER_V2_SIZE],
+                            meta.impact_record_count(),
+                            i,
+                        )
+                    } else {
+                        &[]
+                    };
+                    impacts.append(record)?;
+                }
+                if let Some(ratios) = &mut out_ratios {
+                    let ratio = if meta.ratio_bounds {
+                        read_ratio(&raw[meta.cursors_end()..], i)
+                    } else {
+                        0.0
+                    };
+                    ratios.extend_from_slice(&ratio.to_le_bytes());
+                }
                 // Read source L0 entry directly from raw bytes
                 let (first_doc, last_doc, offset, word) = read_l0(&raw[l0_base..], i);
                 let (block_max_tf, block_min_len) = unpack_bounds(word, meta.len_bounds);
                 let bounds = pack_bounds(block_max_tf, block_min_len.unwrap_or(1));
                 if all_cursors {
-                    let p = cursors_base + i * CURSOR_SIZE;
-                    let cursor = u64::from_le_bytes(raw[p..p + CURSOR_SIZE].try_into().unwrap());
-                    out_cursors.extend_from_slice(&(cursor + positions_before).to_le_bytes());
+                    let size = meta.cursor_size();
+                    let p = cursors_base + i * size;
+                    let cursor = if meta.short_cursors {
+                        u64::from(u32::from_le_bytes(raw[p..p + size].try_into().unwrap()))
+                    } else {
+                        u64::from_le_bytes(raw[p..p + size].try_into().unwrap())
+                    };
+                    if short_cursors {
+                        out_cursors
+                            .extend_from_slice(&((cursor + positions_before) as u32).to_le_bytes());
+                    } else {
+                        out_cursors.extend_from_slice(&(cursor + positions_before).to_le_bytes());
+                    }
                 }
 
                 // Block size from the neighbouring L0 offset (codec-independent)
@@ -1291,13 +1868,24 @@ impl BlockPostingList {
                 }
 
                 // Patch 8-byte header: [count: u16][first_doc: u32][bits: 2 bytes]
-                patch_buf.copy_from_slice(&block[0..8]);
-                let blk_first = u32::from_le_bytes(patch_buf[2..6].try_into().unwrap());
-                patch_buf[2..6].copy_from_slice(&(blk_first + doc_offset).to_le_bytes());
-                writer.write_all(&patch_buf)?;
-                writer.write_all(&block[8..])?;
-
-                stream_written += blk_size as u64;
+                let payload = if meta.compact_headers {
+                    let header = &raw[meta.l0_end() + i * 4..meta.l0_end() + i * 4 + 4];
+                    patch_buf[..2].copy_from_slice(&header[..2]);
+                    patch_buf[6..].copy_from_slice(&header[2..]);
+                    block
+                } else {
+                    patch_buf.copy_from_slice(&block[..8]);
+                    &block[8..]
+                };
+                patch_buf[2..6].copy_from_slice(&(first_doc + doc_offset).to_le_bytes());
+                if compact_output {
+                    out_headers.extend_from_slice(&patch_buf[..2]);
+                    out_headers.extend_from_slice(&patch_buf[6..]);
+                } else {
+                    writer.write_all(&patch_buf)?;
+                }
+                writer.write_all(payload)?;
+                stream_written += (if compact_output { 0 } else { 8 } + payload.len()) as u64;
             }
             positions_before += meta.total_positions;
         }
@@ -1311,6 +1899,7 @@ impl BlockPostingList {
         // Phase 2: Write L0 + L1 + L1 bounds + cursors + footer
         let out_l1_bounds = group_bounds_from_l0(&out_l0, out_l0_count);
         writer.write_all(&out_l0)?;
+        writer.write_all(&out_headers)?;
         for &doc in &out_l1_docs {
             writer.write_u32::<LittleEndian>(doc)?;
         }
@@ -1318,6 +1907,42 @@ impl BlockPostingList {
             writer.write_u32::<LittleEndian>(bounds)?;
         }
         writer.write_all(&out_cursors)?;
+        if let Some(ratios) = &mut out_ratios {
+            append_ratio_groups(ratios, out_l0_count);
+            writer.write_all(ratios)?;
+        }
+        let out_impacts = if let Some(mut impacts) = out_impacts {
+            let mut source = 0;
+            let mut base = 0;
+            impacts.append_groups_with(out_l0_count, |range| {
+                while base + metas[source].l0_count <= range.start {
+                    base += metas[source].l0_count;
+                    source += 1;
+                }
+                let meta = &metas[source];
+                let local = range.start - base;
+                let record = if meta.group_impact_bounds
+                    && local.is_multiple_of(L1_INTERVAL)
+                    && range.end - base == (local + L1_INTERVAL).min(meta.l0_count)
+                {
+                    let raw = sources[source].0;
+                    Some(ImpactTable::record_from_validated(
+                        &raw[meta.ratios_end()..raw.len() - FOOTER_V2_SIZE],
+                        meta.impact_record_count(),
+                        meta.l0_count + local / L1_INTERVAL,
+                    ))
+                } else {
+                    None
+                };
+                Ok(record)
+            })?;
+            impacts.finish()
+        } else {
+            None
+        };
+        if let Some(impacts) = &out_impacts {
+            writer.write_all(impacts.bytes())?;
+        }
         Self::write_footer(
             writer,
             stream_written,
@@ -1325,7 +1950,7 @@ impl BlockPostingList {
             out_l1_docs.len(),
             total_docs,
             merged_max_tf,
-            if all_cursors { positions_before } else { 0 },
+            if all_cursors { total_positions } else { 0 },
             all_cursors,
             Some(if merged_min_len == u32::MAX {
                 1
@@ -1333,13 +1958,28 @@ impl BlockPostingList {
                 merged_min_len
             }),
             true,
+            out_ratios.is_some(),
+            out_impacts.is_some(),
+            out_impacts.is_some(),
+            if compact_output {
+                FLAG_COMPACT_HEADERS
+            } else {
+                0
+            } | if short_cursors && all_cursors {
+                FLAG_SHORT_CURSORS
+            } else {
+                0
+            },
         )?;
 
         let l1_bytes_len = out_l1_docs.len() * L1_SIZE + out_l1_bounds.len() * 4;
         let total_bytes = stream_written as usize
             + out_l0.len()
+            + out_headers.len()
             + l1_bytes_len
             + out_cursors.len()
+            + out_ratios.as_ref().map_or(0, Vec::len)
+            + out_impacts.as_ref().map_or(0, |t| t.bytes().len())
             + FOOTER_V2_SIZE;
         Ok((total_docs, total_bytes))
     }
@@ -1368,38 +2008,137 @@ impl BlockPostingList {
     /// Decode only doc IDs from a block (no TF decoding).
     ///
     /// Returns `(block_data_offset, tf_start_within_block, count)` for deferred TF decode,
-    /// or `None` if block_idx is out of range.
+    /// or `None` if block_idx is out of range. A block whose decoded ids
+    /// disagree with the L0 directory (content corruption that structural
+    /// admission cannot see) also yields `None`, after an error log naming
+    /// the block; callers treat it as the end of the list.
     pub fn decode_block_doc_ids_only(
         &self,
         block_idx: usize,
         doc_ids: &mut Vec<u32>,
     ) -> Option<(usize, usize, usize)> {
+        match self.decode_block_doc_ids_checked(block_idx, doc_ids) {
+            Ok(state) => state,
+            Err(error) => {
+                log::error!(
+                    "posting block {block_idx} of {} is corrupt; the cursor ends here: {error}",
+                    self.l0_count
+                );
+                None
+            }
+        }
+    }
+
+    /// `Ok(None)` is out of range; `Err` is a block whose payload does not
+    /// match its directory entry. On error `doc_ids` is left empty.
+    fn decode_block_doc_ids_checked(
+        &self,
+        block_idx: usize,
+        doc_ids: &mut Vec<u32>,
+    ) -> io::Result<Option<(usize, usize, usize)>> {
         if block_idx >= self.l0_count {
-            return None;
+            return Ok(None);
+        }
+        let decoded = (|| {
+            let (first, last, offset, _) = self.read_l0_entry(block_idx);
+            let header = self.block_header(block_idx);
+            let payload = self.block_payload(block_idx);
+            let state = self.decode_block_doc_ids_unchecked(
+                offset as usize,
+                block_idx,
+                header,
+                payload,
+                doc_ids,
+            )?;
+            if self.verify_content {
+                // Header 8 denotes Rounded with 8-bit raw gaps (no codec tag).
+                let byte_gaps = (header[6] == 8).then(|| &payload[..doc_ids.len() - 1]);
+                if header[6] >> PostingCodec::HEADER_SHIFT == PostingCodec::Simd4x as u8
+                    && doc_ids.len() == BLOCK_SIZE
+                    && !bitpacking4x::first_gap_is_zero(
+                        payload,
+                        header[6] & PostingCodec::WIDTH_MASK,
+                    )
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "SIMD posting first gap must be zero",
+                    ));
+                }
+                let strict_gap_width = (header[6] >> PostingCodec::HEADER_SHIFT
+                    == PostingCodec::Simd4x as u8)
+                    .then_some(header[6] & PostingCodec::WIDTH_MASK);
+                if !verify_block_docs(doc_ids, first, last, byte_gaps, strict_gap_width) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("decoded doc ids leave the directory range {first}..={last}"),
+                    ));
+                }
+            }
+            crate::observe::search_work!(
+                doc_blocks += 1,
+                doc_values += doc_ids.len(),
+                doc_payload_bytes += state.1 - if self.compact_headers { 0 } else { 8 }
+            );
+            Ok(Some(state))
+        })();
+        if decoded.is_err() {
+            doc_ids.clear();
+            if let Some(error) = &self.content_error {
+                // Write-once: no query may erase another query's failure.
+                let _ = error.set(block_idx);
+            }
+        }
+        decoded
+    }
+
+    fn decode_block_doc_ids_unchecked(
+        &self,
+        pos: usize,
+        block_idx: usize,
+        header: [u8; 8],
+        payload: &[u8],
+        doc_ids: &mut Vec<u32>,
+    ) -> io::Result<(usize, usize, usize)> {
+        let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidData, message);
+        let count = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
+        let first_doc = u32::from_le_bytes(header[2..6].try_into().unwrap());
+        let (codec, doc_width) = PostingCodec::from_header_byte(header[6])?;
+        let header_len = if self.compact_headers { 0 } else { 8 };
+        let state = if self.compact_headers { block_idx } else { pos };
+        if count == 0 || count > BLOCK_SIZE {
+            return Err(invalid("invalid posting block count"));
         }
 
-        let (_, _, offset, _) = self.read_l0_entry(block_idx);
-        let pos = offset as usize;
-        let blk_size = self.block_len(block_idx);
-        let block_data = &self.stream[pos..pos + blk_size];
-
-        // 8-byte header: [count: u16][first_doc: u32][doc_bits: u8][tf_bits: u8]
-        let count = u16::from_le_bytes(block_data[0..2].try_into().unwrap()) as usize;
-        let first_doc = u32::from_le_bytes(block_data[2..6].try_into().unwrap());
-        let (codec, doc_width) = PostingCodec::from_header_byte(block_data[6]).ok()?;
-
-        doc_ids.clear();
+        // Every decoder overwrites the complete output; retain initialized
+        // storage so equal-sized blocks do not need a redundant zero pass.
         doc_ids.resize(count, 0);
         doc_ids[0] = first_doc;
 
-        let payload = &block_data[8..];
+        if codec == PostingCodec::Simd4x {
+            let values = if count == BLOCK_SIZE {
+                count
+            } else {
+                count - 1
+            };
+            let bytes = bitpacking4x::encoded_len(values, doc_width);
+            bitpacking4x::decode_docs(&payload[..bytes], doc_width, first_doc, doc_ids);
+            return Ok((state, header_len + bytes, count));
+        }
         let deltas_bytes = if count > 1 {
             match codec {
                 PostingCodec::Rounded => {
-                    let rounded = simd::RoundedBitWidth::from_u8(doc_width);
+                    let rounded = simd::RoundedBitWidth::try_from_u8(doc_width)
+                        .ok_or_else(|| invalid("invalid rounded posting width"))?;
                     let bytes = (count - 1) * rounded.bytes_per_value();
-                    simd::unpack_rounded(&payload[..bytes], rounded, &mut doc_ids[1..], count - 1);
-                    bytes
+                    simd::unpack_rounded_raw_delta_decode(
+                        &payload[..bytes],
+                        rounded,
+                        doc_ids,
+                        first_doc,
+                        count,
+                    );
+                    return Ok((state, header_len + bytes, count));
                 }
                 PostingCodec::Packed => {
                     let bytes = packed_bytes(count - 1, doc_width);
@@ -1407,10 +2146,11 @@ impl BlockPostingList {
                     bytes
                 }
                 PostingCodec::Pfor => {
-                    let bytes = pfor_payload_len(payload, count - 1, doc_width).ok()?;
-                    unpack_pfor(&payload[..bytes], doc_width, &mut doc_ids[1..], count - 1).ok()?;
+                    let bytes = pfor_payload_len(payload, count - 1, doc_width)?;
+                    unpack_pfor(&payload[..bytes], doc_width, &mut doc_ids[1..], count - 1)?;
                     bytes
                 }
+                PostingCodec::Simd4x => unreachable!("SIMD documents were decoded above"),
             }
         } else {
             0
@@ -1419,8 +2159,8 @@ impl BlockPostingList {
             doc_ids[i] = doc_ids[i].wrapping_add(doc_ids[i - 1]);
         }
 
-        let tfs_start = 8 + deltas_bytes;
-        Some((pos, tfs_start, count))
+        let tfs_start = header_len + deltas_bytes;
+        Ok((state, tfs_start, count))
     }
 
     /// Decode TFs from a previously loaded block (deferred decode).
@@ -1433,18 +2173,45 @@ impl BlockPostingList {
         count: usize,
         tfs: &mut Vec<u32>,
     ) {
-        let block_data = &self.stream[block_offset..];
-        let codec = PostingCodec::from_header_byte(block_data[6])
-            .map(|(codec, _)| codec)
-            .unwrap_or_default();
-        let tf_bits = block_data[7];
-
-        tfs.clear();
         tfs.resize(count, 0);
+        self.decode_block_tfs_slice(block_offset, tf_start, tfs);
+    }
+
+    /// Shared frequency decoder for vector and fixed-block consumers.
+    fn decode_block_tfs_slice(&self, block_offset: usize, tf_start: usize, tfs: &mut [u32]) {
+        let count = tfs.len();
+        let (header, block_data) = if self.compact_headers {
+            (
+                self.block_header(block_offset),
+                self.block_payload(block_offset),
+            )
+        } else {
+            (
+                self.stream[block_offset..block_offset + 8]
+                    .try_into()
+                    .unwrap(),
+                &self.stream[block_offset..],
+            )
+        };
+        let (codec, _) = PostingCodec::from_header_byte(header[6]).expect("admitted posting codec");
+        let tf_bits = header[7];
         let payload = &block_data[tf_start..];
+        crate::observe::search_work!(
+            tf_blocks += 1,
+            tf_values += count,
+            tf_payload_bytes += match codec {
+                PostingCodec::Pfor =>
+                    pfor_payload_len(payload, count, tf_bits).expect("admitted frequency payload"),
+                _ => packed_bytes(count, tf_bits),
+            }
+        );
         match codec {
+            PostingCodec::Simd4x => {
+                bitpacking4x::decode(&payload[..packed_bytes(count, tf_bits)], tf_bits, tfs);
+            }
             PostingCodec::Rounded => {
-                let rounded = simd::RoundedBitWidth::from_u8(tf_bits);
+                let rounded = simd::RoundedBitWidth::try_from_u8(tf_bits)
+                    .expect("invalid rounded posting frequency width");
                 simd::unpack_rounded(
                     &payload[..count * rounded.bytes_per_value()],
                     rounded,
@@ -1461,9 +2228,10 @@ impl BlockPostingList {
                 );
             }
             PostingCodec::Pfor => {
-                if let Ok(len) = pfor_payload_len(payload, count, tf_bits) {
-                    let _ = unpack_pfor(&payload[..len], tf_bits, tfs, count);
-                }
+                let len = pfor_payload_len(payload, count, tf_bits)
+                    .expect("invalid patched posting frequency payload");
+                unpack_pfor(&payload[..len], tf_bits, tfs, count)
+                    .expect("invalid patched posting frequency table");
             }
         }
     }
@@ -1479,8 +2247,7 @@ impl BlockPostingList {
         if block_idx >= self.l0_count {
             return None;
         }
-        let (_, _, offset, _) = self.read_l0_entry(block_idx);
-        PostingCodec::from_header_byte(self.stream[offset as usize + 6])
+        PostingCodec::from_header_byte(self.block_header(block_idx)[6])
             .ok()
             .map(|(codec, _)| codec)
     }
@@ -1507,9 +2274,9 @@ impl BlockPostingList {
 
     /// Find the first block whose `last_doc >= target`, starting from `from_block`.
     ///
-    /// Uses SIMD-accelerated linear scan:
-    /// 1. `find_first_ge_u32` on the contiguous L1 `last_doc` array
-    /// 2. Extract ≤`L1_INTERVAL` L0 `last_doc` values into a stack buffer → `find_first_ge_u32`
+    /// Checks the current block first, then gallops over the L1 group ends
+    /// before a bounded L0 search. Near seeks are constant time; distant
+    /// seeks inspect logarithmically many groups rather than scanning the gap.
     ///
     /// Returns `None` if no block contains `target`.
     pub fn seek_block(&self, target: DocId, from_block: usize) -> Option<usize> {
@@ -1517,30 +2284,39 @@ impl BlockPostingList {
             return None;
         }
 
-        let from_l1 = from_block / L1_INTERVAL;
-
-        // SIMD scan L1 to find the group containing target
-        let l1_idx = if !self.l1_docs.is_empty() {
-            let idx = from_l1 + simd::find_first_ge_u32(&self.l1_docs[from_l1..], target);
-            if idx >= self.l1_docs.len() {
-                return None;
-            }
-            idx
-        } else {
-            return None;
-        };
-
-        // Extract L0 last_doc values within the group into a stack buffer for SIMD scan
-        let start = (l1_idx * L1_INTERVAL).max(from_block);
-        let end = ((l1_idx + 1) * L1_INTERVAL).min(self.l0_count);
-        let count = end - start;
-
-        let mut last_docs = [u32::MAX; L1_INTERVAL];
-        for (j, idx) in (start..end).enumerate() {
-            let (_, ld, _, _) = read_l0(&self.l0_bytes, idx);
-            last_docs[j] = ld;
+        if self
+            .block_last_doc(from_block)
+            .is_some_and(|last| last >= target)
+        {
+            return Some(from_block);
         }
-        let within = simd::find_first_ge_u32(&last_docs[..count], target);
+        let from_l1 = from_block / L1_INTERVAL;
+        let groups = self.l1_docs.get(from_l1..)?;
+        let first = *groups.first()?;
+        let offset = if first >= target {
+            0
+        } else {
+            let mut bound = 1usize;
+            while bound < groups.len() && groups[bound] < target {
+                bound = bound.saturating_mul(2);
+            }
+            let lo = bound / 2;
+            let hi = bound.saturating_add(1).min(groups.len());
+            lo + groups[lo..hi].partition_point(|&last| last < target)
+        };
+        let l1_idx = from_l1 + offset;
+        if l1_idx >= self.l1_docs.len() {
+            return None;
+        }
+
+        // Search the validated entries in place instead of gathering every
+        // strided last ID in the group before finding the lower bound.
+        let start = (l1_idx * L1_INTERVAL).max(from_block + 1);
+        let end = ((l1_idx + 1) * L1_INTERVAL).min(self.l0_count);
+        let entries = self.l0_bytes.as_slice().as_chunks::<L0_SIZE>().0;
+        let within = entries[start..end].partition_point(|entry| {
+            u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]) < target
+        });
         let block_idx = start + within;
 
         if block_idx < self.l0_count {
@@ -1572,13 +2348,17 @@ impl BlockPostingList {
             doc_ids,
             term_freqs,
         } = std::mem::take(scratch);
+        let mut block_tfs = term_freqs.unwrap_or_default();
+        block_tfs.take();
         let mut iterator = BlockPostingIterator {
             block_list: std::borrow::Cow::Owned(self),
             current_block: first_block.unwrap_or(0),
             block_doc_ids: doc_ids,
-            block_tfs: term_freqs,
+            block_tfs,
+            tf_state: (0, 0, 0),
             position_in_block: 0,
             tf_prefix: 0,
+            tf_prefix_position: 0,
             exhausted: first_block.is_none(),
         };
         if let Some(block) = first_block {
@@ -1591,25 +2371,31 @@ impl BlockPostingList {
 #[derive(Default)]
 pub(crate) struct PostingDecodeScratch {
     doc_ids: Vec<u32>,
-    term_freqs: Vec<u32>,
+    term_freqs: Option<std::sync::OnceLock<[u32; BLOCK_SIZE]>>,
 }
 
 /// Iterator over block posting list with skip support
 /// Can be either borrowed or owned via Cow
 ///
-/// Uses struct-of-arrays layout: separate `Vec<u32>` for doc_ids and term_freqs.
-/// This is more cache-friendly for SIMD seek (contiguous doc_ids) and halves
-/// memory vs the previous AoS + separate doc_ids approach.
+/// Document IDs and frequencies have separate bounded decode buffers. Document
+/// movement does not initialize frequencies; score and position consumers do.
+/// Only the current block is retained, including during scratch recycling.
 pub struct BlockPostingIterator<'a> {
     block_list: std::borrow::Cow<'a, BlockPostingList>,
     current_block: usize,
     block_doc_ids: Vec<u32>,
-    block_tfs: Vec<u32>,
+    /// Fixed inline scratch, reused across blocks and initialized only by
+    /// frequency/position consumers. OnceLock preserves immutable frequency
+    /// access and the iterator's native Send+Sync contract; keeping it inline
+    /// avoids a heap allocation per cursor per query.
+    block_tfs: std::sync::OnceLock<[u32; BLOCK_SIZE]>,
+    tf_state: (usize, usize, usize),
     position_in_block: usize,
     /// Sum of the term frequencies of the postings before
-    /// `position_in_block` in the current block (position stream offset
+    /// `tf_prefix_position` in the current block (position stream offset
     /// relative to the block's cursor).
     tf_prefix: u64,
+    tf_prefix_position: usize,
     exhausted: bool,
 }
 
@@ -1617,7 +2403,7 @@ impl<'a> BlockPostingIterator<'a> {
     pub(crate) fn recycle(self, scratch: &mut PostingDecodeScratch) {
         *scratch = PostingDecodeScratch {
             doc_ids: self.block_doc_ids,
-            term_freqs: self.block_tfs,
+            term_freqs: Some(self.block_tfs),
         };
     }
 
@@ -1627,9 +2413,11 @@ impl<'a> BlockPostingIterator<'a> {
             block_list: std::borrow::Cow::Borrowed(block_list),
             current_block: 0,
             block_doc_ids: Vec::with_capacity(BLOCK_SIZE),
-            block_tfs: Vec::with_capacity(BLOCK_SIZE),
+            block_tfs: std::sync::OnceLock::new(),
+            tf_state: (0, 0, 0),
             position_in_block: 0,
             tf_prefix: 0,
+            tf_prefix_position: 0,
             exhausted,
         };
         if !iter.exhausted {
@@ -1644,9 +2432,11 @@ impl<'a> BlockPostingIterator<'a> {
             block_list: std::borrow::Cow::Owned(block_list),
             current_block: 0,
             block_doc_ids: Vec::with_capacity(BLOCK_SIZE),
-            block_tfs: Vec::with_capacity(BLOCK_SIZE),
+            block_tfs: std::sync::OnceLock::new(),
+            tf_state: (0, 0, 0),
             position_in_block: 0,
             tf_prefix: 0,
+            tf_prefix_position: 0,
             exhausted,
         };
         if !iter.exhausted {
@@ -1664,9 +2454,40 @@ impl<'a> BlockPostingIterator<'a> {
         self.current_block = block_idx;
         self.position_in_block = 0;
         self.tf_prefix = 0;
+        self.tf_prefix_position = 0;
 
-        self.block_list
-            .decode_block_into(block_idx, &mut self.block_doc_ids, &mut self.block_tfs);
+        self.block_tfs.take();
+        match self
+            .block_list
+            .decode_block_doc_ids_checked(block_idx, &mut self.block_doc_ids)
+        {
+            Ok(Some(state)) => self.tf_state = state,
+            Ok(None) => unreachable!("block index was range-checked above"),
+            Err(error) => {
+                // The cursor API is infallible: end the list here rather than
+                // expose ids outside the directory, and say so.
+                log::error!(
+                    "posting block {block_idx} of {} is corrupt; the cursor ends here: {error}",
+                    self.block_list.l0_count
+                );
+                self.block_doc_ids.clear();
+                self.tf_state = (0, 0, 0);
+                self.exhausted = true;
+            }
+        }
+    }
+
+    fn frequencies(&self) -> &[u32] {
+        let (offset, start, count) = self.tf_state;
+        if count == 0 {
+            return &[];
+        }
+        &self.block_tfs.get_or_init(|| {
+            let mut tfs = [0; BLOCK_SIZE];
+            self.block_list
+                .decode_block_tfs_slice(offset, start, &mut tfs[..count]);
+            tfs
+        })[..count]
     }
 
     /// Offset of the current posting's positions in the term's position
@@ -1675,7 +2496,28 @@ impl<'a> BlockPostingIterator<'a> {
     /// Meaningful only for lists built with position cursors.
     #[inline]
     pub fn position_cursor(&self) -> u64 {
+        self.block_list.pos_cursor(self.current_block).unwrap_or(0)
+            + self.tf_prefix
+            + self.pending_position_prefix()
+    }
+
+    /// Commit only the pending position prefix. Sequential phrase consumers
+    /// reduce each frequency at most once per block; document-only traversal
+    /// never touches these frequencies to maintain an unused position offset.
+    pub(crate) fn position_cursor_mut(&mut self) -> u64 {
+        self.tf_prefix += self.pending_position_prefix();
+        self.tf_prefix_position = self.position_in_block;
         self.block_list.pos_cursor(self.current_block).unwrap_or(0) + self.tf_prefix
+    }
+
+    fn pending_position_prefix(&self) -> u64 {
+        if self.tf_prefix_position == self.position_in_block {
+            return 0;
+        }
+        self.frequencies()[self.tf_prefix_position..self.position_in_block]
+            .iter()
+            .map(|&tf| u64::from(tf))
+            .sum()
     }
 
     pub fn doc(&self) -> DocId {
@@ -1689,10 +2531,10 @@ impl<'a> BlockPostingIterator<'a> {
     }
 
     pub fn term_freq(&self) -> u32 {
-        if self.exhausted || self.position_in_block >= self.block_tfs.len() {
+        if self.exhausted || self.position_in_block >= self.block_doc_ids.len() {
             0
         } else {
-            self.block_tfs[self.position_in_block]
+            self.frequencies()[self.position_in_block]
         }
     }
 
@@ -1701,9 +2543,6 @@ impl<'a> BlockPostingIterator<'a> {
             return TERMINATED;
         }
 
-        if let Some(&tf) = self.block_tfs.get(self.position_in_block) {
-            self.tf_prefix += tf as u64;
-        }
         self.position_in_block += 1;
         if self.position_in_block >= self.block_doc_ids.len() {
             self.load_block(self.current_block + 1);
@@ -1711,37 +2550,241 @@ impl<'a> BlockPostingIterator<'a> {
         self.doc()
     }
 
+    #[inline]
     pub fn seek(&mut self, target: DocId) -> DocId {
+        crate::observe::search_work!(posting_seeks += 1);
         if self.exhausted {
             return TERMINATED;
         }
-
-        // SIMD-accelerated 2-level seek (forward from current block)
-        let block_idx = match self.block_list.seek_block(target, self.current_block) {
-            Some(idx) => idx,
-            None => {
-                self.exhausted = true;
-                return TERMINATED;
-            }
-        };
-
-        if block_idx != self.current_block {
-            self.load_block(block_idx);
+        let current = self.block_doc_ids[self.position_in_block];
+        if target <= current {
+            return current;
         }
+        if target > *self.block_doc_ids.last().unwrap() {
+            return self.seek_later_block(target);
+        }
+        // Nearby intersection probes often need just one step. Distant probes
+        // use logarithmic comparisons instead of scanning the decoded gap.
+        let next = self.position_in_block + 1;
+        self.position_in_block = if self.block_doc_ids[next] >= target {
+            next
+        } else {
+            let remaining = &self.block_doc_ids[next + 1..];
+            let mut bound = 1;
+            while bound < remaining.len() && remaining[bound] < target {
+                bound *= 2;
+            }
+            let lo = bound / 2;
+            let hi = (bound + 1).min(remaining.len());
+            next + 1 + lo + remaining[lo..hi].partition_point(|&doc| doc < target)
+        };
+        self.block_doc_ids[self.position_in_block]
+    }
 
-        // SIMD linear scan within block on cached doc_ids
-        let remaining = &self.block_doc_ids[self.position_in_block..];
-        let pos = crate::structures::simd::find_first_ge_u32(remaining, target);
-        self.tf_prefix += self.block_tfs[self.position_in_block..self.position_in_block + pos]
-            .iter()
-            .map(|&tf| tf as u64)
-            .sum::<u64>();
-        self.position_in_block += pos;
-
-        if self.position_in_block >= self.block_doc_ids.len() {
+    /// Align one bounded pair of decoded blocks. `None` means a block was
+    /// consumed; the caller may check cancellation before continuing. A match
+    /// parks both cursors for subsequent exact TF and position reads.
+    pub(crate) fn intersect_block(
+        &mut self,
+        other: &mut BlockPostingIterator<'_>,
+    ) -> Option<DocId> {
+        if self.exhausted || other.exhausted {
+            return Some(TERMINATED);
+        }
+        if self.block_doc_ids.last().copied().unwrap() < other.doc() {
+            self.seek_later_block(other.doc());
+            return None;
+        }
+        if other.block_doc_ids.last().copied().unwrap() < self.doc() {
+            other.seek_later_block(self.doc());
+            return None;
+        }
+        let mut a = self.position_in_block;
+        let mut b = other.position_in_block;
+        let mut pair = [(0, 0)];
+        if simd::intersect_posting_blocks(
+            &self.block_doc_ids,
+            &mut a,
+            &other.block_doc_ids,
+            &mut b,
+            &mut pair,
+        ) != 0
+        {
+            self.position_in_block = usize::from(pair[0].0);
+            other.position_in_block = usize::from(pair[0].1);
+            return Some(self.doc());
+        }
+        self.position_in_block = a;
+        other.position_in_block = b;
+        if a == self.block_doc_ids.len() {
             self.load_block(self.current_block + 1);
         }
+        if b == other.block_doc_ids.len() {
+            other.load_block(other.current_block + 1);
+        }
+        None
+    }
+
+    /// Reposition a physical probe without discarding its bounded decode buffers.
+    /// Logical document order can move backwards through an RGB permutation.
+    pub(crate) fn seek_physical(&mut self, target: DocId) -> DocId {
+        if !self.exhausted && target >= self.doc() {
+            return self.seek(target);
+        }
+        let Some(block) = self.block_list.seek_block(target, 0) else {
+            self.exhausted = true;
+            return TERMINATED;
+        };
+        self.exhausted = false;
+        if block != self.current_block || self.block_doc_ids.is_empty() {
+            self.load_block(block);
+        }
+        if self.exhausted {
+            return TERMINATED;
+        }
+        self.position_in_block = self.block_doc_ids.partition_point(|&doc| doc < target);
+        self.tf_prefix = 0;
+        self.tf_prefix_position = 0;
         self.doc()
+    }
+
+    fn seek_later_block(&mut self, target: DocId) -> DocId {
+        let Some(block_idx) = self.block_list.seek_block(target, self.current_block + 1) else {
+            self.exhausted = true;
+            return TERMINATED;
+        };
+        self.load_block(block_idx);
+        if self.exhausted {
+            return TERMINATED;
+        }
+        // Verified content: the block's last id is at least `target`.
+        self.position_in_block = self.block_doc_ids.partition_point(|&doc| doc < target);
+        self.block_doc_ids[self.position_in_block]
+    }
+
+    /// Copy a bounded prefix without decoding frequencies or positions.
+    pub(crate) fn fill_doc_batch(&mut self, docs: &mut [DocId]) -> usize {
+        self.fill_batch::<false>(docs, &mut [])
+    }
+
+    pub(crate) fn fill_scored_doc_batch(&mut self, docs: &mut [DocId], tfs: &mut [u32]) -> usize {
+        assert!(tfs.len() >= docs.len());
+        self.fill_batch::<true>(docs, tfs)
+    }
+
+    fn fill_batch<const WITH_FREQUENCIES: bool>(
+        &mut self,
+        docs: &mut [DocId],
+        tfs: &mut [u32],
+    ) -> usize {
+        assert!(docs.len() <= BLOCK_SIZE);
+        let mut count = 0;
+        while count < docs.len() && !self.exhausted {
+            let remaining = &self.block_doc_ids[self.position_in_block..];
+            let take = remaining.len().min(docs.len() - count);
+            docs[count..count + take].copy_from_slice(&remaining[..take]);
+            if WITH_FREQUENCIES {
+                tfs[count..count + take].copy_from_slice(
+                    &self.frequencies()[self.position_in_block..self.position_in_block + take],
+                );
+            }
+            count += take;
+            self.position_in_block += take;
+            if self.position_in_block == self.block_doc_ids.len() {
+                self.load_block(self.current_block + 1);
+            }
+        }
+        count
+    }
+
+    /// Probe sorted IDs within decoded blocks, amortizing directory checks.
+    pub(crate) fn retain_doc_batch(&mut self, docs: &mut [DocId]) -> usize {
+        self.retain_batch::<false>(docs, &mut [])
+    }
+
+    pub(crate) fn retain_scored_doc_batch(&mut self, docs: &mut [DocId], tfs: &mut [u32]) -> usize {
+        assert!(tfs.len() >= docs.len());
+        self.retain_batch::<true>(docs, tfs)
+    }
+
+    fn retain_batch<const WITH_FREQUENCIES: bool>(
+        &mut self,
+        docs: &mut [DocId],
+        tfs: &mut [u32],
+    ) -> usize {
+        assert!(docs.len() <= BLOCK_SIZE);
+        let mut input = 0;
+        let mut kept = 0;
+        while input < docs.len() {
+            if self.seek(docs[input]) == TERMINATED {
+                break;
+            }
+            let last = *self.block_doc_ids.last().unwrap();
+            while input < docs.len() && docs[input] <= last {
+                let doc = docs[input];
+                self.position_in_block = simd::find_first_ge_block_from(
+                    &self.block_doc_ids,
+                    self.position_in_block,
+                    doc,
+                );
+                if self.block_doc_ids[self.position_in_block] == doc {
+                    docs[kept] = doc;
+                    if WITH_FREQUENCIES {
+                        tfs[kept] = self.frequencies()[self.position_in_block];
+                    }
+                    kept += 1;
+                }
+                input += 1;
+            }
+        }
+        kept
+    }
+
+    /// Consume a bounded ID range into caller-owned membership words. Retain the
+    /// term-frequency prefix so subsequent scoring and position reads stay valid.
+    pub(crate) fn fill_doc_window(&mut self, base: DocId, bits: &mut [u64]) {
+        let span = u32::try_from(bits.len()).unwrap().checked_mul(64).unwrap();
+        let end = base.saturating_add(span);
+        bits.fill(0);
+        self.seek(base);
+        self.visit_until::<false>(end, |docs, _| {
+            for &doc in docs {
+                let offset = (doc - base) as usize;
+                bits[offset / 64] |= 1u64 << (offset % 64);
+            }
+            true
+        });
+    }
+
+    /// Visit already decoded posting runs before `end` (exclusive). Each run
+    /// contains at most one block. Returning false leaves that run unconsumed;
+    /// callers can check cancellation without changing storage-layer policy.
+    /// Preserve the TF prefix so subsequent position reads remain valid.
+    pub(crate) fn visit_postings_until(
+        &mut self,
+        end: DocId,
+        mut visit: impl FnMut(&[u32], &[u32]) -> bool,
+    ) {
+        self.visit_until::<true>(end, |docs, tfs| visit(docs, tfs.unwrap()));
+    }
+
+    fn visit_until<const WITH_FREQUENCIES: bool>(
+        &mut self,
+        end: DocId,
+        mut visit: impl FnMut(&[u32], Option<&[u32]>) -> bool,
+    ) {
+        while self.doc() < end {
+            let start = self.position_in_block;
+            let count = self.block_doc_ids[start..].partition_point(|&doc| doc < end);
+            let tfs = WITH_FREQUENCIES.then(|| &self.frequencies()[start..start + count]);
+            if !visit(&self.block_doc_ids[start..start + count], tfs) {
+                return;
+            }
+            self.position_in_block += count;
+            if self.position_in_block == self.block_doc_ids.len() {
+                self.load_block(self.current_block + 1);
+            }
+        }
     }
 
     /// Skip to the next block, returning the first doc_id in the new block
@@ -1781,8 +2824,571 @@ impl<'a> BlockPostingIterator<'a> {
 }
 
 #[cfg(test)]
+mod compact_layout_tests {
+    use super::*;
+    #[test]
+    fn compact_postings_preserve_payload_scores_and_copy_merges() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Simd4x,
+            PostingCodec::Pfor,
+        ] {
+            for count in [1, 2, 127, 128, 129, 1025] {
+                let mut postings = PostingList::new();
+                for doc in 0..count {
+                    postings.push(doc * 3, doc % 13);
+                }
+                let list = BlockPostingList::from_posting_list_with_ratio_bounds(
+                    &postings,
+                    true,
+                    Some(&|doc| doc % 100 + 1),
+                    codec,
+                )
+                .unwrap();
+                let mut old = Vec::new();
+                list.serialize(&mut old).unwrap();
+                let mut bytes = Vec::new();
+                list.serialize_compact(&mut bytes).unwrap();
+                let compact = BlockPostingList::deserialize(&bytes).unwrap();
+                assert_eq!(compact.compact_headers, codec != PostingCodec::Pfor);
+                if codec != PostingCodec::Pfor {
+                    assert_eq!(old.len() - bytes.len(), list.num_blocks() * 8);
+                }
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                for i in 0..list.num_blocks() {
+                    assert_eq!(list.block_payload(i), compact.block_payload(i));
+                    assert_eq!(list.pos_cursor(i), compact.pos_cursor(i));
+                    assert!(compact.decode_block_into(i, &mut a, &mut b));
+                    assert_eq!(
+                        a,
+                        postings.postings
+                            [i * BLOCK_SIZE..(i * BLOCK_SIZE + BLOCK_SIZE).min(count as usize)]
+                            .iter()
+                            .map(|p| p.doc_id)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(b, a.iter().map(|doc| (doc / 3) % 13).collect::<Vec<_>>());
+                }
+                let mut repeated = Vec::new();
+                compact.serialize(&mut repeated).unwrap();
+                assert_eq!(bytes, repeated);
+                for second in [&old, &bytes] {
+                    let mut merged = Vec::new();
+                    let (docs, len) = BlockPostingList::concatenate_streaming(
+                        &[(&bytes, 0), (second, count * 3)],
+                        &mut merged,
+                    )
+                    .unwrap();
+                    assert_eq!(len, merged.len());
+                    assert_eq!(docs, count * 2);
+                    let merged = BlockPostingList::deserialize(&merged).unwrap();
+                    for block in 0..merged.num_blocks() {
+                        assert_eq!(
+                            merged.block_payload(block),
+                            list.block_payload(block % list.num_blocks())
+                        );
+                        assert!(merged.decode_block_into(block, &mut a, &mut b));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_posting_metadata_rejects_bad_descriptors_and_content_checks_remain_observable() {
+        let mut postings = PostingList::new();
+        for doc in 0..257 {
+            postings.push(doc * 2, 1);
+        }
+        let list = BlockPostingList::from_posting_list_with_options(
+            &postings,
+            true,
+            None,
+            PostingCodec::Rounded,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        list.serialize_compact(&mut bytes).unwrap();
+        let footer = Footer::parse(&bytes).unwrap();
+        for (at, value) in [
+            (footer.l0_end(), 0),
+            (footer.l0_end() + 1, 1),
+            (footer.l0_end() + 2, 33),
+            (footer.l0_end() + 3, 33),
+            (footer.l1_bounds_end(), 1),
+        ] {
+            let mut corrupt = bytes.clone();
+            corrupt[at] = value;
+            assert!(
+                BlockPostingList::deserialize(&corrupt).is_err(),
+                "byte {at}"
+            );
+        }
+        let mut corrupt = bytes.clone();
+        corrupt[0] = 0;
+        let compact = BlockPostingList::deserialize(&corrupt).unwrap();
+        let mut docs = Vec::new();
+        assert!(compact.decode_block_doc_ids_checked(0, &mut docs).is_err());
+        assert!(docs.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_decoding_overwrites_stale_values_across_lengths_and_codecs() {
+        let mut docs = vec![u32::MAX; BLOCK_SIZE * 2];
+        let mut tfs = docs.clone();
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            for count in [128, 1, 127, 128, 17, 256, 257] {
+                for freq in [0, 1, 255, 65536] {
+                    let mut postings = PostingList::new();
+                    for i in 0..count {
+                        postings.push(i * 3 + 7, freq);
+                    }
+                    let list = BlockPostingList::from_posting_list_with_options(
+                        &postings, true, None, codec,
+                    )
+                    .unwrap();
+                    for compact in [false, true] {
+                        let mut bytes = Vec::new();
+                        if compact {
+                            list.serialize_compact(&mut bytes).unwrap();
+                        } else {
+                            list.serialize(&mut bytes).unwrap();
+                        }
+                        let list = BlockPostingList::deserialize(&bytes).unwrap();
+                        for block in (0..list.num_blocks()).rev().chain(0..list.num_blocks()) {
+                            docs.fill(u32::MAX);
+                            tfs.fill(u32::MAX);
+                            assert!(list.decode_block_into(block, &mut docs, &mut tfs));
+                            let expected: Vec<_> = postings.postings[block * BLOCK_SIZE
+                                ..postings.postings.len().min((block + 1) * BLOCK_SIZE)]
+                                .iter()
+                                .map(|p| p.doc_id)
+                                .collect();
+                            assert_eq!(docs, expected);
+                            assert_eq!(tfs, vec![freq; expected.len()]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_membership_batches_preserve_resume_frequencies_and_position_prefixes() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let mut postings = PostingList::new();
+            let mut expected = Vec::new();
+            let mut prefix = 0u64;
+            for i in 0..701u32 {
+                let tf = i % 19 + 1;
+                let doc = i * 13 + 5;
+                postings.push(doc, tf);
+                expected.push((doc, tf, prefix));
+                prefix += u64::from(tf);
+            }
+            let list =
+                BlockPostingList::from_posting_list_with_options(&postings, true, None, codec)
+                    .unwrap();
+            let bytes = serialize_bpl(&list);
+            let mut cursor = list.iterator();
+            let mut docs = [0; BLOCK_SIZE];
+            let mut consumed = 0;
+            while cursor.doc() != TERMINATED {
+                let count = cursor.fill_doc_batch(&mut docs);
+                assert_eq!(
+                    &docs[..count],
+                    &expected[consumed..consumed + count]
+                        .iter()
+                        .map(|e| e.0)
+                        .collect::<Vec<_>>()
+                );
+                consumed += count;
+                if consumed < expected.len() {
+                    assert!(cursor.block_tfs.get().is_none(), "copy initialized TFs");
+                    assert_eq!(cursor.doc(), expected[consumed].0);
+                    assert_eq!(cursor.term_freq(), expected[consumed].1);
+                    assert_eq!(cursor.position_cursor_mut(), expected[consumed].2);
+                }
+            }
+            assert_eq!(consumed, expected.len());
+            assert_eq!(cursor.fill_doc_batch(&mut docs), 0);
+            let mut cursor = list.iterator();
+            for start in (0..10_000u32).step_by(BLOCK_SIZE) {
+                let mut candidates: Vec<_> = (start..start + BLOCK_SIZE as u32).collect();
+                let wanted: Vec<_> = candidates
+                    .iter()
+                    .copied()
+                    .filter(|doc| expected.iter().any(|e| e.0 == *doc))
+                    .collect();
+                let kept = cursor.retain_doc_batch(&mut candidates);
+                assert_eq!(&candidates[..kept], wanted, "{codec:?} start={start}");
+                if cursor.doc() != TERMINATED {
+                    let entry = expected.iter().find(|e| e.0 == cursor.doc()).unwrap();
+                    assert_eq!(cursor.term_freq(), entry.1);
+                    assert_eq!(cursor.position_cursor_mut(), entry.2);
+                }
+            }
+            assert_eq!(cursor.doc(), TERMINATED);
+            assert_eq!(serialize_bpl(&list), bytes);
+        }
+    }
+
+    #[test]
+    fn document_only_navigation_defers_frequencies_and_resumes_exact_position_reads() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let mut postings = PostingList::new();
+            let mut expected = Vec::new();
+            let mut prefix = 0u64;
+            for i in 0..701u32 {
+                let tf = if i % 37 == 0 { u32::MAX } else { i % 23 + 1 };
+                let doc = i * 13 + 5;
+                postings.push(doc, tf);
+                expected.push((doc, tf, prefix));
+                prefix += u64::from(tf);
+            }
+            let list =
+                BlockPostingList::from_posting_list_with_options(&postings, true, None, codec)
+                    .unwrap();
+            let bytes = serialize_bpl(&list);
+            for owned in [false, true] {
+                let mut cursor = if owned {
+                    list.clone().into_iterator()
+                } else {
+                    list.iterator()
+                };
+                assert!(
+                    cursor.block_tfs.get().is_none(),
+                    "{codec:?}: ID-only open decoded frequencies"
+                );
+                for target in [20, 205, 1800, 3900] {
+                    let entry = expected.iter().find(|e| e.0 >= target).unwrap();
+                    assert_eq!(cursor.seek(target), entry.0);
+                    assert!(
+                        cursor.block_tfs.get().is_none(),
+                        "ID-only seek decoded frequencies"
+                    );
+                }
+                let entry = expected.iter().find(|e| e.0 == cursor.doc()).unwrap();
+                #[cfg(feature = "native")]
+                std::thread::scope(|scope| {
+                    for _ in 0..4 {
+                        let shared = &cursor;
+                        scope.spawn(move || {
+                            assert_eq!(shared.term_freq(), entry.1);
+                            assert_eq!(shared.position_cursor(), entry.2);
+                        });
+                    }
+                });
+                assert_eq!(cursor.position_cursor(), entry.2);
+                assert_eq!(cursor.term_freq(), entry.1);
+                assert_eq!(cursor.position_cursor_mut(), entry.2);
+                let mut bits = [0u64; 64];
+                cursor.fill_doc_window(4096, &mut bits);
+                for &(doc, _, _) in &expected {
+                    if (4096..8192).contains(&doc) {
+                        assert_ne!(bits[(doc as usize - 4096) / 64] & (1 << (doc % 64)), 0);
+                    }
+                }
+                assert_eq!(
+                    bits.iter().map(|word| word.count_ones()).sum::<u32>(),
+                    expected
+                        .iter()
+                        .filter(|e| (4096..8192).contains(&e.0))
+                        .count() as u32
+                );
+                assert!(
+                    cursor.block_tfs.get().is_none(),
+                    "membership windows decoded frequencies"
+                );
+                let entry = expected.iter().find(|e| e.0 == cursor.doc()).unwrap();
+                assert_eq!(cursor.position_cursor_mut(), entry.2);
+                assert_eq!(cursor.term_freq(), entry.1);
+                let parked = cursor.doc();
+                cursor.visit_postings_until(TERMINATED, |docs, tfs| {
+                    for (&doc, &tf) in docs.iter().zip(tfs) {
+                        assert_eq!(tf, expected.iter().find(|e| e.0 == doc).unwrap().1);
+                    }
+                    false
+                });
+                assert_eq!(cursor.doc(), parked);
+                assert_eq!(cursor.position_cursor(), entry.2);
+                let mut seen = Vec::new();
+                cursor.visit_postings_until(TERMINATED, |docs, tfs| {
+                    seen.extend(docs.iter().copied().zip(tfs.iter().copied()));
+                    true
+                });
+                assert_eq!(
+                    seen,
+                    expected
+                        .iter()
+                        .filter(|e| e.0 >= parked)
+                        .map(|e| (e.0, e.1))
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(cursor.doc(), TERMINATED);
+                assert_eq!(cursor.term_freq(), 0);
+                assert_eq!(cursor.seek(0), TERMINATED);
+            }
+            assert_eq!(serialize_bpl(&list), bytes);
+        }
+    }
+
+    #[test]
+    fn document_navigation_defers_position_accounting_without_changing_cursors() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let mut postings = PostingList::new();
+            let mut expected = Vec::new();
+            let mut total = 0u64;
+            for doc in 0..701u32 {
+                expected.push(total);
+                let tf = doc % 23 + 1;
+                postings.push(doc * 7, tf);
+                total += u64::from(tf);
+            }
+            let list =
+                BlockPostingList::from_posting_list_with_options(&postings, true, None, codec)
+                    .unwrap();
+            let mut cursor = list.iterator();
+            for target in [7, 70, 777, 896, 1400, 3500, 4900] {
+                assert_eq!(cursor.seek(target), target);
+                assert_eq!(
+                    cursor.tf_prefix, 0,
+                    "navigation must not sum unused frequencies"
+                );
+                assert_eq!(cursor.position_cursor(), expected[target as usize / 7]);
+                assert_eq!(cursor.term_freq(), target / 7 % 23 + 1);
+                assert_eq!(cursor.seek(target - 1), target);
+            }
+            assert_eq!(cursor.advance(), TERMINATED);
+        }
+    }
+
+    #[test]
+    fn deferred_position_accounting_resumes_after_reads_windows_and_stopped_runs() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let docs: Vec<_> = (0..600u32).map(|doc| (doc * 11, u32::MAX - doc)).collect();
+            let prefixes = expected_cursors(&docs);
+            let mut input = PostingList::new();
+            for &(doc, tf) in &docs {
+                input.push(doc, tf);
+            }
+            let list = BlockPostingList::build(&input, true, None, codec, false, false).unwrap();
+            let before = serialize_bpl(&list);
+            let mut cursor = list.iterator();
+            for at in [13, 25, 127, 128, 199] {
+                cursor.seek(docs[at].0);
+                assert_eq!(cursor.position_cursor_mut(), prefixes[at]);
+                assert_eq!(cursor.position_cursor_mut(), prefixes[at]);
+                assert_eq!(cursor.position_cursor(), prefixes[at]);
+                cursor.seek(docs[at].0 - 1);
+                assert_eq!(cursor.position_cursor_mut(), prefixes[at]);
+            }
+            cursor.visit_postings_until(docs[220].0, |_, _| true);
+            assert_eq!(cursor.position_cursor_mut(), prefixes[220]);
+            cursor.visit_postings_until(docs[250].0, |_, _| false);
+            assert_eq!(cursor.position_cursor_mut(), prefixes[220]);
+            let mut bits = [0u64; 4];
+            cursor.fill_doc_window(docs[220].0, &mut bits);
+            let at = docs.partition_point(|&(doc, _)| doc < docs[220].0 + 256);
+            assert_eq!(cursor.position_cursor_mut(), prefixes[at]);
+            cursor.skip_to_next_block();
+            assert_eq!(cursor.position_cursor_mut(), prefixes[256]);
+            assert_eq!(serialize_bpl(&list), before);
+        }
+    }
+
+    #[test]
+    fn posting_runs_preserve_frequencies_positions_and_resumption_after_stop() {
+        let docs: Vec<_> = (0..1027u32).map(|i| (i * 7, i % 31 + 1)).collect();
+        let prefixes = expected_cursors(&docs);
+        let mut list = PostingList::new();
+        for &(doc, tf) in &docs {
+            list.push(doc, tf);
+        }
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let postings = BlockPostingList::build(&list, true, None, codec, false, false).unwrap();
+            let bytes = serialize_bpl(&postings);
+            let mut cursor = postings.iterator();
+            cursor.seek(docs[17].0);
+            let mut actual = Vec::new();
+            let mut calls = 0;
+            cursor.visit_postings_until(TERMINATED, |ids, tfs| {
+                calls += 1;
+                assert_eq!(ids.len(), tfs.len());
+                assert!(ids.len() <= BLOCK_SIZE);
+                if calls == 3 {
+                    return false;
+                }
+                actual.extend(ids.iter().copied().zip(tfs.iter().copied()));
+                true
+            });
+            assert_eq!(actual, docs[17..256]);
+            assert_eq!(cursor.doc(), docs[256].0);
+            assert_eq!(cursor.position_cursor(), prefixes[256]);
+            cursor.visit_postings_until(docs[331].0, |ids, tfs| {
+                actual.extend(ids.iter().copied().zip(tfs.iter().copied()));
+                true
+            });
+            assert_eq!(actual, docs[17..331]);
+            assert_eq!(cursor.doc(), docs[331].0);
+            assert_eq!(cursor.term_freq(), docs[331].1);
+            assert_eq!(cursor.position_cursor(), prefixes[331]);
+            cursor.visit_postings_until(TERMINATED, |ids, tfs| {
+                actual.extend(ids.iter().copied().zip(tfs.iter().copied()));
+                true
+            });
+            assert_eq!(actual, docs[17..]);
+            cursor.visit_postings_until(TERMINATED, |_, _| panic!("already exhausted"));
+            assert_eq!(cursor.doc(), TERMINATED);
+            assert_eq!(serialize_bpl(&postings), bytes);
+        }
+    }
+
+    #[test]
+    fn document_windows_preserve_posting_frequencies_positions_and_bytes() {
+        for near_end in [false, true] {
+            let base = if near_end { TERMINATED - 30_000 } else { 0 };
+            let docs: Vec<_> = (0..5000u32).map(|i| (base + i * 5, i % 31 + 1)).collect();
+            let prefixes = expected_cursors(&docs);
+            let mut list = PostingList::new();
+            for &(doc, tf) in &docs {
+                list.push(doc, tf);
+            }
+            for codec in [
+                PostingCodec::Rounded,
+                PostingCodec::Packed,
+                PostingCodec::Pfor,
+                PostingCodec::Simd4x,
+            ] {
+                let postings =
+                    BlockPostingList::build(&list, true, None, codec, false, false).unwrap();
+                let bytes = serialize_bpl(&postings);
+                let mut cursor = postings.iterator();
+                let mut actual = Vec::new();
+                while cursor.doc() != TERMINATED {
+                    let base = cursor.doc();
+                    let mut bits = [u64::MAX; 64];
+                    cursor.fill_doc_window(base, &mut bits);
+                    for (index, word) in bits.into_iter().enumerate() {
+                        for bit in 0..64 {
+                            if word & (1 << bit) != 0 {
+                                actual.push(base + index as u32 * 64 + bit);
+                            }
+                        }
+                    }
+                    let at = docs.partition_point(|&(doc, _)| doc < base.saturating_add(4096));
+                    assert_eq!(cursor.doc(), docs.get(at).map_or(TERMINATED, |p| p.0));
+                    if at < docs.len() {
+                        assert_eq!(cursor.term_freq(), docs[at].1);
+                        assert_eq!(cursor.position_cursor(), prefixes[at]);
+                    }
+                }
+                assert_eq!(actual, docs.iter().map(|p| p.0).collect::<Vec<_>>());
+                assert_eq!(serialize_bpl(&postings), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn nearby_and_distant_seeks_preserve_postings_position_cursors_and_bytes() {
+        let docs: Vec<_> = (0..32_769u32)
+            .map(|i| (i * 5 + i % 3, i % 31 + 1))
+            .collect();
+        let prefixes = expected_cursors(&docs);
+        let mut list = PostingList::new();
+        for &(doc, tf) in &docs {
+            list.push(doc, tf);
+        }
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let postings = BlockPostingList::build(&list, true, None, codec, false, false).unwrap();
+            let bytes = serialize_bpl(&postings);
+            let lasts: Vec<_> = (0..postings.num_blocks())
+                .map(|i| postings.block_last_doc(i).unwrap())
+                .collect();
+            for from in [0, 1, 7, 8, 64, 200, 256, 257] {
+                for target in [0, 1, 100, 639, 640, 641, 700, 160_000, 163_840, TERMINATED] {
+                    let expected = (from..lasts.len()).find(|&i| lasts[i] >= target);
+                    assert_eq!(
+                        postings.seek_block(target, from),
+                        expected,
+                        "{codec:?} from={from} target={target}"
+                    );
+                }
+            }
+            let mut cursor = postings.iterator();
+            let mut at = 0;
+            for target in [
+                0,
+                1,
+                20,
+                19,
+                639,
+                640,
+                641,
+                700,
+                160_000,
+                161_000,
+                160_000,
+                docs.last().unwrap().0 - 1,
+                docs.last().unwrap().0,
+                TERMINATED,
+                0,
+            ] {
+                while at < docs.len() && docs[at].0 < target {
+                    at += 1;
+                }
+                let expected = docs.get(at).map_or(TERMINATED, |&(doc, _)| doc);
+                assert_eq!(cursor.seek(target), expected, "{codec:?} target={target}");
+                if at < docs.len() {
+                    assert_eq!(cursor.term_freq(), docs[at].1);
+                    assert_eq!(cursor.position_cursor(), prefixes[at]);
+                }
+            }
+            assert_eq!(serialize_bpl(&postings), bytes);
+        }
+    }
 
     #[test]
     fn candidate_posting_probes_reuse_buffers_and_preserve_seek_and_position_cursors() {
@@ -1792,6 +3398,7 @@ mod tests {
         }
         let postings = BlockPostingList::from_posting_list(&list).unwrap();
         let mut scratch = PostingDecodeScratch::default();
+        let mut doc_buffer = None;
         for first in [0, 385, 900, 1800, 2100, 100, 2097] {
             let mut reference = postings.clone().into_iterator();
             let mut selected = postings
@@ -1810,7 +3417,17 @@ mod tests {
             }
             selected.recycle(&mut scratch);
             assert!(scratch.doc_ids.capacity() >= BLOCK_SIZE);
-            assert!(scratch.term_freqs.capacity() >= BLOCK_SIZE);
+            // The frequency scratch is inline (no heap allocation to reuse);
+            // the document buffer is the one heap allocation and must be.
+            assert!(scratch.term_freqs.is_some());
+            let address = scratch.doc_ids.as_ptr() as usize;
+            if let Some(previous) = doc_buffer {
+                assert_eq!(
+                    address, previous,
+                    "document scratch allocation must be reused"
+                );
+            }
+            doc_buffer = Some(address);
         }
     }
 
@@ -1834,24 +3451,6 @@ mod tests {
         assert_eq!(iter.term_freq(), 3);
 
         assert_eq!(iter.advance(), TERMINATED);
-    }
-
-    #[test]
-    fn test_posting_list_serialization() {
-        let mut list = PostingList::new();
-        for i in 0..100 {
-            list.push(i * 3, (i % 5) + 1);
-        }
-
-        let mut buffer = Vec::new();
-        list.serialize(&mut buffer).unwrap();
-
-        let deserialized = PostingList::deserialize(&mut &buffer[..]).unwrap();
-        assert_eq!(deserialized.len(), list.len());
-
-        for (a, b) in list.iter().zip(deserialized.iter()) {
-            assert_eq!(a, b);
-        }
     }
 
     #[test]
@@ -1928,6 +3527,17 @@ mod tests {
     }
 
     /// Helper: build a BlockPostingList from (doc_id, tf) pairs
+    #[test]
+    fn deserialization_rejects_unsupported_width_instead_of_empty_results() {
+        let list = build_bpl(&[(0, 1), (1, 2)]);
+        let mut bytes = Vec::new();
+        list.serialize(&mut bytes).unwrap();
+        bytes[6] = 0xe1;
+        let error = BlockPostingList::deserialize(&bytes).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds 32 bits"));
+    }
+
     fn build_bpl(postings: &[(u32, u32)]) -> BlockPostingList {
         let mut pl = PostingList::new();
         for &(doc_id, tf) in postings {
@@ -2429,11 +4039,18 @@ mod tests {
             PostingCodec::Rounded,
             PostingCodec::Packed,
             PostingCodec::Pfor,
+            PostingCodec::Simd4x,
         ] {
             let bpl = BlockPostingList::from_posting_list_with_codec(&list, codec).unwrap();
             assert_eq!(collect_postings(&bpl), postings, "{codec}");
             for b in 0..bpl.num_blocks() {
-                assert_eq!(bpl.block_codec(b), Some(codec));
+                let count = (postings.len() - b * BLOCK_SIZE).min(BLOCK_SIZE);
+                let expected_codec = if codec == PostingCodec::Simd4x && count < BLOCK_SIZE {
+                    PostingCodec::Rounded
+                } else {
+                    codec
+                };
+                assert_eq!(bpl.block_codec(b), Some(expected_codec));
                 assert_eq!(bpl.block_max_tf(b), rounded.block_max_tf(b));
             }
             // Serialized round trip (both copying and zero-copy paths).
@@ -2626,7 +4243,7 @@ mod tests {
         for &(doc, tf) in postings {
             list.push(doc, tf);
         }
-        BlockPostingList::from_posting_list_with_positions(&list).unwrap()
+        BlockPostingList::from_posting_list_with(&list, true, None).unwrap()
     }
 
     /// Expected cursor of every posting: the cumulative tf before it.
@@ -2753,8 +4370,18 @@ mod tests {
         let docs: Vec<(u32, u32)> = (0..300u32).map(|i| (i * 2, 1 + i % 3)).collect();
         let bpl = build_bpl(&docs);
         let bytes = serialize_bpl(&bpl);
-        // A pre-magic list is the same bytes without the 16-byte extension.
-        let legacy = bytes[..bytes.len() - (FOOTER_V2_SIZE - FOOTER_SIZE)].to_vec();
+        // A real pre-magic layout has no L1 bounds or footer extension, and
+        // stores f32 maxima rather than packed TF/length L0 words.
+        let footer = Footer::parse(&bytes).unwrap();
+        let mut legacy = bytes[..footer.l1_end()].to_vec();
+        for block in 0..bpl.num_blocks() {
+            let at = footer.l0_start() + block * L0_SIZE + 12;
+            legacy[at..at + 4]
+                .copy_from_slice(&(bpl.block_max_tf(block).unwrap() as f32).to_le_bytes());
+        }
+        legacy.extend_from_slice(
+            &bytes[bytes.len() - FOOTER_V2_SIZE..bytes.len() - (FOOTER_V2_SIZE - FOOTER_SIZE)],
+        );
         assert!(!BlockPostingList::has_cursors_bytes(&legacy));
         // Legacy lists carry an f32 max tf per block and no lengths.
         let decoded = BlockPostingList::deserialize(&legacy).unwrap();
@@ -2832,5 +4459,507 @@ mod tests {
         let result = bpl.seek_block(target_in_5, 8);
         assert!(result.is_some());
         assert!(result.unwrap() >= 8);
+    }
+    #[test]
+    fn saturated_tf_bounds_remain_upper_bounds_without_changing_encoded_bytes() {
+        let docs: Vec<_> = (0..(BLOCK_SIZE * 18) as u32)
+            .map(|doc| {
+                (
+                    doc,
+                    if doc == (BLOCK_SIZE * 17) as u32 {
+                        100_000
+                    } else {
+                        1
+                    },
+                )
+            })
+            .collect();
+        let list = build_bpl(&docs);
+        let bytes = serialize_bpl(&list);
+        assert_eq!(list.max_tf(), 100_000);
+        assert!(list.block_bounds(17).unwrap().0 >= 100_000);
+        assert!(list.group_bounds(17).unwrap().0 >= 100_000);
+        assert_eq!(list.block_bounds(0).unwrap().0, 1);
+        let decoded = BlockPostingList::deserialize(&bytes).unwrap();
+        assert!(decoded.block_bounds(17).unwrap().0 >= 100_000);
+        assert!(decoded.group_bounds(17).unwrap().0 >= 100_000);
+        assert_eq!(serialize_bpl(&decoded), bytes);
+        assert_eq!(collect_postings(&decoded), docs);
+    }
+    #[test]
+    fn ratio_bounds_preserve_payload_bytes_and_copy_merge_with_legacy_blocks() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let mut postings = PostingList::new();
+            for i in 0..1100 {
+                postings.push(i * 3, 1 + i % 97);
+            }
+            let length = |id| 10 + id % 997;
+            let plain = BlockPostingList::from_posting_list_with_options(
+                &postings,
+                true,
+                Some(&length),
+                codec,
+            )
+            .unwrap();
+            let tight = BlockPostingList::from_posting_list_with_ratio_bounds(
+                &postings,
+                true,
+                Some(&length),
+                codec,
+            )
+            .unwrap();
+            assert_eq!(plain.stream.as_slice(), tight.stream.as_slice());
+            assert_eq!(plain.l0_bytes.as_slice(), tight.l0_bytes.as_slice());
+            assert_eq!(
+                plain.pos_cursors.as_ref().map(OwnedBytes::as_slice),
+                tight.pos_cursors.as_ref().map(OwnedBytes::as_slice)
+            );
+            let mut raw = Vec::new();
+            tight.serialize(&mut raw).unwrap();
+            let decoded = BlockPostingList::deserialize(&raw).unwrap();
+            assert!(decoded.has_ratio_bounds());
+            for block in 0..tight.num_blocks() {
+                assert!(decoded.block_length_ratio(block) > 0.0);
+                for posting in &postings.postings
+                    [block * BLOCK_SIZE..((block + 1) * BLOCK_SIZE).min(postings.len())]
+                {
+                    assert!(
+                        decoded.block_length_ratio(block) as f64
+                            <= length(posting.doc_id) as f64 / posting.term_freq as f64
+                    );
+                    assert!(decoded.group_length_ratio(block) <= decoded.block_length_ratio(block));
+                }
+            }
+            let merged = BlockPostingList::concatenate_blocks(&[
+                (tight.clone(), 0),
+                (plain.clone(), 10_000),
+            ])
+            .unwrap();
+            let mut plain_raw = Vec::new();
+            plain.serialize(&mut plain_raw).unwrap();
+            let mut streaming = Vec::new();
+            let (_, size) = BlockPostingList::concatenate_streaming(
+                &[(&raw, 0), (&plain_raw, 10_000)],
+                &mut streaming,
+            )
+            .unwrap();
+            let mut expected = Vec::new();
+            merged.serialize(&mut expected).unwrap();
+            assert_eq!(streaming, expected);
+            assert_eq!(streaming.len(), size);
+            for block in 0..tight.num_blocks() {
+                assert_eq!(
+                    merged.block_length_ratio(block),
+                    tight.block_length_ratio(block)
+                );
+                assert_eq!(merged.block_length_ratio(block + tight.num_blocks()), 0.0);
+                let mut before = Vec::new();
+                let mut after = Vec::new();
+                let mut tfs_before = Vec::new();
+                let mut tfs_after = Vec::new();
+                tight.decode_block_into(block, &mut before, &mut tfs_before);
+                merged.decode_block_into(block, &mut after, &mut tfs_after);
+                assert_eq!((before, tfs_before), (after, tfs_after));
+            }
+            // Model an actual list without the optional extension: remove
+            // its bytes as well as its flag. Unaddressed trailers are corrupt.
+            let footer = Footer::parse(&raw).unwrap();
+            raw.drain(footer.cursors_end()..footer.ratios_end());
+            let flags = raw.len() - 12;
+            raw[flags] &= !(FLAG_RATIO_BOUNDS as u8);
+            let legacy_view = BlockPostingList::deserialize(&raw).unwrap();
+            assert!(!legacy_view.has_ratio_bounds());
+            assert_eq!(legacy_view.stream.as_slice(), tight.stream.as_slice());
+        }
+    }
+
+    #[test]
+    fn ratio_bounds_reject_truncation_nonfinite_negative_and_unknown_flags() {
+        let mut postings = PostingList::new();
+        postings.push(1, 3);
+        let list = BlockPostingList::from_posting_list_with_ratio_bounds(
+            &postings,
+            false,
+            Some(&|_| 7),
+            PostingCodec::Rounded,
+        )
+        .unwrap();
+        let mut raw = Vec::new();
+        list.serialize(&mut raw).unwrap();
+        let footer = Footer::parse(&raw).unwrap();
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            let mut corrupt = raw.clone();
+            corrupt[footer.cursors_end()..footer.cursors_end() + 4]
+                .copy_from_slice(&bad.to_le_bytes());
+            assert!(BlockPostingList::deserialize(&corrupt).is_err());
+            assert!(
+                BlockPostingList::concatenate_streaming(&[(&corrupt, 0)], &mut Vec::new()).is_err()
+            );
+        }
+        let mut short = raw.clone();
+        short.remove(footer.cursors_end());
+        assert!(BlockPostingList::deserialize(&short).is_err());
+        let at = raw.len() - 12;
+        raw[at] |= 128;
+        assert!(BlockPostingList::deserialize(&raw).is_err());
+    }
+
+    const ALL_CODECS: [PostingCodec; 4] = [
+        PostingCodec::Rounded,
+        PostingCodec::Packed,
+        PostingCodec::Pfor,
+        PostingCodec::Simd4x,
+    ];
+
+    /// Byte offset of the first document delta of `block` in the stream.
+    fn first_delta_byte(list: &BlockPostingList, block: usize) -> usize {
+        let (_, _, offset, _) = list.read_l0_entry(block);
+        let header = offset as usize;
+        // Pfor arrays start with their exception count.
+        header + 8 + usize::from(list.block_codec(block) == Some(PostingCodec::Pfor))
+    }
+
+    /// Structurally valid bytes whose block content disagrees with the L0
+    /// directory must end the cursor explicitly, never index out of range.
+    #[test]
+    fn content_corrupt_block_never_panics_or_truncates_silently() {
+        for codec in ALL_CODECS {
+            // Block 0: docs 0..128 (full); block 1: [200, 300] (a tail, so
+            // Simd4x falls back to Rounded there).
+            let mut postings = PostingList::new();
+            for doc in 0..128 {
+                postings.push(doc, doc % 5 + 1);
+            }
+            postings.push(200, 2);
+            postings.push(300, 3);
+            let list =
+                BlockPostingList::from_posting_list_with_options(&postings, true, None, codec)
+                    .unwrap();
+            let bytes = serialize_bpl(&list);
+            let at = first_delta_byte(&list, 1);
+            assert_eq!(
+                bytes[at], 100,
+                "{codec}: delta 300-200 at the first payload byte"
+            );
+            let mut corrupt = bytes.clone();
+            corrupt[at] = 1; // block 1 now decodes to [200, 201]; L0 still says 200..=300
+            let admitted = BlockPostingList::deserialize(&corrupt)
+                .unwrap_or_else(|e| panic!("{codec}: structural admission must pass: {e}"));
+            // Before the content check this indexed past the decoded block.
+            let mut cursor = admitted.iterator();
+            assert_eq!(cursor.seek(250), TERMINATED, "{codec}");
+            assert_eq!(cursor.term_freq(), 0);
+            assert_eq!(cursor.advance(), TERMINATED);
+            let mut decoded = Vec::new();
+            assert!(
+                admitted
+                    .decode_block_doc_ids_only(0, &mut decoded)
+                    .is_some()
+            );
+            assert_eq!(decoded.len(), 128);
+            assert!(
+                admitted
+                    .decode_block_doc_ids_only(1, &mut decoded)
+                    .is_none(),
+                "{codec}: a content-corrupt block must be reported, not decoded"
+            );
+            assert!(decoded.is_empty(), "no ids escape a corrupt block");
+            assert!(!admitted.decode_block_into(1, &mut decoded, &mut Vec::new()));
+            // Sequential traversal stops at the corrupt block instead of
+            // yielding ids outside the directory range.
+            assert_eq!(
+                collect_postings(&admitted),
+                collect_postings(&list)[..128],
+                "{codec}"
+            );
+            let mut window = admitted.iterator();
+            let mut bits = [0u64; 8];
+            window.fill_doc_window(0, &mut bits);
+            assert_eq!(bits[..2], [u64::MAX, u64::MAX]);
+            assert_eq!(window.doc(), TERMINATED);
+            // Untouched bytes still decode completely.
+            assert_eq!(
+                collect_postings(&BlockPostingList::deserialize(&bytes).unwrap()).len(),
+                130
+            );
+        }
+        // A full Simd4x block: corrupt one lane word after the reserved zero
+        // first gap so the decoded ids drift below the directory's last id.
+        let mut postings = PostingList::new();
+        for doc in 0..128 {
+            postings.push(doc, 1);
+        }
+        for i in 0..128 {
+            postings.push(200 + i * 2, 1);
+        }
+        let list = BlockPostingList::from_posting_list_with_codec(&postings, PostingCodec::Simd4x)
+            .unwrap();
+        assert_eq!(list.block_codec(1), Some(PostingCodec::Simd4x));
+        let mut bytes = serialize_bpl(&list);
+        let at = first_delta_byte(&list, 1) + 1;
+        assert_ne!(bytes[at], 0);
+        bytes[at] = 0;
+        let admitted = BlockPostingList::deserialize(&bytes).unwrap();
+        let mut cursor = admitted.iterator();
+        assert_eq!(cursor.seek(450), TERMINATED);
+        assert!(
+            admitted
+                .decode_block_doc_ids_only(1, &mut Vec::new())
+                .is_none()
+        );
+        assert_eq!(collect_postings(&admitted).len(), 128);
+    }
+
+    /// Single-block list whose tail (count < 128) is encoded with codec id 3,
+    /// as the first Simd4x prototype wrote; the builder now emits Rounded
+    /// tails but readers keep accepting these bytes.
+    fn simd_exact_tail_bytes(docs: &[(u32, u32)]) -> Vec<u8> {
+        assert!(!docs.is_empty() && docs.len() < BLOCK_SIZE);
+        let count = docs.len();
+        let (first, last) = (docs[0].0, docs[count - 1].0);
+        let deltas: Vec<u32> = docs.windows(2).map(|w| w[1].0 - w[0].0).collect();
+        let tfs: Vec<u32> = docs.iter().map(|d| d.1).collect();
+        let max_tf = tfs.iter().copied().max().unwrap();
+        let mut stream = Vec::new();
+        stream.write_u16::<LittleEndian>(count as u16).unwrap();
+        stream.write_u32::<LittleEndian>(first).unwrap();
+        let header_at = stream.len();
+        stream.extend_from_slice(&[0, 0]);
+        let doc_bits = bitpacking4x::encode_gaps(&deltas, &mut stream);
+        let tf_bits = bitpacking4x::encode(&tfs, &mut stream);
+        stream[header_at] = PostingCodec::Simd4x.header_byte(doc_bits);
+        stream[header_at + 1] = tf_bits;
+        let mut bytes = stream.clone();
+        write_l0(&mut bytes, first, last, 0, pack_bounds(max_tf, 1));
+        bytes.extend_from_slice(&last.to_le_bytes());
+        bytes.extend_from_slice(&pack_bounds(max_tf, 1).to_le_bytes());
+        BlockPostingList::write_footer(
+            &mut bytes,
+            stream.len() as u64,
+            1,
+            1,
+            count as u32,
+            max_tf,
+            0,
+            false,
+            Some(1),
+            true,
+            false,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn simd4x_exact_tail_blocks_decode_seek_and_copy_through_merge() {
+        for count in [1usize, 2, 3, 17, 127] {
+            let docs: Vec<(u32, u32)> = (0..count as u32)
+                .map(|i| (i * 3 + 7, i % 4 + 1 + (i == 5) as u32 * 900))
+                .collect();
+            let bytes = simd_exact_tail_bytes(&docs);
+            let list = BlockPostingList::deserialize(&bytes).unwrap();
+            assert_eq!(
+                list.block_codec(0),
+                Some(PostingCodec::Simd4x),
+                "count={count}"
+            );
+            assert_eq!(collect_postings(&list), docs, "count={count}");
+            let mut cursor = list.iterator();
+            for &(doc, tf) in &docs {
+                assert_eq!(cursor.seek(doc.saturating_sub(1)), doc);
+                assert_eq!(cursor.term_freq(), tf);
+            }
+            assert_eq!(cursor.seek(docs[count - 1].0 + 1), TERMINATED);
+            assert_eq!(serialize_bpl(&list), bytes, "byte-identical round trip");
+            // Merges copy the tail verbatim, keeping codec id 3.
+            let mut out = Vec::new();
+            let (merged_count, written) =
+                BlockPostingList::concatenate_streaming(&[(&bytes, 0), (&bytes, 1000)], &mut out)
+                    .unwrap();
+            assert_eq!((merged_count as usize, written), (2 * count, out.len()));
+            let merged = BlockPostingList::deserialize(&out).unwrap();
+            assert_eq!(merged.block_codec(1), Some(PostingCodec::Simd4x));
+            let expected: Vec<(u32, u32)> = docs
+                .iter()
+                .copied()
+                .chain(docs.iter().map(|&(d, t)| (d + 1000, t)))
+                .collect();
+            assert_eq!(collect_postings(&merged), expected, "count={count}");
+            let typed =
+                BlockPostingList::concatenate_blocks(&[(list.clone(), 0), (list.clone(), 1000)])
+                    .unwrap();
+            assert_eq!(serialize_bpl(&typed), out);
+            // Header corruption of the tail is still caught structurally.
+            let mut short = bytes.clone();
+            short[0] = (count + 1) as u8;
+            assert!(BlockPostingList::deserialize(&short).is_err());
+        }
+    }
+
+    /// A legacy 24-byte footer ending in a `max_tf` equal to the extended
+    /// footer magic is ambiguous; it must be rejected, never parsed as the
+    /// extended layout.
+    #[test]
+    fn legacy_footer_whose_max_tf_equals_the_magic_is_rejected_not_misread() {
+        for count in [1u32, 2, 130, 700] {
+            let mut postings = PostingList::new();
+            for i in 0..count {
+                postings.push(i * 2, if i == 0 { FOOTER_MAGIC } else { 1 });
+            }
+            let bpl = BlockPostingList::from_posting_list(&postings).unwrap();
+            assert_eq!(bpl.max_tf(), FOOTER_MAGIC);
+            let bytes = serialize_bpl(&bpl);
+            let footer = Footer::parse(&bytes).unwrap();
+            let mut legacy = bytes[..footer.l1_end()].to_vec();
+            for block in 0..bpl.num_blocks() {
+                let at = footer.l0_start() + block * L0_SIZE + 12;
+                legacy[at..at + 4]
+                    .copy_from_slice(&(bpl.block_max_tf(block).unwrap() as f32).to_le_bytes());
+            }
+            legacy.extend_from_slice(
+                &bytes[bytes.len() - FOOTER_V2_SIZE..bytes.len() - (FOOTER_V2_SIZE - FOOTER_SIZE)],
+            );
+            assert_eq!(
+                u32::from_le_bytes(legacy[legacy.len() - 4..].try_into().unwrap()),
+                FOOTER_MAGIC
+            );
+            assert!(
+                BlockPostingList::deserialize(&legacy).is_err(),
+                "count={count}: ambiguous footer must not be read as either layout"
+            );
+            assert!(!BlockPostingList::has_cursors_bytes(&legacy));
+            let mut out = vec![0xab];
+            assert!(BlockPostingList::concatenate_streaming(&[(&legacy, 0)], &mut out).is_err());
+            assert_eq!(out, [0xab]);
+            // The same postings with the extended footer read back exactly.
+            assert_eq!(
+                BlockPostingList::deserialize(&bytes).unwrap().max_tf(),
+                FOOTER_MAGIC
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_cursor_and_cursorless_sources_fail_loudly_before_output() {
+        let docs: Vec<(u32, u32)> = (0..300u32).map(|i| (i * 2, i % 3 + 1)).collect();
+        let with = build_bpl_with_positions(&docs);
+        let without = build_bpl(&docs);
+        assert!(with.has_position_cursors() && !without.has_position_cursors());
+        for sources in [
+            [(with.clone(), 0), (without.clone(), 1000)],
+            [(without.clone(), 0), (with.clone(), 1000)],
+        ] {
+            let error = BlockPostingList::concatenate_blocks(&sources).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("with and without position cursors"),
+                "{error}"
+            );
+            let bytes: Vec<Vec<u8>> = sources.iter().map(|(s, _)| serialize_bpl(s)).collect();
+            let mut out = vec![0xab];
+            let result = BlockPostingList::concatenate_streaming(
+                &[(&bytes[0], 0), (&bytes[1], 1000)],
+                &mut out,
+            );
+            match result {
+                Err(crate::Error::Corruption(message)) => {
+                    assert!(
+                        message.contains("with and without position cursors"),
+                        "{message}"
+                    )
+                }
+                other => panic!("expected a loud corruption error, got {other:?}"),
+            }
+            assert_eq!(out, [0xab], "nothing is written for a rejected source set");
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "posting/merge_admission_tests.rs"]
+mod merge_admission_tests;
+
+#[cfg(test)]
+mod byte_gap_validation_tests {
+    use super::*;
+
+    #[test]
+    fn strict_gap_validation_agrees_with_full_scan_at_width_and_wrap_boundaries() {
+        for count in 1..=BLOCK_SIZE {
+            for width in 0..=32 {
+                let mask = if width == 0 {
+                    0
+                } else {
+                    u32::MAX >> (32 - width)
+                };
+                for first in [0u32, 17, u32::MAX / 2, u32::MAX - 1] {
+                    for pattern in 0..3 {
+                        let mut docs = vec![first];
+                        for i in 1..count {
+                            let encoded = match pattern {
+                                0 => mask,
+                                1 => 0,
+                                _ => (i as u32).wrapping_mul(0x9e3779b9) & mask,
+                            };
+                            docs.push(docs.last().unwrap().wrapping_add(encoded).wrapping_add(1));
+                        }
+                        let end = *docs.last().unwrap();
+                        for last in [end, end.wrapping_add(1), end.wrapping_sub(1)] {
+                            assert_eq!(
+                                verify_block_docs(&docs, first, last, None, Some(width)),
+                                verify_block_docs(&docs, first, last, None, None),
+                                "count={count}, width={width}, first={first}, pattern={pattern}, last={last}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn byte_gap_validation_agrees_with_decoded_order_for_tails_and_unsigned_wraps() {
+        for count in 1..=BLOCK_SIZE {
+            for first in [0u32, 17, u32::MAX - 400, u32::MAX - 1] {
+                for pattern in 0..5 {
+                    let gaps: Vec<u8> = (1..count)
+                        .map(|i| match pattern {
+                            0 => 1,
+                            1 => 255,
+                            2 => {
+                                if i == count / 2 {
+                                    0
+                                } else {
+                                    1
+                                }
+                            }
+                            3 => (i * 71) as u8,
+                            _ => ((i * 71) as u8).max(1),
+                        })
+                        .collect();
+                    let mut docs = vec![first];
+                    for &gap in &gaps {
+                        docs.push(docs.last().unwrap().wrapping_add(u32::from(gap)));
+                    }
+                    let end = *docs.last().unwrap();
+                    for last in [end, end.wrapping_add(1), end.wrapping_sub(1)] {
+                        assert_eq!(
+                            verify_block_docs(&docs, first, last, Some(&gaps), None),
+                            verify_block_docs(&docs, first, last, None, None),
+                            "count={count}, first={first}, pattern={pattern}, last={last}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

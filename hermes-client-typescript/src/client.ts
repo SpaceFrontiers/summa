@@ -324,7 +324,7 @@ export class HermesClient {
     return response.success;
   }
 
-  /** Reorder BMP blocks by SimHash similarity. */
+  /** Run bounded text, Seismic, and binary ANN layout maintenance. */
   async reorder(indexName: string, timeoutMs?: number): Promise<number> {
     this.ensureConnected();
     const response = await this.indexClient!.reorder(

@@ -10,9 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use memmap2::Mmap;
 
-use super::{
-    Directory, DirectoryWriter, FileHandle, FileStreamingWriter, OwnedBytes, StreamingWriter,
-};
+use super::{Directory, DirectoryWriter, FileHandle, OwnedBytes, StreamingWriter};
 
 /// Memory-mapped directory for efficient access to large index files
 ///
@@ -110,17 +108,7 @@ impl Directory for MmapDirectory {
     }
 
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
-        let full_path = self.resolve(prefix);
-        let mut entries = tokio::fs::read_dir(&full_path).await?;
-        let mut files = Vec::new();
-
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                files.push(entry.path().strip_prefix(&self.root).unwrap().to_path_buf());
-            }
-        }
-
-        Ok(files)
+        super::local::list_files(&self.root, prefix).await
     }
 
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
@@ -177,24 +165,24 @@ impl DirectoryWriter for MmapDirectory {
     }
 
     async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
-        let full_path = self.resolve(path);
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = std::fs::File::create(&full_path)?;
-        Ok(Box::new(FileStreamingWriter::new(file)))
+        super::local::streaming_writer(&self.resolve(path)).await
     }
 
     async fn streaming_writer_cold(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
-        let full_path = self.resolve(path);
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = std::fs::File::create(&full_path)?;
-        Ok(Box::new(super::ColdStreamingWriter::new(
-            file,
+        super::local::streaming_writer_cold(&self.resolve(path), self.label.get(), None).await
+    }
+
+    async fn streaming_writer_cold_with_capacity(
+        &self,
+        path: &Path,
+        buffer_capacity: usize,
+    ) -> io::Result<Box<dyn StreamingWriter>> {
+        super::local::streaming_writer_cold(
+            &self.resolve(path),
             self.label.get(),
-        )))
+            Some(buffer_capacity),
+        )
+        .await
     }
 }
 

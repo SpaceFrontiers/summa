@@ -107,7 +107,8 @@ impl CandidateQuery {
     }
     pub(crate) fn from_decomposition(decomposition: QueryDecomposition) -> Result<Self> {
         match decomposition {
-            QueryDecomposition::TextTerm(term) => Ok(Self::new(term.field, ScoreComponent::Text(vec![(term.term, term.weight)]))),
+            QueryDecomposition::TextTerm(term) if term.global_stats.is_none() => Ok(Self::new(term.field, ScoreComponent::Text(vec![(term.term, term.weight)]))),
+            QueryDecomposition::TextTerm(_) => Err(Error::Query("term carries query-owned global statistics; L1 backfill scores with index statistics, so drop `with_global_stats` on the backfilled term".into())),
             QueryDecomposition::SparseTerms(infos) if !infos.is_empty() => {
                 let field = infos[0].field;
                 if infos.iter().any(|info| info.field != field) { return Err(Error::Query("L1 branch mixes sparse fields".into())); }

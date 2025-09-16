@@ -3,7 +3,8 @@
 //! Supports:
 //! - Term queries: `rust` or `title:rust`
 //! - Phrase queries: `"hello world"` or `title:"hello world"`
-//! - Boolean operators: `AND`, `OR`, `NOT` (or `&&`, `||`, `-`)
+//! - Boolean operators: `AND`, `OR`, `NOT` (or `&&`, `||`, `!`)
+//! - Required/prohibited clauses: `+rust -python`, including phrases and groups
 //! - Grouping: `(rust OR python) AND programming`
 //! - Default fields for unqualified terms
 
@@ -53,6 +54,10 @@ pub enum ParsedQuery {
     And(Vec<ParsedQuery>),
     Or(Vec<ParsedQuery>),
     Not(Box<ParsedQuery>),
+    Required(Box<ParsedQuery>),
+    Prohibited(Box<ParsedQuery>),
+    /// Preserve the scope of clause modifiers inside parentheses.
+    Group(Box<ParsedQuery>),
 }
 
 /// Query language parser with schema awareness
@@ -113,6 +118,16 @@ impl QueryLanguageParser {
     /// - In exclusive mode: only the target field is queried with the substituted value
     /// - In additional mode: both the target field and default fields are queried
     pub fn parse(&self, query_str: &str) -> Result<Box<dyn Query>, String> {
+        self.parse_with_mode(query_str, false)
+    }
+
+    /// Parse query syntax without falling back to tokenized plain text.
+    /// Configured field routing still applies.
+    pub fn parse_strict(&self, query_str: &str) -> Result<Box<dyn Query>, String> {
+        self.parse_with_mode(query_str, true)
+    }
+
+    fn parse_with_mode(&self, query_str: &str, strict: bool) -> Result<Box<dyn Query>, String> {
         let query_str = query_str.trim();
         if query_str.is_empty() {
             return Err("Empty query".to_string());
@@ -127,11 +142,12 @@ impl QueryLanguageParser {
                 &routed.target_field,
                 routed.mode,
                 query_str,
+                strict,
             );
         }
 
         // No routing match - parse normally
-        self.parse_normal(query_str)
+        self.parse_normal(query_str, strict)
     }
 
     /// Build a query from a routed match
@@ -141,6 +157,7 @@ impl QueryLanguageParser {
         target_field: &str,
         mode: RoutingMode,
         original_query: &str,
+        strict: bool,
     ) -> Result<Box<dyn Query>, String> {
         // Validate target field exists
         let _field_id = self
@@ -162,9 +179,9 @@ impl QueryLanguageParser {
                 bool_query = bool_query.should(target_query);
 
                 // Also parse the original query against default fields
-                if let Ok(default_query) = self.parse_normal(original_query) {
-                    bool_query = bool_query.should(default_query);
-                }
+                // An additional route must retain the original query or its
+                // error; dropping it silently changes the requested semantics.
+                bool_query = bool_query.should(self.parse_normal(original_query, strict)?);
 
                 Ok(Box::new(bool_query))
             }
@@ -172,10 +189,18 @@ impl QueryLanguageParser {
     }
 
     /// Parse query without routing (normal parsing path)
-    fn parse_normal(&self, query_str: &str) -> Result<Box<dyn Query>, String> {
+    fn parse_normal(&self, query_str: &str, strict: bool) -> Result<Box<dyn Query>, String> {
         // Try parsing as query language first
         match self.parse_query_string(query_str) {
             Ok(parsed) => self.build_query(&parsed),
+            Err(error)
+                if strict
+                    || query_str
+                        .split(|c: char| c.is_whitespace() || c == '(')
+                        .any(|word| word.len() > 1 && word.starts_with(['+', '-'])) =>
+            {
+                Err(error)
+            }
             Err(_) => {
                 // If grammar parsing fails, treat as plain text
                 // Split by whitespace and create OR of terms
@@ -257,15 +282,17 @@ impl QueryLanguageParser {
     }
 
     fn parse_primary(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
-        let mut negated = false;
+        let mut modifier = None;
         let mut inner_query = None;
 
         for inner in pair.into_inner() {
             match inner.as_rule() {
-                Rule::not_op => negated = true,
+                Rule::not_op | Rule::required_op | Rule::prohibited_op => {
+                    modifier = Some(inner.as_rule());
+                }
                 Rule::group => {
                     let or_expr = inner.into_inner().next().unwrap();
-                    inner_query = Some(self.parse_or_expr(or_expr)?);
+                    inner_query = Some(ParsedQuery::Group(Box::new(self.parse_or_expr(or_expr)?)));
                 }
                 Rule::ann_query => {
                     inner_query = Some(self.parse_ann_query(inner)?);
@@ -288,11 +315,12 @@ impl QueryLanguageParser {
 
         let query = inner_query.ok_or("No query in primary")?;
 
-        if negated {
-            Ok(ParsedQuery::Not(Box::new(query)))
-        } else {
-            Ok(query)
-        }
+        Ok(match modifier {
+            Some(Rule::not_op) => ParsedQuery::Not(Box::new(query)),
+            Some(Rule::required_op) => ParsedQuery::Required(Box::new(query)),
+            Some(Rule::prohibited_op) => ParsedQuery::Prohibited(Box::new(query)),
+            _ => query,
+        })
     }
 
     fn parse_term_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
@@ -466,32 +494,50 @@ impl QueryLanguageParser {
                     .get_field(field)
                     .ok_or_else(|| format!("Unknown field: {}", field))?;
                 let mut query = SparseVectorQuery::new(field_id, vector.clone());
-                if let Some(gamma) = self
+                if let Some(config) = self
                     .schema
                     .get_field_entry(field_id)
                     .and_then(|entry| entry.sparse_vector_config.as_ref())
                     .and_then(|config| config.query_config.as_ref())
-                    .and_then(|config| config.lsp_gamma)
                 {
-                    query = query.with_lsp_gamma(gamma);
+                    if let Some(gamma) = config.lsp_gamma {
+                        query = query.with_lsp_gamma(gamma);
+                    }
+                    query = query
+                        .with_heap_factor(config.heap_factor)
+                        .with_seismic_cut(config.seismic_cut)
+                        .with_seismic_factor(config.seismic_factor)
+                        .with_exhaustive(config.exhaustive);
                 }
                 Ok(Box::new(query))
             }
             ParsedQuery::And(queries) => {
                 let mut bool_query = BooleanQuery::new();
                 for q in queries {
-                    bool_query = bool_query.must(self.build_query(q)?);
+                    bool_query = match q {
+                        ParsedQuery::Prohibited(inner) => {
+                            bool_query.must_not(self.build_query(inner)?)
+                        }
+                        _ => bool_query.must(self.build_query(q)?),
+                    };
                 }
                 Ok(Box::new(bool_query))
             }
             ParsedQuery::Or(queries) => {
                 let mut bool_query = BooleanQuery::new();
                 for q in queries {
-                    bool_query = bool_query.should(self.build_query(q)?);
+                    bool_query = match q {
+                        ParsedQuery::Required(inner) => bool_query.must(self.build_query(inner)?),
+                        ParsedQuery::Prohibited(inner) => {
+                            bool_query.must_not(self.build_query(inner)?)
+                        }
+                        _ => bool_query.should(self.build_query(q)?),
+                    };
                 }
                 Ok(Box::new(bool_query))
             }
-            ParsedQuery::Not(inner) => {
+            ParsedQuery::Required(inner) | ParsedQuery::Group(inner) => self.build_query(inner),
+            ParsedQuery::Not(inner) | ParsedQuery::Prohibited(inner) => {
                 // NOT query needs a context - wrap in a match-all with must_not
                 let mut bool_query = BooleanQuery::new();
                 bool_query = bool_query.must_not(self.build_query(inner)?);
@@ -551,6 +597,15 @@ impl QueryLanguageParser {
                 return Err("No tokens in term".to_string());
             }
 
+            // A single clause needs no Boolean wrapper. Preserve term decomposition
+            // for the owning planner, including when nested in a larger Boolean query.
+            if tokens.len() == 1 && self.default_fields.len() == 1 {
+                return Ok(Box::new(TermQuery::text(
+                    self.default_fields[0],
+                    &tokens[0],
+                )));
+            }
+
             // Build SHOULD query across all default fields for each token
             let mut bool_query = BooleanQuery::new();
             for token in &tokens {
@@ -592,64 +647,54 @@ impl QueryLanguageParser {
         field: Option<&str>,
         phrase: &str,
     ) -> Result<Box<dyn Query>, String> {
-        // For phrase queries, tokenize and create AND query of terms
-        let field_id = if let Some(field_name) = field {
-            self.schema
-                .get_field(field_name)
-                .ok_or_else(|| format!("Unknown field: {}", field_name))?
-        } else if !self.default_fields.is_empty() {
-            self.default_fields[0]
-        } else {
-            return Err("No field specified and no default fields configured".to_string());
-        };
-
-        let tokenizer = self.get_tokenizer(field_id);
-        let tokens: Vec<(u32, String)> = tokenizer
-            .tokenize(phrase)
-            .into_iter()
-            .map(|t| (t.position, t.text.to_lowercase()))
-            .collect();
-
-        if tokens.is_empty() {
-            return Err("No tokens in phrase".to_string());
+        let explicit = field
+            .map(|name| {
+                self.schema
+                    .get_field(name)
+                    .ok_or_else(|| format!("Unknown field: {name}"))
+            })
+            .transpose()?;
+        let fields = explicit
+            .as_ref()
+            .map_or(self.default_fields.as_slice(), std::slice::from_ref);
+        if fields.is_empty() {
+            return Err("No field specified and no default fields configured".into());
         }
-
-        if tokens.len() == 1 {
-            return Ok(Box::new(TermQuery::text(field_id, &tokens[0].1)));
-        }
-
-        // Positional phrase query; on a field without positions it degrades to
-        // an AND of the terms inside PhraseQuery itself. Token positions come
-        // from the tokenizer so gaps left by dropped stop words survive.
-        let phrase_terms = |tokens: &[(u32, String)]| -> Vec<(u32, Vec<u8>)> {
-            tokens
-                .iter()
-                .map(|(offset, t)| (*offset, t.clone().into_bytes()))
-                .collect()
-        };
-
-        // If no field specified and multiple default fields, wrap in OR
-        if field.is_none() && self.default_fields.len() > 1 {
-            let mut outer = BooleanQuery::new();
-            for &f in &self.default_fields {
-                let tokenizer = self.get_tokenizer(f);
-                let tokens: Vec<(u32, String)> = tokenizer
-                    .tokenize(phrase)
-                    .into_iter()
-                    .map(|t| (t.position, t.text.to_lowercase()))
-                    .collect();
-                if tokens.is_empty() {
-                    continue;
-                }
-                outer = outer.should(PhraseQuery::with_offsets(f, phrase_terms(&tokens)));
+        let build = |field_id| -> Result<Option<Box<dyn Query>>, String> {
+            let tokens: Vec<_> = self
+                .get_tokenizer(field_id)
+                .tokenize(phrase)
+                .into_iter()
+                .map(|token| (token.position, token.text.to_lowercase().into_bytes()))
+                .collect();
+            if tokens.is_empty() {
+                return Ok(None);
             }
-            return Ok(Box::new(outer));
+            if tokens.len() == 1 {
+                return Ok(Some(Box::new(TermQuery::new(
+                    field_id,
+                    tokens[0].1.clone(),
+                ))));
+            }
+            PhraseQuery::validate_positions(&self.schema, field_id)
+                .map_err(|error| error.to_string())?;
+            Ok(Some(Box::new(PhraseQuery::with_offsets(field_id, tokens))))
+        };
+        if fields.len() == 1 {
+            return build(fields[0])?.ok_or_else(|| "No tokens in phrase".into());
         }
-
-        Ok(Box::new(PhraseQuery::with_offsets(
-            field_id,
-            phrase_terms(&tokens),
-        )))
+        let mut outer = BooleanQuery::new();
+        let mut populated = false;
+        for &field in fields {
+            if let Some(query) = build(field)? {
+                outer = outer.should(query);
+                populated = true;
+            }
+        }
+        if !populated {
+            return Err("No tokens in phrase".into());
+        }
+        Ok(Box::new(outer))
     }
 
     fn get_tokenizer(&self, field: Field) -> BoxedTokenizer {
@@ -676,6 +721,8 @@ mod tests {
         let mut builder = SchemaBuilder::default();
         let title = builder.add_text_field("title", true, true);
         let body = builder.add_text_field("body", true, true);
+        builder.set_positions(title, crate::dsl::PositionMode::TokenPosition);
+        builder.set_positions(body, crate::dsl::PositionMode::TokenPosition);
         let schema = Arc::new(builder.build());
         let tokenizers = Arc::new(TokenizerRegistry::default());
         (schema, vec![title, body], tokenizers)
@@ -685,7 +732,7 @@ mod tests {
     fn sparse_query_language_preserves_schema_lsp_gamma_including_exhaustive_zero() {
         for gamma in [None, Some(0), Some(7)] {
             let setting = gamma.map_or(String::new(), |gamma| {
-                format!(", query<lsp_gamma: {gamma}>")
+                format!(", query<lsp_gamma: {gamma}, exhaustive: false>")
             });
             let schema = crate::parse_schema(&format!(
                 "index test {{ field emb: sparse_vector [indexed<format: bmp, dims: 16{setting}>] }}"
@@ -701,6 +748,7 @@ mod tests {
             };
             assert_eq!(infos.len(), 1);
             assert_eq!(infos[0].lsp_gamma, gamma);
+            assert!(!infos[0].exhaustive);
         }
     }
 
@@ -744,6 +792,71 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(actual.hits.len(), if gamma == 0 { 9 } else { 1 });
+            assert_eq!(hits(actual), hits(expected));
+        }
+    }
+
+    #[test]
+    fn sparse_query_language_preserves_schema_exhaustive_policy() {
+        for exhaustive in [false, true] {
+            let setting = format!(", query<exhaustive: {exhaustive}>");
+            let schema = crate::parse_schema(&format!(
+                "index test {{ field emb: sparse_vector [indexed<format: seismic, dims: 16{setting}>] }}"
+            )).unwrap();
+            let parser = QueryLanguageParser::new(
+                Arc::new(schema),
+                vec![],
+                Arc::new(TokenizerRegistry::default()),
+            );
+            let query = parser.parse("emb:sparse({0: 1.0})").unwrap();
+            let crate::query::QueryDecomposition::SparseTerms(infos) = query.decompose() else {
+                panic!("sparse syntax did not produce a sparse query");
+            };
+            assert_eq!(infos.len(), 1);
+            assert_eq!(infos[0].exhaustive, exhaustive);
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn parsed_sparse_search_uses_the_fields_exhaustive_policy() {
+        use crate::query::SparseVectorQuery;
+        use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory};
+        for exhaustive in [false, true] {
+            let schema = crate::parse_schema(&format!(
+                "index test {{ field emb: sparse_vector [indexed<format: seismic, dims: 16, seismic_postings: 1, seismic_cluster_size: 1, query<exhaustive: {exhaustive}>>] }}"
+            )).unwrap();
+            let field = schema.get_field("emb").unwrap();
+            let directory = RamDirectory::new();
+            let config = IndexConfig::default();
+            let mut writer = IndexWriter::create(directory.clone(), schema, config.clone())
+                .await
+                .unwrap();
+            // Two superblocks: one of eight weaker documents and one winner.
+            for doc in 0..9 {
+                let mut document = Document::new();
+                document.add_sparse_vector(field, vec![(0, if doc == 8 { 5.0 } else { 0.1 })]);
+                writer.add_document(document).unwrap();
+            }
+            writer.commit().await.unwrap();
+            let index = Index::open(directory, config).await.unwrap();
+            let query = index.query_parser().parse("emb:sparse({0: 1.0})").unwrap();
+            let actual = index.search(query.as_ref(), 9).await.unwrap();
+            let expected = index
+                .search(
+                    &SparseVectorQuery::new(field, vec![(0, 1.0)]).with_exhaustive(exhaustive),
+                    9,
+                )
+                .await
+                .unwrap();
+            let hits = |result: crate::query::SearchResponse| {
+                result
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.address.doc_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(actual.hits.len(), if exhaustive { 9 } else { 1 });
             assert_eq!(hits(actual), hits(expected));
         }
     }
@@ -1070,6 +1183,50 @@ mod tests {
         let _query = parser
             .parse("site:https://reddit.com/r/Transhumanism* longevity drugs")
             .unwrap();
+    }
+
+    #[test]
+    fn boolean_keywords_do_not_split_longer_terms() {
+        let (schema, default_fields, tokenizers) = setup();
+        let parser = QueryLanguageParser::new(schema, default_fields, tokenizers);
+        for word in ["NOTHING", "NOT_name", "NOT-thing", "NOT42", "NOTé"] {
+            let parsed = parser.parse_query_string(word).unwrap();
+            assert!(
+                matches!(&parsed, ParsedQuery::Term { term, .. } if term == word),
+                "{word}: {parsed:?}"
+            );
+        }
+        for word in ["ANDROID", "ORCHID", "AND_name", "OR-thing", "AND42", "ORé"] {
+            let parsed = parser.parse_query_string(&format!("alpha {word}")).unwrap();
+            let ParsedQuery::Or(parts) = &parsed else {
+                panic!("{word}: {parsed:?}");
+            };
+            assert_eq!(parts.len(), 2, "{word}: {parsed:?}");
+            assert!(
+                matches!(&parts[1], ParsedQuery::Term { term, .. } if term == word),
+                "{word}: {parsed:?}"
+            );
+        }
+        assert!(
+            matches!(parser.parse_query_string("NOT:term").unwrap(), ParsedQuery::Term { field: Some(field), term } if field == "NOT" && term == "term")
+        );
+        for prefix in ["NOT", "NOT/path", "NOT@example", "NOT.thing"] {
+            assert!(
+                matches!(parser.parse_query_string(&format!("{prefix}*")).unwrap(), ParsedQuery::Prefix { prefix: value, .. } if value == prefix)
+            );
+        }
+        assert!(matches!(
+            parser.parse_query_string("alpha AND(beta)").unwrap(),
+            ParsedQuery::And(_)
+        ));
+        assert!(matches!(
+            parser.parse_query_string("NOT(alpha)").unwrap(),
+            ParsedQuery::Not(_)
+        ));
+        assert!(matches!(
+            parser.parse_query_string("alpha OR(beta)").unwrap(),
+            ParsedQuery::Or(_)
+        ));
     }
 
     #[test]

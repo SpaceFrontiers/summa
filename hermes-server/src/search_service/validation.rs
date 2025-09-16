@@ -308,6 +308,17 @@ fn validate_query_shape<'a>(
             }
             query::Query::All(_) => {}
             query::Query::SparseVector(sparse) => {
+                if sparse.seismic_cut.is_some_and(|cut| {
+                    cut == 0 || cut as usize > hermes_core::query::MAX_QUERY_TERMS
+                }) {
+                    return Err(Status::invalid_argument("Seismic cut must be in 1..=64"));
+                }
+                if sparse
+                    .seismic_factor
+                    .is_some_and(|factor| !factor.is_finite() || !(0.0..=1.0).contains(&factor))
+                {
+                    return Err(Status::invalid_argument("Seismic factor must be in [0, 1]"));
+                }
                 budget.add_field_name(&sparse.field, "SparseVectorQuery.field")?;
                 budget.add_text(sparse.text.len())?;
                 budget.add_vector(

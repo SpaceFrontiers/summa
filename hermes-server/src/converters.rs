@@ -144,10 +144,8 @@ fn convert_combiner(combiner: i32, temperature: f32, top_k: u32, decay: f32) -> 
             k: if top_k > 0 { top_k as usize } else { 5 },
             decay: if decay > 0.0 { decay } else { 0.7 },
         },
-        _ => MultiValueCombiner::LogSumExp {
-            // 0 or default: LogSumExp
-            temperature: if temperature > 0.0 { temperature } else { 1.5 },
-        },
+        _ if temperature > 0.0 => MultiValueCombiner::LogSumExp { temperature },
+        _ => MultiValueCombiner::default(),
     }
 }
 
@@ -368,6 +366,15 @@ pub fn convert_query(
                     sv_query.heap_factor
                 ));
             }
+            if sv_query
+                .seismic_cut
+                .is_some_and(|cut| cut == 0 || cut as usize > hermes_core::query::MAX_QUERY_TERMS)
+                || sv_query
+                    .seismic_factor
+                    .is_some_and(|factor| !factor.is_finite() || !(0.0..=1.0).contains(&factor))
+            {
+                return Err("Invalid Seismic query cut/factor".into());
+            }
             if !sv_query.weight_threshold.is_finite() || sv_query.weight_threshold < 0.0 {
                 return Err(format!(
                     "Sparse query weight_threshold must be finite and non-negative, got {}",
@@ -506,16 +513,26 @@ pub fn convert_query(
                 };
                 token_ids.into_iter().zip(weights).collect()
             } else {
-                // Pre-computed indices/values provided (from embedding model)
-                // Filter out entries with negative or zero weights - negative weights
-                // from SPLADE indicate "do not match this token" which we handle by
-                // simply not including them in the query
+                // Seismic scores signed inputs; retain the established nonnegative
+                // nomination semantics of BMP and sparse MaxScore.
+                let signed = schema
+                    .get_field_entry(field)
+                    .and_then(|entry| entry.sparse_vector_config.as_ref())
+                    .is_some_and(|config| {
+                        config.format == hermes_core::structures::SparseFormat::Seismic
+                    });
                 sv_query
                     .indices
                     .iter()
                     .copied()
                     .zip(sv_query.values.iter().copied())
-                    .filter(|(_, weight)| *weight > 0.0)
+                    .filter(|(_, weight)| {
+                        if signed {
+                            *weight != 0.0
+                        } else {
+                            *weight > 0.0
+                        }
+                    })
                     .collect()
             };
 
@@ -575,6 +592,21 @@ pub fn convert_query(
                 query = query.with_lsp_gamma(gamma as usize);
             } else if let Some(gamma) = schema_qc.and_then(|config| config.lsp_gamma) {
                 query = query.with_lsp_gamma(gamma);
+            }
+            if let Some(config) = schema_qc {
+                query = query
+                    .with_seismic_cut(config.seismic_cut)
+                    .with_seismic_factor(config.seismic_factor)
+                    .with_exhaustive(config.exhaustive);
+            }
+            if let Some(cut) = sv_query.seismic_cut {
+                query = query.with_seismic_cut(cut as usize);
+            }
+            if let Some(factor) = sv_query.seismic_factor {
+                query = query.with_seismic_factor(factor);
+            }
+            if let Some(exhaustive) = sv_query.exhaustive {
+                query = query.with_exhaustive(exhaustive);
             }
 
             Ok(Box::new(query))
@@ -993,9 +1025,26 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     idx_params.push(format!("bmp_grid_bits: {}", cfg.bmp_grid_bits));
                     idx_params.push(format!("bmp_forward_index: {}", cfg.bmp_forward_index));
                 }
+                if cfg.format == SparseFormat::MaxScore {
+                    idx_params.push("format: maxscore".into());
+                }
+                if cfg.format == SparseFormat::Seismic {
+                    idx_params.push("format: seismic".into());
+                    idx_params.push(format!("seismic_postings: {}", cfg.seismic.postings));
+                    idx_params.push(format!(
+                        "seismic_cluster_size: {}",
+                        cfg.seismic.cluster_size
+                    ));
+                    idx_params.push(format!(
+                        "seismic_summary_energy: {}",
+                        cfg.seismic.summary_energy
+                    ));
+                }
+
                 if let Some(dims) = cfg.dims {
                     idx_params.push(format!("dims: {dims}"));
                 }
+
                 if let Some(max_weight) = cfg.max_weight {
                     idx_params.push(format!("max_weight: {max_weight}"));
                 }
@@ -1014,6 +1063,7 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                 if cfg.weight_threshold > 0.0 {
                     idx_params.push(format!("weight_threshold: {}", cfg.weight_threshold));
                 }
+
                 if cfg.block_size != 128 {
                     idx_params.push(format!("block_size: {}", cfg.block_size));
                 }
@@ -1052,6 +1102,10 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     if let Some(gamma) = qc.lsp_gamma {
                         qparams.push(format!("lsp_gamma: {gamma}"));
                     }
+                    qparams.push(format!("seismic_cut: {}", qc.seismic_cut));
+                    qparams.push(format!("seismic_factor: {}", qc.seismic_factor));
+                    qparams.push(format!("exhaustive: {}", qc.exhaustive));
+
                     if !qparams.is_empty() {
                         idx_params.push(format!("query<{}>", qparams.join(", ")));
                     }
@@ -1470,6 +1524,18 @@ pub fn text_stats_from_proto(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn omitted_combiner_temperature_uses_the_core_default_and_explicit_values_survive() {
+        assert_eq!(
+            convert_combiner(0, 0.0, 0, 0.0),
+            MultiValueCombiner::default()
+        );
+        assert_eq!(
+            convert_combiner(0, 0.7, 0, 0.0),
+            MultiValueCombiner::LogSumExp { temperature: 0.7 },
+        );
+    }
+
     #[test]
     fn match_all_is_valid_for_common_exclusion_filters() {
         let schema = hermes_core::Schema::builder().build();
@@ -1919,9 +1985,12 @@ mod tests {
         builder.build()
     }
 
-    fn bmp_sparse_test_schema() -> Schema {
+    fn seismic_sparse_test_schema() -> Schema {
         let mut builder = hermes_core::SchemaBuilder::default();
-        let mut config = hermes_core::structures::SparseVectorConfig::splade_bmp();
+        let mut config = hermes_core::structures::SparseVectorConfig {
+            format: hermes_core::structures::SparseFormat::Seismic,
+            ..Default::default()
+        };
         config.dims = Some(16);
         builder.add_sparse_vector_field_with_config("sparse", true, false, config);
         builder.build()
@@ -1940,8 +2009,38 @@ mod tests {
     }
 
     #[test]
-    fn bmp_query_dimension_pruning_is_explicit_not_a_server_fallback() {
-        let schema = bmp_sparse_test_schema();
+    fn seismic_rpc_preserves_signed_weights_and_explicit_exhaustive_false() {
+        let schema = seismic_sparse_test_schema();
+        let request = proto::Query {
+            query: Some(ProtoQueryType::SparseVector(proto::SparseVectorQuery {
+                field: "sparse".into(),
+                indices: vec![1, 2, 3],
+                values: vec![-2.0, 3.0, 0.0],
+                exhaustive: Some(false),
+                lsp_gamma: Some(0),
+                ..Default::default()
+            })),
+        };
+        let query = convert_query(&request, &schema, None, None, &shape()).unwrap();
+        let hermes_core::query::QueryDecomposition::SparseTerms(infos) =
+            query.sparse_decomposition()
+        else {
+            panic!("sparse RPC lost its decomposition");
+        };
+        assert_eq!(
+            infos
+                .iter()
+                .map(|info| (info.dim_id, info.weight))
+                .collect::<Vec<_>>(),
+            vec![(1, -2.0), (2, 3.0)]
+        );
+        assert!(!infos[0].exhaustive);
+        assert_eq!(infos[0].lsp_gamma, Some(0));
+    }
+
+    #[test]
+    fn seismic_query_dimension_pruning_is_explicit_not_a_server_fallback() {
+        let schema = seismic_sparse_test_schema();
         let default_query =
             convert_query(&sparse_proto_query(0.0), &schema, None, None, &shape()).unwrap();
         assert!(!default_query.to_string().contains("orig="));
@@ -2125,7 +2224,7 @@ mod tests {
         let Some(ProtoQueryType::SparseVector(query)) = invalid_factor.query.as_mut() else {
             unreachable!()
         };
-        query.heap_factor = f32::INFINITY;
+        query.seismic_factor = Some(f32::INFINITY);
         assert!(convert_query(&invalid_factor, &schema, None, None, &shape()).is_err());
     }
 
@@ -2251,6 +2350,45 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(original.reorder, reported.reorder, "{rendered}");
+        assert_eq!(
+            schema.reorder_on_merge(),
+            reparsed.reorder_on_merge(),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn index_info_schema_preserves_seismic_storage_and_reordering() {
+        let input = r#"
+            index documents {
+                reorder_on_merge: true
+                field sparse: sparse_vector<u32> [indexed<format: seismic, dims: 105879,
+                    quantization: uint8, doc_mass: 0.9,
+                    query<seismic_cut: 12, exhaustive: true>>]
+                field body: text [indexed, reorder]
+            }
+        "#;
+        let schema = hermes_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        let reparsed = hermes_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let original = schema
+            .get_field_entry(schema.get_field("sparse").unwrap())
+            .unwrap();
+        let reported = reparsed
+            .get_field_entry(reparsed.get_field("sparse").unwrap())
+            .unwrap();
+        assert_eq!(
+            original.sparse_vector_config, reported.sparse_vector_config,
+            "{rendered}"
+        );
+        assert!(!reported.reorder, "{rendered}");
+        assert!(
+            reparsed
+                .get_field_entry(reparsed.get_field("body").unwrap())
+                .unwrap()
+                .reorder,
+            "{rendered}"
+        );
         assert_eq!(
             schema.reorder_on_merge(),
             reparsed.reorder_on_merge(),

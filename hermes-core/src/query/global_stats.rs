@@ -317,11 +317,13 @@ impl LazyGlobalStats {
     }
 
     /// Compute document frequency for a sparse dimension (not cached - internal)
-    /// Uses skip list metadata - no I/O needed
+    /// Uses full vector-frequency metadata, independent of top-L nomination pruning.
     fn compute_sparse_df(&self, field: Field, dim_id: u32) -> u64 {
         let mut df = 0u64;
         for segment in &self.segments {
-            if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
+            if let Some(sparse_index) = segment.seismic_index(field) {
+                df += sparse_index.doc_count(dim_id) as u64;
+            } else if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
                 df += sparse_index.doc_count(dim_id) as u64;
             }
         }
@@ -333,7 +335,9 @@ impl LazyGlobalStats {
     fn compute_sparse_total_vectors(&self, field: Field) -> u64 {
         let mut total = 0u64;
         for segment in &self.segments {
-            if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
+            if let Some(sparse_index) = segment.seismic_index(field) {
+                total += sparse_index.total_vectors() as u64;
+            } else if let Some(sparse_index) = segment.sparse_indexes().get(&field.0) {
                 total += sparse_index.total_vectors as u64;
             }
         }

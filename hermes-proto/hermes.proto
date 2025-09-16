@@ -44,7 +44,7 @@ service IndexService {
   // Force merge segments
   rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
 
-  // Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning
+  // Run bounded text, BMP, Seismic, and binary ANN layout maintenance
   rpc Reorder(ReorderRequest) returns (ReorderResponse);
 
   // Delete an index
@@ -170,14 +170,17 @@ message SparseVectorQuery {
   repeated float values = 3;     // Pre-computed token values
   string text = 4;               // Raw text (tokenized server-side if tokenizer configured)
   MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
-  float heap_factor = 6;         // Approximate search factor (1 = exact, 0.8 prunes more; 0 = use default)
+  float heap_factor = 6; // BMP/MaxScore pruning factor (0 = schema default, 1 = exact).
   float combiner_temperature = 7;   // Temperature for LogSumExp (default: 1.5)
   uint32 combiner_top_k = 8;        // K for WeightedTopK (default: 5)
   float combiner_decay = 9;         // Decay for WeightedTopK (default: 0.7)
   float weight_threshold = 10;      // Min abs(weight) for query dims (0 = no filtering)
   uint32 max_query_dims = 11;       // Max query dimensions to process (0 = all)
   float pruning = 12;               // Fraction of query dims to keep (0 = no pruning, 0.1 = top 10%)
-  optional uint32 lsp_gamma = 13;   // LSP/0 gamma (unset = depth-derived, 0 = exhaustive)
+  optional uint32 lsp_gamma = 13; // BMP LSP gamma (unset = depth-derived, 0 = exhaustive).
+  optional uint32 seismic_cut = 14; // Nomination query dimensions (1..64)
+  optional float seismic_factor = 15; // Summary pruning factor (0..1)
+  optional bool exhaustive = 16; // Exact shared-forward scan; false allows approximation
 }
 
 // Dense vector query for similarity search
@@ -254,7 +257,7 @@ message MatchQuery {
   uint32 proximity_window = 5;
   // Approximate MaxScore: scale the pruning threshold by 1/heap_factor
   // (0/unset or 1 = exact, rank-safe; 0.8 prunes more aggressively at some
-  // recall cost). Must be finite and in [0, 1], like SparseVectorQuery.heap_factor.
+  // recall cost). Must be finite and in [0, 1]. This option applies to text queries.
   float heap_factor = 6;
   // Long queries: keep only the `max_terms` rarest (highest idf) tokens for
   // scoring; 0 = all tokens. Approximate.

@@ -380,7 +380,7 @@ class IndexServiceServicer:
         raise NotImplementedError("Method not implemented!")
 
     def Reorder(self, request, context):
-        """Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning"""
+        """Run bounded text, BMP, Seismic, and binary ANN layout maintenance"""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details("Method not implemented!")
         raise NotImplementedError("Method not implemented!")

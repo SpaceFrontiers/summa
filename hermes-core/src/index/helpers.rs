@@ -93,7 +93,7 @@ impl SchemaConfig {
         }
 
         let schema = builder.build();
-        schema.validate_content_hash()?;
+        schema.validate()?;
         Ok(schema)
     }
 }

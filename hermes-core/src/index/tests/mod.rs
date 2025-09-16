@@ -2,9 +2,11 @@ mod basic;
 mod bmp;
 mod boolean;
 mod chunked;
+mod config_policy;
 mod format_migration;
 mod maintenance;
 mod merge;
+mod merge_bounds;
 mod pin;
 mod posting_codecs;
 mod primary_key;
@@ -12,6 +14,8 @@ mod range;
 mod search;
 #[cfg(feature = "sync")]
 mod search_cpu;
+mod seismic_lifecycle;
+mod seismic_operations;
 
 mod vector;
 
@@ -28,21 +32,35 @@ fn search_cpu_pool_is_bounded_and_reused_by_width() {
 #[cfg(feature = "native")]
 #[test]
 fn zero_search_threads_is_rejected() {
-    assert!(super::searcher::SearcherResources::new(1, 1, 0, 1).is_err());
+    assert!(super::searcher::SearcherResources::new(1, None, 1, 0, 1).is_err());
 }
 
 #[cfg(feature = "native")]
 #[test]
-fn zero_bmp_io_concurrency_is_rejected() {
-    assert!(super::searcher::SearcherResources::new(1, 1, 1, 0).is_err());
+fn zero_sparse_io_concurrency_is_rejected() {
+    assert!(super::searcher::SearcherResources::new(1, None, 1, 1, 0).is_err());
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn oversized_term_cache_block_cap_is_rejected_at_load() {
+    let error =
+        super::searcher::SearcherResources::new(super::MAX_TERM_CACHE_BLOCKS + 1, None, 1, 1, 1)
+            .err()
+            .expect("cap above MAX_TERM_CACHE_BLOCKS must fail");
+    assert!(error.to_string().contains("term_cache_blocks"), "{error}");
+    assert!(
+        super::searcher::SearcherResources::new(super::MAX_TERM_CACHE_BLOCKS, Some(0), 1, 1, 1)
+            .is_ok_and(|resources| resources.term_cache_budget_bytes == Some(0))
+    );
 }
 
 #[cfg(feature = "sync")]
 #[tokio::test]
-async fn bmp_io_gate_shares_capacity_between_sync_and_async_paths() {
+async fn sparse_io_gate_shares_capacity_between_sync_and_async_paths() {
     use std::time::Duration;
 
-    let gate = super::BmpIoGate::new(1);
+    let gate = super::SparseIoGate::new(1);
     let blocking = gate.acquire();
     let mut async_waiter = Box::pin(gate.acquire_async());
     assert!(
@@ -54,7 +72,7 @@ async fn bmp_io_gate_shares_capacity_between_sync_and_async_paths() {
     drop(blocking);
     let async_permit = tokio::time::timeout(Duration::from_millis(100), &mut async_waiter)
         .await
-        .expect("async BMP scorer should wake when the shared slot is released");
+        .expect("async sparse scorer should wake when the shared slot is released");
     drop(async_permit);
 
     let _blocking_again = gate.acquire();

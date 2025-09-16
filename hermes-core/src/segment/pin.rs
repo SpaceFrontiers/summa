@@ -1,15 +1,14 @@
 //! Hot-metadata pinning: budgeted residency for per-query-mandatory
 //! structures (a meta/data residency split).
 //!
-//! Every query must touch certain small metadata sections — BMP block-offset
-//! tables, sparse skip sections, doc-id maps, and the coarse BMP hierarchy. Under memory
-//! pressure the kernel evicts them like bulk data, and queries then pay major
-//! faults on structures they cannot skip. This module pins them, in priority
-//! order (smallest/hottest first), until a per-segment budget is exhausted.
+//! Queries touch compact ANN directories, dense document maps, BMP block and
+//! hierarchy directories, and MaxScore skip metadata.
+//! Under memory pressure, budgeted pinning keeps eligible metadata resident.
+//! Seismic's compact term and logical-row directories are eligible; its
+//! forward vectors, summaries, and nomination rows stay evictable.
 //!
-//! Design: `docs/hot-metadata-pinning.md`. Bulk data (BMP 4-bit grid, block
-//! data, raw vectors) is never pinned — it is covered by the
-//! `MADV_RANDOM`/`MADV_WILLNEED` discipline instead.
+//! Design: `docs/hot-metadata-pinning.md`. Corpus-sized vectors and posting
+//! payloads are never pinned by this policy.
 
 use std::sync::{Arc, OnceLock};
 
@@ -333,10 +332,80 @@ pub(crate) fn pin_section(
             }
         }
         PinMode::Copy => {
-            *bytes = OwnedBytes::new(bytes.to_vec());
+            *bytes = copy_section(bytes);
             *remaining -= len;
             report.pinned_bytes += len;
             report.heap_copy_bytes += len;
         }
+    }
+}
+
+/// Copy one admitted metadata section without serial page faults under the
+/// reader's random-access mmap policy. No extra payload scratch or policy toggle.
+fn copy_section(bytes: &OwnedBytes) -> OwnedBytes {
+    #[cfg(target_os = "linux")]
+    {
+        const CHUNK: usize = 128 * 1024;
+        let mut copied = Vec::with_capacity(bytes.len());
+        let mut prefetched = 0;
+        for (i, chunk) in bytes.chunks(CHUNK).enumerate() {
+            let end = (i * CHUNK).saturating_add(2 * CHUNK).min(bytes.len());
+            while prefetched < end {
+                let next = prefetched.saturating_add(CHUNK).min(end);
+                bytes.madvise_range(prefetched..next, libc::MADV_WILLNEED);
+                prefetched = next;
+            }
+            copied.extend_from_slice(chunk);
+        }
+        OwnedBytes::new(copied)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        OwnedBytes::new(bytes.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_pinning_preserves_unaligned_mapped_sections_tails_and_budget() {
+        let len = 5 * 128 * 1024 + 19;
+        let mut mapping = memmap2::MmapMut::map_anon(len).unwrap();
+        for (i, byte) in mapping.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        let source = OwnedBytes::from_mmap(Arc::new(mapping.make_read_only().unwrap()));
+        let mut section = source.slice(7..len - 5);
+        let size = section.len() as u64;
+        let mut remaining = size - 1;
+        let mut report = PinReport::default();
+        pin_section(
+            &mut section,
+            "test",
+            PinMode::Copy,
+            &mut remaining,
+            &mut report,
+        );
+        assert!(section.is_mmap());
+        assert_eq!(remaining, size - 1);
+        assert_eq!(report.skipped_budget_bytes, size);
+        remaining = size;
+        report = PinReport::default();
+        pin_section(
+            &mut section,
+            "test",
+            PinMode::Copy,
+            &mut remaining,
+            &mut report,
+        );
+        assert!(!section.is_mmap());
+        assert_eq!(section.as_slice(), &source[7..len - 5]);
+        assert_eq!(remaining, 0);
+        assert_eq!(report.pinned_bytes, size);
+        assert_eq!(report.heap_copy_bytes, size);
+        assert_eq!(report.intended_bytes, size);
+        assert_eq!(report.failed_bytes, 0);
     }
 }

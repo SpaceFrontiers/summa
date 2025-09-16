@@ -133,11 +133,6 @@ const MAX_TOKEN_POSITION: u32 = (1 << 20) - 1;
 /// available to one vector field in one document.
 pub(crate) const MAX_VECTOR_VALUES_PER_FIELD: usize = u16::MAX as usize + 1;
 
-/// Default BMP vocabulary size when `dims` is unset in the sparse vector
-/// config (SPLADE unigram vocabulary). Must match the build-time defaults in
-/// `builder/sparse.rs` and `merger/sparse.rs`.
-const DEFAULT_BMP_SPARSE_DIMS: u32 = 105879;
-
 /// Human-readable name of a schema field type (matches the SDL/serde names).
 fn field_type_name(field_type: &FieldType) -> &'static str {
     match field_type {
@@ -291,7 +286,7 @@ pub struct SegmentBuilder {
     binary_dense_vectors: FxHashMap<u32, BinaryDenseVectorBuilder>,
 
     /// Sparse vector storage per field: field -> SparseVectorBuilder
-    /// Uses proper BlockSparsePostingList with configurable quantization
+    /// Writes BMP blocks, MaxScore postings, or Seismic runs per field configuration
     sparse_vectors: FxHashMap<u32, SparseVectorBuilder>,
 
     /// Position index for fields with positions enabled
@@ -598,6 +593,7 @@ impl SegmentBuilder {
         // Sparse vectors
         let mut sparse_vectors_bytes: usize = 0;
         for builder in self.sparse_vectors.values() {
+            sparse_vectors_bytes += builder.keys.capacity() * std::mem::size_of::<(DocId, u16)>();
             for postings in builder.postings.values() {
                 sparse_vectors_bytes += postings.capacity() * sparse_entry_size + vec_overhead;
             }
@@ -666,11 +662,9 @@ impl SegmentBuilder {
     ///   would previously fall through `add_document`'s match silently: the
     ///   value was stored but never indexed, so queries on the field could
     ///   never match the document. Reject it loudly instead.
-    /// - Sparse entries destined for a BMP-format field must fit the
-    ///   configured `dims`: the block-max grid only has rows for
-    ///   `dim_id < dims`, so out-of-range entries would be silently dropped
-    ///   from the grid and silently filtered from queries — permanently
-    ///   unsearchable.
+    /// - Sparse dimensions must fit any explicit vocabulary bound and the
+    ///   configured input-ID width. Reject violations before accepting any
+    ///   part of the document.
     fn validate_document_against_schema(&self, doc: &Document) -> Result<()> {
         validate_vector_value_counts(doc, &self.schema)?;
 
@@ -692,20 +686,21 @@ impl SegmentBuilder {
 
             match (&entry.field_type, value) {
                 (FieldType::SparseVector, FieldValue::SparseVector(entries)) => {
-                    if let Some(config) = entry.sparse_vector_config.as_ref()
-                        && config.format == crate::structures::SparseFormat::Bmp
-                    {
-                        let dims = config.dims.unwrap_or(DEFAULT_BMP_SPARSE_DIMS);
-                        if let Some(&(dim_id, _)) =
-                            entries.iter().find(|&&(dim_id, _)| dim_id >= dims)
-                        {
+                    if let Some(config) = entry.sparse_vector_config.as_ref() {
+                        let dims = config.dims.or_else(|| {
+                            (config.format == crate::structures::SparseFormat::Bmp).then_some(105879)
+                        });
+                        if let Some(&(dim_id, _)) = entries.iter().find(|&&(dim_id, _)| {
+                            dims.is_some_and(|dims| dim_id >= dims)
+                                || dim_id > config.index_size.max_value()
+                        }) {
+                            let bound = match dims {
+                                Some(dims) => format!("dims {dims} (exclusive), maximum input ID {}", config.index_size.max_value()),
+                                None => format!("maximum input ID {}", config.index_size.max_value()),
+                            };
                             return Err(crate::Error::Schema(format!(
-                                "sparse vector for field '{}' contains dim_id {} out of \
-                                 range for the configured BMP dims={}: dimensions >= dims \
-                                 are never written to the block-max grid and can never \
-                                 match a query; raise `dims` in the field's sparse_vector \
-                                 config or fix the embedding model",
-                                entry.name, dim_id, dims
+                                "sparse vector for field '{}' contains dim_id {} outside configured dimension bounds: {}",
+                                entry.name, dim_id, bound
                             )));
                         }
                     }
@@ -1292,7 +1287,7 @@ impl SegmentBuilder {
     /// Index a sparse vector field using dedicated sparse posting lists
     ///
     /// Collects (doc_id, ordinal, weight) postings per dimension. During commit, these are
-    /// converted to BlockSparsePostingList with proper quantization from SparseVectorConfig.
+    /// written through the configured sparse backend and precision codec.
     ///
     /// Weights below the configured `weight_threshold` are not indexed. When
     /// `doc_mass` is configured, only the top-|weight| entries covering that
@@ -1326,7 +1321,7 @@ impl SegmentBuilder {
             .entry(field.0)
             .or_insert_with(SparseVectorBuilder::new);
 
-        builder.inc_vector_count();
+        builder.inc_vector_count(doc_id, ordinal);
 
         // Document-side mass cropping: determine the per-vector weight cutoff
         // below which entries fall outside the doc_mass fraction of total mass.
@@ -1462,6 +1457,8 @@ impl SegmentBuilder {
                 position_index,
                 &self.term_interner,
                 &mut *pos_writer,
+                self.config.posting_codec,
+                self.config.compact_text,
             )?;
             pos_writer.finish()?;
             offsets
@@ -1471,7 +1468,27 @@ impl SegmentBuilder {
 
         // Phase 1b: chunk maps of chunked text fields (8 bytes per chunk) and
         // per-document length columns of plain text fields (2 bytes per doc).
-        let chunk_maps = std::mem::take(&mut self.chunk_maps);
+        let mut chunk_maps = std::mem::take(&mut self.chunk_maps);
+        // Reorderable plain text uses one field-local slot per document.
+        // Keeping the identity order at flush preserves its original postings;
+        // RGB may later permute the slots without moving document storage.
+        for (field, entry) in self.schema.fields() {
+            if entry.field_type != FieldType::Text
+                || !entry.indexed
+                || !entry.reorder
+                || entry.chunked
+            {
+                continue;
+            }
+            let slot = self.field_to_slot[&field.0];
+            let mut map = super::chunk_map::ChunkMapBuilder::default();
+            map.set_document_units(true);
+            for doc in 0..self.next_doc_id {
+                let length = self.doc_field_lengths[doc as usize * self.num_indexed_fields + slot];
+                map.push(doc, 0, length)?;
+            }
+            chunk_maps.insert(field.0, map);
+        }
         {
             let mut fields: Vec<(u32, &super::chunk_map::ChunkMapBuilder)> = chunk_maps
                 .iter()
@@ -1485,7 +1502,7 @@ impl SegmentBuilder {
                 if self
                     .schema
                     .get_field_entry(crate::dsl::Field(field_id))
-                    .is_some_and(|entry| entry.chunked)
+                    .is_some_and(|entry| entry.chunked || entry.reorder)
                 {
                     continue;
                 }
@@ -1514,11 +1531,17 @@ impl SegmentBuilder {
                 .collect();
             if !fields.is_empty() || !norms.is_empty() {
                 let mut writer = dir.streaming_writer(&files.chunks).await?;
-                super::chunk_map::write_chunk_maps(&mut *writer, &fields, &norms)?;
+                super::chunk_map::write_chunk_maps_with_norms(
+                    &mut *writer,
+                    &fields,
+                    &norms,
+                    self.config.quantized_norms,
+                )?;
                 writer.finish()?;
             }
         }
         let length_lookup = postings::LengthLookup {
+            quantized_norms: self.config.quantized_norms,
             doc_lengths: &self.doc_field_lengths,
             num_indexed_fields: self.num_indexed_fields,
             field_to_slot: &self.field_to_slot,
@@ -1534,8 +1557,7 @@ impl SegmentBuilder {
         #[cfg(feature = "native")]
         let num_compression_threads = self.config.num_compression_threads;
         let compression_level = self.config.compression_level;
-        let optimization = self.config.optimization;
-        let posting_codec = self.config.posting_codec;
+        let posting_config = &self.config;
         let dense_vectors = std::mem::take(&mut self.dense_vectors);
         let binary_dense_vectors = std::mem::take(&mut self.binary_dense_vectors);
         let mut sparse_vectors = std::mem::take(&mut self.sparse_vectors);
@@ -1559,6 +1581,21 @@ impl SegmentBuilder {
             Some(super::OffsetWriter::new(
                 dir.streaming_writer(&files.sparse).await?,
             ))
+        } else {
+            None
+        };
+        let has_seismic = sparse_vectors.iter().any(|(&field, builder)| {
+            !builder.is_empty()
+                && schema
+                    .get_field_entry(crate::dsl::Field(field))
+                    .and_then(|entry| entry.sparse_vector_config.as_ref())
+                    .is_some_and(|config| config.format == crate::structures::SparseFormat::Seismic)
+        });
+        let mut sparse_partitions = if has_seismic {
+            Some(
+                super::sparse_partitions::SparsePartitionWriters::create(dir, &files, |_| true)
+                    .await?,
+            )
         } else {
             None
         };
@@ -1603,7 +1640,7 @@ impl SegmentBuilder {
                                     &length_lookup,
                                     &mut term_dict_writer,
                                     &mut postings_writer,
-                                    (optimization, posting_codec),
+                                    posting_config,
                                     spill_arg,
                                 )
                             },
@@ -1640,6 +1677,7 @@ impl SegmentBuilder {
                                                 &mut sparse_vectors,
                                                 schema,
                                                 w,
+                                                sparse_partitions.as_mut(),
                                             )?;
                                         }
                                         Ok(())
@@ -1671,7 +1709,7 @@ impl SegmentBuilder {
                 &length_lookup,
                 &mut term_dict_writer,
                 &mut postings_writer,
-                (optimization, posting_codec),
+                posting_config,
             )?;
             store::build_store_streaming_from_buffer(
                 &self.store_buffer,
@@ -1689,7 +1727,12 @@ impl SegmentBuilder {
                 )?;
             }
             if let Some(ref mut w) = sparse_writer {
-                sparse::build_sparse_streaming(&mut sparse_vectors, schema, w)?;
+                sparse::build_sparse_streaming(
+                    &mut sparse_vectors,
+                    schema,
+                    w,
+                    sparse_partitions.as_mut(),
+                )?;
             }
             if let Some(ref mut w) = fast_writer {
                 build_fast_fields_streaming(&mut fast_fields, num_docs, w)?;
@@ -1700,7 +1743,12 @@ impl SegmentBuilder {
         let postings_bytes = postings_writer.offset() as usize;
         let store_bytes = store_writer.offset() as usize;
         let vectors_bytes = vectors_writer.as_ref().map_or(0, |w| w.offset() as usize);
-        let sparse_bytes = sparse_writer.as_ref().map_or(0, |w| w.offset() as usize);
+        let sparse_partition_bytes = match sparse_partitions {
+            Some(partitions) => partitions.finish()?,
+            None => 0,
+        };
+        let sparse_bytes =
+            sparse_writer.as_ref().map_or(0, |w| w.offset() as usize) + sparse_partition_bytes;
         let fast_bytes = fast_writer.as_ref().map_or(0, |w| w.offset() as usize);
 
         term_dict_writer.finish()?;
@@ -1939,17 +1987,16 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Finding: sparse entries with dim_id >= the configured BMP `dims`
-    // were accepted at index time but silently dropped from the BMP grid
-    // and silently filtered from queries — permanently unsearchable.
+    // Reject sparse entries with dim_id >= the configured vocabulary bound
+    // before accepting any part of the document.
     // ------------------------------------------------------------------
     #[test]
-    fn test_add_document_rejects_bmp_sparse_dim_out_of_range() {
+    fn test_add_document_rejects_sparse_dimension_outside_declared_bound() {
         use crate::structures::{SparseFormat, SparseVectorConfig};
 
         let mut sb = SchemaBuilder::default();
         let config = SparseVectorConfig {
-            format: SparseFormat::Bmp,
+            format: SparseFormat::Seismic,
             dims: Some(100),
             ..Default::default()
         };
@@ -1966,7 +2013,7 @@ mod tests {
         doc.add_sparse_vector(spv, vec![(50, 1.0), (150, 2.0)]);
         let err = builder
             .add_document(doc)
-            .expect_err("out-of-range BMP dim must be rejected, not silently unsearchable");
+            .expect_err("out-of-range sparse dimension must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("spv"), "error must name the field: {msg}");
         assert!(msg.contains("150"), "error must name the dim_id: {msg}");
@@ -1982,11 +2029,20 @@ mod tests {
     }
 
     #[test]
-    fn test_add_document_maxscore_sparse_dims_unbounded() {
-        // MaxScore-format sparse fields have no dims bound — large dim ids
-        // stay legal (the per-dim TOC addresses any u32 dimension).
+    fn test_add_document_sparse_dims_without_declared_bound() {
+        // Without a configured vocabulary bound, sparse fields accept large
+        // dimensions within the configured input-ID width.
         let mut sb = SchemaBuilder::default();
-        let spv = sb.add_sparse_vector_field("spv", true, false);
+        let spv = sb.add_sparse_vector_field_with_config(
+            "spv",
+            true,
+            false,
+            crate::structures::SparseVectorConfig {
+                format: crate::structures::SparseFormat::MaxScore,
+                index_size: crate::structures::IndexSize::U32,
+                ..Default::default()
+            },
+        );
         let mut builder = builder_for(sb.build());
 
         let mut doc = Document::new();

@@ -121,7 +121,7 @@ pub(crate) fn rescore_sync(
                 && it.doc() != TERMINATED
                 && it.seek(doc) == doc
             {
-                positions.read_into(doc, it.position_cursor(), it.term_freq(), &mut bufs[t]);
+                positions.read_into(doc, it.position_cursor_mut(), it.term_freq(), &mut bufs[t]);
             }
         }
         let len = lengths

@@ -24,14 +24,15 @@ arrays touched by every ANN route.
 
 ## Residency of per-query structures today
 
-| Structure       | "meta" part                                                      | Residency                | "data" part             | Residency                                                                       |
-| --------------- | ---------------------------------------------------------------- | ------------------------ | ----------------------- | ------------------------------------------------------------------------------- |
-| Sparse MaxScore | `DimensionTable` (SoA Vecs)                                      | heap (de-facto pinned)   | block data              | evictable mmap                                                                  |
-|                 | skip section (`skip_bytes`)                                      | **pinnable**             |                         |                                                                                 |
-| BMP             | `block_data_starts`, E row offsets, H, doc maps                  | **pinnable**             | block data              | evictable (MADV_RANDOM + WILLNEED prefetch)                                     |
-|                 | 4-bit block grid D and superblock grid E                         | never pinned (see below) |                         |                                                                                 |
-| Dense flat      | header + doc-id map                                              | **pinnable**             | raw vectors             | evictable (+ RANDOM/prefetch for ANN fields)                                    |
-| ANN             | global routing/centroids/PQ tables and per-segment run directory | **pinnable**             | quantized codes and IDs | evictable (clustered: MADV_RANDOM + selected-run WILLNEED; flat TQ: sequential) |
+| Structure       | "meta" part                                                      | Residency                 | "data" part                               | Residency                                                                       |
+| --------------- | ---------------------------------------------------------------- | ------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------- |
+| Sparse MaxScore | `DimensionTable` (SoA Vecs)                                      | heap (outside page cache) | block data                                | evictable mmap                                                                  |
+|                 | skip section (`skip_bytes`)                                      | **pinnable**              |                                           |                                                                                 |
+| BMP             | `block_data_starts`, E row offsets, H, doc maps                  | **pinnable**              | block data                                | evictable (MADV_RANDOM + WILLNEED prefetch)                                     |
+|                 | 4-bit block grid D and superblock grid E                         | never pinned (see below)  |                                           |                                                                                 |
+| Seismic         | term/row directories                                             | **pinnable**              | summaries, nomination rows, exact vectors | evictable mmap                                                                  |
+| Dense flat      | header + doc-id map                                              | **pinnable**              | raw vectors                               | evictable (+ RANDOM/prefetch for ANN fields)                                    |
+| ANN             | global routing/centroids/PQ tables and per-segment run directory | **pinnable**              | quantized codes and IDs                   | evictable (clustered: MADV_RANDOM + selected-run WILLNEED; flat TQ: sequential) |
 
 Sizes for a representative 18.2M-vector segment at block size 32
 (568,750 blocks, 71,094 superblocks, 278 coarse groups, SPLADE
@@ -54,6 +55,42 @@ addressable E groups; block traversal does the same for D. Both mappings use
 amplification. The sizes above are dense four-bit upper bounds; the
 row-local variable-width codec is smaller whenever groups need fewer bits.
 
+### Seismic compact-directory residency
+
+Seismic keeps its compact run directory on the heap. Each run also retains
+separate zero-copy views of its term and logical-row directories. The existing
+segment pin policy prioritizes term directories alongside BMP block offsets
+(priority 2), then logical-row directories alongside document maps (priority 4).
+Copy mode replaces only those views, and all directory lookups use them; mlock
+mode locks the same extents. The original encoded run remains the owner of
+forward vectors and nomination payloads and the source for byte-identical merge.
+No format or additional residency policy changes are required. The default pin
+budget remains zero. Copy-mode bytes count as additional sparse heap allocation;
+the original mapped file extent remains file-backed and does not imply resident
+RAM. Mlock consumes page-rounded OS lock capacity; logical-byte budgets do not
+include this rounding or guarantee success. Disabled pinning still reports all
+eligible mapped directory bytes as intended, with zero pinned bytes.
+
+With `MmapDirectory` (the server/tool backend), summaries, nomination rows and
+forward values remain evictable file-backed views. `FsDirectory`, RAM and HTTP
+readers return heap-backed component buffers, so this out-of-core property does
+not apply to those backends. Sparse residency accounting distinguishes heap,
+mmap and pinned metadata for all supported formats. Pin failures and insufficient
+budgets use the same intended/pinned/skipped/failed accounting as BMP and ANN.
+
+The 1M-document four-source copy-merge fixture has 24.0 MB of row directories and
+4.395 MB of term directories. Summary arrays occupy 2.138 GB in Seismic version 3
+and 1.415 GB with version-4 lossless directory compression; version-5
+cluster-ID compression reduces them to 1.328 GB. Compact
+directories are eligible; encoded summary payloads remain evictable even with a
+large pin budget. These are encoded sizes, not page-rounded lock costs or measured
+RSS.
+
+On Linux, eligible copy-mode metadata is copied in 128 KiB chunks with one
+additional chunk prefetched. The destination is allocated once after budget
+admission; reads stay bounded even when the source mapping uses random access.
+Other platforms retain their existing copy behavior.
+
 ## Phase 1 (implemented): budgeted metadata pinning
 
 `segment/pin.rs` defines a process-wide `PinPolicy`:
@@ -62,12 +99,15 @@ row-local variable-width codec is smaller whenever groups need fewer bits.
   budget per segment. The same bound is separately applied once to each
   index-global ANN generation, in routing-first priority order. Default 0
   disables pinning.
-- `--pin-mode` (or `HERMES_PIN_MODE`) — `mlock` (default; zero-copy, needs RLIMIT_MEMLOCK
-  headroom) or `copy` (heap copy; no permissions needed, duplicates bytes,
-  immune to eviction because production runs swapless).
+- `--pin-mode` (or `HERMES_PIN_MODE`) — `mlock` (default; locks existing metadata
+  pages and needs RLIMIT_MEMLOCK headroom) or `copy` (copies mapped metadata to
+  the heap without special permissions). Heap allocations are outside the page
+  cache but can still swap unless the host is swapless.
 
 At `SegmentReader::open`, sections are pinned in the priority order above
-until the budget is exhausted. Loading a trained ANN generation additionally
+until the budget is exhausted. The budget
+is per segment, not per process, and old reader generations can overlap during
+replacement. Loading a trained ANN generation additionally
 locks HNSW/two-level topology, parent centroids, PQ/OPQ tables, and then leaf
 centroids. Each segment locks its compact cluster-run lookup directory. The
 corpus-sized PQ/binary run columns and exact rerank vectors remain mmap-backed

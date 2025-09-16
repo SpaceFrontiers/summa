@@ -26,7 +26,15 @@ async fn create_boolean_test_index() -> (
     let content = sb.add_text_field("content", true, true);
     let timestamp = sb.add_u64_field("timestamp", false, true);
     sb.set_fast(timestamp, true);
-    let embedding = sb.add_sparse_vector_field("embedding", true, true);
+    let embedding = sb.add_sparse_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     let schema = sb.build();
 
     let config = IndexConfig {
@@ -55,18 +63,18 @@ async fn create_boolean_test_index() -> (
     (index, content, timestamp, embedding)
 }
 
-// ── Predicate-aware MaxScore ─────────────────────────────────────────
+// ── Predicate-aware sparse scoring ─────────────────────────────────────────
 
-/// Predicate-aware MaxScore: Boolean(+Range Sparse(dim_0)) where dim 0 matches
+/// Predicate-aware sparse scoring: Boolean(+Range Sparse(dim_0)) where dim 0 matches
 /// all 100 docs. With a selective Range predicate, we should get exactly `limit`
 /// results (or all matching docs if fewer than limit).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_predicate_aware_maxscore_fills_topk() {
+async fn test_predicate_aware_sparse_scoring_fills_topk() {
     let (index, _content, timestamp, embedding) = create_boolean_test_index().await;
 
     // Range [3000, 5000] matches docs 20..=40 (21 docs)
     // Sparse dim 0 (weight 0.5) exists in all 100 docs
-    // Predicate-aware MaxScore should collect top-10 within the range
+    // Predicate-aware sparse scoring should collect top-10 within the range
     let q = BooleanQuery::new()
         .must(RangeQuery::u64(timestamp, Some(3000), Some(5000)))
         .should(SparseTermQuery::new(embedding, 0, 1.0));
@@ -75,7 +83,7 @@ async fn test_predicate_aware_maxscore_fills_topk() {
     assert_eq!(
         results.hits.len(),
         10,
-        "Predicate-aware MaxScore should return exactly limit results when enough docs match, got {}",
+        "Predicate-aware sparse scoring should return exactly limit results when enough docs match, got {}",
         results.hits.len()
     );
 
@@ -95,9 +103,9 @@ async fn test_predicate_aware_maxscore_fills_topk() {
     }
 }
 
-/// Predicate-aware MaxScore with SparseVectorQuery (multi-dim) as SHOULD.
+/// Predicate-aware sparse scoring with SparseVectorQuery (multi-dim) as SHOULD.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_predicate_aware_maxscore_sparse_vector() {
+async fn test_predicate_aware_sparse_vector_scoring() {
     let (index, _content, timestamp, embedding) = create_boolean_test_index().await;
 
     // Range [2000, 8000] matches docs 10..=70 (61 docs)
@@ -169,7 +177,7 @@ async fn test_sparse_term_query_missing_dim() {
 
 // ── SHOULD-only (pure OR) paths ──────────────────────────────────────────
 
-/// SparseVectorQuery with multiple dims → BooleanQuery → MaxScore path.
+/// SparseVectorQuery with multiple dimensions uses Seismic through BooleanQuery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sparse_vector_query_maxscore_path() {
     let (index, _content, _ts, embedding) = create_boolean_test_index().await;
@@ -387,7 +395,15 @@ async fn create_pruning_test_index() -> (
     let dir = MmapDirectory::new(tmp_dir.path());
 
     let mut sb = SchemaBuilder::default();
-    let embedding = sb.add_sparse_vector_field("embedding", true, true);
+    let embedding = sb.add_sparse_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     let schema = sb.build();
 
     // Use a large enough memory budget so all 200 docs fit in a single segment.
@@ -873,7 +889,7 @@ async fn test_must_prefix_should_sparse_no_result_loss() {
 ///
 /// TermQuery on a non-fast field has no `as_doc_predicate()` (needs fast field)
 /// but DOES have `as_doc_bitset()` (posting list). The planner must use the
-/// bitset fallback to create an inline predicate for MaxScore/BMP.
+/// bitset fallback to create an inline predicate for text MaxScore and sparse scoring.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_must_term_non_fast_should_sparse_bitset_fallback() {
     // The shared test index has content field (text, not fast) and sparse embedding.
@@ -918,7 +934,15 @@ async fn create_type_date_index() -> (
     sb.set_fast(doc_type, true);
     let date = sb.add_u64_field("date", false, true);
     sb.set_fast(date, true);
-    let embedding = sb.add_sparse_vector_field("embedding", true, true);
+    let embedding = sb.add_sparse_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     let schema = sb.build();
 
     let config = IndexConfig::default();

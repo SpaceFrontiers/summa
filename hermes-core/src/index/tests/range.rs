@@ -230,7 +230,15 @@ async fn test_must_range_should_sparse() {
     let content = sb.add_text_field("content", true, true);
     let timestamp = sb.add_u64_field("timestamp", false, true);
     sb.set_fast(timestamp, true);
-    let embedding = sb.add_sparse_vector_field("embedding", true, true);
+    let embedding = sb.add_sparse_vector_field_with_config(
+        "embedding",
+        true,
+        true,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     let schema = sb.build();
 
     let config = IndexConfig {

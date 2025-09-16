@@ -67,6 +67,23 @@ pub struct SegmentBuilderConfig {
     pub optimization: crate::structures::IndexOptimization,
     /// Posting block codec (`docs/posting-codecs.md`).
     pub posting_codec: crate::structures::PostingCodec,
+    /// New plain-text columns use versioned byte4 norms. Existing segments retain their scores.
+    pub quantized_norms: bool,
+    /// New position streams use a compact directory separate from payload pages.
+    pub compact_text: bool,
+    /// Opt in to compact, score-independent length/TF block bounds.
+    pub posting_ratio_bounds: bool,
+    /// Opt in to bounded competitive frequency/length envelopes. Implies ratio bounds.
+    pub posting_impact_bounds: bool,
+    /// Validated flush target for this segment's term dictionary.
+    pub term_dict_block_size: crate::structures::SSTableBlockSize,
+}
+
+impl SegmentBuilderConfig {
+    /// Block-bound metadata this builder writes; impact bounds imply ratio bounds.
+    pub fn effective_posting_bounds(&self) -> crate::index::PostingBounds {
+        crate::index::PostingBounds::new(self.posting_ratio_bounds, self.posting_impact_bounds)
+    }
 }
 
 impl Default for SegmentBuilderConfig {
@@ -85,6 +102,11 @@ impl Default for SegmentBuilderConfig {
             posting_map_capacity: 500_000,
             optimization: crate::structures::IndexOptimization::default(),
             posting_codec: crate::structures::PostingCodec::default(),
+            quantized_norms: false,
+            compact_text: false,
+            posting_ratio_bounds: false,
+            posting_impact_bounds: false,
+            term_dict_block_size: crate::structures::SSTableBlockSize::default(),
         }
     }
 }

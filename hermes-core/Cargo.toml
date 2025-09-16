@@ -21,6 +21,7 @@ futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 byteorder = { workspace = true }
+bitpacking = { workspace = true }
 zstd = { workspace = true }
 rustc-hash = { workspace = true }
 parking_lot = { workspace = true }
@@ -52,6 +53,7 @@ half = { version = "2.7", features = ["std"] }
 fst = { version = "0.4", optional = true }
 bincode = { version = "2.0", features = ["serde"] }
 memmap2 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 libc = { version = "0.2", optional = true }
 uuid = { workspace = true, optional = true }
 hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
@@ -84,12 +86,13 @@ rand = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 
-
 [features]
 default = ["sync"]
-native = ["fst-index", "dep:tokio", "dep:async-channel", "dep:num_cpus", "dep:rayon", "dep:lasso", "dep:memmap2", "dep:libc", "dep:uuid", "dep:tokenizers", "dep:hf-hub"]
+native = ["fst-index", "dep:tokio", "dep:async-channel", "dep:num_cpus", "dep:rayon", "dep:lasso", "dep:memmap2", "dep:tempfile", "dep:libc", "dep:uuid", "dep:tokenizers", "dep:hf-hub"]
 sync = ["native"]
 diagnostics = []
+# Per-query work accounting for dedicated diagnostic builds; absent by default.
+query-diagnostics = ["native"]
 metrics = ["dep:metrics"]
 fst-index = ["dep:fst"]
 # Japanese (unidic) and Korean (ko-dic) morphology for the `morph` tokenizer

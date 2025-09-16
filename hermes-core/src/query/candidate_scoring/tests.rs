@@ -41,9 +41,9 @@ async fn prepared_backfill_keeps_distinct_queries_and_quantizations_correct_acro
         true,
         false,
         SparseVectorConfig {
-            format: SparseFormat::Bmp,
+            format: SparseFormat::Seismic,
             dims: Some(16),
-            max_weight: Some(2.0),
+
             ..Default::default()
         },
     );
@@ -437,12 +437,7 @@ async fn l1_preserves_organic_zero_and_negative_scores_and_backfills_only_missin
 
 #[tokio::test]
 async fn dense_only_candidate_gets_exact_bm25_phrase_sparse_and_negative_dense_features() {
-    cross_vertical_backfill(SparseFormat::Bmp).await;
-}
-
-#[tokio::test]
-async fn dense_only_candidate_backfills_maxscore_sparse_fields() {
-    cross_vertical_backfill(SparseFormat::MaxScore).await;
+    cross_vertical_backfill(SparseFormat::Seismic).await;
 }
 
 async fn cross_vertical_backfill(sparse_format: SparseFormat) {
@@ -861,7 +856,7 @@ async fn maxscore_backfill_preserves_ordinals_across_block_boundaries_and_distin
         true,
         false,
         SparseVectorConfig {
-            format: SparseFormat::MaxScore,
+            format: SparseFormat::Seismic,
             dims: Some(8),
             weight_quantization: WeightQuantization::UInt8,
             ..Default::default()
@@ -1017,7 +1012,7 @@ async fn complete_organic_scores_skip_legacy_addressing_and_reorder_upgrades_sma
 }
 
 #[tokio::test]
-async fn bmp_backfill_without_forward_storage_preserves_missing_zero_and_organic_scores() {
+async fn single_copy_sparse_backfill_preserves_missing_zero_and_organic_scores() {
     let mut schema = Schema::builder();
     let title = schema.add_text_field("title", true, false);
     let field = schema.add_sparse_vector_field_with_config(
@@ -1025,10 +1020,9 @@ async fn bmp_backfill_without_forward_storage_preserves_missing_zero_and_organic
         true,
         false,
         SparseVectorConfig {
-            format: SparseFormat::Bmp,
+            format: SparseFormat::Seismic,
             dims: Some(8),
-            max_weight: Some(5.0),
-            bmp_forward_index: false,
+
             ..Default::default()
         },
     );
@@ -1051,13 +1045,7 @@ async fn bmp_backfill_without_forward_storage_preserves_missing_zero_and_organic
     writer.commit().await.unwrap();
     let index = Index::open(dir, config).await.unwrap();
     let searcher = index.reader().await.unwrap().searcher().await.unwrap();
-    assert!(
-        searcher.segment_readers()[0]
-            .bmp_index(field)
-            .unwrap()
-            .forward()
-            .is_none()
-    );
+    assert!(searcher.segment_readers()[0].seismic_index(field).is_some());
     let candidates = searcher
         .search(&TermQuery::text(title, "candidate"), 10)
         .await

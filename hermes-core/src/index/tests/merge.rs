@@ -152,7 +152,9 @@ async fn test_orphan_sweep_removes_sparse_skip_temp_once() {
     let manager = index.segment_manager();
 
     let orphan_id = SegmentId::new();
-    let temp_path = SegmentFiles::new(orphan_id.0).sparse_skip_temp();
+    let temp_path = SegmentFiles::new(orphan_id.0)
+        .sparse
+        .with_extension("nomination.tmp");
     let legacy_partial =
         std::path::PathBuf::from(format!("seg_{}.legacy-partial", orphan_id.to_hex()));
     dir.write(&temp_path, b"partial skip table").await.unwrap();

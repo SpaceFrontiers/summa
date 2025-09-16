@@ -312,7 +312,7 @@ export interface SparseVectorQuery {
   text: string;
   /** How to combine scores for multi-value fields */
   combiner: MultiValueCombiner;
-  /** Approximate search factor (1 = exact, 0.8 prunes more; 0 = use default) */
+  /** BMP/MaxScore pruning factor (0 = schema default, 1 = exact). */
   heapFactor: number;
   /** Temperature for LogSumExp (default: 1.5) */
   combinerTemperature: number;
@@ -326,8 +326,20 @@ export interface SparseVectorQuery {
   maxQueryDims: number;
   /** Fraction of query dims to keep (0 = no pruning, 0.1 = top 10%) */
   pruning: number;
-  /** LSP/0 gamma (unset = depth-derived, 0 = exhaustive) */
-  lspGamma?: number | undefined;
+  /** BMP LSP gamma (unset = depth-derived, 0 = exhaustive). */
+  lspGamma?:
+    | number
+    | undefined;
+  /** Nomination query dimensions (1..64) */
+  seismicCut?:
+    | number
+    | undefined;
+  /** Summary pruning factor (0..1) */
+  seismicFactor?:
+    | number
+    | undefined;
+  /** Exact shared-forward scan; false allows approximation */
+  exhaustive?: boolean | undefined;
 }
 
 /** Dense vector query for similarity search */
@@ -421,7 +433,7 @@ export interface MatchQuery {
   /**
    * Approximate MaxScore: scale the pruning threshold by 1/heap_factor
    * (0/unset or 1 = exact, rank-safe; 0.8 prunes more aggressively at some
-   * recall cost). Must be finite and in [0, 1], like SparseVectorQuery.heap_factor.
+   * recall cost). Must be finite and in [0, 1]. This option applies to text queries.
    */
   heapFactor: number;
   /**
@@ -1928,6 +1940,9 @@ function createBaseSparseVectorQuery(): SparseVectorQuery {
     maxQueryDims: 0,
     pruning: 0,
     lspGamma: undefined,
+    seismicCut: undefined,
+    seismicFactor: undefined,
+    exhaustive: undefined,
   };
 }
 
@@ -1975,6 +1990,15 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
     }
     if (message.lspGamma !== undefined) {
       writer.uint32(104).uint32(message.lspGamma);
+    }
+    if (message.seismicCut !== undefined) {
+      writer.uint32(112).uint32(message.seismicCut);
+    }
+    if (message.seismicFactor !== undefined) {
+      writer.uint32(125).float(message.seismicFactor);
+    }
+    if (message.exhaustive !== undefined) {
+      writer.uint32(128).bool(message.exhaustive);
     }
     return writer;
   },
@@ -2110,6 +2134,30 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
           message.lspGamma = reader.uint32();
           continue;
         }
+        case 14: {
+          if (tag !== 112) {
+            break;
+          }
+
+          message.seismicCut = reader.uint32();
+          continue;
+        }
+        case 15: {
+          if (tag !== 125) {
+            break;
+          }
+
+          message.seismicFactor = reader.float();
+          continue;
+        }
+        case 16: {
+          if (tag !== 128) {
+            break;
+          }
+
+          message.exhaustive = reader.bool();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2162,6 +2210,17 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
         : isSet(object.lsp_gamma)
         ? globalThis.Number(object.lsp_gamma)
         : undefined,
+      seismicCut: isSet(object.seismicCut)
+        ? globalThis.Number(object.seismicCut)
+        : isSet(object.seismic_cut)
+        ? globalThis.Number(object.seismic_cut)
+        : undefined,
+      seismicFactor: isSet(object.seismicFactor)
+        ? globalThis.Number(object.seismicFactor)
+        : isSet(object.seismic_factor)
+        ? globalThis.Number(object.seismic_factor)
+        : undefined,
+      exhaustive: isSet(object.exhaustive) ? globalThis.Boolean(object.exhaustive) : undefined,
     };
   },
 
@@ -2206,6 +2265,15 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
     if (message.lspGamma !== undefined) {
       obj.lspGamma = Math.round(message.lspGamma);
     }
+    if (message.seismicCut !== undefined) {
+      obj.seismicCut = Math.round(message.seismicCut);
+    }
+    if (message.seismicFactor !== undefined) {
+      obj.seismicFactor = message.seismicFactor;
+    }
+    if (message.exhaustive !== undefined) {
+      obj.exhaustive = message.exhaustive;
+    }
     return obj;
   },
 
@@ -2227,6 +2295,9 @@ export const SparseVectorQuery: MessageFns<SparseVectorQuery> = {
     message.maxQueryDims = object.maxQueryDims ?? 0;
     message.pruning = object.pruning ?? 0;
     message.lspGamma = object.lspGamma ?? undefined;
+    message.seismicCut = object.seismicCut ?? undefined;
+    message.seismicFactor = object.seismicFactor ?? undefined;
+    message.exhaustive = object.exhaustive ?? undefined;
     return message;
   },
 };
@@ -10247,7 +10318,7 @@ export const IndexServiceDefinition = {
       responseStream: false,
       options: {},
     },
-    /** Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning */
+    /** Run bounded text, BMP, Seismic, and binary ANN layout maintenance */
     reorder: {
       name: "Reorder",
       requestType: ReorderRequest,

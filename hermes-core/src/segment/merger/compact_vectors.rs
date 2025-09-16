@@ -43,6 +43,16 @@ impl SegmentMerger {
             if count == 0 {
                 continue;
             }
+            let mut locations = (flat.quantization == crate::dsl::DenseVectorQuantization::Binary
+                && source.vector_indexes().contains_key(&field))
+            .then(|| {
+                crate::segment::vector_locations::ExactLocations::with_budget(
+                    budget / 2,
+                    self.cancellation.clone(),
+                )
+            })
+            .transpose()?;
+            let mut ann_len = None;
             if let Some(index) = source.vector_indexes().get(&field) {
                 use crate::segment::ann_build::*;
                 let ann = match index {
@@ -58,10 +68,16 @@ impl SegmentMerger {
                         index.get(),
                         rows,
                         &mut writer,
-                        budget,
+                        if locations.is_some() {
+                            budget / 2
+                        } else {
+                            budget
+                        },
                         self.cancellation.as_deref(),
+                        locations.as_mut(),
                     )?;
                     if size > 0 {
+                        ann_len = Some(size);
                         entries.push(DenseVectorTocEntry {
                             field_id: field,
                             index_type,
@@ -70,6 +86,23 @@ impl SegmentMerger {
                         });
                     }
                 }
+            }
+            if let (Some(locations), Some(ann_len)) = (locations, ann_len) {
+                let offset = writer.offset();
+                let size = locations.write(
+                    flat.dim,
+                    count,
+                    ann_len,
+                    &mut writer,
+                    self.cancellation.as_deref(),
+                )?;
+                entries.push(DenseVectorTocEntry {
+                    field_id: field,
+                    index_type: crate::segment::ann_build::EXACT_LOCATIONS_TYPE,
+                    offset,
+                    size,
+                });
+                continue;
             }
             let offset = writer.offset();
             FlatVectorData::write_binary_header(flat.dim, count, flat.quantization, &mut writer)?;
@@ -89,11 +122,7 @@ impl SegmentMerger {
                 else {
                     continue;
                 };
-                let base = flat.vectors_byte_offset();
-                let bytes = flat
-                    .handle()
-                    .read_bytes_range(base + (start * width) as u64..base + (end * width) as u64)
-                    .await?;
+                let bytes = flat.read_vectors_batch(start, end - start).await?;
                 let mut at = first;
                 while at < end {
                     let from = at;
@@ -140,9 +169,24 @@ impl SegmentMerger {
         files: &SegmentFiles,
         budget: usize,
     ) -> Result<usize> {
-        if source.sparse_indexes().is_empty() && source.bmp_indexes().is_empty() {
+        if source.sparse_indexes().is_empty()
+            && source.bmp_indexes().is_empty()
+            && source.seismic_indexes().is_empty()
+        {
             return Ok(0);
         }
+        let mut partitions = if source.seismic_indexes().is_empty() {
+            None
+        } else {
+            Some(
+                crate::segment::sparse_partitions::SparsePartitionWriters::create(
+                    dir,
+                    files,
+                    |_| true,
+                )
+                .await?,
+            )
+        };
         let mut writer = OffsetWriter::new(dir.streaming_writer_cold(&files.sparse).await?);
         let mut field_tocs = Vec::new();
         let mut skips = Vec::new();
@@ -151,6 +195,44 @@ impl SegmentMerger {
                 continue;
             }
             self.ensure_not_cancelled()?;
+            // Every codec shares these live writers, including fields visited
+            // before the Seismic field itself.
+            let field_budget = budget.saturating_sub(
+                partitions
+                    .as_ref()
+                    .map_or(0, |partitions| partitions.scratch_bytes()),
+            );
+            if let Some(index) = source.seismic_index(field) {
+                let config = entry.sparse_vector_config.clone().unwrap_or_default();
+                let vectors = (0..index.len())
+                    .filter(|&row| rows.get(index.key(row).doc).is_some())
+                    .count() as u32;
+                let offset = writer.offset();
+                let partitions = partitions.as_mut().expect("Seismic partition writers");
+                let available = field_budget.saturating_sub(
+                    skips.len() * std::mem::size_of::<crate::structures::SparseSkipEntry>(),
+                );
+                let lengths = crate::segment::seismic::write_compacted(
+                    index,
+                    &|doc| rows.get(doc),
+                    &config,
+                    available,
+                    &|| self.ensure_not_cancelled(),
+                    &mut crate::segment::sparse_partitions::SeismicFieldWriter {
+                        root: &mut writer,
+                        partitions,
+                    },
+                )?;
+                partitions.record_outputs(field.0, vectors, index.quantization(), &lengths);
+                field_tocs.push(SparseFieldToc::seismic(
+                    field.0,
+                    vectors,
+                    offset,
+                    lengths.root,
+                    index.quantization(),
+                ));
+                continue;
+            }
             let total_vectors = rows.iter().try_fold(0u32, |total, old| {
                 let count = source.row_stats()[&field.0].get_u64(old);
                 u32::try_from(count)
@@ -161,7 +243,7 @@ impl SegmentMerger {
                     })
             })?;
             if let Some(bmp) = source.bmp_indexes().get(&field.0) {
-                let remaining = budget.saturating_sub(
+                let remaining = field_budget.saturating_sub(
                     skips.len() * std::mem::size_of::<crate::structures::SparseSkipEntry>(),
                 );
                 let scratch = dir
@@ -210,7 +292,7 @@ impl SegmentMerger {
                 let mut max_weight = 0.0f32;
                 for i in 0..blocks {
                     self.ensure_not_cancelled()?;
-                    if skips.len().saturating_mul(64) >= budget / 2 {
+                    if skips.len().saturating_mul(64) >= field_budget / 2 {
                         return Err(crate::Error::Schema(
                             "sparse compaction skip directory exceeds scratch budget".into(),
                         ));
@@ -269,8 +351,95 @@ impl SegmentMerger {
         }
         let toc_offset = writer.offset();
         write_sparse_toc_and_footer(&mut writer, skip_offset, toc_offset, &field_tocs)?;
-        let bytes = writer.offset() as usize;
+        let bytes = writer.offset() as usize
+            + match partitions {
+                Some(partitions) => partitions.finish()?,
+                None => 0,
+            };
         writer.finish()?;
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::directories::RamDirectory;
+    use crate::dsl::{Document, SchemaBuilder};
+    use crate::index::{Index, IndexConfig};
+    use crate::structures::{SparseFormat, SparseVectorConfig};
+
+    #[tokio::test]
+    async fn mixed_sparse_compaction_charges_partition_buffers_before_each_codec() {
+        for (format, budget, expected_error) in [
+            (
+                SparseFormat::Bmp,
+                16 * 1024 * 1024 + 512 * 1024,
+                "BMP compaction record maps",
+            ),
+            (
+                SparseFormat::MaxScore,
+                1024 * 1024,
+                "sparse compaction skip directory",
+            ),
+        ] {
+            let mut schema = SchemaBuilder::default();
+            // The non-Seismic field runs first; it must still reserve the
+            // sixteen partition writers that remain live across every field.
+            let other = schema.add_sparse_vector_field_with_config(
+                "other",
+                true,
+                false,
+                SparseVectorConfig {
+                    format,
+                    dims: Some(8),
+                    ..Default::default()
+                },
+            );
+            let seismic = schema.add_sparse_vector_field_with_config(
+                "seismic",
+                true,
+                false,
+                SparseVectorConfig {
+                    format: SparseFormat::Seismic,
+                    dims: Some(8),
+                    ..Default::default()
+                },
+            );
+            let dir = RamDirectory::new();
+            let index = Index::create(dir.clone(), schema.build(), IndexConfig::default())
+                .await
+                .unwrap();
+            let mut writer = index.writer();
+            for value in [1.0, 2.0] {
+                let mut doc = Document::new();
+                doc.add_sparse_vector(other, vec![(0, value)]);
+                doc.add_sparse_vector(seismic, vec![(0, value)]);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+            let source = index.segment_readers().await.unwrap().remove(0);
+            let rows = RowMap::new(2, 1, |doc| doc == 0, 1024).unwrap();
+            let merger = SegmentMerger::new(index.schema());
+            merger
+                .compact_sparse(
+                    &dir,
+                    &source,
+                    &rows,
+                    &SegmentFiles::new(1),
+                    32 * 1024 * 1024,
+                )
+                .await
+                .unwrap();
+            let error = merger
+                .compact_sparse(&dir, &source, &rows, &SegmentFiles::new(2), budget)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(expected_error),
+                "{format:?}: {error}"
+            );
+            writer.shutdown().await.unwrap();
+        }
     }
 }

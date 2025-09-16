@@ -92,10 +92,10 @@ struct Args {
     #[arg(long)]
     search_threads: Option<usize>,
 
-    /// Maximum BMP segment scorers issuing random mmap reads concurrently
+    /// Maximum sparse segment scorers issuing random mmap reads concurrently
     /// across all indexes and queries.
     #[arg(long, default_value = "4")]
-    bmp_io_concurrency: usize,
+    sparse_io_concurrency: usize,
 
     /// Validate all indexes on startup, remove corrupt segments
     #[arg(long)]
@@ -134,9 +134,9 @@ struct Args {
     #[arg(long, default_value = "600")]
     optimizer_unconverged_cooldown_secs: u64,
 
-    /// Maximum consecutive budget-exhausted rewrites that remain eligible for
-    /// optimizer follow-up, including the initial partial pass. 0 disables
-    /// follow-up deepening.
+    /// Follow-up limit for budget-exhausted BP rewrites or consecutive Seismic
+    /// passes that retire no terms. Productive Seismic passes reset the latter
+    /// count. 0 disables follow-up maintenance.
     #[arg(long, default_value = "3")]
     optimizer_max_unconverged_passes: u32,
 
@@ -165,7 +165,7 @@ struct Args {
     bp_memory_budget_mb: usize,
 
     /// Budget (MB) for pinning hot per-segment metadata resident in RAM
-    /// (BMP block offsets/coarse hierarchy, sparse skips, doc-id maps). 0 = off.
+    /// (BMP offsets/hierarchy, sparse skips, ANN lookup and doc-id maps). 0 = off.
     /// Overrides the HERMES_PIN_METADATA_BUDGET_MB env var when set.
     #[arg(long)]
     pin_metadata_budget_mb: Option<u64>,
@@ -508,7 +508,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         info!("HuggingFace cache directory: {:?}", cache_dir);
     }
 
-    // Prometheus exporter: query-path metrics from hermes-core (BMP pruning,
+    // Prometheus exporter: query-path metrics from hermes-core (BMP pruning, Seismic nomination,
     // rerank phases, doc-map indirection, ...) + RPC-level metrics. Fail loud:
     // a bad address or bind failure aborts startup rather than silently
     // serving without metrics.
@@ -580,9 +580,9 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             "--search-threads must be greater than zero"
         ));
     }
-    if args.bmp_io_concurrency == 0 {
+    if args.sparse_io_concurrency == 0 {
         return Err(anyhow::anyhow!(
-            "--bmp-io-concurrency must be greater than zero"
+            "--sparse-io-concurrency must be greater than zero"
         ));
     }
 
@@ -682,7 +682,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
 
     let config = IndexConfig {
         num_threads: search_threads,
-        bmp_io_concurrency: args.bmp_io_concurrency,
+        sparse_io_concurrency: args.sparse_io_concurrency,
         store_cache_budget_bytes,
         max_indexing_memory_bytes,
         vector_training_max_samples: args.vector_training_max_samples,
@@ -767,7 +767,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Indexing threads: {}", num_indexing_threads);
     info!("Worker threads: {}", worker_threads);
     info!("Search CPU threads: {}", search_threads);
-    info!("BMP random-I/O concurrency: {}", args.bmp_io_concurrency);
+    info!(
+        "Sparse random-I/O concurrency: {}",
+        args.sparse_io_concurrency
+    );
     info!("Maximum concurrent searches: {}", max_concurrent_searches);
     info!("Reload interval: {} ms", args.reload_interval_ms);
     info!(

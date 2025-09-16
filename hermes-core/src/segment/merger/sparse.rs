@@ -14,7 +14,6 @@
 //! The raw block bytes are copied directly from mmap.
 
 use std::io::{Read, Write};
-use std::sync::Arc;
 
 use super::OffsetWriter;
 use super::SegmentMerger;
@@ -78,6 +77,21 @@ impl SegmentMerger {
             return Ok((0, true));
         }
 
+        let mut partitions = if segments
+            .iter()
+            .any(|segment| !segment.seismic_indexes().is_empty())
+        {
+            Some(
+                crate::segment::sparse_partitions::SparsePartitionWriters::create(
+                    dir,
+                    files,
+                    |_| true,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         let mut writer = OffsetWriter::new(dir.streaming_writer_cold(&files.sparse).await?);
         let scratch_path = dir.local_path(&files.sparse).unwrap_or_else(|| {
             std::env::temp_dir().join(
@@ -104,6 +118,121 @@ impl SegmentMerger {
                 .as_ref()
                 .map(|c| c.weight_quantization)
                 .unwrap_or(crate::structures::WeightQuantization::Float32);
+
+            if format == SparseFormat::Seismic {
+                let sources: Vec<_> = segments
+                    .iter()
+                    .zip(&doc_offs)
+                    .filter_map(|(segment, &offset)| {
+                        segment.seismic_index(*field).map(|index| (index, offset))
+                    })
+                    .collect();
+                if sources.is_empty() {
+                    continue;
+                }
+                let vectors = sources
+                    .iter()
+                    .try_fold(0u32, |sum, (index, _)| {
+                        sum.checked_add(index.total_vectors())
+                    })
+                    .ok_or_else(|| {
+                        crate::Error::Schema("merged Seismic vector count exceeds u32".into())
+                    })?;
+                let paths: Vec<_> = segments
+                    .iter()
+                    .filter(|seg| seg.seismic_index(*field).is_some())
+                    .map(|seg| dir.local_path(&SegmentFiles::new(seg.meta().id).sparse))
+                    .collect();
+                let offset = writer.offset();
+                let bytes = super::block_in_place_if_multithread(|| {
+                    crate::segment::seismic::write_sources_with_copy(
+                        &sources,
+                        &mut writer,
+                        &|| self.ensure_not_cancelled(),
+                        |source, run_offset, bytes, writer| {
+                            let start = sources[source]
+                                .0
+                                .source_offset()
+                                .checked_add(run_offset)
+                                .ok_or_else(|| {
+                                crate::Error::Corruption("Seismic source offset overflow".into())
+                            })?;
+                            let end = start.checked_add(bytes.len() as u64).ok_or_else(|| {
+                                crate::Error::Corruption("Seismic source extent overflow".into())
+                            })?;
+                            super::copy_local_range_or_bytes(
+                                writer,
+                                paths[source].as_deref(),
+                                start..end,
+                                bytes,
+                                self.cancellation.as_deref(),
+                                "Seismic run",
+                            )
+                        },
+                    )
+                })?;
+                field_tocs.push(SparseFieldToc::seismic(
+                    field.0,
+                    vectors,
+                    offset,
+                    bytes,
+                    sources[0].0.quantization(),
+                ));
+                let partitions = partitions.as_mut().expect("Seismic partition writers");
+                for partition in 0..crate::segment::seismic::PARTITIONS {
+                    self.ensure_not_cancelled()?;
+                    let paths: Vec<_> = segments
+                        .iter()
+                        .filter(|segment| segment.seismic_index(*field).is_some())
+                        .map(|segment| {
+                            dir.local_path(
+                                &SegmentFiles::new(segment.meta().id).seismic_partition(partition),
+                            )
+                        })
+                        .collect();
+                    let bytes = super::block_in_place_if_multithread(|| {
+                        crate::segment::seismic::write_partition_sources_with_copy(
+                            &sources,
+                            partition,
+                            partitions.writer(partition),
+                            &|| self.ensure_not_cancelled(),
+                            |source, run_offset, bytes, writer| {
+                                let start = sources[source]
+                                    .0
+                                    .partition_source_offset(partition)
+                                    .checked_add(run_offset)
+                                    .ok_or_else(|| {
+                                        crate::Error::Corruption(
+                                            "Seismic partition offset overflow".into(),
+                                        )
+                                    })?;
+                                let end =
+                                    start.checked_add(bytes.len() as u64).ok_or_else(|| {
+                                        crate::Error::Corruption(
+                                            "Seismic partition extent overflow".into(),
+                                        )
+                                    })?;
+                                super::copy_local_range_or_bytes(
+                                    writer,
+                                    paths[source].as_deref(),
+                                    start..end,
+                                    bytes,
+                                    self.cancellation.as_deref(),
+                                    "Seismic nomination run",
+                                )
+                            },
+                        )
+                    })?;
+                    partitions.record_field(
+                        partition,
+                        field.0,
+                        vectors,
+                        sources[0].0.quantization(),
+                        bytes,
+                    );
+                }
+                continue;
+            }
 
             // BMP format: merge BMP indexes if any source segments have them
             if format == SparseFormat::Bmp {
@@ -150,7 +279,7 @@ impl SegmentMerger {
                                 .find_map(|bi| bi.map(|idx| idx.max_weight_scale))
                                 .unwrap_or(5.0)
                         });
-                    if self.reorder_bmp && !*field_reorder {
+                    if self.reorder_fields && !*field_reorder {
                         // Reorder-on-merge is on, but this field opted out via
                         // its schema — fall through to block-copy. Loud so an
                         // operator can see why the merged field stays unordered.
@@ -160,7 +289,7 @@ impl SegmentMerger {
                             field.0,
                         );
                     }
-                    if self.reorder_bmp && *field_reorder {
+                    if self.reorder_fields && *field_reorder {
                         // Merge-time BP reorder: write the merged blob in
                         // permuted order instead of block stacking. The output
                         // segment needs no standalone reorder pass afterwards.
@@ -187,17 +316,7 @@ impl SegmentMerger {
                         let out_grid_bits = grid_bits;
                         let scratch_path = scratch_path.clone();
                         let permit_wait_start = std::time::Instant::now();
-                        let _reorder_permit = match &self.reorder_permits {
-                            Some(permits) => {
-                                let gate = Arc::clone(permits);
-                                Some(gate.acquire(self.reorder_priority).await.map_err(|_| {
-                                    crate::Error::Internal(
-                                        "background reorder scheduler is closed".into(),
-                                    )
-                                })?)
-                            }
-                            None => None,
-                        };
+                        let _reorder_permit = self.acquire_reorder_permit().await?;
                         let permit_wait = permit_wait_start.elapsed();
                         if permit_wait >= std::time::Duration::from_secs(1) {
                             log::info!(
@@ -510,7 +629,11 @@ impl SegmentMerger {
         write_sparse_toc_and_footer(&mut writer, skip_offset, toc_offset, &field_tocs)
             .map_err(crate::Error::Io)?;
 
-        let output_size = writer.offset() as usize;
+        let output_size = writer.offset() as usize
+            + match partitions {
+                Some(partitions) => partitions.finish()?,
+                None => 0,
+            };
         writer.finish().map_err(crate::Error::Io)?;
 
         let total_dims: usize = field_tocs.iter().map(|f| f.dims.len()).sum();
