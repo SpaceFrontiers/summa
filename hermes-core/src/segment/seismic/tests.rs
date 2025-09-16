@@ -476,7 +476,7 @@ fn wide_vector_compaction_admits_global_term_map_before_writing() {
 }
 
 #[test]
-fn old_summary_format_version_is_rejected_without_fallback() {
+fn previous_format_version_is_rejected_without_fallback() {
     let config = SparseVectorConfig::default();
     let mut bytes = MemoryWriter::default();
     build_blob(
@@ -486,7 +486,7 @@ fn old_summary_format_version_is_rejected_without_fallback() {
     )
     .unwrap();
     let version = bytes.root.len() - FOOTER + 4;
-    bytes.root[version..version + 4].copy_from_slice(&2u32.to_le_bytes());
+    bytes.root[version..version + 4].copy_from_slice(&5u32.to_le_bytes());
     assert!(bytes.parse(1, 1).is_err());
 }
 
@@ -1081,4 +1081,73 @@ fn opening_nomination_runs_does_not_read_summary_payloads() {
     root.attach_partition(0, OwnedBytes::new(shuffled), 0)
         .unwrap();
     assert!(root.partitions[0].is_some());
+}
+
+#[test]
+fn compressed_forward_preserves_values_and_bytes_through_mixed_merge_and_compaction() {
+    for precision in [
+        WeightQuantization::Float32,
+        WeightQuantization::Float16,
+        WeightQuantization::UInt8,
+        WeightQuantization::UInt4,
+    ] {
+        let mut config = SparseVectorConfig {
+            dims: Some(100_000),
+            weight_quantization: precision,
+            ..Default::default()
+        };
+        let mut postings: FxHashMap<_, _> = (0..137)
+            .map(|dim| (dim * 3, vec![(0, 0, (dim % 11) as f32 - 5.0), (0, 2, 1.0)]))
+            .collect();
+        postings.insert(90_000, vec![(2, 0, -2.0)]);
+        config.seismic.forward_compression = false;
+        let mut raw = MemoryWriter::default();
+        build_blob(postings.clone(), &config, &mut raw).unwrap();
+        let raw = raw.parse(4, 3).unwrap();
+        config.seismic.forward_compression = true;
+        let mut compact = MemoryWriter::default();
+        build_blob(postings, &config, &mut compact).unwrap();
+        let compact = compact.parse(4, 3).unwrap();
+        assert_eq!(compact.vector(0).encoding, 2);
+        assert_eq!(compact.vector(2).encoding, 3);
+        assert!(compact.vector(0).byte_len() < raw.vector(0).byte_len());
+        assert_eq!(compact.rows_for_document(1).count(), 0);
+        for row in 0..3 {
+            let bits = |index: &SeismicIndex| {
+                index
+                    .vector(row)
+                    .iter()
+                    .map(|(d, w)| (d, w.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&raw), bits(&compact));
+        }
+        for id in 0..PARTITIONS {
+            assert_eq!(
+                &*raw.partitions[id].as_ref().unwrap().runs[0].bytes,
+                &*compact.partitions[id].as_ref().unwrap().runs[0].bytes
+            );
+        }
+        let mut merged = MemoryWriter::default();
+        write_sources(&[(&raw, 0), (&compact, 4)], &mut merged, &|| Ok(())).unwrap();
+        let merged = merged.parse(8, 6).unwrap();
+        assert_eq!(&*merged.runs[0].bytes, &*raw.runs[0].bytes);
+        assert_eq!(&*merged.runs[1].bytes, &*compact.runs[0].bytes);
+        let mut output = MemoryWriter::default();
+        write_compacted(
+            &merged,
+            &|doc| (doc >= 4).then(|| doc - 4),
+            &config,
+            16 << 20,
+            &|| Ok(()),
+            &mut output,
+        )
+        .unwrap();
+        let output = output.parse(4, 3).unwrap();
+        for row in 0..3 {
+            assert_eq!(output.key(row), compact.key(row));
+            assert_eq!(output.vector(row).encoding, compact.vector(row).encoding);
+            assert_eq!(output.vector(row).bytes, compact.vector(row).bytes);
+        }
+    }
 }

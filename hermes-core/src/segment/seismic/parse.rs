@@ -167,9 +167,21 @@ impl SeismicIndex {
                 let len = u32_at(r, 16) as usize;
                 if doc >= total_docs
                     || previous_key.is_some_and(|old| old >= key)
-                    || r[6..8] != [0; 2]
+                    || r[6] > 3
+                    || r[7] != 0
                     || at != next_vector
-                    || forward::vector_bytes(n, quantization) != Some(len)
+                    || forward::weight_bytes(n, quantization).is_none_or(|weights| match r[6] {
+                        0 => {
+                            n.checked_mul(4).and_then(|dims| dims.checked_add(weights)) != Some(len)
+                        }
+                        1 => {
+                            n.checked_mul(2).and_then(|dims| dims.checked_add(weights)) != Some(len)
+                        }
+                        3 => {
+                            n.checked_mul(3).and_then(|dims| dims.checked_add(weights)) != Some(len)
+                        }
+                        _ => weights > len,
+                    })
                 {
                     return Err(corrupt("invalid forward row"));
                 }

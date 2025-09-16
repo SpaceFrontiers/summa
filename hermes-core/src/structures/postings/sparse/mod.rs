@@ -25,6 +25,7 @@
 
 mod block;
 mod config;
+pub(crate) mod dimensions;
 mod weights;
 pub(crate) use weights::decode_weight_at as decode_sparse_weight_at;
 #[cfg(any(feature = "native", feature = "wasm", test))]

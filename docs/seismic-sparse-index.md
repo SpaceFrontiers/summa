@@ -9,6 +9,10 @@ All three dispatch through the existing schema, segment, query and lifecycle
 owners; Seismic shares exact forward scoring for its approximate and exhaustive
 paths. The earlier sole-backend integration is superseded by this design.
 
+Version 6 adds opt-in U16/U24/DotVByte forward dimension compression, with U32
+reconstruction for vocabularies such as 100k tokens. Older envelopes require
+rebuilding; no legacy read path is retained. See [forward compression](seismic-forward-compression.md).
+
 ## Configuration and recall controls
 
 New SDL and programmatic schemas default to BMP; select `format: seismic`
@@ -32,14 +36,15 @@ index example {
 
 The values above are the current defaults, not a guaranteed recall target.
 
-| Setting                  | Meaning and trade-off                                                                                                                                                                                                                                   |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `seismic_postings`       | Retain at most 4,096 nominations per term in each newly built run. Higher values increase candidate coverage, build work and stored nominations. Copy merge preserves source runs; this is not a global post-merge cap. Valid range: 1–65,536.          |
-| `seismic_cluster_size`   | Target 64 nominations per geometric cluster. Seed count is the ceiling of retained nominations divided by this target; actual cluster sizes vary. Smaller targets create more summaries and finer selection. Valid range: 1 through `seismic_postings`. |
-| `seismic_summary_energy` | Retain coordinates covering 40% of the cluster summary's total absolute magnitude, starting with the largest. This is not 40% of its coordinates. More retained magnitude makes larger summaries and changes candidate ranking. Valid range: (0, 1].    |
-| `seismic_cut`            | Nominate through the 10 highest-absolute-weight eligible query dimensions. Exact scoring of nominees still uses the effective full query. Larger cuts explore more lists and cost more work. Valid range: 1–64.                                         |
-| `seismic_factor`         | Skip a cluster when its summary proxy is below this factor times the full result heap's threshold. Lower values reduce this pruning and usually improve recall at higher cost; higher values prune more aggressively. Valid range: [0, 1].              |
-| `exhaustive`             | `true` bypasses nominations and scores the shared forward values exhaustively. Default: `false`.                                                                                                                                                        |
+| Setting                       | Meaning and trade-off                                                                                                                                                                                                                                   |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `seismic_postings`            | Retain at most 4,096 nominations per term in each newly built run. Higher values increase candidate coverage, build work and stored nominations. Copy merge preserves source runs; this is not a global post-merge cap. Valid range: 1–65,536.          |
+| `seismic_cluster_size`        | Target 64 nominations per geometric cluster. Seed count is the ceiling of retained nominations divided by this target; actual cluster sizes vary. Smaller targets create more summaries and finer selection. Valid range: 1 through `seismic_postings`. |
+| `seismic_summary_energy`      | Retain coordinates covering 40% of the cluster summary's total absolute magnitude, starting with the largest. This is not 40% of its coordinates. More retained magnitude makes larger summaries and changes candidate ranking. Valid range: (0, 1].    |
+| `seismic_forward_compression` | Losslessly compress forward dimension IDs using adaptive widths and aligned gaps. Default: true; set false for raw U32. Weight precision and logical U32 IDs are unchanged. See [forward compression](seismic-forward-compression.md).                  |
+| `seismic_cut`                 | Nominate through the 10 highest-absolute-weight eligible query dimensions. Exact scoring of nominees still uses the effective full query. Larger cuts explore more lists and cost more work. Valid range: 1–64.                                         |
+| `seismic_factor`              | Skip a cluster when its summary proxy is below this factor times the full result heap's threshold. Lower values reduce this pruning and usually improve recall at higher cost; higher values prune more aggressively. Valid range: [0, 1].              |
+| `exhaustive`                  | `true` bypasses nominations and scores the shared forward values exhaustively. Default: `false`.                                                                                                                                                        |
 
 `lsp_gamma` controls BMP LSP traversal and has no effect on Seismic. For Seismic,
 use `exhaustive: true` for complete coverage. `seismic_factor: 0` removes this
@@ -198,7 +203,8 @@ blobs contain independently copyable runs, a 32-byte entry per run, and a
 40-byte versioned footer. Their combined representation contains:
 
 - One forward payload in the configured Float32, Float16, UInt8 or UInt4
-  precision, using the shared sparse weight codec and U32 dimension IDs.
+  precision, using the shared sparse weight codec. Version 6 optionally compresses
+  dimension IDs with lossless U16/U24/DotVByte encoding; reconstructed IDs remain U32.
 - A 24-byte row directory recording logical document ID, value ordinal,
   payload offset, encoded length and number of coordinates. Empty values keep
   their row and ordinal; missing values have no row.
@@ -512,3 +518,10 @@ not an implemented shortcut; its hit rate and recall implications need measuring
 - `segment/sparse_partitions.rs`: segment file writers and shared TOC integration.
 
 Query unit and integration tests live beside the executor in separate modules.
+
+Forward dimension compression is evaluated in [the codec design](seismic-forward-compression.md).
+
+Components use envelope version 6; older versions require rebuilding. Default `seismic_forward_compression: true` uses
+lossless adaptive U16/U24/DotVByte forward dimension encoding; it leaves configured
+weight precision and nomination unchanged. Default is false. See the linked
+codec design for layout, applicability, and measured tradeoffs.

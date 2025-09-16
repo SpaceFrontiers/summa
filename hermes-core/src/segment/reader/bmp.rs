@@ -225,7 +225,7 @@ impl BmpIndex {
 
         if magic != BMP_BLOB_MAGIC {
             return Err(crate::Error::Corruption(format!(
-                "Unsupported BMP blob magic: {:#x} (expected BMPA {:#x}); migrate or rebuild \
+                "Unsupported BMP blob magic: {:#x} (expected BMPB {:#x}); migrate or rebuild \
                  the index with a compatible Hermes release.",
                 magic, BMP_BLOB_MAGIC
             )));
@@ -521,7 +521,7 @@ impl BmpIndex {
         }
 
         log::debug!(
-            "BMPA index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
+            "BMPB index loaded: num_blocks={}, num_superblocks={}, coarse_groups={}, dims={}, bmp_block_size={}, \
              num_virtual_docs={}, num_real_docs={}, max_weight_scale={:.4}, postings={}, \
              block_grid={}, superblock_grid={}, coarse_grid={}, single_valued={}, block_data={}, doc_map={}, forward={}",
             num_blocks,

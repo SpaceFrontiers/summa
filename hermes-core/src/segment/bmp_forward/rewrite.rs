@@ -1,7 +1,6 @@
 //! Representation-preserving merge/reorder and budgeted forward-storage enablement.
 use super::*;
 use crate::segment::{BmpIndex, OffsetWriter};
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn cancelled(cancellation: Option<&AtomicBool>) -> Result<()> {
@@ -134,11 +133,11 @@ pub(crate) fn write_forward_sources(
                 plan.bmp.validate_block_for_rewrite(block_id)?;
                 let local = (slot % plan.bmp.bmp_block_size) as u8;
                 let mut found = false;
+                let mut row = RowWriter::default();
                 for (dim, _, postings) in plan.bmp.iter_block_terms(block_id) {
                     for posting in postings {
                         if posting.local_slot == local {
-                            writer.write_all(&dim.to_le_bytes())?;
-                            writer.write_all(&[posting.impact])?;
+                            row.push(dim, posting.impact, writer)?;
                             found = true;
                         }
                     }
@@ -146,6 +145,7 @@ pub(crate) fn write_forward_sources(
                 if !found {
                     return Err(corrupt("real vector has no postings"));
                 }
+                row.finish(writer)?;
             }
         }
     }

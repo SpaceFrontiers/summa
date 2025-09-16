@@ -56,7 +56,7 @@
 //!   doc_map_offset: u64           // 60-67  (byte offset of Section F)
 //!   num_real_docs: u32            // 68-71  (actual vector count before padding)
 //!   grid_bits: u32                // 72-75  (2 or 4)
-//!   magic: u32                    // 76-79  (BMPA = 0x41504D42)
+//!   magic: u32                    // 76-79  (BMPB = 0x42504D42)
 //! ```
 
 use std::cmp::Reverse;
@@ -586,9 +586,13 @@ fn write_forward_postings(
     let mut previous = None;
     let mut previous_dim = None;
     let mut bytes = 0u64;
+    let mut row = crate::segment::bmp_forward::RowWriter::default();
     while let Some(Reverse((doc, ordinal, dim, pos, impact))) = heap.pop() {
         let pair = (doc, ordinal);
         if previous != Some(pair) {
+            if previous.is_some() {
+                bytes += row.finish(writer)?;
+            }
             if pairs.get(offsets.len()) != Some(&pair) {
                 return Err(std::io::Error::other(
                     "BMP forward and inverted logical keys disagree",
@@ -601,13 +605,14 @@ fn write_forward_postings(
         if previous_dim.is_some_and(|p| p > dims[dim]) {
             return Err(std::io::Error::other("unordered BMP forward dimension"));
         }
-        writer.write_u32::<LittleEndian>(dims[dim])?;
-        writer.write_u8(impact)?;
-        bytes += 5;
+        bytes += row.push(dims[dim], impact, writer)?;
         previous_dim = Some(dims[dim]);
         if let Some(item) = next(dim, pos + 1) {
             heap.push(item);
         }
+    }
+    if previous.is_some() {
+        bytes += row.finish(writer)?;
     }
     let directory = crate::segment::bmp_forward::write_directory(
         writer,

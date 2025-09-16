@@ -148,7 +148,7 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { block_size_kwarg | bmp_block_size_kwarg | bmp_forward_index_kwarg | bmp_grid_bits_kwarg | sparse_max_weight_kwarg | seismic_postings_kwarg | seismic_cluster_size_kwarg | seismic_summary_energy_kwarg | index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | bm25_k1_kwarg | bm25_b_kwarg | index_type_spec }
+index_config_param = { block_size_kwarg | bmp_block_size_kwarg | bmp_forward_index_kwarg | bmp_grid_bits_kwarg | sparse_max_weight_kwarg | seismic_postings_kwarg | seismic_cluster_size_kwarg | seismic_summary_energy_kwarg | seismic_forward_compression_kwarg | index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | bm25_k1_kwarg | bm25_b_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -220,6 +220,7 @@ COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }
 
 seismic_postings_kwarg = { "seismic_postings" ~ ":" ~ nprobe_spec }
 seismic_cluster_size_kwarg = { "seismic_cluster_size" ~ ":" ~ nprobe_spec }
+seismic_forward_compression_kwarg = { "seismic_forward_compression" ~ ":" ~ boolean_spec }
 seismic_summary_energy_kwarg = { "seismic_summary_energy" ~ ":" ~ pruning_spec }
 query_seismic_cut_kwarg = { "seismic_cut" ~ ":" ~ nprobe_spec }
 query_seismic_factor_kwarg = { "seismic_factor" ~ ":" ~ pruning_spec }

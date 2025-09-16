@@ -6,6 +6,11 @@ use super::logical_address::LogicalUnit;
 use crate::directories::OwnedBytes;
 use crate::{Error, Result};
 
+mod codec;
+pub(crate) use codec::ForwardVector;
+#[cfg(any(feature = "native", feature = "wasm", test))]
+pub(crate) use codec::RowWriter;
+
 const ROW_BYTES: usize = 16;
 pub(super) const TRAILER_BYTES: usize = 16;
 const STORAGE_DISABLED: u32 = 1;
@@ -14,6 +19,7 @@ const STORAGE_DISABLED: u32 = 1;
 pub(crate) struct BmpForward {
     payload: OwnedBytes,
     rows: OwnedBytes,
+    #[cfg_attr(not(any(feature = "native", feature = "wasm", test)), allow(dead_code))]
     dims: u32,
 }
 
@@ -59,7 +65,6 @@ impl BmpForward {
                 .checked_mul(ROW_BYTES)
                 .and_then(|n| n.checked_add(payload_len))
                 != Some(trailer)
-            || !payload_len.is_multiple_of(5)
         {
             return Err(corrupt("invalid directory length or count"));
         }
@@ -80,7 +85,6 @@ impl BmpForward {
                 || (i == 0 && offset != 0)
                 || (i > 0 && offset <= previous_offset)
                 || offset >= payload_len as u64
-                || !offset.is_multiple_of(5)
             {
                 return Err(corrupt("invalid logical key or vector offset"));
             }
@@ -155,8 +159,8 @@ impl BmpForward {
         Ok(self.vector_range(index)?.len() as u64)
     }
 
-    /// Encoded extents only, used for bounded candidate prefetch. Contents are
-    /// still checked by vector() or checked_values() before scoring.
+    /// Borrow encoded extents after directory lookup. Contents are checked only
+    /// by the explicit vector() integrity entry point; this does not prefetch.
     pub(crate) fn encoded_vector(&self, index: u32) -> Result<&[u8]> {
         Ok(&self.payload.as_slice()[self.vector_range(index)?])
     }
@@ -168,11 +172,10 @@ impl BmpForward {
     }
 
     /// Validate only the selected vector's payload, before returning its view.
+    #[cfg(any(feature = "native", feature = "wasm", test))]
     pub(crate) fn vector(&self, index: u32) -> Result<ForwardVector<'_>> {
         let vector = self.vector_for_scoring(index)?;
-        for value in vector.checked_values(self.dims) {
-            value?;
-        }
+        vector.validate(self.dims)?;
         Ok(vector)
     }
 
@@ -225,30 +228,6 @@ impl ValidatedForward<'_> {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ForwardVector<'a>(&'a [u8]);
-impl<'a> ForwardVector<'a> {
-    pub(crate) fn iter(self) -> impl Iterator<Item = (u32, u8)> + 'a {
-        self.0
-            .chunks_exact(5)
-            .map(|entry| (u32::from_le_bytes(entry[..4].try_into().unwrap()), entry[4]))
-    }
-    fn checked_values(self, dims: u32) -> impl Iterator<Item = Result<(u32, u8)>> + 'a {
-        let mut previous = None;
-        self.iter().map(move |(dimension, impact)| {
-            if dimension >= dims || impact == 0 || previous.is_some_and(|p| p > dimension) {
-                return Err(corrupt("invalid dimension order or impact"));
-            }
-            previous = Some(dimension);
-            Ok((dimension, impact))
-        })
-    }
-    #[cfg(feature = "native")]
-    pub(crate) fn len(&self) -> usize {
-        self.0.len() / 5
-    }
-}
-
 #[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) fn write_directory(
     writer: &mut dyn std::io::Write,
@@ -266,7 +245,6 @@ pub(crate) fn write_directory(
             || (written == 0 && offset != 0)
             || (written > 0 && offset <= previous_offset)
             || offset >= payload_bytes
-            || !offset.is_multiple_of(5)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

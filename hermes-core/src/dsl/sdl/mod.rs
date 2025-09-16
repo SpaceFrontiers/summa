@@ -307,6 +307,7 @@ struct IndexConfig {
     seismic_postings: Option<usize>,
     seismic_cluster_size: Option<usize>,
     seismic_summary_energy: Option<f32>,
+    seismic_forward_compression: Option<bool>,
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
     pruning: Option<f32>,
@@ -628,6 +629,10 @@ fn parse_single_index_config_param(
                 .into_inner()
                 .next()
                 .map(|n| n.as_str().parse().unwrap_or(0));
+        }
+        Rule::seismic_forward_compression_kwarg => {
+            config.seismic_forward_compression =
+                p.into_inner().next().map(|v| v.as_str() == "true");
         }
         Rule::seismic_summary_energy_kwarg => {
             config.seismic_summary_energy = p
@@ -1316,6 +1321,9 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     }
     if let Some(size) = idx_cfg.seismic_cluster_size {
         config.seismic.cluster_size = size;
+    }
+    if let Some(compact) = idx_cfg.seismic_forward_compression {
+        config.seismic.forward_compression = compact;
     }
     if let Some(energy) = idx_cfg.seismic_summary_energy {
         config.seismic.summary_energy = energy;
@@ -3559,12 +3567,29 @@ mod seismic_tests {
     use super::*;
 
     #[test]
+    fn seismic_schema_compresses_by_default_and_accepts_explicit_opt_out() {
+        for (setting, enabled) in [("", true), (", seismic_forward_compression: false", false)] {
+            let schema = crate::parse_schema(&format!(
+                "index test {{ field vector: sparse_vector [indexed<format: seismic{setting}>] }}"
+            ))
+            .unwrap();
+            let config = schema
+                .get_field_entry(schema.get_field("vector").unwrap())
+                .unwrap()
+                .sparse_vector_config
+                .as_ref()
+                .unwrap();
+            assert_eq!(config.seismic.forward_compression, enabled);
+        }
+    }
+
+    #[test]
     fn seismic_schema_preserves_build_precision_and_query_settings() {
         let schema = crate::parse_schema(
             r#"index seismic {
             field vector: sparse_vector<u32> [indexed<format: seismic,
                 quantization: float32, seismic_postings: 2048,
-                seismic_cluster_size: 32, seismic_summary_energy: 0.5,
+                seismic_cluster_size: 32, seismic_summary_energy: 0.5, seismic_forward_compression: true,
                 query<seismic_cut: 12, seismic_factor: 0.9, exhaustive: true>>]
         }"#,
         )
@@ -3579,6 +3604,7 @@ mod seismic_tests {
         assert_eq!(config.seismic.postings, 2048);
         assert_eq!(config.seismic.cluster_size, 32);
         assert_eq!(config.seismic.summary_energy, 0.5);
+        assert!(config.seismic.forward_compression);
         let query = config.query_config.as_ref().unwrap();
         assert_eq!(query.seismic_cut, 12);
         assert_eq!(query.seismic_factor, 0.9);
