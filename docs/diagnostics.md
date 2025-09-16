@@ -36,7 +36,9 @@ Diagnostics span every index structure, not only dense ANN:
 | structure                       | cheap (always)                                                                                     | expensive (opt-in)                                                                                                                                                            |
 | ------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | dense ANN (binary IVF / IVF-TQ) | run-directory health (below)                                                                       | `--sample`: zero/all-ones/NaN scan of flat vectors; `--probe-cost`                                                                                                            |
-| sparse (BMP / MaxScore)         | vectors, postings, dims, blocks, postings per vector, block padding ratio                          | `--sparse-stats`: per-dimension posting distribution (p50/p99/max, top-1% share, hottest dims) and u8 impact saturation                                                       |
+| sparse (BMP)                    | vectors, postings, blocks, postings per vector, block padding ratio                                | `--sparse-stats`: per-dimension posting distribution (p50/p99/max, top-1% share, hottest dims) and u8 impact saturation                                                       |
+| sparse (MaxScore)               | vectors, postings, postings per vector                                                             | —                                                                                                                                                                             |
+| sparse (Seismic)                | vectors, nominations, clusters, encoded bytes, runs and pending term debt                          | —                                                                                                                                                                             |
 | full-text                       | per-field doc count and avg tokens/doc (BM25F stats), term-dict entry/block/bloom/dictionary sizes | `--terms N`: whole-dictionary scan — doc-frequency distribution (p50/p99/max), inline-term ratio, postings/positions bytes, top-1% postings share, field-attributed top terms |
 | fast fields                     | per-column type, doc count, multi flag, disk bytes                                                 | —                                                                                                                                                                             |
 | store                           | bytes, block count, docs/block, bytes/block, bytes/doc (from the block index, no decompression)    | —                                                                                                                                                                             |
@@ -51,16 +53,22 @@ Reading the generic stats:
   loose.
 - **doc_freq p50/p99/max** — the Zipf shape dynamic pruning depends on. A max
   near the corpus size identifies de-facto stopwords.
-- **Sparse top-1% share and hottest dims** — SPLADE-style vocabularies are
-  Zipfian; a few hot dimensions holding most postings make BMP block upper
-  bounds loose. Candidates for `weight_threshold` or vocabulary pruning.
-- **Impact saturation** — postings clipped at the u8 quantization ceiling.
-  More than a fraction of a percent means `max_weight_scale` is compressing
-  the model's weight range and ranking is losing resolution.
+- **BMP top-1% share and hottest dims** — a few hot dimensions can make block
+  upper bounds loose. Compare query work before choosing weight or vocabulary
+  pruning.
+- **BMP impact saturation** — postings at the u8 quantization ceiling; inspect
+  `max_weight` and the model weight distribution when this is unexpectedly high.
+- **BMP padding ratio** — virtual-document slots allocated by the grid that do
+  not hold a vector.
+- **Seismic pending terms** — dimensions whose copied nomination fragments still
+  need bounded maintenance. `runs` counts exact-forward storage runs, which
+  maintenance preserves while consolidating nominations in separate partitions.
+  Use pending terms to track nomination maintenance progress.
+- **Sparse file bytes and residency** — include the sparse root and all Seismic
+  nomination partitions. Reused files count toward each live segment's logical
+  size even when the filesystem shares their physical storage through hard links.
 - **Store docs/block and bytes/doc** — retrieval cost per document; underfull
   blocks mean the configured block budget is not being reached.
-- **BMP padding ratio** — virtual-doc grid slots that hold no document but
-  are scanned by every query.
 
 ## Metric definitions (dense ANN)
 
@@ -84,22 +92,23 @@ headroom; both would have fired months early):
 - `fragmentation ≥ 8` → warn (a rebuilt segment is 1.0; 32-way merges can
   reach 32 in one step)
 
-## Run compaction
+## Exact storage and merge fragmentation
 
-Fragmentation now heals itself instead of only being reported:
+Dense reports include `exact_storage` (`ann` or `flat`) and
+`exact_lookup_bytes` (including lookup directories). `flat_bytes` is zero for
+ANN-backed exact vectors; `flat_vectors` remains the logical vector count for
+both layouts. `payload_bytes` counts ANN codes, including SOAR secondary
+assignments. These are storage sizes, not claims about heap or page residency.
 
-**Every binary merge** whose byte-copy output would be fragmented (any
-cluster overlap between sources — in practice, every real merge) rewrites
-the payload cluster-major: one extent per cluster, document IDs made
-absolute, the freshly-built layout restored. There is no threshold, and the
-explicit `reorder` pass simply clones the vectors file — a segment reaching
-it is already at fragmentation 1.0.
-
-The fragmentation diagnostics stay even though binary merges now always
-produce 1.0: TQ payloads still byte-copy, and for binary the ≥ 8 warning
-becomes a regression alarm — it firing means the compaction policy itself
-broke. `hermes_ann_fragmentation` and `hermes-tool diagnose` observe the
-outcome.
+Normal binary merge copies existing ANN payloads and lookup rows without
+coalescing clusters or rewriting vector labels. Fragmentation can grow with
+merge generations, and the existing ≥8 warning remains meaningful. Rebuild
+restores newly assigned runs; deletion compaction rewrites surviving metadata.
+Standalone reorder coalesces binary runs to one per occupied cluster, copying
+codes unchanged and rebuilding the lookup without retraining. It also works on
+binary-only indexes. See [exact binary storage](binary-vector-storage.md) for the
+format; duplicate flat-plus-binary-ANN layouts are rejected. Float AH keeps its existing leaf-wise
+packing policy.
 
 ## Tiers
 
@@ -140,7 +149,7 @@ safe to run against a live index — everything is read-only.
 Expensive opt-ins, one flag each (the `run_expensive_tasks` idea):
 
 - `--sample N` — read N deterministically sampled vectors per field per
-  segment from flat storage and report: all-zero and all-ones counts, mean
+  segment from the exact-vector view and report: all-zero and all-ones counts, mean
   bit fraction for binary codes (healthy sign-quantized embeddings sit near
   0.5), NaN/∞ rows for float vectors. This is the check that would have
   caught both constant-embedding regressions the week they started — the
@@ -180,7 +189,7 @@ hermes-tool diagnose -i ./my_index
 hermes-tool diagnose -i ./my_index --json \
     --sample 1000 --probe-cost 64 --residency > health.json
 
-# Stopword/tokenization bloat and sparse vocabulary shape
+# Stopword/tokenization bloat, BMP vocabulary shape, and Seismic maintenance debt
 hermes-tool diagnose -i ./my_index --terms 20 --sparse-stats
 ```
 

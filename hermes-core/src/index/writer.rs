@@ -697,7 +697,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
-        schema.validate_content_hash()?;
+        schema.validate()?;
         crate::dsl::reject_removed_vector_index_types(&schema).map_err(Error::Schema)?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
@@ -1943,10 +1943,11 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.persist_replacement_snapshot().await
     }
 
-    /// Reorder all segments via Recursive Graph Bisection (BP) for better BMP pruning.
+    /// Maintain each segment: reorder text with Recursive Graph Bisection,
+    /// compact ANN runs, and consolidate sparse nomination runs.
     ///
-    /// Each segment is individually rebuilt with record-level BP reordering:
-    /// ordinals are shuffled across blocks so that similar content clusters tightly.
+    /// Sparse maintenance preserves forward values and limits consolidation
+    /// work to its configured budget.
     pub async fn reorder(&mut self) -> Result<()> {
         self.reorder_with_snapshot_refresh(|| std::future::ready(Ok(())))
             .await

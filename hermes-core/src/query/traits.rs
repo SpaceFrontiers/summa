@@ -338,6 +338,9 @@ pub struct SparseTermQueryInfo {
     pub over_fetch_factor: f32,
     /// LSP/0 γ. None is depth-derived; Some(0) is exhaustive.
     pub lsp_gamma: Option<usize>,
+    pub seismic_cut: usize,
+    pub seismic_factor: f32,
+    pub exhaustive: bool,
 }
 
 /// Decomposition of a query for MaxScore optimization.
@@ -444,7 +447,7 @@ macro_rules! define_query_traits {
             /// Unlike scoring decomposition, this never replaces a query's
             /// scorer. A filter wrapper may expose its inner sparse query here
             /// while remaining opaque to Boolean scoring optimizations.
-            fn lsp_decomposition(&self) -> QueryDecomposition {
+            fn sparse_decomposition(&self) -> QueryDecomposition {
                 self.decompose()
             }
 
@@ -729,8 +732,8 @@ impl Query for Box<dyn Query> {
         (**self).decompose()
     }
 
-    fn lsp_decomposition(&self) -> QueryDecomposition {
-        (**self).lsp_decomposition()
+    fn sparse_decomposition(&self) -> QueryDecomposition {
+        (**self).sparse_decomposition()
     }
 
     fn is_filter(&self) -> bool {

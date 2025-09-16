@@ -494,14 +494,20 @@ impl QueryLanguageParser {
                     .get_field(field)
                     .ok_or_else(|| format!("Unknown field: {}", field))?;
                 let mut query = SparseVectorQuery::new(field_id, vector.clone());
-                if let Some(gamma) = self
+                if let Some(config) = self
                     .schema
                     .get_field_entry(field_id)
                     .and_then(|entry| entry.sparse_vector_config.as_ref())
                     .and_then(|config| config.query_config.as_ref())
-                    .and_then(|config| config.lsp_gamma)
                 {
-                    query = query.with_lsp_gamma(gamma);
+                    if let Some(gamma) = config.lsp_gamma {
+                        query = query.with_lsp_gamma(gamma);
+                    }
+                    query = query
+                        .with_heap_factor(config.heap_factor)
+                        .with_seismic_cut(config.seismic_cut)
+                        .with_seismic_factor(config.seismic_factor)
+                        .with_exhaustive(config.exhaustive);
                 }
                 Ok(Box::new(query))
             }
@@ -726,7 +732,7 @@ mod tests {
     fn sparse_query_language_preserves_schema_lsp_gamma_including_exhaustive_zero() {
         for gamma in [None, Some(0), Some(7)] {
             let setting = gamma.map_or(String::new(), |gamma| {
-                format!(", query<lsp_gamma: {gamma}>")
+                format!(", query<lsp_gamma: {gamma}, exhaustive: false>")
             });
             let schema = crate::parse_schema(&format!(
                 "index test {{ field emb: sparse_vector [indexed<format: bmp, dims: 16{setting}>] }}"
@@ -742,6 +748,7 @@ mod tests {
             };
             assert_eq!(infos.len(), 1);
             assert_eq!(infos[0].lsp_gamma, gamma);
+            assert!(!infos[0].exhaustive);
         }
     }
 
@@ -785,6 +792,71 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(actual.hits.len(), if gamma == 0 { 9 } else { 1 });
+            assert_eq!(hits(actual), hits(expected));
+        }
+    }
+
+    #[test]
+    fn sparse_query_language_preserves_schema_exhaustive_policy() {
+        for exhaustive in [false, true] {
+            let setting = format!(", query<exhaustive: {exhaustive}>");
+            let schema = crate::parse_schema(&format!(
+                "index test {{ field emb: sparse_vector [indexed<format: seismic, dims: 16{setting}>] }}"
+            )).unwrap();
+            let parser = QueryLanguageParser::new(
+                Arc::new(schema),
+                vec![],
+                Arc::new(TokenizerRegistry::default()),
+            );
+            let query = parser.parse("emb:sparse({0: 1.0})").unwrap();
+            let crate::query::QueryDecomposition::SparseTerms(infos) = query.decompose() else {
+                panic!("sparse syntax did not produce a sparse query");
+            };
+            assert_eq!(infos.len(), 1);
+            assert_eq!(infos[0].exhaustive, exhaustive);
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn parsed_sparse_search_uses_the_fields_exhaustive_policy() {
+        use crate::query::SparseVectorQuery;
+        use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory};
+        for exhaustive in [false, true] {
+            let schema = crate::parse_schema(&format!(
+                "index test {{ field emb: sparse_vector [indexed<format: seismic, dims: 16, seismic_postings: 1, seismic_cluster_size: 1, query<exhaustive: {exhaustive}>>] }}"
+            )).unwrap();
+            let field = schema.get_field("emb").unwrap();
+            let directory = RamDirectory::new();
+            let config = IndexConfig::default();
+            let mut writer = IndexWriter::create(directory.clone(), schema, config.clone())
+                .await
+                .unwrap();
+            // Two superblocks: one of eight weaker documents and one winner.
+            for doc in 0..9 {
+                let mut document = Document::new();
+                document.add_sparse_vector(field, vec![(0, if doc == 8 { 5.0 } else { 0.1 })]);
+                writer.add_document(document).unwrap();
+            }
+            writer.commit().await.unwrap();
+            let index = Index::open(directory, config).await.unwrap();
+            let query = index.query_parser().parse("emb:sparse({0: 1.0})").unwrap();
+            let actual = index.search(query.as_ref(), 9).await.unwrap();
+            let expected = index
+                .search(
+                    &SparseVectorQuery::new(field, vec![(0, 1.0)]).with_exhaustive(exhaustive),
+                    9,
+                )
+                .await
+                .unwrap();
+            let hits = |result: crate::query::SearchResponse| {
+                result
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.address.doc_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(actual.hits.len(), if exhaustive { 9 } else { 1 });
             assert_eq!(hits(actual), hits(expected));
         }
     }

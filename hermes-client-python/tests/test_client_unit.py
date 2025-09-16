@@ -84,13 +84,15 @@ def test_query_builder_preserves_recursive_fusion_options():
     assert query.fusion.queries[0].query.boolean.must[0].WhichOneof("query") == "match"
 
 
-def test_sparse_query_preserves_optional_lsp_gamma_presence():
+def test_sparse_query_preserves_optional_exhaustive_presence():
     unset = _build_query({"sparse_vector": {"field": "embedding"}})
-    assert not unset.sparse_vector.HasField("lsp_gamma")
+    assert not unset.sparse_vector.HasField("exhaustive")
 
-    exhaustive = _build_query({"sparse_vector": {"field": "embedding", "lsp_gamma": 0}})
-    assert exhaustive.sparse_vector.HasField("lsp_gamma")
-    assert exhaustive.sparse_vector.lsp_gamma == 0
+    exhaustive = _build_query(
+        {"sparse_vector": {"field": "embedding", "exhaustive": False}}
+    )
+    assert exhaustive.sparse_vector.HasField("exhaustive")
+    assert exhaustive.sparse_vector.exhaustive is False
 
 
 @pytest.mark.asyncio
@@ -422,3 +424,33 @@ async def test_mutations_preserve_keys_chunks_errors_deadlines_and_explicit_comm
         await client.delete_document("docs", "")
     with pytest.raises(ValueError, match="1000 documents"):
         await client.upsert_documents("docs", [{}] * 1001)
+
+
+def test_sparse_backend_controls_preserve_omission_and_explicit_zero_on_wire():
+    from hermes_client_python import hermes_pb2 as pb
+
+    omitted = _build_query({"sparse_vector": {"field": "sparse"}}).sparse_vector
+    assert omitted.heap_factor == 0
+    for option in ("lsp_gamma", "seismic_cut", "seismic_factor", "exhaustive"):
+        assert not omitted.HasField(option)
+
+    query = _build_query(
+        {
+            "sparse_vector": {
+                "field": "sparse",
+                "indices": [1],
+                "values": [2.0],
+                "heap_factor": 0.8,
+                "lsp_gamma": 0,
+                "seismic_cut": 10,
+                "seismic_factor": 0.0,
+                "exhaustive": False,
+            }
+        }
+    )
+    restored = pb.Query.FromString(query.SerializeToString()).sparse_vector
+    assert restored.heap_factor == pytest.approx(0.8)
+    assert restored.lsp_gamma == 0 and restored.HasField("lsp_gamma")
+    assert restored.seismic_cut == 10 and restored.HasField("seismic_cut")
+    assert restored.seismic_factor == 0 and restored.HasField("seismic_factor")
+    assert not restored.exhaustive and restored.HasField("exhaustive")

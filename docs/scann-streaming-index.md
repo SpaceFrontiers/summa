@@ -138,16 +138,17 @@ After a model is published, commit performs a bounded streaming transform:
    Hamming distance.
 5. Write leaf runs ordered by leaf ID, with locators and document ordinals.
 
-Normal merge never retrains. For each leaf it concatenates compatible source
-runs and rebases document IDs. Binary rows copy verbatim; float AH rows are
-streamed through the FastScan packer when compaction joins run-relative 32-row
-blocks. Neither path reads original vectors, reassigns leaves, or changes the
-global model.
+Normal merge never retrains. Binary ANN payloads and exact-vector lookup rows
+copy verbatim; only their run/span/block directories receive new offsets and
+document bases. Source extents remain separate. Float AH rows are streamed through
+the FastScan packer when compaction joins run-relative 32-row blocks. Neither path
+reassigns leaves or changes the global model. Binary exact retrieval shares the
+ANN codes by default; see [exact binary storage](binary-vector-storage.md).
 
 ## Alter operation
 
 `alter_vector_index(field, new_config)` stages a target configuration, then
-builds a complete replacement generation from authoritative flat vectors. It
+builds a complete replacement generation from the authoritative exact-vector view. It
 publishes schema, model metadata, and replacement segment references in one
 metadata rename. Readers continue using the old generation until that point.
 On failure, the old generation remains readable and staged artifacts are
@@ -179,6 +180,28 @@ float ScaNN while using a distinct artifact kind and fingerprint domain.
 The hot loop must dispatch safely to AVX2/AVX-512 popcount where available,
 AArch64 NEON on ARM, and a scalar fallback. Recall is controlled by routing and
 leaf probes; there is no lossy leaf codec once the packed bits are stored.
+
+## Binary leaf scan pruning
+
+Binary IVF and binary ScaNN share the exact Hamming scanner and the existing
+bounded ANN collectors. The scanner checks the collector's
+conservative score threshold before reading document IDs, visibility, and
+ordinals. It still scores every code in each probed leaf: the probe budget,
+recall, and persisted run bytes do not change. Thresholds are refreshed in
+small fixed-size blocks, so a stale threshold can only admit extra candidates.
+Equal scores must reach the collector to preserve document/ordinal tie-breaking.
+
+The unbounded ordinal sink used before Sum, Avg, LogSumExp, and WeightedTopK
+combination has no pruning threshold. A low individual score can still change
+the combined document score. Max and distinct-vector top-k may reuse their
+existing collector thresholds. The expected saving is fewer metadata loads and
+heap comparisons, with no additional scratch, cache, or format.
+
+For 256-bit codes, the same row kernel also receives a compile-time width,
+letting LLVM unroll it without duplicating the Hamming implementation. Runtime
+CPU checks and scalar fallback remain unchanged. See the
+[exact binary storage](binary-vector-storage.md) for the separate proposed
+removal of duplicate flat codes.
 
 ## Verification
 

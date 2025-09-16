@@ -8,9 +8,10 @@ use crate::{DocId, Score};
 
 use super::planner::{
     build_combined_bitset, build_sparse_bmp_results, build_sparse_bmp_results_filtered,
-    build_sparse_maxscore_executor, cap_terms, chain_predicates, combine_sparse_results,
-    compute_idf, extract_all_sparse_infos, finish_chunked_text_maxscore, finish_text_maxscore,
-    prepare_per_field_grouping, prepare_text_maxscore, text_maxscore_allowed,
+    build_sparse_maxscore_executor, build_sparse_results, build_sparse_results_filtered, cap_terms,
+    chain_predicates, combine_sparse_results, compute_idf, extract_all_sparse_infos,
+    finish_chunked_text_maxscore, finish_text_maxscore, prepare_per_field_grouping,
+    prepare_text_maxscore, sparse_result_scorer, text_maxscore_allowed,
 };
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture};
 
@@ -424,6 +425,11 @@ macro_rules! boolean_plan {
             if let Some(infos) =
                 shared_or_extract_sparse_infos(scorer_options.lsp_plan.as_ref(), should)
             {
+                if !scorer_options.complete_text_matches
+                    && let Some((raw, info)) = build_sparse_results(&infos, reader, limit, &scorer_options)?
+                {
+                    return Ok(sparse_result_scorer(raw, info.field));
+                }
                 if let Some((raw, info)) =
                     build_sparse_bmp_results(&infos, reader, limit, &scorer_options)?
                 {
@@ -817,6 +823,13 @@ macro_rules! boolean_plan {
                     }
                     if let Some(ref bitset) = bitset_result {
                         let bitset_pred = |doc_id: crate::DocId| bitset.contains(doc_id);
+                        if !scorer_options.complete_text_matches
+                            && let Some((raw, info)) = build_sparse_results_filtered(
+                                &infos, reader, limit, &bitset_pred, &scorer_options
+                            )?
+                        {
+                            return Ok(sparse_result_scorer(raw, info.field));
+                        }
                         if let Some((raw, info)) =
                             build_sparse_bmp_results_filtered(
                                 &infos, reader, limit, &bitset_pred, &scorer_options
@@ -833,6 +846,13 @@ macro_rules! boolean_plan {
 
                     // Fallback: closure predicate (for queries that don't support bitsets)
                     let combined = chain_predicates(predicates);
+                    if !scorer_options.complete_text_matches
+                        && let Some((raw, info)) = build_sparse_results_filtered(
+                            &infos, reader, limit, &*combined, &scorer_options
+                        )?
+                    {
+                        return Ok(sparse_result_scorer(raw, info.field));
+                    }
                     if let Some((raw, info)) =
                         build_sparse_bmp_results_filtered(
                             &infos, reader, limit, &*combined, &scorer_options
@@ -1171,7 +1191,7 @@ impl Query for BooleanQuery {
         if !self.must.is_empty() || !self.must_not.is_empty() {
             return super::QueryDecomposition::Opaque;
         }
-        self.lsp_decomposition()
+        self.sparse_decomposition()
     }
 
     fn count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
@@ -1212,7 +1232,7 @@ impl Query for BooleanQuery {
         .then_some(count)
     }
 
-    fn lsp_decomposition(&self) -> super::QueryDecomposition {
+    fn sparse_decomposition(&self) -> super::QueryDecomposition {
         // LSP/0 selection depends only on the sparse scoring clauses. Pure
         // filters may remove documents but cannot increase their score, so a
         // query-global superblock plan remains valid and must be shared across

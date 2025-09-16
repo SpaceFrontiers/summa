@@ -68,6 +68,15 @@ impl SegmentReader {
                 }
             }
             FieldType::SparseVector => {
+                if let Some(index) = self.seismic_index(field) {
+                    for &doc in documents {
+                        for physical in index.rows_for_document(doc) {
+                            push(doc, index.key(physical).ordinal, physical)?;
+                        }
+                    }
+                    return Ok(locations);
+                }
+
                 let Some(bmp) = self.bmp_indexes.get(&field.0) else {
                     if self.sparse_indexes.contains_key(&field.0) {
                         return self
@@ -166,6 +175,8 @@ impl SegmentReader {
             .filter_map(|(field, entry)| {
                 let prepared = if let Some(map) = self.chunk_map(field) {
                     map.has_logical_addressing()
+                } else if self.seismic_index(field).is_some() {
+                    true
                 } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
                     bmp.forward().is_some() || bmp.logically_ordered()
                 } else {
@@ -216,6 +227,10 @@ impl SegmentReader {
                     return Err(Error::Query("legacy reordered text needs explicit Reorder to upgrade its chunk map for L1".into()));
                 }
                 map.slot_for_unit(target)
+            } else if let Some(index) = self.seismic_index(field) {
+                index
+                    .rows_for_document(target.doc)
+                    .find(|&row| index.key(row).ordinal == target.ordinal)
             } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
                 if let Some(forward) = bmp.forward() {
                     forward.find(target)
@@ -260,6 +275,9 @@ impl SegmentReader {
             if let Some(physical) = physical {
                 let actual = if let Some(map) = self.chunk_map(field) {
                     map.resolve(physical)
+                } else if let Some(index) = self.seismic_index(field) {
+                    let key = index.key(physical);
+                    (key.doc, key.ordinal)
                 } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
                     if let Some(forward) = bmp.forward() {
                         let key = forward.key(physical);

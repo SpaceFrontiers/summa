@@ -11,6 +11,8 @@ mod directory;
 #[cfg(feature = "http")]
 mod http;
 #[cfg(feature = "native")]
+mod local;
+#[cfg(feature = "native")]
 mod mmap;
 mod slice_cache;
 

@@ -821,6 +821,18 @@ pub trait DirectoryWriter: Directory {
     async fn streaming_writer_cold(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
         self.streaming_writer(path).await
     }
+
+    /// Cold writer with a userspace buffering hint for concurrent outputs.
+    /// Local files clamp the buffer to 1 byte through 8 MiB. Other backends
+    /// may delegate to their usual cold writer; this does not bound owned
+    /// output in memory-backed directories or backend-specific caches.
+    async fn streaming_writer_cold_with_capacity(
+        &self,
+        path: &Path,
+        _buffer_capacity: usize,
+    ) -> io::Result<Box<dyn StreamingWriter>> {
+        self.streaming_writer_cold(path).await
+    }
 }
 
 /// In-memory directory for testing and small indexes
@@ -1072,17 +1084,7 @@ impl Directory for FsDirectory {
     }
 
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
-        let full_path = self.resolve(prefix);
-        let mut entries = tokio::fs::read_dir(&full_path).await?;
-        let mut files = Vec::new();
-
-        while let Some(entry) = entries.next_entry().await? {
-            if entry.file_type().await?.is_file() {
-                files.push(entry.path().strip_prefix(&self.root).unwrap().to_path_buf());
-            }
-        }
-
-        Ok(files)
+        super::local::list_files(&self.root, prefix).await
     }
 
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
@@ -1172,24 +1174,24 @@ impl DirectoryWriter for FsDirectory {
     }
 
     async fn streaming_writer(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
-        let full_path = self.resolve(path);
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = std::fs::File::create(&full_path)?;
-        Ok(Box::new(FileStreamingWriter::new(file)))
+        super::local::streaming_writer(&self.resolve(path)).await
     }
 
     async fn streaming_writer_cold(&self, path: &Path) -> io::Result<Box<dyn StreamingWriter>> {
-        let full_path = self.resolve(path);
-        if let Some(parent) = full_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = std::fs::File::create(&full_path)?;
-        Ok(Box::new(super::ColdStreamingWriter::new(
-            file,
+        super::local::streaming_writer_cold(&self.resolve(path), self.label.get(), None).await
+    }
+
+    async fn streaming_writer_cold_with_capacity(
+        &self,
+        path: &Path,
+        buffer_capacity: usize,
+    ) -> io::Result<Box<dyn StreamingWriter>> {
+        super::local::streaming_writer_cold(
+            &self.resolve(path),
             self.label.get(),
-        )))
+            Some(buffer_capacity),
+        )
+        .await
     }
 }
 

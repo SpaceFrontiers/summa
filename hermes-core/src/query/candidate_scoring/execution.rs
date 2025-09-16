@@ -227,7 +227,19 @@ async fn score_field<D: Directory + 'static>(
                     .await?
             }
             ScoreComponent::Sparse(terms) => {
-                if let Some(index) = reader.bmp_index(query.field) {
+                if let Some(index) = reader.seismic_index(query.field) {
+                    // Charge exact candidate payloads before touching values.
+                    for &row in targets {
+                        let bytes = index.vector_byte_len(row)? as u64;
+                        budget.payload_remaining =
+                            budget.payload_remaining.checked_sub(bytes).ok_or_else(|| {
+                                Error::Query("candidate sparse payload read budget exceeded".into())
+                            })?;
+                    }
+                    searcher.install_search_cpu(|| {
+                        crate::query::seismic::score_candidates(index, terms, targets)
+                    })?
+                } else if let Some(index) = reader.bmp_index(query.field) {
                     reader.reserve_candidate_bmp_reads(
                         query.field,
                         targets,
@@ -836,24 +848,27 @@ mod tests {
     use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
 
     #[tokio::test]
-    async fn bmp_backfill_admits_payload_bytes_before_scoring_with_or_without_forward_storage() {
+    async fn sparse_backfill_admits_payload_bytes_before_scoring_for_each_precision() {
         let mut schema = Schema::builder();
-        let fields: Vec<_> = [true, false]
-            .into_iter()
-            .map(|forward| {
-                schema.add_sparse_vector_field_with_config(
-                    &format!("sparse_{forward}"),
-                    true,
-                    false,
-                    SparseVectorConfig {
-                        format: SparseFormat::Bmp,
-                        dims: Some(16),
-                        bmp_forward_index: forward,
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect();
+        let fields: Vec<_> = [
+            crate::structures::WeightQuantization::Float32,
+            crate::structures::WeightQuantization::UInt8,
+        ]
+        .into_iter()
+        .map(|quantization| {
+            schema.add_sparse_vector_field_with_config(
+                &format!("sparse_{quantization:?}"),
+                true,
+                false,
+                SparseVectorConfig {
+                    format: SparseFormat::Seismic,
+                    dims: Some(16),
+                    weight_quantization: quantization,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
         let directory = RamDirectory::new();
         let config = IndexConfig::default();
         let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())

@@ -609,9 +609,12 @@ fn build_sparse_bmp_results_inner(
         (candidate_terms, scoring_terms)
     };
     let executor_limit = bmp_executor_limit(limit, info.over_fetch_factor, bmp);
-    let lsp_gamma = info
-        .lsp_gamma
-        .unwrap_or_else(|| super::bmp::recommended_lsp_gamma(executor_limit));
+    let lsp_gamma = if info.exhaustive {
+        0
+    } else {
+        info.lsp_gamma
+            .unwrap_or_else(|| super::bmp::recommended_lsp_gamma(executor_limit))
+    };
     let field_label = reader.schema().get_field_name(field).unwrap_or("?");
     // The per-segment `limit` may already be clamped to the segment's doc
     // count, so validate the heap depth against the *query* window carried by
@@ -689,8 +692,17 @@ pub(super) fn extract_all_sparse_infos(
     if all.is_empty() {
         return None;
     }
-    let field = all[0].field;
-    if !all.iter().all(|i| i.field == field) {
+    let first = all[0];
+    if !all.iter().all(|info| {
+        info.field == first.field
+            && info.heap_factor == first.heap_factor
+            && info.over_fetch_factor == first.over_fetch_factor
+            && info.lsp_gamma == first.lsp_gamma
+            && info.combiner == first.combiner
+            && info.seismic_cut == first.seismic_cut
+            && info.seismic_factor == first.seismic_factor
+            && info.exhaustive == first.exhaustive
+    }) {
         return None;
     }
     Some(all)
@@ -1138,8 +1150,111 @@ impl Scorer for TopKResultScorer {
     }
 }
 
-// Sparse executors share `crate::query::vector::VectorResultScorer` with the
+/// Shared Seismic/BMP dispatch for sparse vector and term entry points.
+/// MaxScore keeps its async/sync cursor loading with the caller.
+pub(crate) fn build_sparse_memory_scorer<'a>(
+    infos: &[SparseTermQueryInfo],
+    reader: &'a SegmentReader,
+    limit: usize,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<Box<dyn Scorer + 'a>>> {
+    let Some(info) = infos.first() else {
+        return Ok(Some(Box::new(EmptyScorer)));
+    };
+    if options.complete_text_matches
+        && let Some(scorer) = super::seismic::required_scorer(reader, info.field, infos, options)?
+    {
+        return Ok(Some(scorer));
+    }
+    if let Some((raw, info)) = build_sparse_results(infos, reader, limit, options)? {
+        return Ok(Some(sparse_result_scorer(raw, info.field)));
+    }
+    Ok(build_sparse_bmp_results(infos, reader, limit, options)?
+        .map(|(raw, info)| combine_sparse_results(raw, info.combiner, info.field, limit)))
+}
+
+// Sparse executors share `crate::query::vector::VectorResultScorer` with
 // dense queries (see `combine_sparse_results`).
+
+pub(crate) fn build_sparse_results(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<(Vec<crate::segment::VectorSearchResult>, SparseTermQueryInfo)>> {
+    if let Some(filter) = &options.eligibility {
+        build_sparse_results_inner(
+            infos,
+            reader,
+            limit,
+            Some(&|doc| filter.contains(doc)),
+            options,
+        )
+    } else {
+        build_sparse_results_inner(infos, reader, limit, None, options)
+    }
+}
+
+/// Execute sparse search with a document predicate filter.
+///
+/// The predicate is applied during sparse scoring (not post-filter), ensuring
+/// the collector only contains valid documents and the threshold evolves correctly.
+pub(crate) fn build_sparse_results_filtered(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    predicate: &dyn Fn(crate::DocId) -> bool,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<(Vec<crate::segment::VectorSearchResult>, SparseTermQueryInfo)>> {
+    if let Some(filter) = &options.eligibility {
+        build_sparse_results_inner(
+            infos,
+            reader,
+            limit,
+            Some(&|doc| filter.contains(doc) && predicate(doc)),
+            options,
+        )
+    } else {
+        build_sparse_results_inner(infos, reader, limit, Some(predicate), options)
+    }
+}
+
+fn build_sparse_results_inner(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    predicate: Option<&dyn Fn(crate::DocId) -> bool>,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<(Vec<crate::segment::VectorSearchResult>, SparseTermQueryInfo)>> {
+    let Some(&info) = infos.first() else {
+        return Ok(None);
+    };
+    let Some(index) = reader.seismic_index(info.field) else {
+        return Ok(None);
+    };
+    let allowed = |doc| reader.is_alive(doc) && predicate.is_none_or(|predicate| predicate(doc));
+    let results = super::seismic::execute(
+        index,
+        infos,
+        limit,
+        &allowed,
+        options,
+        predicate.is_some() || reader.alive_docs().is_some(),
+        (
+            reader.schema().index_label(),
+            reader.schema().get_field_name(info.field).unwrap_or("?"),
+        ),
+    )?;
+    Ok(Some((results, info)))
+}
+
+/// Wrap document-level scores whose ordinals were combined before top-k.
+pub(crate) fn sparse_result_scorer<'a>(
+    results: Vec<crate::segment::VectorSearchResult>,
+    field: crate::Field,
+) -> Box<dyn Scorer + 'a> {
+    Box::new(super::vector::VectorResultScorer::new(results, field.0))
+}
 
 #[cfg(test)]
 mod tests {

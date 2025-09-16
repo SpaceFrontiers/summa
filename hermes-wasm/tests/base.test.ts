@@ -107,12 +107,12 @@ test("Hybrid branches retain fast-only type matches and honor exclusions", async
 	}
 });
 
-test("BMP search returns identical scores with optional forward storage", async () => {
+test("Seismic preserves top scores for constant-valued Float32 and UInt8 vectors", async () => {
 	await init();
 	const index = await LocalIndex.create(`
 		index forward_test {
-			field sparse: sparse_vector [indexed<format: bmp, dims: 32, max_weight: 5.0, bmp_block_size: 8>]
-			field inverted: sparse_vector [indexed<format: bmp, dims: 32, max_weight: 5.0, bmp_block_size: 8, bmp_forward_index: false>]
+			field sparse: sparse_vector [indexed<dims: 32, quantization: float32>]
+			field inverted: sparse_vector [indexed<dims: 32, quantization: uint8>]
 		}
 	`);
 	await index.addDocuments(Array.from({ length: 64 }, (_, doc) => ({
@@ -129,20 +129,20 @@ test("BMP search returns identical scores with optional forward storage", async 
 	expect((await index.searchStructured(request("inverted"))).hits).toEqual(baseline.hits);
 });
 
-test.each([0, 1])("Sparse query language inherits schema LSP gamma %i", async (gamma) => {
+test.each([false, true])("Sparse query language inherits schema exhaustive policy %s", async (exhaustive) => {
 	await init();
 	const index = await LocalIndex.create(`
 		index sparse_policy {
-			field emb: sparse_vector [indexed<format: bmp, dims: 16, max_weight: 5.0, bmp_block_size: 1, query<lsp_gamma: ${gamma}>>]
+			field emb: sparse_vector [indexed<format: seismic, dims: 16, seismic_postings: 1, seismic_cluster_size: 1, query<exhaustive: ${exhaustive}>>]
 		}
 	`);
-	// Two superblocks: eight weaker documents followed by one winner.
+	// Only the strongest row is nominated; exhaustive scans retain all matches.
 	await index.addDocuments(Array.from({ length: 9 }, (_, doc) => ({
 		emb: { indices: [0], values: [doc === 8 ? 5.0 : 0.1] },
 	})));
 	await index.commit();
 	const results = await index.search("emb:sparse({0: 1.0})", 9);
-	expect(results.hits).toHaveLength(gamma === 0 ? 9 : 1);
+	expect(results.hits).toHaveLength(exhaustive ? 9 : 1);
 	expect(results.hits[0].address.doc_id).toBe(8);
 });
 
@@ -183,4 +183,44 @@ test("Tracing preserves branch candidates before pagination and RRF attribution 
     expect(root.trace.shards[0].queries[0].query.boolean.must[0].term.field).toBe("title");
     expect(root.hits).toEqual((await index.searchStructured({ query: rootQuery, limit: 1, offset: 1 })).hits);
     await expect(index.searchStructured({ query: rootQuery, includeRrfScores: true })).rejects.toContain("requires fusion");
+});
+
+
+test("Seismic portable search preserves signed large dimensions and explicit exhaustive overrides", async () => {
+    await init();
+    const index = await LocalIndex.create(`index wide_sparse {
+        field emb: sparse_vector [indexed<format: seismic, dims: 100000, seismic_postings: 1,
+            seismic_cluster_size: 1, query<exhaustive: true>>]
+    }`);
+    await index.addDocuments([
+        { emb: { indices: [70000], values: [-4] } },
+        { emb: { indices: [70000], values: [-2] } },
+        {},
+    ]);
+    await index.commit();
+    const query = { field: "emb", indices: [70000], values: [-1] };
+    const exact = await index.searchStructured({ query: { sparseVector: query }, limit: 10 });
+    expect(exact.hits.map((hit: any) => hit.score)).toEqual([4, 2]);
+    const approximate = await index.searchStructured({
+        query: { sparseVector: { ...query, exhaustive: false } }, limit: 10,
+    });
+    expect(approximate.hits.map((hit: any) => hit.score)).toEqual([4]);
+});
+
+
+test.each(["", "format: maxscore,", "format: seismic,"])("All sparse backends support portable build and query: %s", async (format) => {
+    await init();
+    const index = await LocalIndex.create(`index sparse_backends {
+        field emb: sparse_vector [indexed<${format} dims: 16>]
+    }`);
+    await index.addDocuments([
+        { emb: { indices: [1], values: [1] } },
+        { emb: { indices: [1], values: [4] } },
+        {},
+    ]);
+    await index.commit();
+    const result = await index.searchStructured({ query: { sparseVector: {
+        field: "emb", indices: [1], values: [1], exhaustive: true,
+    } }, limit: 10 });
+    expect(result.hits.map((hit: any) => hit.address.doc_id)).toEqual([1, 0]);
 });

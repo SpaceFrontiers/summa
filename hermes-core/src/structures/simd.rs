@@ -363,6 +363,7 @@ mod neon {
     /// rows, and the four accumulator chains overlap instead of serialising on
     /// `vcntq_u8`/`vaddq_u8` latency.
     #[target_feature(enable = "neon")]
+    #[inline]
     pub unsafe fn hamming_distance_x4(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
         let len = query.len();
         let chunks16 = len / 16;
@@ -1037,6 +1038,7 @@ mod avx2 {
     /// reduction are shared across the rows, and the four accumulator chains
     /// overlap instead of serialising on popcount latency.
     #[target_feature(enable = "avx2")]
+    #[inline]
     pub unsafe fn hamming_distance_x4(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
         let len = query.len();
         let chunks32 = len / 32;
@@ -3963,6 +3965,7 @@ unsafe fn hamming_distance_avx512(a: &[u8], b: &[u8]) -> u32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512vpopcntdq")]
 #[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
 unsafe fn hamming_distance_x4_avx512(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
     use std::arch::x86_64::*;
 
@@ -4114,7 +4117,13 @@ impl HammingKernel {
 
     /// `out[i]` receives the distance from `query` to row `i` of `db`.
     pub fn distances(self, query: &[u8], db: &[u8], byte_len: usize, out: &mut [u32]) {
-        self.score_rows(query, db, byte_len, out, |index| index);
+        // A literal width lets LLVM unroll the shared kernel for 256-bit
+        // codes; retain the same dispatch, bounds checks, and tail handling.
+        if byte_len == 32 {
+            self.score_rows(query, db, 32, out, |index| index);
+        } else {
+            self.score_rows(query, db, byte_len, out, |index| index);
+        }
     }
 
     /// `out[i]` receives the distance from `query` to row `ids[i]` of `db`.
@@ -5337,21 +5346,25 @@ mod tests {
     /// rows; every width must still agree bit-for-bit with the scalar loop.
     #[test]
     fn batched_hamming_distances_match_scalar_for_every_row_count() {
-        let kernel = HammingKernel::resolve();
+        let kernels = [HammingKernel::resolve(), HammingKernel::Scalar];
         // Cover both multiples of the quad width and every tail remainder, and
         // byte lengths that exercise 16/32/64-byte chunking plus odd tails.
         for byte_len in [1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 128, 320] {
             for rows in [1, 2, 3, 4, 5, 7, 8, 9, 64, 70] {
                 let (query, db) = hamming_matrix(rows, byte_len);
                 let mut got = vec![0u32; rows];
-                kernel.distances(&query, &db, byte_len, &mut got);
-                for (row, &distance) in got.iter().enumerate() {
-                    let expected =
-                        hamming_distance_scalar(&query, &db[row * byte_len..(row + 1) * byte_len]);
-                    assert_eq!(
-                        distance, expected,
-                        "row {row} of {rows} at byte_len {byte_len}"
-                    );
+                for kernel in kernels {
+                    kernel.distances(&query, &db, byte_len, &mut got);
+                    for (row, &distance) in got.iter().enumerate() {
+                        let expected = hamming_distance_scalar(
+                            &query,
+                            &db[row * byte_len..(row + 1) * byte_len],
+                        );
+                        assert_eq!(
+                            distance, expected,
+                            "{kernel:?}: row {row} of {rows} at byte_len {byte_len}"
+                        );
+                    }
                 }
             }
         }

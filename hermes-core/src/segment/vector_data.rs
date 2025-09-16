@@ -109,8 +109,9 @@ pub fn dequantize_raw(
 /// ```
 ///
 /// `element_size` is determined by `quant_type`: f32=4, f16=2, uint8=1.
-/// Reading is handled by [`LazyFlatVectorData`] which loads only doc_ids into memory
-/// and accesses vector data lazily via mmap-backed range reads.
+/// Packed binary vectors instead use `dim / 8` bytes per row.
+/// [`LazyFlatVectorData`] retains a zero-copy view of the packed document/ordinal
+/// map and accesses vector payloads lazily via range reads (mmap on native files).
 pub struct FlatVectorData;
 
 impl FlatVectorData {
@@ -381,7 +382,8 @@ impl FlatVectorData {
 /// Lazy flat vector data — zero-copy doc_id index, vectors via range reads.
 ///
 /// The doc_id index is kept as `OwnedBytes` (mmap-backed, zero heap copy).
-/// Vector data stays on disk and is accessed via mmap-backed range reads.
+/// Exact vectors stay in flat storage or binary ANN code spans. Both layouts
+/// use the same document/ordinal lookup and lazy range-read interface.
 /// Element size depends on quantization: f32=4, f16=2, uint8=1 bytes/dim.
 ///
 /// Used for:
@@ -399,13 +401,13 @@ pub struct LazyFlatVectorData {
     num_docs_with_vectors: usize,
     /// Storage quantization type
     pub quantization: DenseVectorQuantization,
-    /// Zero-copy doc_id index: packed [u32_le doc_id + u16_le ordinal] × num_vectors
+    /// File-backed rows: document ID + ordinal, plus an address for ANN storage.
     doc_ids_bytes: OwnedBytes,
-    /// Whether `doc_ids_bytes` holds the complete `num_vectors ×
-    /// DOC_ID_ENTRY_SIZE` map. Validated once at open so per-vector lookups
+    /// Whether `doc_ids_bytes` holds the complete document map.
+    /// Validated once at open so per-vector lookups
     /// need no length arithmetic; training-only readers leave it false.
     has_doc_map: bool,
-    /// File handle for this field's flat data region in the .vectors file
+    /// File handle for this field's flat or ANN region in the .vectors file
     handle: FileHandle,
     /// Byte offset within handle where raw vector data starts (after header)
     vectors_offset: u64,
@@ -413,6 +415,8 @@ pub struct LazyFlatVectorData {
     vbs: usize,
     /// Exact byte length of the raw vector region, validated when opening.
     vectors_byte_len: u64,
+    /// Exact codes live in ANN; doc-map entries contain span-relative addresses.
+    locations: Option<super::vector_locations::VectorLocations>,
 }
 
 impl LazyFlatVectorData {
@@ -589,11 +593,49 @@ impl LazyFlatVectorData {
             OwnedBytes::empty()
         };
 
+        let num_docs_with_vectors =
+            Self::validate_doc_map(&doc_ids_bytes, DOC_ID_ENTRY_SIZE, total_docs, |doc, _| {
+                Ok(doc)
+            })?;
+
+        debug_assert!(!load_doc_map || doc_ids_bytes.len() == doc_ids_byte_len_usize);
+        Ok(Self {
+            dim,
+            num_vectors,
+            num_docs_with_vectors,
+            quantization,
+            doc_ids_bytes,
+            has_doc_map: load_doc_map,
+            handle,
+            vectors_offset: header_len,
+            vbs,
+            vectors_byte_len,
+            locations: None,
+        })
+    }
+
+    fn validate_doc_map(
+        bytes: &OwnedBytes,
+        stride: usize,
+        total_docs: Option<u32>,
+        mut resolve: impl FnMut(u32, u16) -> io::Result<u32>,
+    ) -> io::Result<usize> {
         let mut previous = None;
         let mut num_docs_with_vectors = 0usize;
-        for entry in doc_ids_bytes.as_slice().chunks_exact(DOC_ID_ENTRY_SIZE) {
-            let doc_id = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        for (index, entry) in bytes.chunks_exact(stride).enumerate() {
+            // Admission walks this metadata sequentially. Keep at most two
+            // 64K-row windows ahead, never prefetch the vector-code corpus.
+            #[cfg(feature = "native")]
+            if index.is_multiple_of(64 * 1024) {
+                let start = index * stride;
+                let end = start.saturating_add(128 * 1024 * stride).min(bytes.len());
+                bytes.madvise_range(start..end, libc::MADV_WILLNEED);
+            }
+            #[cfg(not(feature = "native"))]
+            let _ = index;
+            let local_doc = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
             let ordinal = u16::from_le_bytes([entry[4], entry[5]]);
+            let doc_id = resolve(local_doc, ordinal)?;
             let current = (doc_id, ordinal);
             if let Some(previous) = previous
                 && previous >= current
@@ -627,19 +669,121 @@ impl LazyFlatVectorData {
             previous = Some(current);
         }
 
-        debug_assert!(!load_doc_map || doc_ids_bytes.len() == doc_ids_byte_len_usize);
+        Ok(num_docs_with_vectors)
+    }
+
+    /// Open a document lookup into this field's exact ANN payload. The
+    /// lookup is evictable metadata, and the code payload is never copied.
+    pub(crate) async fn open_indirect(
+        map: FileHandle,
+        ann: &crate::segment::ann_disk::AnnDiskIndex,
+        total_docs: u32,
+    ) -> io::Result<Self> {
+        use super::vector_locations::{ENTRY_SIZE, VectorLocations};
+        let bytes = map.read_bytes().await?;
+        if bytes.len() as u64 != map.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated exact-vector lookup read",
+            ));
+        }
+        let opened = VectorLocations::open(bytes)?;
+        let handle = ann.exact_vectors_handle();
+        let dim = opened.dim;
+        let num_vectors = opened.count;
+        if opened.ann_len != handle.len() || dim != ann.header().dim {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact-vector lookup does not match its ANN payload",
+            ));
+        }
+        let vbs =
+            FlatVectorData::validate_shape(dim, num_vectors, DenseVectorQuantization::Binary)?;
+        let doc_ids_bytes = opened.rows;
+        let layout = opened.layout;
+        let num_docs_with_vectors = {
+            let spans = ann.exact_location_spans(layout.spans())?;
+            let mut addresses = layout.addresses(doc_ids_bytes.as_slice());
+            Self::validate_doc_map(
+                &doc_ids_bytes,
+                ENTRY_SIZE,
+                Some(total_docs),
+                |local_doc, ordinal| {
+                    let (base, span, row) =
+                        addresses.next().expect("validated lookup row count")?;
+                    let doc = local_doc.checked_add(base).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "vector document base overflow")
+                    })?;
+                    spans[span].validate_label(row, doc, ordinal)?;
+                    Ok(doc)
+                },
+            )?
+        };
+        let vectors_byte_len = (num_vectors as u64)
+            .checked_mul(vbs as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "exact-vector byte count overflow",
+                )
+            })?;
         Ok(Self {
             dim,
             num_vectors,
             num_docs_with_vectors,
-            quantization,
+            quantization: DenseVectorQuantization::Binary,
             doc_ids_bytes,
-            has_doc_map: load_doc_map,
+            has_doc_map: true,
             handle,
-            vectors_offset: header_len,
+            vectors_offset: 0,
             vbs,
             vectors_byte_len,
+            locations: Some(layout),
         })
+    }
+
+    /// Whether exact codes are shared with the ANN payload.
+    pub fn is_ann_backed(&self) -> bool {
+        self.locations.is_some()
+    }
+
+    fn doc_map_stride(&self) -> usize {
+        if self.locations.is_some() {
+            super::vector_locations::ENTRY_SIZE
+        } else {
+            DOC_ID_ENTRY_SIZE
+        }
+    }
+
+    fn code_offset(&self, idx: usize) -> u64 {
+        let at = idx * super::vector_locations::ENTRY_SIZE + DOC_ID_ENTRY_SIZE;
+        let address = u64::from_le_bytes(self.doc_ids_bytes[at..at + 8].try_into().unwrap());
+        self.locations
+            .as_ref()
+            .expect("ANN-backed vector")
+            .code_offset(idx, address, self.vbs)
+            .expect("validated vector location")
+    }
+
+    #[cfg(feature = "native")]
+    pub(super) fn locations(&self) -> Option<&super::vector_locations::VectorLocations> {
+        self.locations.as_ref()
+    }
+
+    #[cfg(feature = "native")]
+    pub(super) fn location_rows(&self) -> &[u8] {
+        self.doc_ids_bytes.as_slice()
+    }
+
+    /// Longest physically contiguous run within a requested document range.
+    fn contiguous_rows(&self, start: usize, count: usize) -> usize {
+        if self.locations.is_none() || count < 2 {
+            return count;
+        }
+        let first = self.code_offset(start);
+        (1..count)
+            .find(|&i| self.code_offset(start + i) != first + i as u64 * self.vbs as u64)
+            .unwrap_or(count)
     }
 
     fn checked_vector_range(
@@ -663,6 +807,31 @@ impl LazyFlatVectorData {
             ));
         }
 
+        if self.locations.is_some() {
+            let len = count.checked_mul(self.vbs).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "vector batch size overflow")
+            })?;
+            if count == 0 {
+                return Ok((0..0, 0));
+            }
+            if self.contiguous_rows(start_idx, count) != count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "vector batch is not physically contiguous",
+                ));
+            }
+            let start = self.code_offset(start_idx);
+            let end = start
+                .checked_add(len as u64)
+                .filter(|&end| end <= self.handle.len())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vector location outside ANN payload",
+                    )
+                })?;
+            return Ok((start..end, len));
+        }
         let relative_offset = start_idx.checked_mul(self.vbs).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -748,6 +917,9 @@ impl LazyFlatVectorData {
     /// No-op for non-mmap (RAM, HTTP) backing.
     #[cfg(feature = "native")]
     pub fn advise_random_access(&self) {
+        if self.locations.is_some() {
+            return;
+        }
         let Some(vectors_end) = self.vectors_offset.checked_add(self.vectors_byte_len) else {
             return;
         };
@@ -776,7 +948,7 @@ impl LazyFlatVectorData {
         let mut run_start = first.start;
         let mut run_end = first.end;
         for range in ranges {
-            if range.start <= run_end.saturating_add(COALESCE_GAP) {
+            if range.start >= run_start && range.start <= run_end.saturating_add(COALESCE_GAP) {
                 run_end = run_end.max(range.end);
             } else {
                 self.handle
@@ -899,6 +1071,28 @@ impl LazyFlatVectorData {
         start_idx: usize,
         count: usize,
     ) -> io::Result<OwnedBytes> {
+        if self.locations.is_some() {
+            start_idx
+                .checked_add(count)
+                .filter(|&end| end <= self.num_vectors)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "vector batch outside logical range",
+                    )
+                })?;
+            let len = count.checked_mul(self.vbs).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "vector batch size overflow")
+            })?;
+            if count == 0 {
+                return Ok(OwnedBytes::empty());
+            }
+            let first_count = self.contiguous_rows(start_idx, count);
+            if first_count < count {
+                let bytes = self.handle.read_bytes().await?;
+                return Ok(self.gather_vectors(bytes.as_slice(), start_idx, count, len));
+            }
+        }
         let (range, expected_len) = self.checked_vector_range(start_idx, count)?;
         let bytes = self.handle.read_bytes_range(range).await?;
         if bytes.len() != expected_len {
@@ -911,6 +1105,17 @@ impl LazyFlatVectorData {
             ));
         }
         Ok(bytes)
+    }
+
+    /// Gather from the ANN reader's shared immutable byte owner. No per-row
+    /// range-read callback, byte-owner clone, or second corpus copy is needed.
+    fn gather_vectors(&self, bytes: &[u8], start: usize, count: usize, len: usize) -> OwnedBytes {
+        let mut gathered = Vec::with_capacity(len);
+        for row in start..start + count {
+            let offset = self.code_offset(row) as usize;
+            gathered.extend_from_slice(&bytes[offset..offset + self.vbs]);
+        }
+        OwnedBytes::new(gathered)
     }
 
     /// Synchronous read of a single vector's raw bytes.
@@ -938,6 +1143,28 @@ impl LazyFlatVectorData {
         start_idx: usize,
         count: usize,
     ) -> io::Result<OwnedBytes> {
+        if self.locations.is_some() {
+            start_idx
+                .checked_add(count)
+                .filter(|&end| end <= self.num_vectors)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "vector batch outside logical range",
+                    )
+                })?;
+            let len = count.checked_mul(self.vbs).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "vector batch size overflow")
+            })?;
+            if count == 0 {
+                return Ok(OwnedBytes::empty());
+            }
+            let first_count = self.contiguous_rows(start_idx, count);
+            if first_count < count {
+                let bytes = self.handle.read_bytes_sync()?;
+                return Ok(self.gather_vectors(bytes.as_slice(), start_idx, count, len));
+            }
+        }
         let (range, expected_len) = self.checked_vector_range(start_idx, count)?;
         let bytes = self.handle.read_bytes_range_sync(range)?;
         if bytes.len() != expected_len {
@@ -1025,7 +1252,7 @@ impl LazyFlatVectorData {
             self.has_doc_map,
             "document IDs are unavailable on a training-only flat-vector reader",
         );
-        let off = idx * DOC_ID_ENTRY_SIZE;
+        let off = idx * self.doc_map_stride();
         self.doc_ids_bytes[off..off + DOC_ID_ENTRY_SIZE]
             .try_into()
             .expect("doc-map entry slice is DOC_ID_ENTRY_SIZE bytes")
@@ -1036,13 +1263,21 @@ impl LazyFlatVectorData {
     fn doc_id_at(&self, idx: usize) -> u32 {
         let d = self.doc_map_entry(idx);
         u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+            + self
+                .locations
+                .as_ref()
+                .map_or(0, |layout| layout.doc_base(idx))
     }
 
     /// Get doc_id and ordinal at index (parsed from zero-copy mmap bytes).
     #[inline]
     pub fn get_doc_id(&self, idx: usize) -> (u32, u16) {
         let d = self.doc_map_entry(idx);
-        let doc_id = u32::from_le_bytes([d[0], d[1], d[2], d[3]]);
+        let doc_id = u32::from_le_bytes([d[0], d[1], d[2], d[3]])
+            + self
+                .locations
+                .as_ref()
+                .map_or(0, |layout| layout.doc_base(idx));
         let ordinal = u16::from_le_bytes([d[4], d[5]]);
         (doc_id, ordinal)
     }
@@ -1059,24 +1294,37 @@ impl LazyFlatVectorData {
         self.num_docs_with_vectors
     }
 
-    /// Total byte length of raw vector data (for chunked merger streaming).
+    /// Contiguous flat payload for bounded raw copying, including vectors
+    /// larger than a copy window. ANN-backed document order is not contiguous.
+    #[cfg(feature = "native")]
+    pub(crate) fn flat_region(&self) -> Option<(&FileHandle, std::ops::Range<u64>)> {
+        self.locations.is_none().then(|| {
+            (
+                &self.handle,
+                self.vectors_offset..self.vectors_offset + self.vectors_byte_len,
+            )
+        })
+    }
+
+    /// Logical exact-vector bytes; ANN-backed vectors share these bytes with ANN.
     pub fn vector_bytes_len(&self) -> u64 {
         self.vectors_byte_len
     }
 
-    /// Byte offset where vector data starts (for direct handle access in merger).
-    pub fn vectors_byte_offset(&self) -> u64 {
-        self.vectors_offset
-    }
-
-    /// Access the underlying file handle (for chunked byte-range reads in merger).
-    pub fn handle(&self) -> &FileHandle {
-        &self.handle
+    /// Persisted lookup bytes, including its small directories, or zero for flat storage.
+    pub fn exact_lookup_bytes(&self) -> u64 {
+        self.locations
+            .as_ref()
+            .map_or(0, |layout| layout.serialized_len(self.num_vectors))
     }
 
     /// Estimated heap usage — document IDs and vectors are file-backed.
     pub fn estimated_heap_bytes(&self) -> usize {
         size_of::<Self>()
+            + self
+                .locations
+                .as_ref()
+                .map_or(0, |layout| layout.heap_bytes())
     }
 }
 

@@ -30,7 +30,15 @@ fn chunked_schema() -> Fields {
     );
     sb.set_chunked(content, true);
     sb.set_positions(content, PositionMode::TokenPosition);
-    let sparse = sb.add_sparse_vector_field("sparse", true, false);
+    let sparse = sb.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        false,
+        crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::MaxScore,
+            ..Default::default()
+        },
+    );
     Fields {
         schema: sb.build(),
         content,

@@ -105,14 +105,14 @@ pub struct ReorderConcurrencyGate {
     foreground_finished: tokio::sync::Notify,
 }
 
-/// Process-wide cap on simultaneously active BMP segment scorers.
+/// Process-wide cap on simultaneously active sparse segment scorers.
 ///
 /// Each scorer performs random mmap reads. Letting every segment of every
 /// concurrent query run at once multiplies page faults without increasing
 /// useful NVMe throughput, so this gate is independent from the CPU pool.
 #[cfg(feature = "native")]
 #[derive(Debug)]
-pub(crate) struct BmpIoGate {
+pub(crate) struct SparseIoGate {
     limit: usize,
     active: parking_lot::Mutex<usize>,
     available: parking_lot::Condvar,
@@ -120,7 +120,7 @@ pub(crate) struct BmpIoGate {
 }
 
 #[cfg(feature = "native")]
-impl BmpIoGate {
+impl SparseIoGate {
     fn new(limit: usize) -> Self {
         Self {
             limit,
@@ -131,16 +131,16 @@ impl BmpIoGate {
     }
 
     #[cfg(feature = "sync")]
-    fn acquire(&self) -> BmpIoPermit<'_> {
+    fn acquire(&self) -> SparseIoPermit<'_> {
         let mut active = self.active.lock();
         while *active >= self.limit {
             self.available.wait(&mut active);
         }
         *active += 1;
-        BmpIoPermit { gate: self }
+        SparseIoPermit { gate: self }
     }
 
-    async fn acquire_async(&self) -> BmpIoPermit<'_> {
+    async fn acquire_async(&self) -> SparseIoPermit<'_> {
         loop {
             // Register before checking the counter, so a release between the
             // check and await cannot be lost.
@@ -149,7 +149,7 @@ impl BmpIoGate {
                 let mut active = self.active.lock();
                 if *active < self.limit {
                     *active += 1;
-                    return BmpIoPermit { gate: self };
+                    return SparseIoPermit { gate: self };
                 }
             }
             notified.await;
@@ -158,12 +158,12 @@ impl BmpIoGate {
 }
 
 #[cfg(feature = "native")]
-struct BmpIoPermit<'a> {
-    gate: &'a BmpIoGate,
+struct SparseIoPermit<'a> {
+    gate: &'a SparseIoGate,
 }
 
 #[cfg(feature = "native")]
-impl Drop for BmpIoPermit<'_> {
+impl Drop for SparseIoPermit<'_> {
     fn drop(&mut self) {
         let mut active = self.gate.active.lock();
         *active -= 1;
@@ -349,11 +349,11 @@ pub struct IndexConfig {
     /// pool. A value of zero is invalid and is rejected by `Index::create` and
     /// `Index::open`.
     pub num_threads: usize,
-    /// Maximum BMP segment scorers issuing random mmap reads concurrently
+    /// Maximum sparse segment scorers issuing random mmap reads concurrently
     /// across the process. CPU parallelism remains controlled by
     /// `num_threads`; this separate cap protects the page cache and storage
     /// queue from segment/query fan-out.
-    pub bmp_io_concurrency: usize,
+    pub sparse_io_concurrency: usize,
     /// Number of parallel segment builders (documents distributed round-robin)
     pub num_indexing_threads: usize,
     /// Width of the document-store compression pool. Concurrent segment
@@ -464,8 +464,8 @@ static STORE_CACHE_POOLS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(feature = "native")]
-static BMP_IO_GATES: OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<usize, Weak<BmpIoGate>>>,
+static SPARSE_IO_GATES: OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<usize, Weak<SparseIoGate>>>,
 > = OnceLock::new();
 
 /// Announce each resource kind once per process. Weak registry entries can
@@ -482,20 +482,20 @@ fn shared_resource_log_level(announced: &OnceLock<()>) -> log::Level {
 }
 
 #[cfg(feature = "native")]
-pub(crate) fn shared_bmp_io_gate(limit: usize) -> Arc<BmpIoGate> {
-    let mut gates = BMP_IO_GATES
+pub(crate) fn shared_sparse_io_gate(limit: usize) -> Arc<SparseIoGate> {
+    let mut gates = SPARSE_IO_GATES
         .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
         .lock();
     if let Some(gate) = gates.get(&limit).and_then(Weak::upgrade) {
         return gate;
     }
-    let gate = Arc::new(BmpIoGate::new(limit));
+    let gate = Arc::new(SparseIoGate::new(limit));
     gates.retain(|_, gate| gate.strong_count() > 0);
     gates.insert(limit, Arc::downgrade(&gate));
     static ANNOUNCED: OnceLock<()> = OnceLock::new();
     log::log!(
         shared_resource_log_level(&ANNOUNCED),
-        "[bmp] process-wide random-I/O concurrency={limit}"
+        "[sparse] process-wide random-I/O concurrency={limit}"
     );
     gate
 }
@@ -574,7 +574,7 @@ impl Default for IndexConfig {
 
         Self {
             num_threads: search_threads,
-            bmp_io_concurrency: 4,
+            sparse_io_concurrency: 4,
             num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
             term_cache_blocks: 256,
@@ -844,7 +844,7 @@ pub struct Index<D: crate::directories::DirectoryWriter + 'static> {
 impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
     /// Create a new index in the directory
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
-        schema.validate_content_hash()?;
+        schema.validate()?;
         let search_resources = searcher::SearcherResources::from_config(&config)?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);

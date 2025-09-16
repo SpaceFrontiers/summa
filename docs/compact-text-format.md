@@ -2,8 +2,9 @@
 
 ## Status and invariant
 
-Compact posting and position directories and opt-in quantized norms share the
-existing format owners. Existing formats remain readable. Unknown revisions
+Implementation experiment, not a measured replacement for the current default.
+The baseline is the September 16 admission/position-directory build. RGB remains
+disabled for comparisons. Existing formats remain readable. Unknown revisions
 fail before query execution. Encoded payloads are copied during ordinary merges;
 only small addressing metadata is remapped. Scratch and retained caches remain
 bounded. Native, async and portable readers share the format owners.

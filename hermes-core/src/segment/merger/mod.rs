@@ -3,6 +3,9 @@
 mod chunk_maps;
 mod compact;
 mod compact_vectors;
+mod copy;
+pub(crate) use copy::append_and_delete_temp;
+pub(super) use copy::copy_local_range_or_bytes;
 mod dense;
 mod fast_fields;
 mod postings;
@@ -14,7 +17,6 @@ pub(crate) use terms::MergedTerms;
 
 pub(crate) use dense::AnnWriteMode;
 
-use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -141,158 +143,6 @@ pub(crate) fn block_in_place_if_multithread<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// Attempt a byte-identical local range copy through the streaming writer's
-/// kernel-assisted path. Returns `Ok(false)` without emitting bytes when the
-/// backend/filesystem does not support it.
-fn try_copy_local_file_range(
-    writer: &mut OffsetWriter,
-    source_path: &std::path::Path,
-    source_range: std::ops::Range<u64>,
-    cancellation: Option<&AtomicBool>,
-    context: &str,
-) -> Result<bool> {
-    const COPY_CHUNK: usize = 16 * 1024 * 1024;
-
-    let source = std::fs::File::open(source_path).map_err(crate::Error::Io)?;
-    let expected = source_range
-        .end
-        .checked_sub(source_range.start)
-        .ok_or_else(|| crate::Error::Corruption(format!("{context} source range is inverted")))?;
-    let mut source_offset = source_range.start;
-    let mut copied = 0u64;
-    while copied < expected {
-        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            return Err(crate::Error::IndexClosed);
-        }
-        let requested = usize::try_from((expected - copied).min(COPY_CHUNK as u64))
-            .expect("bounded copy chunk fits usize");
-        match writer.copy_from_file_range(&source, &mut source_offset, requested) {
-            Ok(0) => {
-                return Err(crate::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!(
-                        "kernel {context} copy stopped after {copied} of {expected} bytes from \
-                         {source_path:?}",
-                    ),
-                )));
-            }
-            Ok(count) => {
-                copied = copied.checked_add(count as u64).ok_or_else(|| {
-                    crate::Error::Internal(format!("{context} copied-byte count exceeds u64"))
-                })?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::Unsupported && copied == 0 => {
-                return Ok(false);
-            }
-            Err(error) => return Err(crate::Error::Io(error)),
-        }
-    }
-
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    if !LOGGED.swap(true, Ordering::Relaxed) {
-        log::info!("[merge] byte-identical local ranges use kernel-assisted file copies");
-    }
-    Ok(true)
-}
-
-/// Copy a byte-identical range, falling back to already-mapped bytes for
-/// abstract directories and filesystems without range-copy support.
-pub(super) fn copy_local_range_or_bytes(
-    writer: &mut OffsetWriter,
-    source_path: Option<&std::path::Path>,
-    source_range: std::ops::Range<u64>,
-    bytes: &[u8],
-    cancellation: Option<&AtomicBool>,
-    context: &str,
-) -> Result<()> {
-    let range_len = source_range
-        .end
-        .checked_sub(source_range.start)
-        .ok_or_else(|| crate::Error::Corruption(format!("{context} source range is inverted")))?;
-    if range_len != bytes.len() as u64 {
-        return Err(crate::Error::Corruption(format!(
-            "{context} source range is {range_len} bytes but mapped section is {} bytes",
-            bytes.len(),
-        )));
-    }
-    if bytes.is_empty() {
-        return Ok(());
-    }
-
-    if let Some(path) = source_path
-        && try_copy_local_file_range(writer, path, source_range, cancellation, context)?
-    {
-        return Ok(());
-    }
-
-    for chunk in bytes.chunks(4 * 1024 * 1024) {
-        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
-            return Err(crate::Error::IndexClosed);
-        }
-        writer.write_all(chunk).map_err(crate::Error::Io)?;
-    }
-    Ok(())
-}
-
-/// Append an exact-length temporary directory file to a segment output and
-/// remove it. Used by sparse skip tables so neither merge nor BP rewrite
-/// buffers a corpus-sized metadata section on heap.
-pub(crate) async fn append_and_delete_temp<D: DirectoryWriter>(
-    directory: &D,
-    path: &std::path::Path,
-    expected_bytes: u64,
-    writer: &mut OffsetWriter,
-    index_label: &str,
-) -> Result<()> {
-    use std::io::Write as _;
-
-    const COPY_CHUNK: u64 = 4 * 1024 * 1024;
-    let actual_bytes = directory.file_size(path).await?;
-    if actual_bytes != expected_bytes {
-        return Err(crate::Error::Corruption(format!(
-            "temporary sparse section {:?} has {} bytes, expected {}",
-            path, actual_bytes, expected_bytes,
-        )));
-    }
-    let copied_in_kernel = if let Some(local_path) = directory.local_path(path) {
-        block_in_place_if_multithread(|| {
-            try_copy_local_file_range(
-                writer,
-                &local_path,
-                0..expected_bytes,
-                None,
-                "sparse scratch",
-            )
-        })?
-    } else {
-        false
-    };
-    if !copied_in_kernel {
-        let mut offset = 0u64;
-        while offset < expected_bytes {
-            let end = (offset + COPY_CHUNK).min(expected_bytes);
-            let chunk = directory.read_range(path, offset..end).await?;
-            writer
-                .write_all(chunk.as_slice())
-                .map_err(crate::Error::Io)?;
-            offset = end;
-        }
-    }
-    if let Err(error) = directory.delete(path).await {
-        // The section is already complete in the output. This output-scoped
-        // scratch file is safe for the startup orphan sweep and must not
-        // invalidate an otherwise successful multi-hour merge.
-        log::warn!(
-            "[merge] index={} failed to remove temporary sparse section {:?}: {}",
-            index_label,
-            path,
-            error,
-        );
-    }
-    Ok(())
-}
-
 /// Segment merger - merges multiple segments into one
 pub struct SegmentMerger {
     schema: Arc<Schema>,
@@ -369,7 +219,7 @@ impl SegmentMerger {
 
     /// Enable field-local BP during merge (historically BMP-only).
     /// Text and BMP fields still opt in through their schema `reorder` flag.
-    pub fn with_bmp_reorder(mut self, reorder: bool) -> Self {
+    pub fn with_reorder_fields(mut self, reorder: bool) -> Self {
         self.reorder_fields = reorder;
         self
     }
@@ -473,6 +323,23 @@ impl SegmentMerger {
                         .map(|config| config.format)
                         .unwrap_or_default();
                     match format {
+                        SparseFormat::Seismic => {
+                            let mut vectors = MergeCapacity::default();
+                            for segment in segments {
+                                if let Some(index) = segment.seismic_index(field)
+                                    && let Some(total) =
+                                        vectors.add(u64::from(index.total_vectors()))
+                                {
+                                    return Err(field_capacity_error(
+                                        field.0,
+                                        &entry.name,
+                                        "Seismic vectors",
+                                        total,
+                                    ));
+                                }
+                            }
+                        }
+
                         SparseFormat::Bmp => {
                             let mut vectors = MergeCapacity::default();
                             let mut blocks = MergeCapacity::default();

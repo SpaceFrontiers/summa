@@ -379,6 +379,19 @@ impl SegmentMeta {
     }
 }
 
+/// Sparse nomination layout diagnostics for one immutable field.
+#[derive(Debug, Clone, Copy)]
+pub struct SeismicStats {
+    pub total_vectors: u32,
+    pub dimensions: u32,
+    pub nominations: u64,
+    pub forward_entries: u64,
+    pub clusters: u64,
+    pub encoded_bytes: u64,
+    pub pending_terms: u32,
+    pub runs: u32,
+}
+
 /// Paths for segment files
 pub struct SegmentFiles {
     /// Encoded per-row text presence and exact token counts for compaction.
@@ -430,10 +443,6 @@ impl SegmentFiles {
         ]
     }
 
-    /// Temporary sparse skip table used while streaming large merges.
-    ///
-    /// Readers never open it, but abort and orphan cleanup must treat it as a
-    /// segment-owned artifact.
     #[cfg(any(feature = "native", feature = "wasm"))]
     pub(crate) fn sparse_skip_temp(&self) -> PathBuf {
         self.sparse.with_extension("skip.tmp")
@@ -441,8 +450,8 @@ impl SegmentFiles {
 
     /// Every permanent or temporary path owned by this segment ID.
     #[cfg(any(feature = "native", feature = "wasm"))]
-    pub(crate) fn lifecycle_paths(&self) -> [PathBuf; 12] {
-        [
+    pub(crate) fn lifecycle_paths(&self) -> Vec<PathBuf> {
+        let mut paths = vec![
             self.deletions.clone(),
             self.row_stats.clone(),
             self.term_dict.clone(),
@@ -455,7 +464,23 @@ impl SegmentFiles {
             self.positions.clone(),
             self.fast.clone(),
             self.chunks.clone(),
-        ]
+        ];
+        paths.extend(
+            (0..super::seismic::PARTITIONS).map(|partition| self.seismic_partition(partition)),
+        );
+        paths
+    }
+
+    /// Immutable nomination partition shared by all Seismic fields.
+    pub fn seismic_partition(&self, partition: usize) -> PathBuf {
+        assert!(partition < super::seismic::PARTITIONS);
+        self.sparse
+            .with_extension(format!("seismic.{partition:02}"))
+    }
+
+    /// Fixed nomination partition paths, independently of sparse field count.
+    pub fn seismic_partitions(&self) -> impl Iterator<Item = PathBuf> + '_ {
+        (0..super::seismic::PARTITIONS).map(|partition| self.seismic_partition(partition))
     }
 }
 

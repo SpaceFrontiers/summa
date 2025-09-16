@@ -1756,8 +1756,8 @@ fn text_and_sparse_factors_have_identical_conventions() {
             super::super::Bm25Params::default(),
             factor,
         );
-        let sparse = MaxScoreExecutor::new(Vec::new(), 1, factor);
-        assert_eq!(text.inv_heap_factor, sparse.inv_heap_factor);
+        let generic = MaxScoreExecutor::new(Vec::new(), 1, factor);
+        assert_eq!(text.inv_heap_factor, generic.inv_heap_factor);
         assert_eq!(text.inv_heap_factor, factor.clamp(0.01, 1.0).recip());
     }
 }

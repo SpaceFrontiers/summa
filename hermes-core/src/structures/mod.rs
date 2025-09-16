@@ -6,7 +6,9 @@
 //! - `simd` - SIMD utilities
 //! - `sstable` - SSTable for term dictionary
 
+pub(crate) mod combination;
 pub mod fast_field;
+pub(crate) mod monotone;
 pub mod postings;
 pub mod simd;
 mod sstable;
@@ -85,6 +87,7 @@ pub use postings::{
     SMALL_BLOCK_SIZE,
     SMALL_BLOCK_THRESHOLD,
     SPARSE_BLOCK_SIZE,
+    SeismicConfig,
     SkipEntry,
     SkipList,
     SparseBlock,

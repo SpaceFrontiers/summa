@@ -14,6 +14,8 @@ mod range;
 mod search;
 #[cfg(feature = "sync")]
 mod search_cpu;
+mod seismic_lifecycle;
+mod seismic_operations;
 
 mod vector;
 
@@ -35,7 +37,7 @@ fn zero_search_threads_is_rejected() {
 
 #[cfg(feature = "native")]
 #[test]
-fn zero_bmp_io_concurrency_is_rejected() {
+fn zero_sparse_io_concurrency_is_rejected() {
     assert!(super::searcher::SearcherResources::new(1, None, 1, 1, 0).is_err());
 }
 
@@ -55,10 +57,10 @@ fn oversized_term_cache_block_cap_is_rejected_at_load() {
 
 #[cfg(feature = "sync")]
 #[tokio::test]
-async fn bmp_io_gate_shares_capacity_between_sync_and_async_paths() {
+async fn sparse_io_gate_shares_capacity_between_sync_and_async_paths() {
     use std::time::Duration;
 
-    let gate = super::BmpIoGate::new(1);
+    let gate = super::SparseIoGate::new(1);
     let blocking = gate.acquire();
     let mut async_waiter = Box::pin(gate.acquire_async());
     assert!(
@@ -70,7 +72,7 @@ async fn bmp_io_gate_shares_capacity_between_sync_and_async_paths() {
     drop(blocking);
     let async_permit = tokio::time::timeout(Duration::from_millis(100), &mut async_waiter)
         .await
-        .expect("async BMP scorer should wake when the shared slot is released");
+        .expect("async sparse scorer should wake when the shared slot is released");
     drop(async_permit);
 
     let _blocking_again = gate.acquire();

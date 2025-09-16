@@ -20,7 +20,7 @@ Implemented and retained:
   Deferred term-frequency and position-prefix accounting on document movement.
 - Bounded decoded-block intersections for conjunctions and phrase candidates;
   ordinary sparse seeks retain their existing policy. Fully overwriting decoders
-  reuse initialized buffers. See posting block execution.
+  reuse initialized buffers. See [posting block execution](search-block-execution.md).
 - Opt-in `IndexConfig::compact_text`: separate fixed-width posting descriptors,
   four-byte cursors where possible, and POS4 position directories. Opt-in
   `quantized_norms` applies byte4 norms to new ordinary text columns. These
@@ -32,7 +32,6 @@ Rejected; do not re-add:
 - **Tiled in-block seek** (16-value tile maxima before a SIMD scan) and the
   earlier **SIMD linear scan** over the decoded block: correct, but their
   timings did not support selection over the probe + binary search
-  (review).
 - **Exact-width Simd4x tails** for postings and positions (`simd4x-v1`):
   regressed on the merged ARM fixture; tails are written `Rounded` (codec 0,
   position tag 0). The reader still accepts the old exact tails.
@@ -153,13 +152,12 @@ tags are rejected at admission.
 Opt-in (`--posting-codec simd4x`), using the `bitpacking` 0.9.3 four-lane
 kernels. Measured on the full corpus with the same writer, document order and
 gates as the rounded control
-(evidence,
 4,044,864,324 (about 20 % smaller); official TOP_10 geometric mean 803.338 →
 824.067 µs (about 2.6 % slower). It is a space trade-off, not the default.
 
 ## Format gates
 
-Metadata format **9** is required; formats 6 through 8 are upgraded on open (see
+Metadata format **9** is required; formats 6–8 are upgraded on open (see
 [row deletion](row-deletion.md)), older indexes must be rebuilt. See
 [`INDEX_META_FORMAT_VERSION`](../hermes-core/src/index/metadata.rs) and the
 [SSTable format gates](../hermes-core/src/structures/sstable.rs). The gate is
@@ -217,7 +215,6 @@ evaluates it in f64 with the canonical scorer's rounding inflation. Lengths are
 capped at `MAX_CHUNK_LENGTH` inside the constructor
 (`from_posting_list_with_ratio_bounds`, `from_posting_list_with_impact_bounds`)
 because persisted scoring lengths saturate there; callers cannot produce an
-over-tight bound. Measured results: ratio follow-up.
 
 <a id="proposed-bm25-impact-envelope-research-not-implemented"></a>
 <a id="whole-vocabulary-storage-audit-and-narrower-first-experiment"></a>
@@ -239,8 +236,6 @@ records; regrouped groups are recomputed from at most 64 stored points. The
 query owner converts the weighted reciprocal minimum to a conservative bound
 with the canonical scorer's guards; unsupported parameters or absent records
 fall back to the extrema/ratio bound. Evidence:
-impact audit,
-competitive impacts run.
 The L0-only build was flat on the 100k ARM workload; group envelopes are an
 opt-in experiment, not a default.
 

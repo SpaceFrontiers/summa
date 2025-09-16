@@ -3,9 +3,7 @@
 //! Data is written first (one dim at a time), then the TOC and footer
 //! are appended. Parallel sort + prune + serialize per dimension.
 //!
-//! Supports two formats:
-//! - **MaxScore** (default): Per-dimension variable-size blocks with skip entries
-//! - **BMP**: Fixed doc_id range blocks with block-max grid
+//! Supports BMP (the default), MaxScore, and partitioned Seismic nominations.
 
 use std::io::Write;
 
@@ -31,6 +29,7 @@ pub(super) struct SparseVectorBuilder {
     pub postings: FxHashMap<u32, Vec<(DocId, u16, f32)>>,
     /// Total number of sparse vectors added (one per index_sparse_vector_field call)
     pub total_vectors: u32,
+    pub keys: Vec<(DocId, u16)>,
 }
 
 impl SparseVectorBuilder {
@@ -38,12 +37,14 @@ impl SparseVectorBuilder {
         Self {
             postings: FxHashMap::default(),
             total_vectors: 0,
+            keys: Vec::new(),
         }
     }
 
     /// Record that a new sparse vector is being indexed (call once per vector, before add())
     #[inline]
-    pub fn inc_vector_count(&mut self) {
+    pub fn inc_vector_count(&mut self, doc: DocId, ordinal: u16) {
+        self.keys.push((doc, ordinal));
         self.total_vectors += 1;
     }
 
@@ -57,7 +58,7 @@ impl SparseVectorBuilder {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.postings.is_empty()
+        self.total_vectors == 0
     }
 }
 
@@ -72,7 +73,9 @@ pub(super) fn build_sparse_streaming(
     sparse_vectors: &mut FxHashMap<u32, SparseVectorBuilder>,
     schema: &Schema,
     writer: &mut dyn Write,
+    partitions: Option<&mut crate::segment::sparse_partitions::SparsePartitionWriters>,
 ) -> Result<()> {
+    let mut partitions = partitions;
     if sparse_vectors.is_empty() {
         return Ok(());
     }
@@ -108,6 +111,38 @@ pub(super) fn build_sparse_streaming(
         let total_vectors = builder.total_vectors;
 
         match format {
+            SparseFormat::Seismic => {
+                let fallback = crate::structures::SparseVectorConfig::default();
+                let config = sparse_config.unwrap_or(&fallback);
+                let partitions = partitions
+                    .as_deref_mut()
+                    .expect("Seismic partition writers");
+                let lengths = crate::segment::seismic::build_blob_with_keys(
+                    std::mem::take(&mut builder.postings),
+                    &builder.keys,
+                    config,
+                    &mut crate::segment::sparse_partitions::SeismicFieldWriter {
+                        root: writer,
+                        partitions,
+                    },
+                )?;
+                partitions.record_outputs(
+                    field_id,
+                    total_vectors,
+                    config.weight_quantization,
+                    &lengths,
+                );
+                let len = lengths.root;
+                field_tocs.push(SparseFieldToc::seismic(
+                    field_id,
+                    total_vectors,
+                    current_offset,
+                    len,
+                    config.weight_quantization,
+                ));
+                current_offset += len;
+            }
+
             SparseFormat::Bmp => {
                 let bmp_block_size = sparse_config
                     .map(|config| config.bmp_block_size)

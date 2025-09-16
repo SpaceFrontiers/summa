@@ -94,7 +94,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         crate::dsl::reject_removed_vector_index_types(&schema)
             .map_err(crate::error::Error::Schema)?;
         let directory = Arc::new(directory);
-        schema.validate_content_hash()?;
+        schema.validate()?;
         let schema = Arc::new(schema);
         let metadata = IndexMetadata::new((*schema).clone());
         metadata.save(directory.as_ref()).await?;

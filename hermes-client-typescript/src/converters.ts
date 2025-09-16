@@ -86,13 +86,16 @@ export function buildQuery(q: Query): PbQuery {
         text: sv.text ?? "",
         combiner: combinerToProto(sv.combiner),
         heapFactor: sv.heapFactor ?? 0,
+        lspGamma: sv.lspGamma,
         combinerTemperature: sv.combinerTemperature ?? 0,
         combinerTopK: sv.combinerTopK ?? 0,
         combinerDecay: sv.combinerDecay ?? 0,
         weightThreshold: sv.weightThreshold ?? 0,
         maxQueryDims: sv.maxQueryDims ?? 0,
         pruning: sv.pruning ?? 0,
-        lspGamma: sv.lspGamma,
+        seismicCut: sv.seismicCut,
+        seismicFactor: sv.seismicFactor,
+        exhaustive: sv.exhaustive,
       },
     };
   }

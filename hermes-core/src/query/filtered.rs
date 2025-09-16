@@ -229,8 +229,8 @@ impl Query for FilteredQuery {
             super::QueryDecomposition::Opaque
         }
     }
-    fn lsp_decomposition(&self) -> super::QueryDecomposition {
-        self.query.lsp_decomposition()
+    fn sparse_decomposition(&self) -> super::QueryDecomposition {
+        self.query.sparse_decomposition()
     }
     fn text_terms(&self, out: &mut Vec<(crate::Field, Vec<u8>)>) {
         self.query.text_terms(out);

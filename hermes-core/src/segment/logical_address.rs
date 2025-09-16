@@ -8,7 +8,7 @@ pub(crate) struct LogicalUnit {
     pub ordinal: u16,
 }
 
-/// Check order while ignoring BMP padding. No inverse allocation is needed
+/// Check order while ignoring unoccupied slots. No inverse allocation is needed
 /// for ordinary build/concatenation maps, including padding between segments.
 pub(crate) fn logically_ordered(units: impl IntoIterator<Item = Option<LogicalUnit>>) -> bool {
     let mut previous = None;

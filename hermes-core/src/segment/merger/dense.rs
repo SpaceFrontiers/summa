@@ -1,6 +1,7 @@
 //! Dense vector merge strategies
 //!
-//! Every field always gets a Flat entry (raw vectors for reranking/merge).
+//! Binary ANN fields share exact codes through a copyable document lookup.
+//! Other fields retain their Flat entry for reranking/merge.
 //! Optionally, an ANN entry is also written alongside. Ordinary merges copy
 //! immutable ANN runs byte-for-byte; vector-generation rewrites explicitly
 //! rebuild against newly trained global artifacts.
@@ -25,6 +26,7 @@ use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
 use crate::segment::reader::SegmentReader;
 use crate::segment::types::SegmentFiles;
 use crate::segment::vector_data::{FlatVectorData, dequantize_raw};
+use crate::segment::vector_locations::{ExactLocations, write_copied_locations};
 
 /// Batch size for streaming vector reads (1024 vectors at a time)
 const VECTOR_BATCH_SIZE: usize = 1024;
@@ -44,6 +46,8 @@ pub(crate) enum AnnWriteMode {
     /// Vector-generation rewrite: rebuild payloads from flat vectors against
     /// the explicitly supplied new global artifacts.
     Rebuild,
+    /// Standalone reorder: coalesce fragmented binary clusters without retraining.
+    Reorder,
 }
 
 /// Streams vectors from a segment's lazy flat data into an add_fn callback.
@@ -140,37 +144,34 @@ async fn write_flat_entry(
     // Pass 1: stream raw vector bytes in chunks
     for segment in segments {
         if let Some(lazy_flat) = segment.flat_vectors().get(&field_id) {
-            let total_bytes = lazy_flat.vector_bytes_len();
-            let base_offset = lazy_flat.vectors_byte_offset();
-            let handle = lazy_flat.handle();
-            for chunk_start in (0..total_bytes).step_by(FLAT_VECTOR_CHUNK as usize) {
-                if cancellation
-                    .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+            if let Some((handle, region)) = lazy_flat.flat_region() {
+                for start in (region.start..region.end).step_by(FLAT_VECTOR_CHUNK as usize) {
+                    if cancellation
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return Err(crate::Error::IndexClosed);
+                    }
+                    let end = start.saturating_add(FLAT_VECTOR_CHUNK).min(region.end);
+                    let bytes = handle.read_bytes_range(start..end).await?;
+                    if bytes.len() as u64 != end - start {
+                        return Err(crate::Error::Corruption(
+                            "truncated flat vector merge read".into(),
+                        ));
+                    }
+                    super::block_in_place_if_multithread(|| writer.write_all(bytes.as_slice()))?;
+                }
+                continue;
+            }
+            // Only generation rewrites gather ANN-backed codes in document
+            // order. A one-row oversized batch stays a shared byte view.
+            let rows = (FLAT_VECTOR_CHUNK as usize / lazy_flat.vector_byte_size()).max(1);
+            for start in (0..lazy_flat.num_vectors).step_by(rows) {
+                if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     return Err(crate::Error::IndexClosed);
                 }
-                let chunk_end = chunk_start
-                    .saturating_add(FLAT_VECTOR_CHUNK)
-                    .min(total_bytes);
-                let range_start = base_offset.checked_add(chunk_start).ok_or_else(|| {
-                    crate::Error::Corruption("flat vector source offset exceeds u64".into())
-                })?;
-                let range_end = base_offset.checked_add(chunk_end).ok_or_else(|| {
-                    crate::Error::Corruption("flat vector source range exceeds u64".into())
-                })?;
-                let bytes = handle
-                    .read_bytes_range(range_start..range_end)
-                    .await
-                    .map_err(crate::Error::Io)?;
-                let expected_len = usize::try_from(chunk_end - chunk_start).map_err(|_| {
-                    crate::Error::Corruption("flat vector merge chunk exceeds usize".into())
-                })?;
-                if bytes.len() != expected_len {
-                    return Err(crate::Error::Corruption(format!(
-                        "flat vector merge read returned {} bytes, expected {expected_len}",
-                        bytes.len()
-                    )));
-                }
+                let count = rows.min(lazy_flat.num_vectors - start);
+                let bytes = lazy_flat.read_vectors_batch(start, count).await?;
                 super::block_in_place_if_multithread(|| writer.write_all(bytes.as_slice()))?;
             }
         }
@@ -299,6 +300,43 @@ impl SegmentMerger {
             let field = fi.field;
             let entry = self.schema.get_field_entry(field).unwrap();
             let config = entry.dense_vector_config.as_ref();
+            let binary = entry.field_type == FieldType::BinaryDenseVector;
+            let reorder_binary = binary
+                && ann_mode == AnnWriteMode::Reorder
+                && segments.iter().any(|segment| {
+                    segment
+                        .ann_health(field)
+                        .is_some_and(|health| health.fragmentation() > 1.0)
+                });
+            let mut lookup_budget = if reorder_binary {
+                self.bp_memory_budget
+            } else {
+                2 * 1024 * 1024
+            };
+            if reorder_binary {
+                for segment in segments {
+                    if let Some(
+                        crate::segment::VectorIndex::BinaryIvf(index)
+                        | crate::segment::VectorIndex::ScannBinary(index),
+                    ) = segment.vector_indexes().get(&field.0)
+                    {
+                        lookup_budget = lookup_budget
+                            .checked_sub(index.get().binary_compaction_scratch_bytes()?)
+                            .ok_or_else(|| {
+                                crate::Error::Schema("binary reorder exceeds scratch budget".into())
+                            })?;
+                    }
+                }
+            }
+            let copy_exact = binary && ann_mode != AnnWriteMode::Rebuild && !reorder_binary;
+            let mut locations = (binary && !copy_exact)
+                .then(|| {
+                    ExactLocations::with_budget(
+                        lookup_budget.min(2 * 1024 * 1024),
+                        self.cancellation.clone(),
+                    )
+                })
+                .transpose()?;
 
             // ── ANN entry (written first, index_type != FLAT_TYPE) ───────
             let tq_config = config.filter(|config| {
@@ -314,9 +352,14 @@ impl SegmentMerger {
                     .await?
             } else {
                 match ann_mode {
-                    AnnWriteMode::Copy => {
-                        self.copy_ann_runs(field, entry, segments, &doc_offs, trained, &mut writer)?
-                    }
+                    AnnWriteMode::Copy | AnnWriteMode::Reorder => self.write_compatible_ann(
+                        field,
+                        segments,
+                        &doc_offs,
+                        trained,
+                        &mut writer,
+                        locations.as_mut(),
+                    )?,
                     AnnWriteMode::Rebuild
                         if entry.field_type == FieldType::DenseVector
                             && config.is_some_and(|config| {
@@ -329,7 +372,11 @@ impl SegmentMerger {
                         {
                             let data_offset = writer.offset();
                             super::block_in_place_if_multithread(|| {
-                                crate::segment::ann_disk::write_built_scann(&payload, &mut writer)
+                                crate::segment::ann_disk::write_built_scann(
+                                    &payload,
+                                    &mut writer,
+                                    None,
+                                )
                             })
                             .map_err(crate::Error::Io)?;
                             Some((
@@ -353,7 +400,11 @@ impl SegmentMerger {
                         {
                             let data_offset = writer.offset();
                             super::block_in_place_if_multithread(|| {
-                                crate::segment::ann_disk::write_built_scann(&payload, &mut writer)
+                                crate::segment::ann_disk::write_built_scann(
+                                    &payload,
+                                    &mut writer,
+                                    locations.as_mut(),
+                                )
                             })
                             .map_err(crate::Error::Io)?;
                             Some((
@@ -381,6 +432,7 @@ impl SegmentMerger {
                                     &index,
                                     routing,
                                     &mut writer,
+                                    locations.as_mut(),
                                 )
                             })
                             .map_err(crate::Error::Io)?;
@@ -433,25 +485,74 @@ impl SegmentMerger {
                 }
             }
 
-            // ── Flat entry (always written, index_type = FLAT_TYPE) ──────
             let data_offset = writer.offset();
-            write_flat_entry(
-                field.0,
-                fi.dim,
-                fi.total_vectors,
-                fi.quantization,
-                segments,
-                &doc_offs,
-                &mut writer,
-                self.cancellation.as_deref(),
-            )
-            .await?;
-            let data_size = writer.offset() - data_offset;
+            let index_type = if binary && let Some((_, _, ann_len)) = ann_entry {
+                if copy_exact {
+                    let mut sources = Vec::new();
+                    let mut bias = 0u64;
+                    for (segment, &doc_base) in segments.iter().zip(&doc_offs) {
+                        let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                            continue;
+                        };
+                        let ann = match segment.vector_indexes().get(&field.0) {
+                            Some(
+                                crate::segment::VectorIndex::BinaryIvf(index)
+                                | crate::segment::VectorIndex::ScannBinary(index),
+                            ) => index.get(),
+                            _ => {
+                                return Err(crate::Error::Corruption(
+                                    "missing binary ANN source for vector lookup".into(),
+                                ));
+                            }
+                        };
+                        sources.push((flat, doc_base, bias));
+                        bias = bias
+                            .checked_add(ann.copied_payload_bytes() as u64)
+                            .ok_or_else(|| {
+                                crate::Error::Corruption("ANN relocation overflow".into())
+                            })?;
+                    }
+                    super::block_in_place_if_multithread(|| {
+                        write_copied_locations(
+                            &sources,
+                            fi.dim,
+                            fi.total_vectors,
+                            ann_len,
+                            &mut writer,
+                            self.cancellation.as_deref(),
+                        )
+                    })?;
+                } else {
+                    super::block_in_place_if_multithread(|| {
+                        locations.take().expect("binary location builder").write(
+                            fi.dim,
+                            fi.total_vectors,
+                            ann_len,
+                            &mut writer,
+                            self.cancellation.as_deref(),
+                        )
+                    })?;
+                }
+                crate::segment::ann_build::EXACT_LOCATIONS_TYPE
+            } else {
+                write_flat_entry(
+                    field.0,
+                    fi.dim,
+                    fi.total_vectors,
+                    fi.quantization,
+                    segments,
+                    &doc_offs,
+                    &mut writer,
+                    self.cancellation.as_deref(),
+                )
+                .await?;
+                crate::segment::ann_build::FLAT_TYPE
+            };
             toc.push(DenseVectorTocEntry {
                 field_id: field.0,
-                index_type: crate::segment::ann_build::FLAT_TYPE,
+                index_type,
                 offset: data_offset,
-                size: data_size,
+                size: writer.offset() - data_offset,
             });
             // Pad to 8-byte boundary
             let pad = (8 - (writer.offset() % 8)) % 8;
@@ -478,17 +579,21 @@ impl SegmentMerger {
         Ok(output_size)
     }
 
-    /// Copy compatible ANN run columns directly from source mmaps. This is the
-    /// only ANN path used by ordinary segment merges.
-    fn copy_ann_runs(
+    /// Copy compatible ANN columns; only standalone binary reorder supplies
+    /// a location builder to request cluster coalescing.
+    fn write_compatible_ann(
         &self,
         field: crate::dsl::Field,
-        entry: &crate::dsl::FieldEntry,
         segments: &[SegmentReader],
         doc_offs: &[u32],
         trained: Option<&TrainedVectorStructures>,
         writer: &mut OffsetWriter,
+        locations: Option<&mut ExactLocations>,
     ) -> Result<Option<(u8, u64, u64)>> {
+        let entry = self
+            .schema
+            .get_field_entry(field)
+            .expect("validated vector field");
         let has_source_ann = segments
             .iter()
             .any(|segment| segment.vector_indexes().contains_key(&field.0));
@@ -521,7 +626,7 @@ impl SegmentMerger {
                     .as_ref()
                     .is_some_and(|config| config.index_type == crate::dsl::BinaryIndexType::Scann))
         {
-            return self.copy_scann_runs(field, entry, segments, doc_offs, trained, writer);
+            return self.copy_scann_runs(field, segments, doc_offs, trained, writer, locations);
         }
 
         let mut sources = Vec::new();
@@ -602,27 +707,21 @@ impl SegmentMerger {
         if sources.is_empty() {
             return Ok(None);
         }
-        // Byte-copy preserves every source extent, so fragmentation (extents
-        // per probed cluster) multiplies with each merge generation and every
-        // extent is a potential seek on a cold index. Every binary merge whose
-        // output would be fragmented compacts instead: same payload bytes
-        // streamed, plus one u32 add per posting, and the result is
-        // indistinguishable from a freshly built segment (fragmentation 1.0).
-        // Measured ~17% more CPU than the byte-copy on a stage that is a
-        // rounding error of merge wall-clock, so there is no threshold.
-        // Only binary payloads compact — TQ codes are block-packed and cannot
-        // be concatenated without re-packing.
         let predicted_fragmentation =
             crate::segment::ann_disk::predicted_merge_fragmentation(&sources);
-        let compact = index_type == crate::segment::ann_build::BINARY_IVF_TYPE
-            && predicted_fragmentation > 1.0 + 1e-9;
         let data_offset = writer.offset();
+        let action = if locations.is_some() {
+            "coalesced"
+        } else {
+            "copied"
+        };
         let result = super::block_in_place_if_multithread(|| {
-            if compact {
+            if let Some(locations) = locations {
                 crate::segment::ann_disk::write_compacted_ann_cancellable(
                     &sources,
                     writer,
                     self.cancellation.as_deref(),
+                    Some(locations),
                 )
             } else {
                 crate::segment::ann_disk::write_merged_ann_cancellable(
@@ -635,25 +734,13 @@ impl SegmentMerger {
         self.ensure_not_cancelled()?;
         result.map_err(crate::Error::Io)?;
         let data_size = writer.offset() - data_offset;
-        if compact {
-            log::info!(
-                "[dense_vector_merge] index={} field {}: compacted {} ANN source(s) at predicted \
-                 fragmentation {predicted_fragmentation:.1} ({}) — one extent per cluster again",
-                self.schema.index_label(),
-                field.0,
-                sources.len(),
-                crate::format_bytes(data_size),
-            );
-        } else {
-            log::debug!(
-                "[dense_vector_merge] index={} field {}: copied {} compatible ANN run source(s), \
-                 {} (predicted fragmentation {predicted_fragmentation:.1})",
-                self.schema.index_label(),
-                field.0,
-                sources.len(),
-                crate::format_bytes(data_size),
-            );
-        }
+        log::debug!(
+            "[dense_vector_merge] index={} field {}: {action} {} binary ANN sources, {} bytes (source fragmentation {predicted_fragmentation:.1})",
+            self.schema.index_label(),
+            field.0,
+            sources.len(),
+            data_size
+        );
         Ok(Some((index_type, data_offset, data_size)))
     }
 
@@ -664,12 +751,16 @@ impl SegmentMerger {
     fn copy_scann_runs(
         &self,
         field: crate::dsl::Field,
-        entry: &crate::dsl::FieldEntry,
         segments: &[SegmentReader],
         doc_offs: &[u32],
         trained: &TrainedVectorStructures,
         writer: &mut OffsetWriter,
+        locations: Option<&mut ExactLocations>,
     ) -> Result<Option<(u8, u64, u64)>> {
+        let entry = self
+            .schema
+            .get_field_entry(field)
+            .expect("validated vector field");
         let artifact = trained.scann_artifacts.get(&field.0).ok_or_else(|| {
             crate::Error::Corruption(format!(
                 "ScaNN field {} has segment payloads but no loaded global artifact",
@@ -737,15 +828,19 @@ impl SegmentMerger {
 
         let data_offset = writer.offset();
         let result = super::block_in_place_if_multithread(|| {
-            // Compact every fragmented ScaNN generation leaf-wise. Binary
-            // rows copy verbatim; AH rows are streamed through the FastScan
-            // packer so 32-row blocks remain valid across source boundaries.
-            // Neither path reassigns vectors or retrains the global model.
-            if crate::segment::ann_disk::predicted_merge_fragmentation(&sources) > 1.0 + 1e-9 {
+            // Binary runs and their lookup rows remain immutable through
+            // merge. Float AH retains leaf-wise compaction with its existing
+            // FastScan packer; neither path reassigns or retrains vectors.
+            if locations.is_some()
+                || (index_type != crate::segment::ann_build::SCANN_BINARY_TYPE
+                    && crate::segment::ann_disk::predicted_merge_fragmentation(&sources)
+                        > 1.0 + 1e-9)
+            {
                 crate::segment::ann_disk::write_compacted_ann_cancellable(
                     &sources,
                     writer,
                     self.cancellation.as_deref(),
+                    locations,
                 )
             } else {
                 crate::segment::ann_disk::write_merged_ann_cancellable(

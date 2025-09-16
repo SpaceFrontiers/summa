@@ -155,15 +155,23 @@ impl BmpForward {
         Ok(self.vector_range(index)?.len() as u64)
     }
 
+    /// Encoded extents only, used for bounded candidate prefetch. Contents are
+    /// still checked by vector() or checked_values() before scoring.
+    pub(crate) fn encoded_vector(&self, index: u32) -> Result<&[u8]> {
+        Ok(&self.payload.as_slice()[self.vector_range(index)?])
+    }
+
+    /// Query scoring trusts writer-produced payload contents. Admitted extents
+    /// retain safe slice bounds; explicit integrity checks use vector().
+    pub(crate) fn vector_for_scoring(&self, index: u32) -> Result<ForwardVector<'_>> {
+        Ok(ForwardVector(self.encoded_vector(index)?))
+    }
+
     /// Validate only the selected vector's payload, before returning its view.
     pub(crate) fn vector(&self, index: u32) -> Result<ForwardVector<'_>> {
-        let vector = ForwardVector(&self.payload.as_slice()[self.vector_range(index)?]);
-        let mut previous = None;
-        for (dimension, impact) in vector.iter() {
-            if dimension >= self.dims || impact == 0 || previous.is_some_and(|p| p > dimension) {
-                return Err(corrupt("invalid dimension order or impact"));
-            }
-            previous = Some(dimension);
+        let vector = self.vector_for_scoring(index)?;
+        for value in vector.checked_values(self.dims) {
+            value?;
         }
         Ok(vector)
     }
@@ -219,11 +227,21 @@ impl ValidatedForward<'_> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ForwardVector<'a>(&'a [u8]);
-impl ForwardVector<'_> {
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (u32, u8)> + '_ {
+impl<'a> ForwardVector<'a> {
+    pub(crate) fn iter(self) -> impl Iterator<Item = (u32, u8)> + 'a {
         self.0
             .chunks_exact(5)
             .map(|entry| (u32::from_le_bytes(entry[..4].try_into().unwrap()), entry[4]))
+    }
+    fn checked_values(self, dims: u32) -> impl Iterator<Item = Result<(u32, u8)>> + 'a {
+        let mut previous = None;
+        self.iter().map(move |(dimension, impact)| {
+            if dimension >= dims || impact == 0 || previous.is_some_and(|p| p > dimension) {
+                return Err(corrupt("invalid dimension order or impact"));
+            }
+            previous = Some(dimension);
+            Ok((dimension, impact))
+        })
     }
     #[cfg(feature = "native")]
     pub(crate) fn len(&self) -> usize {

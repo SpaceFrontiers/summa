@@ -66,6 +66,10 @@ pub enum VectorIndexState {
     },
 }
 
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 fn default_true() -> bool {
     true
 }
@@ -99,6 +103,20 @@ pub struct SegmentMetaInfo {
     /// optimizer can impose a hard follow-up bound instead of rewriting forever.
     #[serde(default)]
     pub bp_unconverged_passes: u32,
+    /// Terms whose copied Seismic nominations still span multiple runs.
+    #[serde(default)]
+    pub seismic_pending_terms: u32,
+    /// Published partial-maintenance passes in this replacement lineage. Used
+    /// to distinguish initial work from cooldown-paced follow-ups, not as a cap.
+    #[serde(default)]
+    pub seismic_maintenance_passes: u32,
+    /// Consecutive published maintenance passes that did not reduce Seismic
+    /// nomination debt. Progress resets this count; the optimizer bounds stalls.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seismic_no_progress_passes: u32,
+    /// Binary ANN leaves with multiple copied runs require lossless coalescing.
+    #[serde(default)]
+    pub ann_fragmented: bool,
 }
 
 impl SegmentMetaInfo {
@@ -248,6 +266,10 @@ impl IndexMetadata {
                 reordered: false,
                 bp_converged: true,
                 bp_unconverged_passes: 0,
+                seismic_pending_terms: 0,
+                seismic_maintenance_passes: 0,
+                seismic_no_progress_passes: 0,
+                ann_fragmented: false,
             },
         );
     }
@@ -272,6 +294,10 @@ impl IndexMetadata {
                 reordered,
                 bp_converged,
                 bp_unconverged_passes: 0,
+                seismic_pending_terms: 0,
+                seismic_maintenance_passes: 0,
+                seismic_no_progress_passes: 0,
+                ann_fragmented: false,
             },
         );
     }
@@ -477,7 +503,7 @@ impl IndexMetadata {
     fn deserialize_versioned(bytes: &[u8]) -> Result<(Self, Option<u32>)> {
         let mut meta: Self =
             serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
-        meta.schema.validate_content_hash()?;
+        meta.schema.validate()?;
         crate::dsl::reject_removed_vector_index_types(&meta.schema).map_err(Error::Schema)?;
         let migrated_from = if meta.version == INDEX_META_FORMAT_VERSION {
             None

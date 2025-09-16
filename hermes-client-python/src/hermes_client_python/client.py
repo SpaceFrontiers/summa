@@ -436,11 +436,11 @@ class HermesClient:
         return response.num_segments
 
     async def reorder(self, index_name: str, timeout: float | None = None) -> int:
-        """Reorder BMP blocks by SimHash similarity for better pruning.
+        """Run configured text reordering and bounded vector maintenance.
 
-        Performs record-level reordering: shuffles individual ordinals across
-        blocks so that ordinals with similar SimHash cluster tightly. This
-        improves block-max pruning effectiveness for BMP sparse vector queries.
+        Coalesces binary ANN runs and repairs Seismic nomination fragmentation.
+        Sparse maintenance uses pending debt independently of text reorder flags;
+        a bounded pass may leave more work for subsequent background passes.
 
         Args:
             index_name: Name of the index
@@ -994,8 +994,9 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
             "max_query_dims": sv.get("max_query_dims", 0),
             "pruning": sv.get("pruning", 0),
         }
-        if "lsp_gamma" in sv:
-            sparse_vector["lsp_gamma"] = sv["lsp_gamma"]
+        for option in ("lsp_gamma", "seismic_cut", "seismic_factor", "exhaustive"):
+            if option in sv:
+                sparse_vector[option] = sv[option]
         return pb.Query(sparse_vector=pb.SparseVectorQuery(**sparse_vector))
 
     if "dense_vector" in q:

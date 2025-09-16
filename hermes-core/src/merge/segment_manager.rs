@@ -115,9 +115,8 @@ fn plan_force_merge_groups(
         }
     }
 
-    // Preserve the old small-to-large source order inside each output. Besides
-    // stable document ordering, BMP block-copy compression depends on source
-    // alignment at group boundaries.
+    // Preserve deterministic small-to-large source order inside each output
+    // so logical document rebasing does not depend on merge grouping.
     for group in &mut groups {
         group
             .segments
@@ -746,6 +745,8 @@ enum ReplacementLayout {
     Compacted,
     /// A BP pass produced the replacement layout.
     BpReordered { converged: bool },
+    /// Seismic/ANN maintenance preserves completed or capped text/BMP order.
+    MaintenanceOnly,
     /// A vector-only rewrite leaves document order and sparse layout exactly
     /// unchanged, so its persisted BP progress must not be reset or advanced.
     PreserveSingleSource,
@@ -778,10 +779,48 @@ fn replacement_bp_state(
                 parent_unconverged_passes.saturating_add(1)
             },
         ),
-        ReplacementLayout::PreserveSingleSource => {
+        ReplacementLayout::PreserveSingleSource | ReplacementLayout::MaintenanceOnly => {
             unreachable!("preserved layouts retain the complete source metadata")
         }
     }
+}
+
+/// Account only a replacement that is about to publish. The caller installs
+/// these counters with the same durable metadata transaction as the new owner.
+fn replacement_seismic_state<'a>(
+    parents: impl Iterator<Item = &'a SegmentMetaInfo>,
+    pending_terms: u32,
+    layout: ReplacementLayout,
+) -> (u32, u32) {
+    if pending_terms == 0 {
+        return (0, 0);
+    }
+    let mut parent_count = 0usize;
+    let mut parent_pending_terms = 0u64;
+    let mut passes = 0u32;
+    let mut stalls = 0u32;
+    for parent in parents {
+        parent_count += 1;
+        parent_pending_terms += u64::from(parent.seismic_pending_terms);
+        passes = passes.max(parent.seismic_maintenance_passes);
+        stalls = stalls.max(parent.seismic_no_progress_passes);
+    }
+    // New merge inputs change the work available. An unchanged one-source
+    // replacement must not bypass a previous stall limit.
+    let made_progress = u64::from(pending_terms) < parent_pending_terms;
+    if parent_count > 1 || made_progress {
+        stalls = 0;
+    }
+    if matches!(
+        layout,
+        ReplacementLayout::BpReordered { .. } | ReplacementLayout::MaintenanceOnly
+    ) {
+        passes = passes.saturating_add(1);
+        if parent_count == 1 && !made_progress {
+            stalls = stalls.saturating_add(1);
+        }
+    }
+    (passes, stalls)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -890,7 +929,7 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     /// bounds whole BP rewrites (optimizer + merge-time + manual) separately
     /// from Rayon thread width, preventing N × memory-budget amplification.
     reorder_permits: Arc<ReorderConcurrencyGate>,
-    /// Run BP reordering of `reorder`-attributed BMP fields inside merges.
+    /// Run BP reordering of `reorder`-attributed text and BMP fields inside merges.
     /// Persisted index configuration (schema-level `reorder_on_merge: true`
     /// in SDL); merged segments are marked `reordered` and skipped by the
     /// standalone optimizer pass.
@@ -2232,6 +2271,27 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             )));
         }
         let has_surviving_bmp = !output_reader.bmp_indexes().is_empty();
+        let ann_fragmented = output_reader
+            .vector_indexes()
+            .iter()
+            .any(|(&field, index)| {
+                matches!(
+                    index,
+                    crate::segment::VectorIndex::BinaryIvf(_)
+                        | crate::segment::VectorIndex::ScannBinary(_)
+                ) && output_reader
+                    .ann_health(crate::dsl::Field(field))
+                    .is_some_and(|health| health.fragmentation() > 1.0)
+            });
+        let seismic_pending_terms =
+            output_reader
+                .seismic_indexes()
+                .values()
+                .try_fold(0u32, |total, index| {
+                    total.checked_add(index.pending_terms()).ok_or_else(|| {
+                        Error::Corruption("Seismic maintenance debt exceeds u32".into())
+                    })
+                })?;
         drop(output_reader);
 
         let mut st = Arc::clone(&self.state).lock_owned().await;
@@ -2294,9 +2354,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     reordered,
                     bp_converged,
                     bp_unconverged_passes,
+                    seismic_pending_terms,
+                    seismic_maintenance_passes: 0,
+                    seismic_no_progress_passes: 0,
+                    ann_fragmented,
                 }
             }
-            ReplacementLayout::PreserveSingleSource | ReplacementLayout::Compacted => {
+            ReplacementLayout::PreserveSingleSource
+            | ReplacementLayout::Compacted
+            | ReplacementLayout::MaintenanceOnly => {
                 let [source_id] = old_ids else {
                     return Err(Error::Internal(
                         "layout-preserving replacement requires exactly one source".into(),
@@ -2313,15 +2379,17 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         ))
                     })?;
                 source.num_docs = doc_count;
-                if matches!(layout, ReplacementLayout::Compacted) {
-                    source.deletions = None;
+                if matches!(
+                    layout,
+                    ReplacementLayout::Compacted | ReplacementLayout::MaintenanceOnly
+                ) {
                     source.ancestors = old_ids.to_vec();
                     source.generation = source.generation.checked_add(1).ok_or_else(|| {
-                        Error::Corruption("compaction generation overflow".into())
+                        Error::Corruption("maintenance generation overflow".into())
                     })?;
-                    // Retain historical order and the finite BP attempt budget.
-                    // New BMP block membership invalidates convergence, but
-                    // compaction itself is not a BP attempt.
+                }
+                if matches!(layout, ReplacementLayout::Compacted) {
+                    source.deletions = None;
                     if has_surviving_bmp && source.reordered {
                         source.bp_converged = false;
                     }
@@ -2329,6 +2397,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 source
             }
         };
+        replacement_info.seismic_pending_terms = seismic_pending_terms;
+        replacement_info.ann_fragmented = ann_fragmented;
+        let (passes, no_progress_passes) = replacement_seismic_state(
+            old_ids.iter().map(|id| &st.metadata.segment_metas[id]),
+            seismic_pending_terms,
+            layout,
+        );
+        replacement_info.seismic_maintenance_passes = passes;
+        replacement_info.seismic_no_progress_passes = no_progress_passes;
         // Take the latest source visibility under the publication lock. A
         // deletion may have committed while encoded payloads were being copied.
         // Field-only BP and ANN rewrites preserve the same physical row order.
@@ -2589,7 +2666,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let merger = SegmentMerger::new(Arc::clone(schema))
             .with_posting_config(optimization, posting_codec)
             .with_term_dict_block_size(term_dict_block_size)
-            .with_bmp_reorder(reorder_bmp)
+            .with_reorder_fields(reorder_bmp)
             .with_granularity(granularity)
             .with_bp_budget(crate::segment::BpBudget {
                 min_partition_docs: None,
@@ -3725,10 +3802,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
-    /// Reorder all segments via Recursive Graph Bisection (BP) for better BMP pruning.
-    ///
-    /// Each segment is individually rebuilt with reordered BMP blocks.
-    /// Non-BMP fields are copied unchanged via streaming file copy.
+    /// Apply bounded maintenance to all segments: opted-in text/BMP BP, Seismic
+    /// nomination consolidation, and binary ANN run coalescing.
+    /// Fields without maintenance work are copied unchanged.
     ///
     /// Uses active-operation ownership to prevent concurrent work on the same segment.
     pub async fn reorder_segments(self: &Arc<Self>) -> Result<()> {
@@ -3805,19 +3881,22 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .collect()
     }
 
-    /// Segments never reordered, with doc counts — for the optimizer to pick
-    /// a size-appropriate BP budget.
+    /// Initial maintenance candidates from persisted layout debt and opted-in
+    /// text/BMP BP, with document counts for budget selection. No payload scan.
     pub async fn unreordered_segments(&self) -> Vec<(String, u32)> {
         let quarantined = self.quarantined_segments.lock().clone();
         let paused = self.paused_reorder_segments();
         let st = self.state.lock().await;
         let active_ids = self.active_operations.snapshot();
+        let has_bp_reorder = self.schema.has_reorder_fields();
         st.metadata
             .segment_metas
             .iter()
             .filter(|(id, info)| {
-                !info.reordered
-                    && info.bp_converged
+                info.bp_converged
+                    && ((has_bp_reorder && !info.reordered)
+                        || info.ann_fragmented
+                        || (info.seismic_pending_terms > 0 && info.seismic_maintenance_passes == 0))
                     && !active_ids.contains(*id)
                     && !quarantined.contains(*id)
                     && !paused.contains(*id)
@@ -3826,9 +3905,10 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .collect()
     }
 
-    /// Segments whose last BP pass hit its wall-clock budget before finishing
-    /// (`bp_converged == false`). A warm-started follow-up pass deepens the
-    /// ordering; the optimizer revisits these at low priority.
+    /// Segments with incomplete text/BMP BP or Seismic nomination consolidation.
+    /// Follow-up work shares the optimizer's cooldown. Productive Seismic passes
+    /// remain eligible until debt is zero; only consecutive stalled passes count
+    /// toward its bound. BMP keeps its existing total-pass lineage bound.
     pub async fn unconverged_segments(&self) -> Vec<(String, u32)> {
         self.unconverged_segments_below(u32::MAX)
             .await
@@ -3837,8 +3917,8 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .collect()
     }
 
-    /// Unconverged segments still below a hard replacement-lineage work
-    /// bound. Includes the persisted attempt count for scheduler diagnostics.
+    /// Segments below the BMP lineage or Seismic no-progress bound. Includes
+    /// the applicable persisted retry count for scheduler diagnostics.
     pub async fn unconverged_segments_below(
         &self,
         max_unconverged_passes: u32,
@@ -3851,25 +3931,31 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             .segment_metas
             .iter()
             .filter(|(id, info)| {
-                !info.bp_converged
-                    && info.bp_unconverged_passes < max_unconverged_passes
+                ((!info.bp_converged && info.bp_unconverged_passes < max_unconverged_passes)
+                    || (info.seismic_pending_terms > 0
+                        && (info.seismic_maintenance_passes > 0 || !info.bp_converged)
+                        && info.seismic_no_progress_passes < max_unconverged_passes))
                     && !active_ids.contains(*id)
                     && !quarantined.contains(*id)
                     && !paused.contains(*id)
             })
-            .map(|(id, info)| (id.clone(), info.num_docs, info.bp_unconverged_passes))
+            .map(|(id, info)| {
+                (
+                    id.clone(),
+                    info.num_docs,
+                    if info.seismic_pending_terms > 0
+                        && (info.seismic_maintenance_passes > 0 || !info.bp_converged)
+                        && info.seismic_no_progress_passes < max_unconverged_passes
+                    {
+                        info.seismic_no_progress_passes
+                    } else {
+                        info.bp_unconverged_passes
+                    },
+                )
+            })
             .collect()
     }
 
-    /// Granularity for a BP pass whose sources are `ids`: `Records` when any
-    /// source carries unconverged BP debt, `Auto` otherwise.
-    ///
-    /// Alignment with the depth budget (docs/block-level-reorder.md): an
-    /// unconverged segment is owed a deepening pass, and the output of this
-    /// pass will be marked `bp_converged`. `Auto` would measure the partial
-    /// pass's residual coherence, potentially take the blockwise path — which
-    /// cannot deepen record clustering — and end the cascade at partial
-    /// quality. Only record-level BP discharges the debt.
     async fn merge_granularity(&self, ids: &[String]) -> crate::segment::reorder::BpGranularity {
         let st = self.state.lock().await;
         let deepening = ids.iter().any(|id| {
@@ -3893,12 +3979,36 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// Reorder a single segment via BP. Returns Ok(true) if reordered, Ok(false) if skipped.
     ///
     /// Non-blocking: operation ownership prevents conflicts with background merges.
-    /// Copies unchanged files and rebuilds only the sparse file with reordered BMP data.
+    /// Copies unchanged files, reorders text/BMP, repairs Seismic debt and coalesces binary ANN runs.
     pub async fn reorder_single_segment(
         self: &Arc<Self>,
         seg_id: &str,
         rayon_pool: Option<Arc<rayon::ThreadPool>>,
         bp_budget: crate::segment::BpBudget,
+    ) -> Result<bool> {
+        self.reorder_single_segment_with_policy(seg_id, rayon_pool, bp_budget, None)
+            .await
+    }
+
+    /// Run automatically scheduled maintenance, reusing completed text/BMP
+    /// layouts and respecting their follow-up bound independently of Seismic.
+    pub async fn optimize_single_segment(
+        self: &Arc<Self>,
+        seg_id: &str,
+        rayon_pool: Option<Arc<rayon::ThreadPool>>,
+        bp_budget: crate::segment::BpBudget,
+        max_bp_passes: u32,
+    ) -> Result<bool> {
+        self.reorder_single_segment_with_policy(seg_id, rayon_pool, bp_budget, Some(max_bp_passes))
+            .await
+    }
+
+    async fn reorder_single_segment_with_policy(
+        self: &Arc<Self>,
+        seg_id: &str,
+        rayon_pool: Option<Arc<rayon::ThreadPool>>,
+        bp_budget: crate::segment::BpBudget,
+        automatic_bp_limit: Option<u32>,
     ) -> Result<bool> {
         let source_id = SegmentId::from_hex(seg_id)
             .ok_or_else(|| Error::Corruption(format!("Invalid segment ID: {}", seg_id)))?;
@@ -3936,8 +4046,6 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
 
         let output_id = SegmentId::new();
         let output_hex = output_id.to_hex();
-        let source_ids = [seg_id.to_string()];
-        let granularity = self.merge_granularity(&source_ids).await;
 
         // Register while holding `state`, matching orphan cleanup's deletion
         // barrier. Candidates are scanned ahead of time and can go stale: a
@@ -3945,7 +4053,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         // be on disk (deferred deletion under a searcher snapshot) — reordering
         // them would re-insert a duplicate copy of docs the merge output holds.
         let all_ids = vec![seg_id.to_string(), output_hex];
-        let (_guard, source_docs, schema) = {
+        let (_guard, source_docs, generation, source_deletions, _visibility_owner, run_bp) = {
             let st = self.state.lock().await;
             // Force merge raises this barrier under the same state lock, so
             // this second check closes the race with the cheap early check
@@ -3968,9 +4076,41 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 return Ok(false);
             };
 
-            let schema = self.published_generation().schema.clone();
+            let run_bp = automatic_bp_limit.is_none_or(|limit| {
+                self.schema.has_reorder_fields()
+                    && ((!source_meta.reordered && source_meta.bp_converged)
+                        || (!source_meta.bp_converged && source_meta.bp_unconverged_passes < limit))
+            });
+            let generation = self.published_generation();
             match self.active_operations.try_register(all_ids) {
-                Some(guard) => (guard, source_meta.num_docs, schema),
+                Some(guard) => {
+                    // Deletions can publish while this address-preserving rewrite
+                    // runs. Pin this exact mask before releasing the metadata lock.
+                    let deletion_ids: Vec<_> = source_meta
+                        .deletions
+                        .iter()
+                        .map(|deletion| deletion.id.clone())
+                        .collect();
+                    let acquired = self.tracker.acquire(&deletion_ids);
+                    if acquired.len() != deletion_ids.len() {
+                        return Err(Error::Corruption(
+                            "maintenance source visibility is already retired".into(),
+                        ));
+                    }
+                    let visibility_owner = SegmentSnapshot::with_delete_fn(
+                        Arc::clone(&self.tracker),
+                        acquired,
+                        Arc::clone(&self.delete_fn),
+                    );
+                    (
+                        guard,
+                        source_meta.num_docs,
+                        generation,
+                        source_meta.deletions.clone(),
+                        visibility_owner,
+                        run_bp,
+                    )
+                }
                 None if !self.active_operations.is_accepting() => {
                     return Err(Error::IndexClosed);
                 }
@@ -3998,23 +4138,45 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             return Err(error);
         }
 
+        let alive = match source_deletions {
+            Some(deletions) => match deletions.load(self.directory.as_ref(), source_docs).await {
+                Ok(alive) => Some(alive),
+                Err(error) => {
+                    if is_deterministic_source_error(&error) {
+                        self.quarantine_segment(seg_id, &error);
+                    } else if !matches!(&error, Error::IndexClosed) {
+                        self.pause_reorder_retries(seg_id, &error).await;
+                    }
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
         let mut output_cleanup = self.output_cleanup_guard(output_id);
 
+        let granularity = if run_bp {
+            self.merge_granularity(&[seg_id.to_owned()]).await
+        } else {
+            crate::segment::reorder::BpGranularity::Auto
+        };
         let reorder_result = crate::segment::reorder::reorder_segment(
             self.directory.as_ref(),
-            &schema,
+            &generation.schema,
             source_id,
             output_id,
             self.term_cache_blocks,
             self.term_cache_budget_bytes,
             self.bp_memory_budget_bytes,
             bp_budget,
+            run_bp,
             granularity,
             self.optimization,
             self.posting_codec,
+            generation.trained_vectors.as_deref(),
             self.term_dict_block_size,
             rayon_pool,
             Some(self.active_operations.cancellation_flag()),
+            alive,
         )
         .await;
         let (new_id, total_docs, bp_converged) = match reorder_result {
@@ -4045,8 +4207,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 &[seg_id.to_string()],
                 new_id,
                 total_docs,
-                ReplacementLayout::BpReordered {
-                    converged: ladder_converged,
+                if run_bp {
+                    ReplacementLayout::BpReordered {
+                        converged: ladder_converged,
+                    }
+                } else {
+                    ReplacementLayout::MaintenanceOnly
                 },
                 None,
             )
@@ -4723,6 +4889,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn productive_seismic_maintenance_remains_eligible_beyond_three_passes() {
+        let manager = lifecycle_test_manager();
+        {
+            let mut state = manager.state.lock().await;
+            for (id, pending, attempts, stalls) in [
+                ("eligible", 7, 100, 0),
+                ("finished", 0, 1, 0),
+                ("limited", 9, 3, 3),
+            ] {
+                state.metadata.add_segment_meta(
+                    id.into(),
+                    SegmentMetaInfo {
+                        deletions: None,
+                        num_docs: 10,
+                        ancestors: Vec::new(),
+                        generation: 1,
+                        reordered: true,
+                        bp_converged: true,
+                        bp_unconverged_passes: 0,
+                        seismic_pending_terms: pending,
+                        seismic_maintenance_passes: attempts,
+                        seismic_no_progress_passes: stalls,
+                        ann_fragmented: false,
+                    },
+                );
+            }
+        }
+        assert_eq!(
+            manager.unconverged_segments_below(3).await,
+            vec![("eligible".to_string(), 10, 0)]
+        );
+        {
+            let mut state = manager.state.lock().await;
+            let mixed = state.metadata.segment_metas.get_mut("eligible").unwrap();
+            mixed.seismic_maintenance_passes = 0;
+            mixed.bp_converged = false;
+            mixed.bp_unconverged_passes = 3;
+        }
+        assert_eq!(
+            manager.unconverged_segments_below(3).await,
+            vec![("eligible".to_string(), 10, 0)],
+            "inherited BMP cap must not hide newly copied Seismic debt"
+        );
+        assert!(manager.unreordered_segments().await.is_empty());
+    }
+
+    #[test]
+    fn seismic_replacements_preserve_stalls_until_progress_or_new_merge_inputs() {
+        let parent = SegmentMetaInfo {
+            deletions: None,
+            num_docs: 10,
+            ancestors: Vec::new(),
+            generation: 1,
+            reordered: true,
+            bp_converged: true,
+            bp_unconverged_passes: 0,
+            seismic_pending_terms: 9,
+            seismic_maintenance_passes: 100,
+            seismic_no_progress_passes: 3,
+            ann_fragmented: false,
+        };
+        for layout in [
+            ReplacementLayout::PreserveSingleSource,
+            ReplacementLayout::BlockCopy,
+            ReplacementLayout::Compacted,
+        ] {
+            assert_eq!(
+                replacement_seismic_state([&parent].into_iter(), 9, layout),
+                (100, 3)
+            );
+        }
+        assert_eq!(
+            replacement_seismic_state([&parent].into_iter(), 8, ReplacementLayout::Compacted),
+            (100, 0)
+        );
+        assert_eq!(
+            replacement_seismic_state(
+                [&parent].into_iter(),
+                8,
+                ReplacementLayout::BpReordered { converged: true }
+            ),
+            (101, 0)
+        );
+        assert_eq!(
+            replacement_seismic_state(
+                [&parent].into_iter(),
+                9,
+                ReplacementLayout::BpReordered { converged: true }
+            ),
+            (101, 4)
+        );
+        assert_eq!(
+            replacement_seismic_state(
+                [&parent, &parent].into_iter(),
+                18,
+                ReplacementLayout::BlockCopy
+            ),
+            (100, 0)
+        );
+        assert_eq!(
+            replacement_seismic_state(
+                [&parent].into_iter(),
+                0,
+                ReplacementLayout::BpReordered { converged: true }
+            ),
+            (0, 0)
+        );
+        let encoded = serde_json::to_value(&parent).unwrap();
+        assert_eq!(encoded["seismic_no_progress_passes"], 3);
+        let mut absent = encoded;
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("seismic_no_progress_passes");
+        assert_eq!(
+            serde_json::from_value::<SegmentMetaInfo>(absent)
+                .unwrap()
+                .seismic_no_progress_passes,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn unconverged_scheduler_stops_at_the_lineage_limit() {
         let manager = lifecycle_test_manager();
         {
@@ -4737,6 +5026,10 @@ mod tests {
                     reordered: true,
                     bp_converged: false,
                     bp_unconverged_passes: 2,
+                    seismic_pending_terms: 0,
+                    seismic_maintenance_passes: 0,
+                    seismic_no_progress_passes: 0,
+                    ann_fragmented: false,
                 },
             );
             state.metadata.add_segment_meta(
@@ -4749,6 +5042,10 @@ mod tests {
                     reordered: true,
                     bp_converged: false,
                     bp_unconverged_passes: 3,
+                    seismic_pending_terms: 0,
+                    seismic_maintenance_passes: 0,
+                    seismic_no_progress_passes: 0,
+                    ann_fragmented: false,
                 },
             );
             state.metadata.add_segment_meta(
@@ -4761,6 +5058,10 @@ mod tests {
                     reordered: false,
                     bp_converged: false,
                     bp_unconverged_passes: 2,
+                    seismic_pending_terms: 0,
+                    seismic_maintenance_passes: 0,
+                    seismic_no_progress_passes: 0,
+                    ann_fragmented: false,
                 },
             );
             state.metadata.add_segment_meta(
@@ -4773,6 +5074,10 @@ mod tests {
                     reordered: false,
                     bp_converged: false,
                     bp_unconverged_passes: 3,
+                    seismic_pending_terms: 0,
+                    seismic_maintenance_passes: 0,
+                    seismic_no_progress_passes: 0,
+                    ann_fragmented: false,
                 },
             );
             state.metadata.add_segment_meta(
@@ -4785,9 +5090,19 @@ mod tests {
                     reordered: true,
                     bp_converged: true,
                     bp_unconverged_passes: 0,
+                    seismic_pending_terms: 0,
+                    seismic_maintenance_passes: 0,
+                    seismic_no_progress_passes: 0,
+                    ann_fragmented: false,
                 },
             );
             state.metadata.add_segment("fresh".into(), 40);
+            state
+                .metadata
+                .segment_metas
+                .get_mut("fresh")
+                .unwrap()
+                .ann_fragmented = true;
         }
 
         assert_eq!(

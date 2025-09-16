@@ -1075,6 +1075,25 @@ impl<D: super::DirectoryWriter> super::DirectoryWriter for SliceCachingDirectory
         self.invalidate(path);
         self.inner.streaming_writer(path).await
     }
+
+    async fn streaming_writer_cold(
+        &self,
+        path: &Path,
+    ) -> io::Result<Box<dyn super::StreamingWriter>> {
+        self.invalidate(path);
+        self.inner.streaming_writer_cold(path).await
+    }
+
+    async fn streaming_writer_cold_with_capacity(
+        &self,
+        path: &Path,
+        buffer_capacity: usize,
+    ) -> io::Result<Box<dyn super::StreamingWriter>> {
+        self.invalidate(path);
+        self.inner
+            .streaming_writer_cold_with_capacity(path, buffer_capacity)
+            .await
+    }
 }
 
 #[cfg(test)]

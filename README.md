@@ -239,7 +239,7 @@ await index.save_cache_to_idb();
 
 **Configurable posting codecs** -- The production posting container supports rounded-width packing, exact-width packing, and patched frame-of-reference (Pfor) blocks. `--posting-codec` and `-O` control the size/decode tradeoff; see [posting codecs](docs/posting-codecs.md).
 
-**Block-Max MaxScore** -- Top-k retrieval uses MaxScore partitioning (Turtle & Flood 1995) combined with block-max pruning (Ding & Suel 2011) and conjunction optimization. A single unified `MaxScoreExecutor` handles both BM25 text and sparse vector queries.
+**Block-Max MaxScore** -- Top-k retrieval uses MaxScore partitioning (Turtle & Flood 1995) combined with block-max pruning (Ding & Suel 2011) and conjunction optimization. The shared `MaxScoreExecutor` serves BM25 text and sparse MaxScore queries. Sparse vectors default to BMP block-at-a-time pruning; Seismic is an optional third algorithm with geometric nomination and exact forward scoring.
 
 **Multi-value combiners** -- Documents with multiple vectors per field (e.g., chunked passages) are scored with configurable strategies: Sum, Max, Avg, LogSumExp (smooth approximation), or WeightedTopK with exponential decay.
 

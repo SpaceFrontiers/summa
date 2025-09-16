@@ -289,7 +289,7 @@ enum Commands {
         term_dict_block_size: hermes_core::structures::SSTableBlockSize,
     },
 
-    /// Reorder BMP blocks via Recursive Graph Bisection (BP) for better pruning
+    /// Maintain text/BMP ordering, Seismic nominations and binary ANN runs
     Reorder {
         /// Path to the index directory
         #[arg(short, long)]

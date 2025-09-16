@@ -445,6 +445,10 @@ pub async fn show_info(index_path: PathBuf) -> Result<()> {
     let mut sparse_vectors: HashMap<u32, u64> = HashMap::new();
     let mut sparse_postings: HashMap<u32, u64> = HashMap::new();
     for segment in &segments {
+        for (field_id, stats) in segment.seismic_stats() {
+            *sparse_vectors.entry(field_id).or_default() += u64::from(stats.total_vectors);
+            *sparse_postings.entry(field_id).or_default() += stats.forward_entries;
+        }
         for (&field_id, idx) in segment.sparse_indexes() {
             *sparse_vectors.entry(field_id).or_default() += idx.total_vectors as u64;
             *sparse_postings.entry(field_id).or_default() += idx.total_postings();

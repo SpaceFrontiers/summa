@@ -40,7 +40,7 @@ async fn reopening_indexes_announces_shared_resources_once_and_keeps_debug_diagn
     let config = IndexConfig {
         num_threads: 1,
         store_cache_budget_bytes: 1024,
-        bmp_io_concurrency: 2,
+        sparse_io_concurrency: 2,
         ..Default::default()
     };
 
@@ -63,7 +63,7 @@ async fn reopening_indexes_announces_shared_resources_once_and_keeps_debug_diagn
         #[cfg(feature = "sync")]
         "[search] process-wide CPU pool:",
         "[store_cache] process-wide budget=",
-        "[bmp] process-wide random-I/O concurrency=",
+        "[sparse] process-wide random-I/O concurrency=",
     ] {
         let levels: Vec<_> = records
             .iter()

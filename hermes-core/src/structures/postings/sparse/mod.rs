@@ -25,12 +25,16 @@
 
 mod block;
 mod config;
+mod weights;
+pub(crate) use weights::{
+    decode_weight_at as decode_sparse_weight_at, encode_weights as encode_sparse_weights,
+};
 mod partitioner;
 
 pub use block::{BlockSparsePostingIterator, BlockSparsePostingList, SparseBlock};
 pub use config::{
-    IndexSize, QueryWeighting, SparseEntry, SparseFormat, SparseQueryConfig, SparseVector,
-    SparseVectorConfig, WeightQuantization,
+    IndexSize, QueryWeighting, SeismicConfig, SparseEntry, SparseFormat, SparseQueryConfig,
+    SparseVector, SparseVectorConfig, WeightQuantization,
 };
 pub use partitioner::optimal_partition;
 

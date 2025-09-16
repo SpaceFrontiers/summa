@@ -11,6 +11,18 @@ use std::future::{Future, poll_fn};
 /// Fixed-size work counters. Repeated work is counted repeatedly, not deduplicated.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct QueryWork {
+    /// Seismic clusters visited, including repeated merged runs.
+    pub seismic_clusters: u64,
+    /// Candidate documents scored after eligibility and complete ordinal gathering.
+    pub seismic_documents: u64,
+    /// Forward vector rows scored, including exact backfill and winner hydration.
+    pub seismic_forward_rows: u64,
+    /// Encoded forward-vector bytes consumed by scoring.
+    pub seismic_forward_bytes: u64,
+    /// Selective or underfilled filtered queries resolved from forward values.
+    pub seismic_filter_scans: u64,
+    /// Nomination executions stopped at a finite expansion budget.
+    pub seismic_budget_truncations: u64,
     /// Searcher segment executions captured, including failed executions.
     pub segment_runs: u64,
     /// Instrumented elapsed nanoseconds inside segment workers (summed across workers).
@@ -83,6 +95,22 @@ pub struct QueryWork {
 
 impl QueryWork {
     fn merge(&mut self, other: Self) {
+        self.seismic_filter_scans = self
+            .seismic_filter_scans
+            .saturating_add(other.seismic_filter_scans);
+        self.seismic_clusters = self.seismic_clusters.saturating_add(other.seismic_clusters);
+        self.seismic_documents = self
+            .seismic_documents
+            .saturating_add(other.seismic_documents);
+        self.seismic_forward_rows = self
+            .seismic_forward_rows
+            .saturating_add(other.seismic_forward_rows);
+        self.seismic_forward_bytes = self
+            .seismic_forward_bytes
+            .saturating_add(other.seismic_forward_bytes);
+        self.seismic_budget_truncations = self
+            .seismic_budget_truncations
+            .saturating_add(other.seismic_budget_truncations);
         self.segment_runs = self.segment_runs.saturating_add(other.segment_runs);
         self.segment_elapsed_ns = self
             .segment_elapsed_ns

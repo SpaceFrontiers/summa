@@ -84,7 +84,7 @@ pub struct FieldDef {
     /// Whether this field is a primary key (unique constraint)
     pub primary: bool,
     pub content_hash: bool,
-    /// Whether build-time document reordering (BP) is enabled for BMP fields
+    /// Whether build-time document reordering (BP) is enabled for text and BMP fields
     pub reorder: bool,
     /// BM25 k1 of a text field (`indexed<k1: ...>`), `None` = default
     pub bm25_k1: Option<f32>,
@@ -102,7 +102,7 @@ pub struct IndexDef {
     pub default_fields: Vec<String>,
     /// Query router rules for routing queries to specific fields
     pub query_routers: Vec<QueryRouterRule>,
-    /// BP-reorder `reorder`-attributed BMP fields inside merges
+    /// BP-reorder `reorder`-attributed sparse fields inside merges
     /// (index-level `reorder_on_merge: true`). Absent = disabled.
     pub reorder_on_merge: bool,
     /// Creation-time cap on retained tokens per L1 phrase; absent means 64.
@@ -298,12 +298,17 @@ struct IndexConfig {
     binary_index_type: Option<super::schema::BinaryIndexType>,
     // Sparse vector index params
     sparse_format: Option<SparseFormat>,
+    query_lsp_gamma: Option<usize>,
+    max_weight: Option<f32>,
+    bmp_forward_index: Option<bool>,
+    bmp_grid_bits: Option<u8>,
+    bmp_block_size: Option<u32>,
+    block_size: Option<usize>,
+    seismic_postings: Option<usize>,
+    seismic_cluster_size: Option<usize>,
+    seismic_summary_energy: Option<f32>,
     quantization: Option<WeightQuantization>,
     weight_threshold: Option<f32>,
-    block_size: Option<usize>,
-    bmp_block_size: Option<u32>,
-    bmp_grid_bits: Option<u8>,
-    bmp_forward_index: Option<bool>,
     pruning: Option<f32>,
     min_terms: Option<usize>,
     doc_mass: Option<f32>,
@@ -314,10 +319,11 @@ struct IndexConfig {
     query_max_dims: Option<usize>,
     query_pruning: Option<f32>,
     query_min_query_dims: Option<usize>,
-    query_lsp_gamma: Option<usize>,
-    // BMP fixed dims (vocabulary size) and max weight scale
+    query_seismic_cut: Option<usize>,
+    query_seismic_factor: Option<f32>,
+    query_exhaustive: Option<bool>,
+    // Optional sparse vocabulary bound
     dims: Option<u32>,
-    max_weight: Option<f32>,
     // Position tracking mode for phrase queries
     positions: Option<super::schema::PositionMode>,
     // Chunked text field: every value is its own BM25 unit
@@ -543,6 +549,7 @@ fn parse_single_index_config_param(
                 }));
             }
         }
+
         Rule::block_size_kwarg => {
             // block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
             if let Some(n) = p.into_inner().next() {
@@ -610,12 +617,31 @@ fn parse_single_index_config_param(
                 }));
             }
         }
+        Rule::seismic_postings_kwarg => {
+            config.seismic_postings = p
+                .into_inner()
+                .next()
+                .map(|n| n.as_str().parse().unwrap_or(0));
+        }
+        Rule::seismic_cluster_size_kwarg => {
+            config.seismic_cluster_size = p
+                .into_inner()
+                .next()
+                .map(|n| n.as_str().parse().unwrap_or(0));
+        }
+        Rule::seismic_summary_energy_kwarg => {
+            config.seismic_summary_energy = p
+                .into_inner()
+                .next()
+                .map(|n| n.as_str().parse().unwrap_or(f32::NAN));
+        }
         Rule::sparse_format_kwarg => {
             // sparse_format_kwarg = { "format" ~ ":" ~ sparse_format_spec }
             if let Some(f) = p.into_inner().next() {
                 config.sparse_format = Some(match f.as_str() {
                     "bmp" => SparseFormat::Bmp,
                     "maxscore" => SparseFormat::MaxScore,
+                    "seismic" => SparseFormat::Seismic,
                     _ => SparseFormat::default(),
                 });
             }
@@ -628,6 +654,7 @@ fn parse_single_index_config_param(
                 }));
             }
         }
+
         Rule::sparse_max_weight_kwarg => {
             if let Some(f) = p.into_inner().next() {
                 config.max_weight = Some(f.as_str().parse().unwrap_or_else(|_| {
@@ -768,6 +795,22 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                                             0
                                         }));
                                 }
+                            }
+                            Rule::query_seismic_cut_kwarg => {
+                                config.query_seismic_cut = p
+                                    .into_inner()
+                                    .next()
+                                    .map(|n| n.as_str().parse().unwrap_or(0));
+                            }
+                            Rule::query_seismic_factor_kwarg => {
+                                config.query_seismic_factor = p
+                                    .into_inner()
+                                    .next()
+                                    .map(|n| n.as_str().parse().unwrap_or(f32::NAN));
+                            }
+                            Rule::query_exhaustive_kwarg => {
+                                config.query_exhaustive =
+                                    p.into_inner().next().map(|n| n.as_str() == "true");
                             }
                             _ => {}
                         }
@@ -1268,6 +1311,16 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
             config.bmp_grid_bits = SparseVectorConfig::DEFAULT_BMP_GRID_BITS;
         }
     }
+    if let Some(postings) = idx_cfg.seismic_postings {
+        config.seismic.postings = postings;
+    }
+    if let Some(size) = idx_cfg.seismic_cluster_size {
+        config.seismic.cluster_size = size;
+    }
+    if let Some(energy) = idx_cfg.seismic_summary_energy {
+        config.seismic.summary_energy = energy;
+    }
+
     if let Some(p) = idx_cfg.pruning {
         let clamped = p.clamp(0.0, 1.0);
         if (clamped - p).abs() > f32::EPSILON {
@@ -1296,6 +1349,7 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
     if let Some(d) = idx_cfg.dims {
         config.dims = Some(d);
     }
+
     if let Some(mw) = idx_cfg.max_weight {
         config.max_weight = Some(mw);
     }
@@ -1307,6 +1361,9 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         || idx_cfg.query_pruning.is_some()
         || idx_cfg.query_min_query_dims.is_some()
         || idx_cfg.query_lsp_gamma.is_some()
+        || idx_cfg.query_seismic_cut.is_some()
+        || idx_cfg.query_seismic_factor.is_some()
+        || idx_cfg.query_exhaustive.is_some()
     {
         let query_config = config
             .query_config
@@ -1331,6 +1388,15 @@ fn apply_index_config_to_sparse_vector(config: &mut SparseVectorConfig, idx_cfg:
         }
         if let Some(gamma) = idx_cfg.query_lsp_gamma {
             query_config.lsp_gamma = Some(gamma);
+        }
+        if let Some(cut) = idx_cfg.query_seismic_cut {
+            query_config.seismic_cut = cut;
+        }
+        if let Some(factor) = idx_cfg.query_seismic_factor {
+            query_config.seismic_factor = factor;
+        }
+        if let Some(exhaustive) = idx_cfg.query_exhaustive {
+            query_config.exhaustive = exhaustive;
         }
     }
 }
@@ -1575,7 +1641,7 @@ fn parse_index_def(pair: pest::iterators::Pair<Rule>) -> Result<IndexDef> {
         reorder_on_merge,
         max_l1_phrase_terms,
     };
-    definition.to_schema().validate_content_hash()?;
+    definition.to_schema().validate()?;
     Ok(definition)
 }
 
@@ -3075,7 +3141,7 @@ mod tests {
     fn test_sparse_vector_query_config_pruning_params() {
         let sdl = r#"
             index documents {
-                field embedding: sparse_vector<u16> [indexed<quantization: uint8, query<weighting: idf, weight_threshold: 0.03, max_dims: 25, pruning: 0.2, lsp_gamma: 500>>]
+                field embedding: sparse_vector<u16> [indexed<quantization: uint8, query<weighting: idf, weight_threshold: 0.03, max_dims: 25, pruning: 0.2, lsp_gamma: 0, seismic_cut: 20, exhaustive: false>>]
             }
         "#;
 
@@ -3087,7 +3153,9 @@ mod tests {
         assert!((qc.weight_threshold - 0.03).abs() < 0.001);
         assert_eq!(qc.max_query_dims, Some(25));
         assert!((qc.pruning.unwrap() - 0.2).abs() < 0.001);
-        assert_eq!(qc.lsp_gamma, Some(500));
+        assert_eq!(qc.seismic_cut, 20);
+        assert!(!qc.exhaustive);
+        assert_eq!(qc.lsp_gamma, Some(0));
 
         // Verify schema roundtrip
         let schema = indexes[0].to_schema();
@@ -3098,7 +3166,9 @@ mod tests {
         assert!((rqc.weight_threshold - 0.03).abs() < 0.001);
         assert_eq!(rqc.max_query_dims, Some(25));
         assert!((rqc.pruning.unwrap() - 0.2).abs() < 0.001);
-        assert_eq!(rqc.lsp_gamma, Some(500));
+        assert_eq!(rqc.seismic_cut, 20);
+        assert!(!rqc.exhaustive);
+        assert_eq!(rqc.lsp_gamma, Some(0));
     }
 
     #[test]
@@ -3123,16 +3193,37 @@ mod tests {
     }
 
     #[test]
-    fn test_sparse_vector_format_bmp() {
+    fn test_sparse_vector_default_format_bmp() {
         let sdl = r#"
             index documents {
-                field embedding: sparse_vector<u16> [indexed<format: bmp, quantization: uint8>]
+                field embedding: sparse_vector<u16> [indexed<quantization: uint8>]
             }
         "#;
 
         let indexes = parse_sdl(sdl).unwrap();
         let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
         assert_eq!(config.format, SparseFormat::Bmp);
+        assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
+
+        // Verify schema roundtrip
+        let schema = indexes[0].to_schema();
+        let field = schema.get_field("embedding").unwrap();
+        let entry = schema.get_field_entry(field).unwrap();
+        let sc = entry.sparse_vector_config.as_ref().unwrap();
+        assert_eq!(sc.format, SparseFormat::Bmp);
+    }
+
+    #[test]
+    fn test_sparse_vector_explicit_format_seismic() {
+        let sdl = r#"
+            index documents {
+                field embedding: sparse_vector<u16> [indexed<format: seismic, quantization: uint8>]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        let config = indexes[0].fields[0].sparse_vector_config.as_ref().unwrap();
+        assert_eq!(config.format, SparseFormat::Seismic);
     }
 
     #[test]
@@ -3336,7 +3427,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reorder_attribute() {
+    fn test_bmp_reorder_attribute() {
         let sdl = r#"
             index documents {
                 field embedding: sparse_vector<u16> [indexed<format: bmp, quantization: uint8>, reorder]
@@ -3365,11 +3456,49 @@ mod tests {
     }
 
     #[test]
+    fn test_reorder_attribute() {
+        let sdl = r#"
+            index documents {
+                field body: text<simple> [indexed<chunked>, reorder]
+                field embedding: sparse_vector [indexed]
+            }
+        "#;
+
+        let indexes = parse_sdl(sdl).unwrap();
+        assert_eq!(indexes[0].fields.len(), 2);
+
+        // First field should have reorder=true
+        assert!(indexes[0].fields[0].reorder);
+        // Second field should have reorder=false
+        assert!(!indexes[0].fields[1].reorder);
+
+        // Verify schema roundtrip
+        let schema = indexes[0].to_schema();
+        let f1 = schema.get_field("body").unwrap();
+        assert!(schema.get_field_entry(f1).unwrap().reorder);
+
+        let f2 = schema.get_field("embedding").unwrap();
+        assert!(!schema.get_field_entry(f2).unwrap().reorder);
+
+        // Index-level reorder_on_merge absent → disabled (current behaviour)
+        assert!(!schema.reorder_on_merge());
+
+        let error = parse_sdl(
+            "index invalid { field embedding: sparse_vector [indexed<format: seismic>, reorder] }",
+        )
+        .expect_err("sparse maintenance must not accept a meaningless text reorder flag");
+        assert!(
+            error.to_string().contains("requires indexed text"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn test_reorder_on_merge_index_option() {
         let sdl = r#"
             index documents {
                 reorder_on_merge: true
-                field embedding: sparse_vector<u16> [indexed<format: bmp>, reorder]
+                field body: text<simple> [indexed, reorder]
             }
         "#;
 
@@ -3382,7 +3511,7 @@ mod tests {
         let sdl_off = r#"
             index documents {
                 reorder_on_merge: false
-                field embedding: sparse_vector<u16> [indexed<format: bmp>, reorder]
+                field body: text<simple> [indexed, reorder]
             }
         "#;
         let indexes = parse_sdl(sdl_off).unwrap();
@@ -3422,5 +3551,38 @@ mod content_hash_tests {
             let decoded: Schema = serde_json::from_slice(&encoded).unwrap();
             assert_eq!(decoded.content_hash_field(), schema.content_hash_field());
         }
+    }
+}
+
+#[cfg(test)]
+mod seismic_tests {
+    use super::*;
+
+    #[test]
+    fn seismic_schema_preserves_build_precision_and_query_settings() {
+        let schema = crate::parse_schema(
+            r#"index seismic {
+            field vector: sparse_vector<u32> [indexed<format: seismic,
+                quantization: float32, seismic_postings: 2048,
+                seismic_cluster_size: 32, seismic_summary_energy: 0.5,
+                query<seismic_cut: 12, seismic_factor: 0.9, exhaustive: true>>]
+        }"#,
+        )
+        .unwrap();
+        let config = schema
+            .get_field_entry(schema.get_field("vector").unwrap())
+            .unwrap()
+            .sparse_vector_config
+            .as_ref()
+            .unwrap();
+        assert_eq!(config.format, SparseFormat::Seismic);
+        assert_eq!(config.seismic.postings, 2048);
+        assert_eq!(config.seismic.cluster_size, 32);
+        assert_eq!(config.seismic.summary_energy, 0.5);
+        let query = config.query_config.as_ref().unwrap();
+        assert_eq!(query.seismic_cut, 12);
+        assert_eq!(query.seismic_factor, 0.9);
+        assert!(query.exhaustive);
+        assert!(schema.has_background_maintenance_fields());
     }
 }

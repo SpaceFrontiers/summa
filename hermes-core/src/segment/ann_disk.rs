@@ -324,7 +324,121 @@ pub(crate) struct AnnDocumentCandidate {
     pub(crate) score: f32,
 }
 
+/// Temporary admission view for one exact-code span; no vector bytes are decoded.
+pub(super) struct ExactVectorSpan<'a> {
+    docs: &'a [u8],
+    ordinals: &'a [u8],
+    doc_base: u32,
+}
+
+impl ExactVectorSpan<'_> {
+    pub(super) fn validate_label(&self, row: u32, doc: u32, ordinal: u16) -> io::Result<()> {
+        let row = row as usize;
+        if row >= self.docs.len() / 4 {
+            return Err(invalid_data("vector lookup row is out of range"));
+        }
+        if read_u32(self.docs, row * 4).checked_add(self.doc_base) != Some(doc)
+            || read_u16(self.ordinals, row * 2) != ordinal
+        {
+            return Err(invalid_data("vector location labels disagree with ANN row"));
+        }
+        Ok(())
+    }
+}
+
 impl AnnDiskIndex {
+    /// Share the existing immutable payload owner with the exact-vector view.
+    /// In particular, HTTP readers must not fetch the same ANN codes twice.
+    pub(crate) fn exact_vectors_handle(&self) -> crate::directories::FileHandle {
+        crate::directories::FileHandle::from_bytes(self.raw.clone())
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn copied_payload_bytes(&self) -> usize {
+        self.runs
+            .iter()
+            .map(|run| run.codes.end)
+            .max()
+            .expect("ANN has runs")
+            - ANN_HEADER_SIZE
+    }
+
+    /// Upper bound for binary coalescing directories, span metadata, and
+    /// document-rebase scratch. The lookup sorter has a separate budget.
+    #[cfg(feature = "native")]
+    pub(crate) fn binary_compaction_scratch_bytes(&self) -> io::Result<usize> {
+        self.runs
+            .len()
+            .checked_mul(2 * (std::mem::size_of::<RunRecord>() + std::mem::size_of::<(u64, u32)>()))
+            .and_then(|bytes| bytes.checked_add(DOC_ID_REWRITE_CHUNK * 4 + 4096))
+            .ok_or_else(|| invalid_data("binary compaction scratch size overflow"))
+    }
+
+    pub(super) fn exact_location_spans(
+        &self,
+        spans: impl Iterator<Item = (u64, u32)>,
+    ) -> io::Result<Vec<ExactVectorSpan<'_>>> {
+        if !matches!(self.header.kind, AnnKind::BinaryIvf | AnnKind::ScannBinary) {
+            return Err(invalid_data(
+                "exact-vector lookup requires exact binary ANN codes",
+            ));
+        }
+        let width = self.header.code_size;
+        let mut runs: Vec<_> = self.runs.iter().collect();
+        runs.sort_unstable_by_key(|run| run.codes.start);
+        #[cfg(feature = "native")]
+        let mut ordinal_prefetch_bytes = 8 * 1024 * 1024usize;
+        #[cfg(feature = "native")]
+        let prefetch_page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|&page| page > 0);
+        spans
+            .map(|(offset, count)| {
+                let offset = usize::try_from(offset)
+                    .map_err(|_| invalid_data("vector location exceeds address space"))?;
+                let i = runs.partition_point(|run| run.codes.start <= offset);
+                let run = i
+                    .checked_sub(1)
+                    .and_then(|i| runs.get(i))
+                    .ok_or_else(|| invalid_data("vector location precedes ANN codes"))?;
+                let relative = offset - run.codes.start;
+                let bytes = (count as usize).checked_mul(width);
+                if !relative.is_multiple_of(width)
+                    || bytes
+                        .and_then(|bytes| offset.checked_add(bytes))
+                        .is_none_or(|end| end > run.codes.end)
+                {
+                    return Err(invalid_data(
+                        "vector location span is not within ANN code rows",
+                    ));
+                }
+                let row = relative / width;
+                let end = row + count as usize;
+                // Code references require ordinal labels too. Bound eager
+                // metadata I/O independently of corpus size.
+                #[cfg(feature = "native")]
+                if let Some(page) = prefetch_page_size
+                    && ordinal_prefetch_bytes > 0
+                {
+                    let start = run.ordinals.start + row * 2;
+                    let len = count as usize * 2;
+                    let address = self.raw.as_slice().as_ptr() as usize + start;
+                    let touched = (address % page + len).div_ceil(page) * page;
+                    if touched <= ordinal_prefetch_bytes {
+                        self.raw
+                            .madvise_range(start..start + len, libc::MADV_WILLNEED);
+                        ordinal_prefetch_bytes -= touched;
+                    }
+                }
+                Ok(ExactVectorSpan {
+                    docs: &self.raw[run.doc_ids.start + row * 4..run.doc_ids.start + end * 4],
+                    ordinals: &self.raw[run.ordinals.start + row * 2..run.ordinals.start + end * 2],
+                    doc_base: run.doc_base,
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn open(
         raw: OwnedBytes,
         expected_kind: AnnKind,
@@ -458,10 +572,26 @@ impl AnnDiskIndex {
                 .checked_add(count)
                 .ok_or_else(|| invalid_data("ANN run vector count overflows usize"))?;
         }
+        let mut payload_order: Vec<usize> = (0..runs.len()).collect();
+        payload_order.sort_unstable_by_key(|&index| runs[index].doc_ids.start);
+        let mut expected_payload_offset = ANN_HEADER_SIZE;
+        for &index in &payload_order {
+            let run = &runs[index];
+            if run.doc_ids.start != expected_payload_offset {
+                return Err(invalid_data("ANN payload runs overlap or contain gaps"));
+            }
+            expected_payload_offset = run.codes.end;
+        }
+        if expected_payload_offset != directory_offset || counted_vectors != vector_count {
+            return Err(invalid_data(
+                "ANN payload coverage/vector count is inconsistent",
+            ));
+        }
         // Validate every doc-ID column once so the scan loops can resolve
         // IDs with plain reads (`run_doc_id_validated`) instead of a per-lane
         // bounds/overflow check. A corrupt column fails loud here.
-        for run in &runs {
+        for &index in &payload_order {
+            let run = &runs[index];
             let column = &bytes[run.doc_ids.clone()];
             if let Some(local_doc_id) = column
                 .chunks_exact(std::mem::size_of::<u32>())
@@ -473,21 +603,6 @@ impl AnnDiskIndex {
                     run.cluster_id, run.max_doc_id
                 )));
             }
-        }
-        let mut payload_order: Vec<usize> = (0..runs.len()).collect();
-        payload_order.sort_unstable_by_key(|&index| runs[index].doc_ids.start);
-        let mut expected_payload_offset = ANN_HEADER_SIZE;
-        for index in payload_order {
-            let run = &runs[index];
-            if run.doc_ids.start != expected_payload_offset {
-                return Err(invalid_data("ANN payload runs overlap or contain gaps"));
-            }
-            expected_payload_offset = run.codes.end;
-        }
-        if expected_payload_offset != directory_offset || counted_vectors != vector_count {
-            return Err(invalid_data(
-                "ANN payload coverage/vector count is inconsistent",
-            ));
         }
 
         // Clustered queries visit a small set of runs at unrelated offsets.
@@ -600,8 +715,7 @@ impl AnnDiskIndex {
             log::warn!(
                 "[ann_health] index={index_label} field={field_id} segment={segment_id:016x}: \
                  {fragmentation:.1} extents per probed cluster ({} runs / {} clusters) — \
-                 cold probes pay that many seeks; the next merge or vector-generation rewrite \
-                 compacts to 1.0",
+                 cold probes can require multiple seeks; byte-copy merges preserve source extents",
                 health.runs,
                 health.clusters_nonempty,
             );
@@ -1930,9 +2044,20 @@ fn coalesce_prefetch_ranges(ranges: &mut Vec<Range<usize>>) {
 
 trait AnnScoreSink {
     fn insert_score(&mut self, doc_id: u32, ordinal: u16, score: f32);
+
+    /// Conservative k-th best score, or no bound when every ordinal is needed
+    /// for document combination (Sum/Avg/LogSumExp/WeightedTopK).
+    fn prune_threshold(&self) -> Option<f32> {
+        None
+    }
 }
 
 impl<const BY_DOCUMENT: bool> AnnScoreSink for BoundedAnnCollector<BY_DOCUMENT, true> {
+    #[inline]
+    fn prune_threshold(&self) -> Option<f32> {
+        self.pruning_threshold()
+    }
+
     #[inline]
     fn insert_score(&mut self, doc_id: u32, ordinal: u16, score: f32) {
         self.insert(doc_id, ordinal, score);
@@ -1940,6 +2065,11 @@ impl<const BY_DOCUMENT: bool> AnnScoreSink for BoundedAnnCollector<BY_DOCUMENT, 
 }
 
 impl AnnScoreSink for BoundedUniqueAnnCollector<true> {
+    #[inline]
+    fn prune_threshold(&self) -> Option<f32> {
+        self.pruning_threshold()
+    }
+
     #[inline]
     fn insert_score(&mut self, doc_id: u32, ordinal: u16, score: f32) {
         self.insert(doc_id, ordinal, score);
@@ -2043,17 +2173,31 @@ fn score_binary_task(
         dim_bits,
         &mut scores[..task.count],
     );
-    for (batch_index, &score) in scores.iter().enumerate().take(task.count) {
-        let index = task.first_index + batch_index;
-        let doc_id = run_doc_id_validated(bytes, task.run, index);
-        if visibility.is_some_and(|bits| !bits.contains(doc_id)) {
-            continue;
+    const THRESHOLD_REFRESH_ROWS: usize = 64;
+
+    // Refresh once per small block. The threshold can only improve while
+    // collecting, so an older bound merely admits extra candidates. Strict
+    // comparison preserves equal-score document/ordinal tie-breaking.
+    for (block_index, block) in scores[..task.count]
+        .chunks(THRESHOLD_REFRESH_ROWS)
+        .enumerate()
+    {
+        let threshold = collector.prune_threshold().unwrap_or(f32::NEG_INFINITY);
+        for (lane, &score) in block.iter().enumerate() {
+            if score < threshold {
+                continue;
+            }
+            let index = task.first_index + block_index * THRESHOLD_REFRESH_ROWS + lane;
+            let doc_id = run_doc_id_validated(bytes, task.run, index);
+            if visibility.is_some_and(|bits| !bits.contains(doc_id)) {
+                continue;
+            }
+            collector.insert_score(
+                doc_id,
+                read_u16(bytes, task.run.ordinals.start + index * 2),
+                score,
+            );
         }
-        collector.insert_score(
-            doc_id,
-            read_u16(bytes, task.run.ordinals.start + index * 2),
-            score,
-        );
     }
     Ok(())
 }
@@ -2107,28 +2251,6 @@ struct ScannScanTask<'a> {
     count: usize,
 }
 
-/// Score sinks that can expose their current k-th best score so FastScan can
-/// reject integer lane sums before converting them.
-trait ScannPruneThreshold {
-    fn prune_threshold(&self) -> Option<f32>;
-}
-
-impl ScannPruneThreshold for BoundedAnnCollector<true, true> {
-    #[inline]
-    fn prune_threshold(&self) -> Option<f32> {
-        self.pruning_threshold()
-    }
-}
-
-impl ScannPruneThreshold for Vec<(u32, u16, f32)> {
-    #[inline]
-    fn prune_threshold(&self) -> Option<f32> {
-        // Every ordinal may change a Sum/Avg/LogSumExp/WeightedTopK document
-        // score, so nothing can be pruned on this path.
-        None
-    }
-}
-
 /// Score one row range of a ScaNN AH run. Complete 32-row groups go through
 /// the integer FastScan kernel; the run's row-major tail (only reached by the
 /// task that ends at `run.count`) uses the float packed-row scorer.
@@ -2138,7 +2260,7 @@ fn scan_scann_ah_task(
     query: &crate::structures::vector::scann::FloatScannQuery,
     geometry: ScannLeafGeometry,
     task: ScannScanTask<'_>,
-    sink: &mut (impl AnnScoreSink + ScannPruneThreshold),
+    sink: &mut impl AnnScoreSink,
 ) -> io::Result<()> {
     use crate::structures::vector::scann::FAST_SCAN_LANES;
 
@@ -2337,10 +2459,39 @@ fn combine_scored_ordinals_retaining(
 }
 
 #[cfg(feature = "native")]
+fn record_exact_locations(
+    locations: &mut Option<&mut crate::segment::vector_locations::ExactLocations>,
+    offset: u64,
+    count: usize,
+    labels: impl Fn(usize) -> io::Result<(u32, u16)>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> io::Result<()> {
+    let Some(locations) = locations else {
+        return Ok(());
+    };
+    let span = locations.span(offset, count)?;
+    for row in 0..count {
+        if row.is_multiple_of(4096)
+            && cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "ANN locations cancelled",
+            ));
+        }
+        let (doc, ordinal) = labels(row)?;
+        let at = (u64::from(span) << 32) | row as u64;
+        locations.push(doc, ordinal, at)?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native")]
 pub(crate) fn write_built_binary_ivf(
     index: &BinaryIvfIndex,
     routing: IvfRoutingMode,
     writer: &mut (impl Write + ?Sized),
+    locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
 ) -> io::Result<u64> {
     let runs: Vec<_> = index
         .clusters
@@ -2365,6 +2516,7 @@ pub(crate) fn write_built_binary_ivf(
         },
         &runs,
         writer,
+        locations,
     )
 }
 
@@ -2377,6 +2529,7 @@ pub(crate) fn write_built_binary_ivf(
 pub(crate) fn write_built_scann(
     payload: &crate::structures::vector::scann::ScannSegmentPayload,
     writer: &mut (impl Write + ?Sized),
+    mut locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
 ) -> io::Result<u64> {
     use crate::structures::vector::scann::ScannEncoding;
 
@@ -2463,6 +2616,18 @@ pub(crate) fn write_built_scann(
         writer.write_all(&run.ordinals_le)?;
         offset = checked_advance(offset, run.ordinals_le.len())?;
         let codes_offset = offset;
+        record_exact_locations(
+            &mut locations,
+            codes_offset,
+            count,
+            |row| {
+                Ok((
+                    read_u32(&run.doc_ids_le, row * 4) + run.doc_base,
+                    read_u16(&run.ordinals_le, row * 2),
+                ))
+            },
+            None,
+        )?;
         writer.write_all(&run.codes)?;
         offset = checked_advance(offset, run.codes.len())?;
         records.push(RunRecord {
@@ -2576,6 +2741,7 @@ pub(crate) fn write_built_ivf_tq(
         },
         &runs,
         writer,
+        None,
     )
 }
 
@@ -2616,6 +2782,7 @@ pub(crate) fn write_built_tq_flat(
         },
         &runs,
         writer,
+        None,
     )
 }
 
@@ -2644,6 +2811,7 @@ fn write_built_runs(
     header: AnnDiskHeader,
     runs: &[BuildRun<'_>],
     writer: &mut (impl Write + ?Sized),
+    mut locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
 ) -> io::Result<u64> {
     if runs.is_empty() || header.vector_count == 0 {
         return Err(invalid_data("cannot write an empty ANN payload"));
@@ -2691,6 +2859,13 @@ fn write_built_runs(
             )
             .ok_or_else(|| invalid_data("ANN output offset overflow"))?;
         let codes_offset = offset;
+        record_exact_locations(
+            &mut locations,
+            codes_offset,
+            count,
+            |row| Ok((run.doc_ids[row], run.ordinals[row])),
+            None,
+        )?;
         writer.write_all(run.codes)?;
         offset = offset
             .checked_add(
@@ -2743,9 +2918,8 @@ pub(crate) fn write_merged_ann_cancellable(
 ///
 /// Byte-copy preserves every source run, so the merged fragmentation is
 /// `total runs / distinct non-empty clusters` — computable exactly from the
-/// in-memory directories before writing a byte. The merge policy compacts
-/// when this crosses its threshold instead of letting probe read
-/// amplification grow another generation.
+/// in-memory directories before writing a byte. Float AH uses this to select
+/// leaf-wise compaction; binary merge reports fragmentation and copies extents.
 #[cfg(feature = "native")]
 pub(crate) fn predicted_merge_fragmentation(sources: &[(&AnnDiskIndex, u32)]) -> f64 {
     let mut total_runs = 0usize;
@@ -2803,7 +2977,8 @@ const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
 /// representation is intentionally outside this ScaNN compactor; TQ merges
 /// stay byte-copy.
 ///
-/// Every supported merge whose prediction is fragmented takes this path.
+/// Normal float-AH merges use this when fragmented. Binary normal merges
+/// retain source runs so their exact-vector lookup rows remain copyable.
 /// Measured (interleaved best-of-3, pre-faulted buffers, aarch64): byte-copy
 /// 38.0 GiB/s vs compaction 32.4 GiB/s — ~17% more CPU on a stage that is a
 /// rounding error of merge wall-clock (a production dense stage is ~0.7s of
@@ -2814,6 +2989,7 @@ pub(crate) fn write_compacted_ann_cancellable(
     sources: &[(&AnnDiskIndex, u32)],
     writer: &mut (impl Write + ?Sized),
     cancellation: Option<&std::sync::atomic::AtomicBool>,
+    mut locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
 ) -> io::Result<u64> {
     let Some((first, _)) = sources.first() else {
         return Err(invalid_data("cannot compact an empty ANN source list"));
@@ -2992,6 +3168,22 @@ pub(crate) fn write_compacted_ann_cancellable(
                     .get(cursor)
                     .filter(|run| run.cluster_id == cluster_id)
                 {
+                    let base = run
+                        .doc_base
+                        .checked_add(sources[source_index].1)
+                        .ok_or_else(|| invalid_data("ANN document base overflow"))?;
+                    record_exact_locations(
+                        &mut locations,
+                        offset,
+                        run.count,
+                        |row| {
+                            Ok((
+                                run_doc_id_with_base(source.raw.as_slice(), run, row, base)?,
+                                read_u16(source.raw.as_slice(), run.ordinals.start + row * 2),
+                            ))
+                        },
+                        cancellation,
+                    )?;
                     copy_range(writer, &source.raw, run.codes.clone(), cancellation)?;
                     offset = checked_advance(offset, run.codes.len())?;
                     cursor += 1;
@@ -3165,12 +3357,7 @@ fn write_merged_ann_impl(
     })?;
     let mut output_payload_starts = Vec::with_capacity(sources.len());
     for &(source, _) in sources {
-        let payload_end = source
-            .runs
-            .iter()
-            .map(|run| run.codes.end)
-            .max()
-            .ok_or_else(|| invalid_data("ANN source has no payload runs"))?;
+        let payload_end = ANN_HEADER_SIZE + source.copied_payload_bytes();
         let output_payload_start = offset;
         output_payload_starts.push(output_payload_start);
         copy_range(
@@ -3634,7 +3821,7 @@ mod tests {
         let mut header = binary_header(5);
         header.num_clusters = 8;
         let mut a_bytes = Vec::new();
-        write_built_runs(header.clone(), &a_runs, &mut a_bytes).unwrap();
+        write_built_runs(header.clone(), &a_runs, &mut a_bytes, None).unwrap();
         let a = AnnDiskIndex::open(OwnedBytes::new(a_bytes), AnnKind::BinaryIvf, 5).unwrap();
 
         let b0_docs = [0u32, 2];
@@ -3660,7 +3847,7 @@ mod tests {
         let mut header_b = binary_header(3);
         header_b.num_clusters = 8;
         let mut b_bytes = Vec::new();
-        write_built_runs(header_b, &b_runs, &mut b_bytes).unwrap();
+        write_built_runs(header_b, &b_runs, &mut b_bytes, None).unwrap();
         let b = AnnDiskIndex::open(OwnedBytes::new(b_bytes), AnnKind::BinaryIvf, 3).unwrap();
 
         // Generation 1: byte-copy A (docs 0..5) + B (docs 5..8).
@@ -3679,7 +3866,7 @@ mod tests {
         let copied =
             AnnDiskIndex::open(OwnedBytes::new(copied_bytes), AnnKind::BinaryIvf, 13).unwrap();
         let mut compacted_bytes = Vec::new();
-        write_compacted_ann_cancellable(&sources, &mut compacted_bytes, None).unwrap();
+        write_compacted_ann_cancellable(&sources, &mut compacted_bytes, None, None).unwrap();
         let compacted =
             AnnDiskIndex::open(OwnedBytes::new(compacted_bytes), AnnKind::BinaryIvf, 13).unwrap();
 
@@ -3778,7 +3965,7 @@ mod tests {
                 vector_count: count,
             };
             let mut bytes = Vec::new();
-            write_built_runs(header, &[run], &mut bytes).unwrap();
+            write_built_runs(header, &[run], &mut bytes, None).unwrap();
             AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, count as u32).unwrap()
         };
 
@@ -3789,7 +3976,8 @@ mod tests {
         let left = make_source(&left_rows);
         let right = make_source(&right_rows);
         let mut bytes = Vec::new();
-        write_compacted_ann_cancellable(&[(&left, 0), (&right, 35)], &mut bytes, None).unwrap();
+        write_compacted_ann_cancellable(&[(&left, 0), (&right, 35)], &mut bytes, None, None)
+            .unwrap();
         let compacted = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, 65).unwrap();
 
         assert_eq!(compacted.runs.len(), 1);
@@ -3834,7 +4022,7 @@ mod tests {
         let mut bytes = Vec::new();
         write_built_tq_flat(&builder, &mut bytes).unwrap();
         let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::TqFlat, 2).unwrap();
-        let error = write_compacted_ann_cancellable(&[(&disk, 0)], &mut Vec::new(), None)
+        let error = write_compacted_ann_cancellable(&[(&disk, 0)], &mut Vec::new(), None, None)
             .expect_err("TQ payloads must not compact");
         assert!(error.to_string().contains("binary"), "{error}");
     }
@@ -3871,7 +4059,7 @@ mod tests {
         let mut header = binary_header(8);
         header.num_clusters = 8;
         let mut a_bytes = Vec::new();
-        write_built_runs(header, &a_runs, &mut a_bytes).unwrap();
+        write_built_runs(header, &a_runs, &mut a_bytes, None).unwrap();
         let a = AnnDiskIndex::open(OwnedBytes::new(a_bytes), AnnKind::BinaryIvf, 8).unwrap();
 
         let b0_docs = [0u32, 1];
@@ -3886,7 +4074,7 @@ mod tests {
         let mut header_b = binary_header(2);
         header_b.num_clusters = 8;
         let mut b_bytes = Vec::new();
-        write_built_runs(header_b, &b_runs, &mut b_bytes).unwrap();
+        write_built_runs(header_b, &b_runs, &mut b_bytes, None).unwrap();
         let b = AnnDiskIndex::open(OwnedBytes::new(b_bytes), AnnKind::BinaryIvf, 2).unwrap();
 
         let mut merged_bytes = Vec::new();
@@ -3932,12 +4120,279 @@ mod tests {
         let mut header = binary_header(8);
         header.num_clusters = 4;
         let mut bytes = Vec::new();
-        write_built_runs(header, &runs, &mut bytes).unwrap();
+        write_built_runs(header, &runs, &mut bytes, None).unwrap();
         let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 8).unwrap();
         let health = disk.health();
         assert!((health.imbalance - 1.0).abs() < 1e-9);
         assert!((health.fragmentation() - 1.0).abs() < 1e-9);
         assert!((health.largest_cluster_share() - 0.25).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn repeated_binary_merge_copies_codes_and_lookup_rows_verbatim() {
+        use crate::directories::FileHandle;
+        use crate::segment::vector_data::LazyFlatVectorData;
+        use crate::segment::vector_locations::{ExactLocations, write_copied_locations};
+
+        async fn open(
+            bytes: Vec<u8>,
+            map: Vec<u8>,
+            kind: AnnKind,
+            docs: u32,
+        ) -> (AnnDiskIndex, LazyFlatVectorData) {
+            let bytes = OwnedBytes::new(bytes);
+            let ann = AnnDiskIndex::open(bytes.clone(), kind, docs).unwrap();
+            let flat = LazyFlatVectorData::open_indirect(
+                FileHandle::from_bytes(OwnedBytes::new(map)),
+                &ann,
+                docs,
+            )
+            .await
+            .unwrap();
+            (ann, flat)
+        }
+        // ScaNN includes a SOAR secondary assignment for (4, 1). It must
+        // retain a single logical value while both ANN copies remain intact.
+        for kind in [AnnKind::BinaryIvf, AnnKind::ScannBinary] {
+            let mut header = binary_header(if kind == AnnKind::ScannBinary { 5 } else { 4 });
+            header.kind = kind;
+            if kind == AnnKind::ScannBinary {
+                header.routing = IvfRoutingMode::Flat;
+                header.codebook_version = 73;
+                header.num_clusters = 3;
+            }
+            let runs = [
+                BuildRun {
+                    cluster_id: 0,
+                    doc_ids: &[4, 1],
+                    ordinals: &[1, 0],
+                    codes: &[41, 10],
+                },
+                BuildRun {
+                    cluster_id: 1,
+                    doc_ids: &[4, 0],
+                    ordinals: &[0, 0],
+                    codes: &[40, 0],
+                },
+                BuildRun {
+                    cluster_id: 2,
+                    doc_ids: &[4],
+                    ordinals: &[1],
+                    codes: &[41],
+                },
+            ];
+            let mut locations = ExactLocations::default();
+            let mut bytes = Vec::new();
+            write_built_runs(
+                header,
+                &runs[..if kind == AnnKind::ScannBinary { 3 } else { 2 }],
+                &mut bytes,
+                Some(&mut locations),
+            )
+            .unwrap();
+            let mut map = Vec::new();
+            locations
+                .write(8, 4, bytes.len() as u64, &mut map, None)
+                .unwrap();
+            // Bad addresses must fail opening, before any query can read a
+            // different logical vector or an out-of-range ANN byte.
+            let mut bad_map = map.clone();
+            bad_map[38..46].copy_from_slice(&u64::MAX.to_le_bytes());
+            let raw = OwnedBytes::new(bytes.clone());
+            let ann = AnnDiskIndex::open(raw.clone(), kind, 6).unwrap();
+            assert!(
+                LazyFlatVectorData::open_indirect(
+                    FileHandle::from_bytes(OwnedBytes::new(bad_map)),
+                    &ann,
+                    6,
+                )
+                .await
+                .is_err()
+            );
+            for mutation in 0..4 {
+                let mut bad = map.clone();
+                match mutation {
+                    0 => bad[38..46].copy_from_slice(&u64::from(u32::MAX).to_le_bytes()),
+                    1 => bad[36..38].copy_from_slice(&u16::MAX.to_le_bytes()),
+                    // A span cannot start in the header or cross run columns.
+                    2 => bad[88..96].copy_from_slice(&0u64.to_le_bytes()),
+                    _ => bad[96..100].copy_from_slice(&6u32.to_le_bytes()),
+                }
+                assert!(
+                    LazyFlatVectorData::open_indirect(
+                        FileHandle::from_bytes(OwnedBytes::new(bad)),
+                        &ann,
+                        6,
+                    )
+                    .await
+                    .is_err(),
+                    "corrupt lookup mutation {mutation}"
+                );
+            }
+            let (source, exact) = open(bytes, map, kind, 6).await;
+            assert_eq!(
+                exact.read_vectors_batch(0, 4).await.unwrap().as_slice(),
+                &[0, 10, 40, 41]
+            );
+            assert_eq!(exact.get_doc_id(2), (4, 0));
+            assert_eq!(exact.get_doc_id(3), (4, 1));
+            let mut merged: Option<(AnnDiskIndex, LazyFlatVectorData)> = None;
+            for generation in 1..=3u32 {
+                let (left_ann, left_exact) = merged
+                    .as_ref()
+                    .map(|(ann, exact)| (ann, exact))
+                    .unwrap_or((&source, &exact));
+                let left_docs = generation * 6;
+                let mut bytes = Vec::new();
+                write_merged_ann(&[(left_ann, 0), (&source, left_docs)], &mut bytes).unwrap();
+                let expected_payload = [
+                    &left_ann.raw[ANN_HEADER_SIZE..payload_end(left_ann)],
+                    &source.raw[ANN_HEADER_SIZE..payload_end(&source)],
+                ]
+                .concat();
+                assert_eq!(
+                    &bytes[ANN_HEADER_SIZE..ANN_HEADER_SIZE + expected_payload.len()],
+                    expected_payload
+                );
+                let mut map = Vec::new();
+                write_copied_locations(
+                    &[
+                        (left_exact, 0, 0),
+                        (&exact, left_docs, left_ann.copied_payload_bytes() as u64),
+                    ],
+                    8,
+                    (generation as usize + 1) * 4,
+                    bytes.len() as u64,
+                    &mut map,
+                    None,
+                )
+                .unwrap();
+                let expected_rows = [left_exact.location_rows(), exact.location_rows()].concat();
+                let (next_ann, next_exact) = open(bytes, map, kind, left_docs + 6).await;
+                assert_eq!(next_exact.location_rows(), expected_rows);
+                let expected_codes = [0, 10, 40, 41].repeat(generation as usize + 1);
+                assert_eq!(
+                    next_exact
+                        .read_vectors_batch(0, next_exact.num_vectors)
+                        .await
+                        .unwrap()
+                        .as_slice(),
+                    expected_codes
+                );
+                #[cfg(feature = "sync")]
+                assert_eq!(
+                    next_exact
+                        .read_vectors_batch_sync(0, next_exact.num_vectors)
+                        .unwrap()
+                        .as_slice(),
+                    expected_codes
+                );
+                for i in 0..next_exact.num_vectors {
+                    assert_eq!(
+                        next_exact.get_doc_id(i),
+                        (
+                            6 * (i / 4) as u32 + [0, 1, 4, 4][i % 4],
+                            [0, 0, 0, 1][i % 4]
+                        )
+                    );
+                }
+                // Own the result between iterations; lookup/codes refer to
+                // immutable byte owners and do not depend on source lifetimes.
+                merged = Some((next_ann, next_exact));
+            }
+            let (merged_ann, merged_exact) = merged.unwrap();
+            let mut coalesced = Vec::new();
+            let mut locations = ExactLocations::with_budget(128 * 1024, None).unwrap();
+            write_compacted_ann_cancellable(
+                &[(&merged_ann, 0)],
+                &mut coalesced,
+                None,
+                Some(&mut locations),
+            )
+            .unwrap();
+            let mut map = Vec::new();
+            locations
+                .write(
+                    8,
+                    merged_exact.num_vectors,
+                    coalesced.len() as u64,
+                    &mut map,
+                    None,
+                )
+                .unwrap();
+            let (ann, exact) = open(coalesced, map, kind, 24).await;
+            assert_eq!(ann.health().fragmentation(), 1.0);
+            assert_eq!(
+                ann.header.quantizer_version,
+                merged_ann.header.quantizer_version
+            );
+            assert_eq!(
+                ann.header.codebook_version,
+                merged_ann.header.codebook_version
+            );
+            assert_eq!(exact.num_vectors, merged_exact.num_vectors);
+            for row in 0..exact.num_vectors {
+                assert_eq!(exact.get_doc_id(row), merged_exact.get_doc_id(row));
+                assert_eq!(
+                    exact.read_vectors_batch(row, 1).await.unwrap().as_slice(),
+                    merged_exact
+                        .read_vectors_batch(row, 1)
+                        .await
+                        .unwrap()
+                        .as_slice()
+                );
+            }
+            let cancelled = std::sync::atomic::AtomicBool::new(true);
+            let error = write_compacted_ann_cancellable(
+                &[(&merged_ann, 0)],
+                &mut Vec::new(),
+                Some(&cancelled),
+                Some(&mut ExactLocations::default()),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_vector_lookup_rejects_short_metadata_reads() {
+        use crate::directories::FileHandle;
+        use crate::segment::vector_data::LazyFlatVectorData;
+        use crate::segment::vector_locations::ExactLocations;
+        let mut locations = ExactLocations::default();
+        let mut bytes = Vec::new();
+        write_built_runs(
+            binary_header(1),
+            &[BuildRun {
+                cluster_id: 0,
+                doc_ids: &[0],
+                ordinals: &[0],
+                codes: &[42],
+            }],
+            &mut bytes,
+            Some(&mut locations),
+        )
+        .unwrap();
+        let mut map = Vec::new();
+        locations
+            .write(8, 1, bytes.len() as u64, &mut map, None)
+            .unwrap();
+        let ann = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 1).unwrap();
+        let map = OwnedBytes::new(map);
+        let truncated = FileHandle::lazy(
+            map.len() as u64 + 1,
+            std::sync::Arc::new(move |_| {
+                let map = map.clone();
+                Box::pin(async move { Ok(map) })
+            }),
+        );
+        assert_eq!(
+            LazyFlatVectorData::open_indirect(truncated, &ann, 1)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 
     fn binary_header(vector_count: usize) -> AnnDiskHeader {
@@ -3955,6 +4410,114 @@ mod tests {
 
     fn payload_end(index: &AnnDiskIndex) -> usize {
         index.runs.iter().map(|run| run.codes.end).max().unwrap()
+    }
+
+    #[test]
+    fn binary_pruning_preserves_ties_deletions_and_complete_ordinal_scores() {
+        // More than one score batch, with decreasing IDs: later equal-score
+        // candidates must replace earlier ones, including across run boundaries.
+        let count = BINARY_SCORE_BATCH + 137;
+        let docs: Vec<u32> = (0..count as u32).rev().map(|id| id / 2).collect();
+        let ordinals: Vec<u16> = (0..count as u32).rev().map(|id| (id % 2) as u16).collect();
+        let codes: Vec<u8> = (0..count).map(|i| (i % 256) as u8).collect();
+        let mut bytes = Vec::new();
+        write_built_runs(
+            binary_header(count),
+            &[
+                BuildRun {
+                    cluster_id: 0,
+                    doc_ids: &docs[..count - 73],
+                    ordinals: &ordinals[..count - 73],
+                    codes: &codes[..count - 73],
+                },
+                BuildRun {
+                    cluster_id: 1,
+                    doc_ids: &docs[count - 73..],
+                    ordinals: &ordinals[count - 73..],
+                    codes: &codes[count - 73..],
+                },
+            ],
+            &mut bytes,
+            None,
+        )
+        .unwrap();
+        let total_docs = count.div_ceil(2) as u32;
+        let mut disk =
+            AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, total_docs).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        for deleted in [false, true] {
+            disk.alive_docs = deleted.then(|| {
+                std::sync::Arc::new(crate::query::DocBitset::from_predicate(total_docs, &|id| {
+                    id % 3 != 0
+                }))
+            });
+            for query in [[0u8], [0x55], [0xff]] {
+                let mut all = Vec::new();
+                let mut scratch = vec![0.0; BINARY_SCORE_BATCH];
+                score_binary_cluster_runs(
+                    &disk,
+                    disk.raw.as_slice(),
+                    &query,
+                    &[0, 1],
+                    &mut scratch,
+                    &mut all,
+                )
+                .unwrap();
+                let expected_all: Vec<_> = docs
+                    .iter()
+                    .zip(&ordinals)
+                    .zip(&codes)
+                    .filter_map(|((&doc, &ordinal), &code)| {
+                        (!deleted || doc % 3 != 0).then_some((
+                            doc,
+                            ordinal,
+                            1.0 - (query[0] ^ code).count_ones() as f32 / 8.0,
+                        ))
+                    })
+                    .collect();
+                assert_eq!(
+                    all, expected_all,
+                    "combined scoring must keep every live ordinal"
+                );
+                for k in [0, 1, 10, 100, count + 1] {
+                    let mut vectors = BoundedUniqueAnnCollector::<true>::new(k);
+                    let mut documents = BoundedAnnCollector::<true, true>::new(k);
+                    for &(doc, ordinal, score) in &all {
+                        vectors.insert(doc, ordinal, score);
+                        documents.insert(doc, ordinal, score);
+                    }
+                    let vectors = vectors.into_sorted_results();
+                    let documents = documents.into_sorted_results();
+                    for parallel_threshold in [usize::MAX, 1] {
+                        let actual_vectors = pool
+                            .install(|| {
+                                disk.search_binary_clusters_with_tuning::<false>(
+                                    &query,
+                                    k,
+                                    &[0, 1],
+                                    parallel_threshold,
+                                )
+                            })
+                            .unwrap();
+                        let actual_documents = pool
+                            .install(|| {
+                                disk.search_binary_clusters_with_tuning::<true>(
+                                    &query,
+                                    k,
+                                    &[0, 1],
+                                    parallel_threshold,
+                                )
+                            })
+                            .unwrap();
+                        assert_eq!(actual_vectors, vectors);
+                        assert_eq!(actual_documents, documents);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -3993,7 +4556,7 @@ mod tests {
             },
         ];
         let mut first_bytes = Vec::new();
-        write_built_runs(binary_header(2), &first_runs, &mut first_bytes).unwrap();
+        write_built_runs(binary_header(2), &first_runs, &mut first_bytes, None).unwrap();
         let first = AnnDiskIndex::open(OwnedBytes::new(first_bytes.clone()), AnnKind::BinaryIvf, 2)
             .unwrap();
 
@@ -4007,7 +4570,7 @@ mod tests {
             codes: &second_codes,
         }];
         let mut second_bytes = Vec::new();
-        write_built_runs(binary_header(2), &second_runs, &mut second_bytes).unwrap();
+        write_built_runs(binary_header(2), &second_runs, &mut second_bytes, None).unwrap();
         let second =
             AnnDiskIndex::open(OwnedBytes::new(second_bytes.clone()), AnnKind::BinaryIvf, 2)
                 .unwrap();
@@ -4130,7 +4693,7 @@ mod tests {
             },
         ];
         let mut bytes = Vec::new();
-        write_built_runs(binary_header(6), &runs, &mut bytes).unwrap();
+        write_built_runs(binary_header(6), &runs, &mut bytes, None).unwrap();
         let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 3).unwrap();
         let parallel_pool = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
@@ -4436,7 +4999,7 @@ mod tests {
             vector_count: count,
         };
         let mut bytes = Vec::new();
-        write_built_runs(header, &[run], &mut bytes).unwrap();
+        write_built_runs(header, &[run], &mut bytes, None).unwrap();
 
         let stamped = u32::from_le_bytes(
             bytes[REVISION_OFFSET..REVISION_OFFSET + 4]
@@ -4780,7 +5343,7 @@ mod tests {
             codes: &codes,
         }];
         let mut bytes = Vec::new();
-        write_built_runs(binary_header(1), &runs, &mut bytes).unwrap();
+        write_built_runs(binary_header(1), &runs, &mut bytes, None).unwrap();
         let footer = bytes.len() - ANN_FOOTER_SIZE;
         let directory = usize::try_from(u64::from_le_bytes(
             bytes[footer..footer + 8].try_into().unwrap(),
@@ -4817,8 +5380,8 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn scann_binary_ann_round_trip_validates_exact_global_generation() {
+    #[tokio::test]
+    async fn scann_binary_ann_round_trip_validates_exact_global_generation() {
         use crate::structures::vector::scann::{
             ScannEncoding, ScannLeafRun, ScannSegmentPayload, ScannTrainedArtifactView,
         };
@@ -4846,12 +5409,61 @@ mod tests {
         .unwrap();
         let payload = ScannSegmentPayload::new(&artifact, 2, vec![primary, secondary]).unwrap();
         let mut bytes = Vec::new();
-        write_built_scann(&payload, &mut bytes).unwrap();
+        let mut locations = crate::segment::vector_locations::ExactLocations::default();
+        write_built_scann(&payload, &mut bytes, Some(&mut locations)).unwrap();
+        let mut map = Vec::new();
+        locations
+            .write(16, 2, bytes.len() as u64, &mut map, None)
+            .unwrap();
 
         let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannBinary, 2).unwrap();
         assert_eq!(disk.header.quantizer_version, artifact.generation);
         assert_eq!(disk.header.codebook_version, artifact.artifact_id);
         assert_eq!(disk.header.vector_count, 3);
+        use crate::directories::FileHandle;
+        use crate::segment::vector_data::LazyFlatVectorData;
+        let exact = LazyFlatVectorData::open_indirect(
+            FileHandle::from_bytes(OwnedBytes::new(map)),
+            &disk,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            exact.read_vectors_batch(0, 2).await.unwrap().as_slice(),
+            &[0x12, 0x34, 0xab, 0xcd]
+        );
+        assert_eq!(exact.get_doc_id(1), (1, 2));
+        let rows = crate::segment::row_map::RowMap::new(2, 1, |doc| doc == 1, 1024).unwrap();
+        let mut locations = crate::segment::vector_locations::ExactLocations::default();
+        let mut compacted = Vec::new();
+        write_live_ann(
+            &disk,
+            &rows,
+            &mut compacted,
+            1024 * 1024,
+            None,
+            Some(&mut locations),
+        )
+        .unwrap();
+        let mut map = Vec::new();
+        locations
+            .write(16, 1, compacted.len() as u64, &mut map, None)
+            .unwrap();
+        let compacted =
+            AnnDiskIndex::open(OwnedBytes::new(compacted), AnnKind::ScannBinary, 1).unwrap();
+        let live = LazyFlatVectorData::open_indirect(
+            FileHandle::from_bytes(OwnedBytes::new(map)),
+            &compacted,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(live.get_doc_id(0), (0, 2));
+        assert_eq!(
+            live.read_vectors_batch(0, 1).await.unwrap().as_slice(),
+            &[0xab, 0xcd]
+        );
         let artifact_bytes = artifact.to_bytes().unwrap();
         let view = ScannTrainedArtifactView::parse(&artifact_bytes).unwrap();
         disk.validate_scann_generation(&view.config, view.generation, view.artifact_id)
@@ -4939,7 +5551,7 @@ mod tests {
         let run = ScannLeafRun::from_rows(0, 0, &docs, &ordinals, codes, encoding, 8).unwrap();
         let payload = ScannSegmentPayload::new(&artifact, 33, vec![run]).unwrap();
         let mut bytes = Vec::new();
-        write_built_scann(&payload, &mut bytes).unwrap();
+        write_built_scann(&payload, &mut bytes, None).unwrap();
 
         let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, 33).unwrap();
         assert_eq!(
@@ -4981,7 +5593,7 @@ mod tests {
             .unwrap();
             let payload = ScannSegmentPayload::new(&artifact, 2, vec![primary, secondary]).unwrap();
             let mut bytes = Vec::new();
-            write_built_scann(&payload, &mut bytes).unwrap();
+            write_built_scann(&payload, &mut bytes, None).unwrap();
             AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannBinary, 2).unwrap()
         };
         let left = make(vec![1, 2, 3, 4]);
@@ -5032,7 +5644,7 @@ mod tests {
         .unwrap();
         let other_payload = ScannSegmentPayload::new(&other_artifact, 1, vec![other_run]).unwrap();
         let mut other_bytes = Vec::new();
-        write_built_scann(&other_payload, &mut other_bytes).unwrap();
+        write_built_scann(&other_payload, &mut other_bytes, None).unwrap();
         let other =
             AnnDiskIndex::open(OwnedBytes::new(other_bytes), AnnKind::ScannBinary, 1).unwrap();
         let error = write_merged_ann(&[(&left, 0), (&other, 2)], &mut Vec::new()).unwrap_err();
@@ -5073,6 +5685,7 @@ pub(crate) fn write_live_ann(
     writer: &mut (impl Write + ?Sized),
     budget: usize,
     cancellation: Option<&std::sync::atomic::AtomicBool>,
+    mut locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
 ) -> io::Result<u64> {
     let check = || {
         if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire)) {
@@ -5157,6 +5770,20 @@ pub(crate) fn write_live_ann(
         copy_selected_column(writer, &raw[run.ordinals.clone()], 2, kept(), &check)?;
         offset = checked_advance(offset, count * 2)?;
         let codes_offset = offset;
+        if let Some(map) = locations.as_deref_mut() {
+            let span = map.span(codes_offset, count)?;
+            for (new_row, old) in kept().enumerate() {
+                let doc = rows
+                    .get(run_doc_id_with_base(raw, run, old, run.doc_base)?)
+                    .unwrap();
+                map.push(
+                    doc,
+                    read_u16(raw, run.ordinals.start + old * 2),
+                    (u64::from(span) << 32) | new_row as u64,
+                )?;
+            }
+            check()?;
+        }
         let codes = &raw[run.codes.clone()];
         if count == run.count {
             for chunk in codes.chunks(4 * 1024 * 1024) {
@@ -5345,6 +5972,7 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
                 codes: &codes,
             }],
             &mut source_bytes,
+            None,
         )
         .unwrap();
         let source = AnnDiskIndex::open(OwnedBytes::new(source_bytes), kind, 33).unwrap();
@@ -5387,10 +6015,11 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
                     codes: &kept_codes,
                 }],
                 &mut expected,
+                None,
             )
             .unwrap();
             let mut actual = Vec::new();
-            write_live_ann(&source, &rows, &mut actual, 1024 * 1024, None).unwrap();
+            write_live_ann(&source, &rows, &mut actual, 1024 * 1024, None, None).unwrap();
             assert_eq!(
                 actual, expected,
                 "{kind:?}: compaction changed surviving codes or global identity"
@@ -5418,8 +6047,11 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
                     flag: &flag,
                     written: 0,
                 };
-                let error = write_live_ann(&source, &rows, &mut writer, 1024 * 1024, Some(&flag))
-                    .expect_err("cancelled ANN iterator reported a truncated output as success");
+                let error =
+                    write_live_ann(&source, &rows, &mut writer, 1024 * 1024, Some(&flag), None)
+                        .expect_err(
+                            "cancelled ANN iterator reported a truncated output as success",
+                        );
                 assert_eq!(error.kind(), io::ErrorKind::Interrupted);
             }
         }
@@ -5462,12 +6094,13 @@ async fn compacted_aligned_scann_groups_preserve_odd_block_padding() {
             codes: &codes,
         }],
         &mut bytes,
+        None,
     )
     .unwrap();
     let source = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::ScannAh, 96).unwrap();
     let rows = super::row_map::RowMap::new(96, 64, |doc| doc >= 32, 4096).unwrap();
     let mut actual = Vec::new();
-    write_live_ann(&source, &rows, &mut actual, 1024 * 1024, None).unwrap();
+    write_live_ann(&source, &rows, &mut actual, 1024 * 1024, None, None).unwrap();
     let mut expected = Vec::new();
     write_built_runs(
         AnnDiskHeader {
@@ -5481,6 +6114,7 @@ async fn compacted_aligned_scann_groups_preserve_odd_block_padding() {
             codes: &encode(32),
         }],
         &mut expected,
+        None,
     )
     .unwrap();
     assert_eq!(actual, expected);

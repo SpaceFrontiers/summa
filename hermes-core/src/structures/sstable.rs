@@ -317,21 +317,14 @@ impl BloomFilter {
 
     /// Add a key to the filter
     pub fn insert(&mut self, key: &[u8]) {
-        let (h1, h2) = self.hash_pair(key);
-        for i in 0..self.num_hashes {
-            let bit_pos = self.get_bit_pos(h1, h2, i);
-            let word_idx = bit_pos / 64;
-            let bit_idx = bit_pos % 64;
-            if word_idx < self.bits.len() {
-                self.bits.set_bit(word_idx, bit_idx);
-            }
-        }
+        let (h1, h2) = bloom_hash_pair(key);
+        self.insert_hashed(h1, h2);
     }
 
     /// Check if a key might be in the filter
     /// Returns false if definitely not present, true if possibly present
     pub fn may_contain(&self, key: &[u8]) -> bool {
-        let (h1, h2) = self.hash_pair(key);
+        let (h1, h2) = bloom_hash_pair(key);
         for i in 0..self.num_hashes {
             let bit_pos = self.get_bit_pos(h1, h2, i);
             let word_idx = bit_pos / 64;
@@ -358,20 +351,6 @@ impl BloomFilter {
                 self.bits.set_bit(word_idx, bit_idx);
             }
         }
-    }
-
-    /// Compute two hash values using FNV-1a variant (single pass over key bytes)
-    #[inline]
-    fn hash_pair(&self, key: &[u8]) -> (u64, u64) {
-        let mut h1: u64 = 0xcbf29ce484222325;
-        let mut h2: u64 = 0x84222325cbf29ce4;
-        for &byte in key {
-            h1 ^= byte as u64;
-            h1 = h1.wrapping_mul(0x100000001b3);
-            h2 = h2.wrapping_mul(0x100000001b3);
-            h2 ^= byte as u64;
-        }
-        (h1, h2)
     }
 
     /// Get bit position for hash iteration i using double hashing
@@ -442,7 +421,7 @@ fn validate_bloom_header(
 }
 
 /// Compute bloom filter hash pair for a key (standalone, no BloomFilter needed).
-/// Uses the same FNV-1a double-hashing as BloomFilter::hash_pair (single pass).
+/// Shared by in-memory insertion, lookup and streaming construction (single pass).
 #[inline]
 fn bloom_hash_pair(key: &[u8]) -> (u64, u64) {
     let mut h1: u64 = 0xcbf29ce484222325;

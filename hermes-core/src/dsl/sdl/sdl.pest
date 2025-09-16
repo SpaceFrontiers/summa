@@ -10,7 +10,7 @@ index_def = { "index" ~ identifier ~ "{" ~ (field_def | default_fields_def | que
 max_l1_phrase_terms_def = { "max_l1_phrase_terms" ~ ":" ~ max_l1_phrase_terms_spec }
 max_l1_phrase_terms_spec = @{ ASCII_DIGIT+ }
 
-// Index-level option: BP-reorder `reorder`-attributed BMP fields inside merges.
+// Index-level option: BP-reorder `reorder`-attributed sparse fields inside merges.
 // Absent = disabled (merges block-copy).
 //   reorder_on_merge: true
 reorder_on_merge_def = { "reorder_on_merge" ~ ":" ~ bool_lit }
@@ -148,7 +148,7 @@ stored_with_config = { "stored" ~ "<" ~ "multi" ~ ">" }
 //   indexed<quantization: uint8, query<tokenizer: "model/name", weighting: idf>>  # with query config
 indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
 index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-index_config_param = { index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | bmp_block_size_kwarg | bmp_grid_bits_kwarg | bmp_forward_index_kwarg | block_size_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | sparse_max_weight_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | bm25_k1_kwarg | bm25_b_kwarg | index_type_spec }
+index_config_param = { block_size_kwarg | bmp_block_size_kwarg | bmp_forward_index_kwarg | bmp_grid_bits_kwarg | sparse_max_weight_kwarg | seismic_postings_kwarg | seismic_cluster_size_kwarg | seismic_summary_energy_kwarg | index_type_kwarg | num_clusters_kwarg | target_vectors_kwarg | tree_levels_kwarg | nprobe_kwarg | routing_kwarg | quantization_kwarg | weight_threshold_kwarg | pruning_kwarg | min_terms_kwarg | sparse_format_kwarg | sparse_dims_kwarg | doc_mass_kwarg | soar_kwarg | query_config_block | positions_kwarg | chunked_kwarg | bm25_k1_kwarg | bm25_b_kwarg | index_type_spec }
 // Position tracking modes:
 //   positions - full tracking (element ordinal + token position)
 //   ordinal - only element ordinal for multi-valued fields
@@ -175,28 +175,15 @@ routing_kwarg = { "routing" ~ ":" ~ routing_spec }
 routing_spec = { "auto" | "flat" | "two_level" | "hnsw" }
 quantization_kwarg = { "quantization" ~ ":" ~ quantization_spec }
 weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spec }
-block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
-block_size_spec = @{ ASCII_DIGIT+ }
-// BMP block size (vectors per block, power of two, max 256; default 32).
-// Uniform across all segments of the field. Larger values reduce compressed
-// grid cells but coarsen pruning (docs/bmp-grid-compression.md).
-bmp_block_size_kwarg = { "bmp_block_size" ~ ":" ~ block_size_spec }
-bmp_forward_index_kwarg = { "bmp_forward_index" ~ ":" ~ boolean_spec }
 boolean_spec = { "true" | "false" }
-// Bits per BMP block-grid cell: 4 (default) or 2. Two caps local D payload
-// widths at two bits (bounds are ceil-quantized — exactness is unchanged).
-bmp_grid_bits_kwarg = { "bmp_grid_bits" ~ ":" ~ bits_spec }
 pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
 pruning_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 min_terms_kwarg = { "min_terms" ~ ":" ~ min_terms_spec }
 min_terms_spec = @{ ASCII_DIGIT+ }
 sparse_format_kwarg = { "format" ~ ":" ~ sparse_format_spec }
-sparse_format_spec = { "bmp" | "maxscore" }
+sparse_format_spec = { "seismic" | "bmp" | "maxscore" }
 sparse_dims_kwarg = { "dims" ~ ":" ~ sparse_dims_spec }
 sparse_dims_spec = @{ ASCII_DIGIT+ }
-sparse_max_weight_kwarg = { "max_weight" ~ ":" ~ sparse_max_weight_spec }
-sparse_max_weight_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
-bits_spec = @{ ASCII_DIGIT }
 // Document-side mass cropping for sparse vectors:
 //   doc_mass: 0.9  # keep top-weight entries covering 90% of each vector's mass
 doc_mass_kwarg = { "doc_mass" ~ ":" ~ pruning_spec }
@@ -214,7 +201,7 @@ path_chars = @{ (!("\"" ) ~ ANY)* }
 // Example: query<tokenizer: "model/name", weighting: idf>
 query_config_block = { "query" ~ "<" ~ query_config_params ~ ">" }
 query_config_params = { query_config_param ~ ("," ~ query_config_param)* }
-query_config_param = { query_tokenizer_kwarg | query_weighting_kwarg | query_weight_threshold_kwarg | query_max_dims_kwarg | query_pruning_kwarg | query_min_query_dims_kwarg | query_lsp_gamma_kwarg }
+query_config_param = { query_lsp_gamma_kwarg | query_seismic_cut_kwarg | query_seismic_factor_kwarg | query_exhaustive_kwarg | query_tokenizer_kwarg | query_weighting_kwarg | query_weight_threshold_kwarg | query_max_dims_kwarg | query_pruning_kwarg | query_min_query_dims_kwarg }
 query_tokenizer_kwarg = { "tokenizer" ~ ":" ~ tokenizer_path }
 query_weighting_kwarg = { "weighting" ~ ":" ~ weighting_spec }
 tokenizer_path = { "\"" ~ path_chars ~ "\"" }
@@ -223,8 +210,6 @@ query_weight_threshold_kwarg = { "weight_threshold" ~ ":" ~ weight_threshold_spe
 query_max_dims_kwarg = { "max_dims" ~ ":" ~ nprobe_spec }
 query_pruning_kwarg = { "pruning" ~ ":" ~ pruning_spec }
 query_min_query_dims_kwarg = { "min_query_dims" ~ ":" ~ min_terms_spec }
-// LSP/0 top-superblock guarantee. 0 means exhaustive SBMax traversal.
-query_lsp_gamma_kwarg = { "lsp_gamma" ~ ":" ~ nprobe_spec }
 
 // Identifier (field names, index names, tokenizer names)
 identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
@@ -232,3 +217,28 @@ identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
 // Whitespace and comments
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }
+
+seismic_postings_kwarg = { "seismic_postings" ~ ":" ~ nprobe_spec }
+seismic_cluster_size_kwarg = { "seismic_cluster_size" ~ ":" ~ nprobe_spec }
+seismic_summary_energy_kwarg = { "seismic_summary_energy" ~ ":" ~ pruning_spec }
+query_seismic_cut_kwarg = { "seismic_cut" ~ ":" ~ nprobe_spec }
+query_seismic_factor_kwarg = { "seismic_factor" ~ ":" ~ pruning_spec }
+query_exhaustive_kwarg = { "exhaustive" ~ ":" ~ boolean_spec }
+
+block_size_kwarg = { "block_size" ~ ":" ~ block_size_spec }
+
+block_size_spec = @{ ASCII_DIGIT+ }
+
+bmp_block_size_kwarg = { "bmp_block_size" ~ ":" ~ block_size_spec }
+
+bmp_forward_index_kwarg = { "bmp_forward_index" ~ ":" ~ boolean_spec }
+
+bmp_grid_bits_kwarg = { "bmp_grid_bits" ~ ":" ~ bits_spec }
+
+sparse_max_weight_kwarg = { "max_weight" ~ ":" ~ sparse_max_weight_spec }
+
+sparse_max_weight_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+
+bits_spec = @{ ASCII_DIGIT }
+
+query_lsp_gamma_kwarg = { "lsp_gamma" ~ ":" ~ nprobe_spec }

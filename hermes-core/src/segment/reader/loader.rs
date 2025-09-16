@@ -16,10 +16,11 @@ use crate::dsl::{
     BinaryIndexType, DenseVectorQuantization, Field, FieldType, Schema, VectorIndexType,
 };
 
-/// Result of loading the `.sparse` file — may contain MaxScore and/or BMP indexes.
+/// Result of loading the shared sparse file, with one configured backend per field.
 pub struct SparseFileData {
     pub maxscore_indexes: FxHashMap<u32, SparseIndex>,
     pub bmp_indexes: FxHashMap<u32, BmpIndex>,
+    pub seismic_indexes: FxHashMap<u32, crate::segment::seismic::SeismicIndex>,
     /// Logical size of the retained `.sparse` file handle. With
     /// `MmapDirectory` this is mapped address space, not resident memory.
     pub file_backed_bytes: u64,
@@ -35,7 +36,7 @@ pub struct VectorsFileData {
     /// `MmapDirectory` this is mapped address space, not resident memory.
     pub file_backed_bytes: u64,
     /// ANN field IDs declared by the validated TOC. Training-only callers use
-    /// this without opening corpus-sized ANN payloads.
+    /// this to distinguish indexed fields from accumulating flat storage.
     #[cfg(feature = "native")]
     pub ann_fields: Vec<u32>,
 }
@@ -309,9 +310,8 @@ pub async fn load_vectors_file<D: Directory>(
     load_vectors_file_impl(dir, files, schema, total_docs, true, None).await
 }
 
-/// Open only selected flat-vector fields for training. The TOC and flat
-/// payloads receive the same validation as search loading, but ANN run columns
-/// are not mapped or parsed.
+/// Open selected exact-vector fields for training. Flat-backed fields skip
+/// ANN loading; single-copy binary fields open their owning ANN payload.
 #[cfg(feature = "native")]
 pub(crate) async fn load_flat_vectors_file<D: Directory>(
     dir: &D,
@@ -391,7 +391,7 @@ async fn load_vectors_file_impl<D: Directory>(
         )));
     }
     let toc_bytes = handle.read_bytes_range(toc_offset..toc_end).await?;
-    let entries = read_dense_toc(toc_bytes.as_slice(), num_fields)?;
+    let mut entries = read_dense_toc(toc_bytes.as_slice(), num_fields)?;
     let data_start = 0;
     let data_end = toc_offset;
 
@@ -401,14 +401,16 @@ async fn load_vectors_file_impl<D: Directory>(
     validate_vector_toc_ranges(&entries, data_start, data_end)?;
 
     // Validate field-level TOC structure before opening any payload. ANN
-    // always depends on the same field's exact flat data, and duplicate
+    // always depends on the same field's exact-vector view, and duplicate
     // entries are corruption regardless of which load mode the caller uses.
     use crate::segment::ann_build;
-    let mut flat_toc_fields = FxHashSet::default();
+    let mut flat_toc_fields = FxHashMap::default();
     let mut ann_toc_fields = FxHashSet::default();
     for entry in &entries {
         let inserted = match entry.index_type {
-            ann_build::FLAT_TYPE => flat_toc_fields.insert(entry.field_id),
+            ann_build::FLAT_TYPE | ann_build::EXACT_LOCATIONS_TYPE => flat_toc_fields
+                .insert(entry.field_id, entry.index_type)
+                .is_none(),
             ann_build::LEGACY_IVF_PQ_TYPE
             | ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
@@ -425,9 +427,21 @@ async fn load_vectors_file_impl<D: Directory>(
         }
     }
     for &field_id in &ann_toc_fields {
-        if !flat_toc_fields.contains(&field_id) {
+        if !flat_toc_fields.contains_key(&field_id) {
             return Err(crate::Error::Corruption(format!(
-                "ANN vectors for field {field_id} are missing matching flat vector storage",
+                "ANN vectors for field {field_id} are missing matching exact vector storage",
+            )));
+        }
+    }
+    for entry in &entries {
+        if matches!(
+            entry.index_type,
+            ann_build::BINARY_IVF_TYPE | ann_build::SCANN_BINARY_TYPE
+        ) && flat_toc_fields.get(&entry.field_id) != Some(&ann_build::EXACT_LOCATIONS_TYPE)
+        {
+            return Err(crate::Error::Corruption(format!(
+                "binary ANN field {} requires single-copy exact storage; duplicate flat-plus-ANN layouts are unsupported; recreate the index",
+                entry.field_id,
             )));
         }
     }
@@ -435,6 +449,21 @@ async fn load_vectors_file_impl<D: Directory>(
     let mut ann_fields: Vec<_> = ann_toc_fields.into_iter().collect();
     #[cfg(feature = "native")]
     ann_fields.sort_unstable();
+
+    // Load ANN owners before indirect exact-vector views. Training opens only
+    // the selected field's ANN backing; normal readers reuse its parsed owner.
+    let binary_payloads: FxHashMap<_, _> = entries
+        .iter()
+        .filter_map(|entry| {
+            let kind = match entry.index_type {
+                ann_build::BINARY_IVF_TYPE => crate::segment::ann_disk::AnnKind::BinaryIvf,
+                ann_build::SCANN_BINARY_TYPE => crate::segment::ann_disk::AnnKind::ScannBinary,
+                _ => return None,
+            };
+            Some((entry.field_id, (entry.offset, entry.size, kind)))
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.index_type == ann_build::EXACT_LOCATIONS_TYPE);
 
     // Load each entry — a field can have both flat and mmap-backed ANN data.
     for DenseVectorTocEntry {
@@ -447,7 +476,7 @@ async fn load_vectors_file_impl<D: Directory>(
         // The complete TOC was bounds/overlap checked before any payload read.
         let end = offset + length;
         match index_type {
-            ann_build::FLAT_TYPE => {
+            ann_build::FLAT_TYPE | ann_build::EXACT_LOCATIONS_TYPE => {
                 // Search readers validate the zero-copy document map. Training
                 // readers need only the header and sampled raw-vector ranges.
                 let field = schema.get_field_entry(Field(field_id)).ok_or_else(|| {
@@ -459,7 +488,30 @@ async fn load_vectors_file_impl<D: Directory>(
                     continue;
                 }
                 let slice = handle.slice(offset..end);
-                let lazy_flat = if load_ann {
+                let lazy_flat = if index_type == ann_build::EXACT_LOCATIONS_TYPE {
+                    let &(ann_offset, ann_size, kind) =
+                        binary_payloads.get(&field_id).ok_or_else(|| {
+                            crate::Error::Corruption(format!(
+                                "exact-vector lookup for field {field_id} has no binary ANN payload"
+                            ))
+                        })?;
+                    let ann_handle = handle.slice(ann_offset..ann_offset + ann_size);
+                    let training_ann;
+                    let ann = match indexes.get(&field_id) {
+                        Some(VectorIndex::BinaryIvf(index) | VectorIndex::ScannBinary(index)) => {
+                            index.get()
+                        }
+                        _ => {
+                            training_ann = crate::segment::ann_disk::AnnDiskIndex::open(
+                                ann_handle.read_bytes_range(0..ann_size).await?,
+                                kind,
+                                total_docs,
+                            )?;
+                            &training_ann
+                        }
+                    };
+                    LazyFlatVectorData::open_indirect(slice, ann, total_docs).await
+                } else if load_ann {
                     LazyFlatVectorData::open_with_doc_limit(slice, Some(total_docs)).await
                 } else {
                     LazyFlatVectorData::open_for_training(slice).await
@@ -673,25 +725,83 @@ pub async fn load_sparse_file<D: Directory>(
     total_docs: u32,
     schema: &Schema,
 ) -> Result<SparseFileData> {
+    let mut data = load_sparse_component(dir, &files.sparse, total_docs, schema, None).await?;
+    if !data.seismic_indexes.is_empty() {
+        for partition in 0..crate::segment::seismic::PARTITIONS {
+            let component = load_sparse_component(
+                dir,
+                &files.seismic_partition(partition),
+                total_docs,
+                schema,
+                Some((partition, &mut data.seismic_indexes)),
+            )
+            .await?;
+            data.file_backed_bytes = data
+                .file_backed_bytes
+                .checked_add(component.file_backed_bytes)
+                .ok_or_else(|| crate::Error::Corruption("sparse file sizes overflow".into()))?;
+        }
+        for index in data.seismic_indexes.values_mut() {
+            index.finish_partitions()?;
+        }
+    } else if schema.fields().any(|(_, entry)| {
+        entry
+            .sparse_vector_config
+            .as_ref()
+            .is_some_and(|config| config.format == crate::structures::SparseFormat::Seismic)
+    }) {
+        // A Seismic schema may legitimately have no values in this segment.
+        // Surviving partitions instead prove that its root owner is missing or
+        // no longer declares those payloads. Check the bounded inventory without
+        // scanning row columns or treating corruption as an empty sparse field.
+        for path in files.seismic_partitions() {
+            if dir.exists(&path).await? {
+                return Err(crate::Error::Corruption(format!(
+                    "Seismic nomination partition {path:?} has no root field owner"
+                )));
+            }
+        }
+    }
+    Ok(data)
+}
+
+async fn load_sparse_component<D: Directory>(
+    dir: &D,
+    path: &std::path::Path,
+    total_docs: u32,
+    schema: &Schema,
+    mut partition: Option<(
+        usize,
+        &mut FxHashMap<u32, crate::segment::seismic::SeismicIndex>,
+    )>,
+) -> Result<SparseFileData> {
     use crate::segment::format::{SPARSE_FOOTER_MAGIC, SPARSE_FOOTER_SIZE};
     use crate::structures::{SparseSkipEntry, SparseVectorConfig};
 
     let empty = || SparseFileData {
         maxscore_indexes: FxHashMap::default(),
         bmp_indexes: FxHashMap::default(),
+        seismic_indexes: FxHashMap::default(),
         file_backed_bytes: 0,
     };
 
     let mut maxscore_indexes = FxHashMap::default();
     let mut bmp_indexes = FxHashMap::default();
+    let mut seismic_indexes = FxHashMap::default();
+    let mut seen_fields = FxHashSet::default();
 
     // Try to open sparse file lazily (may not exist if no sparse vectors were indexed)
-    let handle = match dir.open_lazy(&files.sparse).await {
+    let handle = match dir.open_lazy(path).await {
         Ok(h) => h,
         Err(e) => {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                log::debug!("No sparse file found ({}): {:?}", files.sparse.display(), e);
+            if e.kind() == std::io::ErrorKind::NotFound && partition.is_none() {
+                log::debug!("No sparse file found ({}): {:?}", path.display(), e);
                 return Ok(empty());
+            }
+            if e.kind() == std::io::ErrorKind::NotFound {
+                return Err(crate::Error::Corruption(format!(
+                    "required Seismic partition {path:?} is missing"
+                )));
             }
             return Err(crate::Error::Io(e));
         }
@@ -699,7 +809,7 @@ pub async fn load_sparse_file<D: Directory>(
 
     let file_size = handle.len();
     if file_size < SPARSE_FOOTER_SIZE {
-        return if file_size == 0 {
+        return if file_size == 0 && partition.is_none() {
             Ok(empty())
         } else {
             Err(crate::Error::Corruption(format!(
@@ -742,6 +852,11 @@ pub async fn load_sparse_file<D: Directory>(
     );
 
     if num_fields == 0 {
+        if partition.is_some() {
+            return Err(crate::Error::Corruption(
+                "Seismic partition has no field descriptors".into(),
+            ));
+        }
         if skip_offset != footer_start || toc_offset != footer_start {
             return Err(crate::Error::Corruption(format!(
                 "empty sparse TOC leaves unowned bytes before footer: skip={skip_offset}, toc={toc_offset}, footer={footer_start}"
@@ -788,7 +903,7 @@ pub async fn load_sparse_file<D: Directory>(
         })?;
         let entries = take_toc_bytes(toc_data, &mut pos, entries_len, "sparse dimension entries")?;
 
-        if maxscore_indexes.contains_key(&field_id) || bmp_indexes.contains_key(&field_id) {
+        if !seen_fields.insert(field_id) {
             return Err(crate::Error::Corruption(format!(
                 "duplicate sparse field {field_id} in TOC"
             )));
@@ -818,6 +933,63 @@ pub async fn load_sparse_file<D: Directory>(
                 "sparse field {field_id} ('{}') is stored as {:?} but configured as {:?}; rebuild the index",
                 schema_field.name, stored_config.format, configured_format,
             )));
+        }
+        if partition.is_some() && stored_config.format != crate::structures::SparseFormat::Seismic {
+            return Err(crate::Error::Corruption(
+                "non-Seismic field in nomination partition".into(),
+            ));
+        }
+        if stored_config.format == crate::structures::SparseFormat::Seismic {
+            if ndims != 1 || stored_config.index_size != crate::structures::IndexSize::U32 {
+                return Err(crate::Error::Corruption(
+                    "noncanonical Seismic descriptor".into(),
+                ));
+            }
+            let marker = u32::from_le_bytes(entries[0..4].try_into().unwrap());
+            let start = u64::from_le_bytes(entries[4..12].try_into().unwrap());
+            let low = u32::from_le_bytes(entries[12..16].try_into().unwrap());
+            let high = u32::from_le_bytes(entries[16..20].try_into().unwrap());
+            let len = u64::from(low) | (u64::from(high) << 32);
+            let end = start
+                .checked_add(len)
+                .filter(|&end| end <= skip_offset)
+                .ok_or_else(|| {
+                    crate::Error::Corruption("Seismic blob extent exceeds payload".into())
+                })?;
+            if marker != u32::MAX {
+                return Err(crate::Error::Corruption(
+                    "invalid Seismic blob marker".into(),
+                ));
+            }
+            let bytes = handle.read_bytes_range(start..end).await?;
+            if let Some((partition_id, indexes)) = partition.as_mut() {
+                let index = indexes.get_mut(&field_id).ok_or_else(|| {
+                    crate::Error::Corruption(format!(
+                        "Seismic partition references undeclared field {field_id}"
+                    ))
+                })?;
+                if index.total_vectors() != total_vectors
+                    || index.quantization() != stored_config.weight_quantization
+                {
+                    return Err(crate::Error::Corruption(
+                        "Seismic partition disagrees with root descriptor".into(),
+                    ));
+                }
+                index.attach_partition(*partition_id, bytes, start)?;
+                payload_ranges.push((start, end, field_id, marker));
+                continue;
+            }
+            let mut index =
+                crate::segment::seismic::SeismicIndex::parse(bytes, total_docs, total_vectors)?;
+            index.set_source_offset(start);
+            if index.quantization() != stored_config.weight_quantization {
+                return Err(crate::Error::Corruption(
+                    "Seismic precision disagrees with descriptor".into(),
+                ));
+            }
+            payload_ranges.push((start, end, field_id, marker));
+            seismic_indexes.insert(field_id, index);
+            continue;
         }
         let is_bmp = stored_config.format == crate::structures::SparseFormat::Bmp;
 
@@ -1016,6 +1188,14 @@ pub async fn load_sparse_file<D: Directory>(
         )));
     }
 
+    if let Some((_, indexes)) = partition
+        && (seen_fields.len() != indexes.len() || skip_offset != toc_offset)
+    {
+        return Err(crate::Error::Corruption(
+            "Seismic partition field set disagrees with root".into(),
+        ));
+    }
+
     log::debug!(
         "Sparse file loaded: maxscore_fields={:?}, bmp_fields={:?}",
         maxscore_indexes.keys().collect::<Vec<_>>(),
@@ -1025,6 +1205,7 @@ pub async fn load_sparse_file<D: Directory>(
     Ok(SparseFileData {
         maxscore_indexes,
         bmp_indexes,
+        seismic_indexes,
         file_backed_bytes: file_size,
     })
 }
@@ -1273,7 +1454,10 @@ mod tests {
             "sparse",
             true,
             true,
-            SparseVectorConfig::default(),
+            SparseVectorConfig {
+                format: crate::structures::SparseFormat::MaxScore,
+                ..Default::default()
+            },
         );
         let error = match load_sparse_file(&dir, &files, 0, &schema.build()).await {
             Err(error) => error,
@@ -1401,7 +1585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ann_vectors_require_same_field_flat_storage() {
+    async fn ann_vectors_require_same_field_exact_storage() {
         let mut schema = SchemaBuilder::default();
         schema.add_dense_vector_field("dense_0", 2, true, true);
         schema.add_dense_vector_field("dense_1", 2, true, true);
@@ -1429,7 +1613,49 @@ mod tests {
             panic!("ANN storage without a same-field flat payload must be rejected");
         };
         assert!(message.contains("field 1"));
-        assert!(message.contains("missing matching flat"));
+        assert!(message.contains("missing matching exact"));
+    }
+
+    #[tokio::test]
+    async fn binary_ann_rejects_duplicate_flat_storage_in_search_and_training() {
+        let mut schema = SchemaBuilder::default();
+        schema.add_binary_dense_vector_field("binary", 8, true, true);
+        let schema = schema.build();
+        let files = SegmentFiles::new(121);
+        let dir = RamDirectory::new();
+        let mut flat = Vec::new();
+        FlatVectorData::serialize_binary_from_bits_streaming(8, &[42], &[(0, 0)], &mut flat)
+            .unwrap();
+        // A flat-only binary field still owns its sole exact copy.
+        dir.write(
+            &files.vectors,
+            &vectors_file_with_payloads(vec![(0, ann_build::FLAT_TYPE, flat.clone())]),
+        )
+        .await
+        .unwrap();
+        assert!(load_vectors_file(&dir, &files, &schema, 1).await.is_ok());
+        for kind in [ann_build::BINARY_IVF_TYPE, ann_build::SCANN_BINARY_TYPE] {
+            // Admission must reject the layout before inspecting ANN bytes,
+            // including filtered training reads that would otherwise skip it.
+            dir.write(
+                &files.vectors,
+                &vectors_file_with_payloads(vec![
+                    (0, ann_build::FLAT_TYPE, flat.clone()),
+                    (0, kind, vec![0]),
+                ]),
+            )
+            .await
+            .unwrap();
+            for load_ann in [true, false] {
+                let result =
+                    super::load_vectors_file_impl(&dir, &files, &schema, 1, load_ann, Some(&[]))
+                        .await;
+                let Err(crate::Error::Corruption(message)) = result else {
+                    panic!("duplicate binary storage must be rejected");
+                };
+                assert!(message.contains("requires single-copy"), "{message}");
+            }
+        }
     }
 
     #[tokio::test]

@@ -74,9 +74,8 @@ pub struct FieldEntry {
     /// Stored fingerprint used to skip unchanged committed upserts.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub content_hash: bool,
-    /// Whether build-time document reordering (Recursive Graph Bisection) is enabled.
-    /// Valid for sparse_vector fields with BMP format. Clusters similar documents
-    /// into the same blocks for better pruning effectiveness.
+    /// Whether BP reordering is enabled for this indexed text or BMP field.
+    /// Plain text and chunked text both retain logical document/ordinal mappings.
     #[serde(default)]
     pub reorder: bool,
     /// Chunked text field: every value is its own BM25 scoring unit with a
@@ -99,6 +98,15 @@ impl FieldEntry {
             return None;
         }
         crate::tokenizer::TokenizerSpec::parse(self.tokenizer.as_deref()?).ok()
+    }
+
+    fn supports_reorder(&self) -> bool {
+        self.indexed
+            && (self.field_type == FieldType::Text
+                || self
+                    .sparse_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.format == crate::structures::SparseFormat::Bmp))
     }
 }
 
@@ -160,6 +168,25 @@ pub enum VectorIndexType {
 /// construction all fail loudly with the same actionable message.
 pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), String> {
     for (_, entry) in schema.fields() {
+        if let Some(config) = &entry.sparse_vector_config
+            && config.format == crate::structures::SparseFormat::Seismic
+        {
+            config
+                .seismic
+                .validate()
+                .map_err(|error| format!("sparse field '{}': {error}", entry.name))?;
+            if let Some(query) = &config.query_config
+                && (query.seismic_cut == 0
+                    || query.seismic_cut > crate::query::MAX_QUERY_TERMS
+                    || !query.seismic_factor.is_finite()
+                    || !(0.0..=1.0).contains(&query.seismic_factor))
+            {
+                return Err(format!(
+                    "sparse field '{}': invalid Seismic query cut/factor",
+                    entry.name
+                ));
+            }
+        }
         if let Some(config) = entry.dense_vector_config.as_ref() {
             validate_target_vectors(
                 &entry.name,
@@ -790,7 +817,7 @@ pub struct Schema {
     /// Query router rules for routing queries to specific fields based on regex patterns
     #[serde(default)]
     query_routers: Vec<QueryRouterRule>,
-    /// Run BP (graph bisection) reordering of `reorder`-attributed BMP fields
+    /// Run BP (graph bisection) reordering of `reorder`-attributed text or BMP fields
     /// inside segment merges. SDL: `reorder_on_merge: true` at index level.
     /// Absent = disabled (merges block-copy; the standalone reorder pass
     /// handles ordering).
@@ -901,13 +928,34 @@ impl Schema {
         self.fields.len()
     }
 
-    /// Whether any field has the `reorder` attribute set.
-    /// Used by the background optimizer to determine which indexes need BP reordering.
+    /// Whether indexed text or BMP fields opt into BP reordering.
     pub fn has_reorder_fields(&self) -> bool {
-        self.fields.iter().any(|e| e.reorder)
+        self.fields
+            .iter()
+            .any(|entry| entry.reorder && entry.supports_reorder())
     }
 
-    /// Whether merges BP-reorder `reorder`-attributed BMP fields while writing
+    /// Whether this index has fields serviced by the bounded background optimizer.
+    pub fn has_background_maintenance_fields(&self) -> bool {
+        self.fields.iter().any(|entry| {
+            (entry.reorder && entry.supports_reorder())
+                || (entry.indexed
+                    && (entry
+                        .binary_dense_vector_config
+                        .as_ref()
+                        .is_some_and(|config| {
+                            matches!(
+                                config.index_type,
+                                BinaryIndexType::Ivf | BinaryIndexType::Scann
+                            )
+                        })
+                        || entry.sparse_vector_config.as_ref().is_some_and(|config| {
+                            config.format == crate::structures::SparseFormat::Seismic
+                        })))
+        })
+    }
+
+    /// Whether merges BP-reorder `reorder`-attributed text or BMP fields while writing
     /// the merged segment (index-level SDL option `reorder_on_merge: true`).
     pub fn reorder_on_merge(&self) -> bool {
         self.reorder_on_merge
@@ -965,7 +1013,20 @@ impl Schema {
         })
     }
 
-    pub(crate) fn validate_content_hash(&self) -> crate::Result<()> {
+    /// Shared admission for SDL, programmatic schemas, native/WASM creation and reopen.
+    pub(crate) fn validate(&self) -> crate::Result<()> {
+        for entry in &self.fields {
+            if entry.reorder && !entry.supports_reorder() {
+                return Err(crate::Error::Schema(format!(
+                    "field '{}' uses reorder, which requires indexed text or BMP; Seismic and binary ANN maintenance is automatic",
+                    entry.name
+                )));
+            }
+        }
+        self.validate_content_hash()
+    }
+
+    fn validate_content_hash(&self) -> crate::Result<()> {
         let hashes: Vec<_> = self
             .fields
             .iter()
@@ -1318,7 +1379,8 @@ impl SchemaBuilder {
             .content_hash = true;
     }
 
-    /// Enable build-time document reordering (Recursive Graph Bisection) for BMP fields
+    /// Enable BP reordering for an indexed text or BMP field.
+    /// Invalid field types are rejected at schema admission.
     pub fn set_reorder(&mut self, field: Field, reorder: bool) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.reorder = reorder;
@@ -1344,7 +1406,7 @@ impl SchemaBuilder {
         }
     }
 
-    /// Enable BP reordering of `reorder`-attributed BMP fields inside merges
+    /// Enable BP reordering of `reorder`-attributed text or BMP fields inside merges
     /// (index-level; SDL `reorder_on_merge: true`). Default: disabled.
     pub fn set_reorder_on_merge(&mut self, on: bool) {
         self.reorder_on_merge = on;
@@ -1777,6 +1839,39 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reorder_accepts_indexed_text_and_bmp_and_rejects_unsupported_fields() {
+        for field in [
+            "sparse_vector [indexed<format: seismic>, reorder]",
+            "sparse_vector [indexed<format: maxscore>, reorder]",
+            "dense_vector<4> [indexed, reorder]",
+            "u64 [indexed, reorder]",
+            "text [stored, reorder]",
+        ] {
+            let error =
+                crate::dsl::sdl::parse_sdl(&format!("index test {{ field value: {field} }}"))
+                    .unwrap_err();
+            assert!(error.to_string().contains("reorder"), "{error}");
+        }
+        for field in [
+            "text [indexed, reorder]",
+            "text [indexed<chunked>, reorder]",
+            "sparse_vector [indexed, reorder]",
+        ] {
+            let definitions =
+                crate::dsl::sdl::parse_sdl(&format!("index test {{ field value: {field} }}"))
+                    .unwrap();
+            assert!(definitions[0].to_schema().has_reorder_fields());
+        }
+        let mut builder = Schema::builder();
+        let sparse = builder.add_sparse_vector_field("sparse", true, false);
+        builder.set_reorder(sparse, true);
+        let schema = builder.build();
+        assert!(schema.has_reorder_fields());
+        assert!(schema.has_background_maintenance_fields());
+        assert!(schema.validate().is_ok());
+    }
 
     #[test]
     fn json_content_hashes_roundtrip_and_reject_invalid_values() {

@@ -28,7 +28,7 @@ Read them before changing the search stack; keep system rules there to avoid dri
   builds must fail merge via global quantizer/codebook version checks.
   When a change claims "no behavioral change," verify byte-identical output.
 - **Hot-path allocation hygiene.** Per-query buffers come from reusable /
-  thread-local scratch (see `BmpScratch`), `Vec::with_capacity` over realloc
+  thread-local scratch where appropriate, `Vec::with_capacity` over realloc
   chains, sort+dedup in place over hash maps where possible. New per-query
   allocations on the search path need justification.
 - **Every fallback or drop is observable.** Silent truncation, silently skipped

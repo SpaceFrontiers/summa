@@ -24,8 +24,8 @@ pub(crate) struct SearcherResources {
     pub(crate) term_cache_blocks: usize,
     pub(crate) term_cache_budget_bytes: Option<usize>,
     pub(crate) store_cache: Arc<crate::segment::SharedStoreCache>,
-    pub(crate) bmp_io_gate: Arc<super::BmpIoGate>,
-    pub(crate) bmp_io_concurrency: usize,
+    pub(crate) sparse_io_gate: Arc<super::SparseIoGate>,
+    pub(crate) sparse_io_concurrency: usize,
     #[cfg(feature = "sync")]
     pub(crate) search_pool: Arc<rayon::ThreadPool>,
 }
@@ -39,7 +39,7 @@ impl SearcherResources {
             config.term_cache_budget_bytes,
             config.store_cache_budget_bytes,
             config.num_threads,
-            config.bmp_io_concurrency,
+            config.sparse_io_concurrency,
         )
     }
 
@@ -52,7 +52,7 @@ impl SearcherResources {
         term_cache_budget_bytes: Option<usize>,
         store_cache_budget_bytes: usize,
         num_threads: usize,
-        bmp_io_concurrency: usize,
+        sparse_io_concurrency: usize,
     ) -> Result<Self> {
         super::validate_term_cache_blocks(term_cache_blocks)?;
         if num_threads == 0 {
@@ -60,9 +60,9 @@ impl SearcherResources {
                 "IndexConfig.num_threads must be greater than zero".into(),
             ));
         }
-        if bmp_io_concurrency == 0 {
+        if sparse_io_concurrency == 0 {
             return Err(crate::Error::Internal(
-                "IndexConfig.bmp_io_concurrency must be greater than zero".into(),
+                "IndexConfig.sparse_io_concurrency must be greater than zero".into(),
             ));
         }
 
@@ -73,8 +73,8 @@ impl SearcherResources {
             term_cache_blocks,
             term_cache_budget_bytes,
             store_cache: super::shared_store_cache(store_cache_budget_bytes),
-            bmp_io_gate: super::shared_bmp_io_gate(bmp_io_concurrency),
-            bmp_io_concurrency,
+            sparse_io_gate: super::shared_sparse_io_gate(sparse_io_concurrency),
+            sparse_io_concurrency,
             #[cfg(feature = "sync")]
             search_pool,
         })
@@ -112,9 +112,9 @@ pub struct Searcher<D: Directory + 'static> {
     search_pool: Arc<rayon::ThreadPool>,
     /// Shared random-I/O gate and per-query wave width for BMP.
     #[cfg(feature = "native")]
-    bmp_io_gate: Arc<super::BmpIoGate>,
+    sparse_io_gate: Arc<super::SparseIoGate>,
     #[cfg(feature = "native")]
-    bmp_io_concurrency: usize,
+    sparse_io_concurrency: usize,
 }
 
 impl<D: Directory + 'static> Searcher<D> {
@@ -181,8 +181,8 @@ impl<D: Directory + 'static> Searcher<D> {
             total_docs,
             #[cfg(feature = "sync")]
             search_pool: resources.search_pool,
-            bmp_io_gate: resources.bmp_io_gate,
-            bmp_io_concurrency: resources.bmp_io_concurrency,
+            sparse_io_gate: resources.sparse_io_gate,
+            sparse_io_concurrency: resources.sparse_io_concurrency,
         })
     }
 
@@ -224,8 +224,8 @@ impl<D: Directory + 'static> Searcher<D> {
             total_docs,
             #[cfg(feature = "sync")]
             search_pool: resources.search_pool,
-            bmp_io_gate: resources.bmp_io_gate,
-            bmp_io_concurrency: resources.bmp_io_concurrency,
+            sparse_io_gate: resources.sparse_io_gate,
+            sparse_io_concurrency: resources.sparse_io_concurrency,
         })
     }
 
@@ -278,9 +278,9 @@ impl<D: Directory + 'static> Searcher<D> {
         #[cfg(feature = "sync")]
         let search_pool = super::shared_search_pool(crate::default_search_threads())?;
         #[cfg(feature = "native")]
-        let bmp_io_concurrency = 4;
+        let sparse_io_concurrency = 4;
         #[cfg(feature = "native")]
-        let bmp_io_gate = super::shared_bmp_io_gate(bmp_io_concurrency);
+        let sparse_io_gate = super::shared_sparse_io_gate(sparse_io_concurrency);
 
         let _ = directory; // suppress unused warning on wasm
         Ok(Self {
@@ -298,9 +298,9 @@ impl<D: Directory + 'static> Searcher<D> {
             #[cfg(feature = "sync")]
             search_pool,
             #[cfg(feature = "native")]
-            bmp_io_gate,
+            sparse_io_gate,
             #[cfg(feature = "native")]
-            bmp_io_concurrency,
+            sparse_io_concurrency,
         })
     }
 
@@ -853,7 +853,8 @@ impl<D: Directory + 'static> Searcher<D> {
         if retrieval_depth == 0 {
             return Ok(empty());
         }
-        let crate::query::QueryDecomposition::SparseTerms(infos) = query.lsp_decomposition() else {
+        let crate::query::QueryDecomposition::SparseTerms(infos) = query.sparse_decomposition()
+        else {
             return Ok(empty());
         };
         let Some(&first) = infos.first() else {
@@ -1068,7 +1069,7 @@ impl<D: Directory + 'static> Searcher<D> {
     fn bmp_wave_width(&self) -> usize {
         #[cfg(feature = "native")]
         {
-            self.bmp_io_concurrency
+            self.sparse_io_concurrency
         }
         #[cfg(not(feature = "native"))]
         {
@@ -1144,21 +1145,21 @@ impl<D: Directory + 'static> Searcher<D> {
             (0..self.segments.len()).collect()
         };
         #[cfg(feature = "native")]
-        let bmp_io_gate = Arc::clone(&self.bmp_io_gate);
+        let sparse_io_gate = Arc::clone(&self.sparse_io_gate);
         let run_segment = |segment_index: usize| {
             let text_stats = text_stats.clone();
             let segment = Arc::clone(&self.segments[segment_index]);
             let lsp_plan = lsp_plans[segment_index].clone();
             let shared = shared.clone();
             #[cfg(feature = "native")]
-            let bmp_io_gate = Arc::clone(&bmp_io_gate);
+            let sparse_io_gate = Arc::clone(&sparse_io_gate);
             async move {
                 if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
                     return Ok((Vec::new(), 0u32));
                 }
                 #[cfg(feature = "native")]
                 let _io_permit = if lsp_plan.is_some() {
-                    Some(bmp_io_gate.acquire_async().await)
+                    Some(sparse_io_gate.acquire_async().await)
                 } else {
                     None
                 };
@@ -1307,7 +1308,7 @@ impl<D: Directory + 'static> Searcher<D> {
             if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
                 return Ok((Vec::new(), 0u32));
             }
-            let _io_permit = lsp_plan.as_ref().map(|_| self.bmp_io_gate.acquire());
+            let _io_permit = lsp_plan.as_ref().map(|_| self.sparse_io_gate.acquire());
             let sid = segment.meta().id;
             let (mut results, segment_seen) = crate::query::search_segment_shared_sync_planned(
                 segment.as_ref(),

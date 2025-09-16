@@ -704,6 +704,14 @@ impl SearchService for SearchServiceImpl {
                 *sparse_postings.entry(field_id).or_default() += bmp_idx.total_postings();
                 sparse_dims.entry(field_id).or_insert(bmp_idx.dims());
             }
+            for (field_id, stats) in segment.seismic_stats() {
+                *sparse_totals.entry(field_id).or_default() += u64::from(stats.total_vectors);
+                *sparse_postings.entry(field_id).or_default() += stats.forward_entries;
+                sparse_dims
+                    .entry(field_id)
+                    .and_modify(|dims| *dims = (*dims).max(stats.dimensions))
+                    .or_insert(stats.dimensions);
+            }
         }
 
         let mut vector_stats = Vec::new();

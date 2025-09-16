@@ -1,7 +1,7 @@
 //! Shared format constants for segment binary files.
 //!
 //! `.vectors` uses a 16-byte footer-based (data-first) layout.
-//! `.sparse` V3 uses a 24-byte footer with separate skip section.
+//! `.sparse` uses a 24-byte footer and a MaxScore skip section.
 //!
 //! Data starts at offset 0 (mmap page-aligned). The footer points back
 //! to the TOC via `toc_offset`.
@@ -92,20 +92,12 @@ pub fn read_dense_toc(
 /// Field header: field_id(4) + quant(1) + num_dims(4) + total_vectors(4) = 13B
 pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
-/// Current BMP blob footer magic ("BMPA" in LE). Adaptive inverted blocks,
-/// compressed pruning grids and physical document maps are followed by the
-/// mandatory optional-storage section (forward values or a disabled marker).
-/// Older BMP envelopes are rejected; enabling/disabling storage never changes
-/// the envelope version.
+/// Footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
+pub const SPARSE_FOOTER_SIZE: u64 = 24;
 pub const BMP_BLOB_MAGIC: u32 = 0x41504D42;
-
-/// BMP blob footer size.
 pub const BMP_BLOB_FOOTER_SIZE: usize = 80;
 
-/// V3 footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
-pub const SPARSE_FOOTER_SIZE: u64 = 24;
-
-/// Per-dim TOC entry accumulated during V3 sparse build/merge.
+/// Per-dim TOC entry accumulated during current sparse build/merge.
 #[cfg(any(feature = "native", feature = "wasm", test))]
 pub struct SparseDimTocEntry {
     pub dim_id: u32,
@@ -121,7 +113,7 @@ pub struct SparseDimTocEntry {
     pub max_weight: f32,
 }
 
-/// Per-field TOC entry accumulated during V3 sparse build/merge.
+/// Per-field TOC entry accumulated during current sparse build/merge.
 #[cfg(any(feature = "native", feature = "wasm", test))]
 pub struct SparseFieldToc {
     pub field_id: u32,
@@ -134,7 +126,6 @@ pub struct SparseFieldToc {
 
 #[cfg(any(feature = "native", feature = "wasm", test))]
 impl SparseFieldToc {
-    /// Build the sentinel TOC entry used by the self-contained BMP blob.
     pub(crate) fn bmp(field_id: u32, total_vectors: u32, blob_offset: u64, blob_len: u64) -> Self {
         // BMP always stores u32 dimensions and u8 impacts regardless of the
         // generic sparse schema knobs. Persist the physical representation,
@@ -160,14 +151,43 @@ impl SparseFieldToc {
             }],
         }
     }
+
+    /// Sentinel descriptor for the mandatory-forward Seismic representation.
+    pub(crate) fn seismic(
+        field_id: u32,
+        total_vectors: u32,
+        blob_offset: u64,
+        blob_len: u64,
+        weight_quantization: crate::structures::WeightQuantization,
+    ) -> Self {
+        let config = crate::structures::SparseVectorConfig {
+            format: crate::structures::SparseFormat::Seismic,
+            index_size: crate::structures::IndexSize::U32,
+            weight_quantization,
+            ..Default::default()
+        };
+        Self {
+            field_id,
+            quantization: config.to_byte(),
+            total_vectors,
+            dims: vec![SparseDimTocEntry {
+                dim_id: u32::MAX,
+                block_data_offset: blob_offset,
+                skip_start: blob_len as u32,
+                num_blocks: (blob_len >> 32) as u32,
+                doc_count: 0,
+                max_weight: 0.0,
+            }],
+        }
+    }
 }
 
-/// Write V3 sparse TOC + footer.
+/// Write current sparse TOC + footer.
 ///
-/// V3 layout:
+/// Layout:
 /// ```text
 /// [block data ...]
-/// [skip section: SparseSkipEntry × total_skips (24B each)]
+/// [MaxScore skip entries, if present]
 /// [TOC: per-field header(13B) + per-dim entries(28B each)]
 /// [footer: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4)]
 /// ```
@@ -207,12 +227,12 @@ mod tests {
     use crate::structures::{IndexSize, SparseFormat, SparseVectorConfig, WeightQuantization};
 
     #[test]
-    fn bmp_toc_describes_the_physical_v18_encoding() {
+    fn seismic_toc_describes_the_physical_forward_codec() {
         let blob_len = u64::from(u32::MAX) + 17;
-        let toc = SparseFieldToc::bmp(7, 11, 23, blob_len);
+        let toc = SparseFieldToc::seismic(7, 11, 23, blob_len, WeightQuantization::UInt8);
         let config = SparseVectorConfig::from_byte(toc.quantization).unwrap();
 
-        assert_eq!(config.format, SparseFormat::Bmp);
+        assert_eq!(config.format, SparseFormat::Seismic);
         assert_eq!(config.index_size, IndexSize::U32);
         assert_eq!(config.weight_quantization, WeightQuantization::UInt8);
         assert_eq!(toc.total_vectors, 11);

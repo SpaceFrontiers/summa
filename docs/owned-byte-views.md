@@ -18,7 +18,7 @@ The [ownedbytes implementation](https://docs.rs/ownedbytes/latest/src/ownedbytes
 used in Tantivy illustrates the same direct-view ownership principle.
 
 Matched screens supported retaining the change. The complete selected reader's
-latency and residency are reported in the block-execution results;
+latency and residency are reported in the [block-execution results](search-block-execution.md);
 individual stage gains must not be multiplied. The owner passes native heap,
 mmap, cross-thread lifetime tests and three strict-provenance Miri tests on an
 isolated extraction of the actual implementation.

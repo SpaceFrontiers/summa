@@ -2,7 +2,7 @@ use super::*;
 use crate::query::{
     AllQuery, BooleanQuery, PhraseQuery, RangeQuery, SparseTermQuery, SparseVectorQuery, TermQuery,
 };
-use crate::structures::{SparseFormat, SparseVectorConfig};
+use crate::structures::{SparseFormat, SparseVectorConfig, WeightQuantization};
 use crate::{Document, Field, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
 
 async fn fixture() -> (Index<RamDirectory>, Field, Field, Field, Field) {
@@ -10,16 +10,17 @@ async fn fixture() -> (Index<RamDirectory>, Field, Field, Field, Field) {
     let text = schema.add_text_field_with_tokenizer("body", true, false, "simple");
     let allowed = schema.add_u64_field("allowed", true, false);
     schema.set_fast(allowed, true);
-    let sparse: Vec<_> = [SparseFormat::Bmp, SparseFormat::MaxScore]
+    let sparse: Vec<_> = [WeightQuantization::Float32, WeightQuantization::UInt8]
         .into_iter()
         .enumerate()
-        .map(|(i, format)| {
+        .map(|(i, weight_quantization)| {
             schema.add_sparse_vector_field_with_config(
                 &format!("sparse{i}"),
                 true,
                 false,
                 SparseVectorConfig {
-                    format,
+                    format: SparseFormat::Seismic,
+                    weight_quantization,
                     dims: Some(16),
                     ..Default::default()
                 },
@@ -303,12 +304,12 @@ async fn small_limits_filter_required_plain_text_disjunctions_before_top_k() {
 
 #[tokio::test]
 async fn common_filter_survives_nested_boolean_optimization() {
-    let (index, text, allowed, bmp, maxscore) = fixture().await;
+    let (index, text, allowed, float32, uint8) = fixture().await;
     let text_query = BooleanQuery::new()
         .should(eligible(TermQuery::text(text, "alpha"), allowed))
         .should(TermQuery::text(text, "absent"));
     assert_selected(&index, &text_query, 12, &[10, 11]).await;
-    for field in [bmp, maxscore] {
+    for field in [float32, uint8] {
         let query = BooleanQuery::new()
             .should(eligible(
                 SparseVectorQuery::new(field, vec![(0, 1.0)]),
@@ -321,8 +322,8 @@ async fn common_filter_survives_nested_boolean_optimization() {
 
 #[tokio::test]
 async fn nested_boolean_sparse_filters_survive_scoring_decomposition() {
-    let (index, _, allowed, bmp, maxscore) = fixture().await;
-    for field in [bmp, maxscore] {
+    let (index, _, allowed, float32, uint8) = fixture().await;
+    for field in [float32, uint8] {
         for excluded in [false, true] {
             let inner = BooleanQuery::new().should(SparseVectorQuery::new(field, vec![(0, 1.0)]));
             let inner = if excluded {
@@ -339,7 +340,7 @@ async fn nested_boolean_sparse_filters_survive_scoring_decomposition() {
 }
 
 #[tokio::test]
-async fn filtered_bmp_keeps_one_global_superblock_budget_across_segments() {
+async fn filtered_sparse_scores_remain_comparable_across_segments() {
     let mut schema = Schema::builder();
     let allowed = schema.add_u64_field("allowed", true, false);
     schema.set_fast(allowed, true);
@@ -348,7 +349,7 @@ async fn filtered_bmp_keeps_one_global_superblock_budget_across_segments() {
         true,
         false,
         SparseVectorConfig {
-            format: SparseFormat::Bmp,
+            format: SparseFormat::Seismic,
             dims: Some(16),
             ..Default::default()
         },
@@ -370,7 +371,7 @@ async fn filtered_bmp_keeps_one_global_superblock_budget_across_segments() {
     }
     let index = Index::open(directory, config).await.unwrap();
     assert_eq!(index.segment_readers().await.unwrap().len(), 2);
-    let sparse_query = SparseVectorQuery::new(sparse, vec![(0, 1.0)]).with_lsp_gamma(1);
+    let sparse_query = SparseVectorQuery::new(sparse, vec![(0, 1.0)]).with_exhaustive(true);
     let queries: Vec<Box<dyn Query>> = vec![
         Box::new(eligible(sparse_query.clone(), allowed)),
         Box::new(
@@ -383,8 +384,8 @@ async fn filtered_bmp_keeps_one_global_superblock_budget_across_segments() {
         let hits = index.search(query.as_ref(), 2).await.unwrap().hits;
         assert_eq!(
             hits.len(),
-            1,
-            "one superblock across the entire index: {query}"
+            2,
+            "all eligible segments retain their matches: {query}"
         );
         assert!(hits[0].score > 0.9);
     }
@@ -403,12 +404,12 @@ async fn common_filter_precedes_boolean_text_top_k() {
 }
 
 #[tokio::test]
-async fn common_filter_precedes_boolean_bmp_top_k() {
-    let (index, _, allowed, bmp, _) = fixture().await;
+async fn common_filter_precedes_boolean_sparse_top_k() {
+    let (index, _, allowed, float32, _) = fixture().await;
     let query = eligible(
         BooleanQuery::new()
             .must(AllQuery)
-            .should(SparseTermQuery::new(bmp, 0, 1.0)),
+            .should(SparseTermQuery::new(float32, 0, 1.0)),
         allowed,
     );
     assert_selected(&index, &query, 1, &[10]).await;
@@ -416,18 +417,18 @@ async fn common_filter_precedes_boolean_bmp_top_k() {
 
 #[tokio::test]
 async fn common_filter_precedes_maxscore_sparse_top_k_in_every_plan() {
-    let (index, _, allowed, _, maxscore) = fixture().await;
+    let (index, _, allowed, _, uint8) = fixture().await;
     let queries: Vec<Box<dyn Query>> = vec![
-        Box::new(SparseVectorQuery::new(maxscore, vec![(0, 1.0), (1, 1.0)])),
+        Box::new(SparseVectorQuery::new(uint8, vec![(0, 1.0), (1, 1.0)])),
         Box::new(
             BooleanQuery::new()
-                .should(SparseTermQuery::new(maxscore, 0, 1.0))
-                .should(SparseTermQuery::new(maxscore, 1, 1.0)),
+                .should(SparseTermQuery::new(uint8, 0, 1.0))
+                .should(SparseTermQuery::new(uint8, 1, 1.0)),
         ),
         Box::new(
             BooleanQuery::new()
                 .must(AllQuery)
-                .should(SparseTermQuery::new(maxscore, 0, 1.0)),
+                .should(SparseTermQuery::new(uint8, 0, 1.0)),
         ),
     ];
     for query in queries {

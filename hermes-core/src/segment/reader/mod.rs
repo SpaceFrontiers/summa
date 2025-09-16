@@ -1938,6 +1938,7 @@ pub struct SegmentReader {
     trained_vectors: Arc<crate::segment::TrainedVectorStructures>,
     /// Sparse vector indexes per field (MaxScore format)
     sparse_indexes: FxHashMap<u32, SparseIndex>,
+    seismic_indexes: FxHashMap<u32, crate::segment::seismic::SeismicIndex>,
     /// BMP sparse vector indexes per field (BMP format)
     bmp_indexes: FxHashMap<u32, BmpIndex>,
     /// Logical size of the retained `.sparse` file handle.
@@ -2062,6 +2063,7 @@ impl SegmentReader {
         let sparse_file_backed_bytes = sparse_data.file_backed_bytes;
         let sparse_indexes = sparse_data.maxscore_indexes;
         let bmp_indexes = sparse_data.bmp_indexes;
+        let seismic_indexes = sparse_data.seismic_indexes;
 
         // Load fast-field columns from .fast file
         let fast_fields = loader::load_fast_fields_file(dir, &files, &schema).await?;
@@ -2155,6 +2157,7 @@ impl SegmentReader {
             trained_vectors: Arc::new(crate::segment::TrainedVectorStructures::default()),
             sparse_indexes,
             bmp_indexes,
+            seismic_indexes,
             sparse_file_backed_bytes,
             fast_fields,
             chunk_maps,
@@ -2210,9 +2213,9 @@ impl SegmentReader {
     /// Pin per-query-mandatory metadata sections in priority order until the
     /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
     ///
-    /// Priority: ANN run directories → BMP block-offset tables → sparse skip
+    /// Priority: ANN run directories → BMP offsets + Seismic term directories → sparse skip
     /// sections → doc-id maps → BMP E offsets + coarse H. Bulk data (ANN codes,
-    /// D/E grid payloads, block data, raw vectors) is never pinned. Fail-loud: budget
+    /// D/E grid payloads, Seismic summaries, block data, raw vectors) is never pinned. Fail-loud: budget
     /// exhaustion and mlock failures are
     /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
     /// pinned_metadata_bytes}`.
@@ -2239,6 +2242,9 @@ impl SegmentReader {
         for bmp in self.bmp_indexes.values_mut() {
             bmp.pin_block_starts(policy.mode, &mut remaining, &mut sparse_report);
         }
+        for seismic in self.seismic_indexes.values_mut() {
+            seismic.pin_term_directories(policy.mode, &mut remaining, &mut sparse_report);
+        }
         // Priority 3: sparse skip sections
         for sparse in self.sparse_indexes.values_mut() {
             sparse.pin_skip_section(policy.mode, &mut remaining, &mut sparse_report);
@@ -2249,6 +2255,9 @@ impl SegmentReader {
         }
         for bmp in self.bmp_indexes.values_mut() {
             bmp.pin_doc_maps(policy.mode, &mut remaining, &mut sparse_report);
+        }
+        for seismic in self.seismic_indexes.values_mut() {
+            seismic.pin_row_directories(policy.mode, &mut remaining, &mut sparse_report);
         }
         // Priority 5: BMP E offsets and coarse H
         for bmp in self.bmp_indexes.values_mut() {
@@ -2272,6 +2281,8 @@ impl SegmentReader {
                 .heap_copy_bytes
                 .saturating_add(sparse_report.heap_copy_bytes),
         };
+        self.dense_pin_report = dense_report;
+        self.sparse_pin_report = sparse_report;
         if disabled {
             crate::segment::pin::warn_if_pinning_disabled(
                 self.schema.index_label(),
@@ -2300,8 +2311,6 @@ impl SegmentReader {
                 policy.mode,
             );
         }
-        self.dense_pin_report = dense_report;
-        self.sparse_pin_report = sparse_report;
     }
 
     // NOTE: cross-group MaxScore threshold seeding is query-execution-local
@@ -2388,6 +2397,45 @@ impl SegmentReader {
 
     pub fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Get the Seismic nomination and exact forward owner for a sparse field.
+    pub(crate) fn seismic_index(
+        &self,
+        field: Field,
+    ) -> Option<&crate::segment::seismic::SeismicIndex> {
+        self.seismic_indexes.get(&field.0)
+    }
+
+    /// Seismic sparse fields retained by this immutable segment.
+    #[cfg(any(feature = "native", test))]
+    pub(crate) fn seismic_indexes(&self) -> &FxHashMap<u32, crate::segment::seismic::SeismicIndex> {
+        &self.seismic_indexes
+    }
+
+    /// Encoded nomination and maintenance-debt diagnostics per sparse field.
+    pub fn seismic_stats(&self) -> Vec<(u32, crate::segment::SeismicStats)> {
+        let mut fields: Vec<_> = self
+            .seismic_indexes
+            .iter()
+            .map(|(&field, index)| {
+                (
+                    field,
+                    crate::segment::SeismicStats {
+                        total_vectors: index.total_vectors(),
+                        dimensions: index.dims(),
+                        nominations: index.nomination_count(),
+                        forward_entries: index.forward_entries(),
+                        clusters: index.cluster_count(),
+                        encoded_bytes: index.encoded_bytes() as u64,
+                        pending_terms: index.pending_terms(),
+                        runs: index.run_count() as u32,
+                    },
+                )
+            })
+            .collect();
+        fields.sort_unstable_by_key(|(field, _)| *field);
+        fields
     }
 
     /// Get sparse indexes for all fields
@@ -2503,10 +2551,15 @@ impl SegmentReader {
         // Sparse heap: SoA dimension tables and small reader objects. Posting
         // payloads, BMP grids, and document maps remain file-backed.
         let sparse_heap_bytes: usize = self
-            .sparse_indexes
+            .seismic_indexes
             .values()
-            .map(|s| s.estimated_heap_bytes())
+            .map(|i| i.estimated_heap_bytes())
             .sum::<usize>()
+            + self
+                .sparse_indexes
+                .values()
+                .map(|s| s.estimated_heap_bytes())
+                .sum::<usize>()
             + self
                 .bmp_indexes
                 .values()

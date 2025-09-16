@@ -1,12 +1,12 @@
-//! Sparse vector queries for similarity search (MaxScore-based)
+//! Sparse vector queries with geometric nomination and exact forward scoring.
 
 use crate::dsl::Field;
+use crate::query::{MatchedPositions, ScoredPosition};
 use crate::segment::SegmentReader;
 use crate::{DocId, Score, TERMINATED};
 
 use super::combiner::MultiValueCombiner;
-use crate::query::ScoredPosition;
-use crate::query::traits::{CountFuture, MatchedPositions, Query, Scorer, ScorerFuture};
+use crate::query::traits::{CountFuture, Query, Scorer, ScorerFuture};
 
 const DEFAULT_SPARSE_OVER_FETCH_FACTOR: f32 = crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32;
 
@@ -33,30 +33,32 @@ pub struct SparseVectorQuery {
     pub vector: Vec<(u32, f32)>,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
-    /// Approximate search factor (1.0 = exact, lower values = faster but approximate)
-    /// Controls MaxScore pruning aggressiveness in block-max scoring
     pub heap_factor: f32,
+    pub over_fetch_factor: f32,
+    pub lsp_gamma: Option<usize>,
     /// Minimum abs(weight) for query dimensions (0.0 = no filtering)
     /// Dimensions below this threshold are dropped from candidate generation.
-    /// BMP still uses the bounded full query when scoring visited candidates.
+    /// Seismic still uses the bounded full query when scoring visited candidates.
     pub weight_threshold: f32,
     /// Maximum candidate-generation dimensions (None = implementation cap).
-    /// Keeps only the top-k dimensions by abs(weight); BMP final scoring uses
+    /// Keeps only the top-k dimensions by abs(weight); Seismic final scoring uses
     /// up to `MAX_QUERY_TERMS` dimensions from the full query.
     pub max_query_dims: Option<usize>,
     /// Fraction of query dimensions to keep (0.0-1.0), same semantics as
     /// indexing-time `pruning`: sort by abs(weight) descending,
-    /// keep top fraction. BMP applies it to candidate generation and scores
+    /// keep top fraction. Seismic applies it to candidate generation and scores
     /// visited candidates with the bounded full query. None or 1.0 = no pruning.
     pub pruning: Option<f32>,
     /// Minimum number of query dimensions before pruning and weight_threshold
     /// filtering are applied. Protects short queries from losing signal.
     /// Default: 4. Set to 0 to always apply.
     pub min_query_dims: usize,
-    /// Multiplier on executor limit for ordinal deduplication (1.0 = no over-fetch)
-    pub over_fetch_factor: f32,
-    /// LSP/0 γ. None is depth-derived; Some(0) is exhaustive.
-    pub lsp_gamma: Option<usize>,
+    /// Number of highest-weight dimensions used to nominate Seismic candidates.
+    pub seismic_cut: usize,
+    /// Summary pruning factor. Zero visits every nominated cluster.
+    pub seismic_factor: f32,
+    /// Scan all forward vectors with the same scorer.
+    pub exhaustive: bool,
     /// Cached pruned vector; None = use `vector` as-is (no pruning applied)
     pruned: Option<Vec<(u32, f32)>>,
 }
@@ -65,9 +67,6 @@ impl std::fmt::Display for SparseVectorQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let dims = self.pruned_dims();
         write!(f, "Sparse({}, dims={}", self.field.0, dims.len())?;
-        if self.heap_factor < 1.0 {
-            write!(f, ", heap={}", self.heap_factor)?;
-        }
         if self.vector.len() != dims.len() {
             write!(f, ", orig={}", self.vector.len())?;
         }
@@ -78,22 +77,26 @@ impl std::fmt::Display for SparseVectorQuery {
 impl SparseVectorQuery {
     /// Create a new sparse vector query
     ///
-    /// Default combiner is `LogSumExp { temperature: 0.7 }` — a
+    /// Default combiner is [`MultiValueCombiner::default`] (LogSumExp, temperature 1.5) — a
     /// softmax-weighted smooth maximum. A document's score follows its
     /// strongest ordinals; ordinal *count* contributes nothing on its own,
     /// so many-chunk documents cannot outrank a focused strong match.
     pub fn new(field: Field, vector: Vec<(u32, f32)>) -> Self {
+        let defaults = crate::structures::SparseQueryConfig::default();
         let mut q = Self {
             field,
             vector,
-            combiner: MultiValueCombiner::LogSumExp { temperature: 0.7 },
+            combiner: MultiValueCombiner::default(),
             heap_factor: 1.0,
+            over_fetch_factor: DEFAULT_SPARSE_OVER_FETCH_FACTOR,
+            lsp_gamma: None,
             weight_threshold: 0.0,
             max_query_dims: Some(crate::query::MAX_QUERY_TERMS),
             pruning: None,
             min_query_dims: 4,
-            over_fetch_factor: DEFAULT_SPARSE_OVER_FETCH_FACTOR,
-            lsp_gamma: None,
+            seismic_cut: defaults.seismic_cut,
+            seismic_factor: defaults.seismic_factor,
+            exhaustive: defaults.exhaustive,
             pruned: None,
         };
         q.pruned = q.compute_pruned_vector();
@@ -127,6 +130,7 @@ impl SparseVectorQuery {
                 crate::query::MAX_QUERY_TERMS
             )));
         }
+
         if !self.heap_factor.is_finite() || !(0.0..=1.0).contains(&self.heap_factor) {
             return Err(crate::Error::Query(format!(
                 "sparse heap_factor must be finite and in [0, 1], got {}",
@@ -141,32 +145,42 @@ impl SparseVectorQuery {
                 self.over_fetch_factor
             )));
         }
+        crate::query::seismic::validate_options(self.seismic_cut, self.seismic_factor)?;
         self.combiner.validate().map_err(crate::Error::Query)
     }
 
-    /// Set the multi-value score combiner
-    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
-        self.combiner = combiner;
+    /// Configure Seismic nomination dimensions and summary pruning.
+    pub fn with_heap_factor(mut self, heap_factor: f32) -> Self {
+        self.heap_factor = heap_factor.clamp(0.0, 1.0);
         self
     }
 
-    /// Set executor over-fetch factor for multi-valued fields.
-    /// After MaxScore execution, ordinal combining may reduce result count;
-    /// this multiplier compensates by fetching more from the executor.
-    /// (1.0 = no over-fetch, 2.0 = fetch 2x then combine down)
     pub fn with_over_fetch_factor(mut self, factor: f32) -> Self {
         self.over_fetch_factor = factor.clamp(1.0, DEFAULT_SPARSE_OVER_FETCH_FACTOR);
         self
     }
 
-    /// Set the heap factor for approximate search
-    ///
-    /// Controls the trade-off between speed and recall:
-    /// - 1.0 = exact search (default)
-    /// - 0.8-0.9 = ~20-40% faster with minimal recall loss
-    /// - Lower values = more aggressive pruning, faster but lower recall
-    pub fn with_heap_factor(mut self, heap_factor: f32) -> Self {
-        self.heap_factor = heap_factor.clamp(0.0, 1.0);
+    pub fn with_lsp_gamma(mut self, gamma: usize) -> Self {
+        self.lsp_gamma = Some(gamma);
+        self
+    }
+
+    pub fn with_seismic_cut(mut self, cut: usize) -> Self {
+        self.seismic_cut = cut;
+        self
+    }
+    pub fn with_seismic_factor(mut self, factor: f32) -> Self {
+        self.seismic_factor = factor;
+        self
+    }
+    pub fn with_exhaustive(mut self, exhaustive: bool) -> Self {
+        self.exhaustive = exhaustive;
+        self
+    }
+
+    /// Set the multi-value score combiner
+    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
+        self.combiner = combiner;
         self
     }
 
@@ -180,7 +194,7 @@ impl SparseVectorQuery {
 
     /// Set maximum number of query dimensions (top-k by weight)
     pub fn with_max_query_dims(mut self, max_dims: usize) -> Self {
-        // MaxScore and BMP use a u64 query-term mask in their hot paths.  Keep
+        // The query planner bounds scratch to MAX_QUERY_TERMS. Keep
         // this invariant here even when an SDL or RPC override asks for more.
         self.max_query_dims = Some(max_dims.min(crate::query::MAX_QUERY_TERMS));
         self.pruned = self.compute_pruned_vector();
@@ -200,13 +214,6 @@ impl SparseVectorQuery {
     pub fn with_min_query_dims(mut self, min_dims: usize) -> Self {
         self.min_query_dims = min_dims;
         self.pruned = self.compute_pruned_vector();
-        self
-    }
-
-    /// Select at most the top-γ superblocks by SBMax using LSP/0.
-    /// Zero retains exhaustive SBMax-ordered traversal.
-    pub fn with_lsp_gamma(mut self, gamma: usize) -> Self {
-        self.lsp_gamma = Some(gamma);
         self
     }
 
@@ -448,9 +455,19 @@ impl SparseVectorQuery {
 }
 
 impl SparseVectorQuery {
+    fn sparse_infos_for_plan(
+        &self,
+        plan: Option<&std::sync::Arc<crate::query::bmp::LspSegmentPlan>>,
+    ) -> SparseQueryInfos {
+        match plan {
+            Some(plan) => SparseQueryInfos::Shared(std::sync::Arc::clone(&plan.infos)),
+            None => SparseQueryInfos::Local(self.sparse_infos()),
+        }
+    }
+
     /// Build a bounded full-query decomposition and mark the pruned terms used
-    /// for candidate generation. LSP/BMP scores visited documents with the
-    /// full list; MaxScore continues to consume only marked candidate terms.
+    /// for candidate generation. Seismic scores visited documents with the
+    /// full list.
     fn sparse_infos(&self) -> Vec<crate::query::SparseTermQueryInfo> {
         let candidate_dims: Option<rustc_hash::FxHashSet<u32>> = self
             .pruned
@@ -463,10 +480,21 @@ impl SparseVectorQuery {
             candidate: candidate_dims
                 .as_ref()
                 .is_none_or(|dimensions| dimensions.contains(&dim_id)),
-            heap_factor: self.heap_factor,
             combiner: self.combiner,
+            heap_factor: if self.exhaustive {
+                1.0
+            } else {
+                self.heap_factor
+            },
             over_fetch_factor: self.over_fetch_factor,
-            lsp_gamma: self.lsp_gamma,
+            lsp_gamma: if self.exhaustive {
+                Some(0)
+            } else {
+                self.lsp_gamma
+            },
+            seismic_cut: self.seismic_cut,
+            seismic_factor: self.seismic_factor,
+            exhaustive: self.exhaustive,
         };
         if self.vector.len() <= crate::query::MAX_QUERY_TERMS {
             return self.vector.iter().copied().map(make_info).collect();
@@ -483,19 +511,23 @@ impl SparseVectorQuery {
         scoring_dims.truncate(crate::query::MAX_QUERY_TERMS);
         scoring_dims.into_iter().map(make_info).collect()
     }
-
-    fn sparse_infos_for_plan(
-        &self,
-        plan: Option<&std::sync::Arc<crate::query::bmp::LspSegmentPlan>>,
-    ) -> SparseQueryInfos {
-        match plan {
-            Some(plan) => SparseQueryInfos::Shared(std::sync::Arc::clone(&plan.infos)),
-            None => SparseQueryInfos::Local(self.sparse_infos()),
-        }
-    }
 }
 
 impl Query for SparseVectorQuery {
+    fn as_doc_bitset_with_options(
+        &self,
+        reader: &SegmentReader,
+        options: &crate::query::ScorerOptions,
+    ) -> Option<crate::query::DocBitset> {
+        self.validate(reader).ok()?;
+        let index = reader.seismic_index(self.field)?;
+        let terms: Vec<_> = self
+            .sparse_infos()
+            .iter()
+            .map(|info| (info.dim_id, info.weight))
+            .collect();
+        crate::query::seismic::membership(index, reader.num_docs(), &terms, options)
+    }
     fn candidate_query(&self) -> crate::Result<crate::query::CandidateQuery> {
         Ok(crate::query::CandidateQuery::new(
             self.field,
@@ -524,23 +556,11 @@ impl Query for SparseVectorQuery {
         Box::pin(async move {
             validation?;
             let infos = infos.as_slice();
-            if infos.is_empty() {
-                return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>);
-            }
-
-            // Auto-detect: try BMP executor first (coupled to index format)
-            if let Some((raw, info)) =
-                crate::query::planner::build_sparse_bmp_results(infos, reader, limit, &options)?
+            if let Some(scorer) =
+                crate::query::planner::build_sparse_memory_scorer(infos, reader, limit, &options)?
             {
-                return Ok(crate::query::planner::combine_sparse_results(
-                    raw,
-                    info.combiner,
-                    info.field,
-                    limit,
-                ));
+                return Ok(scorer);
             }
-
-            // Fall back to MaxScore execution
             if let Some((executor, info)) = crate::query::planner::build_sparse_maxscore_executor(
                 infos, reader, limit, None, &options,
             ) {
@@ -552,7 +572,6 @@ impl Query for SparseVectorQuery {
                     limit,
                 ));
             }
-
             Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer>)
         })
     }
@@ -576,23 +595,11 @@ impl Query for SparseVectorQuery {
         self.validate(reader)?;
         let infos = self.sparse_infos_for_plan(options.lsp_plan.as_ref());
         let infos = infos.as_slice();
-        if infos.is_empty() {
-            return Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>);
-        }
-
-        // Auto-detect: try BMP executor first (coupled to index format)
-        if let Some((raw, info)) =
-            crate::query::planner::build_sparse_bmp_results(infos, reader, limit, &options)?
+        if let Some(scorer) =
+            crate::query::planner::build_sparse_memory_scorer(infos, reader, limit, &options)?
         {
-            return Ok(crate::query::planner::combine_sparse_results(
-                raw,
-                info.combiner,
-                info.field,
-                limit,
-            ));
+            return Ok(scorer);
         }
-
-        // Fall back to MaxScore execution
         if let Some((executor, info)) = crate::query::planner::build_sparse_maxscore_executor(
             infos, reader, limit, None, &options,
         ) {
@@ -604,7 +611,6 @@ impl Query for SparseVectorQuery {
                 limit,
             ));
         }
-
         Ok(Box::new(crate::query::EmptyScorer) as Box<dyn Scorer + 'a>)
     }
 
@@ -634,12 +640,14 @@ pub struct SparseTermQuery {
     pub field: Field,
     pub dim_id: u32,
     pub weight: f32,
-    /// MaxScore heap factor (1.0 = exact, lower = approximate)
-    pub heap_factor: f32,
     /// Multi-value combiner for ordinal deduplication
     pub combiner: MultiValueCombiner,
-    /// Multiplier on executor limit to compensate for ordinal deduplication
+    pub heap_factor: f32,
     pub over_fetch_factor: f32,
+    pub lsp_gamma: Option<usize>,
+    pub seismic_cut: usize,
+    pub seismic_factor: f32,
+    pub exhaustive: bool,
 }
 
 impl std::fmt::Display for SparseTermQuery {
@@ -654,28 +662,51 @@ impl std::fmt::Display for SparseTermQuery {
 
 impl SparseTermQuery {
     pub fn new(field: Field, dim_id: u32, weight: f32) -> Self {
+        let defaults = crate::structures::SparseQueryConfig::default();
         Self {
             field,
             dim_id,
             weight,
-            heap_factor: 1.0,
             combiner: MultiValueCombiner::default(),
+            heap_factor: 1.0,
             over_fetch_factor: DEFAULT_SPARSE_OVER_FETCH_FACTOR,
+            lsp_gamma: None,
+            seismic_cut: defaults.seismic_cut,
+            seismic_factor: defaults.seismic_factor,
+            exhaustive: defaults.exhaustive,
         }
     }
 
     pub fn with_heap_factor(mut self, heap_factor: f32) -> Self {
-        self.heap_factor = heap_factor;
-        self
-    }
-
-    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
-        self.combiner = combiner;
+        self.heap_factor = heap_factor.clamp(0.0, 1.0);
         self
     }
 
     pub fn with_over_fetch_factor(mut self, factor: f32) -> Self {
         self.over_fetch_factor = factor.clamp(1.0, DEFAULT_SPARSE_OVER_FETCH_FACTOR);
+        self
+    }
+
+    pub fn with_lsp_gamma(mut self, gamma: usize) -> Self {
+        self.lsp_gamma = Some(gamma);
+        self
+    }
+
+    pub fn with_seismic_cut(mut self, cut: usize) -> Self {
+        self.seismic_cut = cut;
+        self
+    }
+    pub fn with_seismic_factor(mut self, factor: f32) -> Self {
+        self.seismic_factor = factor;
+        self
+    }
+    pub fn with_exhaustive(mut self, exhaustive: bool) -> Self {
+        self.exhaustive = exhaustive;
+        self
+    }
+
+    pub fn with_combiner(mut self, combiner: MultiValueCombiner) -> Self {
+        self.combiner = combiner;
         self
     }
 
@@ -695,6 +726,7 @@ impl SparseTermQuery {
                 "sparse term query weight must be finite".to_string(),
             ));
         }
+
         if !self.heap_factor.is_finite() || !(0.0..=1.0).contains(&self.heap_factor) {
             return Err(crate::Error::Query(format!(
                 "sparse heap_factor must be finite and in [0, 1], got {}",
@@ -709,42 +741,49 @@ impl SparseTermQuery {
                 self.over_fetch_factor
             )));
         }
+        crate::query::seismic::validate_options(self.seismic_cut, self.seismic_factor)?;
         self.combiner.validate().map_err(crate::Error::Query)
     }
 
-    /// BMP fallback: execute BMP for this single dimension and wrap in a TopK scorer.
-    fn bmp_fallback_scorer<'a>(
+    fn sparse_info(&self) -> crate::query::SparseTermQueryInfo {
+        crate::query::SparseTermQueryInfo {
+            field: self.field,
+            dim_id: self.dim_id,
+            weight: self.weight,
+            candidate: true,
+            combiner: self.combiner,
+            heap_factor: if self.exhaustive {
+                1.0
+            } else {
+                self.heap_factor
+            },
+            over_fetch_factor: self.over_fetch_factor,
+            lsp_gamma: if self.exhaustive {
+                Some(0)
+            } else {
+                self.lsp_gamma
+            },
+            seismic_cut: self.seismic_cut,
+            seismic_factor: self.seismic_factor,
+            exhaustive: self.exhaustive,
+        }
+    }
+
+    /// Execute an in-memory sparse backend for this single dimension.
+    fn make_scorer<'a>(
         &self,
         reader: &'a SegmentReader,
         limit: usize,
         options: &crate::query::ScorerOptions,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        let infos = [crate::query::SparseTermQueryInfo {
-            field: self.field,
-            dim_id: self.dim_id,
-            weight: self.weight,
-            candidate: true,
-            heap_factor: self.heap_factor,
-            combiner: self.combiner,
-            over_fetch_factor: self.over_fetch_factor,
-            lsp_gamma: None,
-        }];
-        if let Some((raw, info)) =
-            crate::query::planner::build_sparse_bmp_results(&infos, reader, limit, options)?
-        {
-            return Ok(crate::query::planner::combine_sparse_results(
-                raw,
-                info.combiner,
-                info.field,
-                limit,
-            ));
-        }
-        Ok(Box::new(crate::query::EmptyScorer))
+        let infos = [self.sparse_info()];
+        Ok(
+            crate::query::planner::build_sparse_memory_scorer(&infos, reader, limit, options)?
+                .unwrap_or_else(|| Box::new(crate::query::EmptyScorer)),
+        )
     }
 
-    /// Create a SparseTermScorer from this query's config against a segment.
-    /// Returns EmptyScorer if the dimension doesn't exist.
-    fn make_scorer<'a>(
+    fn make_maxscore_scorer<'a>(
         &self,
         reader: &'a SegmentReader,
     ) -> crate::Result<Option<SparseTermScorer<'a>>> {
@@ -773,6 +812,20 @@ impl SparseTermQuery {
 }
 
 impl Query for SparseTermQuery {
+    fn as_doc_bitset_with_options(
+        &self,
+        reader: &SegmentReader,
+        options: &crate::query::ScorerOptions,
+    ) -> Option<crate::query::DocBitset> {
+        self.validate(reader).ok()?;
+        let index = reader.seismic_index(self.field)?;
+        crate::query::seismic::membership(
+            index,
+            reader.num_docs(),
+            &[(self.dim_id, self.weight)],
+            options,
+        )
+    }
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         self.scorer_with_options(reader, limit, crate::query::ScorerOptions::with_positions())
     }
@@ -786,12 +839,11 @@ impl Query for SparseTermQuery {
         let query = self.clone();
         Box::pin(async move {
             query.validate(reader)?;
-            let mut scorer = match query.make_scorer(reader)? {
-                Some(s) => s,
-                None => return query.bmp_fallback_scorer(reader, limit, &options),
-            };
-            scorer.cursor.ensure_block_loaded().await.ok();
-            Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
+            if let Some(mut scorer) = query.make_maxscore_scorer(reader)? {
+                scorer.cursor.ensure_block_loaded().await?;
+                return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
+            }
+            query.make_scorer(reader, limit, &options)
         })
     }
 
@@ -812,40 +864,32 @@ impl Query for SparseTermQuery {
         options: crate::query::ScorerOptions,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         self.validate(reader)?;
-        let mut scorer = match self.make_scorer(reader)? {
-            Some(s) => s,
-            None => return self.bmp_fallback_scorer(reader, limit, &options),
-        };
-        scorer.cursor.ensure_block_loaded_sync().ok();
-        Ok(Box::new(scorer) as Box<dyn Scorer + 'a>)
+        if let Some(mut scorer) = self.make_maxscore_scorer(reader)? {
+            scorer.cursor.ensure_block_loaded_sync()?;
+            return Ok(Box::new(scorer) as Box<dyn Scorer + 'a>);
+        }
+        self.make_scorer(reader, limit, &options)
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
-        let field = self.field;
-        let dim_id = self.dim_id;
-        Box::pin(async move {
-            let si = match reader.sparse_index(field) {
-                Some(si) => si,
-                None => return Ok(0),
-            };
-            match si.get_skip_range_full(dim_id) {
-                Some((_, skip_count, _, _)) => Ok((skip_count * 256) as u32),
-                None => Ok(0),
-            }
-        })
+        let count = reader.seismic_index(self.field).map_or_else(
+            || {
+                reader.sparse_index(self.field).map_or_else(
+                    || {
+                        reader
+                            .bmp_index(self.field)
+                            .map_or(0, |_| reader.num_docs())
+                    },
+                    |index| index.doc_count(self.dim_id).min(reader.num_docs()),
+                )
+            },
+            |index| index.len().min(reader.num_docs()),
+        );
+        Box::pin(async move { Ok(count) })
     }
 
     fn decompose(&self) -> crate::query::QueryDecomposition {
-        crate::query::QueryDecomposition::SparseTerms(vec![crate::query::SparseTermQueryInfo {
-            field: self.field,
-            dim_id: self.dim_id,
-            weight: self.weight,
-            candidate: true,
-            heap_factor: self.heap_factor,
-            combiner: self.combiner,
-            over_fetch_factor: self.over_fetch_factor,
-            lsp_gamma: None,
-        }])
+        crate::query::QueryDecomposition::SparseTerms(vec![self.sparse_info()])
     }
 }
 
@@ -909,6 +953,46 @@ mod tests {
     use crate::dsl::Field;
 
     #[test]
+    fn programmatic_sparse_queries_share_schema_seismic_defaults() {
+        let defaults = crate::structures::SparseQueryConfig::default();
+        let omitted: crate::structures::SparseQueryConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted, defaults);
+        let vector = SparseVectorQuery::new(Field(0), vec![(7, 0.5)]);
+        let term = SparseTermQuery::new(Field(0), 7, 0.5);
+        let expected = (
+            defaults.seismic_cut,
+            defaults.seismic_factor,
+            defaults.exhaustive,
+        );
+        assert_eq!(
+            (vector.seismic_cut, vector.seismic_factor, vector.exhaustive),
+            expected
+        );
+        assert_eq!(
+            (term.seismic_cut, term.seismic_factor, term.exhaustive),
+            expected
+        );
+        // The programmatic work cap intentionally differs from the optional
+        // schema cap; sharing Seismic defaults must not remove that bound.
+        assert_eq!(vector.max_query_dims, Some(crate::query::MAX_QUERY_TERMS));
+        assert_eq!(defaults.max_query_dims, None);
+        for decomposition in [vector.decompose(), term.decompose()] {
+            let crate::query::QueryDecomposition::SparseTerms(infos) = decomposition else {
+                panic!("sparse queries must expose sparse scoring terms");
+            };
+            assert_eq!(infos.len(), 1);
+            assert_eq!(
+                (
+                    infos[0].seismic_cut,
+                    infos[0].seismic_factor,
+                    infos[0].exhaustive
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn test_sparse_vector_query_new() {
         let sparse = vec![(1, 0.5), (5, 0.3), (10, 0.2)];
         let query = SparseVectorQuery::new(Field(0), sparse.clone());
@@ -930,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn max_query_dims_cannot_exceed_executor_mask_width() {
+    fn max_query_dims_cannot_exceed_query_work_budget() {
         let vector: Vec<(u32, f32)> = (0..100).map(|dim| (dim, dim as f32 + 1.0)).collect();
         let query = SparseVectorQuery::new(Field(0), vector).with_max_query_dims(usize::MAX);
 
@@ -961,21 +1045,6 @@ mod tests {
                 .map(|info| (info.dim_id, info.weight))
                 .collect::<Vec<_>>(),
             vec![(3, 1.0), (7, 0.8), (11, 0.2)]
-        );
-    }
-
-    #[test]
-    fn sparse_over_fetch_factor_uses_shared_candidate_bound() {
-        let query = SparseVectorQuery::new(Field(0), vec![]).with_over_fetch_factor(99.0);
-        let term = SparseTermQuery::new(Field(0), 1, 1.0).with_over_fetch_factor(99.0);
-
-        assert_eq!(
-            query.over_fetch_factor,
-            crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32
-        );
-        assert_eq!(
-            term.over_fetch_factor,
-            crate::query::MAX_CANDIDATE_OVERSUBSCRIPTION as f32
         );
     }
 }

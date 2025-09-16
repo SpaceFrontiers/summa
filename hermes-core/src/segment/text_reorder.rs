@@ -178,7 +178,7 @@ async fn plan_field(
     }
     let prefix = field.0.to_le_bytes();
 
-    // Reuse BMP's low-frequency selection and fitting policy. Text builds
+    // Use the shared graph-bisection low-frequency selection and fitting policy. Text builds
     // a (unit, term) array plus CSR, so its construction costs 12 B/posting.
     // Per-unit scratch includes counts, offsets, fill cursors and BP scratch.
     check_cancelled(cancellation)?;
@@ -968,7 +968,7 @@ mod tests {
             };
             merger().merge(&output, &sources, copy, None).await.unwrap();
             merger()
-                .with_bmp_reorder(true)
+                .with_reorder_fields(true)
                 .merge(&output, &sources, fused, None)
                 .await
                 .unwrap();
@@ -981,10 +981,13 @@ mod tests {
                 None,
                 crate::segment::reorder::DEFAULT_MEMORY_BUDGET,
                 crate::segment::BpBudget::full(),
+                true,
                 crate::segment::reorder::BpGranularity::Auto,
                 crate::structures::IndexOptimization::default(),
                 codec,
+                None,
                 crate::structures::SSTableBlockSize::default(),
+                None,
                 None,
                 None,
             )
