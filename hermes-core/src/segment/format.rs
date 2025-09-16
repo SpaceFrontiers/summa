@@ -94,7 +94,7 @@ pub const SPARSE_FOOTER_MAGIC: u32 = 0x34525053;
 
 /// Footer size: skip_offset(8) + toc_offset(8) + num_fields(4) + magic(4) = 24
 pub const SPARSE_FOOTER_SIZE: u64 = 24;
-pub const BMP_BLOB_MAGIC: u32 = 0x41504D42;
+pub const BMP_BLOB_MAGIC: u32 = 0x42504D42;
 pub const BMP_BLOB_FOOTER_SIZE: usize = 80;
 
 /// Per-dim TOC entry accumulated during current sparse build/merge.

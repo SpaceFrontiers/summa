@@ -129,18 +129,11 @@ pub(crate) fn build_blob_with_keys(
             &weights,
             config.weight_quantization,
         )?;
-        let len = values
-            .len()
-            .checked_mul(4)
-            .and_then(|n| n.checked_add(encoded.len()))
-            .and_then(|n| u32::try_from(n).ok())
-            .ok_or_else(|| corrupt("forward vector too large"))?;
-        let mut bytes = Vec::with_capacity(len as usize);
-        for &(dim, _) in &values {
-            put32(&mut bytes, dim)?;
-        }
+        let (encoding, mut bytes) = dimensions::encode(&values, config.seismic.forward_compression);
         bytes.extend_from_slice(&encoded);
-        let quantized = ForwardVector::new(&bytes, values.len(), config.weight_quantization);
+        let len = u32::try_from(bytes.len()).map_err(|_| corrupt("forward vector too large"))?;
+        let quantized =
+            ForwardVector::new(&bytes, values.len(), config.weight_quantization, encoding);
         for (dest, (_, weight)) in values.iter_mut().zip(quantized.iter()) {
             dest.1 = weight;
         }
@@ -150,7 +143,7 @@ pub(crate) fn build_blob_with_keys(
             ));
         }
         writer.root().write_all(&bytes)?;
-        directory.push((key, offset, len, values.len() as u32));
+        directory.push((key, offset, len, values.len() as u32, encoding));
         offset += u64::from(len);
         rows.push(values);
     }
@@ -159,7 +152,7 @@ pub(crate) fn build_blob_with_keys(
 
 pub(super) fn finish_blob(
     rows: Vec<Values>,
-    directory: Vec<(LogicalUnit, u64, u32, u32)>,
+    directory: Vec<(LogicalUnit, u64, u32, u32, u8)>,
     mut offset: u64,
     dims: u32,
     config: &SparseVectorConfig,
@@ -167,11 +160,11 @@ pub(super) fn finish_blob(
 ) -> Result<OutputLengths> {
     let count = u32::try_from(rows.len()).map_err(|_| corrupt("too many forward vectors"))?;
     let row_offset = offset;
-    for &(key, start, len, n) in &directory {
+    for &(key, start, len, n, encoding) in &directory {
         let root = writer.root();
         put32(root, key.doc)?;
         root.write_all(&key.ordinal.to_le_bytes())?;
-        root.write_all(&[0; 2])?;
+        root.write_all(&[encoding, 0])?;
         put64(root, start)?;
         put32(root, len)?;
         put32(root, n)?;

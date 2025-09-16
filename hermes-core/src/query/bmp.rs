@@ -1997,20 +1997,22 @@ fn score_forward_units(
     query_by_dim_u16: &[(u32, u16)],
 ) -> crate::Result<u32> {
     let mut query = query_by_dim_u16;
-    let mut units = 0u32;
-    for (dimension, impact) in vector.iter() {
-        while query.first().is_some_and(|&(dim, _)| dim < dimension) {
-            query = &query[1..];
-        }
-        // Retain every already-quantized query contribution, including repeated
-        // dimensions. Keep the cursor here for duplicate document entries too.
-        for &(_, weight) in query.iter().take_while(|&&(dim, _)| dim == dimension) {
-            units = units
-                .checked_add(u32::from(impact) * u32::from(weight))
-                .ok_or_else(|| crate::Error::Query("BMP candidate score overflow".into()))?;
-        }
-    }
-    Ok(units)
+    // Keep the fallible accumulator compact in the per-coordinate fold. Carrying
+    // the full Error enum here generates stack copies on every decoded lane.
+    vector
+        .fold(Some(0u32), |units, dimension, impact| {
+            let mut units = units?;
+            while query.first().is_some_and(|&(dim, _)| dim < dimension) {
+                query = &query[1..];
+            }
+            // Retain every already-quantized query contribution, including repeated
+            // dimensions. Keep the cursor here for duplicate document entries too.
+            for &(_, weight) in query.iter().take_while(|&&(dim, _)| dim == dimension) {
+                units = units.checked_add(u32::from(impact) * u32::from(weight))?;
+            }
+            Some(units)
+        })
+        .ok_or_else(|| crate::Error::Query("BMP candidate score overflow".into()))
 }
 
 /// Request-owned preparation for one immutable scoring component. Retain only
@@ -2053,7 +2055,7 @@ impl CandidateBmpPreparation {
         let dequant = prepared.dequant_for(index)?;
         if let Some(forward) = index.forward() {
             for (score, &target) in scores.iter_mut().zip(targets) {
-                let vector = forward.vector(target)?;
+                let vector = forward.vector_for_scoring(target)?;
                 let units = score_forward_units(vector, &prepared.query_by_dim_u16)?;
                 *score = units as f32 * dequant;
             }
@@ -2138,6 +2140,72 @@ mod tests {
         CompressedGrid, CompressedGridLayout, GRID_GROUP_CELLS, GridKernels, ResolvedGridGroup,
         bit_width, pack_group,
     };
+
+    fn forward_score(entries: &[(u32, u8)], query: &[(u32, u16)]) -> crate::Result<u32> {
+        use crate::segment::bmp_forward::{BmpForward, RowWriter, write_directory};
+        use crate::segment::logical_address::LogicalUnit;
+
+        let mut bytes = Vec::new();
+        let mut writer = RowWriter::default();
+        for &(dimension, impact) in entries {
+            writer.push(dimension, impact, &mut bytes).unwrap();
+        }
+        writer.finish(&mut bytes).unwrap();
+        let payload_bytes = bytes.len() as u64;
+        write_directory(
+            &mut bytes,
+            [Ok((LogicalUnit { doc: 0, ordinal: 0 }, 0))],
+            1,
+            payload_bytes,
+        )
+        .unwrap();
+        let forward = BmpForward::parse(OwnedBytes::new(bytes), 1, 1, u32::MAX).unwrap();
+        super::score_forward_units(forward.vector_for_scoring(0).unwrap(), query)
+    }
+
+    #[test]
+    fn forward_score_preserves_duplicate_matches_across_packets_and_encodings() {
+        // Exercise fixed-width packets, gap groups, packet boundaries and tails.
+        for (base, gap) in [(0, 1), (65_530, 3), (100_000, 70_000), (1 << 25, 30_000)] {
+            let entries: Vec<_> = (0..273)
+                .map(|i| (base + (i / 3) * gap, (i % 255 + 1) as u8))
+                .collect();
+            let query = [
+                (base, 1),
+                (base + 42 * gap, 127),
+                (base + 42 * gap, 256),
+                (base + 90 * gap, u16::MAX),
+            ];
+            let expected: u32 = entries
+                .iter()
+                .map(|&(dim, impact)| {
+                    query
+                        .iter()
+                        .filter(|&&(q, _)| q == dim)
+                        .map(|&(_, weight)| u32::from(impact) * u32::from(weight))
+                        .sum::<u32>()
+                })
+                .sum();
+            assert_eq!(forward_score(&entries, &query).unwrap(), expected);
+            assert_eq!(forward_score(&entries, &[]).unwrap(), 0);
+            assert_eq!(forward_score(&entries, &[(u32::MAX, 1)]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn forward_score_accepts_u32_max_and_keeps_overflow_sticky_across_packets() {
+        // (257 * 255 + 2) * 65535 is u32::MAX; the next match must error.
+        let mut entries = vec![(7, 255); 257];
+        entries.push((7, 2));
+        assert_eq!(forward_score(&entries, &[(7, u16::MAX)]).unwrap(), u32::MAX);
+        entries.push((7, 1));
+        // Later unmatched packets must not turn an overflow into a valid score.
+        entries.extend([(8, 255); 257]);
+        assert!(matches!(
+            forward_score(&entries, &[(7, u16::MAX)]),
+            Err(crate::Error::Query(message)) if message == "BMP candidate score overflow"
+        ));
+    }
 
     fn test_grid(rows: &[Vec<u8>], cells: usize) -> CompressedGrid {
         let layout = CompressedGridLayout::new(rows.len(), cells);

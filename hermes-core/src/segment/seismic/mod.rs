@@ -13,6 +13,7 @@ use std::io::Write;
 
 #[cfg(any(feature = "native", feature = "wasm", test))]
 mod build;
+use crate::structures::postings::sparse_dimensions as dimensions;
 mod forward;
 #[cfg(any(feature = "native", test))]
 mod maintain;
@@ -34,7 +35,7 @@ pub(crate) use forward::ForwardVector;
 #[cfg(test)]
 pub(crate) use tests::{MemoryWriter, copy_sources_for_test};
 
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 pub(crate) const PARTITIONS: usize = 16;
 
 #[cfg(any(feature = "native", feature = "wasm", test))]
@@ -205,6 +206,7 @@ impl SeismicIndex {
             &r.bytes[start..start + len],
             u32_at(&r.row_directory, at + 20) as usize,
             self.quantization,
+            r.row_directory[at + 6],
         )
     }
     pub(crate) fn rows_for_document(&self, doc: u32) -> impl Iterator<Item = u32> + '_ {

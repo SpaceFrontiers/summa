@@ -352,7 +352,13 @@ pub(crate) fn write_compacted(
                 check_cancel()?;
                 writer.root().write_all(chunk)?;
             }
-            directory.push((key, offset, vector.byte_len() as u32, vector.len() as u32));
+            directory.push((
+                key,
+                offset,
+                vector.byte_len() as u32,
+                vector.len() as u32,
+                vector.encoding,
+            ));
             offset += vector.byte_len() as u64;
             rows.push(vector.iter().collect());
         }

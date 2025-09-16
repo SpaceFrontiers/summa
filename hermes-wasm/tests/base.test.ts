@@ -224,3 +224,49 @@ test.each(["", "format: maxscore,", "format: seismic,"])("All sparse backends su
     } }, limit: 10 });
     expect(result.hits.map((hit: any) => hit.address.doc_id)).toEqual([1, 0]);
 });
+
+test("Compressed Seismic forward rows preserve portable scoring for groups, tails and U32 fallback", async () => {
+    await init();
+    const index = await LocalIndex.create(`index compressed_sparse {
+        field raw: sparse_vector [indexed<format: seismic, dims: 100000, quantization: float32, seismic_forward_compression: false>]
+        field compact: sparse_vector [indexed<format: seismic, dims: 100000, quantization: float32>]
+    }`);
+    const vectors = [
+        { indices: Array.from({ length: 137 }, (_, i) => 65500 + i * 3), values: Array.from({ length: 137 }, (_, i) => i % 11 - 5) },
+        { indices: [6, 70000], values: [2, -4] },
+        { indices: [6], values: [3] },
+    ];
+    await index.addDocuments(vectors.map(vector => ({ raw: vector, compact: vector })));
+    await index.commit();
+    for (const exhaustive of [false, true]) {
+        for (const indices of [[65500, 65506], [70000], [65506, 65506], [500]]) {
+            const query = (field: string) => ({ query: { sparseVector: {
+                field, indices, values: indices.map((_, i) => i % 2 === 0 ? -1 : 1), exhaustive,
+            } }, limit: 10 });
+            const raw = await index.searchStructured(query("raw"));
+            expect((await index.searchStructured(query("compact"))).hits).toEqual(raw.hits);
+        }
+    }
+});
+
+test("BMP packet storage preserves portable retrieval across wide dimensions and packet tails", async () => {
+    await init();
+    const index = await LocalIndex.create(`index bmp_packets {
+        field compact: sparse_vector [indexed<format: bmp, dims: 100000>]
+        field inverted: sparse_vector [indexed<format: bmp, dims: 100000, bmp_forward_index: false>]
+    }`);
+    const vectors = [
+        { indices: Array.from({ length: 137 }, (_, i) => 65530 + i * 3), values: Array(137).fill(1) },
+        { indices: [6, 70000], values: [2, 3] },
+        { indices: [70000], values: [4] },
+    ];
+    await index.addDocuments([...vectors.map(vector => ({ compact: vector, inverted: vector })), {}]);
+    await index.commit();
+    for (const indices of [[65530, 65536, 65938], [70000], [70000, 70000], [500]]) {
+        const query = (field: string) => ({ query: { sparseVector: {
+            field, indices, values: indices.map(() => 1),
+        } }, limit: 10 });
+        expect((await index.searchStructured(query("compact"))).hits)
+            .toEqual((await index.searchStructured(query("inverted"))).hits);
+    }
+});

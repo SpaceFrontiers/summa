@@ -114,7 +114,11 @@ pub(super) fn score_row(
         work.seismic_forward_rows += 1;
         work.seismic_forward_bytes += vector.byte_len() as u64;
     });
-    query.score_vector(vector.iter())
+    if let Some(values) = vector.raw_iter() {
+        query.score_vector(values)
+    } else {
+        query.score_vector(vector.iter())
+    }
 }
 
 pub(in crate::query) fn score_candidates(

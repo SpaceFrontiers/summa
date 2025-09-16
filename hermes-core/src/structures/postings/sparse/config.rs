@@ -226,6 +226,8 @@ pub struct SeismicConfig {
     pub cluster_size: usize,
     /// Fraction of summary magnitude retained for candidate ranking.
     pub summary_energy: f32,
+    /// Lossless U16/U24/DotVByte forward dimension compression (default true).
+    pub forward_compression: bool,
 }
 
 impl Default for SeismicConfig {
@@ -234,6 +236,7 @@ impl Default for SeismicConfig {
             postings: 4096,
             cluster_size: 64,
             summary_energy: 0.4,
+            forward_compression: true,
         }
     }
 }
@@ -875,6 +878,25 @@ mod seismic_config_tests {
         let restored: SparseVectorConfig =
             serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
         assert_eq!(restored.format, SparseFormat::Bmp);
+    }
+
+    #[test]
+    fn seismic_forward_compression_defaults_on_and_preserves_explicit_opt_out() {
+        assert!(SeismicConfig::default().forward_compression);
+        let omitted: SeismicConfig = serde_json::from_str("{}").unwrap();
+        assert!(omitted.forward_compression);
+        let mut field = serde_json::to_value(SparseVectorConfig::default()).unwrap();
+        field.as_object_mut().unwrap().remove("seismic");
+        let omitted_field: SparseVectorConfig = serde_json::from_value(field).unwrap();
+        assert!(omitted_field.seismic.forward_compression);
+        let disabled: SeismicConfig =
+            serde_json::from_str(r#"{"forward_compression":false}"#).unwrap();
+        assert!(!disabled.forward_compression);
+        assert_eq!(
+            serde_json::from_value::<SeismicConfig>(serde_json::to_value(&disabled).unwrap())
+                .unwrap(),
+            disabled
+        );
     }
 
     #[test]

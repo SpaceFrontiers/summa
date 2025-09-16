@@ -51,6 +51,7 @@ directory. Package READMEs below document each executable or library.
 - [Unified Dense IVF Architecture](unified-vector-quantization.md)
 - [Seismic sparse indexing](seismic-sparse-index.md) — optional third sparse algorithm alongside default BMP and MaxScore; exact values, copy merges and bounded maintenance.
 - [Compact Seismic summaries](seismic-compact-summaries.md) — measured lossless directory compression, memory/latency tradeoffs and deferred locality experiments.
+- [Seismic forward dimension compression](seismic-forward-compression.md) — lossless U24 and aligned gap encoding with full U32 IDs.
 - [Forward values in BMP search passes: research and experiment](bmp-forward-search.md)
 - [BMP forward values and format compatibility](bmp-forward-index.md)
 - [BMP LSP/0 and Maximum-Grid Compression](bmp-grid-compression.md)

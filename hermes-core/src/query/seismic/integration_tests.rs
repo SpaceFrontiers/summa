@@ -14,6 +14,10 @@ async fn fixture() -> (Index<RamDirectory>, crate::Field, crate::Field) {
             format: SparseFormat::Seismic,
             weight_quantization: WeightQuantization::Float32,
             dims: Some(100_000),
+            seismic: crate::structures::SeismicConfig {
+                forward_compression: true,
+                ..Default::default()
+            },
             ..Default::default()
         },
     );
@@ -265,6 +269,7 @@ async fn overflowing_cluster_proxy_preserves_finite_document_scores() {
                 postings: 2,
                 cluster_size: 2,
                 summary_energy: 1.0,
+                ..Default::default()
             },
             ..Default::default()
         },
@@ -454,4 +459,72 @@ async fn sparse_membership_is_complete_even_when_nomination_dimensions_are_prune
         .unwrap();
     assert!(bits.contains(2));
     assert!(!bits.contains(3));
+}
+
+#[tokio::test]
+async fn compressed_forward_matches_raw_for_signed_duplicate_and_high_dimension_queries() {
+    let mut schema = Schema::builder();
+    let fields: Vec<_> = [false, true]
+        .into_iter()
+        .map(|compact| {
+            let mut config = SparseVectorConfig {
+                format: SparseFormat::Seismic,
+                weight_quantization: WeightQuantization::Float32,
+                dims: Some(100_000),
+                ..Default::default()
+            };
+            config.seismic.forward_compression = compact;
+            schema.add_sparse_vector_field_with_config(
+                if compact { "compact" } else { "raw" },
+                true,
+                false,
+                config,
+            )
+        })
+        .collect();
+    let directory = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    for doc in 0..8 {
+        let mut document = Document::new();
+        if doc != 3 {
+            for &field in &fields {
+                document.add_sparse_vector(
+                    field,
+                    (0..137)
+                        .map(|dim| (70_000 + dim * 3, (dim % 11) as f32 - doc as f32))
+                        .collect(),
+                );
+                document.add_sparse_vector(field, vec![(90_000, -2.0), (6, 3.0)]);
+            }
+        }
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(directory, config).await.unwrap();
+    for terms in [
+        vec![(70_000, -1.0), (70_006, 1.0)],
+        vec![(70_003, 1.0), (70_003, -1.0)],
+        vec![(90_000, -2.0)],
+        vec![(500, 1.0)],
+        vec![(3, 0.0)],
+    ] {
+        for exhaustive in [false, true] {
+            let mut results = Vec::new();
+            for &field in &fields {
+                let query = SparseVectorQuery::new(field, terms.clone())
+                    .with_exhaustive(exhaustive)
+                    .with_combiner(MultiValueCombiner::Max);
+                let hits = index.search(&query, 10).await.unwrap().hits;
+                results.push(
+                    hits.into_iter()
+                        .map(|hit| (hit.address.doc_id, hit.score.to_bits()))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(results[0], results[1]);
+        }
+    }
 }

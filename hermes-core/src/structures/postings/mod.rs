@@ -28,6 +28,7 @@ mod roaring;
 mod rounded_bp128;
 mod sparse;
 pub(crate) use sparse::decode_sparse_weight_at;
+pub(crate) use sparse::dimensions as sparse_dimensions;
 #[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) use sparse::encode_sparse_weights;
 mod vertical_bp128;

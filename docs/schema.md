@@ -624,6 +624,9 @@ while candidate scores use the full bounded query.
 - `seismic_postings`: maximum retained postings per term in a new run,1–65536.
 - `seismic_cluster_size`: target cluster size,1–`seismic_postings`.
 - `seismic_summary_energy`: retained summary magnitude fraction,(0,1].
+- `seismic_forward_compression`: lossless adaptive dimension compression, default
+  `true` (`false` keeps raw U32 IDs). Uses U16/U24 or aligned gaps while preserving full U32 IDs and the
+  configured weight precision; see [forward compression](seismic-forward-compression.md).
 - `seismic_cut`: nomination query dimensions,1–64.
 - `seismic_factor`: summary pruning factor,[0,1]. Approximate recall must be
   measured on representative queries; exact scoring does not make nominations exact.

@@ -1030,6 +1030,10 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                 }
                 if cfg.format == SparseFormat::Seismic {
                     idx_params.push("format: seismic".into());
+                    idx_params.push(format!(
+                        "seismic_forward_compression: {}",
+                        cfg.seismic.forward_compression
+                    ));
                     idx_params.push(format!("seismic_postings: {}", cfg.seismic.postings));
                     idx_params.push(format!(
                         "seismic_cluster_size: {}",
@@ -2363,7 +2367,7 @@ mod tests {
             index documents {
                 reorder_on_merge: true
                 field sparse: sparse_vector<u32> [indexed<format: seismic, dims: 105879,
-                    quantization: uint8, doc_mass: 0.9,
+                    quantization: uint8, doc_mass: 0.9, seismic_forward_compression: false,
                     query<seismic_cut: 12, exhaustive: true>>]
                 field body: text [indexed, reorder]
             }

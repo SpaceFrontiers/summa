@@ -382,7 +382,7 @@ fn forward_directory_and_selected_payload_reject_corruption() {
         .is_err()
     );
     let mut payload = forward.payload.to_vec();
-    payload[..4].copy_from_slice(&32u32.to_le_bytes());
+    payload[4..6].copy_from_slice(&32u16.to_le_bytes());
     let parsed = BmpForward::parse(
         encode(&payload, forward.rows.as_slice()),
         forward.len(),
@@ -394,19 +394,19 @@ fn forward_directory_and_selected_payload_reject_corruption() {
 }
 
 #[test]
-fn forward_storage_is_used_by_l1_and_record_bp_but_never_bmp_search() {
+fn explicit_forward_integrity_and_record_bp_reject_corruption_while_bmp_search_ignores_forward() {
     let source = fixture(137);
     let mut bytes = source.read_raw_blob().unwrap().to_vec();
     let footer = bytes.len() - crate::segment::format::BMP_BLOB_FOOTER_SIZE;
     let payload = u64::from_le_bytes(bytes[footer + 60..footer + 68].try_into().unwrap()) as usize
         + source.num_virtual_docs as usize * 6;
     // Corrupt only the forward payload, leaving every inverted representation
-    // valid. Its consumers must report corruption instead of changing readers.
-    bytes[payload..payload + 4].copy_from_slice(&32u32.to_le_bytes());
+    // valid. Explicit integrity and BP validate it; ordinary BMP never reads it.
+    bytes[payload + 4..payload + 6].copy_from_slice(&32u16.to_le_bytes());
     let corrupt = parse(bytes, 137, source.total_vectors);
     let query = [(0, 1.0), (31, 0.3)];
     assert!(matches!(
-        crate::query::bmp::score_bmp_candidates(&corrupt, &query, &[0]),
+        corrupt.forward().unwrap().validate_payload(&|| Ok(())),
         Err(Error::Corruption(_))
     ));
     assert!(matches!(
@@ -721,14 +721,13 @@ fn empty_bmp_blobs_validate_their_storage_section_and_footer() {
 }
 
 #[test]
-fn enabled_forward_storage_keeps_the_published_bytes() {
+fn bmpb_forward_storage_has_stable_encoded_bytes() {
     let source = fixture(137);
     let bytes = source.read_raw_blob().unwrap();
     let hash = bytes.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     });
-    assert_eq!(bytes.len(), 12_713);
-    assert_eq!(hash, 0x5ccfbcdae3690623);
+    assert_eq!((bytes.len(), hash), (13_535, 0x17452c22d28d5c37));
 }
 
 #[test]
@@ -832,4 +831,122 @@ fn rewrite_document_map_scan_observes_cancellation_mid_scan() {
         }
     });
     assert!(matches!(result, Err(crate::Error::IndexClosed)));
+}
+
+fn gap_fixture() -> BmpIndex {
+    let mut postings = rustc_hash::FxHashMap::default();
+    for i in 0..137 {
+        let entries = postings.entry(65_530 + i * 3).or_insert_with(Vec::new);
+        entries.push((0, 0, 1.0));
+        entries.push((2, 3, 2.0));
+        if i == 3 {
+            entries.insert(1, (0, 0, 0.5));
+        }
+    }
+    let mut bytes = Vec::new();
+    crate::segment::builder::bmp::build_bmp_blob(
+        postings, 32, 4, 0.0, None, 100_000, 5.0, 0, true, &mut bytes,
+    )
+    .unwrap();
+    parse(bytes, 3, 2)
+}
+
+#[test]
+fn forward_gap_packets_preserve_wide_ids_duplicates_and_integer_scores() {
+    let bmp = gap_fixture();
+    let forward = bmp.forward().unwrap();
+    assert_eq!(forward_values(forward), inverted_values(&bmp));
+    assert!(forward.payload.len() < (137 * 2 + 1) * 3);
+    let inverted = without_forward(&bmp, 3);
+    let query = [(65_539, 0.5), (65_539, 0.75), (65_938, 1.0)];
+    assert_eq!(
+        crate::query::bmp::score_bmp_candidates(&bmp, &query, &[0, 1]).unwrap(),
+        crate::query::bmp::score_bmp_candidates(&inverted, &query, &[0, 1]).unwrap(),
+    );
+}
+
+#[test]
+fn bmpa_envelope_is_rejected_before_forward_payload_access() {
+    let bmp = gap_fixture();
+    let mut bytes = bmp.read_raw_blob().unwrap().to_vec();
+    let end = bytes.len();
+    bytes[end - 4..].copy_from_slice(&0x41504d42u32.to_le_bytes());
+    assert!(
+        BmpIndex::parse(
+            FileHandle::from_bytes(OwnedBytes::new(bytes)),
+            0,
+            end as u64,
+            3,
+            2,
+        )
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn gap_encoded_rows_survive_copy_merge_and_materialization_byte_identically() {
+    let source = gap_fixture();
+    let absent = without_forward(&source, 3);
+    for input in [&source, &absent] {
+        let dir = RamDirectory::new();
+        let mut writer = OffsetWriter::new(
+            dir.streaming_writer_cold(Path::new("forward"))
+                .await
+                .unwrap(),
+        );
+        write_forward_sources(
+            &[(input, 0), (&source, 4)],
+            &[],
+            &mut writer,
+            Some(1024 * 1024),
+            None,
+            true,
+        )
+        .unwrap();
+        writer.finish().unwrap();
+        let bytes = dir
+            .open_read(Path::new("forward"))
+            .await
+            .unwrap()
+            .read_bytes()
+            .await
+            .unwrap();
+        let result = BmpForward::parse(bytes, 4, 7, 100_000).unwrap();
+        let payload = source.forward().unwrap().payload.as_slice();
+        assert_eq!(result.payload.as_slice(), [payload, payload].concat());
+        result.validate_payload(&|| Ok(())).unwrap();
+        assert_eq!(result.key(3), LogicalUnit { doc: 6, ordinal: 3 });
+    }
+}
+
+#[tokio::test]
+async fn gap_encoded_survivors_are_copied_without_reencoding_on_compaction() {
+    let source = gap_fixture();
+    let rows = crate::segment::row_map::RowMap::new(3, 1, |doc| doc == 2, 1024).unwrap();
+    let dir = RamDirectory::new();
+    let mut writer = OffsetWriter::new(
+        dir.streaming_writer_cold(Path::new("forward"))
+            .await
+            .unwrap(),
+    );
+    write_compacted_forward(&source, &rows, &mut writer, None).unwrap();
+    writer.finish().unwrap();
+    let bytes = dir
+        .open_read(Path::new("forward"))
+        .await
+        .unwrap()
+        .read_bytes()
+        .await
+        .unwrap();
+    let result = BmpForward::parse(bytes, 1, 1, 100_000).unwrap();
+    let forward = source.forward().unwrap();
+    assert_eq!(
+        result.payload.as_slice(),
+        &forward.payload.as_slice()[forward.offset(1) as usize..]
+    );
+    assert_eq!(result.key(0), LogicalUnit { doc: 0, ordinal: 3 });
+    assert_eq!(
+        result.vector(0).unwrap().iter().collect::<Vec<_>>(),
+        forward.vector(1).unwrap().iter().collect::<Vec<_>>()
+    );
 }
