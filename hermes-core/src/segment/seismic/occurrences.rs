@@ -1,5 +1,6 @@
 //! Restart groups for cardinality-aware summary cluster-ID sets.
 use crate::structures::combination;
+#[cfg(any(feature = "native", feature = "wasm", test))]
 use crate::{Error, Result};
 pub(super) const GROUP: usize = 128;
 
@@ -21,6 +22,7 @@ pub(super) fn bit_offsets(
 
 /// Offsets are relative to the payload after the checkpoint directory.
 /// Local layout appends each group's unchanged weight bytes after its ranks.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(super) fn encode(
     ids: &[u64],
     ends: &[u64],

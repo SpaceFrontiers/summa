@@ -24,6 +24,7 @@ pub(crate) fn width(universe: usize, count: usize) -> u8 {
 pub(crate) fn valid(rank: u64, universe: usize, count: usize) -> bool {
     count <= universe && universe <= 64 && rank < CHOOSE[universe][count]
 }
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) fn rank(ids: &[u64]) -> u64 {
     ids.iter()
         .enumerate()
@@ -63,6 +64,7 @@ pub(crate) fn read(bytes: &[u8], bit: usize, width: u8) -> u64 {
     data[..len].copy_from_slice(&bytes[start..start + len]);
     ((u128::from_le_bytes(data) >> (bit % 8)) & ((1u128 << width) - 1)) as u64
 }
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) fn append(bytes: &mut Vec<u8>, bit: &mut usize, rank: u64, width: u8) {
     let end = *bit + usize::from(width);
     bytes.resize(end.div_ceil(8), 0);

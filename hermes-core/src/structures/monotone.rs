@@ -1,10 +1,14 @@
 //! Borrowed, independently addressable blocks of monotone U32 integers.
-use super::fast_field::{bitpack_read, bitpack_write, bits_needed_u64};
+use super::fast_field::bitpack_read;
+#[cfg(any(feature = "native", feature = "wasm", test))]
+use super::fast_field::{bitpack_write, bits_needed_u64};
+#[cfg(any(feature = "native", feature = "wasm", test))]
 use crate::{Error, Result};
 
 pub(crate) const BLOCK: usize = 128;
 const ENTRY: usize = 16;
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 fn invalid() -> Error {
     Error::Corruption("invalid monotone integer block".into())
 }
@@ -141,6 +145,7 @@ impl Block<'_> {
     }
 }
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) fn encode(values: &[u64]) -> Result<Vec<u8>> {
     if values.iter().any(|&v| v > u64::from(u32::MAX)) || values.windows(2).any(|w| w[0] > w[1]) {
         return Err(invalid());

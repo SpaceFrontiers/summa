@@ -1,9 +1,13 @@
 //! Coordinate-transposed nomination summaries, borrowed directly from the run.
 use super::*;
-use crate::structures::fast_field::{bitpack_read, bitpack_write, bits_needed_u64};
+use crate::structures::fast_field::bitpack_read;
+#[cfg(any(feature = "native", feature = "wasm", test))]
+use crate::structures::fast_field::{bitpack_write, bits_needed_u64};
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 const TERM_MAGIC: u32 = 0x34544d53;
 // Paired experiments persist their layout; readers never depend on this choice.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 const LOCAL_OCCURRENCES: bool = false;
 const TERM_FOOTER: usize = 40;
 const BLOCKED: u8 = 255;
@@ -27,6 +31,7 @@ struct Layout {
     id_offset: usize,
     value_offset: usize,
 }
+#[cfg(any(feature = "native", feature = "wasm", test))]
 fn packed_bytes(count: usize, width: u8) -> Option<usize> {
     count.checked_mul(usize::from(width)).map(|n| n.div_ceil(8))
 }
@@ -539,6 +544,7 @@ fn admit(bytes: &[u8], expected_clusters: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 fn encode_directory(values: &[u64], bits: &mut u8) -> Result<Vec<u8>> {
     let mut packed = Vec::new();
     bitpack_write(values, *bits, &mut packed);
@@ -554,12 +560,14 @@ fn encode_directory(values: &[u64], bits: &mut u8) -> Result<Vec<u8>> {
 
 /// One term's transient transpose. Occurrences never outnumber coordinates in
 /// its selected rows; maintenance includes these buffers in its scratch charge.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 #[derive(Default)]
 pub(super) struct Encoder {
     rows: Vec<u32>,
     clusters: Vec<(u32, [u8; 8])>,
     occurrences: Vec<(u32, u32, u8)>,
 }
+#[cfg(any(feature = "native", feature = "wasm", test))]
 impl Encoder {
     pub(super) fn push(&mut self, rows: &[u32], summary: &[(u32, f32)]) -> Result<()> {
         let cluster = self.clusters.len() as u32;

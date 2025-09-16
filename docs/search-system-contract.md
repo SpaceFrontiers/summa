@@ -164,7 +164,8 @@ python3 scripts/check_search.py check --plan
 
 `contracts` checks dependency ownership and documentation links without building.
 `check` also runs formatting, focused Clippy, core/server/broker/tool tests with
-metrics, and the native-without-sync compile boundary. `full` adds API docs,
+metrics, native-without-sync, and standalone broker compilation with core writers
+disabled. Checks treat compiler warnings as errors. `full` adds API docs,
 portable core compilation, and broker end-to-end tests against a real server.
 CI retains the wider workspace, GPU, client, and WASM checks; the focused harness
 does not replace those. Every run saves commands, status, logs and environment

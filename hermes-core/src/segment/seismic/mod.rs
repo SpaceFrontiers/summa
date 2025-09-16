@@ -4,10 +4,14 @@
 //! small run directory; it never reclusters vectors or changes their precision.
 use crate::directories::OwnedBytes;
 use crate::segment::logical_address::LogicalUnit;
-use crate::structures::{SparseVectorConfig, WeightQuantization};
+#[cfg(any(feature = "native", feature = "wasm", test))]
+use crate::structures::SparseVectorConfig;
+use crate::structures::WeightQuantization;
 use crate::{Error, Result};
+#[cfg(any(feature = "native", feature = "wasm", test))]
 use std::io::Write;
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 mod build;
 mod forward;
 #[cfg(any(feature = "native", test))]
@@ -24,6 +28,7 @@ pub(crate) use term::TermRun;
 mod tests;
 #[cfg(test)]
 pub(crate) use build::build_blob;
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) use build::build_blob_with_keys;
 pub(crate) use forward::ForwardVector;
 #[cfg(test)]
@@ -32,11 +37,13 @@ pub(crate) use tests::{MemoryWriter, copy_sources_for_test};
 const VERSION: u32 = 5;
 pub(crate) const PARTITIONS: usize = 16;
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 pub(crate) trait SeismicWriter {
     fn root(&mut self) -> &mut dyn Write;
     fn partition(&mut self, id: usize) -> &mut dyn Write;
 }
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 #[derive(Default)]
 pub(crate) struct OutputLengths {
     pub(crate) root: u64,
@@ -72,9 +79,11 @@ fn u32_at(bytes: &[u8], at: usize) -> u32 {
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
+#[cfg(any(feature = "native", feature = "wasm", test))]
 fn put32(w: &mut (impl Write + ?Sized), n: u32) -> std::io::Result<()> {
     w.write_all(&n.to_le_bytes())
 }
+#[cfg(any(feature = "native", feature = "wasm", test))]
 fn put64(w: &mut (impl Write + ?Sized), n: u64) -> std::io::Result<()> {
     w.write_all(&n.to_le_bytes())
 }
@@ -313,6 +322,7 @@ impl SeismicIndex {
     }
 }
 
+#[cfg(any(feature = "native", feature = "wasm", test))]
 fn write_footer(
     w: &mut (impl Write + ?Sized),
     settings: &SeismicIndex,
@@ -338,6 +348,7 @@ fn write_footer(
     Ok(())
 }
 /// Finish a single forward or nomination run using the shared directory envelope.
+#[cfg(any(feature = "native", feature = "wasm", test))]
 fn finish_run(
     writer: &mut dyn Write,
     mut offset: u64,

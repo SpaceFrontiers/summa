@@ -27,7 +27,9 @@ mod posting_format;
 mod roaring;
 mod rounded_bp128;
 mod sparse;
-pub(crate) use sparse::{decode_sparse_weight_at, encode_sparse_weights};
+pub(crate) use sparse::decode_sparse_weight_at;
+#[cfg(any(feature = "native", feature = "wasm", test))]
+pub(crate) use sparse::encode_sparse_weights;
 mod vertical_bp128;
 
 pub use elias_fano::{

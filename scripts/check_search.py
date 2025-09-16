@@ -91,6 +91,7 @@ def commands(args):
             "--all-targets",
         ],
     ]
+    steps.append(["cargo", "check", "--locked", "-p", "hermes-broker", "--all-targets"])
     if args.mode == "full":
         steps += [
             [
@@ -231,6 +232,7 @@ def main():
         if steps:
             report["environment"] = environment()
         env = os.environ.copy()
+        env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} -Dwarnings".strip()
         env["RUSTDOCFLAGS"] = f"{env.get('RUSTDOCFLAGS', '')} -D warnings".strip()
         for index, command in enumerate(steps, 1):
             print(f"[{index}/{len(steps)}] {shlex.join(command)}", flush=True)

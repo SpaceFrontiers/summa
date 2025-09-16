@@ -26,9 +26,9 @@
 mod block;
 mod config;
 mod weights;
-pub(crate) use weights::{
-    decode_weight_at as decode_sparse_weight_at, encode_weights as encode_sparse_weights,
-};
+pub(crate) use weights::decode_weight_at as decode_sparse_weight_at;
+#[cfg(any(feature = "native", feature = "wasm", test))]
+pub(crate) use weights::encode_weights as encode_sparse_weights;
 mod partitioner;
 
 pub use block::{BlockSparsePostingIterator, BlockSparsePostingList, SparseBlock};
