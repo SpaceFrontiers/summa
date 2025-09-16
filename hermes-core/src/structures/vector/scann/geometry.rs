@@ -1,6 +1,6 @@
 //! Recall-oriented ScaNN partition geometry.
 //!
-//! The constants mirror the freshly validated reference ScaNN builder: do not
+//! The constants mirror the freshly validated ScaNN builder: do not
 //! expose a configurable minimum-training count. Readiness and sample size are
 //! derived from the selected geometry.
 
