@@ -179,6 +179,30 @@ mod tests {
     }
 
     #[test]
+    fn cloned_readers_share_copied_directories_and_outlive_the_original() {
+        let (_directory, mut original) = mmap_fixture();
+        let unpinned = original.clone();
+        let report = pin(&mut original, PinMode::Copy, u64::MAX);
+        assert!(report.heap_copy_bytes > 0);
+        let cloned = original.clone();
+        for (left, right) in original.runs.iter().zip(&cloned.runs) {
+            assert_eq!(left.row_directory.as_ptr(), right.row_directory.as_ptr());
+            assert_eq!(left.bytes.as_ptr(), right.bytes.as_ptr());
+        }
+        for (left, right) in original.partitions.iter().zip(&cloned.partitions) {
+            let (Some(left), Some(right)) = (left, right) else {
+                continue;
+            };
+            for (left, right) in left.runs.iter().zip(&right.runs) {
+                assert_eq!(left.term_directory.as_ptr(), right.term_directory.as_ptr());
+                assert_eq!(left.bytes.as_ptr(), right.bytes.as_ptr());
+            }
+        }
+        drop(original);
+        assert_equivalent(&unpinned, &cloned);
+    }
+
+    #[test]
     fn directory_budget_prioritizes_terms_and_reports_disabled_pinning() {
         let (_directory, mut index) = mmap_fixture();
         let (terms, rows) = directory_bytes(&index);

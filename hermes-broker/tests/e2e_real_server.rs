@@ -1199,3 +1199,69 @@ async fn partitioned_mutations_route_exact_keys_and_remove_all_document_chunks()
         1
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the hermes-server binary; see module docs"]
+async fn broker_forwards_large_singleton_upserts_but_rejects_oversized_batches() {
+    let server = spawn_server();
+    wait_server_ready(&server.addr).await;
+    let broker = spawn_broker(
+        &[format!("id=a,addr={},shard=0", server.addr)],
+        &["--placement", "docs*=0"],
+    );
+    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    let mut index = broker_index_client(&broker)
+        .await
+        .max_encoding_message_size(200 * 1024 * 1024);
+    let name = "docs_large_singleton";
+    index
+        .create_index(CreateIndexRequest {
+            index_name: name.into(),
+            schema: format!(
+                "index {name} {{ field id: text<raw> [primary, indexed, stored] field title: text<raw> [stored] }}"
+            ),
+        })
+        .await
+        .unwrap();
+    wait_for_indexes(&broker, &[name], Duration::from_secs(10)).await;
+    let large = doc("large", &"x".repeat(34 * 1024 * 1024));
+    let accepted = index
+        .upsert_documents(UpsertDocumentsRequest {
+            index_name: name.into(),
+            documents: vec![large.clone()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(accepted.accepted_count, 1);
+    assert!(accepted.errors.is_empty());
+    index
+        .commit(CommitRequest {
+            index_name: name.into(),
+        })
+        .await
+        .unwrap();
+    let rejected = index
+        .upsert_documents(UpsertDocumentsRequest {
+            index_name: name.into(),
+            documents: vec![large, doc("small", "must not be admitted")],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), tonic::Code::ResourceExhausted);
+    index
+        .commit(CommitRequest {
+            index_name: name.into(),
+        })
+        .await
+        .unwrap();
+    let info = broker_search_client(&broker)
+        .await
+        .get_index_info(GetIndexInfoRequest {
+            index_name: name.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.num_docs, 1);
+}

@@ -347,7 +347,7 @@ impl<D: Directory + 'static> Searcher<D> {
         ))
     }
 
-    /// Load segment readers from IDs (parallel loading for performance).
+    /// Load segment readers with bounded opening concurrency.
     /// Reuses existing segment readers for unchanged segments when `existing_segments`
     /// is non-empty — avoids re-opening mmaps, fast fields, sparse indexes, etc.
     #[allow(clippy::too_many_arguments)]
@@ -382,90 +382,98 @@ impl<D: Directory + 'static> Searcher<D> {
             valid_segments.push((idx, sid));
         }
 
-        // Separate into reusable and new segments
-        let mut reused: Vec<(usize, Arc<SegmentReader>)> = Vec::new();
-        let mut to_load: Vec<(usize, SegmentId)> = Vec::new();
-        for (idx, sid) in &valid_segments {
-            if let Some(existing) = existing_map.get(&sid.0)
-                && existing.deletion_meta() == deletions.get(&sid.to_hex()).map(|(_, d)| d)
+        // A changed sidecar is a new visibility view, not a new payload.
+        let mut loaded = Vec::with_capacity(valid_segments.len());
+        let mut to_load = Vec::new();
+        let mut refreshed = 0;
+        for (idx, sid) in valid_segments {
+            let deletion = deletions.get(&sid.to_hex());
+            let existing = existing_map.get(&sid.0);
+            if let (Some(existing), Some((num_docs, _))) = (existing, deletion)
+                && *num_docs != existing.num_docs()
             {
-                reused.push((*idx, Arc::clone(existing)));
+                return Err(crate::Error::Corruption(
+                    "deletion metadata row count mismatch".into(),
+                ));
+            }
+            if let Some(existing) = existing
+                && existing.deletion_meta() == deletion.map(|(_, meta)| meta)
+            {
+                loaded.push((idx, Arc::clone(existing)));
             } else {
-                to_load.push((*idx, *sid));
+                refreshed += usize::from(existing.is_some());
+                to_load.push((idx, sid, existing.cloned()));
             }
         }
 
         if !existing_segments.is_empty() {
             log::info!(
-                "[searcher] index={} reusing {} segment readers, loading {} new",
+                "[searcher] index={} reusing {} segment readers, refreshing {} visibility views, loading {} new",
                 schema.index_label(),
-                reused.len(),
-                to_load.len(),
+                loaded.len(),
+                refreshed,
+                to_load.len() - refreshed,
             );
         }
 
-        // Include the live directory allocation in document-cache keys.
-        // Segment IDs can legitimately repeat when two independent indexes
-        // are copied/opened in the same process.
+        // Segment opens retain their completed payloads, but validation/copy
+        // scratch must not multiply by every new segment during reload.
+        const MAX_CONCURRENT_SEGMENT_OPENS: usize = 2;
+        use futures::{StreamExt, TryStreamExt};
+        // Separate independent copied indexes' shared document-cache keys.
         let store_cache_directory_namespace = Arc::as_ptr(directory) as usize;
-
-        // Load only NEW segments in parallel
-        let futures: Vec<_> = to_load
-            .iter()
-            .map(|(_, segment_id)| {
-                let dir = Arc::clone(directory);
-                let sch = Arc::clone(schema);
+        let results: Vec<_> =
+            futures::stream::iter(to_load.into_iter().map(|(idx, sid, existing)| {
                 let store_cache = Arc::clone(&store_cache);
-                let sid = *segment_id;
                 async move {
-                    SegmentReader::open_with_store_cache(
-                        dir.as_ref(),
-                        sid,
-                        sch,
-                        term_cache_blocks,
-                        term_cache_budget_bytes,
-                        store_cache_directory_namespace,
-                        store_cache,
-                    )
-                    .await
-                }
-            })
-            .collect();
-
-        let results = futures::future::join_all(futures).await;
-
-        // Collect newly loaded results — fail fast if any segment fails to open
-        let mut loaded: Vec<(usize, Arc<SegmentReader>)> = Vec::with_capacity(valid_segments.len());
-
-        // Add reused segments
-        loaded.extend(reused);
-
-        // Add newly loaded segments
-        for ((idx, sid), result) in to_load.into_iter().zip(results) {
-            match result {
-                Ok(mut reader) => {
-                    if let Some((num_docs, meta)) = deletions.get(&sid.to_hex()) {
-                        if *num_docs != reader.num_docs() {
-                            return Err(crate::Error::Corruption(
-                                "deletion metadata row count mismatch".into(),
-                            ));
+                    let deletion = deletions.get(&sid.to_hex());
+                    let mut reader = match existing {
+                        Some(existing) => {
+                            existing
+                                .with_deletions(
+                                    directory.as_ref(),
+                                    deletion.map(|(_, meta)| meta.clone()),
+                                )
+                                .await?
                         }
-                        reader
-                            .load_deletions(directory.as_ref(), meta.clone())
-                            .await?;
-                    }
-                    // Inject the single immutable index-level artifact generation.
+                        None => {
+                            let mut reader = SegmentReader::open_with_store_cache(
+                                directory.as_ref(),
+                                sid,
+                                Arc::clone(schema),
+                                term_cache_blocks,
+                                term_cache_budget_bytes,
+                                store_cache_directory_namespace,
+                                store_cache,
+                            )
+                            .await
+                            .map_err(|error| {
+                                crate::Error::Internal(format!(
+                                    "Failed to open segment {:016x}: {:?}",
+                                    sid.0, error
+                                ))
+                            })?;
+                            if let Some((num_docs, meta)) = deletion {
+                                if *num_docs != reader.num_docs() {
+                                    return Err(crate::Error::Corruption(
+                                        "deletion metadata row count mismatch".into(),
+                                    ));
+                                }
+                                reader
+                                    .load_deletions(directory.as_ref(), meta.clone())
+                                    .await?;
+                            }
+                            reader
+                        }
+                    };
                     reader.set_trained_vectors(Arc::clone(trained_vectors));
-                    loaded.push((idx, Arc::new(reader)));
+                    Ok((idx, Arc::new(reader)))
                 }
-                Err(e) => {
-                    return Err(crate::error::Error::Internal(format!(
-                        "Failed to open segment {:016x}: {:?}",
-                        sid.0, e
-                    )));
-                }
-            }
-        }
+            }))
+            .buffer_unordered(MAX_CONCURRENT_SEGMENT_OPENS)
+            .try_collect()
+            .await?;
+        loaded.extend(results);
 
         // Sort by original index to maintain deterministic ordering
         loaded.sort_by_key(|(idx, _)| *idx);
@@ -2079,6 +2087,124 @@ fn process_rss_bytes() -> u64 {
 #[cfg(test)]
 mod load_segments_tests {
     use super::*;
+
+    #[cfg(feature = "native")]
+    #[derive(Clone, Default)]
+    struct SlowSegmentDirectory {
+        inner: crate::directories::RamDirectory,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "native")]
+    #[async_trait::async_trait]
+    impl Directory for SlowSegmentDirectory {
+        async fn exists(&self, path: &std::path::Path) -> std::io::Result<bool> {
+            self.inner.exists(path).await
+        }
+        async fn file_size(&self, path: &std::path::Path) -> std::io::Result<u64> {
+            self.inner.file_size(path).await
+        }
+        async fn open_read(
+            &self,
+            path: &std::path::Path,
+        ) -> std::io::Result<crate::directories::FileHandle> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "meta")
+            {
+                struct ActiveRead<'a>(&'a std::sync::atomic::AtomicUsize);
+                impl Drop for ActiveRead<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, SeqCst);
+                    }
+                }
+                let active = self.active.fetch_add(1, SeqCst) + 1;
+                let _guard = ActiveRead(&self.active);
+                self.peak.fetch_max(active, SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            self.inner.open_read(path).await
+        }
+        async fn read_range(
+            &self,
+            path: &std::path::Path,
+            range: std::ops::Range<u64>,
+        ) -> std::io::Result<crate::directories::OwnedBytes> {
+            self.inner.read_range(path, range).await
+        }
+        async fn list_files(
+            &self,
+            prefix: &std::path::Path,
+        ) -> std::io::Result<Vec<std::path::PathBuf>> {
+            self.inner.list_files(prefix).await
+        }
+        async fn open_lazy(
+            &self,
+            path: &std::path::Path,
+        ) -> std::io::Result<crate::directories::FileHandle> {
+            self.inner.open_lazy(path).await
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn opening_many_segments_bounds_inflight_reads_and_cancellation_releases_them() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let directory = Arc::new(SlowSegmentDirectory::default());
+        let mut builder = crate::Schema::builder();
+        let text = builder.add_text_field("text", true, false);
+        let schema = Arc::new(builder.build());
+        let mut writer = crate::IndexWriter::create(
+            directory.inner.clone(),
+            (*schema).clone(),
+            crate::IndexConfig {
+                merge_policy: Box::new(crate::NoMergePolicy),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        for _ in 0..8 {
+            let mut document = crate::Document::new();
+            document.add_text(text, "present");
+            writer.add_document(document).unwrap();
+            writer.commit().await.unwrap();
+        }
+        let metadata = crate::index::IndexMetadata::load(directory.as_ref())
+            .await
+            .unwrap();
+        let ids = metadata.segment_ids();
+        let searcher = Searcher::open(directory.clone(), schema.clone(), &ids, 8)
+            .await
+            .unwrap();
+        assert_eq!(searcher.segment_readers().len(), 8);
+        assert!(
+            directory.peak.load(SeqCst) <= 2,
+            "opening every segment concurrently multiplies reload scratch"
+        );
+        assert_eq!(directory.active.load(SeqCst), 0);
+        assert_eq!(
+            searcher
+                .segment_readers()
+                .iter()
+                .map(|r| SegmentId(r.meta().id).to_hex())
+                .collect::<Vec<_>>(),
+            ids
+        );
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            Searcher::open(directory.clone(), schema, &ids, 8),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            directory.active.load(SeqCst),
+            0,
+            "cancelled opens must release in-flight work"
+        );
+    }
 
     #[tokio::test]
     async fn searcher_open_fails_loud_on_corrupt_metadata_segment_id() {

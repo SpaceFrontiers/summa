@@ -953,7 +953,7 @@ export interface DeleteDocumentsRequest {
 
 export interface UpsertDocumentsRequest {
   indexName: string;
-  /** <=1,000 documents, <=32 MiB encoded request */
+  /** <=1,000 documents, <=32 MiB encoded request (<=200 MiB for one document) */
   documents: NamedDocument[];
 }
 

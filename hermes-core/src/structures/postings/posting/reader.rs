@@ -6,6 +6,7 @@ use super::super::positions_v2::{PositionStream, TermPositions};
 use super::{BlockPostingList, Footer};
 use crate::directories::{FileHandle, OwnedBytes};
 
+#[derive(Clone)]
 pub(crate) struct PostingListReader {
     file: FileHandle,
     positions: Option<FileHandle>,
