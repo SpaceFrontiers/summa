@@ -5,12 +5,13 @@ shared Hermes LLM model. It has no Vue, Tailwind, or Hermes WASM dependency.
 
 ## Live model
 
-From the repository root, keep one checkpoint resident and serve Model Lab:
+From the repository root, serve a checkpoint with its training config and
+tokenizer. Replace `sha256-HASH` with the generation in `checkpoint/current.json`:
 
 ```bash
 cargo run --release -p hermes-llm --features metal -- lab \
-  --checkpoint checkpoint/weights.safetensors \
-  --config checkpoint/config.json \
+  --checkpoint checkpoint/generations/sha256-HASH/weights.safetensors \
+  --config model.mal \
   --tokenizer tokenizer.json \
   --metrics checkpoint/metrics.jsonl
 ```
@@ -41,8 +42,8 @@ From the repository root, create a bundle from a checkpoint, optionally includin
 
 ```bash
 cargo run -p hermes-llm -- trace \
-  --checkpoint checkpoint/weights.safetensors \
-  --config checkpoint/config.json \
+  --checkpoint checkpoint/generations/sha256-HASH/weights.safetensors \
+  --config model.mal \
   --tokenizer tokenizer.json \
   --prompt "Plan what evidence to retrieve" \
   --max-tokens 32 \

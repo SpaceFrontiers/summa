@@ -26,10 +26,14 @@ The commands below assume `target/release` is on `PATH` (for example,
 
 ## Generate text
 
+Replace `sha256-HASH` with the generation named by `checkpoint/current.json`;
+use the same MAL/JSON config and tokenizer as training. The trainer does not
+write weights or config at the checkpoint root.
+
 ```bash
 hermes-llm generate \
-  --checkpoint checkpoint/weights.safetensors \
-  --config checkpoint/config.json \
+  --checkpoint checkpoint/generations/sha256-HASH/weights.safetensors \
+  --config model.mal \
   --tokenizer tokenizer.json \
   --prompt "Once upon a time" \
   --max-tokens 100 \
@@ -42,8 +46,8 @@ hermes-llm generate \
 tokens already present in the context. `1.0` disables it; values around
 `1.05`–`1.2` are useful starting points for repetitive checkpoints.
 
-The checkpoint, config, and tokenizer arguments accept local paths. With the
-default `remote` feature they also accept `s3://`, `gs://`, and HTTP(S) URIs;
+Config accepts MAL or JSON. With the default `remote` feature, all three
+artifact arguments also accept `s3://`, `gs://`, and HTTP(S) URIs;
 downloads are cached under `~/.hermes-cache` or `$HERMES_CACHE`.
 
 Backend choice is a build decision. A build without `metal` or `cuda` uses CPU.

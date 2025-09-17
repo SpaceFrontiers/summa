@@ -1,10 +1,31 @@
 # hermes-core
 
 `hermes-core` is the storage, indexing, and query engine behind Hermes. It is
-an embeddable Rust library with native and WebAssembly build profiles. For an
-end-to-end example and the SDL syntax, see the
-[repository README](https://github.com/SpaceFrontiers/hermes#readme) and
-[schema guide](https://github.com/SpaceFrontiers/hermes/blob/main/docs/schema.md).
+an embeddable Rust library with native and WebAssembly build profiles. For
+SDL syntax, see the [schema guide](../docs/schema.md).
+
+## Quick start
+
+With `hermes-core`, `tokio` (`macros`, `rt-multi-thread`), and `serde_json` dependencies:
+
+```rust,no_run
+use hermes_core::{Index, IndexConfig, RamDirectory, index_json_document, parse_single_index};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let schema = parse_single_index(r#"
+        index articles { field title: text<en_stem> [indexed, stored] }
+    "#)?.to_schema();
+    let index = Index::create(RamDirectory::new(), schema, IndexConfig::default()).await?;
+    let mut writer = index.writer();
+    index_json_document(&writer, &serde_json::json!({"title": "Hybrid search"})).await?;
+    writer.commit().await?;
+    for hit in index.query("hybrid", 10).await?.hits {
+        println!("{} {:?}", hit.score, index.get_document(&hit.address).await?);
+    }
+    Ok(())
+}
+```
 
 ## Module map
 
@@ -22,20 +43,21 @@ end-to-end example and the SDL syntax, see the
 The important ownership boundary is that `SegmentManager` is the sole writer
 of index metadata. Indexing, merging, reordering, publication, and cleanup
 must go through its lifecycle protocol; see
-[segment lifecycle and recovery](https://github.com/SpaceFrontiers/hermes/blob/main/docs/segment-lifecycle.md).
+[segment lifecycle and recovery](../docs/segment-lifecycle.md).
 
 ## Features
 
-| Feature          | Purpose                                                                              |
-| ---------------- | ------------------------------------------------------------------------------------ |
-| `sync` (default) | Synchronous search paths; implies `native`                                           |
-| `native`         | Filesystem/mmap directories, native writer, parallel builders, and native tokenizers |
-| `wasm`           | Browser-compatible writer/reader components and tokenizer backend                    |
-| `http`           | HTTP-backed directory access                                                         |
-| `cjk-dict`       | Embedded Japanese/Korean morphology dictionaries for the `morph` tokenizer option    |
-| `metrics`        | Runtime metrics emission                                                             |
-| `diagnostics`    | Additional build diagnostics                                                         |
-| `fst-index`      | FST-backed SSTable block indexes; enabled by `native` and `wasm`                     |
+| Feature             | Purpose                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| `sync` (default)    | Synchronous search paths; implies `native`                                           |
+| `native`            | Filesystem/mmap directories, native writer, parallel builders, and native tokenizers |
+| `wasm`              | Browser-compatible writer/reader components and tokenizer backend                    |
+| `http`              | HTTP-backed directory access                                                         |
+| `cjk-dict`          | Embedded Japanese/Korean morphology dictionaries for the `morph` tokenizer option    |
+| `metrics`           | Runtime metrics emission                                                             |
+| `diagnostics`       | Additional build diagnostics                                                         |
+| `query-diagnostics` | Opt-in per-query work accounting; implies `native`                                   |
+| `fst-index`         | FST-backed SSTable block indexes; enabled by `native` and `wasm`                     |
 
 Common validation profiles are:
 
@@ -59,8 +81,9 @@ then commit; reload readers to observe the new generation. Compaction preserves
 indexed-only fields and trained ANN codes. Old searchers retain their snapshots.
 `force_merge()` retains tombstones; `force_merge_with_compaction(true)` additionally
 compacts the final output, including a single-segment index.
-See the [deletion design](../docs/row-deletion.md) for budgets, the format-7 rebuild
-boundary, and the one-pending-upsert-per-key rule.
+See the [deletion design](../docs/row-deletion.md) for budgets and compatibility. Multiple staged replacements of one key are
+supported; commit publishes the latest accepted version. Optional
+[content hashes](../docs/content-deduplication.md) skip unchanged upserts.
 
 ## Maintenance rules
 

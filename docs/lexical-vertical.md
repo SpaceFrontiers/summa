@@ -155,8 +155,9 @@ blocks are never decoded or re-encoded.
 
 ### Compatibility
 
-Metadata format version 6 is a clean rebuild boundary for this layout; format
-7 (row deletion) upgrades format 6 metadata on open without touching segments.
+Metadata format 6 introduced this layout. Current writers upgrade metadata
+formats 6–8 to 9 without rewriting segments; older segment encodings can still
+require a rebuild. See [compatibility](row-deletion.md).
 
 ## Doc postings and skip metadata
 

@@ -1,70 +1,38 @@
 # hermes-wasm
 
-WebAssembly bindings for the [Hermes](https://github.com/SpaceFrontiers/hermes) search engine. Run a full-text search engine entirely in the browser — including indexing, BM25 ranking, and document storage.
+Browser search and indexing through the shared Rust engine. `LocalIndex` is
+writable; `RemoteIndex` (HTTP) and `IpfsIndex` (fetch callbacks) are read-only.
+Remote readers cache slices in memory and optionally IndexedDB.
 
-## Features
-
-- **Local indexing** — create indexes, add documents, commit, and search entirely in WASM
-- **Pluggable persistence** — bring your own storage (IDB, encrypted, OPFS) via simple JS interface
-- **Remote search** — load pre-built indexes over HTTP with slice caching
-- **IPFS support** — load indexes from IPFS via JavaScript fetch callbacks
-- **Language-aware tokenizers** — English, German, French, Spanish, Russian, Arabic, and more
-- **Query language** — `field:term`, `AND`, `OR`, `NOT`, grouping with parentheses
-- **Static deployment** — host the generated JS/WASM and index files over HTTP
-
-## Quick Start
+## Quick start
 
 ```bash
 npm install hermes-wasm
 ```
 
-### In-Memory Index
-
 ```js
 import init, { LocalIndex } from "hermes-wasm";
 
 await init();
-
-// Define schema using SDL
-const index = await LocalIndex.create(`
-  index articles {
-    field title: text<en_stem> [indexed, stored]
-    field body:  text<en_stem> [indexed, stored]
-    field views: u64 [indexed, stored]
-  }
-`);
-
-// Add documents
-await index.addDocuments([
-  {
-    title: "Rust Programming",
-    body: "Rust is a systems language.",
-    views: 1500,
-  },
-  { title: "Search Engines", body: "BM25 is a ranking function.", views: 800 },
-]);
-
-// Commit (builds the segment)
+const index = await LocalIndex.create(`index articles {
+  field id: text<raw> [primary, stored]
+  field title: text<en_stem> [indexed, stored]
+}`);
+await index.addDocument({ id: "1", title: "Search with Rust" });
 await index.commit();
-
-// Search
 const results = await index.search("rust", 10);
-// { hits: [{ address: { segment_id, doc_id }, score }], total_hits: 1 }
-
-// Get document
-const doc = await index.getDocument(
-  results.hits[0].address.segment_id,
-  results.hits[0].address.doc_id,
-);
-// { title: "Rust Programming", body: "Rust is a systems language.", views: 1500 }
+const { segment_id, doc_id } = results.hits[0].address;
+const doc = await index.getDocument(segment_id, doc_id);
 ```
 
-### Persistent Index (Custom Storage)
+See [SDL](../docs/schema.md) and [query syntax](../docs/query-language.md).
 
-Bring your own storage backend — IndexedDB, encrypted storage, OPFS, or anything async:
+## Persistent local indexes
+
+`LocalIndex.withStorage(storage, sdl)` creates or reopens an index and saves
+changed files on commit. Supply this interface:
 
 ```ts
-// Your storage must implement this interface:
 interface IFilesStorage {
   write(name: string, buffer: ArrayBuffer): Promise<void>;
   get(name: string): Promise<ArrayBuffer | null>;
@@ -73,320 +41,119 @@ interface IFilesStorage {
 }
 ```
 
-```js
-// Create with custom storage — auto-saves changed files on each commit
-const index = await LocalIndex.withStorage(myStorage, schema);
-await index.addDocuments(docs);
-await index.commit(); // only new segment files written to storage
+Use one writable index per storage namespace and atomic per-file replacement.
+IndexedDB, OPFS, and encryption are storage-adapter choices.
 
-// Later (page reload) — same call reopens if storage has files
-const index = await LocalIndex.withStorage(myStorage, schema);
-const results = await index.search("rust", 10); // works immediately
-```
-
-A simple IndexedDB implementation:
+## Remote indexes
 
 ```js
-class IdbStorage {
-  constructor(name) {
-    this.prefix = `idx:${name}:`;
-  }
-  async write(name, buffer) {
-    /* idb put this.prefix + name → buffer */
-  }
-  async get(name) {
-    /* idb get this.prefix + name */
-  }
-  async delete(names) {
-    /* idb delete each this.prefix + name */
-  }
-  async list() {
-    /* idb getAllKeys matching this.prefix, strip prefix */
-  }
-}
-
-const index = await LocalIndex.withStorage(new IdbStorage("articles"), schema);
-```
-
-### Remote Index (HTTP)
-
-```js
-import init, { RemoteIndex } from "hermes-wasm";
+import init, { RemoteIndex, IpfsIndex } from "hermes-wasm";
 
 await init();
-
 const index = new RemoteIndex("https://example.com/my-index/");
-await index.load_with_idb_cache(); // loads with IndexedDB cache for fast reload
+await index.load_with_idb_cache(); // Use load() to skip persistent cache restore.
+const results = await index.search("rust", 10);
+await index.save_cache_to_idb();
 
-const results = await index.search("query", 10);
-
-// Fetch a document
-const doc = await index.get_document(
-  results.hits[0].address.segment_id,
-  results.hits[0].address.doc_id,
-);
+const ipfs = new IpfsIndex("/ipfs/YOUR_CID");
+await ipfs.load(fetchFn, sizeFn);
 ```
 
-## API Reference
+HTTP hosting must support range requests and cross-origin access when needed.
+IPFS callbacks:
 
-### `LocalIndex`
-
-| Method                                                  | Description                                        |
-| ------------------------------------------------------- | -------------------------------------------------- |
-| `LocalIndex.create(sdl)`                                | Create in-memory index from SDL schema             |
-| `LocalIndex.withStorage(storage, sdl)`                  | Create or open index with pluggable storage        |
-| `index.addDocument(json)`                               | Add a single document                              |
-| `index.addDocuments(jsonArray)`                         | Add multiple documents, returns count              |
-| `index.commit()`                                        | Commit pending docs, sync to storage if configured |
-| `index.search(query, limit)`                            | Search with BM25 ranking                           |
-| `index.searchOffset(query, limit, offset)`              | Search with pagination                             |
-| `index.searchStructured(request)`                       | Structured query with inline doc retrieval         |
-| `index.getDocument(segmentId, docId)`                   | Retrieve stored document                           |
-| `index.getDocumentWithFields(segmentId, docId, fields)` | Retrieve only specified fields                     |
-| `index.numDocs()`                                       | Count of committed documents                       |
-| `index.pendingDocs()`                                   | Count of uncommitted documents                     |
-| `index.fieldNames()`                                    | List of field names                                |
-
-### `RemoteIndex`
-
-| Method                                                     | Description                         |
-| ---------------------------------------------------------- | ----------------------------------- |
-| `new RemoteIndex(url)`                                     | Create remote index pointing to URL |
-| `RemoteIndex.with_cache_size(url, bytes)`                  | Create with custom cache size       |
-| `index.load()`                                             | Load index metadata and segments    |
-| `index.load_with_idb_cache()`                              | Load with IndexedDB cache pre-fill  |
-| `index.search(query, limit)`                               | Search                              |
-| `index.search_offset(query, limit, offset)`                | Search with pagination              |
-| `index.searchStructured(request)`                          | Structured query with inline docs   |
-| `index.get_document(segmentId, docId)`                     | Retrieve document                   |
-| `index.get_document_with_fields(segmentId, docId, fields)` | Retrieve only specified fields      |
-| `index.num_docs()`                                         | Document count                      |
-| `index.num_segments()`                                     | Segment count                       |
-| `index.field_names()`                                      | Field names                         |
-| `index.default_fields()`                                   | Default search fields               |
-| `index.export_cache()`                                     | Export slice cache as `Uint8Array`  |
-| `index.import_cache(data)`                                 | Import previously exported cache    |
-| `index.save_cache_to_idb()`                                | Persist slice cache to IndexedDB    |
-| `index.load_cache_from_idb()`                              | Restore cache from IndexedDB        |
-| `index.clear_idb_cache()`                                  | Remove persisted cache              |
-| `index.cache_stats()`                                      | Cache utilization info              |
-| `index.network_stats()`                                    | HTTP request statistics             |
-| `index.reset_network_stats()`                              | Clear network statistics            |
-
-### `IpfsIndex`
-
-Same API as `RemoteIndex` but loaded via JavaScript callbacks instead of HTTP:
-
-| Method                                       | Description                              |
-| -------------------------------------------- | ---------------------------------------- |
-| `new IpfsIndex(basePath)`                    | Create with IPFS path (e.g. `/ipfs/Qm…`) |
-| `IpfsIndex.with_cache_size(path, bytes)`     | Create with custom cache size            |
-| `index.load(fetchFn, sizeFn)`                | Load using JS callbacks                  |
-| `index.load_with_idb_cache(fetchFn, sizeFn)` | Load with IDB cache + JS callbacks       |
-
-`fetchFn`: `(path: string, rangeStart?: number, rangeEnd?: number) => Promise<Uint8Array>`
-`sizeFn`: `(path: string) => Promise<number>`
-
-All other methods (`search`, `get_document`, `cache_stats`, etc.) are identical to `RemoteIndex`.
-
-### Logging
-
-Debug output is off by default (level: `warn`). Enable verbose logging for diagnostics:
-
-```js
-import { set_log_level } from "hermes-wasm";
-
-set_log_level("debug"); // "error" | "warn" | "info" | "debug" | "trace"
+```ts
+type FetchFn = (
+  path: string,
+  start?: number,
+  end?: number,
+) => Promise<Uint8Array>;
+type SizeFn = (path: string) => Promise<number>;
 ```
 
-### `IndexRegistry`
+## API reference
 
-Manages multiple named remote indexes:
+All three indexes support `search(query, limit)` and `searchStructured(request)`.
+Other method names differ:
 
-| Method                                | Description                    |
-| ------------------------------------- | ------------------------------ |
-| `new IndexRegistry()`                 | Create empty registry          |
-| `registry.add_remote(name, url)`      | Load and register remote index |
-| `registry.remove(name)`               | Remove index                   |
-| `registry.list()`                     | List index names               |
-| `registry.search(name, query, limit)` | Search a specific index        |
+| Operation                      | LocalIndex                                        | RemoteIndex / IpfsIndex                                             |
+| ------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------- |
+| Paginated search               | `searchOffset(query, limit, offset)`              | `search_offset(query, limit, offset)`                               |
+| Stored document                | `getDocument(segmentId, docId)`                   | `get_document(segmentId, docId)`                                    |
+| Selected fields                | `getDocumentWithFields(segmentId, docId, fields)` | `getDocumentWithFields(segmentId, docId, fields)`                   |
+| Counts / fields                | `numDocs()`, `pendingDocs()`, `fieldNames()`      | `num_docs()`, `num_segments()`, `field_names()`, `default_fields()` |
+| Ingest                         | `addDocument(doc)`, `addDocuments(docs)`          | —                                                                   |
+| Publish / discard pending work | `commit()`, `abort()`                             | —                                                                   |
 
-### Schema Definition Language (SDL)
+Remote indexes also expose `with_cache_size`, `cache_stats`, `network_stats`,
+`reset_network_stats`, `export_cache`, `import_cache`, `save_cache_to_idb`,
+`load_cache_from_idb`, and `clear_idb_cache`. `IndexRegistry` manages named HTTP
+indexes with `add_remote`, `remove`, `list`, and `search`.
 
-```
-index <name> {
-    field <name>: <type> [attributes]
-}
-```
+For exact signatures, use the generated `pkg/hermes_wasm.d.ts` after building.
+Set diagnostics with `set_log_level("debug")`; the default is `warn`.
 
-**Types:** `text`, `u64`, `i64`, `f64`, `bytes`
-
-**Tokenizers:** `text<en_stem>`, `text<de_stem>`, `text<fr_stem>`, `text<es_stem>`, `text<it_stem>`, `text<pt_stem>`, `text<ru_stem>`, `text<ar_stem>`, `text<simple>`, etc.
-
-**Attributes:** `indexed` (searchable), `stored` (retrievable), `fast` (columnar access)
-
-### Query Language
-
-| Syntax | Example                | Description                 |
-| ------ | ---------------------- | --------------------------- |
-| Term   | `rust`                 | Match across default fields |
-| Field  | `title:rust`           | Match in specific field     |
-| AND    | `rust AND web`         | Both terms required         |
-| OR     | `rust OR python`       | Either term                 |
-| NOT    | `rust NOT unsafe`      | Exclude term                |
-| Group  | `(rust OR go) AND web` | Grouping                    |
-| Phrase | `"search engine"`      | Exact phrase                |
-
-### Structured Query API
-
-`searchStructured()` accepts a query object and returns hits with documents inline:
+## Structured query API
 
 ```js
 const results = await index.searchStructured({
-  query: { term: { field: "title", value: "rust" } },
+  query: { match: { field: "title", text: "rust search" } },
   limit: 10,
-  offset: 0,
-  fieldsToLoad: ["title", "body"],
+  fieldsToLoad: ["title"],
 });
-// { hits: [{ address, score, doc: { title: "...", body: "..." } }], total_hits }
+// { hits: [{ address, score, doc: { title: "..." } }], total_hits }
 ```
 
-**Query types:**
+Requests use camelCase; responses use snake_case. Supported variants are
+`term`, `match`, `phrase`, `boolean`, `prefix`, `sparseVector`, `denseVector`,
+and top-level `fusion`. Term/prefix payloads use `value`, while match/phrase
+use `text`. Fusion supports `rrf` and `normalizedWeightedSum`.
+See the [request definitions](src/query.rs); server L1 and reranker options
+are not exposed by this adapter.
+
+## Structured search diagnostics
+
+`includeRrfScores: true` adds fusion attribution; `tracing: true` captures bounded
+branch nominations and selected addresses without changing retrieval depth or
+ranking. Discarded candidates have no stored fields. Traces contain one local
+shard. The diagnostic window is capped at 10,000 and JSON responses at 64 MiB;
+oversized exports fail. See [candidate diagnostics](../docs/candidate-rescoring.md).
+
+## Delete and upsert local documents
+
+A text primary key enables whole-document deletion and full replacement,
+including all chunks and indexed-only values:
 
 ```js
-// Term query (tokenized with field's stemmer)
-{ term: { field: "title", value: "rust" } }
-
-// Match query (tokenized, OR across tokens)
-{ match: { field: "body", text: "search engine" } }
-
-// Boolean query (recursive composition)
-{ boolean: {
-    must: [{ term: { field: "title", value: "rust" } }],
-    should: [{ match: { field: "body", text: "fast" } }],
-    mustNot: [{ term: { field: "title", value: "python" } }],
-} }
-
-// Prefix query
-{ prefix: { field: "title", value: "rus" } }
-
-// Sparse vector query (pre-tokenized)
-{ sparseVector: { field: "emb", indices: [1, 5, 10], values: [0.5, 0.3, 0.2] } }
-
-// Dense vector query (ANN)
-{ denseVector: { field: "emb", vector: [0.1, 0.2, 0.3], nprobe: 32 } }
+await index.upsertDocument({ id: "1", title: "Updated title" });
+await index.upsertDocument({ id: "1", title: "Latest title" });
+await index.commit();
+index.deleteDocument("1");
+await index.commit();
 ```
+
+Staged rows may be replaced/deleted before commit; the latest accepted version
+wins. Optional [content hashes](../docs/content-deduplication.md) skip unchanged
+upserts. `deleteDocuments(keys)` and `await upsertDocuments(docs)` return
+`{ acceptedCount, errors: [{ index, error }] }`; inspect errors and commit accepted
+work. `abort()` discards the entire pending transaction.
+
+A failed builder requires abort. A failed storage commit can be retried without
+replaying mutations. Batches allow 100,000 deletion keys / 8 MiB key bytes or
+1,000 replacements / 32 MiB JSON. Physical compaction uses native core, CLI, or
+the server. See [row deletion](../docs/row-deletion.md).
 
 ## Building
 
-From the repository root, using Node.js 22.12+ for the test harness:
-
-```bash
-cd hermes-wasm
-bash build.sh  # requires Homebrew LLVM on macOS
-npm ci
-npm test -- --run
-```
-
-The build script sets `CC` and `AR` to Homebrew LLVM binaries for zstd cross-compilation to `wasm32-unknown-unknown`.
-The root `package.json` is a private Vitest harness; the publishable npm
-metadata is generated in `pkg/` by `wasm-pack` from `Cargo.toml`.
-
-## Example
-
-Start from the repository root for the commands below.
-
-Open `examples/index.html` in a browser (needs to be served, not opened as file):
+From the repository root, with `wasm-pack`, LLVM, and Node.js 22.12+:
 
 ```bash
 cd hermes-wasm
 bash build.sh
-cp pkg/hermes_wasm.js pkg/hermes_wasm_bg.wasm examples/
-cd examples && python3 -m http.server 8080
-# Open http://localhost:8080
+npm ci
+npm test -- --run
 ```
 
-## Architecture
-
-```
-Browser JS
-    │
-    ├── LocalIndex (create/index/search in WASM)
-    │       └── WasmIndexWriter → SegmentBuilder → RamDirectory
-    │                                                   │
-    │                                         [pluggable IFilesStorage]
-    │                                         (IDB, encrypted, OPFS, ...)
-    │
-    ├── RemoteIndex (HTTP range requests)
-    │       └── Searcher → SliceCachingDirectory → HttpDirectory
-    │
-    ├── IpfsIndex (JS fetch callbacks)
-    │       └── Searcher → SliceCachingDirectory → JsFetchDirectory
-    │
-    └── IndexRegistry (multi-index management)
-            └── Map<name, RemoteIndex>
-```
-
-## Structured search diagnostics
-
-`searchStructured` accepts `includeRrfScores` for fusion queries and `tracing`
-for any supported structured query. Both default to false:
-
-```js
-const response = await index.searchStructured({
-  query: {
-    fusion: {
-      queries: [
-        { name: "title", query: { match: { field: "title", text: "rust" } } },
-        { name: "body", query: { match: { field: "body", text: "rust" } } },
-      ],
-    },
-  },
-  limit: 10,
-  includeRrfScores: true,
-  tracing: true,
-});
-console.log(response.hits[0].rrf_score, response.hits[0].rrf_contributions);
-console.log(response.trace.shards[0].queries);
-```
-
-Responses use snake_case, matching other WASM search results. RRF attribution
-uses complete bounded branch lists before pagination and leaves `score`
-unchanged. The local trace includes each branch's query tree, raw candidate
-scores/ordinals and selected addresses, without hydrating discarded documents.
-It contains one local shard with empty broker/backend IDs. The trace observes
-the configured retrieval depth and does not run Boolean clauses independently.
-The diagnostic window is capped at 10,000; candidate/ordinal bounds and a 64 MiB
-JSON response limit reject oversized exports. WASM supports its existing RRF and
-weighted-sum fusion modes; server L1/reranker features remain server APIs.
-
-## Delete and upsert local documents
-
-LocalIndex supports primary-key schemas and enforces uniqueness on insert and
-reopen. Delete removes the document and every chunk, including indexed-only data.
-Upserts are complete replacements; an absent key is inserted.
-
-```javascript
-const index = await LocalIndex.create(`index documents {
-  field id: text<raw> [primary, indexed, stored]
-  field body: text<simple> [indexed<chunked>]
-}`);
-await index.addDocument({ id: "a", body: ["first chunk", "second chunk"] });
-await index.commit();
-await index.upsertDocument({ id: "a", body: ["replacement"] });
-await index.commit();
-index.deleteDocument("a");
-await index.commit();
-```
-
-`deleteDocuments(keys)` and `await upsertDocuments(documents)` return
-`{ acceptedCount, errors: [{ index, error }] }`. Inspect errors and commit accepted
-work. A pending insertion/replacement must be committed before another mutation
-of the same key. `await index.abort()` discards the entire pending transaction.
-A failed builder requires abort; a failed storage commit can be retried without
-replaying mutations. RemoteIndex and IpfsIndex remain read-only.
-
-Deletion batches allow 100,000 keys / 8 MiB key bytes; replacement batches allow
-1,000 documents / 32 MiB JSON. Keep one writable LocalIndex per storage namespace,
-and implement atomic per-file replacement in the storage adapter. Physical
-compaction is available through native core, CLI, and the server ForceMerge API.
+`build.sh` selects available LLVM tools for zstd cross-compilation and generates
+`pkg/`. The root `package.json` is the private test harness; `pkg/` is the
+publishable package. For a browser UI, see [hermes-web](../hermes-web/README.md).

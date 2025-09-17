@@ -1,82 +1,40 @@
 # Hermes Web
 
-A Vue 3 + Tailwind CSS application for searching Hermes indexes via WASM.
-This project is search-only; the LLM observability UI lives in
-[`../hermes-model-lab`](../hermes-model-lab/README.md).
+Vue/WASM search UI for static indexes over HTTP or IPFS, with lazy document
+loading and cache/network diagnostics. LLM traces live in the separate
+[Model Lab](../hermes-model-lab/README.md).
 
-The historical `pnpm lab:dev`, `lab:test`, `lab:lint`, `lab:build`, and
-`lab:preview` commands remain as forwarding aliases during the project split.
+## Quick start
 
-## Quick Start
-
-### 1. Start the index server (from the repository root)
+From the repository root, serve an existing index:
 
 ```bash
 cargo run -p hermes-server --bin serve-index -- /path/to/index 8765
 ```
 
-### 2. Start the web app
+In another terminal, build WASM, install dependencies, and start the UI:
 
 ```bash
-# Build WASM, install deps, and launch dev server
 ./hermes-web/scripts/dev.sh
-
-# Or skip WASM build if already built
-./hermes-web/scripts/dev.sh --skip-wasm
+# Use --skip-wasm when pkg/ is already built.
 ```
 
-Open http://localhost:5173 in your browser.
+Open <http://localhost:5173>, connect to `http://localhost:8765`, and search.
+See [UI configuration](../docs/ux-config.md) and [query syntax](../docs/query-language.md).
 
-## Manual Setup
+## Build and checks
 
-Use Node.js 22.12+ and pnpm 10+. Run the WASM build from the repository root.
-
-### Build WASM
+Requires Node.js 22.12+, pnpm 10+, and the [WASM build tools](../hermes-wasm/README.md#building).
+From the repository root:
 
 ```bash
 (cd hermes-wasm && bash build.sh)
+pnpm --dir hermes-web install --frozen-lockfile
+pnpm --dir hermes-web test
+pnpm --dir hermes-web lint
+pnpm --dir hermes-web build
 ```
 
-### Install and run
-
-```bash
-cd hermes-web
-pnpm install --frozen-lockfile
-pnpm dev
-```
-
-## Production Build
-
-Run the following commands from `hermes-web`, after installing dependencies.
-
-```bash
-pnpm build
-```
-
-The static files will be in the `dist/` directory. Serve them with any static file server.
-
-## Quality checks
-
-```bash
-pnpm test
-pnpm lint
-pnpm build
-```
-
-The unit suite covers framework-independent URL/configuration helpers. Keep
-protocol parsing in `src/lib` so it can be shared and tested without booting
-Vue or WASM.
-
-## Usage
-
-1. Enter the server URL (e.g., `http://localhost:8765`)
-2. Click **Connect** to load the index
-3. Enter a search query and click **Search**
-4. Click on results to expand and load document details
-
-## Features
-
-- **Serverless**: Compiles to static files, no backend required
-- **WASM-powered**: Uses hermes-wasm for client-side search
-- **Network stats**: View HTTP requests and cache statistics
-- **Lazy loading**: Documents are fetched on demand when expanded
+Serve `hermes-web/dist/` as static files. Keep protocol/configuration helpers in
+`src/lib` so tests need neither Vue nor WASM. Historical `pnpm lab:*` scripts
+forward to Model Lab.

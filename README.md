@@ -1,340 +1,75 @@
 # Hermes
 
-A hybrid search engine combining BM25 text search, sparse vectors (SPLADE), and dense vectors (global IVF-TQ with HNSW coarse routing) in a single embeddable Rust library. Runs natively, over gRPC, in browsers via WASM, and over IPFS.
+Embeddable Rust search engine: BM25 and phrase search, sparse vectors (BMP,
+MaxScore, Seismic), dense search (flat, TQ, IVF-TQ, binary IVF, ScaNN), and hybrid ranking.
+Run locally, behind gRPC, or in a browser over HTTP/IPFS with WASM.
 
-## Why Hermes?
+- Chunked and multi-value fields, filters, fusion, formula ranking, and reranking.
+- Primary-key deletion, full-document upserts, content-hash deduplication, and compaction.
+- Sharded search through a broker with shared BM25 statistics.
+- A separate MAL-defined Transformer/Mamba stack for training, inference, and inspection.
 
-- Combine BM25, phrase queries, sparse vectors, and dense ANN in one index.
-- Choose IVF-TQ, binary IVF, or ScaNN routing through the [schema](docs/schema.md).
-- Embed the Rust library, serve gRPC through a server or sharding broker, or
-  search static index files in a browser through WASM.
-- Train and inspect MAL-defined language models with the shared inference and
-  training stack.
+[Documentation](docs/README.md) · [Schema](docs/schema.md) ·
+[Query syntax](docs/query-language.md) · [Contributing](CONTRIBUTING.md)
 
-Start with the [documentation index](docs/README.md),
+## Quick start
 
-## Packages
-
-| Package                    | Description                                                  | Distribution                                                  |
-| -------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------- |
-| `hermes-core`              | Core search engine library                                   | [crates.io](https://crates.io/crates/hermes-core)             |
-| `hermes-broker`            | Sharding and routing for gRPC servers                        | [crates.io](https://crates.io/crates/hermes-broker)           |
-| `hermes-server`            | gRPC server for remote search and indexing                   | [crates.io](https://crates.io/crates/hermes-server)           |
-| `hermes-tool`              | CLI for index management and data processing                 | [crates.io](https://crates.io/crates/hermes-tool)             |
-| `hermes-wasm`              | WASM bindings for browser search and indexing                | [npm](https://www.npmjs.com/package/hermes-wasm)              |
-| `hermes-web`               | Vue/WASM search UI                                           | Workspace application                                         |
-| `hermes-model-lab`         | Standalone local LLM trace and observability UI              | Workspace application                                         |
-| `hermes-client-python`     | Async Python gRPC client                                     | [PyPI](https://pypi.org/project/hermes-client-python)         |
-| `hermes-client-typescript` | TypeScript gRPC client                                       | [npm](https://www.npmjs.com/package/hermes-client-typescript) |
-| `hermes-proto`             | Shared gRPC protocol definition                              | Source package                                                |
-| `hermes-mal`               | Model Architecture Language parser and bundled model configs | [crates.io](https://crates.io/crates/hermes-mal)              |
-| `hermes-mal-python`        | Python bindings for the shared MAL parser                    | Python extension                                              |
-| `hermes-tokenizer`         | Stable-Rust byte-level BPE tokenizer                         | [crates.io](https://crates.io/crates/hermes-tokenizer)        |
-| `hermes-llm`               | Shared model, inference, generation, and accelerator kernels | Workspace crate                                               |
-| `hermes-train`             | Training CLI for the shared LLM implementation               | Workspace crate                                               |
-
-## Quick Start
-
-### CLI
+Run in a new working directory:
 
 ```bash
 cargo install hermes-tool
-
-# Create a small schema and dataset in a new working directory.
-cat > schema.sdl <<'SDL'
-index articles {
+hermes-tool init -i ./articles --sdl 'index articles {
+    field id: text<raw> [primary, stored]
     field title: text<en_stem> [indexed, stored]
-    field body: text [indexed, stored]
-}
-SDL
-cat > documents.jsonl <<'JSONL'
-{"title":"Hybrid Search","body":"Combining BM25 with vectors"}
-{"title":"Browser Search","body":"Search static indexes with WASM"}
-JSONL
-
-hermes-tool create -i ./my_index -s schema.sdl
-
-# Index documents from JSONL (with progress logging every 50k docs)
-cat documents.jsonl | hermes-tool index -i ./my_index --stdin -p 50000
-
-# Commit, merge, and inspect
-hermes-tool commit -i ./my_index
-hermes-tool merge -i ./my_index
-hermes-tool info -i ./my_index
-hermes-tool search -i ./my_index --query 'title:hybrid' --limit 10
+}'
+printf '%s\n' '{"id":"1","title":"Hybrid search with Hermes"}' |
+  hermes-tool index -i ./articles --stdin
+hermes-tool search -i ./articles --query 'title:hybrid' --limit 10
 ```
 
-### Rust Library
-
-```rust
-use hermes_core::{
-    Index, IndexConfig, MmapDirectory,
-    index_json_document, parse_single_index,
-};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create index from SDL
-    let dir = MmapDirectory::new("./my_index");
-    let schema = parse_single_index(r#"
-        index articles {
-            field title: text<en_stem> [indexed, stored]
-            field body: text [indexed]
-            field views: u64 [indexed, stored]
-        }
-    "#)?.to_schema();
-    let index = Index::create(dir, schema, IndexConfig::default()).await?;
-
-    // Add documents
-    let mut writer = index.writer();
-    for json in [
-        serde_json::json!({"title": "Hybrid Search", "body": "BM25 meets vectors", "views": 42}),
-        serde_json::json!({"title": "WASM Search", "body": "Search in the browser", "views": 100}),
-    ] {
-        index_json_document(&writer, &json).await?;
-    }
-    writer.commit().await?;
-
-    // Search
-    let results = index.query("hybrid search", 10).await?;
-    for hit in &results.hits {
-        let doc = index.get_document(&hit.address).await?;
-        println!("{:.4} {:?}", hit.score, doc);
-    }
-
-    Ok(())
-}
-```
-
-### gRPC Server
+`index` commits before returning. For remote access:
 
 ```bash
-# Run with Docker
-docker build -t hermes-server -f hermes-server/Dockerfile .
-docker run -p 50051:50051 -v ./data:/data hermes-server --data-dir /data
-
-# Or install directly
 cargo install hermes-server
-hermes-server --addr 0.0.0.0:50051 --data-dir ./data
+hermes-server --data-dir . --addr 127.0.0.1:50051
 ```
 
-For production indexes, BP reorder resources are controlled independently:
+Connect with the [Python](hermes-client-python/README.md) or
+[TypeScript](hermes-client-typescript/README.md) client. See
+[server operations](hermes-server/README.md) for resource limits and maintenance.
 
-```bash
-hermes-server --data-dir /data \
-  --search-threads 12 \
-  --max-concurrent-searches 6 \
-  --optimizer-threads 16 \
-  --optimizer-concurrent-passes 1 \
-  --optimizer-max-unconverged-passes 3 \
-  --bp-memory-budget-mb 24576
-```
+## Packages
 
-- `--search-threads` bounds the process-wide CPU pool shared by nested search
-  work across every index; it defaults to one quarter of detected CPUs.
-- `--max-concurrent-searches` bounds simultaneous search pipelines and rejects
-  overload promptly instead of queueing an unbounded number of decoded RPCs.
-  Result windows, fusion/reranker work, query-tree expansion, vector payloads,
-  stored-field hydration, and response bytes also have explicit server-side
-  budgets; see [Search resource controls](hermes-server/README.md#search-resource-controls).
-- `--optimizer-threads` is the width of one process-wide Rayon pool shared by
-  every index and BP path. An active pass intentionally keeps that pool busy;
-  lower this value when search or indexing needs more CPU. `0` disables the
-  periodic optimizer, while merge-time and manual BP use the bounded fallback
-  pool.
-- `--optimizer-concurrent-passes` limits whole-segment passes across the
-  optimizer, merge-time reorder, and manual reorder. It is hard-capped at two,
-  because each pass can use the complete shared pool and its own memory budget.
-  Explicit force merge pauses new background BP admission and reserves
-  foreground capacity once existing merges have drained.
-- `--optimizer-max-unconverged-passes` is a hard eligibility bound for
-  optimizer follow-up on one budget-truncated replacement lineage (the default
-  `3` includes the initial partial pass). This prevents a segment that cannot
-  converge within its budget from keeping the optimizer BP pool busy forever.
-- `--bp-memory-budget-mb` bounds the main per-pass algorithmic working set:
-  document maps, the BP forward graph and degree arrays, and record-rewrite
-  grid/encode windows. Over-budget record passes fall back to block order and
-  graph dimensions are trimmed. It is not a total-process RSS cap: readers,
-  mmap/page-cache residency, output buffering, merge state, and indexing are
-  additional.
-
-Segment publication, replacement, reader retirement, orphan cleanup, failure
-backoff, and index deletion follow one ownership protocol. Missing files that
-are still referenced by metadata are quarantined instead of being retried in a
-tight merge loop; start once with `--doctor` only when you intentionally want
-to remove those corrupt metadata entries. See
-[Segment lifecycle and recovery](docs/segment-lifecycle.md) and the full
-[server options](hermes-server/README.md#background-merge-and-reorder).
-
-Commit publication is cancellation-safe: after workers flush, an owned
-finalizer carries metadata publication, primary-key refresh, and worker resume
-to completion even if the client disconnects. A pre-publication storage error
-keeps that generation paused and retryable instead of mixing it with new input.
-
-Vector indexes can be switched atomically between IVF and ScaNN with the
-`AlterVectorIndex` gRPC method. The request identifies the field and supplies
-its replacement SDL type/options; the response reports `BUILT`,
-`DEFERRED_FLAT` (the hardcoded geometry-derived training floor has not been
-reached), or `PARAMETERS_ONLY`. See [the schema reference](docs/schema.md).
-
-Python client:
-
-```python
-from hermes_client_python import HermesClient
-
-async with HermesClient("localhost:50051") as client:
-    await client.create_index(
-        "articles",
-        """
-        index articles {
-            field title: text<en_stem> [indexed, stored]
-            field body: text [indexed, stored]
-        }
-    """,
-    )
-
-    await client.index_documents(
-        "articles",
-        [
-            {"title": "Hybrid Search", "body": "Combining BM25 with vectors"},
-        ],
-    )
-    await client.commit("articles")
-
-    results = await client.search(
-        "articles", query={"match": {"field": "title", "text": "hybrid"}}
-    )
-    for hit in results.hits:
-        print(hit.score, hit.address)
-```
-
-### WASM (Browser)
-
-Hermes compiles to WebAssembly and can search indexes hosted over HTTP or IPFS directly in the browser, with IndexedDB-backed slice caching to reuse downloaded slices on repeat visits.
-
-```javascript
-import init, { RemoteIndex, IpfsIndex } from "hermes-wasm";
-
-await init();
-
-// HTTP: load from any static file server
-const index = new RemoteIndex("https://example.com/my_index");
-await index.load();
-
-// IPFS: load from content-addressed storage via verified-fetch
-const ipfsIndex = new IpfsIndex("/ipfs/QmYourCID");
-await ipfsIndex.load(fetchFn, sizeFn);
-
-// Search (same API for both)
-const results = await index.search("hybrid search", 10);
-console.log(results);
-
-// Persist cache to IndexedDB for instant reload
-await index.save_cache_to_idb();
-```
-
-## Key Features
-
-**Unified hybrid search** -- BM25 text ranking, SPLADE sparse vectors, and global IVF-TQ dense vectors share the same index, segments, and query pipeline. No sidecar services required.
-
-**Configurable posting codecs** -- The production posting container supports rounded-width packing, exact-width packing, and patched frame-of-reference (Pfor) blocks. `--posting-codec` and `-O` control the size/decode tradeoff; see [posting codecs](docs/posting-codecs.md).
-
-**Block-Max MaxScore** -- Top-k retrieval uses MaxScore partitioning (Turtle & Flood 1995) combined with block-max pruning (Ding & Suel 2011) and conjunction optimization. The shared `MaxScoreExecutor` serves BM25 text and sparse MaxScore queries. Sparse vectors default to BMP block-at-a-time pruning; Seismic is an optional third algorithm with geometric nomination and exact forward scoring.
-
-**Multi-value combiners** -- Documents with multiple vectors per field (e.g., chunked passages) are scored with configurable strategies: Sum, Max, Avg, LogSumExp (smooth approximation), or WeightedTopK with exponential decay.
-
-**Matryoshka reranking** -- L2 reranker supports Matryoshka dimensionality reduction: scores candidates on leading dimensions first, then full-dimension exact scoring on survivors only. The savings depend on the candidate pool and dimension schedule.
-
-**SOAR multi-probe** -- IVF-TQ indexes default to Google's SOAR (Spilling with Orthogonality-Amplified Residuals) in selective mode, calibrating one secondary assignment for at most 30% of vectors; `soar: off` disables it explicitly.
-
-**SimHash preprocessing** -- Stream JSONL through `simhash` and `sort` to compute fingerprints and order records before ingestion. Apply your duplicate-selection rule before indexing; sorting alone does not remove near-duplicates.
-
-**Language-aware tokenization** -- Snowball stemming, per-document language hints, stop words with phrase-gap preservation, Unicode segmentation, and optional Japanese/Korean morphology. Hugging Face tokenizers are also supported; see the [tokenizer reference](docs/schema.md#tokenizers).
-
-**Storage abstraction** -- Filesystem (mmap), HTTP (range requests), RAM, IPFS (JS fetch callbacks), and slice-caching directories. The same index binary works across all backends.
-
-## Schema
-
-Hermes uses a Schema Definition Language (SDL) to define index structure:
-
-```sdl
-index articles {
-    field url: text [indexed, stored, primary]
-    field title: text<en_stem> [indexed, stored]
-    field body: text [indexed]
-    field author: text<raw_ci> [indexed, stored]
-    field published_at: u64 [indexed, stored]
-    field embedding: dense_vector<768> [indexed, stored]
-    field sparse_embedding: sparse_vector [indexed]
-}
-```
-
-Field types: `text`, `u64`, `i64`, `f64`, `bytes`, `json`, `dense_vector<dim>`, `sparse_vector`
-Attributes: `indexed`, `stored`, `primary`, `fast`
-Tokenizers: `default`, `simple`, `raw`, `raw_ci`, `en_stem`, `de_stem`, `fr_stem`, `es_stem`, `it_stem`, `pt_stem`, `ru_stem`, `ar_stem`, and [more](docs/schema.md).
-
-Full SDL reference: [docs/schema.md](docs/schema.md)
+| Package                                                 | Purpose                                   |
+| ------------------------------------------------------- | ----------------------------------------- |
+| [hermes-core](hermes-core/README.md)                    | Rust storage, indexing, and query library |
+| [hermes-tool](hermes-tool/README.md)                    | Index CLI and JSONL processing            |
+| [hermes-server](hermes-server/README.md)                | gRPC search and indexing                  |
+| [hermes-broker](hermes-broker/README.md)                | Shard routing and distributed search      |
+| [hermes-proto](hermes-proto/README.md)                  | Shared gRPC contract                      |
+| [Python client](hermes-client-python/README.md)         | Async gRPC client                         |
+| [TypeScript client](hermes-client-typescript/README.md) | Node.js gRPC client                       |
+| [hermes-wasm](hermes-wasm/README.md)                    | Browser search and local indexing         |
+| [hermes-web](hermes-web/README.md)                      | Vue/WASM search UI                        |
+| [hermes-llm](hermes-llm/README.md)                      | Inference, generation, and model traces   |
+| [hermes-train](hermes-train/README.md)                  | Training and evaluation workflows         |
+| [hermes-model-lab](hermes-model-lab/README.md)          | Local model observability UI              |
+| [hermes-mal](hermes-mal/README.md)                      | Model Architecture Language parser        |
+| [hermes-mal-python](hermes-mal-python/README.md)        | Python MAL bindings                       |
+| [hermes-tokenizer](hermes-tokenizer/README.md)          | Byte-level BPE tokenizer                  |
 
 ## Development
 
-### Prerequisites
-
-- Rust 1.98.1+ (see `rust-toolchain.toml`)
-- Python 3.12+ for development and MAL bindings (the gRPC client supports 3.10+)
-- Node.js 22.12+ (for WASM and web UI; see [Vite requirements](https://vite.dev/guide/#scaffolding-your-first-vite-project))
-- pnpm 10+ (for TypeScript and web projects)
-- uv and maturin (for Python projects)
-- wasm-pack (for WASM builds)
-- protoc (for gRPC)
-
-### Building
+Use the pinned [Rust toolchain](rust-toolchain.toml) and `protoc`:
 
 ```bash
-# Build all Rust packages
 cargo build --release
-
-# Build WASM (requires Homebrew LLVM on macOS for zstd cross-compilation)
-(cd hermes-wasm && bash build.sh)
-
-# Build the Python gRPC client
-(cd hermes-client-python && uv build)
-
-# Build the MAL Python binding
-(cd hermes-mal-python && maturin build --release)
+python3 scripts/check_search.py check
+uv run scripts/check_docs.py
 ```
 
-Docker Compose provides the Rust and WASM build services:
-
-Examples:
-
-- `docker compose run --rm cargo-build`
-- `docker compose run --rm build-hermes-wasm`
-
-### Testing
-
-```bash
-cargo test --workspace
-```
-
-LLM contributors should start with the [inference and training code map](docs/llm-code-map.md).
-Temporary official-repository GPU revisions and their release exit criteria are
-listed in [the upstream dependency register](docs/upstream-dependencies.md). Backend-specific Metal and
-CUDA checks are documented in those guides; enabling every backend at once is
-not the portable test configuration.
-
-### Linting
-
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-
-# Or run the commit and push hooks
-pip install pre-commit
-pre-commit install
-pre-commit run --all-files
-pre-commit run --all-files --hook-stage pre-push
-```
+Read [AGENTS.md](AGENTS.md) and the [search contract](docs/search-system-contract.md)
+before search changes. See [Contributing](CONTRIBUTING.md) for client, WASM, and
 
 ## License
 

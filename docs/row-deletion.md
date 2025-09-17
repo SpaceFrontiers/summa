@@ -1,13 +1,12 @@
 # Row deletion, upserts, and compaction
 
-Status: implemented in native/portable core, CLI, gRPC server and broker,
-Python and TypeScript clients, and WASM LocalIndex. Index metadata format 8 is
-required; formats 6 and 7 upgrade on open without rewriting segments. Format 7
-added optional `deletions`; format 8 protects the optional content-hash setting. Readers upgrade in memory with a
-`log::warn!`; writers persist the new stamp on open, after which older releases
-cannot open the index (they would silently drop deletion generations). Segments
-written before 1.8.125 still fail at segment open (BMP blob magic) and need a
-rebuild; segments without `.rowstats` refuse compaction until merged.
+Implemented in native/portable core, CLI, gRPC server/broker, Python/TypeScript,
+and WASM LocalIndex. Current metadata is **format 9**; formats 6–8 upgrade on
+open without rewriting segments. Readers upgrade in memory and warn; writers
+persist the stamp, after which older builds cannot open the index. Formats 7,
+8, and 9 introduced deletion masks, content hashes, and compact text/norm flags.
+Segments written before 1.8.125 still need rebuilding (BMP blob magic);
+segments without `.rowstats` require a merge before compaction.
 Native mutation APIs require an initialized primary-key index; server and WASM
 writers initialize it automatically. Cross-shard atomic upserts are not supported.
 
@@ -33,9 +32,7 @@ The replacement operation is named **upsert**: insert when the primary key is
 absent, otherwise replace the complete document and all its chunks. The native
 and portable writer expose async `upsert_document`; clients expose their corresponding
 single/batch helpers; the CLI command is `upsert`; IndexService exposes
-`UpsertDocuments(UpsertDocumentsRequest)`. This renames the unreleased API on this
-branch, including its gRPC method path. Publication, request limits, and persisted
-formats are unchanged, with the same execution and allocation costs.
+`UpsertDocuments(UpsertDocumentsRequest)`.
 
 ```rust,ignore
 let mut writer = index.writer();
