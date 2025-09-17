@@ -722,6 +722,13 @@ pub struct ColumnBlock {
     pub raw_dict: OwnedBytes,
 }
 
+impl ColumnBlock {
+    /// Bounds in the encoded domain, before any text-ordinal remapping.
+    pub(crate) fn value_bounds(&self) -> Option<(u64, u64)> {
+        codec::value_bounds(self.data.as_slice())
+    }
+}
+
 /// Reads a single fast-field column from mmap/buffer.
 ///
 /// A column is a sequence of independently-decodable blocks. Fresh segments
@@ -1271,6 +1278,16 @@ impl FastFieldReader {
     /// per-value scan. Copied block boundaries need not align to batch sizes.
     pub(crate) fn try_scan_single_value_batches<E>(
         &self,
+        f: impl FnMut(u32, &[u64]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.try_scan_single_value_batches_where(|_| true, f)
+    }
+
+    /// Reject complete copied blocks before reading their payloads. The caller
+    /// owns the predicate; ordinary scans erase the unconditional block test.
+    pub(crate) fn try_scan_single_value_batches_where<E>(
+        &self,
+        mut should_scan: impl FnMut(&ColumnBlock) -> bool,
         mut f: impl FnMut(u32, &[u64]) -> Result<(), E>,
     ) -> Result<(), E> {
         if self.multi {
@@ -1289,15 +1306,24 @@ impl FastFieldReader {
         };
 
         for (block_idx, block) in self.blocks.iter().enumerate() {
+            if !should_scan(block) {
+                continue;
+            }
             let n = block.num_docs as usize;
             let mut pos = 0;
+            let mut cursor = codec::BlockwiseLinearCursor::default();
 
             let map = ordinal_maps.map(|maps| &maps[block_idx]);
             let has_map = map.is_some_and(|m| !m.is_empty());
 
             while pos < n {
                 let chunk = (n - pos).min(BATCH);
-                codec::auto_read_batch(block.data.as_slice(), pos, &mut buf[..chunk]);
+                codec::auto_read_batch_with_cursor(
+                    block.data.as_slice(),
+                    pos,
+                    &mut buf[..chunk],
+                    &mut cursor,
+                );
 
                 if has_map {
                     let map = map.unwrap();

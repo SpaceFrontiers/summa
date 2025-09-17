@@ -61,6 +61,7 @@
 
 - [Contributing](../CONTRIBUTING.md)
 - [Range bitset word materialization](range-word-materialization.md)
+- [Range block scan experiments](range-block-scans.md)
 - [Text formats and memory](text-format-comparison.md)
 - [pruning fixes](search-pruning-fixes.md)
 - [Lucene research](lucene-11-performance-research.md)

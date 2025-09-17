@@ -14,7 +14,9 @@
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
-use crate::structures::fast_field::{FAST_FIELD_MISSING, f64_to_sortable_u64, zigzag_decode};
+use crate::structures::fast_field::{
+    FAST_FIELD_MISSING, FastFieldColumnType, f64_to_sortable_u64, zigzag_decode,
+};
 use crate::{DocId, Score};
 
 use super::docset::DocSet;
@@ -41,6 +43,21 @@ enum CompiledRange {
 }
 
 impl CompiledRange {
+    fn may_match(self, bounds: Option<(u64, u64)>) -> bool {
+        let Some((min, max)) = bounds else {
+            return true;
+        };
+        if min == max {
+            return self.contains(min);
+        }
+        match self {
+            Self::Raw { lo, hi } => lo <= hi && lo <= max.min(FAST_FIELD_MISSING - 1) && hi >= min,
+            // Zigzag does not preserve order. Only exact constants above can
+            // reject signed blocks using a raw-domain interval.
+            Self::Signed { .. } => true,
+        }
+    }
+
     #[inline]
     fn contains(self, raw: u64) -> bool {
         if raw == FAST_FIELD_MISSING {
@@ -190,23 +207,29 @@ impl Query for RangeQuery {
         let mut bits = super::DocBitset::new(reader.num_docs());
         // Dispatch the numeric domain once per batch. The concrete predicates
         // can vectorize without duplicating the owning reader's decode loop.
-        let _: Result<(), std::convert::Infallible> =
-            fast_field.try_scan_single_value_batches(|start, values| {
-                match bound {
-                    CompiledRange::Raw { lo, hi } => {
-                        bits.insert_matching_values(start, values, |raw| {
-                            raw != FAST_FIELD_MISSING && raw >= lo && raw <= hi
-                        });
+        let _: Result<(), std::convert::Infallible> = fast_field
+            .try_scan_single_value_batches_where(
+                |block| {
+                    fast_field.column_type == FastFieldColumnType::TextOrdinal
+                        || bound.may_match(block.value_bounds())
+                },
+                |start, values| {
+                    match bound {
+                        CompiledRange::Raw { lo, hi } => {
+                            bits.insert_matching_values(start, values, |raw| {
+                                raw != FAST_FIELD_MISSING && raw >= lo && raw <= hi
+                            });
+                        }
+                        CompiledRange::Signed { lo, hi } => {
+                            bits.insert_matching_values(start, values, |raw| {
+                                let value = zigzag_decode(raw);
+                                raw != FAST_FIELD_MISSING && value >= lo && value <= hi
+                            });
+                        }
                     }
-                    CompiledRange::Signed { lo, hi } => {
-                        bits.insert_matching_values(start, values, |raw| {
-                            let value = zigzag_decode(raw);
-                            raw != FAST_FIELD_MISSING && value >= lo && value <= hi
-                        });
-                    }
-                }
-                Ok(())
-            });
+                    Ok(())
+                },
+            );
         Some(bits)
     }
 

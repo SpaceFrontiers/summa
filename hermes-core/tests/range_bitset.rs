@@ -21,6 +21,56 @@ fn scorer_hits(mut scorer: Box<dyn Scorer + '_>) -> Vec<u32> {
 }
 
 #[tokio::test]
+async fn range_block_pruning_uses_global_text_ordinals_after_merge() {
+    let dir = RamDirectory::new();
+    let mut sb = SchemaBuilder::default();
+    let field = sb.add_text_field("value", false, false);
+    sb.set_fast(field, true);
+    let schema = Arc::new(sb.build());
+    let mut sources = Vec::new();
+    for words in [["y", "z"], ["a", "b"]] {
+        let mut builder =
+            SegmentBuilder::new(Arc::clone(&schema), SegmentBuilderConfig::default()).unwrap();
+        for word in words {
+            let mut doc = Document::new();
+            doc.add_text(field, word);
+            builder.add_document(doc).unwrap();
+        }
+        let id = SegmentId::new();
+        builder.build(&dir, id, None).await.unwrap();
+        sources.push(
+            SegmentReader::open(&dir, id, Arc::clone(&schema), 0)
+                .await
+                .unwrap(),
+        );
+    }
+    let id = SegmentId::new();
+    SegmentMerger::new(Arc::clone(&schema))
+        .merge(&dir, &sources, id, None)
+        .await
+        .unwrap();
+    let reader = SegmentReader::open(&dir, id, schema, 0).await.unwrap();
+    // First block stores local ordinals 0,1, which become global ordinals 2,3.
+    let query = RangeQuery::u64(field, Some(2), Some(3));
+    let result = query.as_doc_bitset(&reader).unwrap();
+    assert_eq!(
+        (0..4)
+            .filter(|&doc| result.contains(doc))
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        scorer_hits(query.scorer(&reader, 4).await.unwrap()),
+        vec![0, 1]
+    );
+    #[cfg(feature = "sync")]
+    assert_eq!(
+        scorer_hits(query.scorer_sync(&reader, 4).unwrap()),
+        vec![0, 1]
+    );
+}
+
+#[tokio::test]
 async fn range_bitsets_preserve_matches_across_every_copied_block_bit_offset() {
     let dir = RamDirectory::new();
     let mut sb = SchemaBuilder::default();
