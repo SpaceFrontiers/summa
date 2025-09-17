@@ -21,6 +21,71 @@ fn scorer_hits(mut scorer: Box<dyn Scorer + '_>) -> Vec<u32> {
 }
 
 #[tokio::test]
+async fn range_bitsets_preserve_matches_across_every_copied_block_bit_offset() {
+    let dir = RamDirectory::new();
+    let mut sb = SchemaBuilder::default();
+    let field = sb.add_u64_field("value", false, false);
+    sb.set_fast(field, true);
+    let schema = Arc::new(sb.build());
+    let mut sources = Vec::new();
+    let mut values = Vec::new();
+    // Each copied block starts one bit later, exercises four full words and
+    // a one-value batch tail, and shares an output word with its neighbour.
+    for block in 0..64 {
+        let mut builder =
+            SegmentBuilder::new(Arc::clone(&schema), SegmentBuilderConfig::default()).unwrap();
+        for local in 0..257 {
+            let value = (local + block) % 5;
+            let mut doc = Document::new();
+            if value != 4 {
+                doc.add_u64(field, value);
+            }
+            builder.add_document(doc).unwrap();
+            values.push(value);
+        }
+        let id = SegmentId::new();
+        builder.build(&dir, id, None).await.unwrap();
+        sources.push(
+            SegmentReader::open(&dir, id, Arc::clone(&schema), 0)
+                .await
+                .unwrap(),
+        );
+    }
+    let id = SegmentId::new();
+    SegmentMerger::new(Arc::clone(&schema))
+        .merge(&dir, &sources, id, None)
+        .await
+        .unwrap();
+    let reader = SegmentReader::open(&dir, id, schema, 0).await.unwrap();
+    assert_eq!(reader.fast_field(field.0).unwrap().num_blocks(), 64);
+    for (lo, hi) in [(0, 0), (1, 2), (0, 3), (4, 4), (3, 1)] {
+        let query = RangeQuery::u64(field, Some(lo), Some(hi));
+        let expected: Vec<_> = values
+            .iter()
+            .enumerate()
+            .filter_map(|(doc, &value)| {
+                (value != 4 && value >= lo && value <= hi).then_some(doc as u32)
+            })
+            .collect();
+        let bits = query.as_doc_bitset(&reader).unwrap();
+        let actual: Vec<_> = (0..reader.num_docs())
+            .filter(|&doc| bits.contains(doc))
+            .collect();
+        assert_eq!(actual, expected, "{query}");
+        assert_eq!(bits.count() as usize, expected.len());
+        assert_eq!(
+            scorer_hits(query.scorer(&reader, values.len()).await.unwrap()),
+            expected
+        );
+        #[cfg(feature = "sync")]
+        assert_eq!(
+            scorer_hits(query.scorer_sync(&reader, values.len()).unwrap()),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
 async fn range_bitsets_preserve_numeric_bounds_missing_values_and_first_multi_value_after_merge() {
     let dir = RamDirectory::new();
     let mut sb = SchemaBuilder::default();

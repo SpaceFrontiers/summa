@@ -188,13 +188,25 @@ impl Query for RangeQuery {
         }
         let bound = self.bound.compile();
         let mut bits = super::DocBitset::new(reader.num_docs());
-        // The generic callback can inline. Traverse blocks once and dispatch
-        // the codec per batch instead of doing random access for every doc.
-        fast_field.scan_single_values(|doc_id, raw| {
-            if bound.contains(raw) {
-                bits.set(doc_id);
-            }
-        });
+        // Dispatch the numeric domain once per batch. The concrete predicates
+        // can vectorize without duplicating the owning reader's decode loop.
+        let _: Result<(), std::convert::Infallible> =
+            fast_field.try_scan_single_value_batches(|start, values| {
+                match bound {
+                    CompiledRange::Raw { lo, hi } => {
+                        bits.insert_matching_values(start, values, |raw| {
+                            raw != FAST_FIELD_MISSING && raw >= lo && raw <= hi
+                        });
+                    }
+                    CompiledRange::Signed { lo, hi } => {
+                        bits.insert_matching_values(start, values, |raw| {
+                            let value = zigzag_decode(raw);
+                            raw != FAST_FIELD_MISSING && value >= lo && value <= hi
+                        });
+                    }
+                }
+                Ok(())
+            });
         Some(bits)
     }
 

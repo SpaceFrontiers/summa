@@ -1258,6 +1258,21 @@ impl FastFieldReader {
         &self,
         mut f: impl FnMut(u32, u64) -> Result<(), E>,
     ) -> Result<(), E> {
+        self.try_scan_single_value_batches(|start, values| {
+            for (i, &value) in values.iter().enumerate() {
+                f(start + i as u32, value)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Visit bounded decoded batches with their first document ID. Values are
+    /// borrowed scratch and text ordinals are remapped exactly as in the
+    /// per-value scan. Copied block boundaries need not align to batch sizes.
+    pub(crate) fn try_scan_single_value_batches<E>(
+        &self,
+        mut f: impl FnMut(u32, &[u64]) -> Result<(), E>,
+    ) -> Result<(), E> {
         if self.multi {
             return Ok(());
         }
@@ -1286,24 +1301,20 @@ impl FastFieldReader {
 
                 if has_map {
                     let map = map.unwrap();
-                    for (i, &raw) in buf[..chunk].iter().enumerate() {
-                        let val = if raw != FAST_FIELD_MISSING {
-                            let idx = raw as usize;
+                    for raw in &mut buf[..chunk] {
+                        *raw = if *raw != FAST_FIELD_MISSING {
+                            let idx = *raw as usize;
                             if idx < map.len() {
                                 map[idx] as u64
                             } else {
                                 FAST_FIELD_MISSING
                             }
                         } else {
-                            raw
+                            *raw
                         };
-                        f(block.cumulative_docs + pos as u32 + i as u32, val)?;
-                    }
-                } else {
-                    for (i, &val) in buf[..chunk].iter().enumerate() {
-                        f(block.cumulative_docs + pos as u32 + i as u32, val)?;
                     }
                 }
+                f(block.cumulative_docs + pos as u32, &buf[..chunk])?;
                 pos += chunk;
             }
         }
