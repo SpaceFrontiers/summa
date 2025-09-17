@@ -3352,7 +3352,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermes-broker"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3382,7 +3382,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-core"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-llm"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "anyhow",
  "axum",
@@ -3468,7 +3468,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "anyhow",
  "pest",
@@ -3480,7 +3480,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-mal-python"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "hermes-mal",
  "pyo3",
@@ -3489,7 +3489,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-server"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "anyhow",
  "clap",
@@ -3514,7 +3514,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tokenizer"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-tool"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3556,7 +3556,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-train"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "hermes-wasm"
-version = "1.8.147"
+version = "1.8.148"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
@@ -7290,9 +7290,9 @@ dependencies = [
 
 [[package]]
 name = "stop-words"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68df56303396bcfb639455b3c166804aeb7994005010aab5e9e8a1277b8871d"
+checksum = "c1ed527ae13a020ac2404e32746ecee62d632aafe64f8e0df2bb3545ae96f6d1"
 dependencies = [
  "serde_json",
 ]
