@@ -96,3 +96,60 @@ Clippy, native-without-sync and standalone broker compilation. All three
 async-only range regressions pass. The WASM release build and all 38 JavaScript tests pass. The
 existing fallible/cancellable scan tests pass in the full suite.
 Validation records and logs are alongside the measurement evidence.
+
+## Incremental interpolation experiment (not integrated)
+
+An exact quotient/remainder progression removes per-value signed 128-bit
+multiplication and division from the BlockwiseLinear batch decoder. It improved
+compressed scans substantially, but repeatable regressions in ordinary bitpacked
+range filters disqualified it. Production retains the existing interpolation.
+The experimental patches and measurements are preserved in the
+
+For `delta = abs(last - first)` and `d = count - 1`, the prototype computes
+`q = delta / d` and `r = delta % d` once. Each prediction advances by `q` plus a
+remainder carry; descending records subtract the same magnitude. Initializing at
+any batch offset preserves the original signed division's truncation toward zero.
+The writer and scalar random reader remain independent references. The prototype
+adds 48 bytes of logical batch state and no heap allocations or persisted bytes.
+
+Apple M4 alternating runs reduced the million-document piecewise scan from
+3.325/3.643 ms to 1.614/1.684 ms. Unaffected controls were noisy and sometimes
+slower, so a dedicated Cascade Lake VM repeated the comparison with matching
+Hermes 1.8.146 binaries, Rust 1.98.1, unchanged release flags and CPU affinity.
+Both run orders confirmed the compressed-data improvement and the ordinary-filter
+regression. Compiler outlining shifted between the shared codec dispatcher and
+bitset packing; explicit inline hints did not remove the tradeoff. A final
+variant additionally isolated the interpolation kernel with `inline(never)` and
+still regressed the controls. No default or code-generation hint was retained.
+
+| Fixture                                |     Before | Two inline hints | Before boundary trial | Kernel boundary |
+| -------------------------------------- | ---------: | ---------------: | --------------------: | --------------: |
+| Shuffled, 65,536 docs, one block, 1%   |    109.706 |          118.852 |               109.863 |         120.139 |
+| Clustered, 65,536 docs, sixteen blocks |     15.223 |           15.752 |                15.184 |          15.753 |
+| Piecewise, 1,048,576 docs, one block   | 17,711.073 |        4,815.838 |            17,714.172 |       4,812.806 |
+
+All four shuffled controls regress 8.1–8.3% with the two-inline candidate and
+9.4–9.6% with the kernel boundary. CPU 2 recorded zero steal ticks across all
+eight measured processes. Peak process RSS for three alternating fixture/test
+runs is 36.21–36.38 MiB before and 36.06–36.15 MiB after on x86; the M4 ranges
+are 39.42–40.05 and 39.38–40.27 MiB. These small differences do not establish
+retained-memory savings. Column encodings and output bitset sizes are unchanged.
+The remote archive was downloaded and SHA256-verified before deleting the
+isolated VM and its boot disk.
+
+These are warm bitset-construction measurements, not full-query latency,
+cold-storage behavior or concurrent throughput. The real-server RPC and GPU
+checks were not run for this codec-only experiment. The source changes were
+reverted after measurement; the earlier production validation remains applicable.
+
+Two remaining implementation candidates deserve separate measurements:
+
+- `RangeScorer::scan_forward` still probes `FastFieldReader::get_u64` one document
+  at a time. A bounded lazy batch cursor could avoid repeated codec work there
+  too. It must preserve efficient distant seeks, first-value multi-value
+  semantics, ordinal remapping and early termination; do not eagerly materialize
+  a whole segment for short scans.
+- A range covering a conservative block interval could fill its document span
+  directly. The reader should expose this through one scan protocol, preserving
+  missing-value rejection and text ordinal semantics, instead of introducing
+  a second query-owned decoder.
