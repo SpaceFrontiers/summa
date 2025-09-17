@@ -2,7 +2,8 @@
 
 ## Implementation and invariants
 
-The public entry point remains `RangeQuery::as_doc_bitset`. The column reader
+The first two optimizations use `RangeQuery::as_doc_bitset`. The lazy scorer
+follow-up below uses `RangeQuery::scorer` and `scorer_sync`. The column reader
 owns copied block boundaries, decoding and ordinal remapping. The codec owns
 header interpretation. The query owns comparisons and document membership.
 Native sync, native async and WASM share these owners. No wire or persisted
@@ -142,14 +143,63 @@ cold-storage behavior or concurrent throughput. The real-server RPC and GPU
 checks were not run for this codec-only experiment. The source changes were
 reverted after measurement; the earlier production validation remains applicable.
 
-Two remaining implementation candidates deserve separate measurements:
+Two follow-ups were identified after the interpolation trial:
 
-- `RangeScorer::scan_forward` still probes `FastFieldReader::get_u64` one document
-  at a time. A bounded lazy batch cursor could avoid repeated codec work there
-  too. It must preserve efficient distant seeks, first-value multi-value
-  semantics, ordinal remapping and early termination; do not eagerly materialize
-  a whole segment for short scans.
-- A range covering a conservative block interval could fill its document span
-  directly. The reader should expose this through one scan protocol, preserving
-  missing-value rejection and text ordinal semantics, instead of introducing
-  a second query-owned decoder.
+- Bounded batching in the lazy range scorer, implemented and measured below.
+- Accepting fully covered block spans through the owning reader's scan protocol,
+  preserving missing-value rejection and global text ordinal semantics. This
+  remains unimplemented.
+
+## Lazy range scorer batching
+
+`RangeQuery::scorer` and `scorer_sync` share `RangeScorer`. Consecutive scalar
+reads previously revisited BlockwiseLinear record headers for every document.
+The scorer now switches from scalar probes to a bounded batch cursor after eight
+consecutive probes. It retains one 64-bit membership mask and decodes at most 64
+values into temporary scratch. A distant seek outside the cached batch resets
+the scalar probe count; short scans and isolated probes avoid decoding ahead.
+
+`SingleValueCursor` belongs to the fast-field reader and borrows one immutable
+column. It reuses the existing codec cursor, resets at copied-block boundaries,
+and returns at most one block's remaining values. Text ordinals use the same
+batch remapping helper as full column scans. Multi-value columns retain scalar
+first-value reads. No writer, persisted format, admission rule, query planner or
+codec-selection policy changes. The scorer preserves inclusive numeric bounds,
+missing values, global text ordinals, score bits, forward-only seeks and repeated
+exhaustion. A column ending before the segment is treated as missing thereafter,
+matching scalar reads.
+
+On 64-bit builds the existing boxed scorer payload grows from 40 to 96 bytes;
+there is no additional allocation. Decoded scratch is 512 bytes in a refill
+call, independent of corpus size. `ColumnBlock` and `FastFieldReader` metadata
+sizes remain unchanged, and encoded column payloads remain evictable. Three
+alternating M4 fixture/test process runs peak at 37.89–40.05 MiB before and
+38.50–39.31 MiB after; these noisy process-level measurements do not establish a
+retained-memory saving.
+
+Assembly inspection matters here: merely extracting a refill helper let LLVM
+inline its scratch and vector setup back into every per-hit scan call. The
+initial M4 scan frame was 848 bytes including saved registers. An explicit
+`inline(never)` refill boundary isolates that work; an `inline` hint on the
+small scan state machine removes an extra call from advance/seek. These hints
+are local to the measured scorer, not general reader/codec policy.
+
+| Full iteration, 65,536 documents |  M4 before |   M4 after | x86 before |  x86 after |
+| -------------------------------- | ---------: | ---------: | ---------: | ---------: |
+| Shuffled                         |    339.045 |    156.154 |    829.109 |    330.960 |
+| Piecewise compressed             |  6,322.629 |    393.718 | 16,913.621 |  1,391.267 |
+| Constant, all match              |    290.351 |    260.807 |    798.591 |    515.909 |
+| Missing values                   |    363.020 |    174.183 |    807.640 |    302.934 |
+| Multi-value, first value         | 14,476.597 | 14,532.508 | 34,303.341 | 34,182.056 |
+| Constant, no match               |    149.284 |     22.519 |    431.970 |    121.502 |
+
+The tradeoff is explicit: x86 short first-hit controls cost
+about 3.6–5.4 ns more, and 65 sparse seeks through cheap single-value columns
+cost 0.06–0.15 microseconds more. The compressed seek case improves from
+1,727.660 to 193.640 microseconds because gaps benefit from batching. Multi-value
+full scans remain effectively unchanged. All five existing x86 bitset controls
+avoid regression; their small gains are not attributed to lazy scorer batching.
+
+The final x86 RSS pairs peak at 36.21–36.34 MiB before and 36.39–36.51 MiB after.
+CPU 2 records zero steal ticks across all measured processes. The remote archive
+was downloaded and SHA256-verified before deleting the VM and boot disk.

@@ -754,6 +754,66 @@ pub struct FastFieldReader {
     text_state: OnceLock<TextState>,
 }
 
+/// Bounded, seekable decoding state tied to one immutable single-value reader.
+/// Decoded scratch belongs to the caller; no payload or heap allocation is owned.
+pub(crate) struct SingleValueCursor<'a> {
+    reader: &'a FastFieldReader,
+    block: usize,
+    codec: codec::BlockwiseLinearCursor,
+}
+
+impl<'a> SingleValueCursor<'a> {
+    pub(crate) fn new(reader: &'a FastFieldReader) -> Self {
+        assert!(!reader.multi);
+        Self {
+            reader,
+            block: usize::MAX,
+            codec: Default::default(),
+        }
+    }
+
+    /// Read at most one copied block into caller scratch. Out-of-range reads
+    /// return zero; unread scratch is untouched. Backward reads are supported.
+    pub(crate) fn read_batch(&mut self, start: u32, out: &mut [u64]) -> usize {
+        if start >= self.reader.num_docs || out.is_empty() {
+            return 0;
+        }
+        let (block_idx, local) = self.reader.find_block(start);
+        if block_idx != self.block {
+            self.block = block_idx;
+            self.codec = Default::default();
+        }
+        let block = &self.reader.blocks[block_idx];
+        let count = out.len().min((block.num_docs - local) as usize);
+        codec::auto_read_batch_with_cursor(
+            block.data.as_slice(),
+            local as usize,
+            &mut out[..count],
+            &mut self.codec,
+        );
+        if self.reader.column_type == FastFieldColumnType::TextOrdinal
+            && self.reader.blocks.len() > 1
+        {
+            let map = &self.reader.ensure_text_state().ordinal_maps[block_idx];
+            remap_batch(map, &mut out[..count]);
+        }
+        count
+    }
+}
+
+fn remap_batch(map: &[u32], values: &mut [u64]) {
+    if map.is_empty() {
+        return;
+    }
+    for raw in values {
+        if *raw != FAST_FIELD_MISSING {
+            *raw = map
+                .get(*raw as usize)
+                .map_or(FAST_FIELD_MISSING, |&ord| u64::from(ord));
+        }
+    }
+}
+
 /// Lazily-built state for text-ordinal columns.
 struct TextState {
     /// Global merged dictionary across all blocks.
@@ -1326,19 +1386,7 @@ impl FastFieldReader {
                 );
 
                 if has_map {
-                    let map = map.unwrap();
-                    for raw in &mut buf[..chunk] {
-                        *raw = if *raw != FAST_FIELD_MISSING {
-                            let idx = *raw as usize;
-                            if idx < map.len() {
-                                map[idx] as u64
-                            } else {
-                                FAST_FIELD_MISSING
-                            }
-                        } else {
-                            *raw
-                        };
-                    }
+                    remap_batch(map.unwrap(), &mut buf[..chunk]);
                 }
                 f(block.cumulative_docs + pos as u32, &buf[..chunk])?;
                 pos += chunk;
@@ -1848,6 +1896,61 @@ mod tests {
         assert_eq!(reader.get_u64(4), 300);
     }
 
+    fn assert_cursor_matches_scalar_reads(reader: &FastFieldReader) {
+        let mut cursor = SingleValueCursor::new(reader);
+        for start in [
+            0,
+            1,
+            63,
+            511,
+            512,
+            599,
+            600,
+            1023,
+            2048,
+            3,
+            reader.num_docs,
+            u32::MAX,
+        ] {
+            for len in [0, 1, 7, 64, 257] {
+                let mut scratch = vec![12345; len];
+                let read = cursor.read_batch(start, &mut scratch);
+                assert!(read <= len);
+                if start < reader.num_docs && len != 0 {
+                    assert!(read > 0);
+                }
+                for (offset, &raw) in scratch[..read].iter().enumerate() {
+                    assert_eq!(raw, reader.get_u64(start + offset as u32));
+                }
+                assert!(scratch[read..].iter().all(|&v| v == 12345));
+            }
+        }
+    }
+
+    #[test]
+    fn seekable_batches_preserve_scalar_values_across_codec_records_and_backward_reads() {
+        for layout in 0..5 {
+            let mut writer = FastFieldWriter::new_numeric(FastFieldColumnType::U64);
+            for doc in 0..2053u32 {
+                let block = u64::from(doc / 512);
+                let local = u64::from(doc % 512);
+                let value = match layout {
+                    0 => 7,
+                    1 => u64::from(doc) * 10,
+                    2 => u64::from(doc.wrapping_mul(40503) & 65535),
+                    3 => ((block * 40503) & 65535) * 65536 + local * (3 + block % 3) + local % 7,
+                    _ if doc % 7 == 0 => FAST_FIELD_MISSING,
+                    _ => u64::from(doc),
+                };
+                writer.add_u64(doc, value);
+            }
+            let mut bytes = Vec::new();
+            let (toc, _) = writer.serialize(&mut bytes, 0).unwrap();
+            let reader = FastFieldReader::open(&owned(bytes), &toc).unwrap();
+            assert_cursor_matches_scalar_reads(&reader);
+        }
+    }
+
     #[test]
     fn fallible_column_scan_stops_at_the_first_error_across_batch_boundaries() {
         let mut column = FastFieldWriter::new_numeric(FastFieldColumnType::U64);
@@ -1902,6 +2005,7 @@ mod tests {
         );
         let ob = owned(buf);
         let reader = FastFieldReader::open(&ob, &toc).unwrap();
+        assert_cursor_matches_scalar_reads(&reader);
         let expected: Vec<_> = (0..1200).map(|doc| (doc, reader.get_u64(doc))).collect();
         let mut complete = Vec::new();
         reader.scan_single_values(|doc, ordinal| complete.push((doc, ordinal)));
