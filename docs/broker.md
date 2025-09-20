@@ -89,6 +89,28 @@ Contract guarantees clients rely on:
   broker→backend channels); inconsistent combinations warn loudly at
   startup.
 
+Coordinated searches (fusion, L1, score exports and traces) additionally use
+`--coordinator-max-transfer-mb` (default **64 MiB**). This is the total
+uncompressed response allowance for a search, not a per-shard allowance.
+The decoder divides it by the number of target shards, even on compressed
+connections. The same setting bounds combined responses, selected output and
+RRF diagnostic retention. Requests exceeding a bound fail with
+`RESOURCE_EXHAUSTED`; results are never silently truncated to fit.
+
+The value must be nonzero, fit in bytes, and not exceed either
+`--backend-max-decode-mb` or `--search-max-encode-mb`; invalid combinations fail
+at startup. Clients and shard encoders must also accept the required messages.
+Increasing generic gRPC limits alone does not raise the coordinator limit.
+Startup logs report the coordinator allowance and both admission caps.
+
+For a bounded increase, use `--coordinator-max-transfer-mb 128
+--max-concurrent-searches 8`: three shards get about 42.7 MiB each. Eight
+simultaneous coordinated searches have up to 1 GiB of incoming protobuf
+payload, before decoded objects, ranking buffers and response copies. This
+is a transfer bound, not a process RSS limit; measure broker memory and
+admission rejections before expanding concurrency. This setting does not
+change retrieval depth, formulas, candidate completeness or shard concurrency.
+
 Pass-through responses are proto-equal, not always byte-equal: protobuf map
 fields (`SearchHit.fields`) may re-serialize entries in a different order.
 

@@ -23,6 +23,8 @@ pub struct BrokerContext {
     /// Optional broker-global search admission on top of the per-backend
     /// semaphores. None = per-backend caps only.
     pub global_search_permits: Option<Arc<Semaphore>>,
+    /// Total uncompressed response allowance per coordinated search.
+    pub coordinator_max_transfer: usize,
     /// Spreads reads across replicas of a shard.
     pub read_rotation: AtomicUsize,
     /// Set when the shutdown signal fires; new RPCs are refused while tonic

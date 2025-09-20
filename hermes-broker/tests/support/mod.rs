@@ -91,6 +91,7 @@ impl MockBackend {
             Server::builder()
                 .add_service(
                     SearchServiceServer::new(search)
+                        .send_compressed(CompressionEncoding::Zstd)
                         .accept_compressed(CompressionEncoding::Zstd)
                         .accept_compressed(CompressionEncoding::Gzip),
                 )

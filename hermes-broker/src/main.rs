@@ -157,6 +157,11 @@ struct Args {
     #[arg(long, default_value = "64")]
     index_max_encode_mb: usize,
 
+    /// Total uncompressed response allowance in MiB for one coordinated search.
+    /// Divided across shards before decoding; pair increases with admission caps.
+    #[arg(long, default_value_t = ranking::DEFAULT_MAX_TRANSFER_BYTES / (1024 * 1024))]
+    coordinator_max_transfer_mb: usize,
+
     /// Maximum decoded message size in MiB on broker→backend channels; must
     /// cover the backends' --search-max-encode-mb / --index-max-encode-mb.
     #[arg(long, default_value = "256")]
@@ -173,6 +178,7 @@ struct Args {
 /// startup, never discovered per-request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MessageCaps {
+    coordinator_max_transfer: usize,
     search_max_decode: usize,
     search_max_encode: usize,
     index_max_decode: usize,
@@ -191,6 +197,10 @@ fn nonzero_mb_to_bytes(flag: &str, mb: usize) -> Result<usize> {
 
 fn resolve_message_caps(args: &Args) -> Result<MessageCaps> {
     let caps = MessageCaps {
+        coordinator_max_transfer: nonzero_mb_to_bytes(
+            "--coordinator-max-transfer-mb",
+            args.coordinator_max_transfer_mb,
+        )?,
         search_max_decode: nonzero_mb_to_bytes(
             "--search-max-decode-mb",
             args.search_max_decode_mb,
@@ -210,6 +220,16 @@ fn resolve_message_caps(args: &Args) -> Result<MessageCaps> {
             args.backend_max_encode_mb,
         )?,
     };
+    for (flag, limit) in [
+        ("--backend-max-decode-mb", caps.backend_max_decode),
+        ("--search-max-encode-mb", caps.search_max_encode),
+    ] {
+        if caps.coordinator_max_transfer > limit {
+            return Err(anyhow::anyhow!(
+                "--coordinator-max-transfer-mb must not exceed {flag}"
+            ));
+        }
+    }
     // Warnings, not errors: a fleet may intentionally run asymmetric caps
     // (e.g. while rolling out a raise), but a silent mismatch strands
     // responses inside the broker with a confusing per-request error.
@@ -411,6 +431,7 @@ async fn async_main(args: Args) -> Result<()> {
         pool,
         placement,
         refresh,
+        coordinator_max_transfer: message_caps.coordinator_max_transfer,
         global_search_permits: args
             .max_concurrent_searches
             .map(|n| Arc::new(Semaphore::new(n))),
@@ -461,6 +482,11 @@ async fn async_main(args: Args) -> Result<()> {
         args.index_max_encode_mb,
         args.backend_max_decode_mb,
         args.backend_max_encode_mb,
+    );
+
+    info!(
+        "coordinator transfer budget: {} MiB per search, global search cap: {:?}, per-backend cap: {}",
+        args.coordinator_max_transfer_mb, args.max_concurrent_searches, args.backend_max_searches,
     );
 
     let signal_flag = Arc::clone(&shutting_down);
@@ -580,6 +606,7 @@ mod tests {
         assert_eq!(
             caps,
             MessageCaps {
+                coordinator_max_transfer: ranking::DEFAULT_MAX_TRANSFER_BYTES,
                 search_max_decode: 4 * 1024 * 1024,
                 search_max_encode: 256 * 1024 * 1024,
                 index_max_decode: 256 * 1024 * 1024,
@@ -606,6 +633,41 @@ mod tests {
 
         let zero = Args::try_parse_from(["hermes-broker", "--index-max-decode-mb", "0"]).unwrap();
         assert!(resolve_message_caps(&zero).is_err());
+    }
+
+    #[test]
+    fn coordinator_budget_validates_transport_envelopes_and_overflow() {
+        let args = Args::try_parse_from([
+            "hermes-broker",
+            "--coordinator-max-transfer-mb",
+            "128",
+            "--max-concurrent-searches",
+            "8",
+        ])
+        .unwrap();
+        let caps = resolve_message_caps(&args).unwrap();
+        assert_eq!(caps.coordinator_max_transfer, 128 * 1024 * 1024);
+        assert_eq!(args.max_concurrent_searches, Some(8));
+        for value in ["0".to_owned(), usize::MAX.to_string()] {
+            let args =
+                Args::try_parse_from(["hermes-broker", "--coordinator-max-transfer-mb", &value])
+                    .unwrap();
+            let error = resolve_message_caps(&args).unwrap_err();
+            assert!(error.to_string().contains("--coordinator-max-transfer-mb"));
+        }
+        for flag in ["--backend-max-decode-mb", "--search-max-encode-mb"] {
+            let args = Args::try_parse_from([
+                "hermes-broker",
+                "--coordinator-max-transfer-mb",
+                "128",
+                flag,
+                "64",
+            ])
+            .unwrap();
+            let error = resolve_message_caps(&args).unwrap_err().to_string();
+            assert!(error.contains("--coordinator-max-transfer-mb"));
+            assert!(error.contains(flag));
+        }
     }
 
     #[test]
