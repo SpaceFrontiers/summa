@@ -26,3 +26,24 @@ test("browser wildcard queries match whole Unicode terms and escaped operators",
     index.free();
   }
 });
+
+
+test("browser regex and escaped literal queries preserve exact whole-term matches", async () => {
+  await init();
+  const index = await LocalIndex.create("index patterns { field id: u64 [stored] field term: text<raw> [indexed] }");
+  try {
+    await index.addDocuments(["1999", "2000", "x1999", "color", "colour", "COLOUR", "books.google.com", "user:ed", "é", "🦀"].map((term, id) => ({id, term})));
+    await index.commit();
+    for (const [query, expected] of [
+      ['term:regex("[0-9]{4}")', [0,1]], ['term:regex("colou?r")', [3,4]],
+      ['term:regex("COLOUR")', [5]], ['term:books.google.com', [6]],
+      ['term:user\\:ed', [7]], ['term:regex(".")', [8,9]],
+    ] as const) {
+      const results = await index.search(query,20);
+      const ids = await Promise.all(results.hits.map(async (hit:any) => (await index.getDocument(hit.address.segment_id,hit.address.doc_id)).id));
+      expect(ids.sort((a,b)=>a-b)).toEqual(expected);
+    }
+    await expect(index.search('term:regex("[")',10)).rejects.toMatch(/regex/);
+    await expect(index.search('term:regex("(?i)color")',10)).rejects.toMatch(/unsupported/);
+  } finally { index.free(); }
+});

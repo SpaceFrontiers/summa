@@ -3,7 +3,7 @@
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 
 // Basic tokens
-term = @{ (LETTER | NUMBER | "_" | "-")+ }
+term = @{ (LETTER | NUMBER | "_" | "-" | "." | "'" | "\\" ~ ANY)+ }
 quoted_string = @{ "\"" ~ inner_string ~ "\"" }
 inner_string = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
 number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
@@ -13,7 +13,7 @@ field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
 field_spec = { field_name ~ ":" }
 
 // Query types
-term_query = { field_spec? ~ term }
+term_query = { field_spec? ~ !("regex" ~ "(") ~ term }
 phrase_query = { field_spec? ~ quoted_string }
 
 // Complete token patterns; consume interior/leading operators as one query.
@@ -22,7 +22,8 @@ pattern_literal = _{ "\\" ~ ANY | !(WHITESPACE | "\"" | "(" | ")" | "*" | "?") ~
 term_pattern = @{ pattern_literal* ~ ("*" | "?") ~ (pattern_literal | "*" | "?")* }
 term_pattern_query = { field_spec? ~ term_pattern }
 
-// Explicit whole-term wildcard pattern, with JSON string escaping.
+// Explicit whole-term patterns, with JSON string escaping.
+regex_query = { field_spec? ~ "regex" ~ "(" ~ quoted_string ~ ")" }
 wildcard_query = { field_spec? ~ "wildcard" ~ "(" ~ quoted_string ~ ")" }
 
 // Vector query: field:ann([1.0, 2.0, 3.0], k=10, nprobe=32)
@@ -54,7 +55,7 @@ prohibited_op = @{ "-" ~ !WHITESPACE }
 group = { "(" ~ or_expr ~ ")" }
 
 // Primary expression (vector queries added)
-primary = { (required_op | prohibited_op | not_op)? ~ !("+" | "-" | "!") ~ (group | ann_query | sparse_query | wildcard_query | phrase_query | term_pattern_query | term_query) }
+primary = { (required_op | prohibited_op | not_op)? ~ !("+" | "-" | "!") ~ (group | ann_query | sparse_query | regex_query | wildcard_query | phrase_query | term_pattern_query | term_query) }
 
 // Boolean expressions
 and_expr = { primary ~ (and_op ~ primary)* }

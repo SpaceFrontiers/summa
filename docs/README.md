@@ -7,6 +7,7 @@
 - [Schema (SDL)](schema.md)
 - [Query language](query-language.md)
 - [Wildcard queries and expansion limits](wildcard-query.md)
+- [Regex queries and escaped literals](regex-query.md)
 - [Tokenization and phrase queries](dynamic-tokenizer-and-phrase.md)
 - [Chunked text](chunked-text-fields.md) and [chunked BM25](chunked-bm25.md)
 - [Formula ranking, backfill, and diagnostics](candidate-rescoring.md)

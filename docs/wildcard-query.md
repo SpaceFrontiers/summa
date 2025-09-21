@@ -44,3 +44,7 @@ portable build must pass; runtime matching never scans or rewrites index metadat
 use hermes_core::WildcardQuery;
 let query = WildcardQuery::text(body_field, "foo*bar?")?;
 ```
+
+The subsequent [regex and escaped-literal follow-up](regex-query.md) accepts
+826/826 expressions on the same small fixture. This does not remove expansion
+limits or establish full-corpus parity.

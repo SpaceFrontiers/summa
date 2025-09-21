@@ -15,8 +15,8 @@ use std::sync::Arc;
 use super::query_field_router::{QueryFieldRouter, RoutingMode};
 use super::schema::{Field, Schema};
 use crate::query::{
-    BooleanQuery, DEFAULT_DENSE_RERANK_FACTOR, PhraseQuery, PrefixQuery, Query, TermQuery,
-    WildcardQuery,
+    BooleanQuery, DEFAULT_DENSE_RERANK_FACTOR, PhraseQuery, PrefixQuery, Query, RegexQuery,
+    TermQuery, WildcardQuery,
 };
 use crate::tokenizer::{BoxedTokenizer, TokenizerRegistry};
 
@@ -42,6 +42,11 @@ pub enum ParsedQuery {
     },
     /// Whole-term wildcard filter with explicit pattern syntax.
     Wildcard {
+        field: Option<String>,
+        pattern: String,
+    },
+    /// Whole-term regular expression; pattern case is preserved.
+    Regex {
         field: Option<String>,
         pattern: String,
     },
@@ -201,6 +206,16 @@ impl QueryLanguageParser {
             Ok(parsed) => self.build_query(&parsed),
             Err(error)
                 if strict
+                    || query_str.contains('\\')
+                    || query_str.match_indices("regex").any(|(at, _)| {
+                        (at == 0
+                            || query_str[..at].ends_with(|ch: char| {
+                                ch.is_whitespace() || matches!(ch, ':' | '+' | '-' | '(')
+                            }))
+                            && query_str[at + "regex".len()..]
+                                .trim_start()
+                                .starts_with('(')
+                    })
                     || query_str
                         .split(|c: char| c.is_whitespace() || c == '(')
                         .any(|word| word.len() > 1 && word.starts_with(['+', '-'])) =>
@@ -302,7 +317,8 @@ impl QueryLanguageParser {
                 Rule::phrase_query => {
                     inner_query = Some(self.parse_phrase_query(inner)?);
                 }
-                Rule::wildcard_query => {
+                Rule::wildcard_query | Rule::regex_query => {
+                    let is_regex = inner.as_rule() == Rule::regex_query;
                     let mut field = None;
                     let mut pattern = String::new();
                     for part in inner.into_inner() {
@@ -312,12 +328,16 @@ impl QueryLanguageParser {
                             }
                             Rule::quoted_string => {
                                 pattern = serde_json::from_str(part.as_str())
-                                    .map_err(|error| format!("Invalid wildcard string: {error}"))?
+                                    .map_err(|error| format!("Invalid pattern string: {error}"))?
                             }
                             _ => {}
                         }
                     }
-                    inner_query = Some(ParsedQuery::Wildcard { field, pattern });
+                    inner_query = Some(if is_regex {
+                        ParsedQuery::Regex { field, pattern }
+                    } else {
+                        ParsedQuery::Wildcard { field, pattern }
+                    });
                 }
                 Rule::term_pattern_query => {
                     inner_query = Some(self.parse_term_pattern(inner)?);
@@ -349,7 +369,20 @@ impl QueryLanguageParser {
                     field = Some(inner.into_inner().next().unwrap().as_str().to_string());
                 }
                 Rule::term => {
-                    term = inner.as_str().to_string();
+                    let source = inner.as_str();
+                    if source.contains('\\') {
+                        term.reserve(source.len());
+                        let mut chars = source.chars();
+                        while let Some(ch) = chars.next() {
+                            term.push(if ch == '\\' {
+                                chars.next().ok_or("Dangling term escape")?
+                            } else {
+                                ch
+                            });
+                        }
+                    } else {
+                        term = source.to_owned();
+                    }
                 }
                 _ => {}
             }
@@ -502,27 +535,41 @@ impl QueryLanguageParser {
             ParsedQuery::Prefix { field, prefix } => {
                 self.build_prefix_query(field.as_deref(), prefix)
             }
-            ParsedQuery::Wildcard { field, pattern } => {
-                if let Some(name) = field {
-                    let field = self
-                        .schema
-                        .get_field(name)
-                        .ok_or_else(|| format!("Unknown field: {name}"))?;
-                    Ok(Box::new(
-                        WildcardQuery::text(field, pattern).map_err(|error| error.to_string())?,
-                    ))
-                } else if !self.default_fields.is_empty() {
-                    let mut query = BooleanQuery::new();
-                    for &field in &self.default_fields {
-                        query = query.should(
+            ParsedQuery::Wildcard { field, pattern } | ParsedQuery::Regex { field, pattern } => {
+                let explicit = field
+                    .as_ref()
+                    .map(|name| {
+                        self.schema
+                            .get_field(name)
+                            .ok_or_else(|| format!("Unknown field: {name}"))
+                    })
+                    .transpose()?;
+                let fields = explicit
+                    .as_ref()
+                    .map_or(self.default_fields.as_slice(), std::slice::from_ref);
+                if fields.is_empty() {
+                    return Err("No field specified and no default fields configured".into());
+                }
+                let build = |field| -> Result<Box<dyn Query>, String> {
+                    if matches!(parsed, ParsedQuery::Regex { .. }) {
+                        Ok(Box::new(
+                            RegexQuery::new(field, pattern).map_err(|error| error.to_string())?,
+                        ))
+                    } else {
+                        Ok(Box::new(
                             WildcardQuery::text(field, pattern)
                                 .map_err(|error| error.to_string())?,
-                        );
+                        ))
                     }
-                    Ok(Box::new(query))
-                } else {
-                    Err("No field specified and no default fields configured".into())
+                };
+                if explicit.is_some() {
+                    return build(fields[0]);
                 }
+                let mut query = BooleanQuery::new();
+                for &field in fields {
+                    query.should.push(Arc::from(build(field)?));
+                }
+                Ok(Box::new(query))
             }
             ParsedQuery::Ann {
                 field,
