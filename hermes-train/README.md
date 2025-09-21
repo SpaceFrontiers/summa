@@ -15,7 +15,27 @@ Build outputs live in `target/release`. To use the commands below from the
 repository root, run `export PATH="$PWD/target/release:$PATH"`.
 [training contracts](../docs/training-objectives-and-curricula.md) for task semantics.
 
+## Commands
+
+| Command                                 | Purpose                                                   |
+| --------------------------------------- | --------------------------------------------------------- |
+| `train`                                 | Built-in streaming objectives and optional periodic sleep |
+| `validate-workflow`, `run-workflow`     | Validate and orchestrate phase workflows                  |
+| `eval`                                  | Held-out loss and task metrics                            |
+| `generate-eval`                         | Free-running generation quality                           |
+| `retrieval-pool-eval`                   | Retrieval against a shared candidate pool                 |
+| `prepare-corpus`, `compose-curriculum`  | Immutable corpus and curriculum builds                    |
+| `quantize`, `upgrade-memory-checkpoint` | Explicit weight transformations                           |
+| `verify-checkpoint`                     | Validate a sealed generation and metric prefix            |
+
+Run `hermes-train <command> --help` for flags. See
+[generation evaluation](../docs/generation-eval.md) and
+[retrieval evaluation](../docs/retrieval-pool-eval.md).
+
 ## WorkflowV2
+
+Use strict [WorkflowV2](../docs/training-objectives-and-curricula.md) configuration.
+Unknown fields and unsupported versions fail before execution.
 
 Validate and inspect resolved paths before a run:
 
@@ -197,25 +217,6 @@ derive that canonical runtime identity from the adapter, immutable revision,
 and adapter parameters, so equal revision labels from different providers or
 model repositories cannot alias one another. Context factories should use
 `FrozenModelSpec::immutable_identity()` as their exact expected value.
-
-The complete education recipe combines periodic sleep with phase kinds outside
-the wake trainer and therefore uses the public embedded host in `native_host`.
-An embedding application constructs `NativeWorkflowAdapters` and registers an
-external worker for ordinary phases, a
-`NativePostTrainingContextFactory` for native DPO/KL/GRPO, a
-`NativePeriodicWakeExecutor` for periodic optimizer-bearing phases not handled
-by typed post-training, and a `NativeSleepPhaseContextFactory` when the
-workflow has a standalone `sleep` phase. Periodic DPO/KL/GRPO boundaries use
-the `PostTrainingBoundaryHook` lent with their native execution context; the
-optimizer receipt, sleep receipt, and cursor therefore commit as one chain.
-Use `NativePostTrainingBoundaryController` with an injected
-`NativePostTrainingSleepRuntime` for the first-party implementation. Its tagged
-resume envelope persists the optimizer receipt before sleep starts and wraps
-every inner `NativeSleepCheckpoint`, so an interrupted sleep subphase cannot
-replace the outer post-training cursor. The registered controller identity must
-match the lent controller and the clock authority. Each resulting immutable
-checkpoint must carry enough authenticated metadata for the next phase factory
-to reconstruct both cumulative optimizer-step and exact model-token clocks.
 
 ## Corpus preparation
 
@@ -406,6 +407,9 @@ reported trends.
 
 ## Ultra-low-bit quantization
 
+In the command below, replace `sha256-HASH` with the generation named by
+`checkpoint/current.json`.
+
 Hermes supports group-128 binary (`1.125` encoded bits/weight for full groups),
 dense two-bit ternary (`2.125`), and compact base-3 ternary (`1.75`) checkpoint
 codecs, including one FP16 scale per group. The training path performs deterministic
@@ -416,7 +420,7 @@ non-matrix tensors stay in their original dtype.
 
 ```bash
 hermes-train quantize \
-  --checkpoint checkpoint/weights.safetensors \
+  --checkpoint checkpoint/generations/sha256-HASH/weights.safetensors \
   --format binary-g128 \
   --output checkpoint/weights.binary-g128
 ```

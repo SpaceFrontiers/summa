@@ -11,7 +11,7 @@ use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
 use tonic::Status;
 
-pub const MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_TRANSFER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WINDOW: usize = 10_000;
 const MAX_ROWS: usize = 2_000_000;
 
@@ -26,6 +26,7 @@ pub struct CoordinatorPlan {
     output_passages: usize,
     window: usize,
     shards: usize,
+    max_transfer_bytes: usize,
     passthrough: bool,
 }
 
@@ -51,6 +52,15 @@ pub fn expected_export_method(request: &proto::SearchRequest) -> Option<&'static
     } else {
         None
     }
+}
+
+pub(super) fn check_transfer_size(bytes: usize, limit: usize, kind: &str) -> Result<(), Status> {
+    if bytes > limit {
+        return Err(Status::resource_exhausted(format!(
+            "{kind} size exceeds {limit} bytes"
+        )));
+    }
+    Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> Status {
@@ -104,7 +114,16 @@ fn key(address: Option<&proto::DocAddress>) -> Result<(u128, u32), Status> {
 }
 
 impl CoordinatorPlan {
-    pub fn new(mut request: proto::SearchRequest, shards: usize) -> Result<Self, Status> {
+    pub fn new(
+        mut request: proto::SearchRequest,
+        shards: usize,
+        max_transfer_bytes: usize,
+    ) -> Result<Self, Status> {
+        if max_transfer_bytes < shards || max_transfer_bytes == 0 {
+            return Err(invalid(
+                "coordinator transfer budget must allow at least one byte per shard",
+            ));
+        }
         if request.limit == 0 {
             request.limit = 10;
         }
@@ -144,6 +163,7 @@ impl CoordinatorPlan {
                     output_passages: 0,
                     window,
                     shards,
+                    max_transfer_bytes,
                     passthrough: true,
                 });
             }
@@ -368,6 +388,7 @@ impl CoordinatorPlan {
             output_passages,
             window,
             shards,
+            max_transfer_bytes,
             passthrough,
         })
     }
@@ -397,11 +418,11 @@ impl CoordinatorPlan {
                 ));
             }
             bytes = bytes.saturating_add(response.encoded_len());
-            if bytes > MAX_TRANSFER_BYTES {
-                return Err(Status::resource_exhausted(
-                    "combined coordinator response exceeds 64 MiB",
-                ));
-            }
+            check_transfer_size(
+                bytes,
+                self.max_transfer_bytes,
+                "combined coordinator response",
+            )?;
             if self.request.tracing {
                 let trace = response
                     .trace
@@ -462,9 +483,11 @@ impl CoordinatorPlan {
             if let Some(lists) = &diagnostics {
                 self.annotate_rrf(lists, &mut response)?;
             }
-            if response.encoded_len() > MAX_TRANSFER_BYTES {
-                return Err(Status::resource_exhausted("traced response exceeds 64 MiB"));
-            }
+            check_transfer_size(
+                response.encoded_len(),
+                self.max_transfer_bytes,
+                "traced response",
+            )?;
             return Ok(response);
         }
         if let Some(model) = &self.model {
@@ -588,9 +611,11 @@ impl CoordinatorPlan {
             {
                 self.annotate_rrf(&lists, &mut response)?;
             }
-            if response.encoded_len() > MAX_TRANSFER_BYTES {
-                return Err(Status::resource_exhausted("traced response exceeds 64 MiB"));
-            }
+            check_transfer_size(
+                response.encoded_len(),
+                self.max_transfer_bytes,
+                "traced response",
+            )?;
             return Ok(response);
         }
         self.fuse(responses)
@@ -731,9 +756,11 @@ impl CoordinatorPlan {
             let lists: Vec<_> = lists.into_iter().map(|(list, _)| list).collect();
             self.annotate_rrf(&lists, &mut response)?;
         }
-        if response.encoded_len() > MAX_TRANSFER_BYTES {
-            return Err(Status::resource_exhausted("traced response exceeds 64 MiB"));
-        }
+        check_transfer_size(
+            response.encoded_len(),
+            self.max_transfer_bytes,
+            "traced response",
+        )?;
         Ok(response)
     }
 
@@ -757,6 +784,7 @@ impl CoordinatorPlan {
             self.combiner,
             lists,
             response,
+            self.max_transfer_bytes,
         )
     }
 }
@@ -810,12 +838,48 @@ mod tests {
     }
 
     #[test]
+    fn combined_responses_obey_the_configured_budget_without_truncation() {
+        let request = proto::SearchRequest {
+            tracing: true,
+            limit: 2,
+            ..Default::default()
+        };
+        let response = proto::SearchResponse {
+            total_hits: 1,
+            trace: Some(proto::SearchTrace {
+                shards: vec![proto::ShardSearchTrace {
+                    index_name: "x".repeat(128),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let total = 2 * response.encoded_len();
+        let smaller = CoordinatorPlan::new(request.clone(), 2, total - 1).unwrap();
+        let error = smaller
+            .finish(vec![response.clone(), response.clone()])
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert!(
+            error
+                .message()
+                .contains("combined coordinator response size exceeds")
+        );
+        assert!(error.message().contains(&(total - 1).to_string()));
+        let exact = CoordinatorPlan::new(request, 2, total).unwrap();
+        let result = exact.finish(vec![response.clone(), response]).unwrap();
+        assert_eq!(result.total_hits, 2);
+        assert_eq!(result.trace.unwrap().shards.len(), 2);
+        assert!(!result.truncated);
+    }
+
+    #[test]
     fn shard_formula_top_window_preserves_global_top_k_and_broker_reapplies_the_same_formula() {
         let mut req = request(true);
         req.offset = 7;
         req.limit = 5;
         req.candidate_limit = 24;
-        let plan = CoordinatorPlan::new(req, 3).unwrap();
+        let plan = CoordinatorPlan::new(req, 3, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert_eq!(plan.shard_request.limit, 12);
         assert_eq!(plan.shard_request.offset, 0);
         assert!(plan.shard_request.score_export.is_some());
@@ -892,7 +956,7 @@ mod tests {
     fn global_rrf_keeps_a_winner_that_shard_local_rrf_would_tie_behind_another_document() {
         let mut req = request(false);
         req.include_rrf_scores = true;
-        let plan = CoordinatorPlan::new(req, 2).unwrap();
+        let plan = CoordinatorPlan::new(req, 2, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert_eq!(plan.shard_request.limit, 4);
         let response = |segment, documents: &[(u32, f32, f32)]| proto::SearchResponse {
             ranking_method: "fusion_candidates_v1".into(),
@@ -943,7 +1007,7 @@ mod tests {
 
     #[test]
     fn formula_mixed_versions_missing_features_and_disagreement_fail_loudly() {
-        let plan = CoordinatorPlan::new(request(true), 1).unwrap();
+        let plan = CoordinatorPlan::new(request(true), 1, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert!(plan.finish(vec![proto::SearchResponse::default()]).is_err());
         let mut response = proto::SearchResponse {
             ranking_method: "formula_v1".into(),
@@ -974,14 +1038,14 @@ mod tests {
             seed_document_passages: true,
             ..Default::default()
         });
-        assert!(CoordinatorPlan::new(req.clone(), 1).is_err());
+        assert!(CoordinatorPlan::new(req.clone(), 1, DEFAULT_MAX_TRANSFER_BYTES).is_err());
         let Some(proto::query::Query::Fusion(fusion)) =
             req.query.as_mut().and_then(|query| query.query.as_mut())
         else {
             panic!("fusion")
         };
         fusion.queries[0].scope = proto::ScoreScope::Chunk as i32;
-        let plan = CoordinatorPlan::new(req.clone(), 1).unwrap();
+        let plan = CoordinatorPlan::new(req.clone(), 1, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         let error = plan
             .finish(vec![proto::SearchResponse::default()])
             .unwrap_err();
@@ -998,7 +1062,7 @@ mod tests {
                 .seed_document_passages
         );
         req.l1.as_mut().unwrap().backfill = Some(false);
-        assert!(CoordinatorPlan::new(req, 1).is_err());
+        assert!(CoordinatorPlan::new(req, 1, DEFAULT_MAX_TRANSFER_BYTES).is_err());
     }
 
     #[test]
@@ -1010,7 +1074,9 @@ mod tests {
             seed_document_passages: false,
             ..Default::default()
         });
-        let error = CoordinatorPlan::new(req, 1).err().expect("invalid policy");
+        let error = CoordinatorPlan::new(req, 1, DEFAULT_MAX_TRANSFER_BYTES)
+            .err()
+            .expect("invalid policy");
         assert!(
             error
                 .message()
@@ -1026,7 +1092,7 @@ mod tests {
             all_passages: false,
             seed_document_passages: false,
         });
-        let max = CoordinatorPlan::new(req.clone(), 2).unwrap();
+        let max = CoordinatorPlan::new(req.clone(), 2, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert_eq!(
             max.shard_request
                 .score_export
@@ -1040,7 +1106,7 @@ mod tests {
             unreachable!()
         };
         fusion.combiner = proto::MultiValueCombiner::CombinerAvg as i32;
-        let avg = CoordinatorPlan::new(req, 2).unwrap();
+        let avg = CoordinatorPlan::new(req, 2, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert_eq!(
             avg.shard_request
                 .score_export
@@ -1055,7 +1121,7 @@ mod tests {
         let mut req = request(true);
         req.include_rrf_scores = true;
         req.tracing = true;
-        let plan = CoordinatorPlan::new(req, 2).unwrap();
+        let plan = CoordinatorPlan::new(req, 2, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         let response = |segment, x, y, discarded_x| {
             let winner = proto::FusionCandidate {
                 address: address(segment, 0),
@@ -1149,7 +1215,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let plan = CoordinatorPlan::new(req, 2).unwrap();
+        let plan = CoordinatorPlan::new(req, 2, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert_eq!(plan.shard_request.limit, 2);
         let responses = (1..=2)
             .map(|segment| proto::SearchResponse {
@@ -1197,7 +1263,7 @@ mod tests {
         req.l1.as_mut().unwrap().formula = "0.0001 * x + rrf".into();
         req.include_rrf_scores = true;
         req.tracing = true;
-        let plan = CoordinatorPlan::new(req, 2).unwrap();
+        let plan = CoordinatorPlan::new(req, 2, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert_eq!(
             plan.shard_request.limit, 4,
             "export every possible union member before global inference"
@@ -1276,7 +1342,7 @@ mod tests {
             query.scope = proto::ScoreScope::Chunk as i32;
         }
         fusion.queries[0].score_only = true;
-        let plan = CoordinatorPlan::new(req, 1).unwrap();
+        let plan = CoordinatorPlan::new(req, 1, DEFAULT_MAX_TRANSFER_BYTES).unwrap();
         assert_eq!(
             plan.shard_request
                 .score_export

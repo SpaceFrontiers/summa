@@ -42,6 +42,32 @@ impl CodecType {
 /// Block size for BlockwiseLinear codec (matching Tantivy).
 pub const BLOCKWISE_LINEAR_BLOCK_SIZE: usize = 512;
 
+/// Conservative raw-value interval derived only from an admitted codec header.
+/// A wrapping interval or a codec without cheap bounds returns `None`.
+pub(super) fn value_bounds(data: &[u8]) -> Option<(u64, u64)> {
+    let (&tag, data) = data.split_first()?;
+    let width_max = |bits: u8| u64::MAX.checked_shr(u32::from(64 - bits)).unwrap_or(0);
+    match CodecType::from_u8(tag)? {
+        CodecType::Constant => {
+            let value = u64::from_le_bytes(data[..8].try_into().unwrap());
+            Some((value, value))
+        }
+        CodecType::Bitpacked => {
+            let min = u64::from_le_bytes(data[..8].try_into().unwrap());
+            Some((min, min.checked_add(width_max(data[8]))?))
+        }
+        CodecType::Linear => {
+            let first = u64::from_le_bytes(data[..8].try_into().unwrap());
+            let last = u64::from_le_bytes(data[8..16].try_into().unwrap());
+            let offset = i64::from_le_bytes(data[20..28].try_into().unwrap()) as i128;
+            let min = i128::from(first.min(last)) + offset;
+            let max = i128::from(first.max(last)) + offset + i128::from(width_max(data[28]));
+            Some((u64::try_from(min).ok()?, u64::try_from(max).ok()?))
+        }
+        CodecType::BlockwiseLinear => None,
+    }
+}
+
 /// Validate an auto-codec payload before exposing it through the infallible
 /// hot-path readers below. This keeps every bounds check out of per-document
 /// access while ensuring corrupt segment metadata cannot trigger slice panics.
@@ -755,6 +781,36 @@ pub(super) fn blockwise_linear_read_from(
 /// consumed in order. This avoids re-scanning every preceding block header for
 /// each value in the batch.
 pub fn blockwise_linear_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
+    blockwise_linear_read_batch_with_cursor(
+        data,
+        start_index,
+        out,
+        &mut BlockwiseLinearCursor::default(),
+    );
+}
+
+/// Position in one admitted column payload. Reuse only for the same payload;
+/// copied column blocks each start with a fresh cursor. No payload is retained.
+pub(super) struct BlockwiseLinearCursor {
+    block: usize,
+    offset: usize,
+}
+
+impl Default for BlockwiseLinearCursor {
+    fn default() -> Self {
+        Self {
+            block: 0,
+            offset: 8,
+        }
+    }
+}
+
+fn blockwise_linear_read_batch_with_cursor(
+    data: &[u8],
+    start_index: usize,
+    out: &mut [u64],
+    cursor: &mut BlockwiseLinearCursor,
+) {
     if out.is_empty() {
         return;
     }
@@ -768,10 +824,13 @@ pub fn blockwise_linear_read_batch(data: &[u8], start_index: usize, out: &mut [u
     }
 
     let target_block = start_index / BLOCKWISE_LINEAR_BLOCK_SIZE;
-    let mut pos = 8usize;
+    if target_block < cursor.block {
+        *cursor = BlockwiseLinearCursor::default();
+    }
+    let mut pos = cursor.offset;
     let mut written = 0usize;
 
-    for block_idx in 0..num_blocks {
+    for block_idx in cursor.block..num_blocks {
         let packed_len = u32::from_le_bytes(data[pos + 25..pos + 29].try_into().unwrap()) as usize;
         if block_idx < target_block {
             pos += 29 + packed_len;
@@ -805,6 +864,13 @@ pub fn blockwise_linear_read_batch(data: &[u8], start_index: usize, out: &mut [u
         }
 
         written += take;
+        if index_in_block + take == block_len {
+            cursor.block = block_idx + 1;
+            cursor.offset = pos + 29 + packed_len;
+        } else {
+            cursor.block = block_idx;
+            cursor.offset = pos;
+        }
         if written == valid_len {
             break;
         }
@@ -926,6 +992,22 @@ fn decode_byte_aligned_batch<const WIDTH: usize>(
 /// Dispatches codec type once (vs. per-value in `auto_read`), enabling tight inner
 /// loops that the compiler auto-vectorizes for byte-aligned bitpacked columns.
 pub fn auto_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
+    auto_read_batch_with_cursor(
+        data,
+        start_index,
+        out,
+        &mut BlockwiseLinearCursor::default(),
+    );
+}
+
+/// Batch decode with an optional sequential advantage for BlockwiseLinear.
+/// The caller must reset the cursor when switching column payloads.
+pub(super) fn auto_read_batch_with_cursor(
+    data: &[u8],
+    start_index: usize,
+    out: &mut [u64],
+    cursor: &mut BlockwiseLinearCursor,
+) {
     if data.is_empty() || out.is_empty() {
         out.iter_mut().for_each(|v| *v = 0);
         return;
@@ -943,7 +1025,9 @@ pub fn auto_read_batch(data: &[u8], start_index: usize, out: &mut [u64]) {
                 *v = linear_read(rest, start_index + i);
             }
         }
-        Some(CodecType::BlockwiseLinear) => blockwise_linear_read_batch(rest, start_index, out),
+        Some(CodecType::BlockwiseLinear) => {
+            blockwise_linear_read_batch_with_cursor(rest, start_index, out, cursor)
+        }
         None => out.iter_mut().for_each(|v| *v = 0),
     }
 }
@@ -975,6 +1059,120 @@ pub fn auto_read(data: &[u8], index: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_batches_preserve_all_codecs_boundaries_and_backward_reads() {
+        let values = blockwise_values(2053);
+        let mut constant = Vec::new();
+        ConstantEstimator::default()
+            .serialize(&[42; 2053], &mut constant)
+            .unwrap();
+        let mut bitpacked = Vec::new();
+        let mut estimator = BitpackedEstimator::default();
+        for &value in &values {
+            estimator.collect(value);
+        }
+        estimator.finalize();
+        estimator.serialize(&values, &mut bitpacked).unwrap();
+        let descending: Vec<_> = (0..2053).map(|i| u64::MAX - i * 7).collect();
+        let mut linear = Vec::new();
+        let mut estimator = LinearEstimator::default();
+        for &value in &descending {
+            estimator.collect(value);
+        }
+        estimator.finalize();
+        estimator.serialize(&descending, &mut linear).unwrap();
+        let mut blockwise = Vec::new();
+        BlockwiseLinearEstimator::default()
+            .serialize(&values, &mut blockwise)
+            .unwrap();
+        assert_eq!(blockwise, serialize_blockwise_reference(&values));
+        for (tag, encoded) in [constant, bitpacked, linear, blockwise].iter().enumerate() {
+            assert_eq!(usize::from(encoded[0]), tag);
+            validate_auto(encoded, 2053).unwrap();
+            let expected: Vec<_> = (0..2053).map(|i| auto_read(encoded, i)).collect();
+            for size in [1, 255, 256, 257, 511, 512, 513, 1000, 2053] {
+                let mut cursor = BlockwiseLinearCursor::default();
+                let mut actual = vec![0; 2053];
+                for (batch, out) in actual.chunks_mut(size).enumerate() {
+                    auto_read_batch_with_cursor(encoded, batch * size, &mut [], &mut cursor);
+                    auto_read_batch_with_cursor(encoded, batch * size, out, &mut cursor);
+                }
+                assert_eq!(actual, expected, "codec {tag}, batch {size}");
+                for start in [1023, 511, 0, 2048] {
+                    let mut out = [0; 5];
+                    auto_read_batch_with_cursor(encoded, start, &mut out, &mut cursor);
+                    assert_eq!(out, expected[start..start + 5]);
+                }
+                if tag == CodecType::BlockwiseLinear as usize {
+                    let mut out = [u64::MAX; 17];
+                    auto_read_batch_with_cursor(encoded, 2050, &mut out, &mut cursor);
+                    assert_eq!(&out[..3], &expected[2050..]);
+                    assert_eq!(&out[3..], &[0; 14]);
+                    auto_read_batch_with_cursor(encoded, usize::MAX, &mut out, &mut cursor);
+                    assert_eq!(out, [0; 17]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_bounds_contain_every_bitpacked_value_including_wrapping_payloads() {
+        for bits in 0..=64 {
+            let max = u64::MAX.checked_shr(64 - bits).unwrap_or(0);
+            for min in [0u64, 17, u64::MAX - 17, u64::MAX] {
+                let raw = [0, max / 2, max];
+                let mut encoded = vec![CodecType::Bitpacked as u8];
+                encoded.extend_from_slice(&min.to_le_bytes());
+                encoded.push(bits as u8);
+                bitpack_write(&raw, bits as u8, &mut encoded);
+                validate_auto(&encoded, raw.len()).unwrap();
+                let bounds = value_bounds(&encoded);
+                if min.checked_add(max).is_none() {
+                    assert_eq!(bounds, None, "wrapping bounds must not prune");
+                } else {
+                    assert_eq!(bounds, Some((min, min + max)));
+                }
+                for i in 0..raw.len() {
+                    let value = auto_read(&encoded, i);
+                    assert!(bounds.is_none_or(|(lo, hi)| value >= lo && value <= hi));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn linear_header_bounds_preserve_descending_extreme_and_wrapping_values() {
+        for first in [0u64, 100, u64::MAX - 100] {
+            for last in [0u64, 100, u64::MAX - 100] {
+                for offset in [i64::MIN, -17, 0, 17, i64::MAX] {
+                    for bits in [0u8, 1, 4, 64] {
+                        let max = u64::MAX.checked_shr(u32::from(64 - bits)).unwrap_or(0);
+                        let raw: Vec<_> =
+                            (0..17).map(|i| if i % 2 == 0 { max } else { 0 }).collect();
+                        let mut encoded = vec![CodecType::Linear as u8];
+                        encoded.extend_from_slice(&first.to_le_bytes());
+                        encoded.extend_from_slice(&last.to_le_bytes());
+                        encoded.extend_from_slice(&17u32.to_le_bytes());
+                        encoded.extend_from_slice(&offset.to_le_bytes());
+                        encoded.push(bits);
+                        bitpack_write(&raw, bits, &mut encoded);
+                        validate_auto(&encoded, raw.len()).unwrap();
+                        let bounds = value_bounds(&encoded);
+                        for i in 0..raw.len() {
+                            let value = auto_read(&encoded, i);
+                            assert!(bounds.is_none_or(|(lo, hi)| value >= lo && value <= hi));
+                        }
+                    }
+                }
+            }
+        }
+        let encoded = [CodecType::Constant as u8]
+            .into_iter()
+            .chain(u64::MAX.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(value_bounds(&encoded), Some((u64::MAX, u64::MAX)));
+    }
 
     fn roundtrip(values: &[u64]) -> Vec<u64> {
         let mut buf = Vec::new();

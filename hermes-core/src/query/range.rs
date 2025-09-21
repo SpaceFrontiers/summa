@@ -14,7 +14,9 @@
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
 use crate::structures::TERMINATED;
-use crate::structures::fast_field::{FAST_FIELD_MISSING, f64_to_sortable_u64, zigzag_decode};
+use crate::structures::fast_field::{
+    FAST_FIELD_MISSING, FastFieldColumnType, SingleValueCursor, f64_to_sortable_u64, zigzag_decode,
+};
 use crate::{DocId, Score};
 
 use super::docset::DocSet;
@@ -41,6 +43,21 @@ enum CompiledRange {
 }
 
 impl CompiledRange {
+    fn may_match(self, bounds: Option<(u64, u64)>) -> bool {
+        let Some((min, max)) = bounds else {
+            return true;
+        };
+        if min == max {
+            return self.contains(min);
+        }
+        match self {
+            Self::Raw { lo, hi } => lo <= hi && lo <= max.min(FAST_FIELD_MISSING - 1) && hi >= min,
+            // Zigzag does not preserve order. Only exact constants above can
+            // reject signed blocks using a raw-domain interval.
+            Self::Signed { .. } => true,
+        }
+    }
+
     #[inline]
     fn contains(self, raw: u64) -> bool {
         if raw == FAST_FIELD_MISSING {
@@ -188,13 +205,31 @@ impl Query for RangeQuery {
         }
         let bound = self.bound.compile();
         let mut bits = super::DocBitset::new(reader.num_docs());
-        // The generic callback can inline. Traverse blocks once and dispatch
-        // the codec per batch instead of doing random access for every doc.
-        fast_field.scan_single_values(|doc_id, raw| {
-            if bound.contains(raw) {
-                bits.set(doc_id);
-            }
-        });
+        // Dispatch the numeric domain once per batch. The concrete predicates
+        // can vectorize without duplicating the owning reader's decode loop.
+        let _: Result<(), std::convert::Infallible> = fast_field
+            .try_scan_single_value_batches_where(
+                |block| {
+                    fast_field.column_type == FastFieldColumnType::TextOrdinal
+                        || bound.may_match(block.value_bounds())
+                },
+                |start, values| {
+                    match bound {
+                        CompiledRange::Raw { lo, hi } => {
+                            bits.insert_matching_values(start, values, |raw| {
+                                raw != FAST_FIELD_MISSING && raw >= lo && raw <= hi
+                            });
+                        }
+                        CompiledRange::Signed { lo, hi } => {
+                            bits.insert_matching_values(start, values, |raw| {
+                                let value = zigzag_decode(raw);
+                                raw != FAST_FIELD_MISSING && value >= lo && value <= hi
+                            });
+                        }
+                    }
+                    Ok(())
+                },
+            );
         Some(bits)
     }
 
@@ -226,12 +261,18 @@ impl Query for RangeQuery {
 /// use order-preserving encodings). For i64 fields, zigzag encoding does NOT
 /// preserve order, so we decode each value and compare in i64 domain.
 struct RangeScorer<'a> {
-    /// Cached fast-field reader — avoids HashMap lookup per doc in matches()
+    /// Cached fast-field reader — avoids HashMap lookup per document
     fast_field: &'a crate::structures::fast_field::FastFieldReader,
     bound: CompiledRange,
     /// Current document position.
     current: u32,
     num_docs: u32,
+    cursor: Option<SingleValueCursor<'a>>,
+    /// Membership in the batch ending at `batch_end`, with bit zero at its start.
+    batch_start: u32,
+    batch_end: u32,
+    matches: u64,
+    scalar_probes: u8,
 }
 
 /// Empty scorer returned when the field has no fast-field data.
@@ -250,32 +291,64 @@ impl<'a> RangeScorer<'a> {
             bound: bound.compile(),
             current: 0,
             num_docs,
+            cursor: (!fast_field.multi).then(|| SingleValueCursor::new(fast_field)),
+            batch_start: 0,
+            batch_end: 0,
+            matches: 0,
+            scalar_probes: 0,
         };
 
-        // Position on first matching doc
-        if num_docs > 0 && !scorer.matches(0) {
-            scorer.scan_forward();
-        }
+        scorer.scan_from(0);
         Ok(scorer)
     }
 
+    /// Keep isolated probes scalar; amortize sustained scans over one word.
     #[inline]
-    fn matches(&self, doc_id: DocId) -> bool {
-        self.bound.contains(self.fast_field.get_u64(doc_id))
-    }
-
-    /// Advance current past non-matching docs.
-    fn scan_forward(&mut self) {
-        loop {
-            self.current += 1;
-            if self.current >= self.num_docs {
-                self.current = self.num_docs;
-                return;
+    fn scan_from(&mut self, mut next: DocId) {
+        while next < self.num_docs {
+            if next < self.batch_end {
+                let offset = next - self.batch_start;
+                let remaining = self.matches & (u64::MAX << offset);
+                if remaining != 0 {
+                    self.current = self.batch_start + remaining.trailing_zeros();
+                    return;
+                }
+                next = self.batch_end;
+                continue;
             }
-            if self.matches(self.current) {
-                return;
+            if self.scalar_probes < 8 || self.cursor.is_none() {
+                self.scalar_probes = self.scalar_probes.saturating_add(1);
+                if self.bound.contains(self.fast_field.get_u64(next)) {
+                    self.current = next;
+                    return;
+                }
+                next += 1;
+                continue;
+            }
+            if !self.refill_batch(next) {
+                break;
             }
         }
+        self.current = self.num_docs;
+    }
+    /// Keep decoded scratch out of the per-hit advance/seek path.
+    #[inline(never)]
+    fn refill_batch(&mut self, start: DocId) -> bool {
+        let mut values = [0u64; 64];
+        let count = self.cursor.as_mut().unwrap().read_batch(start, &mut values);
+        // Scalar reads treat documents beyond the column as missing too.
+        if count == 0 {
+            return false;
+        }
+        self.batch_start = start;
+        self.batch_end = start + count as u32;
+        self.matches = values[..count]
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (i, &raw)| {
+                mask | (u64::from(self.bound.contains(raw)) << i)
+            });
+        true
     }
 }
 
@@ -289,7 +362,9 @@ impl DocSet for RangeScorer<'_> {
     }
 
     fn advance(&mut self) -> DocId {
-        self.scan_forward();
+        if self.current < self.num_docs {
+            self.scan_from(self.current + 1);
+        }
         self.doc()
     }
 
@@ -300,9 +375,10 @@ impl DocSet for RangeScorer<'_> {
         if target <= self.current {
             return self.current;
         }
-        // Position just before target so scan_forward starts at target
-        self.current = target - 1;
-        self.scan_forward();
+        if target >= self.batch_end && target > self.current + 1 {
+            self.scalar_probes = 0;
+        }
+        self.scan_from(target);
         self.doc()
     }
 

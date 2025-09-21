@@ -165,6 +165,10 @@ POS5/POS6 are a rebuild boundary. The position readers, merging, compaction,
 and reordering reject earlier formats. No legacy position decoder or migration
 branch remains.
 
+Metadata format 6 introduced this layout. Current writers upgrade metadata
+formats 6–8 to 9 without rewriting segments; older segment encodings can still
+require a rebuild. See [compatibility](row-deletion.md).
+
 ## Doc postings and skip metadata
 
 - **Block bounds with real lengths** (implemented 2026-09-03). The fourth

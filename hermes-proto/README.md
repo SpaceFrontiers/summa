@@ -62,5 +62,5 @@ from ordinary batches. This matches the ingestion client transport ceiling witho
 raising batch concurrency or the server mutation admission limit. Oversized
 requests fail before conversion, index lookup, or writer admission. The shared Rust validation in
 [mutations.rs](mutations.rs) is included beside generated bindings in both server
-and broker. See [row deletion](../docs/row-deletion.md) for pending-key constraints,
+and broker. See [row deletion](../docs/row-deletion.md) for staged replacements,
 broker routing, cancellation, and publication semantics.

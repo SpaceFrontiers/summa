@@ -753,3 +753,93 @@ async fn partitioned_reads_aggregate_and_fail_on_any_partition() {
         failed.message()
     );
 }
+
+/// Exercise compressed transport, the three-way decode split and the combined
+/// response guard with the same payload; no corpus or external service needed.
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_coordinator_budget_accepts_large_compressed_partition_responses() {
+    const MIB: usize = 1024 * 1024;
+    let mocks: Vec<_> = (0..3).map(|_| MockBackend::new(&["documents"])).collect();
+    let mut specs = Vec::new();
+    for (i, mock) in mocks.iter().enumerate() {
+        let mut hit = scored_hit(&format!("doc-{i}"), (3 - i) as f32);
+        hit.fields.insert(
+            "payload".into(),
+            FieldValueList {
+                values: vec![FieldValue {
+                    value: Some(field_value::Value::Text("x".repeat(24 * MIB))),
+                }],
+            },
+        );
+        mock.state.lock().search_response = SearchResponse {
+            hits: vec![hit],
+            total_hits: 1,
+            trace: Some(SearchTrace {
+                shards: vec![ShardSearchTrace::default()],
+            }),
+            ..Default::default()
+        };
+        let addr = mock.spawn().await;
+        specs.push(backend_spec(&format!("m{i}"), &addr, &(i + 2).to_string()));
+    }
+    let mut request = simple_search_request("documents");
+    request.tracing = true;
+    request.limit = 3;
+    let broker = spawn_broker(&specs, &["--placement", "documents*=2,3,4"]);
+    wait_for_indexes(&broker, &["documents"], Duration::from_secs(10)).await;
+    let error = broker_search_client(&broker)
+        .await
+        .search(request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(error.message().contains("decompressing"), "{error}");
+    drop(broker);
+
+    let broker = spawn_broker(
+        &specs,
+        &[
+            "--placement",
+            "documents*=2,3,4",
+            "--coordinator-max-transfer-mb",
+            "128",
+            "--max-concurrent-searches",
+            "8",
+        ],
+    );
+    wait_for_indexes(&broker, &["documents"], Duration::from_secs(10)).await;
+    let response = broker_search_client(&broker)
+        .await
+        .max_decoding_message_size(128 * MIB)
+        .search(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        response.hits.iter().map(hit_id).collect::<Vec<_>>(),
+        ["doc-0", "doc-1", "doc-2"]
+    );
+    assert_eq!(response.total_hits, 3);
+    assert!(!response.truncated);
+    assert_eq!(response.trace.unwrap().shards.len(), 3);
+    for hit in response.hits {
+        let Some(field_value::Value::Text(payload)) = &hit.fields["payload"].values[0].value else {
+            panic!("missing source payload");
+        };
+        assert_eq!(payload.len(), 24 * MIB);
+    }
+    // Raising the budget must still reject a shard above its share of 128 MiB.
+    mocks[0].state.lock().search_response.hits[0]
+        .fields
+        .get_mut("payload")
+        .unwrap()
+        .values[0]
+        .value = Some(field_value::Value::Text("x".repeat(43 * MIB)));
+    let error = broker_search_client(&broker)
+        .await
+        .search(request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    assert!(error.message().contains("decompressing"), "{error}");
+}

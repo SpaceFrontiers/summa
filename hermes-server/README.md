@@ -1,59 +1,34 @@
 # Hermes Server
 
-A high-performance gRPC search server for Hermes indexes.
+gRPC search, indexing, and maintenance for multiple local indexes.
 
-## Features
-
-- **Index Management**: Create, delete, and manage search indexes
-- **Document Indexing**: Stream or batch index documents
-- **Search**: Text, range, sparse/dense vector, binary vector, and fusion queries
-- **Document Retrieval**: Get documents by stable segment/document address
-- **Segment Management**: Commit changes and force merge segments
-
-## Installation
+## Run
 
 ```bash
 cargo install hermes-server
+hermes-server --addr 127.0.0.1:50051 --data-dir ./data
+hermes-server --help
 ```
 
-Or build from source:
+Defaults: `0.0.0.0:50051`, data directory `./data`. See
+[Python](../hermes-client-python/README.md) and
+[TypeScript](../hermes-client-typescript/README.md) for client examples,
+[metrics](../docs/metrics.md) for monitoring, and
+[the broker](../hermes-broker/README.md) for sharding.
 
-```bash
-cargo build --release -p hermes-server
-```
-
-## Usage
-
-### Starting the Server
-
-```bash
-hermes-server --addr 0.0.0.0:50051 --data-dir ./data
-```
-
-Options:
-
-- `-a, --addr`: Address to bind to (default: `0.0.0.0:50051`)
-- `-d, --data-dir`: Directory for storing indexes (default: `./data`)
+## Operations
 
 ### Search resource controls
 
-`--search-threads` sets the width of a bounded Rayon pool shared by CPU-bound
-search work across every open index. When omitted, it defaults to one thread per
-four detected CPUs (minimum one). Nested parallel work, including fused queries,
-segment fan-out, phrase loading, and vector search, stays inside this same pool;
-Hermes does not create a pool per index or request.
+`--search-threads` bounds the shared CPU pool, including nested and cross-index
+work. Default: detected CPUs / 4, minimum 1.
 
-`--max-concurrent-searches` bounds expensive search pipelines across all HTTP/2
-connections; document lookup and metadata RPCs do not consume these permits.
-When omitted, Hermes allows one concurrent search per eight detected CPUs,
-clamped to `1..=8` (six searches on a 48-core host). Requests above that
-capacity fail promptly with gRPC `RESOURCE_EXHAUSTED`; clients should retry with
-bounded exponential backoff. This keeps overload from accumulating an
-unbounded in-process request queue. Completed or cancelled searches release
-their permit automatically.
+`--max-concurrent-searches` bounds admitted search pipelines. Default: CPUs / 8,
+clamped to 1–8. Overload fails immediately with `RESOURCE_EXHAUSTED`; retry with
+bounded backoff. Completion/cancellation releases admission. Document lookup and
+metadata RPCs do not consume search permits.
 
-The server also rejects request sizes that could otherwise multiply into large
-per-segment heaps:
+Request limits:
 
 | Request component                           |            Limit |
 | ------------------------------------------- | ---------------: |
@@ -106,39 +81,25 @@ and stop ingestion/commit outstanding work before a deployment restart.
 The server uses one BP CPU pool and one whole-pass gate across all indexes.
 These are deliberately separate controls:
 
-| Option                                   |   Default | Meaning                                                                                                                                                                                                             |
-| ---------------------------------------- | --------: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--optimizer-threads`                    |       `0` | Threads in the shared BP pool. `0` disables periodic optimizer scans; merge-time and manual BP still use the process-wide fallback pool.                                                                            |
-| `--optimizer-concurrent-passes`          |       `2` | Maximum simultaneous whole-segment BP passes across optimizer, merge-time, and manual reorder. Values are clamped to `1..=2`; automatic merges use at most one slot so fresh-segment optimization retains capacity. |
-| `--optimizer-scan-interval-secs`         |      `60` | Interval between background scans.                                                                                                                                                                                  |
-| `--optimizer-large-segment-docs`         | `5000000` | Document threshold for partial/budgeted first passes.                                                                                                                                                               |
-| `--optimizer-time-budget-secs`           |     `600` | Wall-clock budget for an optimizer pass on a large segment.                                                                                                                                                         |
-| `--optimizer-partial-min-partition-docs` |     `256` | Initial depth floor for large segments (one default LSP superblock).                                                                                                                                                |
-| `--optimizer-unconverged-cooldown-secs`  |     `600` | Delay after a rewrite finishes before another deepening pass.                                                                                                                                                       |
-| `--optimizer-max-unconverged-passes`     |       `3` | Optimizer follow-up eligibility limit per truncated lineage, including the initial partial pass. `0` disables follow-up deepening.                                                                                  |
-| `--merge-bp-budget-secs`                 |     `600` | Wall-clock budget for BP performed inside a merge; `0` explicitly selects an unbudgeted pass.                                                                                                                       |
-| `--bp-memory-budget-mb`                  |   `24576` | Per-pass algorithmic working-set bound; not a reservation or a total-process RSS limit.                                                                                                                             |
+| Option                                   |   Default | Meaning                                                                                 |
+| ---------------------------------------- | --------: | --------------------------------------------------------------------------------------- |
+| `--optimizer-threads`                    |       `0` | Shared BP threads; `0` disables periodic scans. Manual/merge BP uses the fallback pool. |
+| `--optimizer-concurrent-passes`          |       `2` | Shared whole-pass limit, clamped to 1–2; automatic merges use at most one slot.         |
+| `--optimizer-scan-interval-secs`         |      `60` | Background scan interval.                                                               |
+| `--optimizer-large-segment-docs`         | `5000000` | Large-segment threshold for budgeted first passes.                                      |
+| `--optimizer-time-budget-secs`           |     `600` | Large-segment pass time budget.                                                         |
+| `--optimizer-partial-min-partition-docs` |     `256` | Initial partition floor for large segments.                                             |
+| `--optimizer-unconverged-cooldown-secs`  |     `600` | Completion-to-retry delay for deepening.                                                |
+| `--optimizer-max-unconverged-passes`     |       `3` | Pass limit per truncated lineage, including the first pass; `0` disables follow-up.     |
+| `--merge-bp-budget-secs`                 |     `600` | Merge BP time budget; `0` means unbudgeted.                                             |
+| `--bp-memory-budget-mb`                  |   `24576` | Per-pass scratch bound, not reserved memory or a process RSS cap.                       |
 
-An active BP pass is CPU-bound and is expected to occupy up to
-`--optimizer-threads` cores. Concurrent passes share that same pool, so a
-second pass primarily raises simultaneous working sets and outstanding IO; it
-does not create another pool per pass or per index. Explicit force merges pause
-new background BP admission and reserve foreground capacity after existing
-merges drain. With two-pass admission, automatic merge BP uses at most one
-slot; the other remains available to retire short fresh-segment optimizer
-passes instead of queueing them behind multi-minute merges. For predictable
-service latency, start with one pass and a CPU width that leaves capacity for
-query and indexing work.
-
-The dominant graph representation is roughly `4 bytes/posting + 32
-bytes/document`. The limit also accounts for record maps, vocabulary-sized
-degree arrays, and record-rewrite grid/encode windows. If the record
-representation cannot fit, Hermes performs a valid blockwise rewrite and marks
-it unconverged; if only the graph is too large, it retains a bounded set of
-low-frequency dimensions. Stored postings are never truncated. At the process
-level, still budget for up to `concurrent-passes * bp-memory-budget`, plus
-indexing builders, merge state, mmap/page-cache residency, output buffering,
-and open readers.
+Each pass shares the CPU pool but has its own memory budget. Budget for
+`concurrent-passes * bp-memory-budget`, plus readers, indexing, merge state,
+and page-cache residency. Over-budget BP uses blockwise reorder or a bounded
+graph and reports incomplete convergence; stored postings are never truncated.
+Force merge pauses new background BP and reserves foreground capacity after
+existing merges drain.
 
 Merge failures use exponential retry backoff (30 seconds through 30 minutes).
 A deterministic missing/corrupt source is quarantined for the process lifetime
@@ -150,256 +111,32 @@ explicitly remove corrupt entries and their files, stop normal traffic and run:
 hermes-server --data-dir ./data --doctor
 ```
 
-`--doctor` is destructive recovery: it validates every metadata-live segment
-and removes entries that cannot be opened. Normal startup/writer-open cleanup
-only deletes true unowned files and cannot delete metadata-live, actively
-written, or reader-retained segments. Standalone reorder failures are also
-backed off per source from pass completion, so a pass that outlasts the scan
-interval cannot restart continuously. Successful but budget-truncated outputs
-carry a retry count across replacement IDs and stop being optimizer candidates
-at `--optimizer-max-unconverged-passes`, so a lineage that never converges
-cannot consume the optimizer pool forever. Explicitly configured merge-time BP
-still runs when that lineage later participates in a real merge. Details and
-invariants are in [Segment lifecycle and recovery](../docs/segment-lifecycle.md).
+`--doctor` removes metadata entries and files that cannot be opened. Normal
+cleanup removes only unowned files. Reorder failures back off; truncated outputs
+stop optimizer retries at `--optimizer-max-unconverged-passes`. See the
+[segment lifecycle contract](../docs/segment-lifecycle.md).
 
 ## gRPC API
 
-The server exposes two services: `SearchService` and `IndexService`.
+The [protocol](../hermes-proto/hermes.proto) defines the complete wire API:
 
-### IndexService
+| Service         | Operations                                                                                                                        |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `SearchService` | Search, retrieve documents, inspect indexes, export BM25 statistics                                                               |
+| `IndexService`  | Create/list/delete indexes; batch/stream ingest; delete/upsert rows; commit; merge/compact; reorder; retrain/alter vector indexes |
 
-#### CreateIndex
+Search supports text, phrase, Boolean, range, prefix, sparse/dense/binary vector,
+fusion, formula ranking, and reranking. Use [SDL](../docs/schema.md) or the
+shared JSON schema to create indexes. Document addresses are snapshot-local;
+use primary keys for durable identity.
 
-Create a new index with a schema definition (SDL or JSON format).
+`RetrainVectorIndex` rebuilds ANN segments and publishes the new global artifacts
+atomically. Training samples are bounded per field by both
+`--vector-training-max-samples` (10,000,000) and
+`--vector-training-memory-mb` (4096). `AlterVectorIndex` switches compatible
+fields between IVF and ScaNN; see [vector configuration](../docs/schema.md#dense-vectors).
 
-```protobuf
-rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
-
-message CreateIndexRequest {
-  string index_name = 1;
-  string schema = 2;  // SDL or JSON schema
-}
-```
-
-**SDL Schema Example:**
-
-```
-index articles {
-    field title: text<simple> [indexed, stored]
-    field body: text<simple> [indexed, stored]
-    field author: text<simple> [indexed, stored]
-    field published_at: u64 [indexed, stored]
-    field tags: text<raw> [indexed, stored<multi>]
-}
-```
-
-**JSON Schema Example:**
-
-```json
-{
-  "fields": [
-    { "name": "title", "type": "text", "indexed": true, "stored": true },
-    { "name": "body", "type": "text", "indexed": true, "stored": true },
-    { "name": "score", "type": "f64", "indexed": false, "stored": true }
-  ]
-}
-```
-
-#### BatchIndexDocuments
-
-Index multiple documents in a single request.
-
-```protobuf
-rpc BatchIndexDocuments(BatchIndexDocumentsRequest) returns (BatchIndexDocumentsResponse);
-
-message BatchIndexDocumentsRequest {
-  string index_name = 1;
-  repeated NamedDocument documents = 2;
-}
-
-message NamedDocument {
-  repeated FieldEntry fields = 1;
-}
-
-message FieldEntry {
-  string name = 1;
-  FieldValue value = 2;
-}
-```
-
-`FieldEntry` is repeated so callers can send multiple values with the same
-field name.
-
-#### IndexDocuments (Streaming)
-
-Stream documents for indexing.
-
-```protobuf
-rpc IndexDocuments(stream IndexDocumentRequest) returns (IndexDocumentsResponse);
-```
-
-#### Commit
-
-Commit pending changes to make them searchable.
-
-```protobuf
-rpc Commit(CommitRequest) returns (CommitResponse);
-```
-
-#### ForceMerge
-
-Merge all segments into one for optimal search performance.
-
-```protobuf
-rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
-```
-
-#### RetrainVectorIndex
-
-Train new global IVF-TQ, binary-IVF, or ScaNN artifacts from the current corpus and
-rebuild every ANN segment. The complete segment/codebook generation is
-published atomically; existing readers keep the previous generation.
-
-Training reads a deterministic corpus-wide sample for one field at a time.
-`--vector-training-max-samples` (default 10,000,000) and
-`--vector-training-memory-mb` (default 4096) are simultaneous per-field
-bounds; the smaller limit wins. Unselected corpus vectors are never loaded
-into the training sample.
-
-```protobuf
-rpc RetrainVectorIndex(RetrainVectorIndexRequest) returns (RetrainVectorIndexResponse);
-```
-
-#### DeleteIndex
-
-Delete an index and all its data.
-
-```protobuf
-rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
-```
-
-### SearchService
-
-#### Search
-
-Search for documents matching a query.
-
-```protobuf
-rpc Search(SearchRequest) returns (SearchResponse);
-
-message SearchRequest {
-  string index_name = 1;
-  Query query = 2;
-  uint32 limit = 3;
-  uint32 offset = 4;
-  repeated string fields_to_load = 5;
-  Reranker reranker = 6;
-  uint32 candidate_limit = 7;
-}
-```
-
-**Query Types:**
-
-- `TermQuery` and `MatchQuery`
-- `BooleanQuery`, `BoostQuery`, `RangeQuery`, `PrefixQuery`, and `AllQuery`
-- `SparseVectorQuery`, `DenseVectorQuery`, and `BinaryDenseVectorQuery`
-- top-level `FusionQuery` for hybrid union retrieval
-
-#### GetDocument
-
-Retrieve a document by the `DocAddress` returned in a search hit.
-
-```protobuf
-rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
-```
-
-#### GetIndexInfo
-
-Get information about an index (document count, segments, schema).
-
-```protobuf
-rpc GetIndexInfo(GetIndexInfoRequest) returns (GetIndexInfoResponse);
-```
-
-## Field Types
-
-| Type            | Description                       |
-| --------------- | --------------------------------- |
-| `text`          | Full-text searchable string       |
-| `u64`           | Unsigned 64-bit integer           |
-| `i64`           | Signed 64-bit integer             |
-| `f64`           | 64-bit floating point             |
-| `bytes`         | Binary data                       |
-| `json`          | JSON object (stored as string)    |
-| `sparse_vector` | Sparse vector for semantic search |
-| `dense_vector`  | Dense vector for semantic search  |
-
-## Example: Python client
-
-The maintained client handles protobuf conversion and channel lifecycle:
-
-```python
-from hermes_client_python import HermesClient
-
-async with HermesClient("localhost:50051") as client:
-    await client.create_index(
-        "articles",
-        """
-        index articles {
-            field title: text<simple> [indexed, stored]
-            field body: text<simple> [indexed, stored]
-        }
-        """,
-    )
-    await client.index_documents(
-        "articles",
-        [{"title": "Hello World", "body": "My first article"}],
-    )
-    await client.commit("articles")
-
-    response = await client.search(
-        "articles",
-        query={"term": {"field": "title", "term": "hello"}},
-        fields_to_load=["title", "body"],
-    )
-    for hit in response.hits:
-        print(hit.address, hit.score, hit.fields)
-```
-
-## Docker
-
-Build and run with Docker:
-
-```bash
-docker build -t hermes-server -f hermes-server/Dockerfile .
-docker run -p 50051:50051 -v ./data:/data hermes-server --data-dir /data
-```
-
-Or pull from GitHub Container Registry:
-
-```bash
-docker pull ghcr.io/spacefrontiers/hermes/hermes-server:latest
-docker run -p 50051:50051 -v ./data:/data \
-  ghcr.io/spacefrontiers/hermes/hermes-server:latest \
-  hermes-server --data-dir /data
-```
-
-The published image also contains `hermes-broker`. Override the command to run
-it instead of the default server process.
-
-## License
-
-MIT
-
-## Development checks
-
-```bash
-cargo fmt --all -- --check
-cargo clippy -p hermes-server --all-targets -- -D warnings
-cargo test -p hermes-server
-```
-
-### Row compaction
+## Row compaction
 
 `ForceMerge` retains tombstones by default. Set `compact: true` to physically
 remove deleted rows from its final output, including a singleton. `GetIndexInfo`
@@ -421,7 +158,7 @@ but changes BMP block membership, so it invalidates convergence on previously
 reordered nonempty BMP layouts. The BP attempt count is retained. See
 [the compaction contract](../docs/row-deletion.md) for details.
 
-### Primary-key deletion and upserts
+## Primary-key deletion and upserts
 
 IndexService exposes `DeleteDocuments { index_name, primary_keys }` and
 `UpsertDocuments { index_name, documents }`. Both stage mutations and return
@@ -433,3 +170,26 @@ schema and are bounded before conversion/admission. The broker routes both
 operations to the same partition as ingestion. See
 [the mutation contract](../docs/row-deletion.md#mutation-surfaces) for limits and
 failure/cancellation semantics.
+
+## Docker
+
+Build the server-only image from the repository root:
+
+```bash
+docker build -t hermes-server -f hermes-server/Dockerfile .
+docker run --rm -p 50051:50051 -v "$PWD/data:/data" hermes-server --data-dir /data
+```
+
+The published image contains both server and broker binaries:
+
+```bash
+docker run --rm -p 50051:50051 -v "$PWD/data:/data" \
+  ghcr.io/spacefrontiers/hermes/hermes-server:latest \
+  hermes-server --data-dir /data
+```
+
+## Development checks
+
+```bash
+python3 scripts/check_search.py full
+```

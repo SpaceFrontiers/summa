@@ -29,7 +29,7 @@ hermes-tool init \
   --sdl 'index docs { field title: text<simple> [indexed, stored] }'
 ```
 
-Index JSON Lines from a file or standard input, then commit:
+Index JSON Lines from a file or standard input:
 
 ```bash
 hermes-tool index \
@@ -38,14 +38,14 @@ hermes-tool index \
 
 zstdcat documents.jsonl.zst |
   hermes-tool index --index ./my-index --stdin
-
-hermes-tool commit --index ./my-index
 ```
 
-Use the index inspection and maintenance commands:
+`index` commits and waits for background merges before returning.
+Inspect or maintain the index:
 
 ```bash
 hermes-tool info --index ./my-index
+hermes-tool diagnose --index ./my-index
 hermes-tool search --index ./my-index --query 'title:hermes' --limit 10
 hermes-tool merge --index ./my-index
 hermes-tool reorder --index ./my-index
@@ -114,13 +114,9 @@ cargo test -p hermes-tool
 Keep the clap help in `src/main.rs` and this command overview aligned whenever
 commands or defaults change.
 
-## License
+## Delete, upsert, and compact rows
 
-MIT
-
-### Delete, upsert, and compact rows
-
-These commands require a primary-key field and commit their changes:
+`delete` and `upsert` require a primary-key field and commit their changes:
 
 ```bash
 hermes-tool merge -i ./my_index --compact
@@ -134,5 +130,6 @@ hermes-tool compact -i ./my_index --segment SEGMENT_HEX_ID --memory-budget-mb 25
 `compact` removes deleted rows from each dirty segment, including a singleton.
 `merge` combines segments and retains deletion masks; `merge --compact`
 physically removes deleted rows after merging. Indexed-only fields are
-preserved. Index metadata format 7 requires rebuilding older indexes. See the
-[row-deletion design](../docs/row-deletion.md) for snapshot, budget, and key semantics.
+preserved. Metadata formats 6–8 upgrade to 9 on open; older segment formats may
+require rebuilding. See [row deletion](../docs/row-deletion.md) for compatibility
+and [diagnostics](../docs/diagnostics.md) for health checks.

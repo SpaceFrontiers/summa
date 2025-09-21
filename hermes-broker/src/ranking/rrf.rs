@@ -1,5 +1,5 @@
 //! Validate nomination transport and translate core-owned RRF attribution.
-use super::{MAX_TRANSFER_BYTES, MultiValueCombiner, SearchResult, incompatible, key, proto};
+use super::{MultiValueCombiner, SearchResult, check_transfer_size, incompatible, key, proto};
 use hermes_core::query::{RrfRankedList, ScoreScope, ScoredPosition};
 use prost::Message;
 use std::collections::BTreeSet;
@@ -77,6 +77,7 @@ pub(super) fn annotate(
     combiner: MultiValueCombiner,
     lists: &[Vec<SearchResult>],
     response: &mut proto::SearchResponse,
+    max_transfer_bytes: usize,
 ) -> Result<(), Status> {
     let selected = response
         .hits
@@ -86,14 +87,14 @@ pub(super) fn annotate(
     let scores = scores_for_addresses(fusion, scoped, combiner, lists, &selected)?;
     let mut retained = response.encoded_len();
     for (hit, score) in response.hits.iter_mut().zip(scores) {
-        attach_score(fusion, hit, score, &mut retained)?;
+        attach_score(fusion, hit, score, &mut retained, max_transfer_bytes)?;
     }
     response.fusion_candidates.clear();
-    if response.encoded_len() > MAX_TRANSFER_BYTES {
-        return Err(Status::resource_exhausted(
-            "RRF diagnostic response exceeds 64 MiB",
-        ));
-    }
+    check_transfer_size(
+        response.encoded_len(),
+        max_transfer_bytes,
+        "RRF diagnostic response",
+    )?;
     Ok(())
 }
 
@@ -189,6 +190,7 @@ fn attach_score(
     hit: &mut proto::SearchHit,
     score: hermes_core::query::RrfScore,
     retained: &mut usize,
+    max_transfer_bytes: usize,
 ) -> Result<(), Status> {
     for vote in &score.contributions {
         *retained = retained.saturating_add(
@@ -197,11 +199,7 @@ fn attach_score(
                 + 32,
         );
     }
-    if *retained > MAX_TRANSFER_BYTES {
-        return Err(Status::resource_exhausted(
-            "RRF diagnostic response exceeds 64 MiB",
-        ));
-    }
+    check_transfer_size(*retained, max_transfer_bytes, "RRF diagnostic response")?;
     hit.rrf_score = Some(score.score);
     hit.rrf_contributions = score
         .contributions

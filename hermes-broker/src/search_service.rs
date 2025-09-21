@@ -158,7 +158,11 @@ impl BrokerSearchService {
         permits: Vec<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<SearchResponse, Status> {
         let started = Instant::now();
-        let mut plan = crate::ranking::CoordinatorPlan::new(req, route.targets().len())?;
+        let mut plan = crate::ranking::CoordinatorPlan::new(
+            req,
+            route.targets().len(),
+            self.ctx.coordinator_max_transfer,
+        )?;
         self.attach_text_stats(&mut plan.shard_request, timeout, route)
             .await?;
         let remaining = || {
@@ -176,7 +180,7 @@ impl BrokerSearchService {
         let rpc_timeout = remaining()?;
         // Bound the sum of concurrently decoded responses, including compressed
         // transports. No unbounded per-shard allowance is multiplied by fan-out.
-        let decode_limit = crate::ranking::MAX_TRANSFER_BYTES / route.targets().len();
+        let decode_limit = self.ctx.coordinator_max_transfer / route.targets().len();
         let tracing = plan.shard_request.tracing;
         let calls = route.targets().iter().map(|target| {
             let mut outbound = Request::new(plan.shard_request.clone());

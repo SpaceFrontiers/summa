@@ -1,6 +1,6 @@
 # Hermes Schema Definition Language (SDL)
 
-Hermes uses a simple, readable schema definition language for defining index schemas. This document describes the SDL syntax and features.
+SDL defines index fields, tokenizers, storage, and search options.
 
 ## Basic Syntax
 
@@ -39,23 +39,24 @@ index articles {
     # Rating score
     field rating: f64 [indexed, stored]
 
-    # Caller-supplied content hash: skip unchanged committed upserts
+    # Caller-supplied content hash: skip unchanged upserts
     field content_hash: bytes [stored, content_hash]
 }
 ```
 
 ## Field Types
 
-| Type            | Aliases            | Description                                   |
-| --------------- | ------------------ | --------------------------------------------- |
-| `text`          | `string`, `str`    | UTF-8 text, tokenized for full-text search    |
-| `u64`           | `uint`, `unsigned` | Unsigned 64-bit integer                       |
-| `i64`           | `int`, `integer`   | Signed 64-bit integer                         |
-| `f64`           | `float`, `double`  | 64-bit floating point number                  |
-| `bytes`         | `binary`, `blob`   | Raw binary data                               |
-| `json`          |                    | Arbitrary JSON values                         |
-| `dense_vector`  |                    | Dense float vector for ANN search (see below) |
-| `sparse_vector` |                    | Sparse vector for learned sparse retrieval    |
+| Type                  | Aliases            | Description                                |
+| --------------------- | ------------------ | ------------------------------------------ |
+| `text`                | `string`, `str`    | UTF-8 text, tokenized for full-text search |
+| `u64`                 | `uint`, `unsigned` | Unsigned 64-bit integer                    |
+| `i64`                 | `int`, `integer`   | Signed 64-bit integer                      |
+| `f64`                 | `float`, `double`  | 64-bit floating point number               |
+| `bytes`               | `binary`, `blob`   | Raw binary data                            |
+| `json`                |                    | Arbitrary JSON values                      |
+| `dense_vector`        | `vector`           | Dense float vectors                        |
+| `binary_dense_vector` | `binary_vector`    | Packed bits for Hamming search             |
+| `sparse_vector`       |                    | Sparse vector for learned sparse retrieval |
 
 ## Attributes
 
@@ -117,7 +118,7 @@ The `primary` attribute designates a field as the primary key. When a primary ke
 
 - Documents with duplicate primary key values are rejected during indexing
 - The server automatically initializes deduplication tracking on index open
-- Only one field per index should be marked as `primary`
+- At most one field per index may be marked as `primary`
 - Requires a single-valued `text` field; implies `fast` and `indexed`
 
 ```
@@ -131,7 +132,8 @@ index articles {
 ### Content Hash
 
 Mark one stored, single-valued `text`, `bytes`, or `u64` field with `content_hash`
-to skip reindexing a committed live document when its primary key and hash match.
+to skip reindexing when its primary key and hash match the latest staged or
+committed live document.
 The hash does not need `indexed` or `fast`. Equality is exact and case-sensitive;
 the caller must change the hash whenever any part of the full document changes.
 Missing hashes cause normal replacement. Wrong types and multiple values error.
@@ -345,39 +347,7 @@ hermes-tool init -i ./myindex -s 'index test { field title: text [indexed, store
 
 ## Grammar (PEG)
 
-The SDL is parsed using [pest](https://pest.rs/). The complete grammar:
-
-```pest
-file = { SOI ~ index_def+ ~ EOI }
-
-index_def = { "index" ~ identifier ~ "{" ~ field_def* ~ "}" }
-
-field_def = { "field" ~ identifier ~ ":" ~ field_type ~ (sparse_vector_config | dense_vector_config | binary_dense_vector_config | tokenizer_spec)? ~ attributes? }
-
-field_type = {
-    "text" | "string" | "str" |
-    "u64" | "uint" | "unsigned" |
-    "i64" | "int" | "integer" |
-    "f64" | "float" | "double" |
-    "binary_dense_vector" | "binary_vector" |
-    "bytes" | "binary" | "blob" |
-    "json" |
-    "sparse_vector" |
-    "dense_vector" | "vector"
-}
-
-tokenizer_spec = { "<" ~ identifier ~ tokenizer_params? ~ ">" }
-tokenizer_params = { "(" ~ tokenizer_param ~ ("," ~ tokenizer_param)* ~ ")" }
-tokenizer_param = { identifier ~ ":" ~ identifier }
-
-attributes = { "[" ~ attribute ~ ("," ~ attribute)* ~ "]" }
-attribute = { indexed_with_config | "indexed" | stored_with_config | "stored" | "fast" | "primary" | "content_hash" | "reorder" }
-
-identifier = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
-
-WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
-COMMENT = _{ "#" ~ (!"\n" ~ ANY)* }
-```
+The authoritative grammar is [sdl.pest](../hermes-core/src/dsl/sdl/sdl.pest).
 
 ## Dense Vectors
 
@@ -393,11 +363,14 @@ field embedding: dense_vector<DIM, uint8> [indexed]       # scalar quantized, 4�
 
 ### Quantization Types
 
-| Type    | Aliases | Bytes/dim | Recall impact | Use case            |
-| ------- | ------- | --------- | ------------- | ------------------- |
-| `f32`   |         | 4         | Baseline      | Maximum precision   |
-| `f16`   |         | 2         | <0.1% loss    | Recommended default |
-| `uint8` | `u8`    | 1         | 1-3% loss     | Maximum compression |
+| Type    | Alias | Bytes/dimension |
+| ------- | ----- | --------------: |
+| `f32`   |       |               4 |
+| `f16`   |       |               2 |
+| `uint8` | `u8`  |               1 |
+
+This controls vector value storage; ANN codes have their own layout. Measure
+recall on your corpus before reducing precision.
 
 ### Index Types and Routing
 
@@ -554,7 +527,7 @@ Vectors with at most `min_terms` entries are never cropped.
 field emb: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
 ```
 
-Use `hermes-tool info <index>` to inspect the resulting average sparse vector
+Use `hermes-tool info --index <path>` to inspect the resulting average sparse vector
 length (`avg terms/vector`).
 
 ### BMP Format Options
@@ -618,17 +591,17 @@ field embedding: sparse_vector<u32> [indexed<format: seismic, quantization: floa
 For Seismic, the default is approximate nomination followed by exact candidate scoring.
 `query<exhaustive: true>` scans the same forward values exhaustively. Query
 configuration applies to both query-language and vector API searches. Sparse
-queries have at most64 effective dimensions; query pruning changes nominations,
+queries have at most 64 effective dimensions; query pruning changes nominations,
 while candidate scores use the full bounded query.
 
-- `seismic_postings`: maximum retained postings per term in a new run,1–65536.
-- `seismic_cluster_size`: target cluster size,1–`seismic_postings`.
-- `seismic_summary_energy`: retained summary magnitude fraction,(0,1].
+- `seismic_postings`: maximum retained postings per term in a new run, 1–65536.
+- `seismic_cluster_size`: target cluster size, 1–`seismic_postings`.
+- `seismic_summary_energy`: retained summary magnitude fraction, (0,1].
 - `seismic_forward_compression`: lossless adaptive dimension compression, default
   `true` (`false` keeps raw U32 IDs). Uses U16/U24 or aligned gaps while preserving full U32 IDs and the
   configured weight precision; see [forward compression](seismic-forward-compression.md).
-- `seismic_cut`: nomination query dimensions,1–64.
-- `seismic_factor`: summary pruning factor,[0,1]. Approximate recall must be
+- `seismic_cut`: nomination query dimensions, 1–64.
+- `seismic_factor`: summary pruning factor, [0,1]. Approximate recall must be
   measured on representative queries; exact scoring does not make nominations exact.
 
 `quantization` selects Float32 (default), Float16, UInt8 or UInt4 storage using
@@ -636,17 +609,8 @@ the shared sparse weight codecs. Exact scoring refers to these stored values.
 `dims` optionally bounds vocabulary IDs. Forward values are mandatory; retrieval,
 all ordinal combiners, backfill and maintenance use this one encoded copy.
 
-### Document Mass Cropping
-
-`doc_mass` optionally retains the strongest coordinates covering the requested
-fraction of each vector's absolute weight mass. This destructively changes the
-stored vector. `weight_threshold` and `pruning` are also quality-sensitive;
-measure recall before enabling them. Vectors with at most `min_terms` entries
-are protected from mass cropping.
-
-```sdl
-field embedding: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
-```
+`doc_mass`, `weight_threshold`, and `pruning` change stored values; see
+[document mass cropping](#document-mass-cropping) and measure recall before use.
 
 Ordinary merge copies encoded runs without clustering. The existing background
 optimizer services nomination fragmentation in bounded term passes; retained
@@ -661,11 +625,3 @@ JSON fields store arbitrary JSON values. They must be `stored` (not indexed):
 field metadata: json [stored]
 field spans: json [stored<multi>]    # Multi-value JSON
 ```
-
-## Best Practices
-
-1. **Use descriptive field names** - Field names should clearly indicate their purpose
-2. **Only store what you need** - Use `[indexed]` without `stored` for large fields you only search but don't retrieve
-3. **Use appropriate types** - Use numeric types for numbers to enable range queries
-4. **Comment your schemas** - Add comments to explain field purposes
-5. **Group related indexes** - Keep related indexes in the same SDL file

@@ -40,11 +40,11 @@ resolution when the table fits, and one stored block fetch/decompression on a
 cache miss. Startup/visibility refresh adds a column scan. These are cost models,
 not measured latency claims. The fallback costs a column scan per matching key.
 
-Schema serialization adds a defaulted optional field marker. Metadata format 8
-protects the setting from older writers silently dropping it; formats 6 and 7
-upgrade without rewriting segment payloads. Schema validation applies on SDL
-parse, JSON creation schemas, core creation and metadata load. Hash values remain in the existing store
-format; no sidecar, second writer or hash index is introduced.
+Schema serialization uses a defaulted optional field marker, introduced in
+metadata format 8. Current format 9 upgrades formats 6–8 without rewriting
+segment payloads; older writers cannot silently drop the setting. Validation
+applies on SDL/JSON parsing, core creation, and metadata load. Hashes use the
+existing store; no sidecar, second writer, or hash index is introduced.
 
 Validation covers physical row/mask stability for equal hashes, changed/missing
 hashes, pending insertions/deletions, old readers, abort, reopen, topology changes,
@@ -56,8 +56,8 @@ An existing index with a compatible primary key and stored hash needs only a
 metadata change; its segment payloads already contain everything required.
 Close the index and its writers before editing `metadata.json`. Add
 `"content_hash": true` to exactly one existing entry in `schema.fields` and set
-the top-level `version` to `8`. Preserve field order, field types, name mappings,
-and all other metadata. Reopen with the new build to load the updated schema and
+the top-level `version` to `9` (never downgrade a newer format). Preserve field
+order, types, name mappings, and all other metadata. Reopen with the new build to load the updated schema and
 build the primary-key lookup. Do not patch metadata while a writer or background
 maintenance can publish another generation.
 
@@ -65,7 +65,7 @@ The existing hash field must already be stored, single-valued, and text, bytes,
 or u64; the existing primary key must be single-valued text with indexed and fast
 storage. Merely changing those storage flags cannot add missing encoded columns.
 Rows without a stored hash are replaced normally on their next upsert. Automatic
-format migration from versions 6 or 7 leaves deduplication disabled unless the
+format migration from versions 6–8 leaves deduplication disabled unless the
 field is explicitly marked. No enablement command or RPC is required.
 
 ## Stored-block allocation correction

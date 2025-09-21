@@ -214,6 +214,37 @@ impl DocBitset {
         }
     }
 
+    /// Add matches from consecutive values without a bitset read/modify/write
+    /// per hit. The caller supplies a range inside the document universe.
+    pub(super) fn insert_matching_values(
+        &mut self,
+        start: u32,
+        values: &[u64],
+        predicate: impl Fn(u64) -> bool,
+    ) {
+        for (chunk_index, chunk) in values.chunks(64).enumerate() {
+            let mut matches = [0u8; 64];
+            for (matched, &value) in matches.iter_mut().zip(chunk) {
+                *matched = u8::from(predicate(value));
+            }
+            let mask = matches
+                .iter()
+                .enumerate()
+                .fold(0u64, |mask, (bit, &matched)| {
+                    mask | (u64::from(matched) << bit)
+                });
+            let doc = start as usize + chunk_index * 64;
+            let word = doc / 64;
+            let shift = doc % 64;
+            self.bits[word] |= mask << shift;
+            // Short copied blocks can share words. OR preserves their earlier
+            // matches, and zero-filled comparison tails preserve padding.
+            if shift + chunk.len() > 64 {
+                self.bits[word + 1] |= mask >> (64 - shift);
+            }
+        }
+    }
+
     /// First set bit at or after `from`, if any.
     pub fn next_set_bit(&self, from: DocId) -> Option<DocId> {
         let mut word = from as usize / 64;
@@ -836,5 +867,33 @@ impl super::docset::DocSet for EmptyScorer {
 impl Scorer for EmptyScorer {
     fn score(&self) -> Score {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod bitset_tests {
+    use super::DocBitset;
+
+    #[test]
+    fn batched_matches_preserve_neighbours_and_padding_at_every_bit_offset() {
+        for start in 0..64 {
+            for len in 0..=257 {
+                let end = start + len;
+                let mut bits = DocBitset::new(end + 1);
+                if start != 0 {
+                    bits.set(start - 1);
+                }
+                bits.set(end);
+                let values: Vec<_> = (0..len).map(|i| u64::from(i % 3)).collect();
+                bits.insert_matching_values(start, &values, |v| v == 1);
+                for doc in 0..=end {
+                    let expected = (start != 0 && doc == start - 1)
+                        || doc == end
+                        || (doc >= start && doc < end && (doc - start) % 3 == 1);
+                    assert_eq!(bits.contains(doc), expected, "start={start}, len={len}");
+                }
+                assert_eq!(bits.count(), u32::from(start != 0) + 1 + (len + 1) / 3);
+            }
+        }
     }
 }
