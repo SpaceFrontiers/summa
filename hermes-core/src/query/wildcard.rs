@@ -1,16 +1,11 @@
 //! Whole-term Unicode wildcard filters over the existing term dictionary.
-use std::sync::Arc;
-
+use super::term_pattern::{TermPatternQuery, check_length};
+#[cfg(feature = "sync")]
+use super::traits::Scorer;
+use super::traits::{CountFuture, Query, ScorerFuture};
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
 use crate::{Error, Result};
-
-use super::term_union::{TermUnionScorer, materialize_union, reject_chunked};
-use super::traits::{CountFuture, Query, Scorer, ScorerFuture};
-
-const MAX_PATTERN_BYTES: usize = 1024;
-const MAX_SCANNED_TERMS: usize = 1_000_000;
-const MAX_REGEX_BYTES: usize = 2 * 1024 * 1024;
 
 /// Constant-score union of indexed terms matching a whole-term wildcard.
 ///
@@ -19,28 +14,14 @@ const MAX_REGEX_BYTES: usize = 2 * 1024 * 1024;
 /// uses the same 1,024-term / 5,000,000-posting per-segment limits as prefixes;
 /// scans additionally stop with an error after 1,000,000 candidate terms.
 #[derive(Debug, Clone)]
-pub struct WildcardQuery {
-    field: Field,
-    pattern: Arc<Pattern>,
-}
-
-#[derive(Debug)]
-struct Pattern {
-    source: String,
-    prefix: Vec<u8>,
-    regex: regex::Regex,
-}
+pub struct WildcardQuery(TermPatternQuery);
 
 impl WildcardQuery {
     /// Compile a case-sensitive pattern against indexed UTF-8 terms.
     pub fn new(field: Field, pattern: impl AsRef<str>) -> Result<Self> {
         let source = pattern.as_ref();
-        if source.len() > MAX_PATTERN_BYTES {
-            return Err(Error::Query(format!(
-                "wildcard pattern exceeds {MAX_PATTERN_BYTES} bytes"
-            )));
-        }
-        let mut expression = String::from("\\A(?:");
+        check_length(source, "wildcard")?;
+        let mut expression = String::new();
         let mut prefix = String::new();
         let mut literal_prefix = true;
         let mut characters = source.chars();
@@ -69,111 +50,42 @@ impl WildcardQuery {
                 }
             }
         }
-        expression.push_str(")\\z");
-        let regex = regex::RegexBuilder::new(&expression)
-            .dot_matches_new_line(true)
-            .size_limit(MAX_REGEX_BYTES)
-            .dfa_size_limit(MAX_REGEX_BYTES)
-            .build()
-            .map_err(|error| Error::Query(format!("invalid wildcard pattern: {error}")))?;
-        Ok(Self {
+        Ok(Self(TermPatternQuery::compile(
             field,
-            pattern: Arc::new(Pattern {
-                source: source.to_owned(),
-                prefix: prefix.into_bytes(),
-                regex,
-            }),
-        })
+            source,
+            &expression,
+            prefix.into_bytes(),
+            "wildcard",
+        )?))
     }
 
     /// Lowercase a pattern to match a lowercase term vocabulary.
     pub fn text(field: Field, pattern: &str) -> Result<Self> {
-        if pattern.len() > MAX_PATTERN_BYTES {
-            return Err(Error::Query(format!(
-                "wildcard pattern exceeds {MAX_PATTERN_BYTES} bytes"
-            )));
-        }
+        check_length(pattern, "wildcard")?;
         Self::new(field, pattern.to_lowercase())
-    }
-}
-
-impl Pattern {
-    fn matches(&self, term: &[u8]) -> bool {
-        std::str::from_utf8(term).is_ok_and(|term| self.regex.is_match(term))
     }
 }
 
 impl std::fmt::Display for WildcardQuery {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Wildcard({}:{:?})", self.field.0, self.pattern.source)
+        self.0.fmt(f)
     }
 }
-
 impl Query for WildcardQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
-        let field = self.field;
-        let pattern = self.pattern.clone();
-        Box::pin(async move {
-            reject_chunked(reader, field, "WildcardQuery")?;
-            let postings = reader
-                .get_matching_postings(
-                    field,
-                    &pattern.prefix,
-                    "wildcard",
-                    MAX_SCANNED_TERMS,
-                    |term| pattern.matches(term),
-                )
-                .await?;
-            Ok(Box::new(TermUnionScorer::new(materialize_union(
-                &postings,
-                reader.num_docs(),
-                reader.chunk_map(field),
-            ))) as Box<dyn Scorer>)
-        })
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
+        self.0.scorer(reader, limit)
     }
-
     #[cfg(feature = "sync")]
     fn scorer_sync<'a>(
         &self,
         reader: &'a SegmentReader,
-        _limit: usize,
+        limit: usize,
     ) -> Result<Box<dyn Scorer + 'a>> {
-        reject_chunked(reader, self.field, "WildcardQuery")?;
-        let postings = reader.get_matching_postings_sync(
-            self.field,
-            &self.pattern.prefix,
-            "wildcard",
-            MAX_SCANNED_TERMS,
-            |term| self.pattern.matches(term),
-        )?;
-        Ok(Box::new(TermUnionScorer::new(materialize_union(
-            &postings,
-            reader.num_docs(),
-            reader.chunk_map(self.field),
-        ))))
+        self.0.scorer_sync(reader, limit)
     }
-
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
-        let field = self.field;
-        let pattern = self.pattern.clone();
-        Box::pin(async move {
-            reject_chunked(reader, field, "WildcardQuery")?;
-            let postings = reader
-                .get_matching_postings(
-                    field,
-                    &pattern.prefix,
-                    "wildcard",
-                    MAX_SCANNED_TERMS,
-                    |term| pattern.matches(term),
-                )
-                .await?;
-            Ok(postings
-                .iter()
-                .fold(0u32, |sum, posting| sum.saturating_add(posting.doc_count()))
-                .min(reader.num_docs()))
-        })
+        self.0.count_estimate(reader)
     }
-
     fn is_filter(&self) -> bool {
         true
     }

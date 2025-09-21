@@ -7,6 +7,7 @@
 - [Schema (SDL)](schema.md)
 - [Query language](query-language.md)
 - [Wildcard queries and expansion limits](wildcard-query.md)
+- [Regex queries and escaped literals](regex-query.md)
 - [Tokenization and phrase queries](dynamic-tokenizer-and-phrase.md)
 - [Chunked text](chunked-text-fields.md) and [chunked BM25](chunked-bm25.md)
 - [Formula ranking, backfill, and diagnostics](candidate-rescoring.md)
@@ -58,6 +59,8 @@
 
 ## Documentation checks
 
+
+
 ## Additional guides
 
 - [Contributing](../CONTRIBUTING.md)
@@ -67,6 +70,8 @@
 - [Range block scan experiments](range-block-scans.md)
 - [Text formats and memory](text-format-comparison.md)
 - [pruning fixes](search-pruning-fixes.md)
+- [Ranked conjunction and phrase follow-up](ranked-pruning-followup.md)
+- [Score-guided posting traversal research](score-guided-traversal.md)
 - [Lucene research](lucene-11-performance-research.md)
 - [BMP forward-search experiment (removed)](bmp-forward-search.md)
 - [Former IVF-PQ design](unified-vector-quantization.md)

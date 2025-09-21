@@ -166,6 +166,7 @@ async fn expanded_term_filters_preserve_logical_ids_after_rgb_reordering() {
     let queries: Vec<Box<dyn Query>> = vec![
         Box::new(PrefixQuery::text(field, "alp")),
         Box::new(WildcardQuery::new(field, "a*ha").unwrap()),
+        Box::new(hermes_core::RegexQuery::new(field, "a.*ha").unwrap()),
     ];
     let expected: Vec<_> = (0..2048).step_by(2).collect();
     for query in queries {

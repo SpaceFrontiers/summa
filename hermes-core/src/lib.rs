@@ -75,8 +75,8 @@ pub use segment::{SegmentBuilder, SegmentBuilderConfig, SegmentBuilderStats};
 // Re-exports from query
 pub use query::{
     BinaryDenseVectorQuery, Bm25Params, BooleanQuery, BoostQuery, MaxScoreExecutor, PhraseQuery,
-    PrefixQuery, Query, ScoredDoc, Scorer, SearchHit, SearchResponse, SearchResult, TermQuery,
-    TopKCollector, WildcardQuery,
+    PrefixQuery, Query, RegexQuery, ScoredDoc, Scorer, SearchHit, SearchResponse, SearchResult,
+    TermQuery, TopKCollector, WildcardQuery,
 };
 
 // Re-exports from tokenizer

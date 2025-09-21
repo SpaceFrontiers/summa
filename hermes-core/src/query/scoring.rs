@@ -1687,8 +1687,11 @@ impl<'a> TermCursor<'a> {
             && let Some(&last) = self.doc_ids.last()
         {
             if last >= target && self.doc_ids[self.pos] < target {
-                let remaining = &self.doc_ids[self.pos..];
-                self.pos += crate::structures::simd::find_first_ge_u32(remaining, target);
+                self.pos = crate::structures::simd::find_first_ge_block_from(
+                    &self.doc_ids,
+                    self.pos,
+                    target,
+                );
                 if self.pos >= self.doc_ids.len() {
                     self.block_idx += 1;
                     self.block_loaded = false;
@@ -1751,7 +1754,7 @@ impl<'a> TermCursor<'a> {
         if self.exhausted {
             return false;
         }
-        self.pos = crate::structures::simd::find_first_ge_u32(&self.doc_ids, target);
+        self.pos = crate::structures::simd::find_first_ge_block_from(&self.doc_ids, 0, target);
         if self.pos >= self.doc_ids.len() {
             self.block_idx += 1;
             self.block_loaded = false;

@@ -205,7 +205,7 @@ Warm timings use three alternating runs per version, 200 queries/top-100 and
 three passes, excluding the first pass from latency summaries. Values below are
 medians of per-run statistics. Both versions use the same source fixture,
 compiler, machine, flags and four-worker settings within each architecture.
-There was no compiler overlap. Linux uses the existing n2-highmem-8 VM; Apple M4
+There was no compiler overlap. Linux uses the existing n2-highmem-8 machine; Apple M4
 uses the local shared workstation. All runs use a 64 MiB copy-pin allowance;
 summary arrays remain evictable.
 

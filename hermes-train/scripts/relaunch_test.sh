@@ -1530,8 +1530,8 @@ EOF
     || fail "corrupt remote checkpoint failure was not explained"
 }
 
-run_sleep_and_qat_vm_loss_restore_test() {
-  local case_root=$TEST_ROOT/artifact-vm-loss
+run_sleep_and_qat_machine_loss_restore_test() {
+  local case_root=$TEST_ROOT/artifact-machine-loss
   local config=$case_root/relaunch.conf
   local generation expected_future
   prepare_artifact_checkpoint "$case_root" 31 stable
@@ -2083,7 +2083,7 @@ run_global_step_mismatch_rejected_test
 run_unsafe_pointer_rejected_test
 run_unsafe_manifest_path_rejected_test
 run_corrupt_remote_rejected_test
-run_sleep_and_qat_vm_loss_restore_test
+run_sleep_and_qat_machine_loss_restore_test
 run_equal_generation_release_rehydration_test
 run_rewritten_closure_rejected_test
 run_full_dream_manifest_history_test

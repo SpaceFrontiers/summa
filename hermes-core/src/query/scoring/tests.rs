@@ -1,4 +1,82 @@
 use super::*;
+
+#[test]
+fn skewed_conjunction_preserves_frequency_rows_across_seeks_and_partial_batches() {
+    use crate::structures::{BlockPostingList, PostingCodec, PostingList};
+    let params = super::super::Bm25Params::default();
+    let lengths = crate::segment::chunk_map::DocLengths::from_lengths(&vec![100; 40001]);
+    for codec in [
+        PostingCodec::Rounded,
+        PostingCodec::Packed,
+        PostingCodec::Pfor,
+        PostingCodec::Simd4x,
+    ] {
+        let mut common = PostingList::new();
+        let mut rare = PostingList::new();
+        let mut expected = Vec::new();
+        for doc in 0..40001 {
+            let tf = doc % 7 + 1;
+            if doc % 11 != 1 {
+                common.push(doc, tf);
+            }
+            if doc % 257 == 0 || doc == 40000 {
+                rare.push(doc, doc % 5 + 1);
+                if doc % 11 != 1 && doc % 13 != 0 {
+                    expected.push((
+                        doc,
+                        params.score(tf as f32, 1.0, 100.0, 100.0)
+                            + params.score((doc % 5 + 1) as f32, 2.0, 100.0, 100.0),
+                    ));
+                }
+            }
+        }
+        let count = expected.len();
+        expected.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let common =
+            BlockPostingList::from_posting_list_with_options(&common, false, Some(&|_| 100), codec)
+                .unwrap();
+        let rare =
+            BlockPostingList::from_posting_list_with_options(&rare, false, Some(&|_| 100), codec)
+                .unwrap();
+        for reversed in [false, true] {
+            for k in [1, 10, 128, 200] {
+                let mut lists = vec![(common.clone(), 1.0), (rare.clone(), 2.0)];
+                if reversed {
+                    lists.reverse();
+                }
+                let make = || {
+                    MaxScoreExecutor::text_with_lengths(
+                        lists.clone(),
+                        100.0,
+                        k,
+                        Some(LengthSource::Docs(&lengths)),
+                        params,
+                        1.0,
+                    )
+                    .require_all_terms()
+                    .with_predicate(Box::new(|doc| doc % 13 != 0))
+                };
+                let (counted, seen) = make().execute_counted_conjunction().unwrap();
+                assert_eq!(seen, count as u64);
+                for hits in [
+                    counted,
+                    make().execute_sync().unwrap(),
+                    futures::executor::block_on(make().execute()).unwrap(),
+                ] {
+                    let actual: Vec<_> =
+                        hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect();
+                    let wanted: Vec<_> = expected
+                        .iter()
+                        .take(k)
+                        .map(|&(doc, score)| (doc, score.to_bits()))
+                        .collect();
+                    assert_eq!(actual, wanted, "{codec:?} reversed={reversed} k={k}");
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn ranked_mapped_conjunction_prunes_losers_but_keeps_ties_and_exact_counts() {
     use crate::directories::OwnedBytes;

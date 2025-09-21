@@ -188,6 +188,17 @@ impl MaxScoreExecutor<'_> {
             .cursors
             .get_disjoint_mut(pair)
             .expect("distinct conjunction cursors");
+        let seek_driven = match (&left.variant, &right.variant) {
+            (CursorVariant::Text { list: left, .. }, CursorVariant::Text { list: right, .. }) => {
+                // Below one rare posting per common block, seeking can avoid
+                // scanning most of that block. Denser intersections amortize
+                // the SIMD merge over several matches instead.
+                left.doc_count()
+                    .saturating_mul(crate::structures::postings::POSTING_BLOCK_SIZE as u32)
+                    < right.doc_count()
+            }
+            _ => unreachable!("conjunctions contain text cursors ordered by cost"),
+        };
         let mut pairs = [(0u8, 0u8); crate::structures::postings::POSTING_BLOCK_SIZE];
         let mut count = 0;
         while count < docs.len() && !left.exhausted && !right.exhausted {
@@ -228,13 +239,35 @@ impl MaxScoreExecutor<'_> {
             }
             let mut a = left.pos;
             let mut b = right.pos;
-            let found = crate::structures::simd::intersect_posting_blocks(
-                &left.doc_ids,
-                &mut a,
-                &right.doc_ids,
-                &mut b,
-                &mut pairs[..docs.len() - count],
-            );
+            // RGB can cluster a globally rare term into dense local runs.
+            // Compare the decoded spans too, retaining the SIMD merge there.
+            let sparse_block = seek_driven
+                && left.doc_ids.last().unwrap() - left.doc_ids[0]
+                    > (right.doc_ids.last().unwrap() - right.doc_ids[0])
+                        .saturating_mul(crate::structures::postings::POSTING_BLOCK_SIZE as u32);
+            let found = if sparse_block {
+                // The rarer cursor supplies candidate IDs. Seeking avoids a
+                // linear walk across the common term's decoded block; the
+                // same bounded batch below owns frequencies and scoring.
+                let target = left.doc();
+                let other = right.seek_sync(target)?;
+                if other != target {
+                    left.seek_sync(other)?;
+                    continue;
+                }
+                a = left.pos + 1;
+                b = right.pos + 1;
+                pairs[0] = (left.pos as u8, right.pos as u8);
+                1
+            } else {
+                crate::structures::simd::intersect_posting_blocks(
+                    &left.doc_ids,
+                    &mut a,
+                    &right.doc_ids,
+                    &mut b,
+                    &mut pairs[..docs.len() - count],
+                )
+            };
             *iterations += (a - left.pos + b - right.pos) as u64;
             let mut frequencies_loaded = false;
             for &(a, b) in &pairs[..found] {

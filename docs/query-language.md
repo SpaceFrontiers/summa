@@ -1,6 +1,6 @@
 # Query language
 
-Hermes accepts terms, field-qualified terms, phrases, prefixes, wildcard functions, explicit
+Hermes accepts terms, field-qualified terms, phrases, prefixes, wildcard and regex functions, explicit
 `AND`/`OR`/`NOT`, grouping, unary `+`/`-` modifiers, and vector expressions.
 Whitespace between clauses is an implicit OR.
 
@@ -77,3 +77,19 @@ Prefix and wildcard filters share bounded expansion and union execution and
 preserve logical document IDs on RGB fields. Chunked fields are rejected.
 Leading wildcards may scan many dictionary terms; excessive expansion returns
 an error. See [wildcard queries](wildcard-query.md) for the limits and core API.
+
+## Regex filters and literal punctuation
+
+`field:regex("(19|20)[0-9]{2}")` matches entire indexed terms. Patterns are
+case-sensitive and are not analyzed or lowercased. Supported syntax includes
+classes/ranges, grouping, alternation and repetition; see [regex queries](regex-query.md)
+for the language and resource limits. These filters share wildcard union
+execution, constant scoring, RGB ID mapping and explicit expansion errors.
+Malformed regex calls and dangling term escapes are errors in both parsing entry points.
+
+Dots and apostrophes are accepted inside ordinary terms, including
+`books.google.com`, `12.6` and `hill's`. A backslash quotes the next character:
+`+a +user\:ed` requires both terms, with the colon inside the second term;
+`tag:a\*b` searches for a literal asterisk. The parser unescapes once and applies
+the field's configured tokenizer. Use a raw field when punctuation must be
+preserved verbatim in the index; this syntax does not change analyzer behavior.
