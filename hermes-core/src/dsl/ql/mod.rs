@@ -215,22 +215,15 @@ impl QueryLanguageParser {
             return Err("No default fields configured".to_string());
         }
 
-        let tokenizer = self.get_tokenizer(self.default_fields[0]);
-        let tokens: Vec<String> = tokenizer
-            .tokenize(text)
-            .into_iter()
-            .map(|t| t.text.to_lowercase())
-            .collect();
-
-        if tokens.is_empty() {
-            return Err("No tokens in query".to_string());
-        }
-
         let mut bool_query = BooleanQuery::new();
-        for token in &tokens {
-            for &field_id in &self.default_fields {
-                bool_query = bool_query.should(TermQuery::text(field_id, token));
+        for &field_id in &self.default_fields {
+            for token in self.get_tokenizer(field_id).tokenize(text) {
+                bool_query =
+                    bool_query.should(TermQuery::text(field_id, &token.text.to_lowercase()));
             }
+        }
+        if bool_query.should.is_empty() {
+            return Err("No tokens in query".to_string());
         }
         Ok(Box::new(bool_query))
     }
@@ -585,33 +578,29 @@ impl QueryLanguageParser {
                 Ok(Box::new(bool_query))
             }
         } else if !self.default_fields.is_empty() {
-            // Unqualified term: tokenize and search across default fields
-            let tokenizer = self.get_tokenizer(self.default_fields[0]);
-            let tokens: Vec<String> = tokenizer
-                .tokenize(term)
-                .into_iter()
-                .map(|t| t.text.to_lowercase())
-                .collect();
-
-            if tokens.is_empty() {
-                return Err("No tokens in term".to_string());
-            }
-
-            // A single clause needs no Boolean wrapper. Preserve term decomposition
-            // for the owning planner, including when nested in a larger Boolean query.
-            if tokens.len() == 1 && self.default_fields.len() == 1 {
-                return Ok(Box::new(TermQuery::text(
-                    self.default_fields[0],
-                    &tokens[0],
-                )));
-            }
-
-            // Build SHOULD query across all default fields for each token
+            // Each default field must use the same tokenizer as its indexed text.
+            // Preserve the unqualified term's OR semantics across fields and tokens.
             let mut bool_query = BooleanQuery::new();
-            for token in &tokens {
-                for &field_id in &self.default_fields {
-                    bool_query = bool_query.should(TermQuery::text(field_id, token));
+            for &field_id in &self.default_fields {
+                let tokens = self.get_tokenizer(field_id).tokenize(term);
+
+                // Preserve term decomposition for the owning planner, including
+                // when nested in a larger Boolean query.
+                if tokens.len() == 1 && self.default_fields.len() == 1 {
+                    return Ok(Box::new(TermQuery::text(
+                        field_id,
+                        &tokens[0].text.to_lowercase(),
+                    )));
                 }
+
+                for token in tokens {
+                    bool_query =
+                        bool_query.should(TermQuery::text(field_id, &token.text.to_lowercase()));
+                }
+            }
+            // An empty token stream in one field must not discard other fields.
+            if bool_query.should.is_empty() {
+                return Err("No tokens in term".to_string());
             }
             Ok(Box::new(bool_query))
         } else {
@@ -726,6 +715,128 @@ mod tests {
         let schema = Arc::new(builder.build());
         let tokenizers = Arc::new(TokenizerRegistry::default());
         (schema, vec![title, body], tokenizers)
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn unqualified_search_uses_each_fields_tokenizer_in_either_order() {
+        use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory};
+
+        let cases = [
+            (
+                ["en: text<en_stem>", "zh: text<lex(segmenter: unicode)>"],
+                vec![
+                    [
+                        "The quick brown fox jumps over the lazy dog",
+                        "那只敏捷的棕毛狐狸跃过了那只懒狗",
+                    ],
+                    ["unrelated", "无关"],
+                ],
+                "棕毛狐狸",
+                "zh:棕毛狐狸",
+                vec![0],
+            ),
+            (
+                ["raw: text<simple>", "stemmed: text<en_stem>"],
+                vec![["running", ""], ["", "running"], ["unrelated", "unrelated"]],
+                "running",
+                "raw:running OR stemmed:running",
+                vec![0, 1],
+            ),
+            (
+                [
+                    "filtered: text<lex(default: en, stop_words: true)>",
+                    "raw: text<simple>",
+                ],
+                vec![["", "the"], ["unrelated", "unrelated"]],
+                "the",
+                "raw:the",
+                vec![0],
+            ),
+        ];
+        for (fields, documents, term, qualified, expected) in cases {
+            for reverse in [false, true] {
+                let order = if reverse { [1, 0] } else { [0, 1] };
+                let schema = crate::parse_schema(&format!(
+                    "index test {{ field {} [indexed, stored] field {} [indexed, stored] }}",
+                    fields[order[0]], fields[order[1]],
+                ))
+                .unwrap();
+                let field_ids =
+                    fields.map(|field| schema.get_field(field.split(':').next().unwrap()).unwrap());
+                let directory = RamDirectory::new();
+                let config = IndexConfig::default();
+                let mut writer = IndexWriter::create(directory.clone(), schema, config.clone())
+                    .await
+                    .unwrap();
+                for values in &documents {
+                    let mut document = Document::new();
+                    for (field, value) in field_ids.iter().zip(values) {
+                        if !value.is_empty() {
+                            document.add_text(*field, *value);
+                        }
+                    }
+                    writer.add_document(document).unwrap();
+                }
+                writer.commit().await.unwrap();
+                let index = Index::open(directory, config).await.unwrap();
+                let parser = index.query_parser();
+                // A comma forces the permissive parser's plain-text fallback.
+                let fallback = format!("{term},");
+                assert!(parser.parse_query_string(&fallback).is_err());
+                for text in [qualified, term, fallback.as_str()] {
+                    let result = index.query(text, 10).await.unwrap();
+                    let mut actual: Vec<_> =
+                        result.hits.iter().map(|hit| hit.address.doc_id).collect();
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "query={text}, reverse={reverse}");
+                }
+                let strict = parser.parse_strict(term).unwrap();
+                let mut actual: Vec<_> = index
+                    .search(strict.as_ref(), 10)
+                    .await
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .map(|hit| hit.address.doc_id)
+                    .collect();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "strict query={term}, reverse={reverse}");
+            }
+        }
+    }
+
+    #[test]
+    fn unqualified_search_rejects_queries_with_no_tokens_in_any_default_field() {
+        let schema = Arc::new(
+            crate::parse_schema(
+                "index test {
+                field first: text<en_stem_stop>
+                field second: text<lex(default: en, stop_words: true)>
+            }",
+            )
+            .unwrap(),
+        );
+        let fields = vec![
+            schema.get_field("first").unwrap(),
+            schema.get_field("second").unwrap(),
+        ];
+        let parser =
+            QueryLanguageParser::new(schema, fields, Arc::new(TokenizerRegistry::default()));
+        assert_eq!(parser.parse("the").err().unwrap(), "No tokens in term");
+        assert_eq!(parser.parse("the,").err().unwrap(), "No tokens in query");
+    }
+
+    #[test]
+    fn unqualified_single_field_term_preserves_planner_decomposition() {
+        let (schema, fields, tokenizers) = setup();
+        let parser = QueryLanguageParser::new(schema, vec![fields[0]], tokenizers);
+        let query = parser.parse("RUNNING").unwrap();
+        let crate::query::QueryDecomposition::TextTerm(info) = query.decompose() else {
+            panic!("single-field term must remain decomposable");
+        };
+        assert_eq!(info.field, fields[0]);
+        assert_eq!(info.term, b"running");
     }
 
     #[test]
