@@ -110,12 +110,9 @@ impl PostingListReader {
 
     fn decode_positions(&self, range: Range<u64>, bytes: OwnedBytes) -> io::Result<TermPositions> {
         Self::check_length(&range, &bytes)?;
-        if !PositionStream::is_stream(bytes.as_slice()) {
-            return TermPositions::open(bytes);
-        }
         let stream = PositionStream::open_for_query(bytes)?;
         crate::observe::search_work!(positions_opened += 1);
-        Ok(TermPositions::Stream(stream))
+        Ok(TermPositions(stream))
     }
 }
 
@@ -238,11 +235,7 @@ mod tests {
             Some(FileHandle::from_bytes(OwnedBytes::new(bytes.clone()))),
         );
         assert_eq!(
-            reader
-                .read_positions(0..len)
-                .await
-                .unwrap()
-                .positions(0, 0, 3),
+            reader.read_positions(0..len).await.unwrap().positions(0, 3),
             Some(vec![1, 5, 9])
         );
         bytes[2] = 7;

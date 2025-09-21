@@ -653,7 +653,28 @@ impl<D: Directory + 'static> Searcher<D> {
     /// Run a bounded piece of CPU work inside this index's shared search pool.
     #[cfg(feature = "sync")]
     pub(crate) fn install_search_cpu<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
-        self.search_pool.install(operation)
+        #[cfg(not(feature = "query-diagnostics"))]
+        {
+            self.search_pool.install(operation)
+        }
+        #[cfg(feature = "query-diagnostics")]
+        {
+            let submitted = std::time::Instant::now();
+            let (result, queued, finished) = self.search_pool.install(|| {
+                let queued = submitted.elapsed();
+                let result = operation();
+                (result, queued, std::time::Instant::now())
+            });
+            let returned = finished.elapsed();
+            crate::observe::search_work!(search_pool_installs += 1);
+            crate::observe::search_work!(
+                search_pool_queue_ns += queued.as_nanos().min(u128::from(u64::MAX)) as u64
+            );
+            crate::observe::search_work!(
+                search_pool_return_ns += returned.as_nanos().min(u128::from(u64::MAX)) as u64
+            );
+            result
+        }
     }
 
     /// Async-only/WASM builds execute inline because Rayon is not available.
@@ -1337,7 +1358,7 @@ impl<D: Directory + 'static> Searcher<D> {
         };
 
         if !lsp_plans.iter().any(Option::is_some) {
-            let (merged, seen) = self.search_pool.install(|| {
+            let (merged, seen) = self.install_search_cpu(|| {
                 (0..self.segments.len())
                     .into_par_iter()
                     .map(|segment| run_segment(&segment))

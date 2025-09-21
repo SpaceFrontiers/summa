@@ -23,6 +23,10 @@ path = "src/bin/serve_index.rs"
 name = "test-doc-retrieval"
 path = "src/bin/test_doc_retrieval.rs"
 
+[features]
+# Opt-in core work counters for benchmark diagnosis; never enabled by default.
+query-diagnostics = ["hermes-core/query-diagnostics"]
+
 [dependencies]
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
@@ -46,7 +50,9 @@ tonic-build = { workspace = true }
 tonic-prost-build = "0.14"
 
 [dev-dependencies]
+serde = { workspace = true }
 tempfile = { workspace = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 
 [package.metadata.cargo-machete]
 # prost/tonic-prost are used by tonic::include_proto! generated code

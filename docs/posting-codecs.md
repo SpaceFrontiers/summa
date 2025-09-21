@@ -22,7 +22,7 @@ Implemented and retained:
   ordinary sparse seeks retain their existing policy. Fully overwriting decoders
   reuse initialized buffers. See [posting block execution](search-block-execution.md).
 - Opt-in `IndexConfig::compact_text`: separate fixed-width posting descriptors,
-  four-byte cursors where possible, and POS4 position directories. Opt-in
+  four-byte cursors where possible, and POS6 position directories. Opt-in
   `quantized_norms` applies byte4 norms to new ordinary text columns. These
   formats require metadata version 9; previous encodings remain readable.
   See [compact text storage](compact-text-format.md) for the experiment and limits.
@@ -282,3 +282,32 @@ opt-in experiment, not a default.
   `tests/simd_posting_format.rs`, `tests/impact_ranked_collection.rs`,
   `tests/ratio_chunked_collection.rs`.
   sequential decode and skip-seek on the production container.
+
+### Unique-position certificate for exact phrase bounds
+
+A term stream whose positions are strictly increasing within every document
+allows exact phrase frequency to be bounded by any phrase term's frequency,
+provided the **original first term** has this property. Distinct first starts
+map injectively to the required position in every other term. Sloppy phrases
+and streams containing duplicate first positions retain the original-first TF
+bound. This changes pruning only, never occurrence counting or BM25 scores.
+
+Current position streams use footer magic `POS5` (interleaved blocks) or `POS6`
+(compact directory). The high bit of the footer's block count is the unique
+positions certificate; the remaining 31 bits are the block count. Both layouts
+support duplicate positions with the bit clear. There are no extra bytes.
+Earlier position formats are rejected; existing indexes must be rebuilt. There
+is no legacy decoder or migration path in query, merge, compaction, or reorder.
+
+The canonical writer observes equality while sorting/delta-encoding each
+document. Raw delta appends cannot certify document boundaries and clear the
+property. Encoded concatenation combines certificates with logical AND;
+doc-aligned compaction/reordering preserves the source certificate while copying
+payloads. No query-time scan or schema/tokenizer inference establishes it.
+
+For certified exact phrases the scorer chooses the rarest term for score
+admission, uses that term's existing block metadata and TF/length bounds, and
+only aligns other terms for competitive candidates. Scratch stays bounded as in
+first-term admission. Writer, copied merge, deletion compaction, reorder,
+duplicate-position, and sloppy-phrase cases are covered by regression tests.
+measures the retained optimization; impact metadata remains opt-in.

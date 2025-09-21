@@ -59,8 +59,6 @@ pub use postings::{
     PartitionedEFPostingIterator,
     PartitionedEFPostingList,
     PartitionedEliasFano,
-    PositionPostingIterator,
-    PositionPostingList,
     PositionStream,
     PositionStreamEncoder,
     Posting,
@@ -68,7 +66,6 @@ pub use postings::{
     PostingFormat,
     PostingList,
     PostingListIterator,
-    PostingWithPositions,
     QueryWeighting,
     // Roaring
     ROARING_BLOCK_SIZE,

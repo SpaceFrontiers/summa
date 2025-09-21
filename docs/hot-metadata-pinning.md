@@ -55,6 +55,22 @@ addressable E groups; block traversal does the same for D. Both mappings use
 amplification. The sizes above are dense four-bit upper bounds; the
 row-local variable-width codec is smaller whenever groups need fewer bits.
 
+### Fast-field header checkpoints
+
+Single-value blockwise-linear fast fields retain at most 256 sparse header
+checkpoints per reader, across all merged source blocks: at most 3 KiB of heap
+payload. The directory is constructed after encoded-envelope validation and does
+not grow during queries. Other codecs and multivalue columns allocate no such
+directory. Values and text dictionary bytes retain their original byte owner
+(file-backed with `MmapDirectory`); the checkpoint heap is not `mlock` residency or a pinned payload.
+
+`SegmentMemoryStats.fast_field_metadata_heap_bytes` includes fast-field block
+metadata plus checkpoints, and contributes to `estimated_heap_bytes()`. Row-stat
+columns include their checkpoints in the existing row-stat heap counter. These
+estimates still exclude existing lazy text dictionary tables and ordinal maps;
+they are not a complete process heap measurement. See the
+for the cost model and measured evidence.
+
 ### Seismic compact-directory residency
 
 Seismic keeps its compact run directory on the heap. Each run also retains

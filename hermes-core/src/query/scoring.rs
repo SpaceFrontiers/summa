@@ -144,6 +144,7 @@ impl ScoreCollector {
             }
 
             self.heap.push(entry);
+            crate::observe::search_work!(maxscore_heap_updates += 1);
             // The final real entry displaces the last virtual sentinel.
             if self.heap.len() == self.k {
                 self.virtual_threshold = None;
@@ -158,6 +159,7 @@ impl ScoreCollector {
                 *worst = entry;
             }
             self.update_threshold();
+            crate::observe::search_work!(maxscore_heap_updates += 1);
             true
         } else {
             false

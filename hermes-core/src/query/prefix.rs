@@ -3,14 +3,10 @@
 //! doc ID set bounded by the segment's document count. Score is always 1.0
 //! (filter-style, like `RangeQuery`).
 
-use std::sync::Arc;
-
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
-use crate::structures::{BlockPostingList, TERMINATED};
-use crate::{DocId, Score};
 
-use super::docset::{DocSet, SortedVecDocSet};
+use super::term_union::{TermUnionScorer, materialize_union, reject_chunked};
 use super::traits::{CountFuture, EmptyScorer, Query, Scorer, ScorerFuture};
 
 /// Prefix query — matches documents containing any term starting with `prefix`.
@@ -49,34 +45,21 @@ impl PrefixQuery {
     }
 }
 
-/// Prefix unions materialise document-id sets; postings of a chunked field
-/// are keyed by virtual chunk ids, so the union would filter the wrong
-/// documents. Fail loudly instead of silently mis-matching.
-fn reject_chunked(reader: &SegmentReader, field: Field) -> crate::Result<()> {
-    if reader.is_chunked_field(field) {
-        return Err(crate::Error::Query(format!(
-            "PrefixQuery is not supported on chunked text field '{}'; use a MatchQuery or PhraseQuery",
-            reader.schema().get_field_name(field).unwrap_or("?")
-        )));
-    }
-    Ok(())
-}
-
 impl Query for PrefixQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let prefix = self.prefix.clone();
         Box::pin(async move {
-            reject_chunked(reader, field)?;
+            reject_chunked(reader, field, "PrefixQuery")?;
             let postings = reader.get_prefix_postings(field, &prefix).await?;
             if postings.is_empty() {
                 return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
             }
-            let docs = materialize_union(&postings, reader.num_docs());
+            let docs = materialize_union(&postings, reader.num_docs(), reader.chunk_map(field));
             if docs.is_empty() {
                 return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
             }
-            Ok(Box::new(PrefixScorer::new(docs)) as Box<dyn Scorer>)
+            Ok(Box::new(TermUnionScorer::new(docs)) as Box<dyn Scorer>)
         })
     }
 
@@ -86,16 +69,16 @@ impl Query for PrefixQuery {
         reader: &'a SegmentReader,
         _limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        reject_chunked(reader, self.field)?;
+        reject_chunked(reader, self.field, "PrefixQuery")?;
         let postings = reader.get_prefix_postings_sync(self.field, &self.prefix)?;
         if postings.is_empty() {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
         }
-        let docs = materialize_union(&postings, reader.num_docs());
+        let docs = materialize_union(&postings, reader.num_docs(), reader.chunk_map(self.field));
         if docs.is_empty() {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
         }
-        Ok(Box::new(PrefixScorer::new(docs)) as Box<dyn Scorer>)
+        Ok(Box::new(TermUnionScorer::new(docs)) as Box<dyn Scorer>)
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
@@ -117,7 +100,9 @@ impl Query for PrefixQuery {
     #[cfg(feature = "sync")]
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
         let bitset = self.as_doc_bitset(reader)?;
-        Some(Box::new(move |doc_id: DocId| bitset.contains(doc_id)))
+        Some(Box::new(move |doc_id: crate::DocId| {
+            bitset.contains(doc_id)
+        }))
     }
 
     #[cfg(feature = "sync")]
@@ -133,10 +118,10 @@ impl Query for PrefixQuery {
             let mut iter = posting.iterator();
             loop {
                 let d = iter.doc();
-                if d == TERMINATED {
+                if d == crate::structures::TERMINATED {
                     break;
                 }
-                bitset.set(d);
+                bitset.set(reader.chunk_map(self.field).map_or(d, |map| map.doc_id(d)));
                 iter.advance();
             }
         }
@@ -144,111 +129,15 @@ impl Query for PrefixQuery {
     }
 }
 
-// ── PrefixScorer ────────────────────────────────────────────────────────
-
-/// Scorer backed by a pre-materialized sorted doc ID set.
-struct PrefixScorer {
-    inner: SortedVecDocSet,
-}
-
-impl PrefixScorer {
-    fn new(docs: Vec<u32>) -> Self {
-        Self {
-            inner: SortedVecDocSet::new(Arc::new(docs)),
-        }
-    }
-}
-
-impl DocSet for PrefixScorer {
-    #[inline]
-    fn doc(&self) -> DocId {
-        self.inner.doc()
-    }
-
-    #[inline]
-    fn advance(&mut self) -> DocId {
-        self.inner.advance()
-    }
-
-    fn seek(&mut self, target: DocId) -> DocId {
-        self.inner.seek(target)
-    }
-
-    fn size_hint(&self) -> u32 {
-        self.inner.size_hint()
-    }
-}
-
-impl Scorer for PrefixScorer {
-    fn score(&self) -> Score {
-        1.0
-    }
-}
-
-// ── Helpers ─────────────────────────────────────────────────────────────
-
-/// Materialize a posting union using the smaller of two bounded scratch forms.
-/// Narrow prefixes append/sort doc IDs; broad, overlapping prefixes use a
-/// segment-sized bitset so duplicate postings cannot multiply memory.
-fn materialize_union(postings: &[BlockPostingList], num_docs: u32) -> Vec<u32> {
-    let posting_count = postings.iter().fold(0usize, |sum, posting| {
-        sum.saturating_add(posting.doc_count() as usize)
-    });
-    let posting_bytes = posting_count.saturating_mul(std::mem::size_of::<u32>());
-    let bitset_bytes = (num_docs as usize)
-        .div_ceil(64)
-        .saturating_mul(std::mem::size_of::<u64>());
-
-    if posting_bytes <= bitset_bytes {
-        let mut docs = Vec::with_capacity(posting_count);
-        for posting in postings {
-            let mut iter = posting.iterator();
-            loop {
-                let d = iter.doc();
-                if d == TERMINATED {
-                    break;
-                }
-                docs.push(d);
-                iter.advance();
-            }
-        }
-        docs.sort_unstable();
-        docs.dedup();
-        return docs;
-    }
-
-    let mut bitset = super::DocBitset::new(num_docs);
-    for posting in postings {
-        let mut iter = posting.iterator();
-        loop {
-            let d = iter.doc();
-            if d == TERMINATED {
-                break;
-            }
-            bitset.set(d);
-            iter.advance();
-        }
-    }
-
-    let mut docs = Vec::with_capacity(bitset.count() as usize);
-    for (word_idx, &word) in bitset.bits.iter().enumerate() {
-        let mut remaining = word;
-        while remaining != 0 {
-            let bit = remaining.trailing_zeros() as usize;
-            docs.push((word_idx * 64 + bit) as u32);
-            remaining &= remaining - 1;
-        }
-    }
-    docs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query::DocSet;
+    use crate::structures::{BlockPostingList, TERMINATED};
 
     #[test]
     fn test_materialize_union_empty() {
-        let docs = materialize_union(&[], 0);
+        let docs = materialize_union(&[], 0, None);
         assert!(docs.is_empty());
     }
 
@@ -267,18 +156,18 @@ mod tests {
             BlockPostingList::from_posting_list(&right).unwrap(),
         ];
 
-        assert_eq!(materialize_union(&postings, 11), vec![1, 2, 5, 9, 10]);
+        assert_eq!(materialize_union(&postings, 11, None), vec![1, 2, 5, 9, 10]);
         // A huge segment with a narrow prefix takes the posting-vector path;
         // it must not allocate a num_docs-sized bitset.
         assert_eq!(
-            materialize_union(&postings[..1], 1_000_000_000),
+            materialize_union(&postings[..1], 1_000_000_000, None),
             vec![1, 5, 9]
         );
     }
 
     #[test]
     fn test_prefix_scorer_basic() {
-        let mut scorer = PrefixScorer::new(vec![1, 5, 10, 20]);
+        let mut scorer = TermUnionScorer::new(vec![1, 5, 10, 20]);
         assert_eq!(scorer.doc(), 1);
         assert_eq!(scorer.score(), 1.0);
         assert_eq!(scorer.advance(), 5);
@@ -289,7 +178,7 @@ mod tests {
 
     #[test]
     fn test_prefix_scorer_seek_past() {
-        let mut scorer = PrefixScorer::new(vec![1, 5, 10, 20]);
+        let mut scorer = TermUnionScorer::new(vec![1, 5, 10, 20]);
         assert_eq!(scorer.seek(7), 10);
         assert_eq!(scorer.seek(100), TERMINATED);
     }

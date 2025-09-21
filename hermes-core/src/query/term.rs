@@ -943,12 +943,8 @@ impl Scorer for TermScorer {
 
     fn matched_positions(&self) -> Option<super::MatchedPositions> {
         let positions = self.positions.as_ref()?;
-        let doc_id = self.iterator.doc();
-        let pos = positions.positions(
-            doc_id,
-            self.iterator.position_cursor(),
-            self.iterator.term_freq(),
-        )?;
+        let pos =
+            positions.positions(self.iterator.position_cursor(), self.iterator.term_freq())?;
         let score = self.score();
         // Each position contributes equally to the term score
         let per_position_score = if pos.is_empty() {

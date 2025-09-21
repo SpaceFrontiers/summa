@@ -16,6 +16,7 @@ use super::query_field_router::{QueryFieldRouter, RoutingMode};
 use super::schema::{Field, Schema};
 use crate::query::{
     BooleanQuery, DEFAULT_DENSE_RERANK_FACTOR, PhraseQuery, PrefixQuery, Query, TermQuery,
+    WildcardQuery,
 };
 use crate::tokenizer::{BoxedTokenizer, TokenizerRegistry};
 
@@ -38,6 +39,11 @@ pub enum ParsedQuery {
     Prefix {
         field: Option<String>,
         prefix: String,
+    },
+    /// Whole-term wildcard filter with explicit pattern syntax.
+    Wildcard {
+        field: Option<String>,
+        pattern: String,
     },
     /// Dense vector ANN query
     Ann {
@@ -296,8 +302,25 @@ impl QueryLanguageParser {
                 Rule::phrase_query => {
                     inner_query = Some(self.parse_phrase_query(inner)?);
                 }
-                Rule::prefix_query => {
-                    inner_query = Some(self.parse_prefix_query(inner)?);
+                Rule::wildcard_query => {
+                    let mut field = None;
+                    let mut pattern = String::new();
+                    for part in inner.into_inner() {
+                        match part.as_rule() {
+                            Rule::field_spec => {
+                                field = Some(part.into_inner().next().unwrap().as_str().to_owned())
+                            }
+                            Rule::quoted_string => {
+                                pattern = serde_json::from_str(part.as_str())
+                                    .map_err(|error| format!("Invalid wildcard string: {error}"))?
+                            }
+                            _ => {}
+                        }
+                    }
+                    inner_query = Some(ParsedQuery::Wildcard { field, pattern });
+                }
+                Rule::term_pattern_query => {
+                    inner_query = Some(self.parse_term_pattern(inner)?);
                 }
                 Rule::term_query => {
                     inner_query = Some(self.parse_term_query(inner)?);
@@ -335,7 +358,7 @@ impl QueryLanguageParser {
         Ok(ParsedQuery::Term { field, term })
     }
 
-    fn parse_prefix_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
+    fn parse_term_pattern(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
         let mut field = None;
         let mut prefix = String::new();
 
@@ -344,14 +367,27 @@ impl QueryLanguageParser {
                 Rule::field_spec => {
                     field = Some(inner.into_inner().next().unwrap().as_str().to_string());
                 }
-                Rule::prefix_value => {
+                Rule::term_pattern => {
                     prefix = inner.as_str().to_string();
                 }
                 _ => {}
             }
         }
 
-        Ok(ParsedQuery::Prefix { field, prefix })
+        if let Some(literal) = prefix.strip_suffix('*')
+            && !literal.is_empty()
+            && !literal.contains(['*', '?', '\\'])
+        {
+            Ok(ParsedQuery::Prefix {
+                field,
+                prefix: literal.to_owned(),
+            })
+        } else {
+            Ok(ParsedQuery::Wildcard {
+                field,
+                pattern: prefix,
+            })
+        }
     }
 
     fn parse_phrase_query(&self, pair: pest::iterators::Pair<Rule>) -> Result<ParsedQuery, String> {
@@ -465,6 +501,28 @@ impl QueryLanguageParser {
             }
             ParsedQuery::Prefix { field, prefix } => {
                 self.build_prefix_query(field.as_deref(), prefix)
+            }
+            ParsedQuery::Wildcard { field, pattern } => {
+                if let Some(name) = field {
+                    let field = self
+                        .schema
+                        .get_field(name)
+                        .ok_or_else(|| format!("Unknown field: {name}"))?;
+                    Ok(Box::new(
+                        WildcardQuery::text(field, pattern).map_err(|error| error.to_string())?,
+                    ))
+                } else if !self.default_fields.is_empty() {
+                    let mut query = BooleanQuery::new();
+                    for &field in &self.default_fields {
+                        query = query.should(
+                            WildcardQuery::text(field, pattern)
+                                .map_err(|error| error.to_string())?,
+                        );
+                    }
+                    Ok(Box::new(query))
+                } else {
+                    Err("No field specified and no default fields configured".into())
+                }
             }
             ParsedQuery::Ann {
                 field,

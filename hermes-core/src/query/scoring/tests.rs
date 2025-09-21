@@ -2815,3 +2815,22 @@ fn batched_text_admission_preserves_total_order_and_seeded_heaps() {
         }
     }
 }
+
+#[cfg(feature = "query-diagnostics")]
+#[test]
+fn diagnostic_heap_updates_count_admissions_and_exclude_rejections() {
+    let ((hits, empty), work) = crate::search_diagnostics::capture_sync(|| {
+        let mut heap = super::ScoreCollector::new(2);
+        assert!(heap.insert(7, 1.0));
+        assert!(heap.insert(8, 2.0));
+        assert!(!heap.insert(9, 0.5));
+        assert!(heap.insert(6, 1.0)); // Equal-score stable-ID replacement.
+        assert!(!heap.insert(10, 1.0));
+        assert!(heap.insert(5, 3.0));
+        let mut empty = super::ScoreCollector::new(0);
+        assert!(!empty.insert(0, 100.0));
+        (heap.len(), empty.len())
+    });
+    assert_eq!((hits, empty), (2, 0));
+    assert_eq!(work.maxscore_heap_updates, 4);
+}

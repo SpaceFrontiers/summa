@@ -2,6 +2,11 @@
 
 Status: design (2026-07-09), implemented.
 
+These writers use buffered filesystem I/O and cache advice, not io_uring. The
+[September 20 I/O audit](iresearch-optimization-audit.md#io_uring-source-and-running-host-findings)
+traces the active server path and separates proposed async payload reads/writes
+from the existing mmap reader.
+
 ## Problem
 
 Phase 1 (`docs/hot-metadata-pinning.md`) pins per-query metadata so the

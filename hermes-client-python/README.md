@@ -121,10 +121,12 @@ See [query types](src/hermes_client_python/types.py) and the
 ```python
 results = await client.search(
     "articles",
-    query={"boolean": {
-        "must": [{"match": {"field": "title", "text": "search"}}],
-        "must_not": [{"term": {"field": "title", "term": "draft"}}],
-    }},
+    query={
+        "boolean": {
+            "must": [{"match": {"field": "title", "text": "search"}}],
+            "must_not": [{"term": {"field": "title", "term": "draft"}}],
+        }
+    },
     fields_to_load=["title"],
 )
 ```

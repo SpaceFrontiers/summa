@@ -279,8 +279,8 @@ encoded directories. Current position
 streams copy complete selected blocks and decode at most one partial block at a
 time. Output cursors, directories and conservative score bounds are rebuilt.
 Decoded survivors/positions are never retained for an entire current-format term.
-Encoded directories remain budgeted; legacy position lists use an explicitly
-admitted whole-list fallback with additional room for decoding.
+Encoded directories remain budgeted. Unsupported position formats are rejected;
+old indexes must be rebuilt.
 
 Flat-vector payloads use bounded batches (at most 4 MiB), skip all-dead batches
 before I/O, and copy contiguous surviving slices within mixed batches. ANN

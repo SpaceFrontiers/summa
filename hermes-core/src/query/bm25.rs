@@ -265,6 +265,22 @@ impl PreparedBounds {
         Self::inflate(self.numerator * (tf / (tf + norm)))
     }
 
+    /// Approximate inverse used only to seed an integer cutoff search. Callers
+    /// must verify its neighboring lengths with the authoritative score predicate.
+    pub(super) fn length_cutoff_hint(&self, tf: u32, score: f32) -> Option<u32> {
+        if self.k == 0.0 || self.length_ratio == 0.0 || score <= 0.0 {
+            return None;
+        }
+        let inflation = 1.0 + 16.0 * f64::from(f32::EPSILON);
+        let length = (f64::from(tf) * (self.numerator * inflation / f64::from(score) - 1.0)
+            / self.k
+            - self.reciprocal)
+            / self.length_ratio;
+        length
+            .is_finite()
+            .then(|| (length.floor() + 1.0).clamp(1.0, 65536.0) as u32)
+    }
+
     pub(super) fn ratio(&self, max_tf: u32, ratio: f32) -> f32 {
         if max_tf == 0 || ratio <= 0.0 || !ratio.is_finite() {
             return f32::INFINITY;

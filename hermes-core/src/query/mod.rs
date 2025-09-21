@@ -42,9 +42,11 @@ mod scoring;
 mod scoring_tests;
 pub(crate) mod seismic;
 mod term;
+mod term_union;
 mod text_mapping;
 mod traits;
 mod vector;
+mod wildcard;
 
 pub use all::AllQuery;
 pub use bm25::*;
@@ -63,6 +65,7 @@ pub use scoring::*;
 pub use term::*;
 pub use traits::*;
 pub use vector::*;
+pub use wildcard::WildcardQuery;
 
 pub use candidate_scoring::{
     CandidateFeature, CandidateQuery, CandidateScores, CandidateScoringPlan, PassageFeatures,

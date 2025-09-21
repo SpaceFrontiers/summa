@@ -28,6 +28,12 @@ pub struct QueryWork {
     /// Instrumented elapsed nanoseconds inside segment workers (summed across workers).
     /// This is diagnostic wall time, not production latency or CPU time.
     pub segment_elapsed_ns: u64,
+    /// Completed shared search-pool installs observed on the capturing caller.
+    pub search_pool_installs: u64,
+    /// Wall time from submitting an install to entering its closure.
+    pub search_pool_queue_ns: u64,
+    /// Wall time from its closure finishing until the caller resumes.
+    pub search_pool_return_ns: u64,
     /// Document-ID blocks decoded, including repeat decodes.
     pub doc_blocks: u64,
     /// Document IDs decoded, including repeat decodes.
@@ -83,6 +89,9 @@ pub struct QueryWork {
     pub executor_candidates: u64,
     /// Window documents reported as entering the heap.
     pub executor_heap_admissions: u64,
+    /// Successful MaxScore heap pushes/replacements, including conjunctions.
+    /// Excludes the outer segment/result collectors.
+    pub maxscore_heap_updates: u64,
     /// Single-term MaxScore blocks scored.
     pub single_blocks_scored: u64,
     /// Single-term MaxScore blocks skipped by score bounds.
@@ -95,6 +104,18 @@ pub struct QueryWork {
 
 impl QueryWork {
     fn merge(&mut self, other: Self) {
+        self.search_pool_installs = self
+            .search_pool_installs
+            .saturating_add(other.search_pool_installs);
+        self.search_pool_queue_ns = self
+            .search_pool_queue_ns
+            .saturating_add(other.search_pool_queue_ns);
+        self.search_pool_return_ns = self
+            .search_pool_return_ns
+            .saturating_add(other.search_pool_return_ns);
+        self.maxscore_heap_updates = self
+            .maxscore_heap_updates
+            .saturating_add(other.maxscore_heap_updates);
         self.seismic_filter_scans = self
             .seismic_filter_scans
             .saturating_add(other.seismic_filter_scans);

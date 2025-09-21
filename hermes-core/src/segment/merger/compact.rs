@@ -436,19 +436,12 @@ impl SegmentMerger {
                     None => None,
                 };
                 let has_positions = source_positions.is_some();
-                if input.has_positions() && !has_positions
-                    || source_positions
-                        .as_ref()
-                        .is_some_and(|positions| positions.is_stream() && !input.has_positions())
-                {
+                if input.has_positions() != has_positions {
                     return Err(crate::Error::Corruption(
                         "posting and position formats disagree".into(),
                     ));
                 }
-                if let Some(positions) = source_positions
-                    .as_ref()
-                    .filter(|positions| positions.is_stream())
-                {
+                if let Some(positions) = source_positions.as_ref() {
                     let total = if input.len() == 0 {
                         0
                     } else {
@@ -505,12 +498,7 @@ impl SegmentMerger {
                     }
                     let block = input.read_block(i).await?;
                     let span = input.position_span(i)?;
-                    if live == last - first + 1
-                        && (!has_positions
-                            || source_positions
-                                .as_ref()
-                                .is_some_and(|positions| positions.is_stream()))
-                    {
+                    if live == last - first + 1 {
                         output.append(&block, map.get(first).expect("live interval"))?;
                         if let Some(positions) = &mut source_positions {
                             positions
@@ -541,7 +529,7 @@ impl SegmentMerger {
                             output.push(new, tf, length)?;
                             if let Some(positions) = &mut source_positions {
                                 positions
-                                    .append_doc(&mut position_output, old, cursor, tf, cancellation)
+                                    .append_doc(&mut position_output, cursor, tf, cancellation)
                                     .await?;
                             }
                         }
@@ -787,7 +775,7 @@ mod tests {
                 .await
                 .unwrap();
             if compact {
-                assert_eq!(&position_bytes[position_bytes.len() - 4..], b"POS4");
+                assert_eq!(&position_bytes[position_bytes.len() - 4..], b"POS6");
             }
             let positions = TermPositions::open(position_bytes).unwrap();
             let mut cursor = postings.iterator();
@@ -797,7 +785,6 @@ mod tests {
                 assert_eq!(cursor.doc(), doc);
                 assert_eq!(cursor.term_freq(), 4);
                 assert!(positions.positions_into(
-                    doc,
                     cursor.position_cursor(),
                     4,
                     &mut scratch,

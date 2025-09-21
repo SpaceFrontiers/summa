@@ -3,6 +3,7 @@
 pub(crate) mod bmp;
 pub(crate) mod candidate_lookup;
 pub(crate) mod loader;
+mod term_expansion;
 mod types;
 
 pub use bmp::{BmpDimStats, BmpIndex};
@@ -44,6 +45,8 @@ pub struct SegmentMemoryStats {
     /// Numeric row-statistic block directories; values remain evictable.
     pub row_stats_heap_bytes: usize,
     pub row_stats_file_backed_bytes: u64,
+    /// Fast-field block directories and bounded codec checkpoints (excludes lazy dictionaries).
+    pub fast_field_metadata_heap_bytes: usize,
     /// Document store block cache bytes
     pub store_cache_bytes: usize,
     /// Sparse-vector lookup structures retained on the heap.
@@ -76,6 +79,7 @@ impl SegmentMemoryStats {
     pub fn estimated_heap_bytes(&self) -> usize {
         self.deletion_bytes
             + self.row_stats_heap_bytes
+            + self.fast_field_metadata_heap_bytes
             + self.term_dict_cache_bytes
             + self.posting_integrity_heap_bytes
             + self.store_cache_bytes
@@ -2635,6 +2639,11 @@ impl SegmentReader {
         let pin_intended_bytes = sparse_pin_intended_bytes.saturating_add(dense_pin_intended_bytes);
 
         SegmentMemoryStats {
+            fast_field_metadata_heap_bytes: self
+                .fast_fields
+                .values()
+                .map(|column| column.block_metadata_bytes())
+                .sum(),
             row_stats_heap_bytes: self
                 .row_stats
                 .values()
@@ -2738,61 +2747,6 @@ impl SegmentReader {
         let block_list = self.postings.read(range).await?;
 
         Ok(Some(block_list))
-    }
-
-    /// Get all posting lists for terms that start with `prefix` in the given field.
-    pub async fn get_prefix_postings(
-        &self,
-        field: Field,
-        prefix: &[u8],
-    ) -> Result<Vec<BlockPostingList>> {
-        if prefix.is_empty() {
-            return Err(Error::Query("prefix must not be empty".into()));
-        }
-        // Build composite key prefix: field_id ++ prefix
-        let mut key_prefix = Vec::with_capacity(4 + prefix.len());
-        key_prefix.extend_from_slice(&field.0.to_le_bytes());
-        key_prefix.extend_from_slice(prefix);
-
-        let (entries, truncated) = self
-            .term_dict
-            .prefix_scan_limited(&key_prefix, MAX_PREFIX_TERMS)
-            .await?;
-        if truncated {
-            return Err(Error::Query(format!(
-                "prefix expands to more than {MAX_PREFIX_TERMS} terms"
-            )));
-        }
-        let posting_count: u64 = entries
-            .iter()
-            .map(|(_, term_info)| term_info.doc_freq() as u64)
-            .sum();
-        if posting_count > MAX_PREFIX_POSTINGS {
-            return Err(Error::Query(format!(
-                "prefix expands to {posting_count} postings (maximum {MAX_PREFIX_POSTINGS})"
-            )));
-        }
-        let mut results = Vec::with_capacity(entries.len());
-
-        for (_key, term_info) in entries {
-            if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
-                let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
-                    posting_list.push(doc_id, tf);
-                }
-                results.push(BlockPostingList::from_posting_list(&posting_list)?);
-            } else if let Some((posting_offset, posting_len)) = term_info.external_info() {
-                let range = checked_file_range(
-                    posting_offset,
-                    posting_len,
-                    self.postings.file().len(),
-                    "prefix posting",
-                )?;
-                results.push(self.postings.read(range).await?);
-            }
-        }
-
-        Ok(results)
     }
 
     /// Get document by local doc_id (async - loads on demand).
@@ -3933,59 +3887,6 @@ impl SegmentReader {
         let block_list = self.postings.read_sync(range)?;
 
         Ok(Some(block_list))
-    }
-
-    /// Synchronous prefix posting list lookup — requires Inline (mmap/RAM) file handles.
-    pub fn get_prefix_postings_sync(
-        &self,
-        field: Field,
-        prefix: &[u8],
-    ) -> Result<Vec<BlockPostingList>> {
-        if prefix.is_empty() {
-            return Err(Error::Query("prefix must not be empty".into()));
-        }
-        let mut key_prefix = Vec::with_capacity(4 + prefix.len());
-        key_prefix.extend_from_slice(&field.0.to_le_bytes());
-        key_prefix.extend_from_slice(prefix);
-
-        let (entries, truncated) = self
-            .term_dict
-            .prefix_scan_limited_sync(&key_prefix, MAX_PREFIX_TERMS)?;
-        if truncated {
-            return Err(Error::Query(format!(
-                "prefix expands to more than {MAX_PREFIX_TERMS} terms"
-            )));
-        }
-        let posting_count: u64 = entries
-            .iter()
-            .map(|(_, term_info)| term_info.doc_freq() as u64)
-            .sum();
-        if posting_count > MAX_PREFIX_POSTINGS {
-            return Err(Error::Query(format!(
-                "prefix expands to {posting_count} postings (maximum {MAX_PREFIX_POSTINGS})"
-            )));
-        }
-        let mut results = Vec::with_capacity(entries.len());
-
-        for (_key, term_info) in entries {
-            if let Some((doc_ids, term_freqs)) = term_info.decode_inline() {
-                let mut posting_list = crate::structures::PostingList::with_capacity(doc_ids.len());
-                for (doc_id, tf) in doc_ids.into_iter().zip(term_freqs) {
-                    posting_list.push(doc_id, tf);
-                }
-                results.push(BlockPostingList::from_posting_list(&posting_list)?);
-            } else if let Some((posting_offset, posting_len)) = term_info.external_info() {
-                let range = checked_file_range(
-                    posting_offset,
-                    posting_len,
-                    self.postings.file().len(),
-                    "prefix posting",
-                )?;
-                results.push(self.postings.read_sync(range)?);
-            }
-        }
-
-        Ok(results)
     }
 
     /// Synchronous position list lookup — requires Inline (mmap/RAM) file handles.

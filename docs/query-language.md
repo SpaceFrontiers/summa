@@ -1,6 +1,6 @@
 # Query language
 
-Hermes accepts terms, field-qualified terms, phrases, prefixes, explicit
+Hermes accepts terms, field-qualified terms, phrases, prefixes, wildcard functions, explicit
 `AND`/`OR`/`NOT`, grouping, unary `+`/`-` modifiers, and vector expressions.
 Whitespace between clauses is an implicit OR.
 
@@ -61,3 +61,19 @@ Use an explicit AND for unordered terms, or rebuild the field with token
 positions. Unqualified phrases keep all configured default-field branches,
 including branches that analyze to one token; an unsupported multi-token
 branch is an error.
+
+## Wildcard term filters
+
+`field:wildcard("foo*bar?")` matches complete indexed terms. `*` matches zero or
+more Unicode characters; `?` matches exactly one. The pattern is lowercased,
+but not tokenized or stemmed. Arguments use JSON string escaping: for example,
+`field:wildcard("a\\*b")` matches the literal term `a*b`. An unqualified function
+searches the default fields. Every matching document scores 1.0 per field,
+regardless of how many terms matched. Bare patterns such as `field:foo*bar?` and `*suffix` are also supported. A simple
+trailing-star pattern retains the existing prefix query path. Interior patterns
+are consumed as one query rather than split into separate clauses.
+
+Prefix and wildcard filters share bounded expansion and union execution and
+preserve logical document IDs on RGB fields. Chunked fields are rejected.
+Leading wildcards may scan many dictionary terms; excessive expansion returns
+an error. See [wildcard queries](wildcard-query.md) for the limits and core API.

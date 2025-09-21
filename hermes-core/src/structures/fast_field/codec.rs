@@ -734,15 +734,21 @@ impl CodecEstimator for BlockwiseLinearEstimator {
 ///
 /// `data` starts right after the codec_id byte.
 pub fn blockwise_linear_read(data: &[u8], index: usize) -> u64 {
+    blockwise_linear_read_from(data, index, 0, 8)
+}
+
+/// Resume from a validated header checkpoint (offset excludes the codec byte).
+pub(super) fn blockwise_linear_read_from(
+    data: &[u8],
+    index: usize,
+    first_block: usize,
+    mut pos: usize,
+) -> u64 {
     let _num_values = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let num_blocks = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-
     let target_block = index / BLOCKWISE_LINEAR_BLOCK_SIZE;
     let index_in_block = index % BLOCKWISE_LINEAR_BLOCK_SIZE;
-
-    // Scan block headers to find the right one
-    let mut pos = 8usize;
-    for b in 0..num_blocks {
+    for b in first_block..num_blocks {
         let first = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
         let last = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
         let offset = i64::from_le_bytes(data[pos + 16..pos + 24].try_into().unwrap());

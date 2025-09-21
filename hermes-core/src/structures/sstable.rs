@@ -2159,6 +2159,17 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         prefix: &[u8],
         max_results: usize,
     ) -> io::Result<PrefixScanResult<V>> {
+        self.prefix_scan_filtered(prefix, max_results, usize::MAX, |_| true)
+            .await
+    }
+
+    pub(crate) async fn prefix_scan_filtered(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+        max_scanned: usize,
+        mut accepts: impl FnMut(&[u8]) -> bool + Send,
+    ) -> io::Result<PrefixScanResult<V>> {
         if self.block_index.is_empty() || prefix.is_empty() {
             return Ok((Vec::new(), false));
         }
@@ -2169,6 +2180,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         let start_block = self.block_index.locate(prefix).unwrap_or(0);
 
         let mut results = Vec::new();
+        let mut scanned = 0usize;
 
         for block_idx in start_block..self.block_index.len() {
             let block_data = self.load_block(block_idx).await?;
@@ -2179,6 +2191,15 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 let value = decode_block_entry(&mut reader, &mut current_key)?;
 
                 if current_key.starts_with(prefix) {
+                    if scanned == max_scanned {
+                        return Err(io::Error::other(format!(
+                            "term dictionary scan exceeds {max_scanned} terms"
+                        )));
+                    }
+                    scanned += 1;
+                    if !accepts(&current_key) {
+                        continue;
+                    }
                     if results.len() >= max_results {
                         return Ok((results, true));
                     }
@@ -2207,6 +2228,17 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         prefix: &[u8],
         max_results: usize,
     ) -> io::Result<PrefixScanResult<V>> {
+        self.prefix_scan_filtered_sync(prefix, max_results, usize::MAX, |_| true)
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn prefix_scan_filtered_sync(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+        max_scanned: usize,
+        mut accepts: impl FnMut(&[u8]) -> bool + Send,
+    ) -> io::Result<PrefixScanResult<V>> {
         if self.block_index.is_empty() || prefix.is_empty() {
             return Ok((Vec::new(), false));
         }
@@ -2215,6 +2247,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         let start_block = self.block_index.locate(prefix).unwrap_or(0);
 
         let mut results = Vec::new();
+        let mut scanned = 0usize;
 
         for block_idx in start_block..self.block_index.len() {
             let block_data = self.load_block_sync(block_idx)?;
@@ -2225,6 +2258,15 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 let value = decode_block_entry(&mut reader, &mut current_key)?;
 
                 if current_key.starts_with(prefix) {
+                    if scanned == max_scanned {
+                        return Err(io::Error::other(format!(
+                            "term dictionary scan exceeds {max_scanned} terms"
+                        )));
+                    }
+                    scanned += 1;
+                    if !accepts(&current_key) {
+                        continue;
+                    }
                     if results.len() >= max_results {
                         return Ok((results, true));
                     }
@@ -2561,6 +2603,73 @@ mod tests {
                 vec![b"apple".to_vec(), b"apricot".to_vec()]
             );
             assert!(reader.prefix_scan_sync(b"0").unwrap().is_empty());
+        }
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn filtered_prefix_scans_bound_examined_terms_and_matched_results_independently() {
+        let mut writer = SSTableWriter::<_, u64>::new(Vec::new());
+        for (key, value) in [(b"aa", 1), (b"ab", 2), (b"ac", 3), (b"ba", 4)] {
+            writer.insert(key, &value).unwrap();
+        }
+        let reader = AsyncSSTableReader::<u64>::open(
+            FileHandle::from_bytes(OwnedBytes::new(writer.finish().unwrap())),
+            4,
+        )
+        .await
+        .unwrap();
+        let accepts = |key: &[u8]| key.ends_with(b"c");
+        assert_eq!(
+            reader
+                .prefix_scan_filtered(b"a", 1, 3, accepts)
+                .await
+                .unwrap(),
+            (vec![(b"ac".to_vec(), 3)], false)
+        );
+        assert!(
+            reader
+                .prefix_scan_filtered(b"a", 1, 2, accepts)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("scan exceeds 2")
+        );
+        assert_eq!(
+            reader
+                .prefix_scan_filtered(b"a", 0, 3, accepts)
+                .await
+                .unwrap(),
+            (vec![], true)
+        );
+        assert_eq!(
+            reader
+                .prefix_scan_filtered(b"a", 1, 3, |_| false)
+                .await
+                .unwrap(),
+            (vec![], false)
+        );
+        #[cfg(feature = "sync")]
+        {
+            assert_eq!(
+                reader
+                    .prefix_scan_filtered_sync(b"a", 1, 3, accepts)
+                    .unwrap(),
+                (vec![(b"ac".to_vec(), 3)], false)
+            );
+            assert!(
+                reader
+                    .prefix_scan_filtered_sync(b"a", 1, 2, accepts)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("scan exceeds 2")
+            );
+            assert_eq!(
+                reader
+                    .prefix_scan_filtered_sync(b"a", 0, 3, accepts)
+                    .unwrap(),
+                (vec![], true)
+            );
         }
     }
 

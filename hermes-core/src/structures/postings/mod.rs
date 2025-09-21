@@ -47,8 +47,8 @@ pub use partitioned_ef::{
     PartitionedEliasFano,
 };
 pub use positions::{
-    MAX_ELEMENT_ORDINAL, MAX_TOKEN_POSITION, PositionPostingIterator, PositionPostingList,
-    PostingWithPositions, decode_element_ordinal, decode_token_position, encode_position,
+    MAX_ELEMENT_ORDINAL, MAX_TOKEN_POSITION, decode_element_ordinal, decode_token_position,
+    encode_position,
 };
 #[cfg(feature = "native")]
 pub(crate) use positions_v2::PositionRangeSource;
@@ -88,3 +88,5 @@ pub use vertical_bp128::{
     VERTICAL_BP128_BLOCK_SIZE, VerticalBP128Block, VerticalBP128Iterator, VerticalBP128PostingList,
     pack_vertical, unpack_vertical,
 };
+
+pub(crate) use posting::PostingIntersection;

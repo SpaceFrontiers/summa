@@ -595,6 +595,22 @@ macro_rules! define_query_traits {
             /// scorer's final score space. The default never excludes a score.
             fn candidate_score_upper_bound(&self) -> Score { Score::INFINITY }
 
+            /// Conservative final-score bound through an inclusive physical doc ID.
+            /// The interval starts at the current candidate. Only a top-level ranked
+            /// collector may skip it; exact/nested traversal stays unchanged.
+            /// Returning None opts out for the remaining traversal. A skipped
+            /// interval is left through seek_candidate, including deadline checks.
+            fn candidate_block_upper_bound(&mut self) -> Option<(DocId, Score)> { None }
+
+            /// Advance while optionally omitting candidates whose final-score bound
+            /// cannot compete with `minimum`. Only top-level ranked collection
+            /// may call this. `allow_equal = false` certifies that every remaining
+            /// stable ID loses an equal-score tie against the full local heap.
+            fn advance_competitive_candidate(&mut self, _minimum: Score, _allow_equal: bool) -> DocId {
+                self.advance_candidate()
+            }
+
+
             /// Whether this scorer's batches remain useful when every match
             /// needs a predicate check. Composite scorers can amortize child
             /// traversal; leaf bitmap production alone may cost more than a
