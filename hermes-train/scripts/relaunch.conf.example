@@ -36,7 +36,7 @@ HERMES_TRAIN_MAX_RESTARTS=0
 # uploaded and verified before current.json is published last. Artifact payloads
 # are deduplicated in checkpoint-objects/sha256/ and each generation has an
 # immutable checkpoint-artifacts/<generation>/artifact-manifest.json. Keep all
-# paths supplied by HERMES_TRAIN_COMMAND stable across VM replacements so the
+# paths supplied by HERMES_TRAIN_COMMAND stable across machine replacements so the
 # verified closure can be restored to the same semantic roots. A configured
 # external Dreaming initial_policy is deployment-owned and must exist at its
 # pinned path with the same digest after replacement. Remote current.json binds

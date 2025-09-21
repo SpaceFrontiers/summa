@@ -1,6 +1,7 @@
 //! Phrase query - matches documents containing terms in consecutive positions
 
 mod competitive;
+mod seed;
 use competitive::CompetitiveLengths;
 
 use std::sync::Arc;
@@ -573,20 +574,23 @@ impl Query for PhraseQuery {
             options
         );
 
-        // Parallel fetch across all terms via rayon
+        // Two memory-backed term lookups do not need nested worker tasks.
+        // Larger phrases retain parallel fetching on the shared search pool.
         use rayon::prelude::*;
-        let pairs: crate::Result<Vec<Option<(BlockPostingList, TermPositions)>>> = self
-            .terms
-            .par_iter()
-            .map(|term| {
-                let postings = reader.get_postings_sync(self.field, term)?;
-                let positions = reader.get_positions_sync(self.field, term)?;
-                Ok(match (postings, positions) {
-                    (Some(p), Some(pos)) => Some((p, pos)),
-                    _ => None,
-                })
+        let load = |term: &Vec<u8>| {
+            let postings = reader.get_postings_sync(self.field, term)?;
+            let positions = reader.get_positions_sync(self.field, term)?;
+            Ok(match (postings, positions) {
+                (Some(p), Some(pos)) => Some((p, pos)),
+                _ => None,
             })
-            .collect();
+        };
+        let pairs: crate::Result<Vec<Option<(BlockPostingList, TermPositions)>>> =
+            if self.terms.len() == 2 {
+                self.terms.iter().map(load).collect()
+            } else {
+                self.terms.par_iter().map(load).collect()
+            };
         let mut term_data = Vec::with_capacity(self.terms.len());
         for entry in pairs? {
             match entry {
@@ -792,6 +796,8 @@ struct PhraseScorer {
     lead: usize,
     /// Exact phrases with unique original-first starts may use any term's TF.
     bound_term: usize,
+    /// Unique original-first starts certify every exact-phrase term's TF bound.
+    exact_term_bounds: bool,
     scan_bound_term: bool,
     intersection: crate::structures::postings::PostingIntersection,
     budget: Option<super::SharedThreshold>,
@@ -887,6 +893,7 @@ impl PhraseScorer {
             cost,
             lead,
             bound_term,
+            exact_term_bounds,
             scan_bound_term,
             intersection,
             budget: budget.filter(|b| b.deadline().is_some()),
@@ -1003,6 +1010,10 @@ impl PhraseScorer {
 
     /// Find next document where all terms appear
     fn find_next_and_match(&mut self) -> DocId {
+        self.find_next_and_match_through::<false>(TERMINATED)
+    }
+
+    fn find_next_and_match_through<const BOUNDED: bool>(&mut self, last: DocId) -> DocId {
         if self.posting_iters.is_empty() {
             return TERMINATED;
         }
@@ -1020,6 +1031,9 @@ impl PhraseScorer {
                 (second, first)
             };
             loop {
+                if BOUNDED && lead.doc() > last {
+                    return TERMINATED;
+                }
                 if self
                     .budget
                     .as_ref()
@@ -1028,12 +1042,19 @@ impl PhraseScorer {
                     return TERMINATED;
                 }
                 if let Some(doc) = self.intersection.intersect_block(lead, other) {
-                    return doc;
+                    return if BOUNDED && doc > last {
+                        TERMINATED
+                    } else {
+                        doc
+                    };
                 }
             }
         }
 
         'align: loop {
+            if BOUNDED && self.posting_iters[self.lead].doc() > last {
+                return TERMINATED;
+            }
             if self
                 .budget
                 .as_ref()
@@ -1048,7 +1069,7 @@ impl PhraseScorer {
             let Some(candidate) = self.intersection.intersect_block(lead, second) else {
                 continue;
             };
-            if candidate == TERMINATED {
+            if candidate == TERMINATED || (BOUNDED && candidate > last) {
                 return TERMINATED;
             }
             for &index in self.term_order.iter().skip(2) {
@@ -1138,7 +1159,7 @@ impl PhraseScorer {
         if self.posting_iters.len() == 2 {
             let (first_cursor, first_tf) = self.posting_iters[0].position_range();
             let (second_cursor, second_tf) = self.posting_iters[1].position_range();
-            if first_tf == 1 || (self.bound_term == 1 && second_tf == 1) {
+            if first_tf == 1 || (self.exact_term_bounds && second_tf == 1) {
                 let (anchor, other, cursor, other_cursor, other_tf) = if first_tf == 1 {
                     (0, 1, first_cursor, second_cursor, second_tf)
                 } else {
@@ -1434,6 +1455,9 @@ impl super::docset::DocSet for PhraseScorer {
 }
 
 impl Scorer for PhraseScorer {
+    fn seed_ranked_score(&mut self, limit: usize) -> Option<Score> {
+        self.seed_score(limit)
+    }
     fn supports_candidate_score_bounds(&self) -> bool {
         self.prepared_bounds.is_some()
     }
@@ -1466,7 +1490,15 @@ impl Scorer for PhraseScorer {
             return Score::INFINITY;
         };
         // The constructor selects a term whose TF bounds phrase frequency.
-        let max_tf = self.posting_iters[self.bound_term].term_freq();
+        let max_tf = if self.exact_term_bounds {
+            self.posting_iters
+                .iter()
+                .map(BlockPostingIterator::term_freq)
+                .min()
+                .unwrap_or(0)
+        } else {
+            self.posting_iters[self.bound_term].term_freq()
+        };
         let length = lengths.length(self.current_doc).max(1);
         if max_tf == 1
             && let Some(bound) = self
@@ -2216,7 +2248,10 @@ mod tests {
     #[test]
     fn rare_term_score_bounds_require_unique_first_positions_and_zero_slop() {
         use crate::structures::{PositionStreamEncoder, PostingList};
-        for duplicate in [false, true] {
+        for (duplicate, rare) in [false, true]
+            .into_iter()
+            .flat_map(|dup| [0, 1].map(|rare| (dup, rare)))
+        {
             for slop in [0, 4] {
                 let mut lists = Vec::new();
                 let mut positions = Vec::new();
@@ -2224,7 +2259,7 @@ mod tests {
                     let mut list = PostingList::new();
                     let mut bytes = Vec::new();
                     let mut encoder = PositionStreamEncoder::new(&mut bytes);
-                    for doc in 0..if term == 0 { 5 } else { 1 } {
+                    for doc in 0..if term == rare { 1 } else { 5 } {
                         let mut values = if term == 1 {
                             vec![1]
                         } else if duplicate {
@@ -2247,12 +2282,22 @@ mod tests {
                         .with_lengths(Lengths::Docs(
                             crate::segment::chunk_map::DocLengths::from_lengths(&[5; 5]),
                         ));
-                assert_eq!(scorer.lead, 1);
-                assert_eq!(scorer.bound_term, usize::from(!duplicate && slop == 0));
+                assert_eq!(scorer.lead, rare);
+                assert_eq!(
+                    scorer.bound_term,
+                    if !duplicate && slop == 0 { rare } else { 0 }
+                );
                 assert_eq!(scorer.find_next_candidate(), 0);
                 let bound = scorer.candidate_score_upper_bound();
                 assert!(scorer.confirm_candidate());
                 assert!(bound >= scorer.score());
+                if !duplicate && slop == 0 {
+                    assert_eq!(
+                        bound.to_bits(),
+                        scorer.score().to_bits(),
+                        "a singleton in any term bounds the exact phrase"
+                    );
+                }
                 assert_eq!(
                     scorer.exact_phrase_frequency(),
                     if slop != 0 {

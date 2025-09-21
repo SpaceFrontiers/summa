@@ -1559,16 +1559,19 @@ fn drive_ranked_candidates(
 ) {
     let mut doc = scorer.doc();
     let mut next_block_check = 0;
+    let mut confirmations = 0usize;
+    let mut seed_attempted = false;
+    let mut seeded_floor = Score::NEG_INFINITY;
     while doc != TERMINATED {
         if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
             break;
         }
-        if doc >= next_block_check && collector.is_full() {
+        if doc >= next_block_check && (collector.is_full() || seeded_floor.is_finite()) {
             if let Some((last, bound)) = scorer.candidate_block_upper_bound() {
                 next_block_check = last.saturating_add(1);
                 // ID zero is the best possible stable-ID tie, including mapped
                 // physical order. Reject only when no document can enter the heap.
-                if !collector.would_collect(0, bound) {
+                if bound < seeded_floor || !collector.would_collect(0, bound) {
                     doc = scorer.seek_candidate(next_block_check);
                     continue;
                 }
@@ -1578,11 +1581,16 @@ fn drive_ranked_candidates(
         }
         let result_doc = map.map_or(doc, |map| map.doc_id(doc));
         // Skip the bound computation while the heap is still filling.
-        let competitive = !collector.is_full()
-            || collector.would_collect(result_doc, scorer.candidate_score_upper_bound());
+        let competitive = if collector.is_full() || seeded_floor.is_finite() {
+            let bound = scorer.candidate_score_upper_bound();
+            bound >= seeded_floor && collector.would_collect(result_doc, bound)
+        } else {
+            true
+        };
         if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
             break;
         }
+        confirmations += usize::from(competitive);
         if competitive && scorer.confirm_candidate() {
             if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
                 break;
@@ -1601,10 +1609,21 @@ fn drive_ranked_candidates(
                 collector.collect(result_doc, score, &[]);
             }
         }
+        if map.is_some() && confirmations >= 1024 && !seed_attempted {
+            seed_attempted = true;
+            if let Some(score) = scorer.seed_ranked_score(collector.k)
+                && score.is_finite()
+            {
+                seeded_floor = score;
+            }
+        }
         // Without a mapping, monotone IDs after this candidate cannot replace
         // an equal-score ID already in the full local heap. Physical RGB order
         // does not establish that relationship, so retain equality there.
-        doc = scorer.advance_competitive_candidate(collector.competitive_score(), map.is_some());
+        doc = scorer.advance_competitive_candidate(
+            collector.competitive_score().max(seeded_floor),
+            map.is_some(),
+        );
     }
 }
 
@@ -1747,6 +1766,7 @@ mod tests {
         scores: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         bounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         pause_confirmation: bool,
+        seed_calls: usize,
     }
 
     impl BoundedCandidates {
@@ -1765,6 +1785,7 @@ mod tests {
                 scores: Default::default(),
                 bounds: Default::default(),
                 pause_confirmation: false,
+                seed_calls: 0,
             }
         }
     }
@@ -1786,6 +1807,16 @@ mod tests {
     }
 
     impl super::super::Scorer for BoundedCandidates {
+        fn seed_ranked_score(&mut self, limit: usize) -> Option<Score> {
+            self.seed_calls += 1;
+            let mut scores: Vec<_> = self.hits[self.at + 1..]
+                .iter()
+                .filter(|hit| hit.3)
+                .map(|hit| hit.1)
+                .collect();
+            scores.sort_unstable_by(|a, b| b.total_cmp(a));
+            scores.get(limit - 1).copied()
+        }
         fn supports_candidate_score_bounds(&self) -> bool {
             true
         }
@@ -1823,6 +1854,65 @@ mod tests {
                 )],
             )])
         }
+    }
+
+    #[test]
+    fn mapped_score_seeding_keeps_late_equal_score_winners_and_underfilled_heaps() {
+        use crate::directories::OwnedBytes;
+        use crate::segment::chunk_map::{ChunkMapBuilder, read_chunk_maps, write_chunk_maps};
+        let mut map = ChunkMapBuilder::default();
+        map.set_document_units(true);
+        for doc in 0..2048 {
+            map.push(2047 - doc, 0, 100).unwrap();
+        }
+        let mut bytes = Vec::new();
+        write_chunk_maps(&mut bytes, &[(0, &map)], &[]).unwrap();
+        let maps = read_chunk_maps(OwnedBytes::new(bytes)).unwrap();
+        for prefix_matches in [false, true] {
+            let mut scorer = BoundedCandidates::fixture();
+            scorer.hits = (0..2048)
+                .map(|doc| {
+                    if doc < 2000 {
+                        (doc, 1.0, 1.5, prefix_matches)
+                    } else {
+                        (doc, 2.0, 2.0, true)
+                    }
+                })
+                .collect();
+            let (hits, _) =
+                top_k_from_mapped_scorer(&mut scorer, 10, true, None, Some(&maps.chunk_maps[&0]));
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| (hit.doc_id, hit.score))
+                    .collect::<Vec<_>>(),
+                (0..10).map(|doc| (doc, 2.0)).collect::<Vec<_>>()
+            );
+            assert_eq!(scorer.seed_calls, 1);
+            assert_eq!(scorer.confirmations.lock().unwrap().len(), 1072);
+        }
+        let mut scorer = BoundedCandidates::fixture();
+        scorer.hits = (0..2048)
+            .map(|doc| (doc, if doc < 2000 { 1.0 } else { 2.0 }, 2.0, true))
+            .collect();
+        let mut filtered = super::super::PredicatedScorer::new(
+            Box::new(scorer),
+            vec![Box::new(|doc| doc < 2000)],
+            Vec::new(),
+            Vec::new(),
+        );
+        // A child proof may contain documents rejected by its wrapper.
+        assert_eq!(
+            super::super::Scorer::seed_ranked_score(&mut filtered, 10),
+            None
+        );
+        let (hits, _) =
+            top_k_from_mapped_scorer(&mut filtered, 10, false, None, Some(&maps.chunk_maps[&0]));
+        assert_eq!(
+            hits.iter()
+                .map(|hit| (hit.doc_id, hit.score))
+                .collect::<Vec<_>>(),
+            (48..58).map(|doc| (doc, 1.0)).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]

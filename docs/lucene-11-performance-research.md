@@ -47,7 +47,7 @@ out pending a controlled explanation of its net benefit.
 Final retained code passes 1,649 native tests, native without sync, and the WASM
 build plus 20 tests. All 1,676 ARM query gates pass ordered ID/score-bit and exact
 count checks. Full-corpus final checks pass all 1,676 gates. Timings use the same Cascade Lake
-VM as the frozen baseline and Tantivy, excluding builds and profiles. No Lucene
+machine as the frozen baseline and Tantivy, excluding builds and profiles. No Lucene
 engine timing or sparse-index speedup is claimed in this pass.
 
 ## Dictionary lookup is a separate bottleneck
@@ -148,6 +148,12 @@ search, but its ranked cursor still scans decoded IDs using SIMD. Applying the
 ordinary cursor's lower-bound policy to the ranked owner is an unmeasured
 hypothesis targeting that discrepancy. It does not require copying Tantivy's
 unsafe fixed-size implementation or changing on-disk blocks.
+
+September 24 follow-up: the [ranked pruning investigation](ranked-pruning-followup.md)
+now measures that existing fixed-block primitive in Hermes's ranked cursor,
+alongside guarded rare-term conjunction seeks and phrase changes. Its targeted
+10M cloud and smaller ARM evidence is separate from this earlier full-corpus
+research snapshot; it does not establish an all-query win.
 
 Tantivy's [phrase scorer](https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/query/phrase_query/phrase_scorer.rs)
 separates phrase existence from full frequency when scoring is disabled. Hermes's

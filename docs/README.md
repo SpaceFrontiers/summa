@@ -58,6 +58,8 @@
 
 ## Documentation checks
 
+
+
 ## Additional guides
 
 - [Contributing](../CONTRIBUTING.md)
@@ -67,6 +69,8 @@
 - [Range block scan experiments](range-block-scans.md)
 - [Text formats and memory](text-format-comparison.md)
 - [pruning fixes](search-pruning-fixes.md)
+- [Ranked conjunction and phrase follow-up](ranked-pruning-followup.md)
+- [Score-guided posting traversal research](score-guided-traversal.md)
 - [Lucene research](lucene-11-performance-research.md)
 - [BMP forward-search experiment (removed)](bmp-forward-search.md)
 - [Former IVF-PQ design](unified-vector-quantization.md)

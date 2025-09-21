@@ -610,6 +610,13 @@ macro_rules! define_query_traits {
                 self.advance_candidate()
             }
 
+            /// Optionally prove a lower bound on the kth best score using
+            /// distinct real matches. Restore the current candidate unless
+            /// cancelled. Emit no sampled hits; normal traversal still owns them.
+            /// Only top-level ranked collection may use this hint. Equality
+            /// remains competitive until its own heap resolves stable-ID ties.
+            fn seed_ranked_score(&mut self, _limit: usize) -> Option<Score> { None }
+
 
             /// Whether this scorer's batches remain useful when every match
             /// needs a predicate check. Composite scorers can amortize child

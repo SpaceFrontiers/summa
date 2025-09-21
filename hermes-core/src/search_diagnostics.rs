@@ -77,6 +77,10 @@ pub struct QueryWork {
     pub phrase_bound_calls: u64,
     /// Actual phrase-position checks; excludes cached confirmations.
     pub phrase_confirmations: u64,
+    /// Real phrase candidates inspected by a bounded score-floor pilot.
+    pub phrase_seed_candidates: u64,
+    /// Posting-bound entries inspected to choose the bounded pilot.
+    pub phrase_seed_metadata_blocks: u64,
     /// Aligned conjunction candidates before final collection.
     pub conjunction_candidates: u64,
     /// MaxScore text windows visited.
@@ -177,6 +181,12 @@ impl QueryWork {
         self.phrase_confirmations = self
             .phrase_confirmations
             .saturating_add(other.phrase_confirmations);
+        self.phrase_seed_candidates = self
+            .phrase_seed_candidates
+            .saturating_add(other.phrase_seed_candidates);
+        self.phrase_seed_metadata_blocks = self
+            .phrase_seed_metadata_blocks
+            .saturating_add(other.phrase_seed_metadata_blocks);
         self.conjunction_candidates = self
             .conjunction_candidates
             .saturating_add(other.conjunction_candidates);
