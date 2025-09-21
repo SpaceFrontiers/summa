@@ -31,7 +31,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use rust_stemmers::Algorithm;
 use serde::{Deserialize, Serialize};
-use stop_words::LANGUAGE;
+use stop_words::Language as StopWordLanguage;
 
 /// What a tokenization is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,26 +304,26 @@ impl Language {
         }
     }
 
-    pub(super) fn to_stop_words_language(self) -> LANGUAGE {
+    pub(super) fn to_stop_words_language(self) -> StopWordLanguage {
         match self {
-            Language::Arabic => LANGUAGE::Arabic,
-            Language::Danish => LANGUAGE::Danish,
-            Language::Dutch => LANGUAGE::Dutch,
-            Language::English => LANGUAGE::English,
-            Language::Finnish => LANGUAGE::Finnish,
-            Language::French => LANGUAGE::French,
-            Language::German => LANGUAGE::German,
-            Language::Greek => LANGUAGE::Greek,
-            Language::Hungarian => LANGUAGE::Hungarian,
-            Language::Italian => LANGUAGE::Italian,
-            Language::Norwegian => LANGUAGE::Norwegian,
-            Language::Portuguese => LANGUAGE::Portuguese,
-            Language::Romanian => LANGUAGE::Romanian,
-            Language::Russian => LANGUAGE::Russian,
-            Language::Spanish => LANGUAGE::Spanish,
-            Language::Swedish => LANGUAGE::Swedish,
-            Language::Tamil => LANGUAGE::Tamil,
-            Language::Turkish => LANGUAGE::Turkish,
+            Language::Arabic => StopWordLanguage::Arabic,
+            Language::Danish => StopWordLanguage::Danish,
+            Language::Dutch => StopWordLanguage::Dutch,
+            Language::English => StopWordLanguage::English,
+            Language::Finnish => StopWordLanguage::Finnish,
+            Language::French => StopWordLanguage::French,
+            Language::German => StopWordLanguage::German,
+            Language::Greek => StopWordLanguage::Greek,
+            Language::Hungarian => StopWordLanguage::Hungarian,
+            Language::Italian => StopWordLanguage::Italian,
+            Language::Norwegian => StopWordLanguage::Norwegian,
+            Language::Portuguese => StopWordLanguage::Portuguese,
+            Language::Romanian => StopWordLanguage::Romanian,
+            Language::Russian => StopWordLanguage::Russian,
+            Language::Spanish => StopWordLanguage::Spanish,
+            Language::Swedish => StopWordLanguage::Swedish,
+            Language::Tamil => StopWordLanguage::Tamil,
+            Language::Turkish => StopWordLanguage::Turkish,
         }
     }
 }
