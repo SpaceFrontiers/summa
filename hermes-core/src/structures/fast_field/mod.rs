@@ -722,6 +722,8 @@ pub struct ColumnBlock {
     pub raw_dict: OwnedBytes,
 }
 
+mod checkpoints;
+
 /// Reads a single fast-field column from mmap/buffer.
 ///
 /// A column is a sequence of independently-decodable blocks. Fresh segments
@@ -745,6 +747,7 @@ pub struct FastFieldReader {
     /// Lazy-initialized text state (global dict + ordinal maps).
     /// Built on first text-related access, not at load time.
     text_state: OnceLock<TextState>,
+    checkpoints: checkpoints::Checkpoints,
 }
 
 /// Lazily-built state for text-ordinal columns.
@@ -759,7 +762,7 @@ struct TextState {
 impl FastFieldReader {
     /// Heap directory only; encoded values and dictionaries remain file-backed.
     pub(crate) fn block_metadata_bytes(&self) -> usize {
-        self.blocks.capacity() * std::mem::size_of::<ColumnBlock>()
+        self.blocks.capacity() * std::mem::size_of::<ColumnBlock>() + self.checkpoints.heap_bytes()
     }
 
     /// Bytes of column data backing this reader (values, offsets, dicts).
@@ -1002,7 +1005,9 @@ impl FastFieldReader {
             ));
         }
 
+        let checkpoints = checkpoints::Checkpoints::new(&blocks, toc.multi);
         Ok(Self {
+            checkpoints,
             column_type: toc.column_type,
             num_docs: toc.num_docs,
             multi: toc.multi,
@@ -1167,7 +1172,7 @@ impl FastFieldReader {
             return self.remap_ordinal(bi, raw);
         }
 
-        let raw = codec::auto_read(block.data.as_slice(), local as usize);
+        let raw = self.checkpoints.read(&self.blocks, bi, local);
         self.remap_ordinal(bi, raw)
     }
 
@@ -1363,7 +1368,7 @@ impl FastFieldReader {
             }
             codec::auto_read(block.value_data.as_slice(), start as usize)
         } else {
-            codec::auto_read(block.data.as_slice(), local as usize)
+            self.checkpoints.read(&self.blocks, bi, local)
         };
         if raw_ordinal == FAST_FIELD_MISSING {
             return None;
@@ -1674,6 +1679,86 @@ pub fn read_fast_field_toc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_checkpoints_bound_heap_and_preserve_merged_values_and_bytes() {
+        use codec::{BlockwiseLinearEstimator, CodecEstimator};
+        let values: Vec<_> = (0..(512 * 301 + 7))
+            .map(|i| (i / 512 * 100_000 + i % 512 * 3 + i % 7) as u64)
+            .collect();
+        let mut encoded = Vec::new();
+        BlockwiseLinearEstimator::default()
+            .serialize(&values, &mut encoded)
+            .unwrap();
+        let mut missing = Vec::new();
+        codec::serialize_auto(&[FAST_FIELD_MISSING], &mut missing).unwrap();
+        let (bytes, toc) = assemble_blocked_column(
+            0,
+            FastFieldColumnType::U64,
+            false,
+            &[
+                (values.len() as u32, &encoded, 0, &[]),
+                (1, &missing, 0, &[]),
+                (values.len() as u32, &encoded, 0, &[]),
+            ],
+        );
+        let original = bytes.clone();
+        let owned = owned(bytes);
+        let reader = FastFieldReader::open(&owned, &toc).unwrap();
+        assert!(reader.checkpoints.heap_bytes() > 0);
+        assert!(reader.checkpoints.heap_bytes() <= 256 * 12);
+        assert_eq!(
+            reader.block_metadata_bytes(),
+            reader.blocks.capacity() * std::mem::size_of::<ColumnBlock>()
+                + reader.checkpoints.heap_bytes()
+        );
+        for start in [0, values.len() + 1] {
+            for i in (0..values.len())
+                .step_by(71)
+                .chain([510, 511, 512, 513, values.len() - 1])
+            {
+                assert_eq!(reader.get_u64((start + i) as u32), values[i]);
+            }
+        }
+        assert_eq!(reader.get_u64(values.len() as u32), FAST_FIELD_MISSING);
+        assert_eq!(reader.get_u64(reader.num_docs), FAST_FIELD_MISSING);
+        assert_eq!(owned.as_slice(), original);
+    }
+
+    #[test]
+    fn sparse_checkpoints_preserve_local_text_dictionaries_and_rank_order() {
+        use codec::{BlockwiseLinearEstimator, CodecEstimator};
+        let mut a = FastFieldWriter::new_text();
+        a.add_text(0, "alpha");
+        a.add_text(1, "beta");
+        let (_, dict_a, _) = serialize_single_block(&mut a);
+        let mut b = FastFieldWriter::new_text();
+        b.add_text(0, "beta");
+        b.add_text(1, "gamma");
+        let (_, dict_b, _) = serialize_single_block(&mut b);
+        let values: Vec<_> = (0..1100).map(|i| (i % 2) as u64).collect();
+        let mut encoded = Vec::new();
+        BlockwiseLinearEstimator::default()
+            .serialize(&values, &mut encoded)
+            .unwrap();
+        let (bytes, toc) = assemble_blocked_column(
+            0,
+            FastFieldColumnType::TextOrdinal,
+            false,
+            &[(1100, &encoded, 2, &dict_a), (1100, &encoded, 2, &dict_b)],
+        );
+        let reader = FastFieldReader::open(&owned(bytes), &toc).unwrap();
+        for doc in [2199, 1100, 511, 512, 1099, 0, 512, 1101] {
+            let expected = if doc < 1100 {
+                ["alpha", "beta"]
+            } else {
+                ["beta", "gamma"]
+            };
+            assert_eq!(reader.get_text(doc), Some(expected[(doc % 2) as usize]));
+        }
+        assert_eq!(reader.get_text(2200), None);
+        assert_eq!(reader.get_ordinal(1101), 2);
+    }
 
     #[test]
     fn test_zigzag_roundtrip() {

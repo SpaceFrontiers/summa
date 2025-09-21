@@ -402,6 +402,16 @@ impl TopKCollector {
         }
     }
 
+    fn competitive_score(&self) -> Score {
+        if !self.is_full() {
+            return Score::NEG_INFINITY;
+        }
+        match &self.heap {
+            TopKHeap::Scores(heap) => heap.peek().map_or(Score::NEG_INFINITY, |hit| hit.score()),
+            TopKHeap::Positions(heap) => heap.peek().map_or(Score::NEG_INFINITY, |hit| hit.score),
+        }
+    }
+
     pub fn into_sorted_results(self) -> Vec<SearchResult> {
         match self.heap {
             TopKHeap::Scores(heap) => {
@@ -1548,9 +1558,23 @@ fn drive_ranked_candidates(
     map: Option<&crate::segment::chunk_map::ChunkMap>,
 ) {
     let mut doc = scorer.doc();
+    let mut next_block_check = 0;
     while doc != TERMINATED {
         if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
             break;
+        }
+        if doc >= next_block_check && collector.is_full() {
+            if let Some((last, bound)) = scorer.candidate_block_upper_bound() {
+                next_block_check = last.saturating_add(1);
+                // ID zero is the best possible stable-ID tie, including mapped
+                // physical order. Reject only when no document can enter the heap.
+                if !collector.would_collect(0, bound) {
+                    doc = scorer.seek_candidate(next_block_check);
+                    continue;
+                }
+            } else {
+                next_block_check = TERMINATED;
+            }
         }
         let result_doc = map.map_or(doc, |map| map.doc_id(doc));
         // Skip the bound computation while the heap is still filling.
@@ -1577,7 +1601,10 @@ fn drive_ranked_candidates(
                 collector.collect(result_doc, score, &[]);
             }
         }
-        doc = scorer.advance_candidate();
+        // Without a mapping, monotone IDs after this candidate cannot replace
+        // an equal-score ID already in the full local heap. Physical RGB order
+        // does not establish that relationship, so retain equality there.
+        doc = scorer.advance_competitive_candidate(collector.competitive_score(), map.is_some());
     }
 }
 
@@ -2294,6 +2321,83 @@ mod tests {
                 assert_eq!(actual, expected.into_results_with_count());
                 // The handoff consumed the retained list; no second heap walk.
                 assert_eq!(scorer.doc(), TERMINATED);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn phrase_block_pruning_preserves_late_winners_score_bits_and_exact_counts() {
+        use crate::query::PhraseQuery;
+        use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
+        use crate::structures::PostingCodec;
+        for (codec, posting_ratio_bounds, posting_impact_bounds) in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ]
+        .into_iter()
+        .flat_map(|codec| {
+            [
+                (codec, false, false),
+                (codec, true, false),
+                (codec, true, true),
+            ]
+        }) {
+            let dir = crate::RamDirectory::new();
+            let mut schema = crate::SchemaBuilder::default();
+            let field = schema.add_text_field("body", true, false);
+            schema.set_positions(field, crate::dsl::PositionMode::TokenPosition);
+            let schema = std::sync::Arc::new(schema.build());
+            let mut builder = SegmentBuilder::new(
+                schema.clone(),
+                SegmentBuilderConfig {
+                    posting_codec: codec,
+                    posting_ratio_bounds,
+                    posting_impact_bounds,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            for id in 0..2053 {
+                // Whole weak blocks lie between short documents and later
+                // higher-frequency winners. Include nonmatching intersections.
+                let text = match id {
+                    0..=3 => "alpha beta".to_owned(),
+                    2048.. => "alpha beta alpha beta".to_owned(),
+                    _ if id % 7 == 0 => format!("alpha {} beta", "filler ".repeat(80)),
+                    _ => format!("alpha beta {}", "filler ".repeat(80)),
+                };
+                let mut doc = crate::Document::new();
+                doc.add_text(field, text);
+                builder.add_document(doc).unwrap();
+            }
+            let id = SegmentId::new();
+            builder.build(&dir, id, None).await.unwrap();
+            let reader = SegmentReader::open(&dir, id, schema, 16).await.unwrap();
+            for slop in [0, 4] {
+                let query = PhraseQuery::new(field, vec![b"alpha".to_vec(), b"beta".to_vec()])
+                    .with_slop(slop);
+                for k in [1, 3, 10, 100] {
+                    let mut complete = query.scorer(&reader, 0).await.unwrap();
+                    let mut top = TopKCollector::new(k);
+                    let mut count = CountCollector::new();
+                    drive_scorer(complete.as_mut(), &mut (&mut top, &mut count));
+                    let expected = top.into_sorted_results();
+                    let (actual, _) = search_segment_with_count(&reader, &query, k).await.unwrap();
+                    assert_eq!(actual, expected, "{codec:?}, slop={slop}, k={k}");
+                    #[cfg(feature = "sync")]
+                    assert_eq!(
+                        search_segment_with_count_sync(&reader, &query, k)
+                            .unwrap()
+                            .0,
+                        expected
+                    );
+                    let mut exact = CountCollector::new();
+                    collect_segment(&reader, &query, &mut exact).await.unwrap();
+                    assert_eq!(exact.count(), count.count());
+                    assert!(exact.count() > 1700);
+                }
             }
         }
     }

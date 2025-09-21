@@ -16,6 +16,7 @@ directory. Package READMEs below document each executable or library.
 
 - [Hermes Schema Definition Language (SDL)](schema.md)
 - [Query language](query-language.md): required/prohibited clauses, precedence, and strict parsing.
+- [Wildcard queries](wildcard-query.md): whole-term core API, shared prefix execution and expansion budgets.
 - [Dynamic per-document stemming and wire-level phrase queries](dynamic-tokenizer-and-phrase.md)
 - [Chunked text fields: BM25 over passages with ordinals](chunked-text-fields.md)
 - [BM25 over equal-length chunks](chunked-bm25.md)
@@ -28,6 +29,7 @@ directory. Package READMEs below document each executable or library.
 ## Storage, operations, and distributed search
 
 - [Hermes broker](broker.md)
+- [Topic-aware placement and N→M redistribution](topic-aware-placement.md) — proposed intra-shard topic routing, stable cells, similarity-aware merges, and local rewrite flows.
 - [Segment Lifecycle and Recovery](segment-lifecycle.md)
 - [Row deletion, upserts, and compaction](row-deletion.md)
 - [Content-hash deduplication](content-deduplication.md)
@@ -104,6 +106,7 @@ directory. Package READMEs below document each executable or library.
 
 ## Additional guides
 
+- [IResearch optimization and Linux I/O audit](iresearch-optimization-audit.md)
 - [MoE A100 performance](moe-performance.md)
 - [Attention kernels](fused-attention.md)
 - [Fused chunked cross-entropy (GPU)](fused-cross-entropy.md)

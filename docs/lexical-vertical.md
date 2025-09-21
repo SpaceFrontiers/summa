@@ -1,7 +1,7 @@
 # Lexical vertical: positions, pruning, reordering, tokenization
 
 Status: implementation ledger and remaining research, reviewed 2026-09-05.
-Positions v3, block bounds, windowed MaxScore, dynamic tokenization, phrase
+Cursor-addressed positions, block bounds, windowed MaxScore, dynamic tokenization, phrase
 queries, and cross-shard BM25 statistics are implemented. Sections below
 identify remaining proposals explicitly; the initial audit records the
 pre-change baseline.
@@ -86,7 +86,9 @@ doc_freq, position_offset, position_len }`. FST or raw mmap index. Not in
 
 ## Position list format v3
 
-Status: implemented (2026-09-03), `structures/postings/positions_v2.rs`.
+Status: implemented (2026-09-03), updated to POS5/POS6 on 2026-09-23,
+`structures/postings/positions_v2.rs`. The [posting codec contract](posting-codecs.md)
+defines the current formats and unique-position certificate.
 
 Goal: positions cost bytes only where they exist, and a phrase query touches
 only the positions of documents that survived the doc-level conjunction.
@@ -99,10 +101,14 @@ through its own skip list:
 ```text
 .pos  per term:  [block 0]...[block n-1]
                  [block index: (byte offset u32, value start u64) × n]
-                 [footer: n u32, total_positions u64, magic "POS3"]
+                 [footer: n_and_flags u32, total_positions u64, magic "POS5"]
 block:           [count u16][bits u8][pad u8][packed values: count × bytes(bits)]
                  at most 128 values per block
 ```
+
+The high bit of `n_and_flags` certifies unique positions within each document;
+the low 31 bits are the block count. POS6 separates compact block metadata from
+the payload. The certificate enables rare-term score bounds for exact phrases.
 
 - Values are **deltas**: a document's positions are sorted, the first is
   stored as is, the rest relative to the previous one. For a chunked field
@@ -155,8 +161,9 @@ blocks are never decoded or re-encoded.
 
 ### Compatibility
 
-Metadata format version 6 is a clean rebuild boundary for this layout; format
-7 (row deletion) upgrades format 6 metadata on open without touching segments.
+POS5/POS6 are a rebuild boundary. The position readers, merging, compaction,
+and reordering reject earlier formats. No legacy position decoder or migration
+branch remains.
 
 ## Doc postings and skip metadata
 
@@ -562,3 +569,30 @@ do, and where the text vertical stands (2026-09-03):
   2025; Bruch et al., Seismic, SIGIR 2024 (sparse-side context only).
 - Williams, Zobel, Bahle, Fast phrase querying with combined indexes, TOIS
   2004 (next-word indexes; not planned while stop words are dropped).
+
+## Phrase competitive scans (September 23 follow-up)
+
+Ranked phrases retain exact BM25 scores, stable-ID ties, duplicate-start
+multiplicity, slop, and RGB mapping semantics. The collector passes its local
+heap floor into the phrase scorer. Strict score admission is allowed only when
+subsequent physical IDs also follow stable result-ID order; reordered fields
+retain equality. Count traversal never receives this ranked cutoff.
+
+The owning phrase module caches integer length cutoffs for TF 1–32. An inverse
+BM25 estimate seeds a bounded search, and canonical neighboring score comparisons
+establish the actual cutoff, including floating-point rounding boundaries.
+Certified singleton phrases use the canonical singleton score; larger TFs retain
+conservative bounds. Posting-block and optional impact-group bounds can skip
+whole ranges. SIMD scans test TF eligibility before gathering exact u16 lengths;
+AVX2 and AVX-512 implementations retain scalar admission for unknown frequencies
+and tails, with explicit gather extent and CPU-feature preconditions. Portable
+execution uses the same cutoff semantics. Scratch remains constant per scorer;
+no index-format or default change is required by this follow-up.
+
+Position decoding caches a bounded prefix of per-document offsets and specializes
+singleton and two-term matching without a second position codec. The intended
+cost reduction is fewer candidate comparisons, indexed length loads and repeated
+position-directory traversals. Same-index exhaustive IDs/score-bit comparisons,
+scalar/SIMD lane-and-tail tests, native/async tests, and separate ordinary/RGB
+records the retained speedups, regressions, memory and remaining gaps. The
+32-vCPU results are a separate campaign in the performance review.

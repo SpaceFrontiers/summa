@@ -46,6 +46,10 @@ async fn work_counts_distinguish_metadata_count_decoding_scoring_and_cached_posi
             result.unwrap();
             assert_eq!(count.count(), 300);
             assert_eq!(work.doc_blocks, 0, "term COUNT uses metadata");
+            assert_eq!(
+                work.search_pool_installs, 0,
+                "direct async collection does not enter Rayon"
+            );
             assert_eq!(work.exact_score_units + work.lookup_score_units, 0);
 
             for query in [
@@ -105,6 +109,18 @@ async fn work_counts_distinguish_metadata_count_decoding_scoring_and_cached_posi
                 assert_eq!((a.doc_id, a.score.to_bits()), (b.doc_id, b.score.to_bits()));
             }
             assert_eq!(ranked_work.doc_values, 300);
+            assert_eq!(
+                ranked_work.search_pool_installs, 1,
+                "one owner-controlled pool entry"
+            );
+            assert_eq!(ranked_work.segment_runs, 1);
+            let (invalid, invalid_work) =
+                capture_sync(|| searcher.search_with_offset_and_count_sync(&query, usize::MAX, 1));
+            assert!(invalid.is_err());
+            assert_eq!(
+                invalid_work.search_pool_installs, 0,
+                "invalid windows fail before pool admission"
+            );
             assert_eq!(
                 ranked_work.exact_score_units + ranked_work.lookup_score_units,
                 300

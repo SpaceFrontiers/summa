@@ -729,11 +729,7 @@ pub(crate) async fn reorder_term(
                     "reorder posting count disagrees with dictionary".into(),
                 ));
             }
-            if input.has_positions() && !has_positions
-                || position_source
-                    .as_ref()
-                    .is_some_and(|p| p.is_stream() && !input.has_positions())
-            {
+            if input.has_positions() != has_positions {
                 return Err(crate::Error::Corruption(
                     "reorder posting and position formats disagree".into(),
                 ));
@@ -772,11 +768,10 @@ pub(crate) async fn reorder_term(
                 }
             }
             if position_source.as_ref().is_some_and(|p| {
-                p.is_stream()
-                    && p.total_positions()
-                        != input
-                            .position_span(input.len() - 1)
-                            .map_or(u64::MAX, |span| span.end)
+                p.total_positions()
+                    != input
+                        .position_span(input.len() - 1)
+                        .map_or(u64::MAX, |span| span.end)
             }) {
                 return Err(crate::Error::Corruption(
                     "reorder position count mismatch".into(),
@@ -836,13 +831,7 @@ pub(crate) async fn reorder_term(
         output.push(entry.new, entry.tf, length)?;
         if let Some(positions) = &mut positions[entry.source] {
             positions
-                .append_doc(
-                    &mut position_output,
-                    entry.old,
-                    entry.cursor,
-                    entry.tf,
-                    cancellation,
-                )
+                .append_doc(&mut position_output, entry.cursor, entry.tf, cancellation)
                 .await?;
         }
     }

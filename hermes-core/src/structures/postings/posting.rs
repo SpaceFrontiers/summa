@@ -2357,8 +2357,9 @@ impl BlockPostingList {
             block_tfs,
             tf_state: (0, 0, 0),
             position_in_block: 0,
-            tf_prefix: 0,
-            tf_prefix_position: 0,
+            position_offsets: None,
+            position_offsets_ready: false,
+            block_position_cursor: 0,
             exhausted: first_block.is_none(),
         };
         if let Some(block) = first_block {
@@ -2391,11 +2392,11 @@ pub struct BlockPostingIterator<'a> {
     block_tfs: std::sync::OnceLock<[u32; BLOCK_SIZE]>,
     tf_state: (usize, usize, usize),
     position_in_block: usize,
-    /// Sum of the term frequencies of the postings before
-    /// `tf_prefix_position` in the current block (position stream offset
-    /// relative to the block's cursor).
-    tf_prefix: u64,
-    tf_prefix_position: usize,
+    /// Lazily computed absolute position offsets, including the one-past-end
+    /// offset. One bounded block (1 KiB) replaces per-document prefix reductions.
+    position_offsets: Option<Box<[u64; BLOCK_SIZE + 1]>>,
+    position_offsets_ready: bool,
+    block_position_cursor: u64,
     exhausted: bool,
 }
 
@@ -2416,8 +2417,9 @@ impl<'a> BlockPostingIterator<'a> {
             block_tfs: std::sync::OnceLock::new(),
             tf_state: (0, 0, 0),
             position_in_block: 0,
-            tf_prefix: 0,
-            tf_prefix_position: 0,
+            position_offsets: None,
+            position_offsets_ready: false,
+            block_position_cursor: 0,
             exhausted,
         };
         if !iter.exhausted {
@@ -2435,8 +2437,9 @@ impl<'a> BlockPostingIterator<'a> {
             block_tfs: std::sync::OnceLock::new(),
             tf_state: (0, 0, 0),
             position_in_block: 0,
-            tf_prefix: 0,
-            tf_prefix_position: 0,
+            position_offsets: None,
+            position_offsets_ready: false,
+            block_position_cursor: 0,
             exhausted,
         };
         if !iter.exhausted {
@@ -2453,8 +2456,8 @@ impl<'a> BlockPostingIterator<'a> {
 
         self.current_block = block_idx;
         self.position_in_block = 0;
-        self.tf_prefix = 0;
-        self.tf_prefix_position = 0;
+        self.position_offsets_ready = false;
+        self.block_position_cursor = self.block_list.pos_cursor(block_idx).unwrap_or(0);
 
         self.block_tfs.take();
         match self
@@ -2496,28 +2499,46 @@ impl<'a> BlockPostingIterator<'a> {
     /// Meaningful only for lists built with position cursors.
     #[inline]
     pub fn position_cursor(&self) -> u64 {
-        self.block_list.pos_cursor(self.current_block).unwrap_or(0)
-            + self.tf_prefix
-            + self.pending_position_prefix()
-    }
-
-    /// Commit only the pending position prefix. Sequential phrase consumers
-    /// reduce each frequency at most once per block; document-only traversal
-    /// never touches these frequencies to maintain an unused position offset.
-    pub(crate) fn position_cursor_mut(&mut self) -> u64 {
-        self.tf_prefix += self.pending_position_prefix();
-        self.tf_prefix_position = self.position_in_block;
-        self.block_list.pos_cursor(self.current_block).unwrap_or(0) + self.tf_prefix
-    }
-
-    fn pending_position_prefix(&self) -> u64 {
-        if self.tf_prefix_position == self.position_in_block {
-            return 0;
+        if self.position_offsets_ready {
+            self.position_offsets.as_ref().unwrap()[self.position_in_block]
+        } else {
+            self.block_position_cursor
+                + self.frequencies()[..self.position_in_block]
+                    .iter()
+                    .map(|&tf| u64::from(tf))
+                    .sum::<u64>()
         }
-        self.frequencies()[self.tf_prefix_position..self.position_in_block]
-            .iter()
-            .map(|&tf| u64::from(tf))
-            .sum()
+    }
+
+    pub(crate) fn position_cursor_mut(&mut self) -> u64 {
+        if !self.position_offsets_ready {
+            self.initialize_position_offsets();
+        }
+        self.position_offsets.as_ref().unwrap()[self.position_in_block]
+    }
+
+    /// Address and length of the current posting's positions. Prefixes are
+    /// prepared once per block; document-only iteration does not initialize them.
+    #[inline]
+    pub(crate) fn position_range(&mut self) -> (u64, u32) {
+        let cursor = self.position_cursor_mut();
+        (cursor, self.frequencies()[self.position_in_block])
+    }
+
+    fn initialize_position_offsets(&mut self) {
+        self.frequencies();
+        let offsets = self
+            .position_offsets
+            .get_or_insert_with(|| Box::new([0; BLOCK_SIZE + 1]));
+        let mut total = self.block_position_cursor;
+        offsets[0] = total;
+        if let Some(frequencies) = self.block_tfs.get() {
+            for (offset, &tf) in offsets[1..].iter_mut().zip(&frequencies[..self.tf_state.2]) {
+                total += u64::from(tf);
+                *offset = total;
+            }
+        }
+        self.position_offsets_ready = true;
     }
 
     pub fn doc(&self) -> DocId {
@@ -2581,47 +2602,21 @@ impl<'a> BlockPostingIterator<'a> {
         self.block_doc_ids[self.position_in_block]
     }
 
-    /// Align one bounded pair of decoded blocks. `None` means a block was
-    /// consumed; the caller may check cancellation before continuing. A match
-    /// parks both cursors for subsequent exact TF and position reads.
-    pub(crate) fn intersect_block(
+    /// Select a posting from a bounded decoded suffix, leaving it parked for
+    /// ordinary frequency/position reads. None yields after consuming a block.
+    pub(crate) fn find_in_block(
         &mut self,
-        other: &mut BlockPostingIterator<'_>,
+        mut find: impl FnMut(&[u32], &[u32]) -> Option<usize>,
     ) -> Option<DocId> {
-        if self.exhausted || other.exhausted {
+        if self.exhausted {
             return Some(TERMINATED);
         }
-        if self.block_doc_ids.last().copied().unwrap() < other.doc() {
-            self.seek_later_block(other.doc());
-            return None;
+        let start = self.position_in_block;
+        if let Some(offset) = find(&self.block_doc_ids[start..], &self.frequencies()[start..]) {
+            self.position_in_block += offset;
+            return Some(self.block_doc_ids[self.position_in_block]);
         }
-        if other.block_doc_ids.last().copied().unwrap() < self.doc() {
-            other.seek_later_block(self.doc());
-            return None;
-        }
-        let mut a = self.position_in_block;
-        let mut b = other.position_in_block;
-        let mut pair = [(0, 0)];
-        if simd::intersect_posting_blocks(
-            &self.block_doc_ids,
-            &mut a,
-            &other.block_doc_ids,
-            &mut b,
-            &mut pair,
-        ) != 0
-        {
-            self.position_in_block = usize::from(pair[0].0);
-            other.position_in_block = usize::from(pair[0].1);
-            return Some(self.doc());
-        }
-        self.position_in_block = a;
-        other.position_in_block = b;
-        if a == self.block_doc_ids.len() {
-            self.load_block(self.current_block + 1);
-        }
-        if b == other.block_doc_ids.len() {
-            other.load_block(other.current_block + 1);
-        }
+        self.load_block(self.current_block + 1);
         None
     }
 
@@ -2643,8 +2638,6 @@ impl<'a> BlockPostingIterator<'a> {
             return TERMINATED;
         }
         self.position_in_block = self.block_doc_ids.partition_point(|&doc| doc < target);
-        self.tf_prefix = 0;
-        self.tf_prefix_position = 0;
         self.doc()
     }
 
@@ -2810,6 +2803,11 @@ impl<'a> BlockPostingIterator<'a> {
         self.block_list.l0_count
     }
 
+    /// Borrow immutable metadata for the currently decoded posting block.
+    pub(crate) fn current_block_metadata(&self) -> Option<(&BlockPostingList, usize)> {
+        (!self.exhausted).then_some((&self.block_list, self.current_block))
+    }
+
     /// Get the current block's max term frequency for block-max pruning
     #[inline]
     pub fn current_block_max_tf(&self) -> u32 {
@@ -2823,9 +2821,206 @@ impl<'a> BlockPostingIterator<'a> {
     }
 }
 
+/// Bounded intersection scratch for a fixed pair of monotonically advancing
+/// posting iterators. Cursor positions stay on a match while its TF and positions
+/// are consumed; the SIMD kernel runs once per overlapping block pair.
+pub(crate) struct PostingIntersection {
+    seek_driven: bool,
+    left_is_rare: bool,
+    blocks: (usize, usize),
+    pairs: [(u8, u8); BLOCK_SIZE],
+    next: usize,
+    count: usize,
+    ends: (usize, usize),
+}
+
+impl Default for PostingIntersection {
+    fn default() -> Self {
+        Self {
+            seek_driven: false,
+            left_is_rare: true,
+            blocks: (usize::MAX, usize::MAX),
+            pairs: [(0, 0); BLOCK_SIZE],
+            next: 0,
+            count: 0,
+            ends: (0, 0),
+        }
+    }
+}
+
+impl PostingIntersection {
+    pub(crate) fn with_costs(left: u32, right: u32) -> Self {
+        Self {
+            seek_driven: left.min(right).saturating_mul(4) < left.max(right),
+            left_is_rare: left <= right,
+            ..Self::default()
+        }
+    }
+
+    /// Invalidate cached pairs before a physical rewind through a document map.
+    pub(crate) fn reset(&mut self) {
+        self.blocks = (usize::MAX, usize::MAX);
+    }
+
+    /// None yields at a block boundary so the caller can check cancellation.
+    pub(crate) fn intersect_block(
+        &mut self,
+        left: &mut BlockPostingIterator<'_>,
+        right: &mut BlockPostingIterator<'_>,
+    ) -> Option<DocId> {
+        if left.exhausted || right.exhausted {
+            return Some(TERMINATED);
+        }
+        if left.doc() == right.doc() {
+            return Some(left.doc());
+        }
+        if self.seek_driven {
+            fn align(
+                lead: &mut BlockPostingIterator<'_>,
+                other: &mut BlockPostingIterator<'_>,
+            ) -> Option<DocId> {
+                let candidate = lead.doc();
+                let next = other.seek(candidate);
+                if next == candidate {
+                    return Some(candidate);
+                }
+                lead.seek(next);
+                None
+            }
+            return if self.left_is_rare {
+                align(left, right)
+            } else {
+                align(right, left)
+            };
+        }
+        if *left.block_doc_ids.last().unwrap() < right.doc() {
+            left.seek_later_block(right.doc());
+            return None;
+        }
+        if *right.block_doc_ids.last().unwrap() < left.doc() {
+            right.seek_later_block(left.doc());
+            return None;
+        }
+        let blocks = (left.current_block, right.current_block);
+        if self.blocks != blocks {
+            let mut a = left.position_in_block;
+            let mut b = right.position_in_block;
+            self.count = simd::intersect_posting_blocks(
+                &left.block_doc_ids,
+                &mut a,
+                &right.block_doc_ids,
+                &mut b,
+                &mut self.pairs,
+            );
+            self.blocks = blocks;
+            self.ends = (a, b);
+            self.next = 0;
+        }
+        while self.next < self.count {
+            let (a, b) = self.pairs[self.next];
+            self.next += 1;
+            let (a, b) = (usize::from(a), usize::from(b));
+            if a >= left.position_in_block && b >= right.position_in_block {
+                left.position_in_block = a;
+                right.position_in_block = b;
+                return Some(left.doc());
+            }
+        }
+        left.position_in_block = left.position_in_block.max(self.ends.0);
+        right.position_in_block = right.position_in_block.max(self.ends.1);
+        if left.position_in_block == left.block_doc_ids.len() {
+            left.load_block(left.current_block + 1);
+        }
+        if right.position_in_block == right.block_doc_ids.len() {
+            right.load_block(right.current_block + 1);
+        }
+        None
+    }
+}
+
 #[cfg(test)]
 mod compact_layout_tests {
     use super::*;
+    #[test]
+    fn batched_intersection_preserves_monotone_seeks_frequencies_and_position_offsets() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let make = |divisor| {
+                let mut postings = PostingList::new();
+                for doc in 0..3001 {
+                    if doc % divisor != 1 {
+                        postings.push(doc, 1 + doc % 7);
+                    }
+                }
+                BlockPostingList::from_posting_list_with_options(&postings, true, None, codec)
+                    .unwrap()
+            };
+            let a = make(3);
+            let b = make(5);
+            for (seek_driven, left_is_rare) in [(false, true), (true, true), (true, false)] {
+                let mut left = a.iterator();
+                let mut right = b.iterator();
+                let mut reference_left = a.iterator();
+                let mut reference_right = b.iterator();
+                let mut intersection = PostingIntersection {
+                    seek_driven,
+                    left_is_rare,
+                    ..Default::default()
+                };
+                let mut target = 0;
+                loop {
+                    left.seek(target);
+                    right.seek(target);
+                    let doc = loop {
+                        if let Some(doc) = intersection.intersect_block(&mut left, &mut right) {
+                            break doc;
+                        }
+                    };
+                    let expected = (target..3001)
+                        .find(|doc| doc % 3 != 1 && doc % 5 != 1)
+                        .unwrap_or(TERMINATED);
+                    assert_eq!(doc, expected);
+                    assert_eq!(
+                        intersection.intersect_block(&mut left, &mut right),
+                        Some(doc)
+                    );
+                    if doc == TERMINATED {
+                        break;
+                    }
+                    reference_left.seek(doc);
+                    reference_right.seek(doc);
+                    assert_eq!(left.term_freq(), reference_left.term_freq());
+                    assert_eq!(right.term_freq(), reference_right.term_freq());
+                    assert_eq!(left.position_cursor(), reference_left.position_cursor());
+                    assert_eq!(right.position_cursor(), reference_right.position_cursor());
+                    target = doc + if doc % 7 == 0 { 19 } else { 1 };
+                }
+                for target in [0, 200, 129, 3, 2048, 3000, 2] {
+                    intersection.reset();
+                    left.seek_physical(target);
+                    right.seek_physical(target);
+                    let doc = loop {
+                        if let Some(doc) = intersection.intersect_block(&mut left, &mut right) {
+                            break doc;
+                        }
+                    };
+                    let expected = (target..3001)
+                        .find(|doc| doc % 3 != 1 && doc % 5 != 1)
+                        .unwrap_or(TERMINATED);
+                    assert_eq!(doc, expected);
+                    reference_left.seek_physical(doc);
+                    reference_right.seek_physical(doc);
+                    assert_eq!(left.position_cursor(), reference_left.position_cursor());
+                    assert_eq!(right.position_cursor(), reference_right.position_cursor());
+                }
+            }
+        }
+    }
+
     #[test]
     fn compact_postings_preserve_payload_scores_and_copy_merges() {
         for codec in [
@@ -3178,9 +3373,9 @@ mod tests {
             let mut cursor = list.iterator();
             for target in [7, 70, 777, 896, 1400, 3500, 4900] {
                 assert_eq!(cursor.seek(target), target);
-                assert_eq!(
-                    cursor.tf_prefix, 0,
-                    "navigation must not sum unused frequencies"
+                assert!(
+                    cursor.position_offsets.is_none(),
+                    "navigation must not prepare unused position offsets"
                 );
                 assert_eq!(cursor.position_cursor(), expected[target as usize / 7]);
                 assert_eq!(cursor.term_freq(), target / 7 % 23 + 1);
@@ -3209,6 +3404,8 @@ mod tests {
             let mut cursor = list.iterator();
             for at in [13, 25, 127, 128, 199] {
                 cursor.seek(docs[at].0);
+                assert_eq!(cursor.position_range(), (prefixes[at], docs[at].1));
+                assert_eq!(cursor.position_range(), (prefixes[at], docs[at].1));
                 assert_eq!(cursor.position_cursor_mut(), prefixes[at]);
                 assert_eq!(cursor.position_cursor_mut(), prefixes[at]);
                 assert_eq!(cursor.position_cursor(), prefixes[at]);

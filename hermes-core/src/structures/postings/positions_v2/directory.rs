@@ -1,7 +1,7 @@
-//! POS4 metadata, independent of the packed payload pages.
+//! POS6 metadata, independent of the packed payload pages.
 use super::*;
 
-pub(super) const COMPACT_MAGIC: u32 = 0x3453_4f50;
+pub(super) const COMPACT_MAGIC: u32 = 0x3653_4f50;
 const GROUP: usize = 8;
 
 fn invalid() -> io::Error {

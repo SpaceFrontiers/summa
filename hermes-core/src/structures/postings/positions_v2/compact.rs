@@ -16,10 +16,9 @@ pub(crate) struct PositionRangeSource {
     cached: Option<usize>,
     raw: OwnedBytes,
     values: Vec<u32>,
-    legacy: Option<TermPositionCursor>,
-    budget: usize,
     compact: bool,
     repack_blocks: bool,
+    unique_positions: bool,
 }
 
 impl PositionRangeSource {
@@ -40,35 +39,15 @@ impl PositionRangeSource {
             cached: None,
             raw: OwnedBytes::new(Vec::new()),
             values: Vec::with_capacity(POSITION_STREAM_BLOCK),
-            legacy: None,
-            budget,
             compact: directory::is_compact(tail.as_slice()),
             repack_blocks: false,
+            unique_positions: false,
         };
-        if !PositionStream::is_stream(tail.as_slice()) {
-            if source.file.len() > (budget / 16) as u64 || tail.len() != FOOTER {
-                return Err(invalid("legacy positions exceed compaction scratch budget"));
-            }
-            let bytes = source.file.read_bytes().await?;
-            let data_len = u64::from_le_bytes(tail[..8].try_into().unwrap());
-            let count = u32::from_le_bytes(tail[8..12].try_into().unwrap()) as u64;
-            if data_len.checked_add(count * 20) != Some(source.file.len() - FOOTER as u64) {
-                return Err(invalid("invalid legacy position directory"));
-            }
-            for entry in bytes[data_len as usize..bytes.len() - FOOTER].chunks_exact(20) {
-                let offset = u64::from_le_bytes(entry[8..16].try_into().unwrap());
-                let len = u32::from_le_bytes(entry[16..20].try_into().unwrap()) as u64;
-                if offset.checked_add(len).is_none_or(|end| end > data_len) {
-                    return Err(invalid("invalid legacy position block"));
-                }
-            }
-            source.legacy = Some(TermPositions::open(bytes)?.into_cursor());
-            return Ok(source);
-        }
         let total_len = usize::try_from(source.file.len())
             .map_err(|_| invalid("position file exceeds address space"))?;
         let (blocks, index_start, total) =
             PositionStream::parse_layout_tail(tail.as_slice(), total_len)?;
+        source.unique_positions = has_unique_positions(tail.as_slice());
         if total_len - FOOTER - index_start > budget {
             return Err(invalid(
                 "position directory exceeds compaction scratch budget",
@@ -134,9 +113,6 @@ impl PositionRangeSource {
     pub(crate) fn total_positions(&self) -> u64 {
         self.total
     }
-    pub(crate) fn is_stream(&self) -> bool {
-        self.legacy.is_none()
-    }
     fn entry(&self, i: usize) -> (usize, u64) {
         if self.compact {
             directory::entry(self.index.as_slice(), self.blocks, i)
@@ -148,42 +124,32 @@ impl PositionRangeSource {
     pub(crate) async fn append_doc<W: Write>(
         &mut self,
         writer: &mut PositionStreamEncoder<W>,
-        doc: DocId,
         cursor: u64,
         tf: u32,
         cancellation: Option<&AtomicBool>,
     ) -> io::Result<()> {
-        if let Some(legacy) = &mut self.legacy {
-            if (tf as usize).saturating_mul(4) > self.budget / 2 {
-                return Err(invalid(
-                    "legacy document positions exceed compaction scratch budget",
-                ));
-            }
-            if !legacy.read_into(doc, cursor, tf, &mut self.values)
-                || self.values.len() != tf as usize
-            {
-                return Err(invalid("invalid legacy document positions"));
-            }
-            return writer.push_doc(&mut self.values);
-        }
         let end = cursor
             .checked_add(u64::from(tf))
             .ok_or_else(|| invalid("position cursor overflow"))?;
         self.append_range(writer, cursor..end, cancellation).await
     }
 
+    /// Copy a range spanning complete postings; callers own the doc/TF boundaries.
+    /// The source certificate survives only when every appended source has it.
     pub(crate) async fn append_range<W: Write>(
         &mut self,
         writer: &mut PositionStreamEncoder<W>,
         range: std::ops::Range<u64>,
         cancellation: Option<&AtomicBool>,
     ) -> io::Result<()> {
-        if range.start > range.end || range.end > self.total || self.legacy.is_some() {
+        if range.start > range.end || range.end > self.total {
             return Err(invalid("invalid position compaction range"));
         }
         if range.is_empty() {
             return Ok(());
         }
+        let unique_positions = writer.unique_positions && self.unique_positions;
+        writer.unique_positions = false;
         let mut low = 0;
         let mut high = self.blocks;
         while low < high {
@@ -259,6 +225,7 @@ impl PositionRangeSource {
             cursor = take_end;
             block += 1;
         }
+        writer.unique_positions = unique_positions;
         Ok(())
     }
 }
@@ -291,6 +258,69 @@ impl<W: Write> PositionStreamEncoder<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn doc_aligned_position_copies_preserve_uniqueness_across_reorder_and_deletion() {
+        for compact in [false, true] {
+            for duplicate in [false, true] {
+                let docs: Vec<Vec<u32>> = (0..300)
+                    .map(|i| {
+                        if duplicate && i == 13 {
+                            vec![0, 0]
+                        } else {
+                            vec![0, i + 1]
+                        }
+                    })
+                    .collect();
+                let mut bytes = Vec::new();
+                let mut encoder = PositionStreamEncoder::new(&mut bytes);
+                if compact {
+                    encoder = encoder.with_compact_directory();
+                }
+                for doc in &docs {
+                    encoder.push_doc(&mut doc.clone()).unwrap();
+                }
+                encoder.finish().unwrap();
+                for repack in [false, true] {
+                    let mut source = PositionRangeSource::open(
+                        FileHandle::from_bytes(OwnedBytes::new(bytes.clone())),
+                        4096,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                    if repack {
+                        source = source.with_repacked_blocks();
+                    }
+                    let mut output = Vec::new();
+                    let mut writer = PositionStreamEncoder::with_budget(
+                        &mut output,
+                        4096,
+                        PostingCodec::Rounded,
+                    );
+                    if compact {
+                        writer = writer.with_compact_directory();
+                    }
+                    for doc in [299u32, 0, 13, 200, 128] {
+                        source
+                            .append_doc(&mut writer, u64::from(doc) * 2, 2, None)
+                            .await
+                            .unwrap();
+                    }
+                    writer.finish().unwrap();
+                    assert_eq!(has_unique_positions(&output), !duplicate);
+                    let mut cursor = TermPositions::open(OwnedBytes::new(output))
+                        .unwrap()
+                        .into_cursor();
+                    let mut actual = Vec::new();
+                    for (i, doc) in [299, 0, 13, 200, 128].into_iter().enumerate() {
+                        assert!(cursor.read_into(i as u64 * 2, 2, &mut actual));
+                        assert_eq!(actual, docs[doc]);
+                    }
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn reordered_position_ranges_pack_identically_to_fresh_encoding() {
@@ -464,80 +494,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// A pre-stream `PositionPostingList` source is re-encoded document by
-    /// document into a current stream; the result must be byte-identical to
-    /// encoding the same documents directly, and the legacy budget guards
-    /// must reject sources that do not fit the compaction scratch.
-    #[tokio::test]
-    async fn legacy_position_lists_are_recoded_into_streams_document_by_document() {
-        let docs: Vec<(DocId, Vec<u32>)> = (0..300u32)
-            .map(|doc| (doc * 2, (0..doc % 9 + 1).map(|p| p * 5 + doc).collect()))
-            .collect();
-        let mut legacy = crate::structures::PositionPostingList::new();
-        for (doc, positions) in &docs {
-            legacy.push(*doc, positions.clone());
-        }
-        let mut legacy_bytes = Vec::new();
-        legacy.serialize(&mut legacy_bytes).unwrap();
-        assert!(!PositionStream::is_stream(&legacy_bytes));
-        let file = FileHandle::from_bytes(OwnedBytes::new(legacy_bytes.clone()));
-
-        let mut source = PositionRangeSource::open(file.clone(), 1 << 20, None)
-            .await
-            .unwrap();
-        assert!(!source.is_stream());
-        let mut output = Vec::new();
-        let mut writer =
-            PositionStreamEncoder::with_budget(&mut output, 1 << 20, PostingCodec::Rounded);
-        let mut cursor = 0u64;
-        for (doc, positions) in &docs {
-            source
-                .append_doc(&mut writer, *doc, cursor, positions.len() as u32, None)
-                .await
-                .unwrap();
-            cursor += positions.len() as u64;
-        }
-        // Stream-only range copies are refused on a legacy source.
-        assert!(source.append_range(&mut writer, 0..1, None).await.is_err());
-        writer.finish().unwrap();
-
-        let mut expected = Vec::new();
-        let mut encoder = PositionStreamEncoder::new(&mut expected);
-        for (_, positions) in &docs {
-            encoder.push_doc(&mut positions.clone()).unwrap();
-        }
-        encoder.finish().unwrap();
-        assert_eq!(
-            output, expected,
-            "legacy re-encoding must match direct encoding"
-        );
-
-        // A document id the legacy list does not contain is a hard error.
-        let mut source = PositionRangeSource::open(file.clone(), 1 << 20, None)
-            .await
-            .unwrap();
-        let mut writer =
-            PositionStreamEncoder::with_budget(Vec::new(), 1 << 20, PostingCodec::Rounded);
-        assert!(source.append_doc(&mut writer, 1, 0, 1, None).await.is_err());
-
-        // Legacy sources larger than budget / 16 are refused at open, and a
-        // document whose tf does not fit half the budget is refused at copy.
-        assert!(
-            PositionRangeSource::open(file.clone(), legacy_bytes.len() * 16 - 16, None)
-                .await
-                .is_err()
-        );
-        let mut source = PositionRangeSource::open(file, legacy_bytes.len() * 16, None)
-            .await
-            .unwrap();
-        assert!(
-            source
-                .append_doc(&mut writer, 0, 0, u32::MAX, None)
-                .await
-                .is_err()
-        );
     }
 
     #[tokio::test]

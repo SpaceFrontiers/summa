@@ -1,5 +1,8 @@
 //! Phrase query - matches documents containing terms in consecutive positions
 
+mod competitive;
+use competitive::CompetitiveLengths;
+
 use std::sync::Arc;
 
 use crate::dsl::Field;
@@ -361,6 +364,7 @@ fn finish_phrase_scorer<'a>(
                 reader.num_docs(),
                 budget,
                 |scorer, slot| {
+                    scorer.intersection.reset();
                     for cursor in &mut scorer.posting_iters {
                         cursor.seek_physical(slot);
                     }
@@ -431,7 +435,7 @@ pub(super) async fn score_phrase_candidates(
         for cursor in &mut scorer.posting_iters {
             matches &= cursor.seek(target) == target;
         }
-        if matches && scorer.check_phrase_positions(target) {
+        if matches && scorer.check_phrase_positions() {
             scorer.current_doc = target;
             scores[index] = scorer.score();
         }
@@ -727,16 +731,73 @@ impl Lengths {
     }
 }
 
+/// Phrase frequency cannot exceed the original-first term's frequency, so its
+/// existing term envelopes also bound the phrase in the phrase's score space.
+fn phrase_block_bound(
+    bounds: &super::bm25::PreparedBounds,
+    list: &BlockPostingList,
+    block: usize,
+    singletons: Option<&[Score; 1024]>,
+) -> Score {
+    let (tf, length) = list.block_bounds(block).unwrap_or((0, None));
+    let length = length.unwrap_or(1).max(1);
+    let mut score = if tf == 1 {
+        singletons
+            .and_then(|table| table.get(length as usize))
+            .copied()
+            .unwrap_or_else(|| bounds.pair(tf, length))
+    } else {
+        bounds.pair(tf, length)
+    };
+    if list.has_ratio_bounds() {
+        score = score.min(bounds.ratio(tf, list.block_length_ratio(block)));
+    }
+    if list.has_impact_bounds() {
+        score = score.min(bounds.impacts(|a, b| list.block_impact_minimum(block, a, b)));
+    }
+    score
+}
+
+/// The same phrase-frequency bound applies across an existing L1 posting group.
+fn phrase_group_bound(
+    bounds: &super::bm25::PreparedBounds,
+    list: &BlockPostingList,
+    block: usize,
+    singletons: Option<&[Score; 1024]>,
+) -> Option<(DocId, Score)> {
+    let (tf, length) = list.group_bounds(block)?;
+    let length = length.max(1);
+    let mut score = if tf == 1 {
+        singletons
+            .and_then(|table| table.get(length as usize))
+            .copied()
+            .unwrap_or_else(|| bounds.pair(tf, length))
+    } else {
+        bounds.pair(tf, length)
+    };
+    if list.has_ratio_bounds() {
+        score = score.min(bounds.ratio(tf, list.group_length_ratio(block)));
+    }
+    if list.has_group_impact_bounds() {
+        score = score.min(bounds.impacts(|a, b| list.group_impact_minimum(block, a, b)));
+    }
+    Some((list.group_last_doc(block)?, score))
+}
+
 /// Scorer that checks phrase positions
 struct PhraseScorer {
     /// Upper bound on matches, used to choose conjunction drivers.
     cost: u32,
     /// Rarest posting list; position arrays retain their original phrase order.
     lead: usize,
+    /// Exact phrases with unique original-first starts may use any term's TF.
+    bound_term: usize,
+    scan_bound_term: bool,
+    intersection: crate::structures::postings::PostingIntersection,
     budget: Option<super::SharedThreshold>,
     /// Posting iterators for each term
     posting_iters: Vec<BlockPostingIterator<'static>>,
-    /// Positions of each term (legacy list or cursor-addressed stream)
+    /// Cursor-addressed position streams for each term
     position_lists: Vec<crate::structures::postings::TermPositionCursor>,
     /// Position-list cursors advance monotonically within a matching unit.
     position_indices: Vec<usize>,
@@ -769,6 +830,8 @@ struct PhraseScorer {
     /// Whether per-candidate score bounds are numerically safe; computed once
     /// from the lengths and parameters, not per candidate.
     prepared_bounds: Option<super::bm25::PreparedBounds>,
+    singleton_bounds: Option<Box<[Score; 1024]>>,
+    competitive_lengths: Option<CompetitiveLengths>,
     /// Reusable position buffers (one per term, avoids per-document allocation)
     position_bufs: Vec<Vec<u32>>,
 }
@@ -790,8 +853,24 @@ impl PhraseScorer {
             .map(|(index, list)| (index, list.doc_count()))
             .min_by_key(|&(_, count)| count)
             .unwrap_or((0, 0));
+        let exact_term_bounds = slop == 0
+            && position_lists
+                .first()
+                .is_some_and(TermPositions::has_unique_positions);
+        let bound_term = if exact_term_bounds { lead } else { 0 };
+        let scan_bound_term = posting_lists
+            .get(bound_term)
+            .is_some_and(|list| list.doc_count() <= cost.saturating_mul(4));
         let mut term_order: smallvec::SmallVec<[usize; 8]> = (0..posting_lists.len()).collect();
         term_order.sort_unstable_by_key(|&index| (posting_lists[index].doc_count(), index));
+        let intersection = if term_order.len() >= 2 {
+            crate::structures::postings::PostingIntersection::with_costs(
+                posting_lists[term_order[0]].doc_count(),
+                posting_lists[term_order[1]].doc_count(),
+            )
+        } else {
+            Default::default()
+        };
         let posting_iters: Vec<_> = posting_lists
             .into_iter()
             .map(|p| p.into_iterator())
@@ -807,6 +886,9 @@ impl PhraseScorer {
         Self {
             cost,
             lead,
+            bound_term,
+            scan_bound_term,
+            intersection,
             budget: budget.filter(|b| b.deadline().is_some()),
             posting_iters,
             position_lists: position_lists
@@ -827,6 +909,8 @@ impl PhraseScorer {
             avg_field_len,
             lengths: None,
             prepared_bounds: None,
+            singleton_bounds: None,
+            competitive_lengths: None,
             position_bufs: (0..num_terms).map(|_| Vec::new()).collect(),
         }
     }
@@ -835,6 +919,8 @@ impl PhraseScorer {
     fn with_lengths(mut self, lengths: Lengths) -> Self {
         self.lengths = Some(lengths);
         self.prepared_bounds = self.prepare_bounds();
+        self.competitive_lengths = None;
+        self.singleton_bounds = self.prepare_singleton_bounds();
         self
     }
 
@@ -842,16 +928,34 @@ impl PhraseScorer {
     fn with_params(mut self, params: super::Bm25Params) -> Self {
         self.params = params;
         self.prepared_bounds = self.prepare_bounds();
+        self.competitive_lengths = None;
+        self.singleton_bounds = self.prepare_singleton_bounds();
         self
     }
 
     /// Conservative bounds need document lengths and parameters under which
     /// the canonical score is finite and monotone in term frequency.
     fn prepare_bounds(&self) -> Option<super::bm25::PreparedBounds> {
-        if !matches!(self.lengths, Some(Lengths::Docs(_))) {
-            return None;
+        match &self.lengths {
+            Some(Lengths::Docs(_)) => {}
+            Some(Lengths::Chunks(map)) if map.is_document_map() => {}
+            _ => return None,
         }
         super::bm25::PreparedBounds::new(self.params, u32::MAX, self.idf, self.avg_field_len)
+    }
+
+    /// Cache the common singleton frequency over short scoring lengths. Scratch
+    /// is bounded at 4 KiB per scorer; short lists and longer lengths use the
+    /// same scalar bound without paying the table construction cost.
+    fn prepare_singleton_bounds(&self) -> Option<Box<[Score; 1024]>> {
+        self.prepared_bounds.as_ref()?;
+        if self.cost < 1024 {
+            return None;
+        }
+        Some(Box::new(std::array::from_fn(|length| {
+            self.params
+                .score(1.0, self.idf, (length as f32).max(1.0), self.avg_field_len)
+        })))
     }
 
     /// Park on a posting intersection without reading positions.
@@ -872,6 +976,18 @@ impl PhraseScorer {
         self.confirmed = confirmed;
     }
 
+    /// Both cursors are parked on an already consumed conjunction candidate.
+    /// Moving them together exposes consecutive common matches without another
+    /// intersection probe. Other phrase arities keep the rarest-term driver.
+    fn advance_aligned(&mut self) {
+        if let [first, second] = self.posting_iters.as_mut_slice() {
+            first.advance();
+            second.advance();
+        } else {
+            self.posting_iters[self.lead].advance();
+        }
+    }
+
     /// Find next document where all terms appear as a phrase.
     fn find_next_phrase_match(&mut self) {
         while self.find_next_candidate() != TERMINATED {
@@ -881,7 +997,7 @@ impl PhraseScorer {
             if self.current_doc == TERMINATED {
                 return;
             }
-            self.posting_iters[self.lead].advance();
+            self.advance_aligned();
         }
     }
 
@@ -911,7 +1027,7 @@ impl PhraseScorer {
                 {
                     return TERMINATED;
                 }
-                if let Some(doc) = lead.intersect_block(other) {
+                if let Some(doc) = self.intersection.intersect_block(lead, other) {
                     return doc;
                 }
             }
@@ -929,7 +1045,7 @@ impl PhraseScorer {
                 .posting_iters
                 .get_disjoint_mut([self.lead, self.term_order[1]])
                 .expect("distinct phrase cursors");
-            let Some(candidate) = lead.intersect_block(second) else {
+            let Some(candidate) = self.intersection.intersect_block(lead, second) else {
                 continue;
             };
             if candidate == TERMINATED {
@@ -947,7 +1063,7 @@ impl PhraseScorer {
     }
 
     /// Check if positions form a valid phrase for the given document
-    fn check_phrase_positions(&mut self, doc_id: DocId) -> bool {
+    fn check_phrase_positions(&mut self) -> bool {
         crate::observe::search_work!(phrase_confirmations += 1);
         // Backfill also calls this method directly after parking term cursors.
         // Frequency belongs to these position buffers, so invalidate it at
@@ -955,13 +1071,13 @@ impl PhraseScorer {
         self.first_match = false;
         self.frequency.take();
         if self.slop == 0 {
-            return self.check_exact_phrase_positions(doc_id);
+            return self.check_exact_phrase_positions();
         }
         // Get positions for each term into reusable buffers (zero allocation).
         // The doc-posting iterator of every term is parked on `doc_id`, so
         // its cursor and term frequency address the term's position stream.
         for i in 0..self.position_lists.len() {
-            if !self.read_term_positions(i, doc_id) {
+            if !self.read_term_positions(i) {
                 return false;
             }
         }
@@ -979,20 +1095,103 @@ impl PhraseScorer {
         self.first_match
     }
 
-    fn read_term_positions(&mut self, term: usize, doc_id: DocId) -> bool {
-        let cursor = self.posting_iters[term].position_cursor_mut();
-        let tf = self.posting_iters[term].term_freq();
-        self.position_lists[term].read_into(doc_id, cursor, tf, &mut self.position_bufs[term])
+    fn read_term_positions(&mut self, term: usize) -> bool {
+        let (cursor, tf) = self.posting_iters[term].position_range();
+        self.position_lists[term].read_into(cursor, tf, &mut self.position_bufs[term])
     }
 
-    fn check_exact_phrase_positions(&mut self, doc_id: DocId) -> bool {
+    fn check_exact_phrase_positions(&mut self) -> bool {
+        // A singleton of the certified bounding term fixes the only possible
+        // original-first start. Probe each required position directly; this
+        // also avoids materializing intermediate lists for longer phrases.
+        if self.posting_iters.len() > 2 && self.posting_iters[self.bound_term].term_freq() == 1 {
+            let anchor = self.bound_term;
+            let (cursor, _) = self.posting_iters[anchor].position_range();
+            let Some(start) = self.position_lists[anchor]
+                .read_one(cursor, &mut self.position_bufs[anchor])
+                .and_then(|position| position.checked_sub(self.deltas[anchor]))
+            else {
+                return false;
+            };
+            for index in 0..self.term_order.len() {
+                let term = self.term_order[index];
+                if term == anchor {
+                    continue;
+                }
+                let Some(target) = start.checked_add(self.deltas[term]) else {
+                    return false;
+                };
+                let (cursor, tf) = self.posting_iters[term].position_range();
+                if !self.position_lists[term].contains(
+                    cursor,
+                    tf,
+                    target,
+                    &mut self.position_bufs[term],
+                ) {
+                    return false;
+                }
+            }
+            self.first_match = true;
+            self.frequency = std::sync::OnceLock::from(1);
+            return true;
+        }
+        if self.posting_iters.len() == 2 {
+            let (first_cursor, first_tf) = self.posting_iters[0].position_range();
+            let (second_cursor, second_tf) = self.posting_iters[1].position_range();
+            if first_tf == 1 || (self.bound_term == 1 && second_tf == 1) {
+                let (anchor, other, cursor, other_cursor, other_tf) = if first_tf == 1 {
+                    (0, 1, first_cursor, second_cursor, second_tf)
+                } else {
+                    (1, 0, second_cursor, first_cursor, first_tf)
+                };
+                let target = self.position_lists[anchor]
+                    .read_one(cursor, &mut self.position_bufs[anchor])
+                    .and_then(|position| {
+                        if anchor == 0 {
+                            position.checked_add(self.deltas[1])
+                        } else {
+                            position.checked_sub(self.deltas[1])
+                        }
+                    });
+                self.first_match = target.is_some_and(|target| {
+                    self.position_lists[other].contains(
+                        other_cursor,
+                        other_tf,
+                        target,
+                        &mut self.position_bufs[other],
+                    )
+                });
+                self.frequency = std::sync::OnceLock::from(u32::from(self.first_match));
+                return self.first_match;
+            }
+            if !self.position_lists[0].read_into(first_cursor, first_tf, &mut self.position_bufs[0])
+                || !self.position_lists[1].read_into(
+                    second_cursor,
+                    second_tf,
+                    &mut self.position_bufs[1],
+                )
+            {
+                return false;
+            }
+            self.next_start = 0;
+            self.position_indices[1] = 0;
+            self.first_match = next_exact_phrase_match(
+                &self.position_bufs[0],
+                &self.position_bufs[1],
+                self.deltas[1],
+                &mut self.next_start,
+                &mut self.position_indices[1],
+            )
+            .is_some();
+            return self.first_match;
+        }
         let anchor = self.lead;
         let last = if anchor == 0 {
             *self.term_order.last().unwrap()
         } else {
             0
         };
-        if !self.read_term_positions(anchor, doc_id) {
+        if !self.read_term_positions(anchor) {
             return false;
         }
         if anchor != 0 {
@@ -1016,7 +1215,7 @@ impl PhraseScorer {
             if term == last && (anchor == 0 || rank + 1 == self.term_order.len()) {
                 continue;
             }
-            if !self.read_term_positions(term, doc_id) {
+            if !self.read_term_positions(term) {
                 return false;
             }
             let (starts, positions) = if anchor < term {
@@ -1031,9 +1230,7 @@ impl PhraseScorer {
                 return false;
             }
         }
-        if (anchor == 0 || self.term_order.last() == Some(&0))
-            && !self.read_term_positions(last, doc_id)
-        {
+        if (anchor == 0 || self.term_order.last() == Some(&0)) && !self.read_term_positions(last) {
             return false;
         }
         // Enumerate the original first term even when a rarer term supplied
@@ -1064,7 +1261,9 @@ impl PhraseScorer {
         }
         *self.frequency.get_or_init(|| {
             if self.slop == 0 {
-                let (last, delta) = if self.lead == 0 {
+                let (last, delta) = if self.posting_iters.len() == 2 {
+                    (1, self.deltas[1])
+                } else if self.lead == 0 {
                     let last = *self.term_order.last().unwrap();
                     (last, self.deltas[last])
                 } else {
@@ -1200,6 +1399,10 @@ fn count_phrase_matches(
 }
 
 impl super::docset::DocSet for PhraseScorer {
+    fn supports_doc_batches(&self) -> bool {
+        true
+    }
+
     fn doc(&self) -> DocId {
         self.current_doc
     }
@@ -1209,7 +1412,7 @@ impl super::docset::DocSet for PhraseScorer {
             return TERMINATED;
         }
 
-        self.posting_iters[self.lead].advance();
+        self.advance_aligned();
         self.find_next_phrase_match();
         self.current_doc
     }
@@ -1235,6 +1438,22 @@ impl Scorer for PhraseScorer {
         self.prepared_bounds.is_some()
     }
 
+    fn candidate_block_upper_bound(&mut self) -> Option<(DocId, Score)> {
+        let bounds = self.prepared_bounds.as_ref()?;
+        if self.current_doc == TERMINATED {
+            return None;
+        }
+        // A certified exact phrase can use its rarest term; otherwise only
+        // the original-first TF bounds duplicate-start multiplicity.
+        let first = &self.posting_iters[self.bound_term];
+        let (list, block) = first.current_block_metadata()?;
+        let last = list.block_last_doc(block)?;
+        Some((
+            last,
+            phrase_block_bound(bounds, list, block, self.singleton_bounds.as_deref()),
+        ))
+    }
+
     fn candidate_score_upper_bound(&self) -> Score {
         crate::observe::search_work!(phrase_bound_calls += 1);
         if self.current_doc == TERMINATED {
@@ -1243,14 +1462,26 @@ impl Scorer for PhraseScorer {
         let Some(bounds) = &self.prepared_bounds else {
             return Score::INFINITY;
         };
-        let Some(Lengths::Docs(lengths)) = &self.lengths else {
+        let Some(lengths) = &self.lengths else {
             return Score::INFINITY;
         };
-        // Phrase frequency counts original-first starts, including duplicates.
-        // Another term's smaller TF is not an upper bound on that multiplicity.
-        let max_tf = self.posting_iters[0].term_freq();
+        // The constructor selects a term whose TF bounds phrase frequency.
+        let max_tf = self.posting_iters[self.bound_term].term_freq();
         let length = lengths.length(self.current_doc).max(1);
-        bounds.pair(max_tf, length)
+        if max_tf == 1
+            && let Some(bound) = self
+                .singleton_bounds
+                .as_ref()
+                .and_then(|table| table.get(length as usize))
+        {
+            return *bound;
+        }
+        if max_tf == 1 {
+            self.params
+                .score(1.0, self.idf, length as f32, self.avg_field_len)
+        } else {
+            bounds.pair(max_tf, length)
+        }
     }
 
     fn advance_candidate(&mut self) -> DocId {
@@ -1259,6 +1490,139 @@ impl Scorer for PhraseScorer {
         }
         self.posting_iters[self.lead].advance();
         self.find_next_candidate()
+    }
+
+    fn advance_competitive_candidate(&mut self, minimum: Score, allow_equal: bool) -> DocId {
+        if minimum <= 0.0
+            || !minimum.is_finite()
+            || self.prepared_bounds.is_none()
+            || self.cost < 1024
+        {
+            return self.advance_candidate();
+        }
+        if self.current_doc == TERMINATED {
+            return TERMINATED;
+        }
+        let bounds = self.prepared_bounds.as_ref().unwrap();
+        if self
+            .competitive_lengths
+            .as_ref()
+            .is_none_or(|table| table.minimum != minimum || table.allow_equal != allow_equal)
+        {
+            self.competitive_lengths = Some(CompetitiveLengths::new(
+                bounds,
+                minimum,
+                allow_equal,
+                |length| {
+                    self.params
+                        .score(1.0, self.idf, length as f32, self.avg_field_len)
+                },
+            ));
+        }
+        // A score scan of a very common first term loses against probing from
+        // a much shorter list. Keep rarest-first alignment in that case, while
+        // retaining the same cheap score admission inside the concrete scorer.
+        if !self.scan_bound_term {
+            loop {
+                self.posting_iters[self.lead].advance();
+                let doc = self.find_next_and_match();
+                if doc == TERMINATED {
+                    self.park(doc, Some(false));
+                    return doc;
+                }
+                let tf = self.posting_iters[self.bound_term].term_freq();
+                let length = self.lengths.as_ref().unwrap().length(doc).max(1);
+                if self.competitive_lengths.as_ref().unwrap().accepts(
+                    self.prepared_bounds.as_ref().unwrap(),
+                    tf,
+                    length,
+                ) {
+                    self.park(doc, None);
+                    return doc;
+                }
+            }
+        }
+        self.posting_iters[self.bound_term].advance();
+        let bounds = self.prepared_bounds.as_ref().unwrap();
+        let lengths = self.lengths.as_ref().unwrap();
+        let competitive = self.competitive_lengths.as_ref().unwrap();
+        let mut checked_block = usize::MAX;
+        let mut checked_group_end = None;
+        'align: loop {
+            if self
+                .budget
+                .as_ref()
+                .is_some_and(super::SharedThreshold::stop_if_expired)
+            {
+                self.park(TERMINATED, Some(false));
+                return TERMINATED;
+            }
+            if let Some((list, block)) =
+                self.posting_iters[self.bound_term].current_block_metadata()
+                && block != checked_block
+            {
+                checked_block = block;
+                let group_end = list.group_last_doc(block);
+                if group_end != checked_group_end {
+                    checked_group_end = group_end;
+                    if let Some((last, bound)) =
+                        phrase_group_bound(bounds, list, block, self.singleton_bounds.as_deref())
+                        && (bound < minimum || (!allow_equal && bound == minimum))
+                    {
+                        self.posting_iters[self.bound_term].seek(last.saturating_add(1));
+                        continue;
+                    }
+                }
+                let bound =
+                    phrase_block_bound(bounds, list, block, self.singleton_bounds.as_deref());
+                if bound < minimum || (!allow_equal && bound == minimum) {
+                    // Inspect a bounded directory run before decoding the next
+                    // competitive block. Yield after one L1 group for cancellation.
+                    let end = list.next_group_block(block);
+                    let mut next = block + 1;
+                    while next < end {
+                        let score = phrase_block_bound(
+                            bounds,
+                            list,
+                            next,
+                            self.singleton_bounds.as_deref(),
+                        );
+                        if score > minimum || (allow_equal && score == minimum) {
+                            break;
+                        }
+                        next += 1;
+                    }
+                    let target = list
+                        .block_last_doc(next - 1)
+                        .map_or(TERMINATED, |last| last.saturating_add(1));
+                    self.posting_iters[self.bound_term].seek(target);
+                    continue;
+                }
+            }
+            let Some(doc) = competitive.find_candidate(
+                bounds,
+                lengths,
+                &mut self.posting_iters[self.bound_term],
+            ) else {
+                continue;
+            };
+            if doc == TERMINATED {
+                self.park(doc, Some(false));
+                return doc;
+            }
+            for &index in &self.term_order {
+                if index == self.bound_term {
+                    continue;
+                }
+                let other = self.posting_iters[index].seek(doc);
+                if other != doc {
+                    self.posting_iters[self.bound_term].seek(other);
+                    continue 'align;
+                }
+            }
+            self.park(doc, None);
+            return doc;
+        }
     }
 
     fn seek_candidate(&mut self, target: DocId) -> DocId {
@@ -1284,7 +1648,7 @@ impl Scorer for PhraseScorer {
         if let Some(matched) = self.confirmed {
             return matched;
         }
-        let matched = self.check_phrase_positions(self.current_doc);
+        let matched = self.check_phrase_positions();
         self.confirmed = Some(matched);
         matched
     }
@@ -1301,7 +1665,7 @@ impl Scorer for PhraseScorer {
         crate::observe::search_work!(phrase_score_units += 1);
 
         // Real unit length when the segment has it; otherwise the summed
-        // term frequency stands in for the length (legacy segments).
+        // term frequency stands in for the length when no lengths were supplied.
         let doc_len = match &self.lengths {
             Some(lengths) => (lengths.length(self.current_doc) as f32).max(1.0),
             None => self
@@ -1319,6 +1683,385 @@ impl Scorer for PhraseScorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reordered_document_lengths_enable_bounds_without_enabling_chunk_folding() {
+        use crate::directories::OwnedBytes;
+        use crate::segment::chunk_map::{ChunkMapBuilder, read_chunk_maps, write_chunk_maps};
+        use crate::structures::{PositionStreamEncoder, PostingCodec, PostingList};
+        for document_units in [false, true] {
+            let mut map = ChunkMapBuilder::default();
+            map.set_document_units(document_units);
+            let lengths = [90, 3, 1200, 1];
+            for (physical, doc) in [3, 2, 0, 1].into_iter().enumerate() {
+                map.push(doc, 0, lengths[physical]).unwrap();
+            }
+            let mut bytes = Vec::new();
+            write_chunk_maps(&mut bytes, &[(0, &map)], &[]).unwrap();
+            let map = read_chunk_maps(OwnedBytes::new(bytes))
+                .unwrap()
+                .chunk_maps
+                .remove(&0)
+                .unwrap();
+            let mut list = PostingList::new();
+            let mut bytes = Vec::new();
+            let mut encoder =
+                PositionStreamEncoder::with_posting_codec(&mut bytes, PostingCodec::Packed);
+            for doc in 0..4 {
+                list.push(doc, 1);
+                encoder.push_doc(&mut [0]).unwrap();
+            }
+            encoder.finish().unwrap();
+            let postings = BlockPostingList::from_posting_list_with_options(
+                &list,
+                true,
+                None,
+                PostingCodec::Packed,
+            )
+            .unwrap();
+            let positions = TermPositions::open(OwnedBytes::new(bytes)).unwrap();
+            let mut scorer = PhraseScorer::unpositioned(
+                vec![postings],
+                vec![positions],
+                &[0],
+                0,
+                1.2345,
+                17.5,
+                None,
+            )
+            .with_lengths(Lengths::Chunks(map));
+            assert_eq!(scorer.supports_candidate_score_bounds(), document_units);
+            scorer.find_next_candidate();
+            while scorer.doc() != TERMINATED {
+                let bound = scorer.candidate_score_upper_bound();
+                assert!(scorer.confirm_candidate());
+                assert!(bound >= scorer.score());
+                scorer.advance_candidate();
+            }
+        }
+    }
+
+    #[test]
+    fn competitive_length_cutoffs_preserve_scalar_bound_decisions_at_boundaries() {
+        for params in [
+            super::super::Bm25Params::default(),
+            super::super::Bm25Params { k1: 0.0, b: 1.0 },
+            super::super::Bm25Params { k1: 7e20, b: 0.0 },
+        ] {
+            let bounds =
+                super::super::bm25::PreparedBounds::new(params, u32::MAX, 1.2345, 100.0).unwrap();
+            for minimum in [f32::MIN_POSITIVE, 0.1, 0.5, 1.0, 2.0, 5.0] {
+                let table = CompetitiveLengths::new(&bounds, minimum, true, |length| {
+                    bounds.pair(1, length)
+                });
+                for tf in (0..=40).chain([u32::MAX]) {
+                    let limit = table.limits[tf.saturating_sub(1).min(31) as usize];
+                    for length in [
+                        1,
+                        2,
+                        1023,
+                        1024,
+                        65535,
+                        65536,
+                        u32::MAX,
+                        limit.saturating_sub(1).max(1),
+                        limit,
+                        limit + 1,
+                    ] {
+                        assert_eq!(
+                            table.accepts(&bounds, tf, length),
+                            bounds.pair(tf, length) >= minimum,
+                            "tf={tf}, len={length}, floor={minimum}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn competitive_scans_preserve_scalar_admission_at_tails_and_after_reverse_probes() {
+        use crate::structures::{PostingCodec, PostingList};
+        let bounds = super::super::bm25::PreparedBounds::new(
+            super::super::Bm25Params::default(),
+            u32::MAX,
+            1.5,
+            120.0,
+        )
+        .unwrap();
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let lengths: Vec<u16> = (0..389)
+                .map(|i| [0, 1, 17, 255, 4096, 65535][i % 6])
+                .collect();
+            let frequencies: Vec<u32> = (0..389)
+                .map(|i| [1, 1, 1, 2, 32, 33, u32::MAX][i % 7])
+                .collect();
+            let source = Lengths::Docs(crate::segment::chunk_map::DocLengths::from_lengths(
+                &lengths,
+            ));
+            let mut input = PostingList::new();
+            for (doc, &tf) in frequencies.iter().enumerate() {
+                input.push(doc as u32, tf);
+            }
+            let list = BlockPostingList::from_posting_list_with_options(&input, true, None, codec)
+                .unwrap();
+            for minimum in [0.1, 0.8, 1.7, 2.5, 10.0] {
+                let table = CompetitiveLengths::new(&bounds, minimum, true, |length| {
+                    bounds.pair(1, length)
+                });
+                let mut cursor = list.iterator();
+                for start in [0, 127, 128, 255, 388, 17] {
+                    cursor.seek_physical(start);
+                    let mut actual = Vec::new();
+                    loop {
+                        match table.find_candidate(&bounds, &source, &mut cursor) {
+                            Some(TERMINATED) => break,
+                            Some(doc) => {
+                                actual.push(doc);
+                                assert_eq!(cursor.term_freq(), frequencies[doc as usize]);
+                                assert_eq!(
+                                    cursor.position_cursor(),
+                                    frequencies[..doc as usize]
+                                        .iter()
+                                        .map(|&tf| u64::from(tf))
+                                        .sum::<u64>()
+                                );
+                                cursor.advance();
+                            }
+                            None => {}
+                        }
+                    }
+                    let expected: Vec<_> = (start..389)
+                        .filter(|&doc| {
+                            bounds.pair(
+                                frequencies[doc as usize],
+                                u32::from(lengths[doc as usize]).max(1),
+                            ) >= minimum
+                        })
+                        .collect();
+                    assert_eq!(
+                        actual, expected,
+                        "{codec:?}, floor={minimum}, start={start}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn competitive_phrase_traversal_preserves_bounds_ties_and_position_cursors() {
+        use crate::structures::{PositionStreamEncoder, PostingCodec, PostingList};
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let lengths: Vec<u16> = (0..2053).map(|doc| 3 + (doc % 1030) as u16).collect();
+            let mut lists = Vec::new();
+            let mut positions = Vec::new();
+            for term in 0..3 {
+                let mut list = PostingList::new();
+                let mut bytes = Vec::new();
+                let mut encoder = PositionStreamEncoder::with_posting_codec(&mut bytes, codec);
+                for doc in 0..2053 {
+                    if doc % (term + 3) == 1 {
+                        continue;
+                    }
+                    let tf = 1 + doc % 5;
+                    list.push(doc, tf);
+                    let mut values: Vec<_> = (0..tf).map(|i| i * 3 + term).collect();
+                    encoder.push_doc(&mut values).unwrap();
+                }
+                encoder.finish().unwrap();
+                lists.push(
+                    BlockPostingList::from_posting_list_with_options(&list, true, None, codec)
+                        .unwrap(),
+                );
+                positions
+                    .push(TermPositions::open(crate::directories::OwnedBytes::new(bytes)).unwrap());
+            }
+            let make = || {
+                let mut scorer = PhraseScorer::unpositioned(
+                    lists.clone(),
+                    positions.clone(),
+                    &[0, 1, 2],
+                    0,
+                    1.2345,
+                    100.0,
+                    None,
+                )
+                .with_lengths(Lengths::Docs(
+                    crate::segment::chunk_map::DocLengths::from_lengths(&lengths),
+                ));
+                scorer.find_next_candidate();
+                scorer
+            };
+            for (floor, scan_bound_term) in [0.0, 0.5, 1.5, 3.0]
+                .into_iter()
+                .flat_map(|floor| [true, false].map(|scan| (floor, scan)))
+            {
+                let mut expected = make();
+                let mut actual = make();
+                actual.scan_bound_term = scan_bound_term;
+                loop {
+                    assert_eq!(actual.doc(), expected.doc());
+                    if actual.doc() == TERMINATED {
+                        break;
+                    }
+                    assert_eq!(actual.confirm_candidate(), expected.confirm_candidate());
+                    assert_eq!(actual.score().to_bits(), expected.score().to_bits());
+                    expected.advance_candidate();
+                    while expected.doc() != TERMINATED
+                        && expected.candidate_score_upper_bound() < floor
+                    {
+                        expected.advance_candidate();
+                    }
+                    actual.advance_competitive_candidate(floor, true);
+                }
+                assert_eq!(
+                    actual.advance_competitive_candidate(floor, true),
+                    TERMINATED
+                );
+            }
+            let mut expected = make();
+            expected.advance_candidate();
+            let tied_bound = expected.candidate_score_upper_bound();
+            let mut actual = make();
+            assert_eq!(
+                actual.advance_competitive_candidate(tied_bound, true),
+                expected.doc()
+            );
+            let budget = super::super::SharedThreshold::for_limit(10)
+                .with_deadline(Some(std::time::Instant::now()));
+            actual.budget = Some(budget.clone());
+            assert_eq!(actual.advance_competitive_candidate(0.5, true), TERMINATED);
+            assert!(budget.truncated());
+        }
+    }
+
+    #[test]
+    fn singleton_score_ties_are_skipped_only_when_stable_id_order_allows_it() {
+        use crate::structures::{PositionStreamEncoder, PostingList};
+        let mut postings = Vec::new();
+        let mut positions = Vec::new();
+        for term in 0..2 {
+            let mut list = PostingList::new();
+            let mut bytes = Vec::new();
+            let mut encoder = PositionStreamEncoder::new(&mut bytes);
+            for doc in 0..1031 {
+                list.push(doc, 1);
+                encoder.push_doc(&mut [term]).unwrap();
+            }
+            encoder.finish().unwrap();
+            postings.push(BlockPostingList::from_posting_list_with(&list, true, None).unwrap());
+            positions
+                .push(TermPositions::open(crate::directories::OwnedBytes::new(bytes)).unwrap());
+        }
+        let make = || {
+            PhraseScorer::unpositioned(
+                postings.clone(),
+                positions.clone(),
+                &[0, 1],
+                0,
+                1.5,
+                3.0,
+                None,
+            )
+            .with_lengths(Lengths::Docs(
+                crate::segment::chunk_map::DocLengths::from_lengths(&[2; 1031]),
+            ))
+        };
+        let mut original = make();
+        original.find_next_phrase_match();
+        let score = original.score();
+        assert_eq!(
+            original.candidate_score_upper_bound().to_bits(),
+            score.to_bits()
+        );
+        for minimum in [
+            f32::from_bits(score.to_bits() - 1),
+            score,
+            f32::from_bits(score.to_bits() + 1),
+        ] {
+            for allow_equal in [false, true] {
+                let mut scorer = make();
+                scorer.find_next_candidate();
+                let expected = if score > minimum || (allow_equal && score == minimum) {
+                    1
+                } else {
+                    TERMINATED
+                };
+                assert_eq!(
+                    scorer.advance_competitive_candidate(minimum, allow_equal),
+                    expected
+                );
+                if expected != TERMINATED {
+                    assert!(scorer.confirm_candidate());
+                    assert_eq!(scorer.score().to_bits(), score.to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn singleton_bound_lookup_preserves_scalar_bits_and_long_length_fallback() {
+        use crate::structures::{PositionStreamEncoder, PostingCodec, PostingList};
+        let mut list = PostingList::new();
+        let mut bytes = Vec::new();
+        let mut encoder =
+            PositionStreamEncoder::with_posting_codec(&mut bytes, PostingCodec::Packed);
+        let lengths: Vec<u16> = (0..=1025).chain([u16::MAX]).collect();
+        for doc in 0..lengths.len() as u32 {
+            list.push(doc, 1);
+            encoder.push_doc(&mut [0]).unwrap();
+        }
+        encoder.finish().unwrap();
+        let postings = BlockPostingList::from_posting_list_with_options(
+            &list,
+            true,
+            None,
+            PostingCodec::Packed,
+        )
+        .unwrap();
+        let positions = TermPositions::open(crate::directories::OwnedBytes::new(bytes)).unwrap();
+        for params in [
+            super::super::Bm25Params::default(),
+            super::super::Bm25Params { k1: 0.0, b: 1.0 },
+            super::super::Bm25Params { k1: 7e20, b: 0.0 },
+        ] {
+            let mut scorer = PhraseScorer::unpositioned(
+                vec![postings.clone()],
+                vec![positions.clone()],
+                &[0],
+                0,
+                1.2345,
+                17.5,
+                None,
+            )
+            .with_params(params)
+            .with_lengths(Lengths::Docs(
+                crate::segment::chunk_map::DocLengths::from_lengths(&lengths),
+            ));
+            assert!(scorer.singleton_bounds.is_some());
+            scorer.find_next_candidate();
+            while scorer.doc() != TERMINATED {
+                let cached = scorer.candidate_score_upper_bound();
+                let table = scorer.singleton_bounds.take();
+                let scalar = scorer.candidate_score_upper_bound();
+                scorer.singleton_bounds = table;
+                assert_eq!(cached.to_bits(), scalar.to_bits());
+                assert!(scorer.confirm_candidate());
+                assert!(cached >= scorer.score());
+                scorer.advance_candidate();
+            }
+        }
+    }
 
     #[test]
     fn phrase_bounds_preserve_duplicate_start_multiplicity_without_reading_positions() {
@@ -1370,6 +2113,7 @@ mod tests {
                         assert_eq!(scorer.find_next_candidate(), 0);
                         assert!(scorer.supports_candidate_score_bounds());
                         let bound = scorer.candidate_score_upper_bound();
+                        let (_, block_bound) = scorer.candidate_block_upper_bound().unwrap();
                         let previous = params.upper_bound_with_impacts(5, 1.2345, avg, |a, b| {
                             Some((a + b * f64::from(length.max(1))) / 5.0)
                         });
@@ -1384,6 +2128,10 @@ mod tests {
                         assert!(
                             bound >= scorer.score(),
                             "{codec:?} length={length} avg={avg} params={params:?}"
+                        );
+                        assert!(
+                            block_bound >= scorer.score(),
+                            "block bound must preserve duplicate starts"
                         );
                     }
                 }
@@ -1453,7 +2201,7 @@ mod tests {
         }
         let mut scorer =
             PhraseScorer::unpositioned(lists, positions, &[0, 1, 2], 0, 1.0, 10.0, None);
-        assert!(!scorer.check_phrase_positions(0));
+        assert!(!scorer.check_phrase_positions());
         assert!(
             scorer.position_bufs[1].is_empty(),
             "the original first term must reject before a less selective middle term is read"
@@ -1463,6 +2211,128 @@ mod tests {
             [4, 14],
             "filtering must not mutate the original first-term occurrences"
         );
+    }
+
+    #[test]
+    fn rare_term_score_bounds_require_unique_first_positions_and_zero_slop() {
+        use crate::structures::{PositionStreamEncoder, PostingList};
+        for duplicate in [false, true] {
+            for slop in [0, 4] {
+                let mut lists = Vec::new();
+                let mut positions = Vec::new();
+                for term in 0..2 {
+                    let mut list = PostingList::new();
+                    let mut bytes = Vec::new();
+                    let mut encoder = PositionStreamEncoder::new(&mut bytes);
+                    for doc in 0..if term == 0 { 5 } else { 1 } {
+                        let mut values = if term == 1 {
+                            vec![1]
+                        } else if duplicate {
+                            vec![0, 0, 2]
+                        } else {
+                            vec![0, 2, 4]
+                        };
+                        list.push(doc, values.len() as u32);
+                        encoder.push_doc(&mut values).unwrap();
+                    }
+                    encoder.finish().unwrap();
+                    lists
+                        .push(BlockPostingList::from_posting_list_with(&list, true, None).unwrap());
+                    positions.push(
+                        TermPositions::open(crate::directories::OwnedBytes::new(bytes)).unwrap(),
+                    );
+                }
+                let mut scorer =
+                    PhraseScorer::unpositioned(lists, positions, &[0, 1], slop, 1.0, 10.0, None)
+                        .with_lengths(Lengths::Docs(
+                            crate::segment::chunk_map::DocLengths::from_lengths(&[5; 5]),
+                        ));
+                assert_eq!(scorer.lead, 1);
+                assert_eq!(scorer.bound_term, usize::from(!duplicate && slop == 0));
+                assert_eq!(scorer.find_next_candidate(), 0);
+                let bound = scorer.candidate_score_upper_bound();
+                assert!(scorer.confirm_candidate());
+                assert!(bound >= scorer.score());
+                assert_eq!(
+                    scorer.exact_phrase_frequency(),
+                    if slop != 0 {
+                        3
+                    } else if duplicate {
+                        2
+                    } else {
+                        1
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_term_exact_phrases_preserve_duplicate_starts_with_either_term_rarest() {
+        use crate::structures::{PositionStreamEncoder, PostingCodec, PostingList};
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            for lead in 0..2 {
+                for offset in [0, 1, 7, u32::MAX] {
+                    let values = [
+                        vec![0, 0, 3, u32::MAX - 7, u32::MAX],
+                        vec![0, 1, 7, 10, u32::MAX],
+                    ];
+                    let expected = values[0]
+                        .iter()
+                        .filter(|&&start| {
+                            start
+                                .checked_add(offset)
+                                .is_some_and(|end| values[1].contains(&end))
+                        })
+                        .count() as u32;
+                    let mut lists = Vec::new();
+                    let mut positions = Vec::new();
+                    for (term, first_values) in values.iter().enumerate() {
+                        let mut list = PostingList::new();
+                        let mut bytes = Vec::new();
+                        let mut encoder =
+                            PositionStreamEncoder::with_posting_codec(&mut bytes, codec);
+                        for doc in 0..if term == lead { 1 } else { 3 } {
+                            let mut positions = first_values.clone();
+                            list.push(doc, positions.len() as u32);
+                            encoder.push_doc(&mut positions).unwrap();
+                        }
+                        encoder.finish().unwrap();
+                        lists.push(
+                            BlockPostingList::from_posting_list_with_options(
+                                &list, true, None, codec,
+                            )
+                            .unwrap(),
+                        );
+                        positions.push(
+                            TermPositions::open(crate::directories::OwnedBytes::new(bytes))
+                                .unwrap(),
+                        );
+                    }
+                    let mut scorer = PhraseScorer::unpositioned(
+                        lists,
+                        positions,
+                        &[0, offset],
+                        0,
+                        1.0,
+                        10.0,
+                        None,
+                    );
+                    assert_eq!(scorer.lead, lead);
+                    assert_eq!(scorer.find_next_candidate(), 0);
+                    assert_eq!(scorer.confirm_candidate(), expected != 0);
+                    assert!(scorer.frequency.get().is_none());
+                    assert_eq!(scorer.exact_phrase_frequency(), expected);
+                    assert_eq!(scorer.exact_phrase_frequency(), expected);
+                    assert_eq!(scorer.advance_candidate(), TERMINATED);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1521,7 +2391,7 @@ mod tests {
                 let mut scorer =
                     PhraseScorer::unpositioned(lists, positions, &offsets, 0, 1.0, 10.0, None);
                 assert!(
-                    scorer.check_phrase_positions(0),
+                    scorer.check_phrase_positions(),
                     "codec {codec:?}, rare {rare}"
                 );
                 assert!(scorer.frequency.get().is_none());
@@ -1576,7 +2446,7 @@ mod tests {
             }
             let mut scorer =
                 PhraseScorer::unpositioned(lists, positions, &[0, 1, 2], 0, 1.0, 10.0, None);
-            assert!(!scorer.check_phrase_positions(0));
+            assert!(!scorer.check_phrase_positions());
             assert!(
                 scorer.position_bufs[0].is_empty(),
                 "an impossible rare-term intersection must reject before reading the frequent first term"
@@ -1619,7 +2489,7 @@ mod tests {
             }
             let mut scorer =
                 PhraseScorer::unpositioned(lists, positions, &[0, 1, 2], 0, 1.0, 10.0, None);
-            assert!(!scorer.check_phrase_positions(0));
+            assert!(!scorer.check_phrase_positions());
             assert!(
                 scorer.position_bufs[2].is_empty(),
                 "a failed prefix must not read a later term's positions"
@@ -1628,7 +2498,7 @@ mod tests {
             for cursor in &mut scorer.posting_iters {
                 assert_eq!(cursor.seek(1), 1);
             }
-            assert!(scorer.check_phrase_positions(1));
+            assert!(scorer.check_phrase_positions());
             scorer.current_doc = 1;
             assert_eq!(scorer.exact_phrase_frequency(), 3);
             assert_eq!(
@@ -1776,7 +2646,7 @@ mod tests {
                         })
                         .count() as u32;
                     assert_eq!(
-                        scorer.check_phrase_positions(target),
+                        scorer.check_phrase_positions(),
                         expected_tf > 0,
                         "codec={codec:?},terms={terms},doc={doc}"
                     );
@@ -1831,7 +2701,7 @@ mod tests {
                 matches &= cursor.seek(target) == target;
             }
             if matches {
-                assert!(scorer.check_phrase_positions(target));
+                assert!(scorer.check_phrase_positions());
                 scorer.current_doc = target;
                 let tf = docs.iter().find(|e| e.0 == target).unwrap().1 as f32;
                 let expected = super::super::Bm25Params::default().score(tf, 1.0, 2.0 * tf, 10.0);

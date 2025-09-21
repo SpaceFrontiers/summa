@@ -3492,6 +3492,7 @@ name = "hermes-server"
 version = "1.8.144"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "env_logger",
  "hermes-core",
@@ -3503,6 +3504,7 @@ dependencies = [
  "prost",
  "rayon",
  "rustc-hash 2.1.3",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
