@@ -119,6 +119,73 @@ define_docset_trait!(Send + Sync);
 #[cfg(target_arch = "wasm32")]
 define_docset_trait!();
 
+/// Owned bitmap cursor for already materialized membership. It keeps complete
+/// unions compact and serves the same bounded windows as posting cursors.
+pub(super) struct BitsetDocSet {
+    bits: super::DocBitset,
+    current: DocId,
+    count: u32,
+}
+
+impl BitsetDocSet {
+    pub(super) fn new(bits: super::DocBitset) -> Self {
+        let current = bits.next_set_bit(0).unwrap_or(TERMINATED);
+        let count = bits.count();
+        Self {
+            bits,
+            current,
+            count,
+        }
+    }
+}
+
+impl DocSet for BitsetDocSet {
+    fn doc(&self) -> DocId {
+        self.current
+    }
+
+    fn advance(&mut self) -> DocId {
+        self.seek(self.current.saturating_add(1))
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        if target > self.current {
+            self.current = self.bits.next_set_bit(target).unwrap_or(TERMINATED);
+        }
+        self.current
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.count
+    }
+
+    fn supports_doc_windows(&self) -> bool {
+        true
+    }
+
+    fn fill_doc_window(&mut self, base: DocId, window: &mut DocWindow) {
+        window.fill(0);
+        let end = base.saturating_add(DOC_WINDOW_SIZE);
+        let start = base.max(self.current);
+        if start >= end {
+            return;
+        }
+        let first = base as usize / 64;
+        let shift = base % 64;
+        for (offset, word) in window.iter_mut().enumerate() {
+            let index = first + offset;
+            *word = self.bits.bits.get(index).copied().unwrap_or(0) >> shift;
+            if shift != 0 {
+                *word |= self.bits.bits.get(index + 1).copied().unwrap_or(0) << (64 - shift);
+            }
+        }
+        let consumed = (start - base) as usize;
+        window[..consumed / 64].fill(0);
+        window[consumed / 64] &= u64::MAX << (consumed % 64);
+        self.current = self.bits.next_set_bit(end).unwrap_or(TERMINATED);
+    }
+}
+
 // ── DocSet for Box<dyn DocSet> ───────────────────────────────────────────
 
 impl DocSet for Box<dyn DocSet + '_> {
@@ -202,6 +269,17 @@ impl DocSet for SortedVecDocSet {
 
     fn size_hint(&self) -> u32 {
         self.docs.len().saturating_sub(self.pos) as u32
+    }
+
+    fn supports_doc_batches(&self) -> bool {
+        true
+    }
+
+    fn fill_doc_batch(&mut self, docs: &mut DocBatch) -> usize {
+        let count = (self.docs.len() - self.pos).min(docs.len());
+        docs[..count].copy_from_slice(&self.docs[self.pos..self.pos + count]);
+        self.pos += count;
+        count
     }
 }
 
@@ -524,6 +602,60 @@ impl super::Scorer for PredicatedScorer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bitmap_windows_preserve_unaligned_bases_consumed_prefixes_and_tail_seeks() {
+        for stride in [1, 2, 63, 127] {
+            let expected: Vec<u32> = (0..12291).step_by(stride).collect();
+            let mut bits = super::super::DocBitset::new(12291);
+            for &doc in &expected {
+                bits.set(doc);
+            }
+            for base in [
+                0, 1, 63, 64, 4094, 4095, 4096, 8191, 10000, 12290, 12291, TERMINATED,
+            ] {
+                let mut cursor = BitsetDocSet::new(bits.clone());
+                cursor.seek(base.saturating_add(17));
+                let previous = cursor.doc();
+                let end = base.saturating_add(DOC_WINDOW_SIZE);
+                let mut actual = [u64::MAX; DOC_WINDOW_WORDS];
+                cursor.fill_doc_window(base, &mut actual);
+                let mut wanted = [0; DOC_WINDOW_WORDS];
+                for &doc in &expected {
+                    if doc >= previous.max(base) && doc < end {
+                        let relative = (doc - base) as usize;
+                        wanted[relative / 64] |= 1 << (relative % 64);
+                    }
+                }
+                assert_eq!(actual, wanted, "stride={stride}, base={base}");
+                assert_eq!(
+                    cursor.doc(),
+                    expected
+                        .iter()
+                        .copied()
+                        .find(|&doc| doc >= previous.max(end))
+                        .unwrap_or(TERMINATED)
+                );
+            }
+            let mut cursor = BitsetDocSet::new(bits);
+            let mut actual = Vec::new();
+            while cursor.doc() != TERMINATED {
+                let base = cursor.doc();
+                let mut words = [0; DOC_WINDOW_WORDS];
+                cursor.fill_doc_window(base, &mut words);
+                for (i, &word) in words.iter().enumerate() {
+                    let mut word = word;
+                    while word != 0 {
+                        actual.push(base + i as u32 * 64 + word.trailing_zeros());
+                        word &= word - 1;
+                    }
+                }
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(cursor.advance(), TERMINATED);
+            assert_eq!(cursor.seek(0), TERMINATED);
+        }
+    }
 
     struct WindowScorer(SortedVecDocSet, f32, bool);
 

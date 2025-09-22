@@ -146,3 +146,90 @@ async fn work_counts_distinguish_metadata_count_decoding_scoring_and_cached_posi
         }
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn plain_ranked_terms_and_conjunctions_skip_proven_losing_blocks() {
+    let dir = RamDirectory::new();
+    let mut schema = SchemaBuilder::default();
+    let text = schema.add_text_field_with_tokenizer("text", true, false, "simple");
+    let config = IndexConfig {
+        posting_ratio_bounds: false,
+        posting_impact_bounds: false,
+        num_threads: 1,
+        num_indexing_threads: 1,
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    for row in 0..8192 {
+        let mut doc = Document::new();
+        doc.add_text(
+            text,
+            if row < 128 {
+                "alpha beta ".repeat(16)
+            } else {
+                "alpha beta padding ".to_owned() + &"padding ".repeat(30)
+            },
+        );
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.shutdown().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let segment = &searcher.segment_readers()[0];
+    assert!(segment.chunk_map(text).is_none());
+    assert!(
+        !segment
+            .get_postings(text, b"alpha")
+            .await
+            .unwrap()
+            .unwrap()
+            .has_ratio_bounds()
+    );
+    let queries: Vec<Box<dyn hermes_core::query::Query>> = vec![
+        Box::new(TermQuery::text(text, "alpha")),
+        Box::new(hermes_core::query::PrefixQuery::text(text, "alp")),
+        Box::new(hermes_core::query::WildcardQuery::text(text, "al*a").unwrap()),
+        Box::new(hermes_core::query::RegexQuery::new(text, "al.*a").unwrap()),
+        Box::new(
+            BooleanQuery::new()
+                .must(TermQuery::text(text, "alpha"))
+                .must(TermQuery::text(text, "beta")),
+        ),
+    ];
+    for query in queries {
+        let mut exhaustive = TopKCollector::new(8192);
+        let mut count = CountCollector::new();
+        collect_segment(segment, query.as_ref(), &mut (&mut exhaustive, &mut count))
+            .await
+            .unwrap();
+        assert_eq!(count.count(), 8192);
+        let expected = exhaustive.into_sorted_results();
+        for k in [1, 10, 100] {
+            let (actual, work) =
+                capture_sync(|| searcher.search_with_offset_and_count_sync(query.as_ref(), k, 0));
+            let (actual, _) = actual.unwrap();
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|h| (h.doc_id, h.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                expected[..k]
+                    .iter()
+                    .map(|h| (h.doc_id, h.score.to_bits()))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                work.exact_score_units + work.lookup_score_units < 8192 / 2,
+                "plain ranked queries must skip proven losers: {work:?}"
+            );
+            assert!(
+                work.doc_blocks < 32,
+                "ranked term filters must not decode every block: {work:?}"
+            );
+        }
+    }
+}

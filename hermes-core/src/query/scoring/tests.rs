@@ -2684,7 +2684,7 @@ fn single_text_heap_factor_below_one_prunes_more_blocks_with_exact_scores() {
         |factor| MaxScoreExecutor::text(lists.clone(), avg, 50, Some(&lengths), params, factor);
 
     let mut exact = make(1.0);
-    assert!(exact.single_text_with_ratio_bounds());
+    assert!(exact.single_text_with_block_bounds());
     let exact_hits = exact.execute_single_text().unwrap();
     assert_eq!(
         exact_hits

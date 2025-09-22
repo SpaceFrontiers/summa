@@ -82,6 +82,7 @@ anyhow = "1.0"
 pest = "2.8"
 pest_derive = "2.8"
 regex = "1.12"
+regex-syntax = "0.8.11"
 
 # Encoding
 base64 = "0.22"

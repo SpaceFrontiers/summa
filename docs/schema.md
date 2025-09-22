@@ -266,32 +266,39 @@ See `docs/chunked-text-fields.md` for the design.
 
 ### Available Tokenizers
 
-| Name                          | Aliases      | Description                                        |
-| ----------------------------- | ------------ | -------------------------------------------------- |
-| `simple`                      | `default`    | Whitespace split, punctuation stripped, lowercased |
-| `raw`                         |              | Whole value as one token, unchanged                |
-| `raw_ci`                      |              | Whole value as one token, lowercased               |
-| `lex(by: F, default: L, ...)` |              | Lexical tokenizer hinted by field `F` (see above)  |
-| `en_stem`                     | `english`    | English Snowball stemmer                           |
-| `de_stem`                     | `german`     | German Snowball stemmer                            |
-| `fr_stem`                     | `french`     | French Snowball stemmer                            |
-| `es_stem`                     | `spanish`    | Spanish Snowball stemmer                           |
-| `it_stem`                     | `italian`    | Italian Snowball stemmer                           |
-| `pt_stem`                     | `portuguese` | Portuguese Snowball stemmer                        |
-| `ru_stem`                     | `russian`    | Russian Snowball stemmer                           |
-| `ar_stem`                     | `arabic`     | Arabic Snowball stemmer                            |
-| `da_stem`                     | `danish`     | Danish Snowball stemmer                            |
-| `nl_stem`                     | `dutch`      | Dutch Snowball stemmer                             |
-| `fi_stem`                     | `finnish`    | Finnish Snowball stemmer                           |
-| `el_stem`                     | `greek`      | Greek Snowball stemmer                             |
-| `hu_stem`                     | `hungarian`  | Hungarian Snowball stemmer                         |
-| `no_stem`                     | `norwegian`  | Norwegian Snowball stemmer                         |
-| `ro_stem`                     | `romanian`   | Romanian Snowball stemmer                          |
-| `sv_stem`                     | `swedish`    | Swedish Snowball stemmer                           |
-| `ta_stem`                     | `tamil`      | Tamil Snowball stemmer                             |
-| `tr_stem`                     | `turkish`    | Turkish Snowball stemmer                           |
+| Name                          | Aliases      | Description                                                      |
+| ----------------------------- | ------------ | ---------------------------------------------------------------- |
+| `simple`                      | `default`    | Whitespace split, punctuation stripped, lowercased               |
+| `unicode_word`                |              | UAX #29 words and lowercase; preserves internal word punctuation |
+| `raw`                         |              | Whole value as one token, unchanged                              |
+| `raw_ci`                      |              | Whole value as one token, lowercased                             |
+| `lex(by: F, default: L, ...)` |              | Lexical tokenizer hinted by field `F` (see above)                |
+| `en_stem`                     | `english`    | English Snowball stemmer                                         |
+| `de_stem`                     | `german`     | German Snowball stemmer                                          |
+| `fr_stem`                     | `french`     | French Snowball stemmer                                          |
+| `es_stem`                     | `spanish`    | Spanish Snowball stemmer                                         |
+| `it_stem`                     | `italian`    | Italian Snowball stemmer                                         |
+| `pt_stem`                     | `portuguese` | Portuguese Snowball stemmer                                      |
+| `ru_stem`                     | `russian`    | Russian Snowball stemmer                                         |
+| `ar_stem`                     | `arabic`     | Arabic Snowball stemmer                                          |
+| `da_stem`                     | `danish`     | Danish Snowball stemmer                                          |
+| `nl_stem`                     | `dutch`      | Dutch Snowball stemmer                                           |
+| `fi_stem`                     | `finnish`    | Finnish Snowball stemmer                                         |
+| `el_stem`                     | `greek`      | Greek Snowball stemmer                                           |
+| `hu_stem`                     | `hungarian`  | Hungarian Snowball stemmer                                       |
+| `no_stem`                     | `norwegian`  | Norwegian Snowball stemmer                                       |
+| `ro_stem`                     | `romanian`   | Romanian Snowball stemmer                                        |
+| `sv_stem`                     | `swedish`    | Swedish Snowball stemmer                                         |
+| `ta_stem`                     | `tamil`      | Tamil Snowball stemmer                                           |
+| `tr_stem`                     | `turkish`    | Turkish Snowball stemmer                                         |
 
 ### Custom Tokenizers
+
+`unicode_word` performs no stemming, normalization, elision, or CJK expansion.
+Words longer than 255 Unicode scalar values are skipped while retaining the
+position gap. It uses the Unicode version of the bundled `unicode-segmentation`
+crate; it does not promise exact Lucene StandardAnalyzer equivalence. Changing
+an existing field to this tokenizer requires reindexing its source documents.
 
 You can register custom tokenizers programmatically:
 

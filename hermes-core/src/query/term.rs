@@ -140,6 +140,22 @@ pub(super) fn compute_term_idf(
     )
 }
 
+/// Complete membership and positioned callers need a cursor. Ranked callers
+/// benefit from block traversal only when bounds can avoid part of the list.
+fn can_rank_term(
+    postings: &BlockPostingList,
+    limit: usize,
+    complete: bool,
+    collect_positions: bool,
+) -> bool {
+    if complete || collect_positions {
+        return false;
+    }
+    let has_block_bounds = postings.min_len().is_some() && postings.num_blocks() > 1;
+    let needs_top_k = limit < postings.doc_count() as usize;
+    has_block_bounds && needs_top_k
+}
+
 // ── Unified term scorer macro ────────────────────────────────────────────
 //
 // Parameterised on:
@@ -225,9 +241,7 @@ macro_rules! term_plan {
 
                 // Ranked term requests can use the same block bounds as a text
                 // union. Complete membership and positioned callers keep a cursor.
-                if !$complete && !$load_positions && posting_list.has_ratio_bounds() && posting_list.num_blocks() > 1
-                    && limit < posting_list.doc_count() as usize
-                {
+                if can_rank_term(&posting_list, limit, $complete, $load_positions) {
                     return super::planner::finish_text_maxscore(
                         vec![(posting_list, idf)],
                         avg_field_len,

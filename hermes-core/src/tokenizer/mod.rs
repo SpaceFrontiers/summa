@@ -116,6 +116,29 @@ impl Tokenizer for SimpleTokenizer {
     }
 }
 
+/// Unicode word boundaries followed by lowercase, without lexical rewriting.
+/// Internal punctuation follows UAX #29. Overlong words retain a position gap.
+#[derive(Debug, Clone, Default)]
+pub struct UnicodeWordTokenizer;
+
+impl Tokenizer for UnicodeWordTokenizer {
+    fn tokenize(&self, text: &str) -> Vec<Token> {
+        use unicode_segmentation::UnicodeSegmentation;
+        text.unicode_word_indices()
+            .enumerate()
+            .filter(|(_, (_, word))| word.chars().count() <= 255)
+            .map(|(position, (offset, word))| {
+                Token::new(
+                    word.to_lowercase(),
+                    position as u32,
+                    offset,
+                    offset + word.len(),
+                )
+            })
+            .collect()
+    }
+}
+
 /// Raw tokenizer — no tokenization at all.
 ///
 /// The entire input text becomes a single token (trimmed).
@@ -725,6 +748,7 @@ impl TokenizerRegistry {
         // Basic tokenizers ("default" is the documented alias of "simple")
         self.register("simple", SimpleTokenizer);
         self.register("default", SimpleTokenizer);
+        self.register("unicode_word", UnicodeWordTokenizer);
         self.register("raw", RawTokenizer);
         self.register("raw_ci", RawCiTokenizer);
 
@@ -928,6 +952,40 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].text, "hello");
         assert_eq!(tokens[1].text, "world");
+    }
+
+    #[test]
+    fn unicode_words_preserve_internal_punctuation_and_original_offsets() {
+        let tokenizer = TokenizerRegistry::new().get("unicode_word").unwrap();
+        let input = "TERM_start5 User:Robert books.google.com John's CAFÉ e\u{301}";
+        let tokens = tokenizer.tokenize(input);
+        let expected = [
+            "term_start5",
+            "user:robert",
+            "books.google.com",
+            "john's",
+            "café",
+            "e\u{301}",
+        ];
+        assert_eq!(tokens.len(), expected.len());
+        for (i, (token, expected)) in tokens.iter().zip(expected).enumerate() {
+            assert_eq!(token.text, expected);
+            assert_eq!(token.position, i as u32);
+            assert_eq!(
+                input[token.offset_from..token.offset_to].to_lowercase(),
+                expected
+            );
+            assert!(!token.variant);
+        }
+        let input = format!("left {} right", "x".repeat(256));
+        let tokens = tokenizer.tokenize(&input);
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|t| (t.text.as_str(), t.position))
+                .collect::<Vec<_>>(),
+            vec![("left", 0), ("right", 2)]
+        );
     }
 
     #[test]

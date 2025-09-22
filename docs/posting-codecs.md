@@ -243,6 +243,10 @@ opt-in experiment, not a default.
 
 ## Cursor behaviour
 
+- Opening a posting list borrows its L1 document ends and packed bounds from
+  the validated `OwnedBytes` range. Four-byte little-endian views support
+  unaligned files without allocating or copying two group arrays per query.
+  Writers still construct owned bytes; the serialized representation is unchanged.
 - `seek` compares with the current posting and the decoded block's last id
   first; leaving the block gallops over L1 group ends before a bounded L0
   search; inside a block it probes the next document, gallops to bound the

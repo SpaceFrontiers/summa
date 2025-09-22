@@ -520,6 +520,22 @@ impl SSTableValue for SparseDimInfo {
 /// Maximum number of postings that can be inlined in TermInfo
 pub const MAX_INLINE_POSTINGS: usize = 3;
 
+#[derive(Clone, Debug)]
+pub(crate) struct DecodedInlinePostings {
+    docs: [u32; MAX_INLINE_POSTINGS],
+    frequencies: [u32; MAX_INLINE_POSTINGS],
+    len: usize,
+}
+
+impl DecodedInlinePostings {
+    pub(crate) fn docs(&self) -> &[u32] {
+        &self.docs[..self.len]
+    }
+    pub(crate) fn frequencies(&self) -> &[u32] {
+        &self.frequencies[..self.len]
+    }
+}
+
 /// Term info for posting list references
 ///
 /// Supports two modes:
@@ -699,6 +715,11 @@ impl TermInfo {
     /// Decode inline postings into (doc_ids, term_freqs)
     /// Returns None if this is an external reference
     pub fn decode_inline(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        self.decode_inline_fixed()
+            .map(|decoded| (decoded.docs().to_vec(), decoded.frequencies().to_vec()))
+    }
+
+    pub(crate) fn decode_inline_fixed(&self) -> Option<DecodedInlinePostings> {
         match self {
             TermInfo::Inline {
                 doc_freq,
@@ -711,21 +732,24 @@ impl TermInfo {
                 {
                     return None;
                 }
-                let mut doc_ids = Vec::with_capacity(*doc_freq as usize);
-                let mut term_freqs = Vec::with_capacity(*doc_freq as usize);
+                let mut decoded = DecodedInlinePostings {
+                    docs: [0; MAX_INLINE_POSTINGS],
+                    frequencies: [0; MAX_INLINE_POSTINGS],
+                    len: usize::from(*doc_freq),
+                };
                 let mut reader = &data[..*data_len as usize];
                 let mut prev_doc_id = 0u32;
 
-                for _ in 0..*doc_freq {
-                    let delta = read_vint(&mut reader).ok()? as u32;
-                    let tf = read_vint(&mut reader).ok()? as u32;
+                for i in 0..decoded.len {
+                    let delta = u32::try_from(read_vint(&mut reader).ok()?).ok()?;
+                    let tf = u32::try_from(read_vint(&mut reader).ok()?).ok()?;
                     let doc_id = prev_doc_id.checked_add(delta)?;
-                    doc_ids.push(doc_id);
-                    term_freqs.push(tf);
+                    decoded.docs[i] = doc_id;
+                    decoded.frequencies[i] = tf;
                     prev_doc_id = doc_id;
                 }
 
-                Some((doc_ids, term_freqs))
+                Some(decoded)
             }
             TermInfo::External { .. } => None,
         }
@@ -2168,8 +2192,33 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         prefix: &[u8],
         max_results: usize,
         max_scanned: usize,
-        mut accepts: impl FnMut(&[u8]) -> bool + Send,
+        accepts: impl FnMut(&[u8]) -> bool + Send,
     ) -> io::Result<PrefixScanResult<V>> {
+        self.prefix_scan_projected(prefix, max_results, max_scanned, accepts, |key, value| {
+            (key.to_vec(), value)
+        })
+        .await
+    }
+
+    pub(crate) async fn prefix_scan_values(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+        max_scanned: usize,
+        accepts: impl FnMut(&[u8]) -> bool + Send,
+    ) -> io::Result<(Vec<V>, bool)> {
+        self.prefix_scan_projected(prefix, max_results, max_scanned, accepts, |_, value| value)
+            .await
+    }
+
+    async fn prefix_scan_projected<T: Send>(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+        max_scanned: usize,
+        mut accepts: impl FnMut(&[u8]) -> bool + Send,
+        mut project: impl FnMut(&[u8], V) -> T + Send,
+    ) -> io::Result<(Vec<T>, bool)> {
         if self.block_index.is_empty() || prefix.is_empty() {
             return Ok((Vec::new(), false));
         }
@@ -2203,7 +2252,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                     if results.len() >= max_results {
                         return Ok((results, true));
                     }
-                    results.push((current_key.clone(), value));
+                    results.push(project(&current_key, value));
                 } else if current_key.as_slice() > prefix {
                     // Keys are sorted — past the prefix range, done
                     return Ok((results, false));
@@ -2237,8 +2286,33 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         prefix: &[u8],
         max_results: usize,
         max_scanned: usize,
-        mut accepts: impl FnMut(&[u8]) -> bool + Send,
+        accepts: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrefixScanResult<V>> {
+        self.prefix_scan_projected_sync(prefix, max_results, max_scanned, accepts, |key, value| {
+            (key.to_vec(), value)
+        })
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn prefix_scan_values_sync(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+        max_scanned: usize,
+        accepts: impl FnMut(&[u8]) -> bool,
+    ) -> io::Result<(Vec<V>, bool)> {
+        self.prefix_scan_projected_sync(prefix, max_results, max_scanned, accepts, |_, value| value)
+    }
+
+    #[cfg(feature = "sync")]
+    fn prefix_scan_projected_sync<T>(
+        &self,
+        prefix: &[u8],
+        max_results: usize,
+        max_scanned: usize,
+        mut accepts: impl FnMut(&[u8]) -> bool,
+        mut project: impl FnMut(&[u8], V) -> T,
+    ) -> io::Result<(Vec<T>, bool)> {
         if self.block_index.is_empty() || prefix.is_empty() {
             return Ok((Vec::new(), false));
         }
@@ -2270,7 +2344,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                     if results.len() >= max_results {
                         return Ok((results, true));
                     }
-                    results.push((current_key.clone(), value));
+                    results.push(project(&current_key, value));
                 } else if current_key.as_slice() > prefix {
                     return Ok((results, false));
                 }
@@ -2355,6 +2429,83 @@ impl<'a, V: SSTableValue> AsyncSSTableIterator<'a, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn value_projection_preserves_filtered_scan_budgets_order_and_errors() {
+        let (bytes, _) = keyed_table(4096);
+        let reader =
+            AsyncSSTableReader::<u64>::open(FileHandle::from_bytes(OwnedBytes::new(bytes)), 8)
+                .await
+                .unwrap();
+        for prefix in [b"field".as_slice(), b"field02", b"missing", b""] {
+            for results in [0, 1, 17, 4096] {
+                for scanned in [0, 1, 12, 8192] {
+                    let accepts = |key: &[u8]| key.last().is_some_and(|byte| byte % 2 == 0);
+                    let expected = reader
+                        .prefix_scan_filtered(prefix, results, scanned, accepts)
+                        .await
+                        .map(|(rows, more)| {
+                            (
+                                rows.into_iter().map(|(_, value)| value).collect::<Vec<_>>(),
+                                more,
+                            )
+                        })
+                        .map_err(|error| (error.kind(), error.to_string()));
+                    let actual = reader
+                        .prefix_scan_values(prefix, results, scanned, accepts)
+                        .await
+                        .map_err(|error| (error.kind(), error.to_string()));
+                    assert_eq!(actual, expected);
+                    #[cfg(feature = "sync")]
+                    assert_eq!(
+                        reader
+                            .prefix_scan_values_sync(prefix, results, scanned, accepts)
+                            .map_err(|error| (error.kind(), error.to_string())),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_inline_decode_preserves_values_and_serialized_bytes() {
+        for (docs, frequencies) in [
+            (vec![0], vec![1]),
+            (vec![1, 128], vec![255, 128]),
+            (vec![0, 1, u32::MAX], vec![1, 129, 10]),
+        ] {
+            let info = TermInfo::try_inline(&docs, &frequencies).unwrap();
+            let mut before = Vec::new();
+            info.serialize(&mut before).unwrap();
+            let fixed = info.decode_inline_fixed().unwrap();
+            assert_eq!(fixed.docs(), docs);
+            assert_eq!(fixed.frequencies(), frequencies);
+            assert_eq!(info.decode_inline().unwrap(), (docs, frequencies));
+            let restored = TermInfo::try_inline(fixed.docs(), fixed.frequencies()).unwrap();
+            let mut after = Vec::new();
+            restored.serialize(&mut after).unwrap();
+            assert_eq!(before, after);
+        }
+    }
+
+    #[test]
+    fn inline_values_above_u32_are_rejected_without_truncation() {
+        for pair in [(u64::from(u32::MAX) + 1, 1), (1, u64::from(u32::MAX) + 1)] {
+            let mut encoded = Vec::new();
+            write_vint(&mut encoded, pair.0).unwrap();
+            write_vint(&mut encoded, pair.1).unwrap();
+            let mut data = [0; 16];
+            data[..encoded.len()].copy_from_slice(&encoded);
+            let info = TermInfo::Inline {
+                doc_freq: 1,
+                data,
+                data_len: encoded.len() as u8,
+            };
+            assert!(info.decode_inline_fixed().is_none());
+            assert!(info.decode_inline().is_none());
+        }
+    }
 
     #[test]
     fn test_bloom_filter_basic() {

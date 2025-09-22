@@ -1,13 +1,15 @@
 //! Prefix query — matches all documents containing any term that starts with a
-//! given prefix. Materializes the union of matching posting lists into a sorted
-//! doc ID set bounded by the segment's document count. Score is always 1.0
+//! given prefix. Ranked callers merge posting cursors lazily; complete/mapped
+//! callers materialize bounded document sets. Score is always 1.0
 //! (filter-style, like `RangeQuery`).
 
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
 
-use super::term_union::{TermUnionScorer, materialize_union, reject_chunked};
-use super::traits::{CountFuture, EmptyScorer, Query, Scorer, ScorerFuture};
+#[cfg(test)]
+use super::term_union::materialize_union;
+use super::term_union::{TermUnionScorer, reject_chunked};
+use super::traits::{CountFuture, Query, Scorer, ScorerFuture};
 
 /// Prefix query — matches documents containing any term starting with `prefix`.
 #[derive(Debug, Clone)]
@@ -46,20 +48,18 @@ impl PrefixQuery {
 }
 
 impl Query for PrefixQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let prefix = self.prefix.clone();
         Box::pin(async move {
             reject_chunked(reader, field, "PrefixQuery")?;
-            let postings = reader.get_prefix_postings(field, &prefix).await?;
-            if postings.is_empty() {
-                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
-            }
-            let docs = materialize_union(&postings, reader.num_docs(), reader.chunk_map(field));
-            if docs.is_empty() {
-                return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
-            }
-            Ok(Box::new(TermUnionScorer::new(docs)) as Box<dyn Scorer>)
+            let postings = reader.get_prefix_expansion(field, &prefix).await?;
+            Ok(Box::new(TermUnionScorer::from_expanded(
+                postings,
+                reader.num_docs(),
+                reader.chunk_map(field),
+                limit,
+            )) as Box<dyn Scorer>)
         })
     }
 
@@ -67,25 +67,23 @@ impl Query for PrefixQuery {
     fn scorer_sync<'a>(
         &self,
         reader: &'a SegmentReader,
-        _limit: usize,
+        limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
         reject_chunked(reader, self.field, "PrefixQuery")?;
-        let postings = reader.get_prefix_postings_sync(self.field, &self.prefix)?;
-        if postings.is_empty() {
-            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
-        }
-        let docs = materialize_union(&postings, reader.num_docs(), reader.chunk_map(self.field));
-        if docs.is_empty() {
-            return Ok(Box::new(EmptyScorer) as Box<dyn Scorer>);
-        }
-        Ok(Box::new(TermUnionScorer::new(docs)) as Box<dyn Scorer>)
+        let postings = reader.get_prefix_expansion_sync(self.field, &self.prefix)?;
+        Ok(Box::new(TermUnionScorer::from_expanded(
+            postings,
+            reader.num_docs(),
+            reader.chunk_map(self.field),
+            limit,
+        )))
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         let field = self.field;
         let prefix = self.prefix.clone();
         Box::pin(async move {
-            let postings = reader.get_prefix_postings(field, &prefix).await?;
+            let postings = reader.get_prefix_expansion(field, &prefix).await?;
             Ok(postings
                 .iter()
                 .fold(0u32, |sum, posting| sum.saturating_add(posting.doc_count()))
