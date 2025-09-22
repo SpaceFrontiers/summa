@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.9.1"
+version = "2.0.0"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT"
@@ -30,11 +30,11 @@ categories = ["database", "text-processing"]
 
 [workspace.dependencies]
 # Internal crates
-summa-core = { version = "1.9.1", path = "summa-core", default-features = false }
-summa-mal = { version = "1.9.1", path = "summa-mal" }
-summa-llm = { version = "1.9.1", path = "summa-llm", default-features = false }
-summa-tokenizer = { version = "1.9.1", path = "summa-tokenizer" }
-summa-proto = { version = "1.9.1", path = "summa-proto" }
+summa-core = { version = "2.0.0", path = "summa-core", default-features = false }
+summa-mal = { version = "2.0.0", path = "summa-mal" }
+summa-llm = { version = "2.0.0", path = "summa-llm", default-features = false }
+summa-tokenizer = { version = "2.0.0", path = "summa-tokenizer" }
+summa-proto = { version = "2.0.0", path = "summa-proto" }
 
 # Async runtime
 tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }
