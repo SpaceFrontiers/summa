@@ -36,7 +36,9 @@ and types are unchanged, but fully qualified RPC service names now begin with
 
 The original Summa blog and its assets are retained in the GitHub Pages source.
 Historical articles describe their original implementation; current package and
-API documentation is maintained alongside the code.
+API documentation is maintained alongside the code. The website build reads
+its API, schema and operations guides directly from these maintained sources
+through `scripts/build_website.py`, keeping the published guides in sync.
 
 ## Release and validation
 

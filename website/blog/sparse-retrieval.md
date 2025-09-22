@@ -10,8 +10,6 @@ nav_order: 4
 
 _September 25, 2026_
 
-<script async src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js"></script>
-
 Let's return to the [inverted index](how-search-engines-work.md). We already know how to find documents containing a word. Now imagine that a model could decide which words describe a document, including useful words the author never wrote. We would get semantic expansion without throwing away the inverted index.
 
 This leads us to learned sparse retrieval. More generally, sparse retrieval represents a query and a document using a large coordinate space in which most weights are zero. The important property is the pattern of
