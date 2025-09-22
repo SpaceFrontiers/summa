@@ -1,13 +1,7 @@
 ---
-title: JS
+title: Browser WASM API
 parent: APIs
+source_doc: summa-wasm/README.md
 ---
 
-> Historical Summa 0.x guide. For Summa 2, use the [current documentation](https://github.com/SpaceFrontiers/summa/blob/main/docs/README.md).
-
-[![NPM](https://img.shields.io/npm/v/summa-wasm.svg?label=summa-wasm)](https://www.npmjs.com/package/summa-wasm)
-
-# NPM package `summa-wasm`
-
-Package [summa-wasm](https://www.npmjs.com/package/summa-wasm) provides bindings to the most essential parts of Summa server.
-Bindings allow you to open multiple indices and do all types of queries.
+[Read the maintained guide](../../summa-wasm/README.md).

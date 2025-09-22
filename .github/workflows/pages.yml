@@ -3,7 +3,15 @@ name: Documentation and blog
 on:
   push:
     branches: [main]
-    paths: ["website/**", ".github/workflows/pages.yml"]
+    paths:
+      [
+        "website/**",
+        "docs/**",
+        "**/README.md",
+        "CONTRIBUTING.md",
+        "scripts/build_website.py",
+        ".github/workflows/pages.yml",
+      ]
   workflow_dispatch:
 
 permissions:
@@ -23,10 +31,12 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare current documentation
+        run: python3 scripts/build_website.py
       - uses: actions/configure-pages@v5
       - uses: actions/jekyll-build-pages@v1
         with:
-          source: ./website
+          source: ./.context/website
           destination: ./_site
       - uses: actions/upload-pages-artifact@v3
       - uses: actions/deploy-pages@v4

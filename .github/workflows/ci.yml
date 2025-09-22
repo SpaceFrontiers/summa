@@ -19,6 +19,8 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - name: Check documentation
         run: uv run --python 3.12 scripts/check_docs.py
+      - name: Build website sources
+        run: python3 scripts/build_website.py
       - name: Test documentation checker
         run: uv run --python 3.12 --with markdown-it-py==4.0.0 python -m unittest discover -s scripts -p 'test_check_docs.py'
 

@@ -1,13 +1,16 @@
 ---
-title: Kafka Consuming
+title: Ingestion from Kafka
 parent: APIs
 ---
 
-> Historical Summa 0.x guide. For Summa 2, use the [current documentation](https://github.com/SpaceFrontiers/summa/blob/main/docs/README.md).
+# Ingestion from Kafka
 
-## Consumer API
+Summa 2 does not ship the original Kafka consumer API. Run the consumer in your
+application and use [Python](python-api.md), [TypeScript](typescript-api.md), or
+[gRPC](grpc-api.md) document ingestion.
 
-Summa can ingest documents through Kafka.
-The core concept is Consumer that can be created through API.
-Consumer operated in a separate thread and transfers messages from Kafka topic into the selected index.
-At the moment it is the most performant way to index large number of documents.
+Inspect per-document errors and commit accepted writes before advancing the
+corresponding Kafka offsets. Handle retries using primary keys and the
+[upsert semantics](../guides/mutations.md). A Summa commit and a Kafka offset
+commit are separate operations; this integration does not provide a transaction
+across both systems. Bound batch sizes and retry concurrency.

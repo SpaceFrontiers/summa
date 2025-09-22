@@ -1,111 +1,96 @@
-In this quick-start we will create index for searching in WikiBooks. There are two essential parts, **Summa server** responsible for
-indexing text data and **Summa client** that is required for communicating with Summa server.
+Let's create a small searchable collection with Summa 2. We need the server,
+which owns the index, and a client that sends indexing and search requests.
 
-Although there is a [GRPC API](https://spacefrontiers.github.io/summa/apis/grpc-api) you may want to use through tools like `grpcurl`, here we will use Summa client implemented in Python.
+### Start the server
 
-### Install <a name="setup"></a>
-
-#### Prerequisite:
-
-- [Python3](https://www.python.org/downloads/) or [grpcurl](https://github.com/fullstorydev/grpcurl)
-- [Docker](https://www.docker.com/)
-
-`summa-server` is distributed as a prebuilt Docker image hosted on Dockerhub, or may be build from sources. Summa exposes its APIs through GRPC what
-makes available it to use in all languages having GRPC client libraries. Additionally, there is an `aiosumma` Python packages
-that provides Python client and CLI.
-
-#### Summa Server
-
-We are going to pull and launch `summa-server` through Docker. Pulling can be done by `docker pull`
+The current container image is published by SpaceFrontiers in GitHub Container
+Registry. It listens for gRPC requests on port 50051 and stores its indexes in
+`/data`:
 
 ```bash
-# Pull actual image for `summa-server`
-docker pull izihawa/summa-server:testing
-
-# Create local directory for storing index
-mkdir data
-
-# Generate config for `summa-server`
-# -a flag is for setting listen address of GRPC API
-docker run izihawa/summa-server:testing generate-config -d /data \
--a 0.0.0.0:8082 > summa.yaml
-
-# Launch `summa-server`
-docker run -v $(pwd)/summa.yaml:/summa.yaml -v $(pwd)/data:/data -p 8082:8082 \
-izihawa/summa-server:testing serve /summa.yaml
+docker pull ghcr.io/spacefrontiers/summa/summa-server:2.0.0
+mkdir -p data
+docker run --rm -p 50051:50051 -v "$PWD/data:/data" \
+  ghcr.io/spacefrontiers/summa/summa-server:2.0.0 summa-server \
+  --data-dir /data --addr 0.0.0.0:50051
 ```
 
-After the last command you should see starting logs of `summa-server`, something like
+Alternatively, build and run the Rust package:
 
 ```bash
-2022-11-17T16:14:00.712450Z  INFO main lifecycle: summa_server::servers::metrics: action="binded" endpoint="0.0.0.0:8084"
-2022-11-17T16:14:00.714536Z  INFO main lifecycle: summa_server::servers::grpc: action="binded" endpoint="0.0.0.0:8082"
-2022-11-17T16:14:00.752511Z  INFO main summa_server::services::index_service: action="index_holders" index_holders={}
+cargo install summa-server --version 2.0.0
+summa-server --data-dir ./data --addr 127.0.0.1:50051
 ```
 
-#### Aiosumma
+### Install the Python client
 
-`aiosumma` is a Python package for using Summa GRPC API from Python and Terminal. Let's install it:
+Use Python 3.10 or newer:
 
 ```bash
-# (Optional) Create virtual env for `aiosumma`
-python3 -m venv venv
-source venv/bin/acticate
-
-# Install aiosumma
-pip3 install -U aiosumma
+python3 -m venv .venv
+source .venv/bin/activate
+pip install summa-client-python==2.0.0
 ```
 
-#### grpcurl
+### Index and search
 
-You may also use `curl`-alike tool for reaching `summa-server` though Terminal.
-You may download its binary from [their repository](https://github.com/fullstorydev/grpcurl/releases) or install through
-brew on MacOS: `brew install grpcurl`
+Save the following as `search.py`. The schema declares a stored, searchable text
+field. Indexing stages documents; `commit` makes them visible to searches.
 
-### Create Index
+```python
+import asyncio
 
-Summa is a schemaful search engines. It requires from you to define fields what you are going to use. Let's create
-a schema for WikiBooks:
+from summa_client_python import SummaClient
 
-```bash
-# Create index schema in file
-cat << EOF > schema.yaml
-{% include summa-wiki-schema.yaml %}
-EOF
+
+async def main():
+    async with SummaClient("localhost:50051") as client:
+        await client.create_index(
+            "articles",
+            """
+            index articles {
+                field id: text<raw> [primary, stored]
+                field title: text<simple> [indexed, stored]
+                field body: text<simple> [indexed, stored]
+            }
+            """,
+        )
+
+        indexed, error_count, errors = await client.index_documents(
+            "articles",
+            [
+                {"id": "1", "title": "Hello World", "body": "First article"},
+                {"id": "2", "title": "Summa Search", "body": "Fast retrieval"},
+            ],
+        )
+        if error_count:
+            raise RuntimeError(errors)
+        print(f"Indexed {indexed} documents")
+
+        await client.commit("articles")
+
+        results = await client.search(
+            "articles",
+            query={"match": {"field": "title", "text": "hello"}},
+            fields_to_load=["title", "body"],
+        )
+        for hit in results.hits:
+            print(hit.address, hit.score, hit.fields)
+
+        if results.hits:
+            document = await client.get_document("articles", results.hits[0].address)
+            print(document.fields if document else "document not found")
+
+
+asyncio.run(main())
 ```
 
-```bash
-# Create index
-summa-cli localhost:8082 - create-index-from-file schema.yaml
-```
+Run it with `python search.py`. The client connects to the local server and
+prints the matching article. Check indexing errors before committing: an RPC
+completing does not mean every supplied document was accepted.
 
-### Add Documents <a name="fill"></a>
-
-WikiBooks provides weekly dumps of their books' database.
-Let's download their dump and index it in Summa:
-
-```bash
-{% include download-dump-snippet.sh %}
-```
-
-```bash
-{% include import-data-to-summa-snippet.sh %}
-```
-
-Well, we have WikiBooks database indexed locally.
-
-### Search <a name="query"></a>
-
-Let's do a test query:
-
-```bash
-# Do a match query that returns top-10 documents and its total count
-summa-cli 0.0.0.0:8082 search '{"index_alias": "books", "query": {"match": {"value": "astronomy"}}, "collectors": [{"top_docs": {"limit": 10}}, {"count": {}}]}'
-```
-
-You will see response containing found documents.
-
-## Further reading
-
-- [Core components](https://spacefrontiers.github.io/summa/core)
-- [API References](https://spacefrontiers.github.io/summa/apis)
+See the [Python client guide](https://github.com/SpaceFrontiers/summa/blob/main/summa-client-python/README.md)
+for updates, deletions and streaming, and [server operations](https://github.com/SpaceFrontiers/summa/blob/main/summa-server/README.md)
+for resource limits. Existing Summa 0.x applications should follow the
+[migration guide](https://github.com/SpaceFrontiers/summa/blob/main/docs/summa-2-migration.md);
+the old YAML configuration and `aiosumma` CLI are not the Summa 2 interface.

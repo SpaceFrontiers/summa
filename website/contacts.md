@@ -1,17 +1,11 @@
 ---
-title: Contacts
-nav_order: 6
+title: Community
+nav_order: 8
 ---
 
-> Historical Summa 0.x guide. For Summa 2, use the [current documentation](https://github.com/SpaceFrontiers/summa/blob/main/docs/README.md).
+# Community
 
-### Summa:
-
-- [Support Chat in Telegram](https://t.me/+lCDtzXKpXfNmYmUy)
-
-### Maintainers
-
-- [@PashaPodolsky](https://github.com/ppodolsky)
-  - [LinkedIn](https://www.linkedin.com/in/pasha-perevedentsev-28731777/)
-  - [Habrahabr (ru)](https://habr.com/ru/users/PashaPodolsky)
-  - [Telegram Blog (ru)](https://t.me/nerdy_vibes)
+- [SpaceFrontiers on GitHub](https://github.com/SpaceFrontiers)
+- [Summa repository](https://github.com/SpaceFrontiers/summa)
+- [Report an issue](https://github.com/SpaceFrontiers/summa/issues)
+- [Maintainer: Pasha Podolsky](https://github.com/ppodolsky)
