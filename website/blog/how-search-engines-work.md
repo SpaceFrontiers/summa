@@ -48,7 +48,7 @@ The main issue with the vector search model is how to construct the vector space
 
 <a href="https://towardsdatascience.com/document-embedding-techniques-fed3e7a6a25d">Modern libraries</a> allow to build complex vector spaces with a small number of dimensions and dense information content in each dimension with just a few clicks. In such spaces all vector coordinates characterize particular aspect of the document or query: theme, mood, length, lexicon, or any combination of these aspects. Often, coordinate value cannot be explained in human language, but is understood by machines. A simple plan for building such a search is:
 
-- Take your favorite library for building text embeddings, such as <a href="https://fasttext.cc/">fastText</a> or <a href="https://github.com/google-research/bert">BERT</a>, and transform the documents into vectors
+- Choose a retrieval-trained embedding model and transform documents into vectors using its prescribed pooling, normalization and document instructions
 - Store the obtained vectors in your favorite K nearest neighbors (k-NN) search library, such as <a href="https://github.com/facebookresearch/faiss">faiss</a>
 - Transform the search query into a vector using the same method as for documents
 - Find the nearest vectors to the query vector and extract the corresponding documents
@@ -64,7 +64,7 @@ Let's represent relevance as two mathematical functions and then fill them with 
 
 We impose the restriction of additivity on $$score(q, d)$$ and express the relevance of the query through the sum of its terms' relevance: $$score(q, d)=\sum_{t \in q}score(t, d)$$
 
-Additivity simplifies further computations, but forces us to agree with a strong simplification of reality - as if all words in the text occur <a href="https://en.wikipedia.org/wiki/Bag-of-words_model">independently of each other</a>.
+Additivity simplifies computation. A basic <a href="https://en.wikipedia.org/wiki/Bag-of-words_model">bag-of-words model</a> ignores word order and interactions unless we add explicit phrase or proximity features; additivity itself does not prove that words occur independently.
 
 The most well-known additive relevance functions are TF-IDF and BM25. They are used in most search systems as ones of the main relevance metrics.
 

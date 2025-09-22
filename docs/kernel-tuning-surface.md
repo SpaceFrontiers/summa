@@ -57,8 +57,8 @@ PLANE_WIDTH` is statically asserted (both CUDA warps and Metal SIMD
 
 ## Measured constants (re-measure for a very different regime)
 
-Tuned on A100 40GB at retriever-100m scale (d_inner 1536, state 16,
-T1024). They are _correct_ everywhere; their optimality was measured here:
+Tuned on A100 40GB at retriever-100m scale (d*inner 1536, state 16,
+T1024). They are \_correct* everywhere; their optimality was measured here:
 
 - `CHECKPOINTED_SCAN_INTERVAL = 32` — the recompute/parallelism balance;
   16 measured −2.3%, 8 −8.3% at this scale. Statically asserted to tile by
