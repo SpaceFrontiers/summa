@@ -7,22 +7,19 @@ use super::{
 use log::debug;
 
 impl MaxScoreExecutor<'_> {
-    /// Pruning is useful only where both lists carry selective block bounds.
+    /// Pruning requires conservative bounds from both text cursors.
     /// Unsupported scorers and approximate heap factors retain exhaustive AND.
     pub(super) fn can_prune_text_pair(&self) -> bool {
-        self.document_map.is_some()
-            && self.inv_heap_factor == 1.0
-            && self.cursors.len() == 2
-            && self.cursors.iter().all(|cursor| {
-                cursor.max_score.is_finite()
-                    && matches!(&cursor.variant,
-                        CursorVariant::Text { list, length_bounds: true, prepared_bounds: Some(_), .. }
-                        if list.has_ratio_bounds())
-            })
+        if self.inv_heap_factor != 1.0 || self.cursors.len() != 2 {
+            return false;
+        }
+        self.cursors
+            .iter()
+            .all(super::TermCursor::supports_text_block_pruning)
     }
 
     /// Semantic AND aligns typed cursors and batches only actual matches.
-    /// Ranked mapped pairs can skip strictly losing blocks; counted traversal
+    /// Ranked pairs can skip strictly losing blocks; counted traversal
     /// always uses the exhaustive instantiation below.
     pub(super) fn execute_conjunction(&mut self) -> crate::Result<Vec<ScoredDoc>> {
         with_window_scratch(|scratch| self.run_ranked_conjunction(scratch))

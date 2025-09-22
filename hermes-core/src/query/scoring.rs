@@ -1121,6 +1121,21 @@ impl<'a> TermCursor<'a> {
         matches!(self.variant, CursorVariant::Text { .. })
     }
 
+    /// Length bounds are safe for pruning only with supported finite scoring.
+    fn supports_text_block_pruning(&self) -> bool {
+        if !self.max_score.is_finite() {
+            return false;
+        }
+        match &self.variant {
+            CursorVariant::Text {
+                length_bounds,
+                prepared_bounds,
+                ..
+            } => *length_bounds && prepared_bounds.is_some(),
+            CursorVariant::Sparse { .. } => false,
+        }
+    }
+
     /// Upper bound of text block `idx` from its `(max_tf, min_len)` word.
     fn text_block_bound(&self, idx: usize) -> f32 {
         self.text_block_bound_for_threshold(idx, f32::NEG_INFINITY)
@@ -2404,7 +2419,7 @@ impl<'a> MaxScoreExecutor<'a> {
             self.execute_conjunction()
         } else if self.required_mask != 0 {
             self.execute_text_windows::<true>()
-        } else if self.single_text_with_ratio_bounds() {
+        } else if self.single_text_with_block_bounds() {
             self.execute_single_text()
         } else if self.all_text() {
             self.execute_windowed()
@@ -2457,15 +2472,9 @@ impl<'a> MaxScoreExecutor<'a> {
         bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
     }
 
-    /// Route a lone text cursor to [`Self::execute_single_text`] only when
-    /// its list stores ratio bounds. That path decides per block and group
-    /// from skip metadata alone and needs the tight ratio bounds to skip
-    /// anything; without them its bounds admit nearly every block, and the
-    /// measured cost of the windowed path at n = 1 (one sorted run per
-    /// block, no reduction) is no higher, so plain lists stay on the general
-    /// path.
-    fn single_text_with_ratio_bounds(&self) -> bool {
-        matches!(self.cursors.as_slice(), [TermCursor { variant: CursorVariant::Text { list, .. }, .. }] if list.has_ratio_bounds())
+    /// A lone bounded text cursor needs no window partition or reduction.
+    fn single_text_with_block_bounds(&self) -> bool {
+        matches!(self.cursors.as_slice(), [cursor] if cursor.supports_text_block_pruning())
     }
 
     /// A single text cursor needs no dense ID-window scratch or score reduction.

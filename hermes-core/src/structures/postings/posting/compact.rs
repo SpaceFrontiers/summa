@@ -222,8 +222,8 @@ impl PostingBlockSource {
             stream,
             l0_bytes: OwnedBytes::new(l0),
             l0_count: 1,
-            l1_docs: vec![last],
-            l1_bounds: Vec::new(),
+            l1_docs: vec![last].into(),
+            l1_bounds: Vec::new().into(),
             ratios: self.footer.ratio_bounds.then(|| {
                 let ratio = read_ratio(
                     &self.index[self.footer.cursors_end() - self.footer.stream_len..],

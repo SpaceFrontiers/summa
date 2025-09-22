@@ -23,15 +23,20 @@ impl WildcardQuery {
         check_length(source, "wildcard")?;
         let mut expression = String::new();
         let mut prefix = String::new();
+        let mut suffix = String::new();
+        let mut stars = 0usize;
+        let mut questions = false;
         let mut literal_prefix = true;
         let mut characters = source.chars();
         while let Some(character) = characters.next() {
             match character {
                 '*' => {
+                    stars += 1;
                     expression.push_str(".*");
                     literal_prefix = false;
                 }
                 '?' => {
+                    questions = true;
                     expression.push('.');
                     literal_prefix = false;
                 }
@@ -46,15 +51,25 @@ impl WildcardQuery {
                     expression.push_str(&regex::escape(literal.encode_utf8(&mut [0; 4])));
                     if literal_prefix {
                         prefix.push(literal);
+                    } else {
+                        suffix.push(literal);
                     }
                 }
             }
+        }
+        if stars == 1 && !questions {
+            return Ok(Self(TermPatternQuery::single_star(
+                field,
+                source,
+                prefix.into_bytes(),
+                suffix.into_bytes(),
+            )));
         }
         Ok(Self(TermPatternQuery::compile(
             field,
             source,
             &expression,
-            prefix.into_bytes(),
+            vec![prefix.into_bytes()],
             "wildcard",
         )?))
     }

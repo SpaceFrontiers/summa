@@ -6,12 +6,13 @@ use hermes_core::{Document, RamDirectory, SchemaBuilder};
 
 #[tokio::test(flavor = "current_thread")]
 async fn ranked_terms_match_exhaustive_global_scores_ties_and_offsets() {
-    for impacts in [false, true] {
-        ranked_terms_match_exhaustive_global_scores_ties_and_offsets_with(impacts).await;
+    for (ratio, impacts) in [(false, false), (true, false), (true, true)] {
+        ranked_terms_match_exhaustive_global_scores_ties_and_offsets_with(ratio, impacts).await;
     }
 }
 
 async fn ranked_terms_match_exhaustive_global_scores_ties_and_offsets_with(
+    posting_ratio_bounds: bool,
     posting_impact_bounds: bool,
 ) {
     let dir = RamDirectory::new();
@@ -21,7 +22,7 @@ async fn ranked_terms_match_exhaustive_global_scores_ties_and_offsets_with(
     let field = schema.add_text_field("text", true, false);
     schema.set_bm25_params(field, Some(0.9), Some(0.6));
     let config = IndexConfig {
-        posting_ratio_bounds: true,
+        posting_ratio_bounds,
         posting_impact_bounds,
         num_threads: 1,
         num_indexing_threads: 1,

@@ -60,9 +60,9 @@ pub use posting::{
     BLOCK_SIZE as POSTING_BLOCK_SIZE, BlockPostingIterator, BlockPostingList, Posting,
     PostingCodec, PostingList, PostingListIterator, TERMINATED,
 };
+pub(crate) use posting::{DeferredPosting, PostingDecodeScratch, PostingListReader};
 #[cfg(feature = "native")]
 pub(crate) use posting::{PostingBlockSource, PostingStreamWriter};
-pub(crate) use posting::{PostingDecodeScratch, PostingListReader};
 pub use posting_common::{
     BLOCK_SIZE as COMMON_BLOCK_SIZE, RoundedBitWidth, SkipEntry, SkipList, pack_deltas_fixed,
     read_doc_id_block, read_vint, unpack_deltas_fixed, write_doc_id_block, write_vint,

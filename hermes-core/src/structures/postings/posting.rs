@@ -11,12 +11,14 @@
 //! The codec is stored per block in the header, so a single list (for example
 //! the output of a merge) may mix codecs.
 
+mod groups;
 mod impacts;
 mod reader;
 mod validation;
+use groups::GroupWords;
 use impacts::{ImpactBuilder, ImpactTable};
 
-pub(crate) use reader::PostingListReader;
+pub(crate) use reader::{DeferredPosting, PostingListReader};
 
 #[cfg(feature = "native")]
 mod compact;
@@ -426,7 +428,7 @@ fn unpack_bounds(word: u32, packed: bool) -> (u32, Option<u32>) {
 const CURSOR_SIZE: usize = 8;
 
 /// Parsed footer of either format plus the derived section layout.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Footer {
     compact_headers: bool,
     short_cursors: bool,
@@ -790,7 +792,7 @@ pub struct BlockPostingList {
     /// Explicit deserialization checks decoded ordering; segment queries trust the writer.
     verify_content: bool,
     /// First decoding failure detected in this immutable segment reader.
-    content_error: Option<std::sync::Arc<std::sync::OnceLock<usize>>>,
+    content_error: Option<std::sync::Arc<reader::PostingIntegrity>>,
     /// Block data stream (packed blocks laid out sequentially).
     stream: OwnedBytes,
     /// Level-0 skip entries: `(first_doc, last_doc, offset, max_weight)` × `l0_count`.
@@ -800,11 +802,11 @@ pub struct BlockPostingList {
     /// Number of blocks (= number of L0 entries).
     l0_count: usize,
     /// Level-1 skip `last_doc` values — one per `L1_INTERVAL` blocks.
-    /// Stored as `Vec<u32>` for direct SIMD-accelerated `find_first_ge_u32`.
-    l1_docs: Vec<u32>,
+    /// Borrowed little-endian words; opening does not copy the group directory.
+    l1_docs: GroupWords,
     /// Packed `(max_tf, min_len)` per L1 group (superblock bounds); empty
     /// for legacy lists.
-    l1_bounds: Vec<u32>,
+    l1_bounds: GroupWords,
     /// Optional L0 then L1 length/TF ratio minima, borrowed from index bytes.
     ratios: Option<OwnedBytes>,
     /// Validated borrowed offsets and compact integer envelope records.
@@ -1063,8 +1065,8 @@ impl BlockPostingList {
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
             l0_count,
-            l1_docs,
-            l1_bounds,
+            l1_docs: l1_docs.into(),
+            l1_bounds: l1_bounds.into(),
             ratios: ratios.map(OwnedBytes::new),
             impacts: if let Some(mut impacts) = impacts {
                 impacts.append_groups_with(l0_count, |_| Ok(None))?;
@@ -1148,12 +1150,8 @@ impl BlockPostingList {
                 writer.write_all(&header[6..])?;
             }
         }
-        for &doc in &self.l1_docs {
-            writer.write_u32::<LittleEndian>(doc)?;
-        }
-        for &bounds in &self.l1_bounds {
-            writer.write_u32::<LittleEndian>(bounds)?;
-        }
+        writer.write_all(self.l1_docs.bytes())?;
+        writer.write_all(self.l1_bounds.bytes())?;
         let short_cursors =
             compact && self.pos_cursors.is_some() && self.total_positions <= u32::MAX as u64;
         if self.pos_cursors.is_some() {
@@ -1245,8 +1243,7 @@ impl BlockPostingList {
     }
 
     /// Zero-copy deserialization from OwnedBytes.
-    /// Stream, L0 and cursors are sliced from the source without copying.
-    /// L1 is extracted into a `Vec<u32>` for SIMD-friendly access (tiny: ≤ N/8 entries).
+    /// Stream, L0, L1 and cursors are sliced from the source without copying.
     pub fn deserialize_zero_copy(raw: OwnedBytes) -> io::Result<Self> {
         let footer = Self::validate_bytes(&raw)?;
         Ok(Self::from_layout(raw, footer))
@@ -1273,12 +1270,8 @@ impl BlockPostingList {
         let ratios = footer
             .ratio_bounds
             .then(|| raw.slice(footer.cursors_end()..footer.ratios_end()));
-        let l1_docs = Self::extract_l1_docs(&raw[footer.l1_start()..], footer.l1_count);
-        let l1_bounds = if footer.l1_bounds {
-            Self::extract_l1_docs(&raw[footer.l1_end()..], footer.l1_count)
-        } else {
-            Vec::new()
-        };
+        let l1_docs = GroupWords::borrowed(raw.slice(footer.l1_start()..footer.l1_end()));
+        let l1_bounds = GroupWords::borrowed(raw.slice(footer.l1_end()..footer.l1_bounds_end()));
         let pos_cursors = footer
             .has_cursors
             .then(|| raw.slice(footer.l1_bounds_end()..footer.cursors_end()));
@@ -1420,7 +1413,7 @@ impl BlockPostingList {
         if block_idx >= self.l0_count {
             return None;
         }
-        let word = *self.l1_bounds.get(block_idx / L1_INTERVAL)?;
+        let word = self.l1_bounds.get(block_idx / L1_INTERVAL)?;
         let (max_tf, min_len) = unpack_bounds(word, true);
         let max_tf = if max_tf == u16::MAX as u32 {
             max_tf.max(self.max_tf)
@@ -1433,7 +1426,7 @@ impl BlockPostingList {
     /// Last doc of the L1 group containing `block_idx`.
     #[inline]
     pub fn group_last_doc(&self, block_idx: usize) -> Option<DocId> {
-        self.l1_docs.get(block_idx / L1_INTERVAL).copied()
+        self.l1_docs.get(block_idx / L1_INTERVAL)
     }
 
     /// Whether `block_idx` opens an L1 group.
@@ -1501,16 +1494,6 @@ impl BlockPostingList {
                 u64::from_le_bytes(b.try_into().unwrap())
             }
         })
-    }
-
-    /// Extract L1 last_doc values from raw LE bytes into a Vec<u32>.
-    fn extract_l1_docs(bytes: &[u8], count: usize) -> Vec<u32> {
-        let mut docs = Vec::with_capacity(count);
-        for i in 0..count {
-            let p = i * L1_SIZE;
-            docs.push(u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap()));
-        }
-        docs
     }
 
     pub fn doc_count(&self) -> u32 {
@@ -1664,8 +1647,8 @@ impl BlockPostingList {
             stream: OwnedBytes::new(stream),
             l0_bytes: OwnedBytes::new(l0_buf),
             l0_count,
-            l1_docs,
-            l1_bounds,
+            l1_docs: l1_docs.into(),
+            l1_bounds: l1_bounds.into(),
             ratios: ratios.map(OwnedBytes::new),
             impacts: if let Some(mut impacts) = impacts {
                 let mut source = 0;
@@ -2086,7 +2069,7 @@ impl BlockPostingList {
             doc_ids.clear();
             if let Some(error) = &self.content_error {
                 // Write-once: no query may erase another query's failure.
-                let _ = error.set(block_idx);
+                error.record(block_idx);
             }
         }
         decoded
@@ -2291,18 +2274,18 @@ impl BlockPostingList {
             return Some(from_block);
         }
         let from_l1 = from_block / L1_INTERVAL;
-        let groups = self.l1_docs.get(from_l1..)?;
-        let first = *groups.first()?;
+        let groups = self.l1_docs.words().get(from_l1..)?;
+        let first = u32::from_le_bytes(*groups.first()?);
         let offset = if first >= target {
             0
         } else {
             let mut bound = 1usize;
-            while bound < groups.len() && groups[bound] < target {
+            while bound < groups.len() && u32::from_le_bytes(groups[bound]) < target {
                 bound = bound.saturating_mul(2);
             }
             let lo = bound / 2;
             let hi = bound.saturating_add(1).min(groups.len());
-            lo + groups[lo..hi].partition_point(|&last| last < target)
+            lo + groups[lo..hi].partition_point(|&last| u32::from_le_bytes(last) < target)
         };
         let l1_idx = from_l1 + offset;
         if l1_idx >= self.l1_docs.len() {
@@ -2740,10 +2723,48 @@ impl<'a> BlockPostingIterator<'a> {
         let end = base.saturating_add(span);
         bits.fill(0);
         self.seek(base);
+        let list = self.block_list.as_ref();
+        let dense = list.doc_count() >= 16
+            && list
+                .block_first_doc(0)
+                .zip(list.block_last_doc(list.num_blocks().saturating_sub(1)))
+                .is_some_and(|(first, last)| {
+                    u64::from(last)
+                        .checked_sub(u64::from(first))
+                        .is_some_and(|span| span < u64::from(list.doc_count()) * 2)
+                });
+        if dense {
+            self.fill_doc_words::<true>(base, end, bits);
+        } else {
+            self.fill_doc_words::<false>(base, end, bits);
+        }
+    }
+
+    fn fill_doc_words<const GROUPED: bool>(&mut self, base: DocId, end: DocId, bits: &mut [u64]) {
         self.visit_until::<false>(end, |docs, _| {
-            for &doc in docs {
-                let offset = (doc - base) as usize;
-                bits[offset / 64] |= 1u64 << (offset % 64);
+            // Decide once per window, outside the hot decoded-run loop.
+            if !GROUPED {
+                for &doc in docs {
+                    let offset = (doc - base) as usize;
+                    bits[offset / 64] |= 1u64 << (offset % 64);
+                }
+                return true;
+            }
+            let mut index = 0;
+            while index < docs.len() {
+                let offset = (docs[index] - base) as usize;
+                let word_index = offset / 64;
+                let mut mask = 1u64 << (offset % 64);
+                index += 1;
+                while index < docs.len() {
+                    let offset = (docs[index] - base) as usize;
+                    if offset / 64 != word_index {
+                        break;
+                    }
+                    mask |= 1u64 << (offset % 64);
+                    index += 1;
+                }
+                bits[word_index] |= mask;
             }
             true
         });
@@ -2759,6 +2780,15 @@ impl<'a> BlockPostingIterator<'a> {
         mut visit: impl FnMut(&[u32], &[u32]) -> bool,
     ) {
         self.visit_until::<true>(end, |docs, tfs| visit(docs, tfs.unwrap()));
+    }
+
+    /// Consume bounded decoded ID runs without initializing frequencies.
+    pub(crate) fn visit_doc_ids_until(
+        &mut self,
+        end: DocId,
+        mut visit: impl FnMut(&[u32]) -> bool,
+    ) {
+        self.visit_until::<false>(end, |docs, _| visit(docs));
     }
 
     fn visit_until<const WITH_FREQUENCIES: bool>(
@@ -3242,6 +3272,51 @@ mod tests {
             }
             assert_eq!(cursor.doc(), TERMINATED);
             assert_eq!(serialize_bpl(&list), bytes);
+        }
+    }
+
+    #[test]
+    fn membership_words_preserve_unaligned_dense_sparse_windows_and_resume() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            for stride in [1, 2, 3, 67, 129] {
+                let docs: Vec<u32> = (0..10_000).step_by(stride).collect();
+                let mut postings = PostingList::new();
+                for &doc in &docs {
+                    postings.push(doc, 1 + doc % 7);
+                }
+                let list =
+                    BlockPostingList::from_posting_list_with_options(&postings, true, None, codec)
+                        .unwrap();
+                for start in [0, 1, 17, 63, 64, 127, 511] {
+                    let mut cursor = list.iterator();
+                    for base in [start, start + 4096, start + 8192] {
+                        let mut bits = [u64::MAX; 64];
+                        cursor.fill_doc_window(base, &mut bits);
+                        let mut expected = [0u64; 64];
+                        for &doc in &docs {
+                            if (base..base + 4096).contains(&doc) {
+                                let offset = (doc - base) as usize;
+                                expected[offset / 64] |= 1u64 << (offset % 64);
+                            }
+                        }
+                        assert_eq!(bits, expected, "{codec:?}, stride={stride}, base={base}");
+                        let next = docs
+                            .iter()
+                            .copied()
+                            .find(|&doc| doc >= base + 4096)
+                            .unwrap_or(TERMINATED);
+                        assert_eq!(cursor.doc(), next);
+                        if next != TERMINATED {
+                            assert_eq!(cursor.term_freq(), 1 + next % 7);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4117,15 +4192,15 @@ mod tests {
         assert_eq!(bpl.l1_docs.len(), 3); // ceil(20/8) = 3
         // L1[0] = last_doc of block 7 (end of first group)
         let expected_l1_0 = bpl.block_last_doc(7).unwrap();
-        assert_eq!(bpl.l1_docs[0], expected_l1_0);
+        assert_eq!(bpl.l1_docs.get(0).unwrap(), expected_l1_0);
 
         // L1[1] = last_doc of block 15 (end of second group)
         let expected_l1_1 = bpl.block_last_doc(15).unwrap();
-        assert_eq!(bpl.l1_docs[1], expected_l1_1);
+        assert_eq!(bpl.l1_docs.get(1).unwrap(), expected_l1_1);
 
         // L1[2] = last_doc of block 19 (end of partial group)
         let expected_l1_2 = bpl.block_last_doc(19).unwrap();
-        assert_eq!(bpl.l1_docs[2], expected_l1_2);
+        assert_eq!(bpl.l1_docs.get(2).unwrap(), expected_l1_2);
     }
 
     #[test]
@@ -4350,7 +4425,53 @@ mod tests {
         }
 
         // Verify L1 docs match
-        assert_eq!(bpl.l1_docs, bpl2.l1_docs);
+        assert_eq!(bpl.l1_docs.bytes(), bpl2.l1_docs.bytes());
+    }
+
+    #[test]
+    fn posting_open_borrows_unaligned_group_directories_and_preserves_bytes_and_seeks() {
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+        ] {
+            let mut postings = PostingList::new();
+            for i in 0..3457u32 {
+                postings.push(i * 7 + 3, i % 13 + 1);
+            }
+            let built = BlockPostingList::from_posting_list_with_codec(&postings, codec).unwrap();
+            let encoded = serialize_bpl(&built);
+            for prefix in [1, 3, 7] {
+                let mut padded = vec![0; prefix];
+                padded.extend_from_slice(&encoded);
+                let owner = OwnedBytes::new(padded);
+                let raw = owner.slice(prefix..owner.len());
+                let footer = Footer::parse(&raw).unwrap();
+                let docs_start = raw[footer.l1_start()..].as_ptr();
+                let bounds_start = raw[footer.l1_end()..].as_ptr();
+                let opened = BlockPostingList::deserialize_zero_copy(raw).unwrap();
+                assert_eq!(
+                    opened.l1_docs.bytes().as_ptr(),
+                    docs_start,
+                    "opening must borrow group document metadata"
+                );
+                assert_eq!(
+                    opened.l1_bounds.bytes().as_ptr(),
+                    bounds_start,
+                    "opening must borrow group bound metadata"
+                );
+                assert_eq!(serialize_bpl(&opened), encoded);
+                for from in 0..=built.num_blocks() {
+                    for target in (0..=3457 * 7 + 4).step_by(37) {
+                        let expected = (from..built.num_blocks())
+                            .find(|&block| built.block_last_doc(block).unwrap() >= target);
+                        assert_eq!(opened.seek_block(target, from), expected);
+                    }
+                }
+                assert_eq!(collect_postings(&opened), collect_postings(&built));
+            }
+        }
     }
 
     #[test]
@@ -4365,7 +4486,7 @@ mod tests {
 
         // Same structure
         assert_eq!(copied.l0_count, zero_copy.l0_count);
-        assert_eq!(copied.l1_docs, zero_copy.l1_docs);
+        assert_eq!(copied.l1_docs.bytes(), zero_copy.l1_docs.bytes());
         assert_eq!(copied.doc_count, zero_copy.doc_count);
         assert_eq!(copied.max_tf, zero_copy.max_tf);
 
@@ -4395,7 +4516,8 @@ mod tests {
         assert_eq!(merged.l1_docs.len(), expected_l1_count);
 
         // Verify L1 values are correct
-        for (i, &l1_doc) in merged.l1_docs.iter().enumerate() {
+        for (i, word) in merged.l1_docs.words().iter().enumerate() {
+            let l1_doc = u32::from_le_bytes(*word);
             let last_block_in_group = ((i + 1) * L1_INTERVAL - 1).min(merged.num_blocks() - 1);
             let expected = merged.block_last_doc(last_block_in_group).unwrap();
             assert_eq!(l1_doc, expected, "L1[{}] mismatch", i);

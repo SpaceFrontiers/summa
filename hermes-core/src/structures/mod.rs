@@ -12,6 +12,7 @@ pub(crate) mod monotone;
 pub mod postings;
 pub mod simd;
 mod sstable;
+pub(crate) use sstable::DecodedInlinePostings;
 mod sstable_index;
 pub mod vector;
 mod vint;

@@ -21,16 +21,47 @@ impl RegexQuery {
         let source = pattern.as_ref();
         check_length(source, "regex")?;
         validate_syntax(source)?;
-        // No guessed prefix: alternation or optional prefixes can make a literal
-        // prefix unsafe. Dictionary scans retain the shared hard work limits.
         Ok(Self(TermPatternQuery::compile(
             field,
             source,
             source,
-            Vec::new(),
+            literal_prefixes(source)?,
             "regex",
         )?))
     }
+}
+
+/// Every matching term must start with one extracted literal. Limits make an
+/// infinite set fall back to the full field; they never truncate its language.
+fn literal_prefixes(source: &str) -> Result<Vec<Vec<u8>>> {
+    let hir = regex_syntax::ParserBuilder::new()
+        .dot_matches_new_line(true)
+        .build()
+        .parse(source)
+        .map_err(|error| Error::Query(format!("invalid regex pattern: {error}")))?;
+    let sequence = regex_syntax::hir::literal::Extractor::new()
+        .limit_total(64)
+        .limit_literal_len(64)
+        .limit_repeat(8)
+        .extract(&hir);
+    let Some(literals) = sequence.literals() else {
+        return Ok(vec![Vec::new()]);
+    };
+    let mut prefixes: Vec<_> = literals
+        .iter()
+        .map(|literal| literal.as_bytes().to_vec())
+        .collect();
+    prefixes.sort_unstable();
+    let mut disjoint: Vec<Vec<u8>> = Vec::with_capacity(prefixes.len());
+    for prefix in prefixes {
+        if disjoint
+            .last()
+            .is_none_or(|previous| !prefix.starts_with(previous))
+        {
+            disjoint.push(prefix);
+        }
+    }
+    Ok(disjoint)
 }
 
 fn validate_syntax(source: &str) -> Result<()> {
@@ -89,5 +120,38 @@ impl Query for RegexQuery {
     }
     fn is_filter(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn extracted_ranges_keep_alternation_optional_prefixes_and_unicode() {
+        // The prior planner always scanned the entire field, even for these
+        // selective, syntactically proven ranges.
+        let ranges = |source| super::literal_prefixes(source).unwrap();
+        assert_eq!(ranges("colou?r"), [b"color".to_vec(), b"colour".to_vec()]);
+        assert_eq!(
+            ranges("(www|http|https)"),
+            [b"http".to_vec(), b"www".to_vec()]
+        );
+        assert_eq!(ranges("(alpha|alphabet).*"), [b"alpha".to_vec()]);
+        assert_eq!(ranges("a?b"), [b"ab".to_vec(), b"b".to_vec()]);
+        assert_eq!(ranges(".*tion"), [Vec::<u8>::new()]);
+        assert_eq!(
+            ranges("(é|🦀)x"),
+            ["éx".as_bytes().to_vec(), "🦀x".as_bytes().to_vec()]
+        );
+        let regex = regex::Regex::new("^(?:[ab]{50})$").unwrap();
+        let prefixes = ranges("[ab]{50}");
+        assert!(prefixes.len() <= 64);
+        for term in ["a".repeat(50), "b".repeat(50), "ab".repeat(25)] {
+            assert!(regex.is_match(&term));
+            assert!(
+                prefixes
+                    .iter()
+                    .any(|prefix| term.as_bytes().starts_with(prefix))
+            );
+        }
     }
 }

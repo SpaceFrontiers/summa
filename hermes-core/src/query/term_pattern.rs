@@ -1,5 +1,5 @@
 //! Shared bounded dictionary matching for whole-term pattern filters.
-use super::term_union::{TermUnionScorer, materialize_union, reject_chunked};
+use super::term_union::{TermUnionScorer, reject_chunked};
 use super::traits::{CountFuture, Query, Scorer, ScorerFuture};
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
@@ -20,8 +20,14 @@ pub(super) struct TermPatternQuery {
 #[derive(Debug)]
 struct Pattern {
     source: String,
-    prefix: Vec<u8>,
-    regex: regex::Regex,
+    prefixes: Vec<Vec<u8>>,
+    matcher: Matcher,
+}
+
+#[derive(Debug)]
+enum Matcher {
+    Regex(regex::Regex),
+    SingleStar { prefix: Vec<u8>, suffix: Vec<u8> },
 }
 
 impl TermPatternQuery {
@@ -43,7 +49,7 @@ impl TermPatternQuery {
         field: Field,
         source: &str,
         expression: &str,
-        prefix: Vec<u8>,
+        prefixes: Vec<Vec<u8>>,
         label: &'static str,
     ) -> Result<Self> {
         check_length(source, label)?;
@@ -57,11 +63,28 @@ impl TermPatternQuery {
             field,
             pattern: Arc::new(Pattern {
                 source: source.to_owned(),
-                prefix,
-                regex,
+                prefixes,
+                matcher: Matcher::Regex(regex),
             }),
             label,
         })
+    }
+
+    pub(super) fn single_star(
+        field: Field,
+        source: &str,
+        prefix: Vec<u8>,
+        suffix: Vec<u8>,
+    ) -> Self {
+        Self {
+            field,
+            pattern: Arc::new(Pattern {
+                source: source.to_owned(),
+                prefixes: vec![prefix.clone()],
+                matcher: Matcher::SingleStar { prefix, suffix },
+            }),
+            label: "wildcard",
+        }
     }
 }
 
@@ -76,7 +99,17 @@ pub(super) fn check_length(source: &str, label: &str) -> Result<()> {
 
 impl Pattern {
     fn matches(&self, term: &[u8]) -> bool {
-        std::str::from_utf8(term).is_ok_and(|term| self.regex.is_match(term))
+        match &self.matcher {
+            Matcher::Regex(regex) => {
+                std::str::from_utf8(term).is_ok_and(|term| regex.is_match(term))
+            }
+            Matcher::SingleStar { prefix, suffix } => {
+                term.len() >= prefix.len() + suffix.len()
+                    && term.starts_with(prefix)
+                    && term.ends_with(suffix)
+                    && std::str::from_utf8(term).is_ok()
+            }
+        }
     }
 }
 
@@ -97,22 +130,23 @@ impl std::fmt::Display for TermPatternQuery {
 }
 
 impl Query for TermPatternQuery {
-    fn scorer<'a>(&self, reader: &'a SegmentReader, _limit: usize) -> ScorerFuture<'a> {
+    fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         let field = self.field;
         let pattern = self.pattern.clone();
         let label = self.label;
         Box::pin(async move {
             Self::validate_field(reader, field, label)?;
             let postings = reader
-                .get_matching_postings(field, &pattern.prefix, label, MAX_SCANNED_TERMS, |term| {
+                .get_matching_postings(field, &pattern.prefixes, label, MAX_SCANNED_TERMS, |term| {
                     pattern.matches(term)
                 })
                 .await?;
-            Ok(Box::new(TermUnionScorer::new(materialize_union(
-                &postings,
+            Ok(Box::new(TermUnionScorer::from_expanded(
+                postings,
                 reader.num_docs(),
                 reader.chunk_map(field),
-            ))) as Box<dyn Scorer>)
+                limit,
+            )) as Box<dyn Scorer>)
         })
     }
 
@@ -120,21 +154,22 @@ impl Query for TermPatternQuery {
     fn scorer_sync<'a>(
         &self,
         reader: &'a SegmentReader,
-        _limit: usize,
+        limit: usize,
     ) -> Result<Box<dyn Scorer + 'a>> {
         Self::validate_field(reader, self.field, self.label)?;
         let postings = reader.get_matching_postings_sync(
             self.field,
-            &self.pattern.prefix,
+            &self.pattern.prefixes,
             self.label,
             MAX_SCANNED_TERMS,
             |term| self.pattern.matches(term),
         )?;
-        Ok(Box::new(TermUnionScorer::new(materialize_union(
-            &postings,
+        Ok(Box::new(TermUnionScorer::from_expanded(
+            postings,
             reader.num_docs(),
             reader.chunk_map(self.field),
-        ))))
+            limit,
+        )))
     }
 
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
@@ -144,7 +179,7 @@ impl Query for TermPatternQuery {
         Box::pin(async move {
             Self::validate_field(reader, field, label)?;
             let postings = reader
-                .get_matching_postings(field, &pattern.prefix, label, MAX_SCANNED_TERMS, |term| {
+                .get_matching_postings(field, &pattern.prefixes, label, MAX_SCANNED_TERMS, |term| {
                     pattern.matches(term)
                 })
                 .await?;
@@ -157,5 +192,56 @@ impl Query for TermPatternQuery {
 
     fn is_filter(&self) -> bool {
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn single_star_matches_regex_for_unicode_overlap_empty_and_invalid_terms() {
+        let mut terms = vec![String::new()];
+        let mut frontier = vec![String::new()];
+        for _ in 0..4 {
+            frontier = frontier
+                .iter()
+                .flat_map(|prefix| {
+                    ['a', 'b', 'é', '🦀', '*', '?', '\n']
+                        .into_iter()
+                        .map(move |ch| format!("{prefix}{ch}"))
+                })
+                .collect();
+            terms.extend(frontier.iter().cloned());
+        }
+        for prefix in ["", "a", "ab", "é", "*"] {
+            for suffix in ["", "b", "ba", "🦀", "?"] {
+                let query = TermPatternQuery::single_star(
+                    Field(0),
+                    "test",
+                    prefix.as_bytes().to_vec(),
+                    suffix.as_bytes().to_vec(),
+                );
+                let expression = regex::RegexBuilder::new(&format!(
+                    r"\A{}.*{}\z",
+                    regex::escape(prefix),
+                    regex::escape(suffix)
+                ))
+                .dot_matches_new_line(true)
+                .build()
+                .unwrap();
+                for term in &terms {
+                    assert_eq!(
+                        query.pattern.matches(term.as_bytes()),
+                        expression.is_match(term),
+                        "{prefix}*{suffix}, {term:?}"
+                    );
+                }
+                let mut invalid = prefix.as_bytes().to_vec();
+                invalid.push(0xff);
+                invalid.extend_from_slice(suffix.as_bytes());
+                assert!(!query.pattern.matches(&invalid));
+            }
+        }
     }
 }

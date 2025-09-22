@@ -9,11 +9,13 @@ memory and HTTP directories construct it. Native mmap support is feature-gated;
 the Vec owner also serves portable/WASM code. No persisted or wire format
 includes this Rust struct.
 
-The direct view replaces the previous byte range at the same struct footprint
-(32 bytes in the native build, 24 in the portable build). Subsequent `as_slice`
+The direct view occupies 32 bytes in native and portable builds. The query-local
+owner variant keeps the native size unchanged and raises the portable size from
+24 to 32 bytes. Subsequent `as_slice`
 reads its pointer/length without resolving the backing enum, following the Arc
 or checking the same range again. The backing owner and mmap classification
-remain intact; no extra owner allocation or resident payload copy is added.
+remain intact; no resident payload copy is added. A bounded expansion creates
+one local owner allocation shared by its posting views.
 The [ownedbytes implementation](https://docs.rs/ownedbytes/latest/src/ownedbytes/lib.rs.html)
 used in Tantivy illustrates the same direct-view ownership principle.
 
@@ -24,6 +26,24 @@ mmap, cross-thread lifetime tests and three strict-provenance Miri tests on an
 isolated extraction of the actual implementation.
 
 ## Invariants and safety argument
+
+### Query-local expansion owners
+
+Concurrent prefix top-k costs about 4.86 ms of server CPU per request on the
+large corpus, versus about 0.15 ms of native search for one representative
+prefix. A concurrent profile identified shared reference-count contention during
+posting construction and destruction. A bounded posting
+expansion receives one local Arc owner over the same immutable storage. Its subviews
+clone that local owner rather than repeatedly changing the file's shared
+reference count. No payload is copied, read eagerly, pinned or cached.
+Lazy file handles retain their range reader. Owner indirection is at most one
+level; mmap classification, checked subranges and cross-thread lifetimes must
+remain unchanged. Paired concurrent measurements improved prefix top-k
+throughput from about 5,800 to 16,000–18,000 queries/second, reduced CPU/request
+from about 4.85 ms to 1.5–1.65 ms, and reduced anonymous RSS from 203 to
+187–190 MiB. Later removal of contention on the shared integrity observer is
+measured separately in the closing-gap report. The observer still publishes
+the first corruption to the original segment-wide write-once state.
 
 - Every stored pointer/length comes from a checked slice of the owned allocation.
   A child slice is bounded by its parent view, including empty and nested views.
@@ -48,4 +68,4 @@ inside the original allocation; the regression first demonstrated that boundary 
 Tests cover dropped owners, cross-thread clones, empty views, unaligned
 subviews, invalid/reversed ranges and mmap ownership. The search harness,
 native-without-sync and portable compilation pass, along with whole-fixture
-score/count and immutable-byte comparisons. WASM rebuilding remains skipped by user request.
+score/count and immutable-byte comparisons. Portable release builds and JavaScript tests are recorded in the performance review.

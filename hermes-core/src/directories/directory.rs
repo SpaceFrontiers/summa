@@ -105,6 +105,21 @@ impl std::fmt::Debug for FileHandle {
 }
 
 impl FileHandle {
+    /// Give a batch of borrowed ranges one local reference-count owner.
+    /// Lazy handles keep their original bounded range-read behavior.
+    pub(crate) fn with_local_owner(&self) -> Self {
+        match &self.inner {
+            FileHandleInner::Inline { data, offset, len } => Self {
+                inner: FileHandleInner::Inline {
+                    data: data.clone().with_local_owner(),
+                    offset: *offset,
+                    len: *len,
+                },
+            },
+            FileHandleInner::Lazy { .. } => self.clone(),
+        }
+    }
+
     /// Create an inline file handle from owned bytes (mmap, RAM).
     /// Sync reads are available.
     pub fn from_bytes(data: OwnedBytes) -> Self {
@@ -313,6 +328,7 @@ enum SharedBytes {
     Vec(Arc<Vec<u8>>),
     #[cfg(feature = "native")]
     Mmap(Arc<memmap2::Mmap>),
+    Local(Arc<SharedBytes>),
 }
 
 impl SharedBytes {
@@ -322,6 +338,7 @@ impl SharedBytes {
             SharedBytes::Vec(v) => v.as_slice(),
             #[cfg(feature = "native")]
             SharedBytes::Mmap(m) => m.as_ref(),
+            SharedBytes::Local(owner) => owner.as_bytes(),
         }
     }
 }
@@ -332,6 +349,7 @@ impl std::fmt::Debug for SharedBytes {
             SharedBytes::Vec(v) => write!(f, "Vec(len={})", v.len()),
             #[cfg(feature = "native")]
             SharedBytes::Mmap(m) => write!(f, "Mmap(len={})", m.len()),
+            SharedBytes::Local(owner) => owner.fmt(f),
         }
     }
 }
@@ -366,6 +384,13 @@ impl std::fmt::Debug for OwnedBytes {
 }
 
 impl OwnedBytes {
+    fn with_local_owner(mut self) -> Self {
+        if !matches!(self.data, SharedBytes::Local(_)) {
+            self.data = SharedBytes::Local(Arc::new(self.data));
+        }
+        self
+    }
+
     /// Validate a view while its stable backing owner is available. Moving the
     /// Arc handle below does not move the Vec buffer or memory mapping.
     fn with_range(data: SharedBytes, range: Range<usize>) -> Self {
@@ -435,7 +460,11 @@ impl OwnedBytes {
     #[cfg(feature = "native")]
     #[inline]
     pub fn is_mmap(&self) -> bool {
-        matches!(self.data, SharedBytes::Mmap(_))
+        match &self.data {
+            SharedBytes::Mmap(_) => true,
+            SharedBytes::Local(owner) => matches!(owner.as_ref(), SharedBytes::Mmap(_)),
+            SharedBytes::Vec(_) => false,
+        }
     }
 
     /// Advise the kernel about the access pattern for these bytes.
@@ -1377,6 +1406,34 @@ mod tests {
     }
 
     #[test]
+    fn local_byte_owners_share_storage_without_repeated_global_refcounts() {
+        let backing = Arc::new((0u8..64).collect::<Vec<_>>());
+        let handle = FileHandle::from_bytes(OwnedBytes::from_arc_vec(backing.clone(), 3..61));
+        let local = handle.slice(2..40).with_local_owner().with_local_owner();
+        let count = Arc::strong_count(&backing);
+        let views: Vec<_> = (0..20)
+            .map(|i| local.read_bytes_range_sync(i..i + 3).unwrap())
+            .collect();
+        assert_eq!(Arc::strong_count(&backing), count);
+        drop(local);
+        drop(handle);
+        let survivor = std::thread::spawn(move || {
+            for (i, view) in views.iter().enumerate() {
+                assert_eq!(
+                    view.as_slice(),
+                    &[(i + 5) as u8, (i + 6) as u8, (i + 7) as u8]
+                );
+            }
+            views[7].clone()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(survivor.as_slice(), &[12, 13, 14]);
+        drop(survivor);
+        assert_eq!(Arc::strong_count(&backing), 1);
+    }
+
+    #[test]
     fn owned_byte_views_retain_heap_storage_across_moves_clones_and_empty_slices() {
         let backing = Arc::new((0u8..64).collect::<Vec<_>>());
         let weak = Arc::downgrade(&backing);
@@ -1431,6 +1488,14 @@ mod tests {
         let mapping = Arc::new(mapping.make_read_only().unwrap());
         let weak = Arc::downgrade(&mapping);
         check(OwnedBytes::from_mmap_range(mapping.clone(), 0..64), true);
+        check(
+            OwnedBytes::from_mmap_range(mapping.clone(), 0..64).with_local_owner(),
+            true,
+        );
+        check(
+            OwnedBytes::new((0u8..64).collect()).with_local_owner(),
+            false,
+        );
         assert_eq!(Arc::strong_count(&mapping), 1);
         drop(mapping);
         assert!(weak.upgrade().is_none());
