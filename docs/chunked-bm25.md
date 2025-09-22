@@ -2,11 +2,11 @@
 
 Status: research note + decisions (2026-09-04). Mechanism: `docs/chunked-text-fields.md`.
 
-Hermes splits a document's text into fixed-size chunks before building the
+Summa splits a document's text into fixed-size chunks before building the
 inverted index of a `chunked` text field. Each chunk is a scoring unit with
 its own posting entry and length; the document score is the maximum over its
 chunks (MaxP). This note records what the literature says about that setup
-and which of it Hermes applies.
+and which of it Summa applies.
 
 ## What is applied
 
@@ -36,13 +36,13 @@ and which of it Hermes applies.
    significantly outperforms the other approaches"), Nguyen, MacAvaney & Yates
    (2023: Sum "bias towards longer documents", Mean corrects it but
    underperforms Max). Sum is length-biased and mean dilutes (Bendersky &
-   Kurland 2008). Hermes' `MultiValueCombiner::Max` for chunked text is kept.
+   Kurland 2008). Summa' `MultiValueCombiner::Max` for chunked text is kept.
 
 3. **`k1`, `b` unchanged** (`1.2`, `0.75`). Within a 200–300-token chunk
    `tf` is small and saturation matters little. Anserini's tuned MS MARCO
    passage run uses `k1 = 0.82`, `b = 0.68`; that is evidence that tuning can
    help a specific collection, not a portable replacement for the defaults.
-   With the length floor `b` is almost inert among full chunks. A Hermes
+   With the length floor `b` is almost inert among full chunks. A Summa
    change therefore needs a labelled set (see "Measure").
 
 ## What is not applied (and why)

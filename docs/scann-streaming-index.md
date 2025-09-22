@@ -3,8 +3,8 @@
 ## Status
 
 This document defines the on-disk and lifecycle contract for adding ScaNN to
-Hermes. It covers floating-point dense vectors and packed binary embeddings.
-The implementation must preserve Hermes' immutable-segment model: training is
+Summa. It covers floating-point dense vectors and packed binary embeddings.
+The implementation must preserve Summa' immutable-segment model: training is
 an index-generation operation, while ordinary commits and merges only assign,
 encode, and move rows within an already-published generation.
 

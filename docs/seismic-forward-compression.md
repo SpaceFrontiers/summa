@@ -7,7 +7,7 @@ proposes DotVByte: sorted component gaps, one length bit per 16-bit gap,
 eight gaps per control byte, independent document alignment, and fused SIMD
 scoring. Its RGB permutation reorders **dimensions**, not documents.
 
-Hermes stores configured weight bytes after each vector's dimension bytes.
+Summa stores configured weight bytes after each vector's dimension bytes.
 Adaptive dimension compression is enabled by default and reduces that same
 single owner without adding another forward index. Explicitly disabling it
 stores raw U32 dimensions. Weights, logical document/ordinal identity, missing vectors,

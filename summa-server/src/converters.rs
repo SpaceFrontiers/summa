@@ -1,0 +1,2587 @@
+//! Proto conversion helpers
+
+use std::sync::LazyLock;
+
+use log::{debug, warn};
+use summa_core::query::{
+    BinaryDenseVectorQuery, DenseVectorQuery, LazyGlobalStats, MAX_DENSE_NPROBE,
+    MultiValueCombiner, RerankerConfig, SparseVectorQuery,
+};
+use summa_core::structures::QueryWeighting;
+use summa_core::tokenizer::{Purpose, idf_weights_cache, tokenizer_cache};
+use summa_core::{
+    BooleanQuery, BoostQuery, Document, FieldValue as CoreFieldValue, PhraseQuery, PrefixQuery,
+    Query, Schema, TermQuery, TokenizerRegistry,
+};
+
+static TOKENIZER_REGISTRY: LazyLock<TokenizerRegistry> = LazyLock::new(TokenizerRegistry::new);
+
+use crate::proto;
+use crate::proto::field_value::Value;
+use crate::proto::query::Query as ProtoQueryType;
+use crate::search_service::QueryShapeLimits;
+
+fn validate_token_expansion(kind: &str, count: usize, maximum: usize) -> Result<(), String> {
+    if count > maximum {
+        return Err(format!(
+            "{kind} expands to {count} tokens; maximum is {maximum}"
+        ));
+    }
+    Ok(())
+}
+
+/// [`field_token_stream`] reduced to the token texts.
+fn field_tokens(
+    kind: &str,
+    schema: &Schema,
+    field_name: &str,
+    text: &str,
+    tokenizer_hint: &str,
+    shape: &QueryShapeLimits,
+    purpose: Purpose,
+) -> Result<(summa_core::Field, Vec<String>), String> {
+    let (field, tokens) = field_token_stream(
+        kind,
+        schema,
+        field_name,
+        text,
+        tokenizer_hint,
+        shape,
+        purpose,
+    )?;
+    Ok((field, tokens.into_iter().map(|t| t.text).collect()))
+}
+
+/// Resolve a text field and tokenize query text with the field's configured
+/// tokenizer, so stemmers (static or hinted dynamic ones) match the indexing
+/// path. An empty `tokenizer_hint` means "no hint". Tokens keep the
+/// positions the tokenizer assigned, including gaps of dropped stop words.
+fn field_token_stream(
+    kind: &str,
+    schema: &Schema,
+    field_name: &str,
+    text: &str,
+    tokenizer_hint: &str,
+    shape: &QueryShapeLimits,
+    purpose: Purpose,
+) -> Result<(summa_core::Field, Vec<summa_core::tokenizer::Token>), String> {
+    let field = schema
+        .get_field(field_name)
+        .ok_or_else(|| format!("Field '{field_name}' not found"))?;
+    let entry = schema.get_field_entry(field);
+    if let Some(e) = entry
+        && e.field_type != summa_core::FieldType::Text
+    {
+        return Err(format!(
+            "{kind} requires a text field, but '{field_name}' is {:?}. Use RangeQuery for numeric fields.",
+            e.field_type
+        ));
+    }
+    let tokenizer_name = entry
+        .and_then(|e| e.tokenizer.as_deref())
+        .unwrap_or("simple");
+    let tokenizer = TOKENIZER_REGISTRY
+        .get(tokenizer_name)
+        .unwrap_or_else(|| Box::new(summa_core::SimpleTokenizer));
+    let hint = Some(tokenizer_hint.trim()).filter(|hint| !hint.is_empty());
+    let tokens = tokenizer.tokenize_with(text, hint, purpose);
+    validate_token_expansion(kind, tokens.len(), shape.max_text_query_tokens)?;
+    Ok((field, tokens))
+}
+
+/// Whether a clause is a phrase (or a Boolean made only of such phrases)
+/// that tokenizes to nothing on its field, typically because every word is a
+/// stop word of the field's tokenizer. Such a constraint can be neither
+/// verified nor refuted from the index, so Boolean conversion drops it.
+fn is_unverifiable_phrase(
+    q: &proto::Query,
+    schema: &Schema,
+    shape: &QueryShapeLimits,
+) -> Result<bool, String> {
+    match &q.query {
+        Some(ProtoQueryType::Phrase(phrase)) => {
+            if phrase.text.strip_suffix('*').is_some() {
+                return Ok(false);
+            }
+            let (_, tokens) = field_token_stream(
+                "PhraseQuery",
+                schema,
+                &phrase.field,
+                &phrase.text,
+                &phrase.tokenizer_hint,
+                shape,
+                Purpose::Exact,
+            )?;
+            Ok(tokens.is_empty())
+        }
+        Some(ProtoQueryType::Boolean(inner)) => {
+            let clauses = inner
+                .must
+                .iter()
+                .chain(&inner.should)
+                .chain(&inner.must_not);
+            let mut any = false;
+            for clause in clauses {
+                any = true;
+                if !is_unverifiable_phrase(clause, schema, shape)? {
+                    return Ok(false);
+                }
+            }
+            Ok(any)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Convert proto combiner enum to core MultiValueCombiner
+/// Parameters (temperature, k, decay) are passed separately from the query message
+fn convert_combiner(combiner: i32, temperature: f32, top_k: u32, decay: f32) -> MultiValueCombiner {
+    match combiner {
+        1 => MultiValueCombiner::Max,
+        2 => MultiValueCombiner::Avg,
+        3 => MultiValueCombiner::Sum,
+        4 => MultiValueCombiner::WeightedTopK {
+            k: if top_k > 0 { top_k as usize } else { 5 },
+            decay: if decay > 0.0 { decay } else { 0.7 },
+        },
+        _ if temperature > 0.0 => MultiValueCombiner::LogSumExp { temperature },
+        _ => MultiValueCombiner::default(),
+    }
+}
+
+/// Convert a non-zero proto combiner value for fusion chunk combination.
+/// (0/unset is handled by the caller: fusion defaults to Max, not LogSumExp.)
+pub fn convert_fusion_combiner(combiner: i32) -> MultiValueCombiner {
+    convert_combiner(combiner, 0.0, 0, 0.0)
+}
+
+pub fn convert_query(
+    query: &proto::Query,
+    schema: &Schema,
+    global_stats: Option<&LazyGlobalStats>,
+    idf_cache_dir: Option<&std::path::Path>,
+    shape: &QueryShapeLimits,
+) -> Result<Box<dyn Query>, String> {
+    match &query.query {
+        Some(ProtoQueryType::Term(term_query)) => {
+            let (field, tokens) = field_tokens(
+                "TermQuery",
+                schema,
+                &term_query.field,
+                &term_query.term,
+                &term_query.tokenizer_hint,
+                shape,
+                Purpose::Exact,
+            )?;
+            if tokens.is_empty() {
+                return Err(format!("No tokens in term '{}'", term_query.term));
+            }
+            if tokens.len() == 1 {
+                Ok(Box::new(TermQuery::text(field, &tokens[0])))
+            } else {
+                let mut query = BooleanQuery::new();
+                for token in tokens {
+                    query = query.must(TermQuery::text(field, &token));
+                }
+                Ok(Box::new(query))
+            }
+        }
+        Some(ProtoQueryType::Match(match_query)) => {
+            if !match_query.heap_factor.is_finite()
+                || !(0.0..=1.0).contains(&match_query.heap_factor)
+            {
+                return Err("MatchQuery heap_factor must be finite and between 0 and 1".into());
+            }
+            // Protobuf zero/unset selects the exact default, like sparse.
+            let heap_factor = if match_query.heap_factor == 0.0 {
+                1.0
+            } else {
+                match_query.heap_factor
+            };
+            // Trailing `*` → PrefixQuery (no tokenization, raw lowercased prefix)
+            if let Some(prefix) = match_query.text.strip_suffix('*') {
+                let field = schema
+                    .get_field(&match_query.field)
+                    .ok_or_else(|| format!("Field '{}' not found", match_query.field))?;
+                if prefix.is_empty() {
+                    return Err("Prefix query must not be empty".to_string());
+                }
+                if schema
+                    .get_field_entry(field)
+                    .is_some_and(|entry| entry.chunked)
+                {
+                    return Err(format!(
+                        "Prefix queries are not supported on chunked text field '{}'; use a MatchQuery or PhraseQuery",
+                        match_query.field
+                    ));
+                }
+                return Ok(Box::new(PrefixQuery::text(field, prefix)));
+            }
+
+            let (field, tokens) = field_tokens(
+                "MatchQuery",
+                schema,
+                &match_query.field,
+                &match_query.text,
+                &match_query.tokenizer_hint,
+                shape,
+                Purpose::Match,
+            )?;
+
+            if tokens.is_empty() {
+                return Err(format!(
+                    "No tokens in match query text '{}'",
+                    match_query.text
+                ));
+            }
+
+            // Query term de-duplication: a repeated token becomes one clause
+            // weighted by its query term frequency (same score as the
+            // repeated clauses, one cursor instead of several).
+            let mut distinct: Vec<(String, f32)> = Vec::with_capacity(tokens.len());
+            for token in tokens {
+                match distinct.iter_mut().find(|(t, _)| *t == token) {
+                    Some((_, count)) => *count += 1.0,
+                    None => distinct.push((token, 1.0)),
+                }
+            }
+            let term_clause = |token: &str, count: f32| -> Box<dyn Query> {
+                if count > 1.0 {
+                    Box::new(summa_core::query::BoostQuery::new(
+                        TermQuery::text(field, token),
+                        count,
+                    ))
+                } else {
+                    Box::new(TermQuery::text(field, token))
+                }
+            };
+
+            if distinct.len() == 1 && heap_factor == 1.0 {
+                // Exact single token: keep the direct path. Tuned text must
+                // reach the text executor even when tokenization leaves one term.
+                let (token, count) = &distinct[0];
+                return Ok(term_clause(token, *count));
+            }
+
+            // Multiple tokens - use BooleanQuery with SHOULD clauses (MaxScore fast path)
+            let mut query = BooleanQuery::new();
+            for (token, count) in &distinct {
+                query = query.should(term_clause(token, *count));
+            }
+            if match_query.proximity_weight > 0.0 {
+                query = query.with_proximity(summa_core::query::ProximityConfig::new(
+                    match_query.proximity_weight,
+                    match_query.proximity_window,
+                ));
+            }
+            if heap_factor < 1.0 {
+                query = query.with_text_heap_factor(heap_factor);
+            }
+            if match_query.max_terms > 0 {
+                query = query.with_max_terms(match_query.max_terms as usize);
+            }
+            Ok(Box::new(query))
+        }
+        Some(ProtoQueryType::Phrase(phrase_query)) => {
+            let (field, tokens) = field_token_stream(
+                "PhraseQuery",
+                schema,
+                &phrase_query.field,
+                &phrase_query.text,
+                &phrase_query.tokenizer_hint,
+                shape,
+                Purpose::Exact,
+            )?;
+            if tokens.is_empty() {
+                return Err(format!(
+                    "No tokens in phrase query text '{}' after tokenization (only stop words?)",
+                    phrase_query.text
+                ));
+            }
+            // PhraseQuery itself collapses one term to a TermQuery and, on a
+            // field without positions, degrades to a MUST of the terms. Token
+            // offsets keep the gaps of stop words the tokenizer dropped.
+            let terms = tokens
+                .into_iter()
+                .map(|t| (t.position, t.text.into_bytes()))
+                .collect();
+            Ok(Box::new(
+                PhraseQuery::with_offsets(field, terms).with_slop(phrase_query.slop),
+            ))
+        }
+        Some(ProtoQueryType::Boolean(bool_query)) => {
+            convert_boolean_query(bool_query, schema, global_stats, idf_cache_dir, shape)
+        }
+        Some(ProtoQueryType::Boost(boost_query)) => {
+            if !boost_query.boost.is_finite() {
+                return Err("Boost must be a finite number".to_string());
+            }
+            let inner = boost_query
+                .query
+                .as_ref()
+                .ok_or_else(|| "Boost query requires inner query".to_string())?;
+            let inner_query = convert_query(inner, schema, global_stats, idf_cache_dir, shape)?;
+            Ok(Box::new(BoostQuery {
+                inner: inner_query.into(),
+                boost: boost_query.boost,
+            }))
+        }
+        Some(ProtoQueryType::All(_)) => Ok(Box::new(summa_core::query::AllQuery)),
+        Some(ProtoQueryType::SparseVector(sv_query)) => {
+            let field = schema
+                .get_field(&sv_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", sv_query.field))?;
+            let field_entry = schema
+                .get_field_entry(field)
+                .ok_or_else(|| format!("Field entry for '{}' not found", sv_query.field))?;
+            if field_entry.field_type != summa_core::FieldType::SparseVector {
+                return Err(format!(
+                    "SparseVectorQuery requires a sparse_vector field, but '{}' is {:?}",
+                    sv_query.field, field_entry.field_type
+                ));
+            }
+            if sv_query.text.is_empty() && sv_query.indices.len() != sv_query.values.len() {
+                return Err(format!(
+                    "Sparse query has {} indices but {} values",
+                    sv_query.indices.len(),
+                    sv_query.values.len()
+                ));
+            }
+            if let Some((index, value)) = sv_query
+                .values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(format!(
+                    "Sparse query contains non-finite value {value} at index {index}"
+                ));
+            }
+            if !sv_query.heap_factor.is_finite()
+                || sv_query.heap_factor < 0.0
+                || sv_query.heap_factor > 1.0
+            {
+                return Err(format!(
+                    "Sparse query heap_factor must be finite and in [0, 1], got {}",
+                    sv_query.heap_factor
+                ));
+            }
+            if sv_query
+                .seismic_cut
+                .is_some_and(|cut| cut == 0 || cut as usize > summa_core::query::MAX_QUERY_TERMS)
+                || sv_query
+                    .seismic_factor
+                    .is_some_and(|factor| !factor.is_finite() || !(0.0..=1.0).contains(&factor))
+            {
+                return Err("Invalid Seismic query cut/factor".into());
+            }
+            if !sv_query.weight_threshold.is_finite() || sv_query.weight_threshold < 0.0 {
+                return Err(format!(
+                    "Sparse query weight_threshold must be finite and non-negative, got {}",
+                    sv_query.weight_threshold
+                ));
+            }
+            if !sv_query.pruning.is_finite() || sv_query.pruning < 0.0 || sv_query.pruning > 1.0 {
+                return Err(format!(
+                    "Sparse query pruning must be finite and in [0, 1], got {}",
+                    sv_query.pruning
+                ));
+            }
+
+            let vector: Vec<(u32, f32)> = if !sv_query.text.is_empty() {
+                // Text provided - tokenize server-side
+                let sparse_config = field_entry.sparse_vector_config.as_ref().ok_or_else(|| {
+                    format!("Field '{}' is not a sparse vector field", sv_query.field)
+                })?;
+                let query_config = sparse_config
+                    .query_config
+                    .as_ref()
+                    .ok_or_else(|| format!("Field '{}' has no query config", sv_query.field))?;
+                let tokenizer_name = query_config.tokenizer.as_ref().ok_or_else(|| {
+                    format!("Field '{}' has no tokenizer configured", sv_query.field)
+                })?;
+
+                let tokenizer = tokenizer_cache()
+                    .get_or_load(tokenizer_name)
+                    .map_err(|e| format!("Failed to load tokenizer '{}': {}", tokenizer_name, e))?;
+
+                let token_counts = tokenizer
+                    .tokenize(&sv_query.text)
+                    .map_err(|e| format!("Tokenization failed: {}", e))?;
+                validate_token_expansion(
+                    "SparseVectorQuery.text",
+                    token_counts.len(),
+                    shape.max_sparse_token_dimensions,
+                )?;
+
+                // Convert (token_id, count) to (token_id, weight)
+                // Apply IDF weighting if configured
+                let token_ids: Vec<u32> = token_counts.iter().map(|(id, _)| *id).collect();
+                let weights: Vec<f32> = match query_config.weighting {
+                    QueryWeighting::One => token_counts
+                        .iter()
+                        .map(|(_, count)| *count as f32)
+                        .collect(),
+                    QueryWeighting::Idf => {
+                        // Use real IDF from global index statistics
+                        if let Some(stats) = global_stats {
+                            let idf_weights = stats.sparse_idf_weights(field, &token_ids);
+                            let final_weights: Vec<f32> = token_counts
+                                .iter()
+                                .zip(idf_weights.iter())
+                                .map(|((_, count), idf)| *count as f32 * idf)
+                                .collect();
+                            if log::log_enabled!(log::Level::Debug) {
+                                let paired: Vec<_> = token_ids
+                                    .iter()
+                                    .zip(final_weights.iter())
+                                    .map(|(id, w)| {
+                                        let tok = tokenizer.id_to_token(*id).unwrap_or_default();
+                                        format!("({:?},{},{:.4})", tok, id, w)
+                                    })
+                                    .collect();
+                                debug!(
+                                    "Sparse IDF (global stats): field={}, total_docs={}, tokens=[{}]",
+                                    sv_query.field,
+                                    stats.total_docs(),
+                                    paired.join(", "),
+                                );
+                            }
+                            final_weights
+                        } else {
+                            warn!(
+                                "Sparse IDF: no global_stats available for field={}, falling back to count",
+                                sv_query.field,
+                            );
+                            token_counts
+                                .iter()
+                                .map(|(_, count)| *count as f32)
+                                .collect()
+                        }
+                    }
+                    QueryWeighting::IdfFile => {
+                        // Use pre-computed IDF from model's idf.json
+                        let precomputed =
+                            idf_weights_cache().get_or_load(tokenizer_name, idf_cache_dir);
+
+                        if let Some(idf_weights) = &precomputed {
+                            let weights: Vec<f32> = token_counts
+                                .iter()
+                                .map(|&(id, count)| count as f32 * idf_weights.get(id))
+                                .collect();
+                            if log::log_enabled!(log::Level::Debug) {
+                                let paired: Vec<_> = token_ids
+                                    .iter()
+                                    .zip(weights.iter())
+                                    .map(|(id, w)| {
+                                        let tok = tokenizer.id_to_token(*id).unwrap_or_default();
+                                        format!("({:?},{},{:.4})", tok, id, w)
+                                    })
+                                    .collect();
+                                debug!(
+                                    "Sparse IDF (idf.json): tokenizer={}, tokens=[{}]",
+                                    tokenizer_name,
+                                    paired.join(", "),
+                                );
+                            }
+                            weights
+                        } else if let Some(stats) = global_stats {
+                            // Fallback: use index-derived IDF from global stats.
+                            // Without IDF weighting, all query dimensions get equal weight,
+                            // which disables MaxScore pruning and causes full posting list scans.
+                            warn!(
+                                "Sparse IdfFile: no idf.json for model '{}', field={}, falling back to index-derived IDF",
+                                tokenizer_name, sv_query.field,
+                            );
+                            let idf_weights = stats.sparse_idf_weights(field, &token_ids);
+                            token_counts
+                                .iter()
+                                .zip(idf_weights.iter())
+                                .map(|((_, count), idf)| *count as f32 * idf)
+                                .collect()
+                        } else {
+                            warn!(
+                                "Sparse IdfFile: no idf.json and no global stats for field={}, falling back to count",
+                                sv_query.field,
+                            );
+                            token_counts
+                                .iter()
+                                .map(|(_, count)| *count as f32)
+                                .collect()
+                        }
+                    }
+                };
+                token_ids.into_iter().zip(weights).collect()
+            } else {
+                // Seismic scores signed inputs; retain the established nonnegative
+                // nomination semantics of BMP and sparse MaxScore.
+                let signed = schema
+                    .get_field_entry(field)
+                    .and_then(|entry| entry.sparse_vector_config.as_ref())
+                    .is_some_and(|config| {
+                        config.format == summa_core::structures::SparseFormat::Seismic
+                    });
+                sv_query
+                    .indices
+                    .iter()
+                    .copied()
+                    .zip(sv_query.values.iter().copied())
+                    .filter(|(_, weight)| {
+                        if signed {
+                            *weight != 0.0
+                        } else {
+                            *weight > 0.0
+                        }
+                    })
+                    .collect()
+            };
+
+            let combiner = convert_combiner(
+                sv_query.combiner,
+                sv_query.combiner_temperature,
+                sv_query.combiner_top_k,
+                sv_query.combiner_decay,
+            );
+            // SearchRequest.candidate_limit is the single candidate budget.
+            // Query collectors must not multiply it independently.
+            let mut query = SparseVectorQuery::new(field, vector)
+                .with_combiner(combiner)
+                .with_over_fetch_factor(1.0);
+
+            // Apply SDL query_config defaults, then override with per-request values
+            let sparse_config = schema
+                .get_field_entry(field)
+                .and_then(|entry| entry.sparse_vector_config.as_ref());
+            let schema_qc = sparse_config.and_then(|config| config.query_config.as_ref());
+
+            // heap_factor: per-request > schema default > 1.0
+            if sv_query.heap_factor > 0.0 {
+                query = query.with_heap_factor(sv_query.heap_factor);
+            } else if let Some(qc) = schema_qc {
+                query = query.with_heap_factor(qc.heap_factor);
+            }
+
+            // weight_threshold: per-request > schema default > 0.0
+            if sv_query.weight_threshold > 0.0 {
+                query = query.with_weight_threshold(sv_query.weight_threshold);
+            } else if let Some(qc) = schema_qc {
+                query = query.with_weight_threshold(qc.weight_threshold);
+            }
+
+            // max_query_dims: per-request > schema default > None
+            if sv_query.max_query_dims > 0 {
+                query = query.with_max_query_dims(sv_query.max_query_dims as usize);
+            } else if let Some(Some(max_dims)) = schema_qc.map(|qc| qc.max_query_dims) {
+                query = query.with_max_query_dims(max_dims);
+            }
+
+            // pruning: per-request > schema default > None
+            if sv_query.pruning > 0.0 {
+                query = query.with_pruning(sv_query.pruning);
+            } else if let Some(Some(p)) = schema_qc.map(|qc| qc.pruning) {
+                query = query.with_pruning(p);
+            }
+
+            // min_query_dims: schema default (no per-request override)
+            if let Some(qc) = schema_qc {
+                query = query.with_min_query_dims(qc.min_query_dims);
+            }
+
+            // LSP/0 gamma: per-request > schema default > depth-derived.
+            if let Some(gamma) = sv_query.lsp_gamma {
+                query = query.with_lsp_gamma(gamma as usize);
+            } else if let Some(gamma) = schema_qc.and_then(|config| config.lsp_gamma) {
+                query = query.with_lsp_gamma(gamma);
+            }
+            if let Some(config) = schema_qc {
+                query = query
+                    .with_seismic_cut(config.seismic_cut)
+                    .with_seismic_factor(config.seismic_factor)
+                    .with_exhaustive(config.exhaustive);
+            }
+            if let Some(cut) = sv_query.seismic_cut {
+                query = query.with_seismic_cut(cut as usize);
+            }
+            if let Some(factor) = sv_query.seismic_factor {
+                query = query.with_seismic_factor(factor);
+            }
+            if let Some(exhaustive) = sv_query.exhaustive {
+                query = query.with_exhaustive(exhaustive);
+            }
+
+            Ok(Box::new(query))
+        }
+        Some(ProtoQueryType::DenseVector(dv_query)) => {
+            let field = schema
+                .get_field(&dv_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", dv_query.field))?;
+            let entry = schema
+                .get_field_entry(field)
+                .ok_or_else(|| format!("Field entry for '{}' not found", dv_query.field))?;
+            if entry.field_type != summa_core::FieldType::DenseVector {
+                return Err(format!(
+                    "DenseVectorQuery requires a dense_vector field, but '{}' is {:?}",
+                    dv_query.field, entry.field_type
+                ));
+            }
+            let config = entry.dense_vector_config.as_ref().ok_or_else(|| {
+                format!(
+                    "Dense vector field '{}' has no dense vector configuration",
+                    dv_query.field
+                )
+            })?;
+            if dv_query.vector.is_empty() {
+                return Err("Dense query vector must not be empty".to_string());
+            }
+            if dv_query.vector.len() != config.dim {
+                return Err(format!(
+                    "Dense query vector dimension {} does not match field '{}' dimension {}",
+                    dv_query.vector.len(),
+                    dv_query.field,
+                    config.dim
+                ));
+            }
+            if let Some((index, value)) = dv_query
+                .vector
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(format!(
+                    "Dense query vector contains non-finite value {value} at index {index}"
+                ));
+            }
+
+            let nprobe = if dv_query.nprobe == 0 {
+                config.nprobe
+            } else {
+                dv_query.nprobe as usize
+            };
+            if nprobe > MAX_DENSE_NPROBE {
+                return Err(format!(
+                    "Dense query nprobe must be at most {MAX_DENSE_NPROBE}, got {nprobe}"
+                ));
+            }
+
+            let mut query = DenseVectorQuery::new(field, dv_query.vector.clone())
+                .with_nprobe(nprobe)
+                .with_rerank_factor(1.0);
+            let combiner = convert_combiner(
+                dv_query.combiner,
+                dv_query.combiner_temperature,
+                dv_query.combiner_top_k,
+                dv_query.combiner_decay,
+            );
+            query = query.with_combiner(combiner);
+            Ok(Box::new(query))
+        }
+        Some(ProtoQueryType::BinaryDenseVector(bv_query)) => {
+            let field = schema
+                .get_field(&bv_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", bv_query.field))?;
+            let entry = schema
+                .get_field_entry(field)
+                .ok_or_else(|| format!("Field entry for '{}' not found", bv_query.field))?;
+            if entry.field_type != summa_core::FieldType::BinaryDenseVector {
+                return Err(format!(
+                    "BinaryDenseVectorQuery requires a binary_dense_vector field, but '{}' is {:?}",
+                    bv_query.field, entry.field_type
+                ));
+            }
+            let config = entry.binary_dense_vector_config.as_ref().ok_or_else(|| {
+                format!(
+                    "Binary dense vector field '{}' has no configuration",
+                    bv_query.field
+                )
+            })?;
+            if bv_query.vector.len() != config.byte_len() {
+                return Err(format!(
+                    "Binary query byte length {} does not match field '{}' byte length {}",
+                    bv_query.vector.len(),
+                    bv_query.field,
+                    config.byte_len()
+                ));
+            }
+            let mut query = BinaryDenseVectorQuery::new(field, bv_query.vector.clone());
+            let combiner = convert_combiner(
+                bv_query.combiner,
+                bv_query.combiner_temperature,
+                bv_query.combiner_top_k,
+                bv_query.combiner_decay,
+            );
+            query = query.with_combiner(combiner);
+            Ok(Box::new(query))
+        }
+        Some(ProtoQueryType::Range(range_query)) => convert_range_query(range_query, schema),
+        Some(ProtoQueryType::Prefix(prefix_query)) => {
+            let field = schema
+                .get_field(&prefix_query.field)
+                .ok_or_else(|| format!("Field '{}' not found", prefix_query.field))?;
+            if prefix_query.prefix.is_empty() {
+                return Err("Prefix query must not be empty".to_string());
+            }
+            Ok(Box::new(PrefixQuery::text(field, &prefix_query.prefix)))
+        }
+        Some(ProtoQueryType::Fusion(_)) => {
+            Err("FusionQuery is only supported at the top level of SearchRequest.query".to_string())
+        }
+        None => Err("Query type is required".to_string()),
+    }
+}
+
+/// Convert a BooleanQuery. MUST/SHOULD/MUST_NOT clauses are mapped to
+/// the corresponding BooleanQuery fields. Intersection between MUST clauses
+/// (including term filters and vector queries) is handled by BooleanScorer's
+/// DocSet-based seek optimization.
+fn convert_boolean_query(
+    bool_query: &proto::BooleanQuery,
+    schema: &Schema,
+    global_stats: Option<&LazyGlobalStats>,
+    idf_cache_dir: Option<&std::path::Path>,
+    shape: &QueryShapeLimits,
+) -> Result<Box<dyn Query>, String> {
+    let mut bq = BooleanQuery::new();
+    // A quoted span made only of stop words has no postings to check; as a
+    // MUST it would empty the result set and as a SHOULD it would contribute
+    // nothing, so it is dropped rather than failing the whole request.
+    let skip = |q: &proto::Query| -> Result<bool, String> {
+        let unverifiable = is_unverifiable_phrase(q, schema, shape)?;
+        if unverifiable {
+            warn!("Dropping phrase clause without searchable tokens: {q:?}");
+        }
+        Ok(unverifiable)
+    };
+    for q in &bool_query.must {
+        if skip(q)? {
+            continue;
+        }
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
+        bq.must.push(inner.into());
+    }
+    for q in &bool_query.should {
+        if skip(q)? {
+            continue;
+        }
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
+        bq.should.push(inner.into());
+    }
+    for q in &bool_query.must_not {
+        if skip(q)? {
+            continue;
+        }
+        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
+        bq.must_not.push(inner.into());
+    }
+    Ok(Box::new(bq))
+}
+
+/// Convert a RangeQuery from proto to core.
+///
+/// Detects the type from which bounds are set:
+/// - min_u64/max_u64 → U64 range
+/// - min_i64/max_i64 → I64 range
+/// - min_f64/max_f64 → F64 range
+///   Field must have fast=true in the schema.
+fn convert_range_query(rq: &proto::RangeQuery, schema: &Schema) -> Result<Box<dyn Query>, String> {
+    use summa_core::query::{RangeBound, RangeQuery};
+
+    let field = schema
+        .get_field(&rq.field)
+        .ok_or_else(|| format!("Range query field '{}' not found", rq.field))?;
+
+    let entry = schema
+        .get_field_entry(field)
+        .ok_or_else(|| format!("Field entry for '{}' not found", rq.field))?;
+
+    if !entry.fast {
+        return Err(format!(
+            "Range query field '{}' must have fast=true in schema",
+            rq.field
+        ));
+    }
+
+    // Detect which type of bounds are provided
+    let bound = if rq.min_u64.is_some() || rq.max_u64.is_some() {
+        RangeBound::U64 {
+            min: rq.min_u64,
+            max: rq.max_u64,
+        }
+    } else if rq.min_i64.is_some() || rq.max_i64.is_some() {
+        RangeBound::I64 {
+            min: rq.min_i64,
+            max: rq.max_i64,
+        }
+    } else if rq.min_f64.is_some() || rq.max_f64.is_some() {
+        RangeBound::F64 {
+            min: rq.min_f64,
+            max: rq.max_f64,
+        }
+    } else {
+        // No bounds specified — match all docs that have a value (exists check)
+        // Use full u64 range which excludes FAST_FIELD_MISSING
+        RangeBound::U64 {
+            min: None,
+            max: None,
+        }
+    };
+
+    Ok(Box::new(RangeQuery::new(field, bound)))
+}
+
+pub fn convert_field_value(value: &CoreFieldValue) -> proto::FieldValue {
+    let v = match value {
+        CoreFieldValue::Text(s) => Value::Text(s.clone()),
+        CoreFieldValue::U64(n) => Value::U64(*n),
+        CoreFieldValue::I64(n) => Value::I64(*n),
+        CoreFieldValue::F64(n) => Value::F64(*n),
+        CoreFieldValue::Bytes(b) => Value::BytesValue(b.clone()),
+        CoreFieldValue::SparseVector(entries) => {
+            let (indices, values): (Vec<u32>, Vec<f32>) = entries.iter().copied().unzip();
+            Value::SparseVector(proto::SparseVector { indices, values })
+        }
+        CoreFieldValue::DenseVector(values) => Value::DenseVector(proto::DenseVector {
+            values: values.clone(),
+        }),
+        CoreFieldValue::Json(json_val) => {
+            Value::JsonValue(serde_json::to_string(json_val).unwrap_or_default())
+        }
+        CoreFieldValue::BinaryDenseVector(b) => Value::BinaryDenseVector(b.clone()),
+    };
+    proto::FieldValue { value: Some(v) }
+}
+
+/// Convert Schema to SDL string representation
+///
+/// Produces a faithful round-trippable SDL including tokenizer, multi, fast,
+/// positions, and full vector configuration (dense/sparse).
+pub fn schema_to_sdl(schema: &Schema) -> String {
+    use summa_core::dsl::{
+        BinaryIndexType, DenseVectorQuantization, FieldType, IvfRoutingMode, PositionMode,
+        VectorIndexType,
+    };
+    use summa_core::structures::{IndexSize, SparseFormat, WeightQuantization};
+
+    let mut lines = vec!["index _ {".to_string()];
+    lines.push(format!(
+        "    max_l1_phrase_terms: {}",
+        schema.max_l1_phrase_terms()
+    ));
+    if schema.reorder_on_merge() {
+        lines.push("    reorder_on_merge: true".into());
+    }
+    for (_, entry) in schema.fields() {
+        // --- type name + optional type-level config ---
+        let mut type_part = match entry.field_type {
+            FieldType::Text => "text".to_string(),
+            FieldType::U64 => "u64".to_string(),
+            FieldType::I64 => "i64".to_string(),
+            FieldType::F64 => "f64".to_string(),
+            FieldType::Bytes => "bytes".to_string(),
+            FieldType::Json => "json".to_string(),
+            FieldType::SparseVector => "sparse_vector".to_string(),
+            FieldType::DenseVector => "dense_vector".to_string(),
+            FieldType::BinaryDenseVector => "binary_dense_vector".to_string(),
+        };
+
+        // Text tokenizer: text<en_stem>
+        if entry.field_type == FieldType::Text
+            && let Some(ref tok) = entry.tokenizer
+        {
+            type_part.push_str(&format!("<{}>", tok));
+        }
+
+        // Sparse vector type config: sparse_vector<u16>
+        if let Some(ref cfg) = entry.sparse_vector_config {
+            let idx = match cfg.index_size {
+                IndexSize::U16 => "u16",
+                IndexSize::U32 => "u32",
+            };
+            type_part.push_str(&format!("<{}>", idx));
+        }
+
+        // Dense vector type config: dense_vector<768> or dense_vector<768, f16>
+        if let Some(ref cfg) = entry.dense_vector_config {
+            let quant_suffix = match cfg.quantization {
+                DenseVectorQuantization::F32 => String::new(),
+                DenseVectorQuantization::F16 => ", f16".to_string(),
+                DenseVectorQuantization::UInt8 => ", uint8".to_string(),
+                DenseVectorQuantization::Binary => String::new(), // binary uses BinaryDenseVector field type
+            };
+            type_part.push_str(&format!("<{}{}>", cfg.dim, quant_suffix));
+        }
+
+        // Binary dense vector type config: binary_dense_vector<128>
+        if let Some(ref cfg) = entry.binary_dense_vector_config {
+            type_part.push_str(&format!("<{}>", cfg.dim));
+        }
+
+        // --- attributes: [indexed<...>, stored<multi>, fast] ---
+        let mut attrs = Vec::new();
+
+        if entry.indexed {
+            let mut idx_params = Vec::new();
+
+            // Chunked text: every value is its own BM25 unit
+            if entry.chunked {
+                idx_params.push("chunked".to_string());
+            }
+            // BM25 parameters of a text field
+            if let Some(k1) = entry.bm25_k1 {
+                idx_params.push(format!("k1: {k1}"));
+            }
+            if let Some(b) = entry.bm25_b {
+                idx_params.push(format!("b: {b}"));
+            }
+
+            // Positions (for text/sparse)
+            if let Some(pos) = entry.positions {
+                idx_params.push(match pos {
+                    PositionMode::Ordinal => "ordinal".to_string(),
+                    PositionMode::TokenPosition => "token_position".to_string(),
+                    PositionMode::Full => "positions".to_string(),
+                });
+            }
+
+            // Dense vector index params
+            if let Some(ref cfg) = entry.dense_vector_config {
+                let idx_name = match cfg.index_type {
+                    VectorIndexType::Flat => "flat",
+                    // Unreachable in practice: schemas with the retired
+                    // ivf_pq type are rejected at index create/open.
+                    VectorIndexType::IvfPq => "ivf_pq",
+                    VectorIndexType::Tq => "tq",
+                    VectorIndexType::IvfTq => "ivf_tq",
+                    VectorIndexType::Scann => "scann",
+                };
+                idx_params.push(idx_name.to_string());
+                // TQ scans every code: IVF knobs do not apply and re-parsing
+                // them would warn.
+                if cfg.index_type != VectorIndexType::Tq {
+                    if let Some(nc) = cfg.num_clusters {
+                        idx_params.push(format!("num_clusters: {}", nc));
+                    }
+                    if let Some(tree_levels) = cfg.tree_levels {
+                        idx_params.push(format!("tree_levels: {tree_levels}"));
+                    }
+                    if cfg.nprobe != 64 {
+                        idx_params.push(format!("nprobe: {}", cfg.nprobe));
+                    }
+                    if cfg.ivf_routing != IvfRoutingMode::Auto {
+                        let routing = match cfg.ivf_routing {
+                            IvfRoutingMode::Auto => unreachable!(),
+                            IvfRoutingMode::Flat => "flat",
+                            IvfRoutingMode::TwoLevel => "two_level",
+                            IvfRoutingMode::Hnsw => "hnsw",
+                        };
+                        idx_params.push(format!("routing: {routing}"));
+                    }
+                    if let Some(soar) = &cfg.soar {
+                        let mode = if soar.selective {
+                            "selective"
+                        } else if soar.num_secondary > 1 {
+                            "aggressive"
+                        } else {
+                            "full"
+                        };
+                        idx_params.push(format!("soar: {mode}"));
+                    }
+                }
+            }
+
+            if let Some(ref cfg) = entry.binary_dense_vector_config {
+                idx_params.push(
+                    match cfg.index_type {
+                        BinaryIndexType::Flat => "flat",
+                        BinaryIndexType::Ivf => "ivf",
+                        BinaryIndexType::Scann => "scann",
+                    }
+                    .to_string(),
+                );
+                if let Some(num_clusters) = cfg.num_clusters {
+                    idx_params.push(format!("num_clusters: {num_clusters}"));
+                }
+                if let Some(tree_levels) = cfg.tree_levels {
+                    idx_params.push(format!("tree_levels: {tree_levels}"));
+                }
+                if cfg.nprobe != 64 {
+                    idx_params.push(format!("nprobe: {}", cfg.nprobe));
+                }
+                if cfg.ivf_routing != IvfRoutingMode::Auto {
+                    let routing = match cfg.ivf_routing {
+                        IvfRoutingMode::Auto => unreachable!(),
+                        IvfRoutingMode::Flat => "flat",
+                        IvfRoutingMode::TwoLevel => "two_level",
+                        IvfRoutingMode::Hnsw => "hnsw",
+                    };
+                    idx_params.push(format!("routing: {routing}"));
+                }
+            }
+
+            // Sparse vector index params
+            if let Some(ref cfg) = entry.sparse_vector_config {
+                if cfg.format == SparseFormat::Bmp {
+                    idx_params.push("format: bmp".into());
+                    idx_params.push(format!("bmp_block_size: {}", cfg.bmp_block_size));
+                    idx_params.push(format!("bmp_grid_bits: {}", cfg.bmp_grid_bits));
+                    idx_params.push(format!("bmp_forward_index: {}", cfg.bmp_forward_index));
+                }
+                if cfg.format == SparseFormat::MaxScore {
+                    idx_params.push("format: maxscore".into());
+                }
+                if cfg.format == SparseFormat::Seismic {
+                    idx_params.push("format: seismic".into());
+                    idx_params.push(format!(
+                        "seismic_forward_compression: {}",
+                        cfg.seismic.forward_compression
+                    ));
+                    idx_params.push(format!("seismic_postings: {}", cfg.seismic.postings));
+                    idx_params.push(format!(
+                        "seismic_cluster_size: {}",
+                        cfg.seismic.cluster_size
+                    ));
+                    idx_params.push(format!(
+                        "seismic_summary_energy: {}",
+                        cfg.seismic.summary_energy
+                    ));
+                }
+
+                if let Some(dims) = cfg.dims {
+                    idx_params.push(format!("dims: {dims}"));
+                }
+
+                if let Some(max_weight) = cfg.max_weight {
+                    idx_params.push(format!("max_weight: {max_weight}"));
+                }
+                if let Some(doc_mass) = cfg.doc_mass {
+                    idx_params.push(format!("doc_mass: {doc_mass}"));
+                }
+                let quant = match cfg.weight_quantization {
+                    WeightQuantization::Float32 => None,
+                    WeightQuantization::Float16 => Some("float16"),
+                    WeightQuantization::UInt8 => Some("uint8"),
+                    WeightQuantization::UInt4 => Some("uint4"),
+                };
+                if let Some(q) = quant {
+                    idx_params.push(format!("quantization: {}", q));
+                }
+                if cfg.weight_threshold > 0.0 {
+                    idx_params.push(format!("weight_threshold: {}", cfg.weight_threshold));
+                }
+
+                if cfg.block_size != 128 {
+                    idx_params.push(format!("block_size: {}", cfg.block_size));
+                }
+                if let Some(p) = cfg.pruning {
+                    idx_params.push(format!("pruning: {}", p));
+                }
+                if cfg.min_terms != 4 {
+                    idx_params.push(format!("min_terms: {}", cfg.min_terms));
+                }
+                // Query config sub-block
+                if let Some(ref qc) = cfg.query_config {
+                    let mut qparams = Vec::new();
+                    if let Some(ref t) = qc.tokenizer {
+                        qparams.push(format!("tokenizer: \"{}\"", t));
+                    }
+                    if qc.weighting != summa_core::structures::QueryWeighting::One {
+                        let w = match qc.weighting {
+                            summa_core::structures::QueryWeighting::Idf => "idf",
+                            summa_core::structures::QueryWeighting::IdfFile => "idf_file",
+                            _ => "one",
+                        };
+                        qparams.push(format!("weighting: {}", w));
+                    }
+                    if qc.weight_threshold > 0.0 {
+                        qparams.push(format!("weight_threshold: {}", qc.weight_threshold));
+                    }
+                    if let Some(md) = qc.max_query_dims {
+                        qparams.push(format!("max_dims: {}", md));
+                    }
+                    if let Some(p) = qc.pruning {
+                        qparams.push(format!("pruning: {}", p));
+                    }
+                    if qc.min_query_dims != 4 {
+                        qparams.push(format!("min_query_dims: {}", qc.min_query_dims));
+                    }
+                    if let Some(gamma) = qc.lsp_gamma {
+                        qparams.push(format!("lsp_gamma: {gamma}"));
+                    }
+                    qparams.push(format!("seismic_cut: {}", qc.seismic_cut));
+                    qparams.push(format!("seismic_factor: {}", qc.seismic_factor));
+                    qparams.push(format!("exhaustive: {}", qc.exhaustive));
+
+                    if !qparams.is_empty() {
+                        idx_params.push(format!("query<{}>", qparams.join(", ")));
+                    }
+                }
+            }
+
+            if idx_params.is_empty() {
+                attrs.push("indexed".to_string());
+            } else {
+                attrs.push(format!("indexed<{}>", idx_params.join(", ")));
+            }
+        }
+
+        if entry.stored {
+            if entry.multi {
+                attrs.push("stored<multi>".to_string());
+            } else {
+                attrs.push("stored".to_string());
+            }
+        }
+
+        if entry.fast {
+            attrs.push("fast".to_string());
+        }
+
+        if entry.content_hash {
+            attrs.push("content_hash".to_string());
+        }
+        if entry.primary_key {
+            attrs.push("primary".to_string());
+        }
+        if entry.reorder {
+            attrs.push("reorder".into());
+        }
+
+        if attrs.is_empty() {
+            lines.push(format!("    field {}: {}", entry.name, type_part));
+        } else {
+            lines.push(format!(
+                "    field {}: {} [{}]",
+                entry.name,
+                type_part,
+                attrs.join(", ")
+            ));
+        }
+    }
+    lines.push("}".to_string());
+    lines.join("\n")
+}
+
+pub fn convert_reranker(
+    reranker: &proto::Reranker,
+    schema: &Schema,
+) -> Result<RerankerConfig, String> {
+    let field = schema
+        .get_field(&reranker.field)
+        .ok_or_else(|| format!("Reranker field '{}' not found", reranker.field))?;
+
+    let entry = schema
+        .get_field_entry(field)
+        .ok_or_else(|| format!("Field entry for '{}' not found", reranker.field))?;
+
+    let is_binary = entry.field_type == summa_core::FieldType::BinaryDenseVector;
+
+    if !reranker.rrf_k.is_finite() || reranker.rrf_k < 0.0 {
+        return Err(format!(
+            "Reranker rrf_k must be finite and non-negative, got {}",
+            reranker.rrf_k
+        ));
+    }
+
+    if entry.field_type != summa_core::FieldType::DenseVector && !is_binary {
+        return Err(format!(
+            "Reranker field '{}' must be dense_vector or binary_dense_vector, got {:?}",
+            reranker.field, entry.field_type
+        ));
+    }
+
+    // Validate query vector
+    if is_binary {
+        if reranker.binary_vector.is_empty() {
+            return Err(
+                "Reranker binary_vector must not be empty for binary_dense_vector field"
+                    .to_string(),
+            );
+        }
+        if let Some(ref bv_config) = entry.binary_dense_vector_config {
+            let expected_bytes = bv_config.byte_len();
+            if reranker.binary_vector.len() != expected_bytes {
+                return Err(format!(
+                    "Reranker binary_vector byte length {} does not match field '{}' expected {} (dim={})",
+                    reranker.binary_vector.len(),
+                    reranker.field,
+                    expected_bytes,
+                    bv_config.dim
+                ));
+            }
+        }
+    } else {
+        if reranker.vector.is_empty() {
+            return Err("Reranker query vector must not be empty".to_string());
+        }
+        if let Some(ref dv_config) = entry.dense_vector_config
+            && reranker.vector.len() != dv_config.dim
+        {
+            return Err(format!(
+                "Reranker query vector dimension {} does not match field '{}' dimension {}",
+                reranker.vector.len(),
+                reranker.field,
+                dv_config.dim
+            ));
+        }
+        if let Some((index, value)) = reranker
+            .vector
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "Reranker query vector contains non-finite value {value} at index {index}"
+            ));
+        }
+    }
+
+    // Default reranker combiner to WeightedTopK(k=3, decay=0.7) — decaying
+    // combination of top-3 best-matching chunks. LogSumExp heavily biases
+    // toward documents with many vectors regardless of relevance.
+    // Proto enum default 0 = LOG_SUM_EXP — if nothing was explicitly set
+    // (combiner=0, temperature=0), override for reranking.
+    let combiner = if reranker.combiner == 0 && reranker.combiner_temperature == 0.0 {
+        MultiValueCombiner::WeightedTopK { k: 3, decay: 0.7 }
+    } else {
+        convert_combiner(
+            reranker.combiner,
+            reranker.combiner_temperature,
+            reranker.combiner_top_k,
+            reranker.combiner_decay,
+        )
+    };
+
+    let unit_norm = entry
+        .dense_vector_config
+        .as_ref()
+        .is_some_and(|c| c.unit_norm);
+
+    let matryoshka_dims = if reranker.matryoshka_dims > 0 {
+        Some(reranker.matryoshka_dims as usize)
+    } else {
+        None
+    };
+    if is_binary && matryoshka_dims.is_some() {
+        return Err("Reranker matryoshka_dims is not supported for binary vectors".to_string());
+    }
+    if let (Some(dims), Some(config)) = (matryoshka_dims, entry.dense_vector_config.as_ref())
+        && dims > config.dim
+    {
+        return Err(format!(
+            "Reranker matryoshka_dims {dims} exceeds field '{}' dimension {}",
+            reranker.field, config.dim
+        ));
+    }
+
+    Ok(RerankerConfig {
+        field,
+        vector: reranker.vector.clone(),
+        binary_vector: reranker.binary_vector.clone(),
+        combiner,
+        unit_norm,
+        matryoshka_dims,
+        rrf_k: reranker.rrf_k,
+    })
+}
+
+fn validate_binary_document_value(
+    name: &str,
+    field: summa_core::Field,
+    bytes: &[u8],
+    schema: &Schema,
+) -> Result<(), String> {
+    let config = schema
+        .get_field_entry(field)
+        .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+        .ok_or_else(|| format!("Field '{}' has no binary dense vector config", name))?;
+    if bytes.len() != config.byte_len() {
+        return Err(format!(
+            "Field '{}': binary vector byte length {} does not match schema byte length {}",
+            name,
+            bytes.len(),
+            config.byte_len()
+        ));
+    }
+    Ok(())
+}
+
+pub fn convert_proto_to_document(
+    fields: &[proto::FieldEntry],
+    schema: &Schema,
+) -> Result<Document, String> {
+    use summa_core::FieldType;
+
+    let mut doc = Document::new();
+
+    for entry in fields {
+        let name = &entry.name;
+        let value = entry
+            .value
+            .as_ref()
+            .ok_or_else(|| format!("Field '{}' has no value", name))?;
+
+        let field = schema
+            .get_field(name)
+            .ok_or_else(|| format!("Field '{}' not found in schema", name))?;
+
+        let field_type = schema
+            .get_field_entry(field)
+            .map(|e| &e.field_type)
+            .ok_or_else(|| format!("Field '{}' has no entry", name))?;
+
+        // Extract a numeric value from any proto numeric variant for coercion.
+        // Clients infer the proto type from the native value (e.g. Python sends
+        // positive ints as u64 even for i64/f64 schema fields), so we coerce
+        // to match the schema field type.
+        match (&value.value, field_type) {
+            // ── Text ──
+            (Some(Value::Text(s)), _) => doc.add_text(field, s),
+
+            // ── Numeric: coerce any numeric proto variant to the schema type ──
+            (Some(Value::U64(n)), FieldType::U64) => doc.add_u64(field, *n),
+            (Some(Value::U64(n)), FieldType::I64) => doc.add_i64(field, *n as i64),
+            (Some(Value::U64(n)), FieldType::F64) => doc.add_f64(field, *n as f64),
+
+            (Some(Value::I64(n)), FieldType::I64) => doc.add_i64(field, *n),
+            (Some(Value::I64(n)), FieldType::U64) => doc.add_u64(field, *n as u64),
+            (Some(Value::I64(n)), FieldType::F64) => doc.add_f64(field, *n as f64),
+
+            (Some(Value::F64(n)), FieldType::F64) => doc.add_f64(field, *n),
+            (Some(Value::F64(n)), FieldType::U64) => doc.add_u64(field, *n as u64),
+            (Some(Value::F64(n)), FieldType::I64) => doc.add_i64(field, *n as i64),
+
+            // ── Non-numeric types: no coercion needed ──
+            // bytes_value coerced to binary_dense_vector when schema says so
+            (Some(Value::BytesValue(b)), FieldType::BinaryDenseVector) => {
+                validate_binary_document_value(name, field, b, schema)?;
+                doc.add_binary_dense_vector(field, b.clone());
+            }
+            (Some(Value::BytesValue(b)), _) => doc.add_bytes(field, b.clone()),
+            (Some(Value::BinaryDenseVector(b)), FieldType::BinaryDenseVector) => {
+                validate_binary_document_value(name, field, b, schema)?;
+                doc.add_binary_dense_vector(field, b.clone());
+            }
+            (Some(Value::SparseVector(sv)), FieldType::SparseVector) => {
+                if sv.indices.len() != sv.values.len() {
+                    return Err(format!(
+                        "Field '{}': sparse vector has {} indices but {} values",
+                        name,
+                        sv.indices.len(),
+                        sv.values.len()
+                    ));
+                }
+                if let Some((index, value)) =
+                    sv.values.iter().enumerate().find(|(_, v)| !v.is_finite())
+                {
+                    return Err(format!(
+                        "Field '{}': sparse vector contains non-finite value {value} at index {index}",
+                        name
+                    ));
+                }
+                let entries: Vec<(u32, f32)> = sv
+                    .indices
+                    .iter()
+                    .copied()
+                    .zip(sv.values.iter().copied())
+                    .collect();
+                doc.add_sparse_vector(field, entries);
+            }
+            (Some(Value::DenseVector(dv)), FieldType::DenseVector) => {
+                let expected_dim = schema
+                    .get_field_entry(field)
+                    .and_then(|field| field.dense_vector_config.as_ref())
+                    .map(|config| config.dim)
+                    .ok_or_else(|| format!("Field '{}' has no dense vector config", name))?;
+                if dv.values.len() != expected_dim {
+                    return Err(format!(
+                        "Field '{}': dense vector dimension {} does not match schema dimension {}",
+                        name,
+                        dv.values.len(),
+                        expected_dim
+                    ));
+                }
+                if let Some((index, value)) = dv
+                    .values
+                    .iter()
+                    .enumerate()
+                    .find(|(_, value)| !value.is_finite())
+                {
+                    return Err(format!(
+                        "Field '{}': dense vector contains non-finite value {value} at index {index}",
+                        name
+                    ));
+                }
+                doc.add_dense_vector(field, dv.values.clone());
+            }
+            (Some(Value::DenseVector(_)), got)
+            | (Some(Value::SparseVector(_)), got)
+            | (Some(Value::BinaryDenseVector(_)), got) => {
+                return Err(format!(
+                    "Field '{}': vector value does not match schema type {:?}",
+                    name, got
+                ));
+            }
+            // ── JSON: expand string arrays into multi-valued text fields ──
+            // Python client serializes list[str] as json_value '["en","fr"]'
+            // because it can't distinguish from a generic list. When the schema
+            // field is Text, expand the array into multiple add_text calls.
+            (Some(Value::JsonValue(json_str)), FieldType::Text) => {
+                let json_val: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| format!("Invalid JSON in field '{}': {}", name, e))?;
+                if let serde_json::Value::Array(arr) = &json_val {
+                    for item in arr {
+                        if let serde_json::Value::String(s) = item {
+                            doc.add_text(field, s);
+                        } else {
+                            return Err(format!(
+                                "Field '{}': expected string in JSON array, got {}",
+                                name, item
+                            ));
+                        }
+                    }
+                } else if let serde_json::Value::String(s) = &json_val {
+                    doc.add_text(field, s);
+                } else {
+                    return Err(format!(
+                        "Field '{}': expected JSON string array for text field, got {}",
+                        name, json_val
+                    ));
+                }
+            }
+            (Some(Value::JsonValue(json_str)), _) => {
+                let json_val: serde_json::Value = serde_json::from_str(json_str)
+                    .map_err(|e| format!("Invalid JSON in field '{}': {}", name, e))?;
+                doc.add_json(field, json_val);
+            }
+            (None, _) => return Err(format!("Field '{}' has no value", name)),
+            // Numeric value sent to a non-numeric field (e.g. u64 to text) — skip with warning
+            (Some(_), _) => {
+                warn!(
+                    "Field '{}': proto value type does not match schema type {:?}, skipping",
+                    name, field_type
+                );
+            }
+        }
+    }
+
+    Ok(doc)
+}
+
+/// Render the text statistics of one searcher for `GetTextStats`.
+pub fn text_stats_to_proto(
+    stats: &summa_core::query::GlobalStats,
+    schema: &summa_core::Schema,
+) -> crate::proto::TextStats {
+    let mut fields: Vec<crate::proto::TextFieldStats> = stats
+        .text_fields()
+        .filter_map(|(field, field_stats)| {
+            let name = schema.get_field_name(field)?;
+            let mut terms: Vec<crate::proto::TermDocFreq> = field_stats
+                .doc_freqs
+                .iter()
+                .map(|(term, df)| crate::proto::TermDocFreq {
+                    term: term.as_bytes().to_vec(),
+                    doc_freq: *df,
+                })
+                .collect();
+            terms.sort_by(|a, b| a.term.cmp(&b.term));
+            Some(crate::proto::TextFieldStats {
+                field: name.to_string(),
+                corpus_size: field_stats.corpus_size,
+                avg_len: field_stats.avg_field_len,
+                terms,
+            })
+        })
+        .collect();
+    fields.sort_by(|a, b| a.field.cmp(&b.field));
+    crate::proto::TextStats {
+        total_docs: stats.total_docs(),
+        fields,
+    }
+}
+
+/// Build the scoring statistics a search runs with from a broker-supplied
+/// `SearchRequest.text_stats`. Fields unknown to this schema are dropped.
+pub fn text_stats_from_proto(
+    stats: &crate::proto::TextStats,
+    schema: &summa_core::Schema,
+) -> summa_core::query::GlobalStats {
+    let mut builder = summa_core::query::GlobalStatsBuilder::new();
+    builder.total_docs = stats.total_docs;
+    for field_stats in &stats.fields {
+        let Some(field) = schema.get_field(&field_stats.field) else {
+            continue;
+        };
+        builder.set_avg_field_len(field, field_stats.avg_len.max(1.0));
+        builder.set_text_corpus_size(field, field_stats.corpus_size);
+        for term in &field_stats.terms {
+            if term.doc_freq > 0 {
+                builder.add_text_df(
+                    field,
+                    String::from_utf8_lossy(&term.term).into_owned(),
+                    term.doc_freq,
+                );
+            }
+        }
+    }
+    builder.build(0)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn omitted_combiner_temperature_uses_the_core_default_and_explicit_values_survive() {
+        assert_eq!(
+            convert_combiner(0, 0.0, 0, 0.0),
+            MultiValueCombiner::default()
+        );
+        assert_eq!(
+            convert_combiner(0, 0.7, 0, 0.0),
+            MultiValueCombiner::LogSumExp { temperature: 0.7 },
+        );
+    }
+
+    #[test]
+    fn match_all_is_valid_for_common_exclusion_filters() {
+        let schema = summa_core::Schema::builder().build();
+        let query = proto::Query {
+            query: Some(ProtoQueryType::All(proto::AllQuery {})),
+        };
+        assert!(convert_query(&query, &schema, None, None, &shape()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn match_heap_factor_reaches_text_executor_for_one_and_multiple_terms() {
+        use summa_core::directories::RamDirectory;
+        use summa_core::index::{Index, IndexConfig, IndexWriter};
+        for chunked in [false, true] {
+            let mut builder = summa_core::SchemaBuilder::default();
+            let body = builder.add_text_field_with_tokenizer("body", true, false, "simple");
+            builder.set_chunked(body, chunked);
+            let schema = builder.build();
+            let dir = RamDirectory::new();
+            let config = IndexConfig {
+                num_indexing_threads: 1,
+                ..Default::default()
+            };
+            let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+                .await
+                .unwrap();
+            for id in 0..512 {
+                let text = if id < 128 {
+                    "machine learning padding padding padding padding"
+                } else {
+                    "machine learning machine learning machine learning"
+                };
+                let mut doc = summa_core::Document::new();
+                doc.add_text(body, text);
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+            let index = Index::open(dir, config).await.unwrap();
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            for text in ["machine", "machine learning"] {
+                let mut rankings = Vec::new();
+                for factor in [1.0, 0.01, 0.0] {
+                    let query = convert_query(
+                        &proto::Query {
+                            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                                field: "body".into(),
+                                text: text.into(),
+                                heap_factor: factor,
+                                ..Default::default()
+                            })),
+                        },
+                        &schema,
+                        None,
+                        None,
+                        &shape(),
+                    )
+                    .unwrap();
+                    let (hits, _) = searcher
+                        .search_with_count(query.as_ref(), 10)
+                        .await
+                        .unwrap();
+                    rankings.push(hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>());
+                }
+                assert_ne!(rankings[0], rankings[1], "chunked={chunked}, text={text}");
+                assert_eq!(
+                    rankings[0], rankings[2],
+                    "zero must select the exact default"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn match_heap_factor_rejects_old_and_invalid_wire_values() {
+        let schema = stemmed_text_schema();
+        for factor in [-1.0, 1.5, f32::INFINITY, f32::NAN] {
+            let result = convert_query(
+                &proto::Query {
+                    query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                        field: "body".into(),
+                        text: "running foxes".into(),
+                        heap_factor: factor,
+                        ..Default::default()
+                    })),
+                },
+                &schema,
+                None,
+                None,
+                &shape(),
+            );
+            assert!(result.is_err(), "must reject {factor}");
+        }
+    }
+
+    #[test]
+    fn match_query_deduplicates_repeated_tokens() {
+        let mut builder = summa_core::SchemaBuilder::default();
+        builder.add_text_field_with_tokenizer("body", true, false, "simple");
+        let schema = builder.build();
+        let query = proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: "body".to_string(),
+                text: "needle needle haystack needle".to_string(),
+                tokenizer_hint: String::new(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
+            })),
+        };
+        let shape = QueryShapeLimits::default();
+        let converted = convert_query(&query, &schema, None, None, &shape).unwrap();
+        let rendered = converted.to_string();
+        assert_eq!(rendered.matches("needle").count(), 1, "{rendered}");
+        assert!(rendered.contains("haystack"), "{rendered}");
+        assert!(rendered.contains('3'), "boost of 3 expected: {rendered}");
+    }
+
+    #[test]
+    fn text_stats_round_trip_through_proto() {
+        use summa_core::query::GlobalStatsBuilder;
+        let mut builder = summa_core::SchemaBuilder::default();
+        let body = builder.add_text_field_with_tokenizer("body", true, false, "simple");
+        let title = builder.add_text_field_with_tokenizer("title", true, false, "simple");
+        let schema = builder.build();
+        let mut builder = GlobalStatsBuilder::new();
+        builder.total_docs = 1_000;
+        builder.set_text_corpus_size(body, 12_345);
+        builder.set_avg_field_len(body, 48.5);
+        builder.add_text_df(body, "needle".to_string(), 7);
+        builder.add_text_df(body, "haystack".to_string(), 900);
+        builder.set_text_corpus_size(title, 1_000);
+        builder.set_avg_field_len(title, 6.0);
+        builder.add_text_df(title, "needle".to_string(), 3);
+        let stats = builder.build(0);
+
+        let wire = text_stats_to_proto(&stats, &schema);
+        assert_eq!(wire.total_docs, 1_000);
+        assert_eq!(wire.fields.len(), 2);
+        let body_wire = wire.fields.iter().find(|f| f.field == "body").unwrap();
+        assert_eq!(body_wire.corpus_size, 12_345);
+        assert_eq!(body_wire.terms.len(), 2);
+
+        let back = text_stats_from_proto(&wire, &schema);
+        assert_eq!(back.total_docs(), 1_000);
+        assert_eq!(back.text_corpus_size(body), 12_345);
+        assert_eq!(back.text_df(body, "needle"), Some(7));
+        assert_eq!(back.text_df(title, "needle"), Some(3));
+        assert!((back.avg_field_len(body) - 48.5).abs() < 1e-6);
+        // IDF uses the field's corpus (chunks), not the document total.
+        let expected = ((12_345.0f32 - 7.0 + 0.5) / (7.0 + 0.5) + 1.0).ln();
+        assert!((back.text_idf(body, "needle") - expected).abs() < 1e-5);
+        assert_eq!(back.text_idf(body, "absent"), 0.0);
+    }
+
+    use super::*;
+
+    fn shape() -> QueryShapeLimits {
+        QueryShapeLimits::default()
+    }
+
+    #[test]
+    fn token_expansion_is_bounded_before_query_construction() {
+        assert!(validate_token_expansion("test", 256, 256).is_ok());
+        assert!(validate_token_expansion("test", 257, 256).is_err());
+    }
+
+    fn stemmed_text_schema() -> Schema {
+        let mut builder = summa_core::SchemaBuilder::default();
+        builder.add_text_field_with_tokenizer("body", true, false, "en_stem");
+        builder.add_text_field_with_tokenizer("languages", false, false, "raw_ci");
+        builder.add_text_field_with_tokenizer(
+            "content",
+            true,
+            false,
+            "lex(by: languages, segmenter: simple, stem: snowball, variants: false)",
+        );
+        builder.add_text_field_with_tokenizer(
+            "stopped",
+            true,
+            false,
+            "lex(by: languages, stop_words: true, segmenter: simple, stem: snowball, variants: false)",
+        );
+        builder.add_u64_field("views", true, false);
+        builder.build()
+    }
+
+    fn boolean_proto(must: Vec<proto::Query>, should: Vec<proto::Query>) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::Boolean(proto::BooleanQuery {
+                must,
+                should,
+                must_not: vec![],
+            })),
+        }
+    }
+
+    #[test]
+    fn phrase_query_keeps_the_gaps_of_dropped_stop_words() {
+        let schema = stemmed_text_schema();
+        let query = convert_query(
+            &phrase_proto("stopped", "Quantum of the Arts", 0, "en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(rendered.contains("quantum@0 art@3"), "{rendered}");
+
+        // Without stop words the same text is four adjacent terms.
+        let plain = convert_query(
+            &phrase_proto("content", "Quantum of the Arts", 0, "en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(plain.contains("\"quantum of the art\""), "{plain}");
+    }
+
+    #[test]
+    fn boolean_conversion_drops_phrases_made_only_of_stop_words() {
+        let schema = stemmed_text_schema();
+        let empty = phrase_proto("stopped", "to be or not to be", 0, "en");
+
+        // Standalone: an error, as for any query without tokens.
+        assert!(convert_query(&empty, &schema, None, None, &shape()).is_err());
+
+        // Inside a Boolean the clause disappears and the rest survives, also
+        // when it is wrapped in its own SHOULD-only Boolean (the shape a
+        // client uses to try a phrase under several fields or hints).
+        let wrapped = boolean_proto(vec![], vec![empty.clone(), empty.clone()]);
+        let query = convert_query(
+            &boolean_proto(
+                vec![empty.clone(), wrapped],
+                vec![match_proto("stopped", "hamlet", "en")],
+            ),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(!rendered.contains("Phrase("), "{rendered}");
+        assert!(rendered.contains("hamlet"), "{rendered}");
+
+        // A phrase with surviving terms is kept.
+        let kept = convert_query(
+            &boolean_proto(
+                vec![phrase_proto("stopped", "the origin of species", 0, "en")],
+                vec![],
+            ),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(kept.contains("origin@1 speci@3"), "{kept}");
+    }
+
+    fn phrase_proto(field: &str, text: &str, slop: u32, hint: &str) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::Phrase(proto::PhraseQuery {
+                field: field.to_string(),
+                text: text.to_string(),
+                slop,
+                tokenizer_hint: hint.to_string(),
+            })),
+        }
+    }
+
+    fn match_proto(field: &str, text: &str, hint: &str) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: field.to_string(),
+                text: text.to_string(),
+                tokenizer_hint: hint.to_string(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
+            })),
+        }
+    }
+
+    #[test]
+    fn phrase_query_tokenizes_with_the_field_stemmer() {
+        let schema = stemmed_text_schema();
+        let query = convert_query(
+            &phrase_proto("body", "Running Foxes", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(rendered.contains("Phrase("), "{rendered}");
+        assert!(rendered.contains("\"run fox\""), "{rendered}");
+        assert!(!rendered.contains('~'), "{rendered}");
+
+        let slop = convert_query(
+            &phrase_proto("body", "Running Foxes", 2, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        assert!(slop.to_string().contains("~2"), "{slop}");
+    }
+
+    #[test]
+    fn phrase_and_match_queries_honour_the_tokenizer_hint() {
+        let schema = stemmed_text_schema();
+        let hinted = convert_query(
+            &phrase_proto("content", "бегущие foxes", 0, "ru,en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(hinted.contains("\"бегущ fox\""), "{hinted}");
+
+        // No hint → the spec default (simple): cleaned but unstemmed terms.
+        let unhinted = convert_query(
+            &phrase_proto("content", "бегущие foxes", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(unhinted.contains("\"бегущие foxes\""), "{unhinted}");
+
+        // MatchQuery: a single stemmed token collapses to a TermQuery.
+        let matched = convert_query(
+            &match_proto("content", "Foxes", "en"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(matched.contains("fox"), "{matched}");
+        assert!(!matched.contains("foxes"), "{matched}");
+
+        // Static tokenizers ignore the hint.
+        let static_hint = convert_query(
+            &match_proto("body", "Foxes", "ru"),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(static_hint.contains("fox"), "{static_hint}");
+    }
+
+    #[test]
+    fn phrase_query_rejects_bad_fields_and_empty_text() {
+        let schema = stemmed_text_schema();
+        let unknown = convert_query(
+            &phrase_proto("missing", "quick fox", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .err()
+        .unwrap();
+        assert!(unknown.contains("not found"), "{unknown}");
+
+        let numeric = convert_query(
+            &phrase_proto("views", "quick fox", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .err()
+        .unwrap();
+        assert!(numeric.contains("requires a text field"), "{numeric}");
+
+        let empty = convert_query(
+            &phrase_proto("body", " ... ", 0, ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .err()
+        .unwrap();
+        assert!(empty.contains("No tokens"), "{empty}");
+
+        let mut tight = shape();
+        tight.max_text_query_tokens = 2;
+        let too_many = convert_query(
+            &phrase_proto("body", "one two three", 0, ""),
+            &schema,
+            None,
+            None,
+            &tight,
+        )
+        .err()
+        .unwrap();
+        assert!(too_many.contains("expands to 3 tokens"), "{too_many}");
+    }
+
+    fn dense_test_schema(nprobe: usize) -> Schema {
+        let mut builder = summa_core::SchemaBuilder::default();
+        let mut config = summa_core::dsl::DenseVectorConfig::new(3);
+        config.nprobe = nprobe;
+        builder.add_dense_vector_field_with_config("embedding", true, false, config);
+        builder.add_text_field("title", true, false);
+        builder.build()
+    }
+
+    fn dense_proto_query(vector: Vec<f32>) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::DenseVector(proto::DenseVectorQuery {
+                field: "embedding".to_string(),
+                vector,
+                ..Default::default()
+            })),
+        }
+    }
+
+    fn vector_test_schema() -> Schema {
+        let mut builder = summa_core::SchemaBuilder::default();
+        builder.add_sparse_vector_field("sparse", true, false);
+        builder.add_binary_dense_vector_field("binary", 16, true, false);
+        builder.add_text_field("title", true, false);
+        builder.build()
+    }
+
+    fn seismic_sparse_test_schema() -> Schema {
+        let mut builder = summa_core::SchemaBuilder::default();
+        let mut config = summa_core::structures::SparseVectorConfig {
+            format: summa_core::structures::SparseFormat::Seismic,
+            ..Default::default()
+        };
+        config.dims = Some(16);
+        builder.add_sparse_vector_field_with_config("sparse", true, false, config);
+        builder.build()
+    }
+
+    fn sparse_proto_query(pruning: f32) -> proto::Query {
+        proto::Query {
+            query: Some(ProtoQueryType::SparseVector(proto::SparseVectorQuery {
+                field: "sparse".to_string(),
+                indices: vec![1, 2, 3, 4, 5, 6],
+                values: vec![1.0; 6],
+                pruning,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn seismic_rpc_preserves_signed_weights_and_explicit_exhaustive_false() {
+        let schema = seismic_sparse_test_schema();
+        let request = proto::Query {
+            query: Some(ProtoQueryType::SparseVector(proto::SparseVectorQuery {
+                field: "sparse".into(),
+                indices: vec![1, 2, 3],
+                values: vec![-2.0, 3.0, 0.0],
+                exhaustive: Some(false),
+                lsp_gamma: Some(0),
+                ..Default::default()
+            })),
+        };
+        let query = convert_query(&request, &schema, None, None, &shape()).unwrap();
+        let summa_core::query::QueryDecomposition::SparseTerms(infos) =
+            query.sparse_decomposition()
+        else {
+            panic!("sparse RPC lost its decomposition");
+        };
+        assert_eq!(
+            infos
+                .iter()
+                .map(|info| (info.dim_id, info.weight))
+                .collect::<Vec<_>>(),
+            vec![(1, -2.0), (2, 3.0)]
+        );
+        assert!(!infos[0].exhaustive);
+        assert_eq!(infos[0].lsp_gamma, Some(0));
+    }
+
+    #[test]
+    fn seismic_query_dimension_pruning_is_explicit_not_a_server_fallback() {
+        let schema = seismic_sparse_test_schema();
+        let default_query =
+            convert_query(&sparse_proto_query(0.0), &schema, None, None, &shape()).unwrap();
+        assert!(!default_query.to_string().contains("orig="));
+
+        let pruned_query =
+            convert_query(&sparse_proto_query(0.33), &schema, None, None, &shape()).unwrap();
+        assert!(pruned_query.to_string().contains("orig=6"));
+    }
+
+    #[test]
+    fn dense_query_uses_schema_nprobe_when_request_omits_it() {
+        let schema = dense_test_schema(17);
+        let query = convert_query(
+            &dense_proto_query(vec![1.0, 2.0, 3.0]),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+
+        assert!(query.to_string().contains("nprobe=17"));
+    }
+
+    #[test]
+    fn server_conversion_uses_the_shared_candidate_budget() {
+        let schema = dense_test_schema(17);
+        let query = convert_query(
+            &dense_proto_query(vec![1.0, 2.0, 3.0]),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+
+        assert!(query.to_string().contains("rerank=1"));
+    }
+
+    #[test]
+    fn dense_query_rejects_invalid_dimensions_and_values() {
+        let schema = dense_test_schema(17);
+        for vector in [
+            vec![],
+            vec![1.0, 2.0],
+            vec![1.0, 2.0, 3.0, 4.0],
+            vec![1.0, f32::NAN, 3.0],
+            vec![1.0, f32::INFINITY, 3.0],
+            vec![1.0, f32::NEG_INFINITY, 3.0],
+        ] {
+            assert!(
+                convert_query(&dense_proto_query(vector), &schema, None, None, &shape()).is_err(),
+                "invalid vector should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn dense_query_rejects_wrong_field_and_unbounded_search_parameters() {
+        let schema = dense_test_schema(17);
+        let mut wrong_field = dense_proto_query(vec![1.0, 2.0, 3.0]);
+        let Some(ProtoQueryType::DenseVector(query)) = wrong_field.query.as_mut() else {
+            unreachable!()
+        };
+        query.field = "title".to_string();
+        assert!(convert_query(&wrong_field, &schema, None, None, &shape()).is_err());
+
+        let mut proto = dense_proto_query(vec![1.0, 2.0, 3.0]);
+        let Some(ProtoQueryType::DenseVector(query)) = proto.query.as_mut() else {
+            unreachable!()
+        };
+        query.nprobe = MAX_DENSE_NPROBE as u32 + 1;
+        assert!(convert_query(&proto, &schema, None, None, &shape()).is_err());
+    }
+
+    #[test]
+    fn prefix_query_rejects_empty_prefixes() {
+        let schema = dense_test_schema(17);
+        let match_all_prefix = proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: "title".to_string(),
+                text: "*".to_string(),
+                tokenizer_hint: String::new(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
+            })),
+        };
+        let explicit_empty_prefix = proto::Query {
+            query: Some(ProtoQueryType::Prefix(proto::PrefixQuery {
+                field: "title".to_string(),
+                prefix: String::new(),
+            })),
+        };
+
+        assert!(convert_query(&match_all_prefix, &schema, None, None, &shape()).is_err());
+        assert!(convert_query(&explicit_empty_prefix, &schema, None, None, &shape()).is_err());
+    }
+
+    #[test]
+    fn binary_query_and_document_require_exact_schema_width() {
+        let schema = vector_test_schema();
+        let query = |field: &str, vector: Vec<u8>| proto::Query {
+            query: Some(ProtoQueryType::BinaryDenseVector(
+                proto::BinaryDenseVectorQuery {
+                    field: field.to_string(),
+                    vector,
+                    ..Default::default()
+                },
+            )),
+        };
+
+        assert!(convert_query(&query("binary", vec![0, 1]), &schema, None, None, &shape()).is_ok());
+        assert!(convert_query(&query("binary", vec![0]), &schema, None, None, &shape()).is_err());
+        assert!(convert_query(&query("title", vec![0, 1]), &schema, None, None, &shape()).is_err());
+
+        let bad_document = [proto::FieldEntry {
+            name: "binary".to_string(),
+            value: Some(proto::FieldValue {
+                value: Some(Value::BinaryDenseVector(vec![0])),
+            }),
+        }];
+        assert!(convert_proto_to_document(&bad_document, &schema).is_err());
+    }
+
+    #[test]
+    fn sparse_query_rejects_malformed_arrays_and_parameters() {
+        let schema = vector_test_schema();
+        let query = |field: &str, indices: Vec<u32>, values: Vec<f32>| proto::Query {
+            query: Some(ProtoQueryType::SparseVector(proto::SparseVectorQuery {
+                field: field.to_string(),
+                indices,
+                values,
+                ..Default::default()
+            })),
+        };
+
+        assert!(
+            convert_query(
+                &query("sparse", vec![1], vec![1.0]),
+                &schema,
+                None,
+                None,
+                &shape()
+            )
+            .is_ok()
+        );
+        assert!(
+            convert_query(
+                &query("sparse", vec![1, 2], vec![1.0]),
+                &schema,
+                None,
+                None,
+                &shape()
+            )
+            .is_err()
+        );
+        assert!(
+            convert_query(
+                &query("sparse", vec![1], vec![f32::NAN]),
+                &schema,
+                None,
+                None,
+                &shape()
+            )
+            .is_err()
+        );
+        assert!(
+            convert_query(
+                &query("title", vec![1], vec![1.0]),
+                &schema,
+                None,
+                None,
+                &shape()
+            )
+            .is_err()
+        );
+
+        let mut invalid_factor = query("sparse", vec![1], vec![1.0]);
+        let Some(ProtoQueryType::SparseVector(query)) = invalid_factor.query.as_mut() else {
+            unreachable!()
+        };
+        query.seismic_factor = Some(f32::INFINITY);
+        assert!(convert_query(&invalid_factor, &schema, None, None, &shape()).is_err());
+    }
+
+    #[test]
+    fn reranker_rejects_invalid_rrf_and_matryoshka_dimensions() {
+        let schema = dense_test_schema(17);
+        let base = proto::Reranker {
+            field: "embedding".to_string(),
+            vector: vec![1.0, 2.0, 3.0],
+            ..Default::default()
+        };
+
+        for rrf_k in [f32::NAN, f32::INFINITY, -1.0] {
+            let mut reranker = base.clone();
+            reranker.rrf_k = rrf_k;
+            assert!(convert_reranker(&reranker, &schema).is_err());
+        }
+
+        let mut too_wide = base;
+        too_wide.matryoshka_dims = 4;
+        assert!(convert_reranker(&too_wide, &schema).is_err());
+    }
+
+    #[test]
+    fn match_query_carries_proximity_rescoring() {
+        let schema = stemmed_text_schema();
+        let query = convert_query(
+            &proto::Query {
+                query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                    field: "body".to_string(),
+                    text: "running foxes".to_string(),
+                    tokenizer_hint: String::new(),
+                    proximity_weight: 0.5,
+                    proximity_window: 0,
+                    heap_factor: 0.0,
+                    max_terms: 0,
+                })),
+            },
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        let rendered = query.to_string();
+        assert!(rendered.contains("~proximity(0.5, 8)"), "{rendered}");
+
+        let tuned = convert_query(
+            &proto::Query {
+                query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                    field: "body".to_string(),
+                    text: "running foxes jump".to_string(),
+                    tokenizer_hint: String::new(),
+                    proximity_weight: 0.0,
+                    proximity_window: 0,
+                    heap_factor: 0.6,
+                    max_terms: 2,
+                })),
+            },
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(tuned.contains("~heap(0.6)"), "{tuned}");
+        assert!(tuned.contains("~max_terms(2)"), "{tuned}");
+        let off = convert_query(
+            &match_proto("body", "running foxes", ""),
+            &schema,
+            None,
+            None,
+            &shape(),
+        )
+        .unwrap();
+        assert!(!off.to_string().contains("~proximity"), "{off}");
+    }
+
+    #[test]
+    fn index_info_schema_reports_default_and_configured_phrase_limits() {
+        for configured in [None, Some(65), Some(300)] {
+            let mut builder = Schema::builder();
+            if let Some(limit) = configured {
+                builder.set_max_l1_phrase_terms(std::num::NonZeroU32::new(limit).unwrap());
+            }
+            let rendered = schema_to_sdl(&builder.build());
+            let schema = summa_core::parse_schema(&rendered).unwrap();
+            assert_eq!(
+                schema.max_l1_phrase_terms(),
+                configured.unwrap_or(64) as usize,
+                "{rendered}"
+            );
+            assert!(rendered.contains(&format!(
+                "max_l1_phrase_terms: {}",
+                configured.unwrap_or(64)
+            )));
+        }
+    }
+
+    #[test]
+    fn index_info_schema_preserves_bmp_storage_and_reordering() {
+        let input = r#"
+            index documents {
+                reorder_on_merge: true
+                field sparse: sparse_vector<u32> [indexed<format: bmp, dims: 105879,
+                    max_weight: 5.0, bmp_block_size: 64, bmp_grid_bits: 2, bmp_forward_index: false,
+                    quantization: uint8, doc_mass: 0.9,
+                    query<lsp_gamma: 64>>, reorder]
+            }
+        "#;
+        let schema = summa_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let original = schema
+            .get_field_entry(schema.get_field("sparse").unwrap())
+            .unwrap();
+        let reported = reparsed
+            .get_field_entry(reparsed.get_field("sparse").unwrap())
+            .unwrap();
+        assert_eq!(
+            original.sparse_vector_config, reported.sparse_vector_config,
+            "{rendered}"
+        );
+        assert_eq!(original.reorder, reported.reorder, "{rendered}");
+        assert_eq!(
+            schema.reorder_on_merge(),
+            reparsed.reorder_on_merge(),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn index_info_schema_preserves_seismic_storage_and_reordering() {
+        let input = r#"
+            index documents {
+                reorder_on_merge: true
+                field sparse: sparse_vector<u32> [indexed<format: seismic, dims: 105879,
+                    quantization: uint8, doc_mass: 0.9, seismic_forward_compression: false,
+                    query<seismic_cut: 12, exhaustive: true>>]
+                field body: text [indexed, reorder]
+            }
+        "#;
+        let schema = summa_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let original = schema
+            .get_field_entry(schema.get_field("sparse").unwrap())
+            .unwrap();
+        let reported = reparsed
+            .get_field_entry(reparsed.get_field("sparse").unwrap())
+            .unwrap();
+        assert_eq!(
+            original.sparse_vector_config, reported.sparse_vector_config,
+            "{rendered}"
+        );
+        assert!(!reported.reorder, "{rendered}");
+        assert!(
+            reparsed
+                .get_field_entry(reparsed.get_field("body").unwrap())
+                .unwrap()
+                .reorder,
+            "{rendered}"
+        );
+        assert_eq!(
+            schema.reorder_on_merge(),
+            reparsed.reorder_on_merge(),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn schema_to_sdl_renders_bm25_parameters() {
+        let input = r#"
+            index documents {
+                field title: text<en_stem> [indexed<token_position, k1: 0.9, b: 0.4>]
+            }
+        "#;
+        let schema = summa_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        assert!(rendered.contains("k1: 0.9"), "{rendered}");
+        assert!(rendered.contains("b: 0.4"), "{rendered}");
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let entry = reparsed
+            .get_field_entry(reparsed.get_field("title").unwrap())
+            .unwrap();
+        assert_eq!(entry.bm25_k1, Some(0.9));
+        assert_eq!(entry.bm25_b, Some(0.4));
+    }
+
+    #[test]
+    fn schema_to_sdl_renders_chunked_text_fields() {
+        let input = r#"
+            index documents {
+                field languages: text<raw_ci> [fast]
+                field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed<chunked, token_position>]
+            }
+        "#;
+        let schema = summa_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let rendered = schema_to_sdl(&schema);
+        assert!(
+            rendered.contains("indexed<chunked, token_position>"),
+            "{rendered}"
+        );
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        let entry = reparsed
+            .get_field_entry(reparsed.get_field("content").unwrap())
+            .unwrap();
+        assert!(entry.chunked);
+
+        // Prefix queries cannot be re-keyed from chunk ids to documents.
+        let query = proto::Query {
+            query: Some(ProtoQueryType::Match(proto::MatchQuery {
+                field: "content".to_string(),
+                text: "need*".to_string(),
+                tokenizer_hint: String::new(),
+                proximity_weight: 0.0,
+                proximity_window: 0,
+                heap_factor: 0.0,
+                max_terms: 0,
+            })),
+        };
+        let error = convert_query(&query, &schema, None, None, &QueryShapeLimits::default())
+            .err()
+            .expect("prefix on a chunked field must be rejected");
+        assert!(error.contains("chunked"), "{error}");
+    }
+
+    #[test]
+    fn test_schema_to_sdl_roundtrip() {
+        let input_sdl = r#"
+            index documents {
+                field id: text<raw> [primary, indexed, stored]
+                field content_hash: bytes [stored, content_hash]
+                field title: text<en_stem> [indexed, stored]
+                field uris: text<default> [indexed, stored<multi>]
+                field price: f64 [indexed, fast]
+                field count: u64 [indexed, stored, fast]
+                field tags: text<raw_ci> [indexed, stored<multi>, fast]
+                field languages: text<raw_ci> [fast]
+                field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed<token_position>]
+                field sparse_emb: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
+                field dense_emb: dense_vector<1024, f16> [indexed<ivf_pq, routing: hnsw, num_clusters: 256>, stored<multi>]
+                field scann_emb: dense_vector<768, f16> [indexed<scann, num_clusters: 4096, tree_levels: 2, nprobe: 128>]
+                field binary_scann: binary_dense_vector<512> [indexed<scann, num_clusters: 2048, tree_levels: 2, nprobe: 96>]
+                field meta: json [stored<multi>]
+            }
+        "#;
+
+        let indexes = summa_core::dsl::sdl::parse_sdl(input_sdl).unwrap();
+        let schema = indexes[0].to_schema();
+        let sdl_output = schema_to_sdl(&schema);
+
+        // Verify the output is valid SDL that parses back
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&sdl_output)
+            .unwrap_or_else(|e| panic!("Failed to reparse SDL:\n{}\nError: {}", sdl_output, e));
+        assert_eq!(reparsed.len(), 1);
+        let reparsed_schema = reparsed[0].to_schema();
+
+        // Verify field count matches
+        assert_eq!(
+            schema.fields().count(),
+            reparsed_schema.fields().count(),
+            "SDL:\n{}",
+            sdl_output
+        );
+
+        // Verify each field entry round-trips
+        for ((_, orig), (_, reparsed)) in schema.fields().zip(reparsed_schema.fields()) {
+            assert_eq!(orig.name, reparsed.name, "field name mismatch");
+            assert_eq!(
+                orig.field_type, reparsed.field_type,
+                "field type mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.indexed, reparsed.indexed,
+                "indexed mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.stored, reparsed.stored,
+                "stored mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.multi, reparsed.multi,
+                "multi mismatch for {}",
+                orig.name
+            );
+            assert_eq!(orig.fast, reparsed.fast, "fast mismatch for {}", orig.name);
+            assert_eq!(
+                orig.primary_key, reparsed.primary_key,
+                "primary_key mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.content_hash, reparsed.content_hash,
+                "content_hash mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.tokenizer, reparsed.tokenizer,
+                "tokenizer mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.positions, reparsed.positions,
+                "positions mismatch for {}",
+                orig.name
+            );
+            assert_eq!(
+                orig.sparse_vector_config, reparsed.sparse_vector_config,
+                "sparse config mismatch for {}",
+                orig.name
+            );
+            if let (Some(a), Some(b)) = (&orig.dense_vector_config, &reparsed.dense_vector_config) {
+                assert_eq!(a.dim, b.dim, "dense dim mismatch for {}", orig.name);
+                assert_eq!(
+                    a.quantization, b.quantization,
+                    "dense quant mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    a.index_type, b.index_type,
+                    "dense index_type mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    a.num_clusters, b.num_clusters,
+                    "dense num_clusters mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    a.tree_levels, b.tree_levels,
+                    "dense tree_levels mismatch for {}",
+                    orig.name
+                );
+                assert_eq!(
+                    a.nprobe, b.nprobe,
+                    "dense nprobe mismatch for {}",
+                    orig.name
+                );
+            }
+            if let (Some(a), Some(b)) = (
+                &orig.binary_dense_vector_config,
+                &reparsed.binary_dense_vector_config,
+            ) {
+                assert_eq!(a.index_type, b.index_type);
+                assert_eq!(a.num_clusters, b.num_clusters);
+                assert_eq!(a.tree_levels, b.tree_levels);
+                assert_eq!(a.nprobe, b.nprobe);
+            }
+        }
+    }
+}

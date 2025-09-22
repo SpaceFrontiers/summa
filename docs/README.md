@@ -16,7 +16,8 @@
 
 ## Operations
 
-- [Server](../hermes-server/README.md) and [broker](broker.md)
+- [Summa 2 migration](summa-2-migration.md)
+- [Server](../summa-server/README.md) and [broker](broker.md)
 - [Segment lifecycle and recovery](segment-lifecycle.md)
 - [Deletion, upserts, and compaction](row-deletion.md)
 - [Content-hash deduplication](content-deduplication.md)

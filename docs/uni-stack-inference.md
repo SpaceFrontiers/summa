@@ -1,7 +1,7 @@
 # LLM compute architecture
 
-Hermes has one MAL-driven `Transformer` implementation in `hermes-llm`.
-`hermes-train` places it on an autodiff device; generation uses the same module
+Summa has one MAL-driven `Transformer` implementation in `summa-llm`.
+`summa-train` places it on an autodiff device; generation uses the same module
 on the plain device.
 
 ## Backends
@@ -17,7 +17,7 @@ does not build an autodiff graph.
 
 ## Reused operations
 
-Hermes uses Burn's ready implementations for:
+Summa uses Burn's ready implementations for:
 
 - linear layers, embeddings, RMSNorm, LayerNorm, and dropout
 - grouped `Conv1d` for the CPU Mamba depthwise-convolution reference
@@ -27,7 +27,7 @@ Hermes uses Burn's ready implementations for:
 - tensor matmul, activation, gather, reshape, and elementwise operations
 - AdamW and the tensor reductions used by global gradient clipping
 
-Hermes adds custom CubeCL forward and backward operations where the runtime has
+Summa adds custom CubeCL forward and backward operations where the runtime has
 no efficient training primitive: Mamba selective scan, GPU depthwise
 convolution, and CUDA attention backward. The memory-bounded output loss and
 attention backward are composed from Burn tensor operations and CubeCL

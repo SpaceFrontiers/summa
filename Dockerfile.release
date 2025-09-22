@@ -18,29 +18,29 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
-COPY hermes-broker ./hermes-broker
-COPY hermes-core ./hermes-core
-COPY hermes-llm ./hermes-llm
-COPY hermes-mal ./hermes-mal
-COPY hermes-mal-python ./hermes-mal-python
-COPY hermes-tokenizer ./hermes-tokenizer
-COPY hermes-train ./hermes-train
-COPY hermes-server ./hermes-server
-COPY hermes-tool ./hermes-tool
-COPY hermes-wasm ./hermes-wasm
-COPY hermes-proto ./hermes-proto
+COPY summa-broker ./summa-broker
+COPY summa-core ./summa-core
+COPY summa-llm ./summa-llm
+COPY summa-mal ./summa-mal
+COPY summa-mal-python ./summa-mal-python
+COPY summa-tokenizer ./summa-tokenizer
+COPY summa-train ./summa-train
+COPY summa-server ./summa-server
+COPY summa-tool ./summa-tool
+COPY summa-wasm ./summa-wasm
+COPY summa-proto ./summa-proto
 
 # Layer caching alone is ineffective after a version bump changes the
 # manifests. These cache mounts let Cargo reuse downloaded crates and compiled
 # dependencies while the output copies remain normal image layers.
-RUN --mount=type=cache,id=hermes-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=hermes-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=hermes-cargo-target,target=/app/target,sharing=locked \
+RUN --mount=type=cache,id=summa-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=summa-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=summa-cargo-target,target=/app/target,sharing=locked \
     cargo build --locked --release \
-        -p hermes-server --bin hermes-server \
-        -p hermes-broker --bin hermes-broker \
-    && install -Dm755 target/release/hermes-server /out/hermes-server \
-    && install -Dm755 target/release/hermes-broker /out/hermes-broker
+        -p summa-server --bin summa-server \
+        -p summa-broker --bin summa-broker \
+    && install -Dm755 target/release/summa-server /out/summa-server \
+    && install -Dm755 target/release/summa-broker /out/summa-broker
 
 FROM debian:bookworm-slim
 
@@ -50,9 +50,9 @@ RUN apt-get update && apt-get install -y \
 
 EXPOSE 50051
 
-COPY --from=builder /out/hermes-server /usr/local/bin/hermes-server
-COPY --from=builder /out/hermes-broker /usr/local/bin/hermes-broker
+COPY --from=builder /out/summa-server /usr/local/bin/summa-server
+COPY --from=builder /out/summa-broker /usr/local/bin/summa-broker
 
-# Run the server by default. Supplying `hermes-broker` as the container command
+# Run the server by default. Supplying `summa-broker` as the container command
 # starts the broker from this same image.
-CMD ["hermes-server"]
+CMD ["summa-server"]

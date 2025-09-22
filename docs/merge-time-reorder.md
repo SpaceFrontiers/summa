@@ -6,7 +6,7 @@ Status: implemented for BMP; extended to mapped text on September 17, 2026.
 
 Recursive Graph Bisection (BP) reordering was originally a standalone,
 whole-segment operation: merges block-copy BMP data in concatenated source
-order, and a separate pass (`hermes-tool reorder` / the server's background
+order, and a separate pass (`summa-tool reorder` / the server's background
 optimizer) later rewrites the entire segment — copying every unchanged file
 and rebuilding the sparse file. For a freshly merged segment the index is
 rewritten **twice**: once by the merge, once by the reorder.
@@ -37,7 +37,7 @@ anyway:
 - Per-field gate: only text and BMP sparse fields carrying the `reorder` schema attribute
   (`field splade: sparse_vector<...> [indexed, reorder]`,
   `SchemaBuilder::set_reorder`) are BP-reordered — by merges AND by the
-  standalone reorder paths (`hermes-tool reorder`, `IndexWriter::reorder`,
+  standalone reorder paths (`summa-tool reorder`, `IndexWriter::reorder`,
   the server's background optimizer). Fields without the attribute have
   their blob copied byte-identically (insertion order preserved — right for
   corpora whose insertion order already clusters well, e.g. date-sorted).

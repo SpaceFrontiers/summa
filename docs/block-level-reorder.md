@@ -88,7 +88,7 @@ Two estimator details:
 
 Threshold: `BLOCKWISE_NORM_COHERENCE_THRESHOLD = 0.5`. Every `Auto`
 decision logs `norm`, `d`, `d_rand`, `d_max`, blocks scanned, scan time,
-and the chosen granularity (and emits `hermes_reorder_coherence{,_norm}`)
+and the chosen granularity (and emits `summa_reorder_coherence{,_norm}`)
 so the default can be tuned from production data. Explicit granularity
 skips the scan entirely and emits only the granularity counter.
 

@@ -2,7 +2,7 @@
 
 Cargo dependencies use official repository URLs, with no personal-fork
 URLs. The tokenizer contains an explicitly maintained source extraction; see
-[its upstream provenance](../hermes-tokenizer/UPSTREAM.md). GPU fixes that have not yet merged are fetched from their official
+[its upstream provenance](../summa-tokenizer/UPSTREAM.md). GPU fixes that have not yet merged are fetched from their official
 repositories at the immutable heads of the corresponding upstream pull
 requests.
 

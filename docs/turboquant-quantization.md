@@ -135,7 +135,7 @@ fingerprint. Only centroids are stored as trained artifacts
 
 Unmarked, pre-cosine IVF-TQ artifacts are unsupported and rejected while the
 trained generation or ANN payload is opened. Rebuild the index with a current
-Hermes version; the current reader and writer do not load or migrate the legacy
+Summa version; the current reader and writer do not load or migrate the legacy
 format.
 
 Coarse training draws a deterministic uniform point sample directly at the
@@ -176,4 +176,4 @@ Rayon pool above 65k vectors (per-task collectors, merged top-k).
 - No configurable bit width (4 = 3+1 fixed; header carries it for evolution).
 - No WASM in-browser TQ _encoding_ (WASM reads native-built payloads;
   `LocalIndex` encode support is a follow-up).
-- No L2 metric (dense scoring in Hermes is cosine/dot; unchanged).
+- No L2 metric (dense scoring in Summa is cosine/dot; unchanged).

@@ -1,0 +1,1604 @@
+//! Dense vector merge strategies
+//!
+//! Binary ANN fields share exact codes through a copyable document lookup.
+//! Other fields retain their Flat entry for reranking/merge.
+//! Optionally, an ANN entry is also written alongside. Ordinary merges copy
+//! immutable ANN runs byte-for-byte; vector-generation rewrites explicitly
+//! rebuild against newly trained global artifacts.
+//!
+//! Raw vectors are read from source segments' lazy flat data (mmap-backed),
+//! never from the document store.
+//!
+//! **Streaming**: normal ANN merge payloads and flat vectors are copied in
+//! bounded chunks. Rebuilds retain only one field's compressed ANN output;
+//! doc-ID maps are streamed in chunks (384 KB per chunk).
+
+use std::io::Write;
+
+use super::OffsetWriter;
+use super::SegmentMerger;
+use super::TrainedVectorStructures;
+use super::doc_offsets;
+use crate::Result;
+use crate::directories::{Directory, DirectoryWriter};
+use crate::dsl::{DenseVectorQuantization, FieldType, VectorIndexType};
+use crate::segment::format::{DenseVectorTocEntry, write_dense_toc_and_footer};
+use crate::segment::reader::SegmentReader;
+use crate::segment::types::SegmentFiles;
+use crate::segment::vector_data::{FlatVectorData, dequantize_raw};
+use crate::segment::vector_locations::{ExactLocations, write_copied_locations};
+
+/// Batch size for streaming vector reads (1024 vectors at a time)
+const VECTOR_BATCH_SIZE: usize = 1024;
+
+/// Chunk size for streaming flat vector bytes during merge (8 MB)
+const FLAT_VECTOR_CHUNK: u64 = 8 * 1024 * 1024;
+
+/// Chunk size for streaming doc_id+ordinal entries during merge.
+/// 64K entries × 6 bytes = 384 KB per chunk (vs 60 MB unbounded).
+const DOC_ID_CHUNK: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnnWriteMode {
+    /// Ordinary segment merge: require compatible ANN payloads and copy their
+    /// immutable run columns. Missing/mismatched data is corruption.
+    Copy,
+    /// Vector-generation rewrite: rebuild payloads from flat vectors against
+    /// the explicitly supplied new global artifacts.
+    Rebuild,
+    /// Standalone reorder: coalesce fragmented binary clusters without retraining.
+    Reorder,
+}
+
+/// Streams vectors from a segment's lazy flat data into an add_fn callback.
+///
+/// Reads vectors in batches of VECTOR_BATCH_SIZE to bound memory usage.
+/// Each batch is a single range read via LazyFileSlice. Vectors are
+/// dequantized to f32 regardless of storage quantization (f16, u8, f32).
+///
+/// Returns number of vectors added.
+async fn feed_segment(
+    segment: &SegmentReader,
+    field: crate::dsl::Field,
+    doc_id_offset: u32,
+    mut add_batch: impl FnMut(&[(u32, u16)], &[f32]) -> Result<()>,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> crate::Result<usize> {
+    let lazy_flat = match segment.flat_vectors().get(&field.0) {
+        Some(f) => f,
+        None => return Ok(0),
+    };
+    let n = lazy_flat.num_vectors;
+    if n == 0 {
+        return Ok(0);
+    }
+    let dim = lazy_flat.dim;
+    let quant = lazy_flat.quantization;
+    let mut count = 0;
+    // Only allocate dequantize buffer for non-f32 quantizations
+    let needs_dequant = quant != DenseVectorQuantization::F32;
+    let mut f32_buf: Vec<f32> = Vec::new();
+    let mut labels = Vec::with_capacity(VECTOR_BATCH_SIZE);
+
+    for batch_start in (0..n).step_by(VECTOR_BATCH_SIZE) {
+        if cancellation
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            return Err(crate::Error::IndexClosed);
+        }
+        let batch_count = VECTOR_BATCH_SIZE.min(n - batch_start);
+        let batch_bytes = lazy_flat
+            .read_vectors_batch(batch_start, batch_count)
+            .await
+            .map_err(crate::Error::Io)?;
+        let raw = batch_bytes.as_slice();
+        let batch_floats = batch_count.checked_mul(dim).ok_or_else(|| {
+            crate::Error::Corruption("dense merge batch size overflows usize".into())
+        })?;
+
+        // For f32: reinterpret mmap bytes directly (zero-copy).
+        // For f16/u8: dequantize into buffer.
+        let vectors: &[f32] = if needs_dequant {
+            f32_buf.resize(batch_floats, 0.0);
+            dequantize_raw(raw, quant, batch_floats, &mut f32_buf).map_err(crate::Error::Io)?;
+            &f32_buf
+        } else {
+            if !(raw.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
+                return Err(crate::Error::Corruption(
+                    "f32 flat vector data is not 4-byte aligned".into(),
+                ));
+            }
+            // Safety: mmap-backed vector data is page-aligned. Assertion above
+            // guards against unexpected misalignment.
+            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, batch_floats) }
+        };
+
+        labels.clear();
+        for i in 0..batch_count {
+            let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+            labels.push((doc_id_offset + doc_id, ordinal));
+        }
+        add_batch(&labels, vectors)?;
+        count += batch_count;
+    }
+    Ok(count)
+}
+
+/// Write a Flat entry: header + raw vectors (chunked) + doc_ids (chunked).
+///
+/// Doc_id map is streamed in DOC_ID_CHUNK entries (384 KB) instead of
+/// buffering all at once (was 60 MB for 10M vectors).
+#[allow(clippy::too_many_arguments)]
+async fn write_flat_entry(
+    field_id: u32,
+    dim: usize,
+    total_vectors: usize,
+    quantization: DenseVectorQuantization,
+    segments: &[SegmentReader],
+    doc_offs: &[u32],
+    writer: &mut OffsetWriter,
+    cancellation: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    FlatVectorData::write_binary_header(dim, total_vectors, quantization, writer)?;
+
+    // Pass 1: stream raw vector bytes in chunks
+    for segment in segments {
+        if let Some(lazy_flat) = segment.flat_vectors().get(&field_id) {
+            if let Some((handle, region)) = lazy_flat.flat_region() {
+                for start in (region.start..region.end).step_by(FLAT_VECTOR_CHUNK as usize) {
+                    if cancellation
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return Err(crate::Error::IndexClosed);
+                    }
+                    let end = start.saturating_add(FLAT_VECTOR_CHUNK).min(region.end);
+                    let bytes = handle.read_bytes_range(start..end).await?;
+                    if bytes.len() as u64 != end - start {
+                        return Err(crate::Error::Corruption(
+                            "truncated flat vector merge read".into(),
+                        ));
+                    }
+                    super::block_in_place_if_multithread(|| writer.write_all(bytes.as_slice()))?;
+                }
+                continue;
+            }
+            // Only generation rewrites gather ANN-backed codes in document
+            // order. A one-row oversized batch stays a shared byte view.
+            let rows = (FLAT_VECTOR_CHUNK as usize / lazy_flat.vector_byte_size()).max(1);
+            for start in (0..lazy_flat.num_vectors).step_by(rows) {
+                if cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return Err(crate::Error::IndexClosed);
+                }
+                let count = rows.min(lazy_flat.num_vectors - start);
+                let bytes = lazy_flat.read_vectors_batch(start, count).await?;
+                super::block_in_place_if_multithread(|| writer.write_all(bytes.as_slice()))?;
+            }
+        }
+    }
+
+    // Pass 2: stream doc_ids with offset adjustment (chunked, 384 KB per chunk)
+    let mut buf = Vec::with_capacity(DOC_ID_CHUNK * 6);
+    for (seg_idx, segment) in segments.iter().enumerate() {
+        if let Some(lazy_flat) = segment.flat_vectors().get(&field_id) {
+            let offset = doc_offs[seg_idx];
+            let count = lazy_flat.num_vectors;
+            for chunk_start in (0..count).step_by(DOC_ID_CHUNK) {
+                if cancellation
+                    .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    return Err(crate::Error::IndexClosed);
+                }
+                buf.clear();
+                let chunk_end = (chunk_start + DOC_ID_CHUNK).min(count);
+                for i in chunk_start..chunk_end {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(i);
+                    buf.extend_from_slice(&(offset + doc_id).to_le_bytes());
+                    buf.extend_from_slice(&ordinal.to_le_bytes());
+                }
+                super::block_in_place_if_multithread(|| writer.write_all(&buf))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+impl SegmentMerger {
+    /// Merge dense vector indexes - returns output size in bytes
+    ///
+    /// Single-pass streaming: for each field, the ANN blob (if any) is built,
+    /// serialized, written to disk, and freed immediately. Then the Flat entry
+    /// is streamed. Peak memory = one ANN blob at a time, not all simultaneously.
+    ///
+    /// No document store reads — all vector data comes from .vectors files.
+    pub(crate) async fn merge_dense_vectors<D: Directory + DirectoryWriter>(
+        &self,
+        dir: &D,
+        segments: &[SegmentReader],
+        files: &SegmentFiles,
+        trained: Option<&TrainedVectorStructures>,
+        ann_mode: AnnWriteMode,
+    ) -> Result<usize> {
+        let doc_offs = doc_offsets(segments)?;
+
+        // Collect fields that need writing (in schema field_id order)
+        struct FieldInfo {
+            field: crate::dsl::Field,
+            dim: usize,
+            total_vectors: usize,
+            quantization: DenseVectorQuantization,
+        }
+        let mut fields_to_write: Vec<FieldInfo> = Vec::new();
+
+        for (field, entry) in self.schema.fields() {
+            self.ensure_not_cancelled()?;
+            if !matches!(
+                entry.field_type,
+                FieldType::DenseVector | FieldType::BinaryDenseVector
+            ) || !(entry.indexed || entry.stored)
+            {
+                continue;
+            }
+
+            let dim: usize = segments
+                .iter()
+                .filter_map(|s| s.flat_vectors().get(&field.0).map(|f| f.dim))
+                .find(|&d| d > 0)
+                .unwrap_or(0);
+            if dim == 0 {
+                continue;
+            }
+
+            let total_vectors = segments
+                .iter()
+                .filter_map(|s| s.flat_vectors().get(&field.0).map(|f| f.num_vectors))
+                .try_fold(0usize, |total, count| total.checked_add(count))
+                .ok_or_else(|| {
+                    crate::Error::Corruption(format!(
+                        "flat vector count overflows usize for field {}",
+                        field.0
+                    ))
+                })?;
+            if total_vectors == 0 {
+                continue;
+            }
+
+            let quantization = if entry.field_type == FieldType::BinaryDenseVector {
+                DenseVectorQuantization::Binary
+            } else {
+                entry
+                    .dense_vector_config
+                    .as_ref()
+                    .map(|c| c.quantization)
+                    .or_else(|| {
+                        segments
+                            .iter()
+                            .find_map(|s| s.flat_vectors().get(&field.0).map(|f| f.quantization))
+                    })
+                    .unwrap_or(DenseVectorQuantization::F32)
+            };
+
+            fields_to_write.push(FieldInfo {
+                field,
+                dim,
+                total_vectors,
+                quantization,
+            });
+        }
+
+        if fields_to_write.is_empty() {
+            return Ok(0);
+        }
+
+        let write_start = std::time::Instant::now();
+        let mut writer = OffsetWriter::new(dir.streaming_writer_cold(&files.vectors).await?);
+        let mut toc: Vec<DenseVectorTocEntry> = Vec::new();
+
+        for fi in &fields_to_write {
+            self.ensure_not_cancelled()?;
+            let field = fi.field;
+            let entry = self.schema.get_field_entry(field).unwrap();
+            let config = entry.dense_vector_config.as_ref();
+            let binary = entry.field_type == FieldType::BinaryDenseVector;
+            let reorder_binary = binary
+                && ann_mode == AnnWriteMode::Reorder
+                && segments.iter().any(|segment| {
+                    segment
+                        .ann_health(field)
+                        .is_some_and(|health| health.fragmentation() > 1.0)
+                });
+            let mut lookup_budget = if reorder_binary {
+                self.bp_memory_budget
+            } else {
+                2 * 1024 * 1024
+            };
+            if reorder_binary {
+                for segment in segments {
+                    if let Some(
+                        crate::segment::VectorIndex::BinaryIvf(index)
+                        | crate::segment::VectorIndex::ScannBinary(index),
+                    ) = segment.vector_indexes().get(&field.0)
+                    {
+                        lookup_budget = lookup_budget
+                            .checked_sub(index.get().binary_compaction_scratch_bytes()?)
+                            .ok_or_else(|| {
+                                crate::Error::Schema("binary reorder exceeds scratch budget".into())
+                            })?;
+                    }
+                }
+            }
+            let copy_exact = binary && ann_mode != AnnWriteMode::Rebuild && !reorder_binary;
+            let mut locations = (binary && !copy_exact)
+                .then(|| {
+                    ExactLocations::with_budget(
+                        lookup_budget.min(2 * 1024 * 1024),
+                        self.cancellation.clone(),
+                    )
+                })
+                .transpose()?;
+
+            // ── ANN entry (written first, index_type != FLAT_TYPE) ───────
+            let tq_config = config.filter(|config| {
+                entry.field_type == FieldType::DenseVector
+                    && config.index_type == VectorIndexType::Tq
+            });
+            let ann_entry = if let Some(tq_config) = tq_config {
+                // TQ payloads carry no trained generation: every merge mode
+                // byte-copies compatible runs; only sources without a payload
+                // (pre-TQ builds or a schema switch to `tq`) are upgraded by
+                // re-encoding from their flat vectors.
+                self.write_tq_entry(field, tq_config, segments, &doc_offs, &mut writer)
+                    .await?
+            } else {
+                match ann_mode {
+                    AnnWriteMode::Copy | AnnWriteMode::Reorder => self.write_compatible_ann(
+                        field,
+                        segments,
+                        &doc_offs,
+                        trained,
+                        &mut writer,
+                        locations.as_mut(),
+                    )?,
+                    AnnWriteMode::Rebuild
+                        if entry.field_type == FieldType::DenseVector
+                            && config.is_some_and(|config| {
+                                config.index_type == VectorIndexType::Scann
+                            }) =>
+                    {
+                        if let Some(payload) = self
+                            .rebuild_scann_ah(field, config, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_scann(
+                                    &payload,
+                                    &mut writer,
+                                    None,
+                                )
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::SCANN_AH_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    AnnWriteMode::Rebuild
+                        if entry.field_type == FieldType::BinaryDenseVector
+                            && entry.binary_dense_vector_config.as_ref().is_some_and(
+                                |config| config.index_type == crate::dsl::BinaryIndexType::Scann,
+                            ) =>
+                    {
+                        if let Some(payload) = self
+                            .rebuild_binary_scann(field, entry, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_scann(
+                                    &payload,
+                                    &mut writer,
+                                    locations.as_mut(),
+                                )
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::SCANN_BINARY_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    AnnWriteMode::Rebuild if entry.field_type == FieldType::BinaryDenseVector => {
+                        if let Some(index) = self
+                            .rebuild_binary_ivf(field, entry, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            let routing = entry
+                                .binary_dense_vector_config
+                                .as_ref()
+                                .expect("binary field configuration validated")
+                                .ivf_routing;
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_binary_ivf(
+                                    &index,
+                                    routing,
+                                    &mut writer,
+                                    locations.as_mut(),
+                                )
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::BINARY_IVF_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                    AnnWriteMode::Rebuild => {
+                        if let Some((index, num_clusters)) = self
+                            .rebuild_ivf_tq(field, config, segments, &doc_offs, trained)
+                            .await?
+                        {
+                            let data_offset = writer.offset();
+                            super::block_in_place_if_multithread(|| {
+                                crate::segment::ann_disk::write_built_ivf_tq(
+                                    &index,
+                                    num_clusters,
+                                    &mut writer,
+                                )
+                            })
+                            .map_err(crate::Error::Io)?;
+                            Some((
+                                crate::segment::ann_build::IVF_TQ_TYPE,
+                                data_offset,
+                                writer.offset() - data_offset,
+                            ))
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+            if let Some((index_type, data_offset, data_size)) = ann_entry {
+                toc.push(DenseVectorTocEntry {
+                    field_id: field.0,
+                    index_type,
+                    offset: data_offset,
+                    size: data_size,
+                });
+                let pad = (8 - (writer.offset() % 8)) % 8;
+                if pad > 0 {
+                    super::block_in_place_if_multithread(|| {
+                        writer.write_all(&[0u8; 8][..pad as usize])
+                    })?;
+                }
+            }
+
+            let data_offset = writer.offset();
+            let index_type = if binary && let Some((_, _, ann_len)) = ann_entry {
+                if copy_exact {
+                    let mut sources = Vec::new();
+                    let mut bias = 0u64;
+                    for (segment, &doc_base) in segments.iter().zip(&doc_offs) {
+                        let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                            continue;
+                        };
+                        let ann = match segment.vector_indexes().get(&field.0) {
+                            Some(
+                                crate::segment::VectorIndex::BinaryIvf(index)
+                                | crate::segment::VectorIndex::ScannBinary(index),
+                            ) => index.get(),
+                            _ => {
+                                return Err(crate::Error::Corruption(
+                                    "missing binary ANN source for vector lookup".into(),
+                                ));
+                            }
+                        };
+                        sources.push((flat, doc_base, bias));
+                        bias = bias
+                            .checked_add(ann.copied_payload_bytes() as u64)
+                            .ok_or_else(|| {
+                                crate::Error::Corruption("ANN relocation overflow".into())
+                            })?;
+                    }
+                    super::block_in_place_if_multithread(|| {
+                        write_copied_locations(
+                            &sources,
+                            fi.dim,
+                            fi.total_vectors,
+                            ann_len,
+                            &mut writer,
+                            self.cancellation.as_deref(),
+                        )
+                    })?;
+                } else {
+                    super::block_in_place_if_multithread(|| {
+                        locations.take().expect("binary location builder").write(
+                            fi.dim,
+                            fi.total_vectors,
+                            ann_len,
+                            &mut writer,
+                            self.cancellation.as_deref(),
+                        )
+                    })?;
+                }
+                crate::segment::ann_build::EXACT_LOCATIONS_TYPE
+            } else {
+                write_flat_entry(
+                    field.0,
+                    fi.dim,
+                    fi.total_vectors,
+                    fi.quantization,
+                    segments,
+                    &doc_offs,
+                    &mut writer,
+                    self.cancellation.as_deref(),
+                )
+                .await?;
+                crate::segment::ann_build::FLAT_TYPE
+            };
+            toc.push(DenseVectorTocEntry {
+                field_id: field.0,
+                index_type,
+                offset: data_offset,
+                size: writer.offset() - data_offset,
+            });
+            // Pad to 8-byte boundary
+            let pad = (8 - (writer.offset() % 8)) % 8;
+            if pad > 0 {
+                super::block_in_place_if_multithread(|| {
+                    writer.write_all(&[0u8; 8][..pad as usize])
+                })?;
+            }
+        }
+
+        // Write TOC + footer
+        let toc_offset = writer.offset();
+        write_dense_toc_and_footer(&mut writer, toc_offset, &toc)?;
+
+        let output_size = writer.offset() as usize;
+        super::block_in_place_if_multithread(move || writer.finish())?;
+        log::info!(
+            "[dense_vector_merge] index={} file written: {} ({} fields) in {:.1}s",
+            self.schema.index_label(),
+            crate::format_bytes(output_size as u64),
+            toc.len(),
+            write_start.elapsed().as_secs_f64()
+        );
+        Ok(output_size)
+    }
+
+    /// Copy compatible ANN columns; only standalone binary reorder supplies
+    /// a location builder to request cluster coalescing.
+    fn write_compatible_ann(
+        &self,
+        field: crate::dsl::Field,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+        writer: &mut OffsetWriter,
+        locations: Option<&mut ExactLocations>,
+    ) -> Result<Option<(u8, u64, u64)>> {
+        let entry = self
+            .schema
+            .get_field_entry(field)
+            .expect("validated vector field");
+        let has_source_ann = segments
+            .iter()
+            .any(|segment| segment.vector_indexes().contains_key(&field.0));
+        let Some(trained) = trained else {
+            if has_source_ann {
+                return Err(crate::Error::Corruption(format!(
+                    "ANN field {} has segment payloads but no loaded global artifacts",
+                    field.0,
+                )));
+            }
+            return Ok(None);
+        };
+
+        if entry.field_type == FieldType::DenseVector
+            && let Some(config) = entry
+                .dense_vector_config
+                .as_ref()
+                .filter(|config| config.index_type == VectorIndexType::IvfTq)
+        {
+            return self.copy_ivf_tq_runs(field, config, segments, doc_offs, Some(trained), writer);
+        }
+        if (entry.field_type == FieldType::DenseVector
+            && entry
+                .dense_vector_config
+                .as_ref()
+                .is_some_and(|config| config.index_type == VectorIndexType::Scann))
+            || (entry.field_type == FieldType::BinaryDenseVector
+                && entry
+                    .binary_dense_vector_config
+                    .as_ref()
+                    .is_some_and(|config| config.index_type == crate::dsl::BinaryIndexType::Scann))
+        {
+            return self.copy_scann_runs(field, segments, doc_offs, trained, writer, locations);
+        }
+
+        let mut sources = Vec::new();
+        let index_type = match entry.field_type {
+            FieldType::DenseVector => {
+                // IVF-TQ was intercepted above; every other dense index type
+                // (flat, tq handled separately, removed ivf_pq) must not
+                // reach the trained-copy path with ANN payloads attached.
+                if has_source_ann {
+                    return Err(crate::Error::Corruption(format!(
+                        "dense field {} unexpectedly contains trained ANN payloads \
+                         (was it created as ivf_pq? that format was removed — \
+                         recreate the index with ivf_tq)",
+                        field.0,
+                    )));
+                }
+                return Ok(None);
+            }
+            FieldType::BinaryDenseVector => {
+                let Some(config) = entry
+                    .binary_dense_vector_config
+                    .as_ref()
+                    .filter(|config| config.index_type == crate::dsl::BinaryIndexType::Ivf)
+                else {
+                    if has_source_ann {
+                        return Err(crate::Error::Corruption(format!(
+                            "flat binary field {} unexpectedly contains ANN payloads",
+                            field.0,
+                        )));
+                    }
+                    return Ok(None);
+                };
+                let Some(quantizer) = trained.binary_quantizers.get(&field.0) else {
+                    if has_source_ann {
+                        return Err(crate::Error::Corruption(format!(
+                            "binary IVF field {} has payloads but no global quantizer",
+                            field.0,
+                        )));
+                    }
+                    return Ok(None);
+                };
+                for (segment_index, segment) in segments.iter().enumerate() {
+                    let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                        continue;
+                    };
+                    let Some(crate::segment::VectorIndex::BinaryIvf(index)) =
+                        segment.vector_indexes().get(&field.0)
+                    else {
+                        return Err(crate::Error::Corruption(format!(
+                            "ordinary merge source {:032x} field {} is missing its binary IVF payload",
+                            segment.meta().id,
+                            field.0,
+                        )));
+                    };
+                    let disk = index.get();
+                    let header = disk.header();
+                    if header.dim != config.dim
+                        || header.code_size != config.byte_len()
+                        || header.num_clusters != quantizer.num_clusters
+                        || header.quantizer_version != quantizer.version
+                        || header.codebook_version != 0
+                        || header.routing != config.ivf_routing
+                        || header.vector_count != flat.num_vectors
+                    {
+                        return Err(crate::Error::Corruption(format!(
+                            "ordinary merge source {:032x} field {} uses an incompatible binary IVF generation",
+                            segment.meta().id,
+                            field.0,
+                        )));
+                    }
+                    sources.push((disk, doc_offs[segment_index]));
+                }
+                crate::segment::ann_build::BINARY_IVF_TYPE
+            }
+            _ => return Ok(None),
+        };
+
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        let predicted_fragmentation =
+            crate::segment::ann_disk::predicted_merge_fragmentation(&sources);
+        let data_offset = writer.offset();
+        let action = if locations.is_some() {
+            "coalesced"
+        } else {
+            "copied"
+        };
+        let result = super::block_in_place_if_multithread(|| {
+            if let Some(locations) = locations {
+                crate::segment::ann_disk::write_compacted_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                    Some(locations),
+                )
+            } else {
+                crate::segment::ann_disk::write_merged_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            }
+        });
+        self.ensure_not_cancelled()?;
+        result.map_err(crate::Error::Io)?;
+        let data_size = writer.offset() - data_offset;
+        log::debug!(
+            "[dense_vector_merge] index={} field {}: {action} {} binary ANN sources, {} bytes (source fragmentation {predicted_fragmentation:.1})",
+            self.schema.index_label(),
+            field.0,
+            sources.len(),
+            data_size
+        );
+        Ok(Some((index_type, data_offset, data_size)))
+    }
+
+    /// Copy ScaNN leaf extents without decoding, assigning, or retraining.
+    /// Every source must point at the exact global model stored in this
+    /// segment-generation snapshot; the ANN header checks both monotonically
+    /// assigned generation and content fingerprint.
+    fn copy_scann_runs(
+        &self,
+        field: crate::dsl::Field,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: &TrainedVectorStructures,
+        writer: &mut OffsetWriter,
+        locations: Option<&mut ExactLocations>,
+    ) -> Result<Option<(u8, u64, u64)>> {
+        let entry = self
+            .schema
+            .get_field_entry(field)
+            .expect("validated vector field");
+        let artifact = trained.scann_artifacts.get(&field.0).ok_or_else(|| {
+            crate::Error::Corruption(format!(
+                "ScaNN field {} has segment payloads but no loaded global artifact",
+                field.0
+            ))
+        })?;
+        let binary = entry.field_type == FieldType::BinaryDenseVector;
+        let index_type = if binary {
+            crate::segment::ann_build::SCANN_BINARY_TYPE
+        } else {
+            crate::segment::ann_build::SCANN_AH_TYPE
+        };
+        let mut sources = Vec::new();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            let disk = match (binary, segment.vector_indexes().get(&field.0)) {
+                (false, Some(crate::segment::VectorIndex::ScannAh(index)))
+                | (true, Some(crate::segment::VectorIndex::ScannBinary(index))) => index.get(),
+                (_, Some(_)) => {
+                    return Err(crate::Error::Corruption(format!(
+                        "ordinary merge source {:032x} field {} has the wrong ANN payload type for ScaNN",
+                        segment.meta().id,
+                        field.0,
+                    )));
+                }
+                (_, None) => {
+                    return Err(crate::Error::Corruption(format!(
+                        "ordinary merge source {:032x} field {} is missing its ScaNN payload; run a vector-generation rebuild",
+                        segment.meta().id,
+                        field.0,
+                    )));
+                }
+            };
+            disk.validate_scann_generation(
+                artifact.config(),
+                artifact.generation(),
+                artifact.artifact_id(),
+            )
+            .map_err(|error| {
+                crate::Error::Corruption(format!(
+                    "ordinary merge source {:032x} field {} uses an incompatible ScaNN generation: {error}",
+                    segment.meta().id,
+                    field.0,
+                ))
+            })?;
+            let soar = entry
+                .binary_dense_vector_config
+                .as_ref()
+                .and_then(|config| config.soar.as_ref());
+            disk.validate_scann_posting_count(flat.num_vectors, soar)
+                .map_err(|error| {
+                    crate::Error::Corruption(format!(
+                        "ordinary merge source {:032x} field {} has an invalid ScaNN posting count: {error}",
+                        segment.meta().id,
+                        field.0,
+                    ))
+                })?;
+            sources.push((disk, doc_offs[segment_index]));
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+
+        let data_offset = writer.offset();
+        let result = super::block_in_place_if_multithread(|| {
+            // Binary runs and their lookup rows remain immutable through
+            // merge. Float AH retains leaf-wise compaction with its existing
+            // FastScan packer; neither path reassigns or retrains vectors.
+            if locations.is_some()
+                || (index_type != crate::segment::ann_build::SCANN_BINARY_TYPE
+                    && crate::segment::ann_disk::predicted_merge_fragmentation(&sources)
+                        > 1.0 + 1e-9)
+            {
+                crate::segment::ann_disk::write_compacted_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                    locations,
+                )
+            } else {
+                crate::segment::ann_disk::write_merged_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            }
+        });
+        self.ensure_not_cancelled()?;
+        result.map_err(crate::Error::Io)?;
+        let data_size = writer.offset() - data_offset;
+        log::debug!(
+            "[merge_vectors] index={} field {}: copied {} compatible ScaNN leaf source(s), {} bytes",
+            self.schema.index_label(),
+            field.0,
+            sources.len(),
+            data_size,
+        );
+        Ok(Some((index_type, data_offset, data_size)))
+    }
+
+    /// Write the merged TQ payload for one field.
+    ///
+    /// The normal path is the same pure byte-copy as every other ANN merge:
+    /// TQ payloads have no trained generation, so compatibility is only the
+    /// codec fingerprint. Sources without a payload (segments built before
+    /// the field used `tq`) are upgraded by re-encoding from flat storage —
+    /// loudly, and only for this field.
+    async fn write_tq_entry(
+        &self,
+        field: crate::dsl::Field,
+        config: &crate::dsl::DenseVectorConfig,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        writer: &mut OffsetWriter,
+    ) -> Result<Option<(u8, u64, u64)>> {
+        let expected_fingerprint =
+            crate::structures::vector::quantization::tq_expected_fingerprint(config.dim);
+        let mut sources = Vec::new();
+        let mut segments_with_vectors = 0usize;
+        let mut missing_segments = Vec::new();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            segments_with_vectors += 1;
+            match segment.vector_indexes().get(&field.0) {
+                Some(crate::segment::VectorIndex::Tq { index, .. }) => {
+                    let header = index.get().header();
+                    if header.dim != config.dim
+                        || header.quantizer_version != expected_fingerprint
+                        || header.vector_count != flat.num_vectors
+                    {
+                        return Err(crate::Error::Corruption(format!(
+                            "merge source {:032x} field {} carries an incompatible TQ payload \
+                             (dim {} fingerprint {:#x} count {}, expected dim {} fingerprint \
+                             {:#x} count {})",
+                            segment.meta().id,
+                            field.0,
+                            header.dim,
+                            header.quantizer_version,
+                            header.vector_count,
+                            config.dim,
+                            expected_fingerprint,
+                            flat.num_vectors,
+                        )));
+                    }
+                    sources.push((index.get(), doc_offs[segment_index]));
+                }
+                Some(_) => {
+                    return Err(crate::Error::Corruption(format!(
+                        "merge source {:032x} field {} has a non-TQ ANN payload for a tq field",
+                        segment.meta().id,
+                        field.0,
+                    )));
+                }
+                None => missing_segments.push(segment_index),
+            }
+        }
+        if segments_with_vectors == 0 {
+            return Ok(None);
+        }
+
+        if missing_segments.is_empty() {
+            let data_offset = writer.offset();
+            let result = super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_merged_ann_cancellable(
+                    &sources,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            });
+            self.ensure_not_cancelled()?;
+            result.map_err(crate::Error::Io)?;
+            let data_size = writer.offset() - data_offset;
+            log::debug!(
+                "[merge_vectors] index={} field {}: copied {} compatible TQ run source(s), {} bytes",
+                self.schema.index_label(),
+                field.0,
+                sources.len(),
+                data_size,
+            );
+            return Ok(Some((
+                crate::segment::ann_build::TQ_FLAT_TYPE,
+                data_offset,
+                data_size,
+            )));
+        }
+
+        // Payload-less sources (pre-TQ builds or a schema switch to `tq`)
+        // are re-encoded; every compatible source is still byte-copied.
+        log::info!(
+            "[merge_vectors] index={} field {}: {}/{} TQ source(s) have no payload; re-encoding only \
+             those from flat vectors (training-free), byte-copying the rest",
+            self.schema.index_label(),
+            field.0,
+            missing_segments.len(),
+            segments_with_vectors,
+        );
+        let codec = crate::structures::vector::quantization::tq_shared_codec(config.dim);
+        let mut builder = crate::structures::TqFlatBuilder::new(codec);
+        let encode_start = std::time::Instant::now();
+        for &segment_index in &missing_segments {
+            feed_segment(
+                &segments[segment_index],
+                field,
+                doc_offs[segment_index],
+                |labels, vectors| {
+                    super::block_in_place_if_multithread(|| {
+                        let mut add = || builder.add_batch(labels, vectors);
+                        if let Some(pool) = &self.background_pool {
+                            pool.install(add)
+                        } else {
+                            add()
+                        }
+                    })
+                    .map_err(|error| {
+                        crate::Error::Internal(format!(
+                            "TQ re-encode failed for field {}: {error}",
+                            field.0,
+                        ))
+                    })
+                },
+                self.cancellation.as_deref(),
+            )
+            .await?;
+        }
+        builder.finish();
+        let vector_count = builder.len();
+        if sources.is_empty() && vector_count == 0 {
+            log::warn!(
+                "[merge_vectors] index={} field {}: TQ re-encode found no vectors in any source; \
+                 the merged segment will carry no TQ payload and fall back to exact scan",
+                self.schema.index_label(),
+                field.0,
+            );
+            return Ok(None);
+        }
+        let data_offset = writer.offset();
+        if sources.is_empty() {
+            super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_built_tq_flat(&builder, writer)
+            })
+            .map_err(crate::Error::Io)?;
+        } else {
+            let extra = crate::segment::ann_disk::tq_builder_extra_run(&builder);
+            let extra_runs: &[_] = if vector_count == 0 {
+                &[]
+            } else {
+                std::slice::from_ref(&extra)
+            };
+            let result = super::block_in_place_if_multithread(|| {
+                crate::segment::ann_disk::write_merged_ann_with_extra(
+                    &sources,
+                    extra_runs,
+                    writer,
+                    self.cancellation.as_deref(),
+                )
+            });
+            self.ensure_not_cancelled()?;
+            result.map_err(crate::Error::Io)?;
+        }
+        log::info!(
+            "[merge_vectors] index={} field {}: TQ re-encoded {} vectors in {:.1}s ({} sources copied)",
+            self.schema.index_label(),
+            field.0,
+            vector_count,
+            encode_start.elapsed().as_secs_f64(),
+            sources.len(),
+        );
+        Ok(Some((
+            crate::segment::ann_build::TQ_FLAT_TYPE,
+            data_offset,
+            writer.offset() - data_offset,
+        )))
+    }
+
+    /// Byte-copy compatible IVF-TQ run columns (the ordinary merge path for
+    /// `ivf_tq` fields). Generation compatibility is the trained centroid
+    /// version plus the derived codec fingerprint.
+    fn copy_ivf_tq_runs(
+        &self,
+        field: crate::dsl::Field,
+        config: &crate::dsl::DenseVectorConfig,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+        writer: &mut OffsetWriter,
+    ) -> Result<Option<(u8, u64, u64)>> {
+        let has_source_ann = segments
+            .iter()
+            .any(|segment| segment.vector_indexes().contains_key(&field.0));
+        let Some(centroids) = trained.and_then(|trained| trained.centroids.get(&field.0)) else {
+            if has_source_ann {
+                return Err(crate::Error::Corruption(format!(
+                    "IVF-TQ field {} has payloads but no global centroids",
+                    field.0,
+                )));
+            }
+            return Ok(None);
+        };
+        if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
+            return Err(crate::Error::Corruption(format!(
+                "IVF-TQ field {} uses the removed legacy raw generation; \
+                 rebuild the index with a current Summa version",
+                field.0,
+            )));
+        }
+        let expected_fingerprint =
+            crate::structures::vector::quantization::tq_expected_fingerprint(config.dim);
+        let max_assignments = centroids
+            .soar_config
+            .as_ref()
+            .map_or(1, |soar| 1usize.saturating_add(soar.num_secondary));
+        let mut sources = Vec::new();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            let Some(crate::segment::VectorIndex::IvfTq { index, .. }) =
+                segment.vector_indexes().get(&field.0)
+            else {
+                return Err(crate::Error::Corruption(format!(
+                    "ordinary merge source {:032x} field {} is missing its IVF-TQ payload",
+                    segment.meta().id,
+                    field.0,
+                )));
+            };
+            let disk = index.get();
+            let header = disk.header();
+            let max_vectors = flat
+                .num_vectors
+                .checked_mul(max_assignments)
+                .ok_or_else(|| {
+                    crate::Error::Corruption(format!(
+                        "IVF-TQ assignment count overflows for field {}",
+                        field.0,
+                    ))
+                })?;
+            if header.dim != config.dim
+                || header.num_clusters != centroids.num_clusters
+                || header.quantizer_version != centroids.version
+                || header.codebook_version != expected_fingerprint
+                || header.routing != config.ivf_routing
+                || !(flat.num_vectors..=max_vectors).contains(&header.vector_count)
+            {
+                return Err(crate::Error::Corruption(format!(
+                    "ordinary merge source {:032x} field {} uses an incompatible IVF-TQ generation",
+                    segment.meta().id,
+                    field.0,
+                )));
+            }
+            sources.push((disk, doc_offs[segment_index]));
+        }
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        let data_offset = writer.offset();
+        let result = super::block_in_place_if_multithread(|| {
+            crate::segment::ann_disk::write_merged_ann_cancellable(
+                &sources,
+                writer,
+                self.cancellation.as_deref(),
+            )
+        });
+        self.ensure_not_cancelled()?;
+        result.map_err(crate::Error::Io)?;
+        let data_size = writer.offset() - data_offset;
+        log::debug!(
+            "[merge_vectors] index={} field {}: copied {} compatible IVF-TQ run source(s), {} bytes",
+            self.schema.index_label(),
+            field.0,
+            sources.len(),
+            data_size,
+        );
+        Ok(Some((
+            crate::segment::ann_build::IVF_TQ_TYPE,
+            data_offset,
+            data_size,
+        )))
+    }
+
+    /// Rebuild the IVF-TQ index for a vector-generation rewrite: re-assign
+    /// every raw flat vector against the supplied centroid generation and
+    /// re-encode normalized residuals with the derived codec.
+    async fn rebuild_ivf_tq(
+        &self,
+        field: crate::dsl::Field,
+        config: Option<&crate::dsl::DenseVectorConfig>,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+    ) -> Result<Option<(crate::structures::IvfTqIndex, u32)>> {
+        let Some(config) = config.filter(|config| config.index_type == VectorIndexType::IvfTq)
+        else {
+            return Ok(None);
+        };
+        let Some(centroids) = trained.and_then(|trained| trained.centroids.get(&field.0)) else {
+            return Ok(None);
+        };
+        if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
+            return Err(crate::Error::Corruption(format!(
+                "IVF-TQ field {} uses the removed legacy raw generation; \
+                 rebuild the index with a current Summa version",
+                field.0,
+            )));
+        }
+
+        let codec = crate::structures::vector::quantization::tq_shared_codec(config.dim);
+        let mut index = crate::structures::IvfTqIndex::new(
+            config.dim,
+            config.ivf_routing,
+            centroids.version,
+            codec,
+        );
+        let mut total_fed = 0usize;
+        let ann_start = std::time::Instant::now();
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let fed = feed_segment(
+                segment,
+                field,
+                doc_offs[segment_index],
+                |labels, vectors| {
+                    super::block_in_place_if_multithread(|| {
+                        let mut add = || index.add_vectors_parallel(centroids, labels, vectors);
+                        if let Some(pool) = &self.background_pool {
+                            pool.install(add)
+                        } else {
+                            add()
+                        }
+                    })
+                    .map_err(|error| {
+                        crate::Error::Internal(format!(
+                            "parallel IVF-TQ rebuild failed for field {}: {error}",
+                            field.0,
+                        ))
+                    })
+                },
+                self.cancellation.as_deref(),
+            )
+            .await?;
+            total_fed = total_fed.checked_add(fed).ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "IVF-TQ rebuild vector count overflows for field {}",
+                    field.0,
+                ))
+            })?;
+        }
+        if total_fed == 0 {
+            return Ok(None);
+        }
+        log::info!(
+            "[merge_vectors] index={} field {} IVF-TQ rebuilt from {} vectors into {} assignments ({:.1}s)",
+            self.schema.index_label(),
+            field.0,
+            total_fed,
+            index.len(),
+            ann_start.elapsed().as_secs_f64()
+        );
+        Ok(Some((index, centroids.num_clusters)))
+    }
+
+    /// Re-encode flat vectors against a newly trained global ScaNN model.
+    /// This path is used only by vector-generation staging; ordinary commits
+    /// and merges copy compatible leaf runs and never retrain/re-encode them.
+    async fn rebuild_scann_ah(
+        &self,
+        field: crate::dsl::Field,
+        config: Option<&crate::dsl::DenseVectorConfig>,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+    ) -> Result<Option<crate::structures::vector::scann::ScannSegmentPayload>> {
+        let Some(config) = config.filter(|config| config.index_type == VectorIndexType::Scann)
+        else {
+            return Ok(None);
+        };
+        if config.soar.is_some() {
+            return Err(crate::Error::Schema(format!(
+                "ScaNN field {} enables SOAR, but ScaNN SOAR secondary assignments are not implemented; set soar: null before building",
+                field.0
+            )));
+        }
+        let Some(artifact) = trained.and_then(|trained| trained.scann_artifacts.get(&field.0))
+        else {
+            return Ok(None);
+        };
+        let mut builder = crate::segment::ann_build::ScannAhSegmentBuilder::new(artifact);
+        let mut total_fed = 0usize;
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let fed = feed_segment(
+                segment,
+                field,
+                doc_offs[segment_index],
+                |labels, vectors| builder.add_batch(labels, vectors),
+                self.cancellation.as_deref(),
+            )
+            .await?;
+            total_fed = total_fed.checked_add(fed).ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "ScaNN rebuild vector count overflows for field {}",
+                    field.0
+                ))
+            })?;
+        }
+        if total_fed == 0 {
+            return Ok(None);
+        }
+        let doc_count = segments.iter().try_fold(0u32, |total, segment| {
+            total.checked_add(segment.meta().num_docs).ok_or_else(|| {
+                crate::Error::Corruption("ScaNN rebuilt segment document count overflows".into())
+            })
+        })?;
+        Ok(Some(builder.finish(doc_count)?))
+    }
+
+    /// Rebuild the binary IVF index for a vector-generation rewrite.
+    ///
+    /// Streams packed codes from source flat storage and assigns every vector
+    /// to the already-trained global quantizer generation. Codes are exact, so
+    /// rebuilding the per-segment run payload is lossless.
+    async fn rebuild_binary_ivf(
+        &self,
+        field: crate::dsl::Field,
+        entry: &crate::dsl::FieldEntry,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+    ) -> Result<Option<crate::structures::BinaryIvfIndex>> {
+        let Some(cfg) = entry.binary_dense_vector_config.as_ref() else {
+            return Ok(None);
+        };
+        if cfg.index_type != crate::dsl::BinaryIndexType::Ivf {
+            return Ok(None);
+        }
+        let Some(quantizer) = trained.and_then(|trained| trained.binary_quantizers.get(&field.0))
+        else {
+            return Ok(None);
+        };
+
+        const CODE_BATCH: usize = 65536;
+        let mut builder =
+            crate::structures::vector::index::BinaryIvfBuilder::new(quantizer, cfg.ivf_routing)
+                .map_err(crate::Error::Io)?;
+        let mut labels = Vec::with_capacity(CODE_BATCH);
+        let mut vector_count = 0usize;
+        for (seg_idx, segment) in segments.iter().enumerate() {
+            let Some(lazy_flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            let offset = doc_offs[seg_idx];
+            let n = lazy_flat.num_vectors;
+            for batch_start in (0..n).step_by(CODE_BATCH) {
+                let batch_count = CODE_BATCH.min(n - batch_start);
+                let bytes = lazy_flat
+                    .read_vectors_batch(batch_start, batch_count)
+                    .await
+                    .map_err(crate::Error::Io)?;
+                labels.clear();
+                for i in 0..batch_count {
+                    let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
+                    let merged_doc_id = doc_id.checked_add(offset).ok_or_else(|| {
+                        crate::Error::Corruption(format!(
+                            "binary IVF doc-id offset overflow: {doc_id} + {offset}"
+                        ))
+                    })?;
+                    labels.push((merged_doc_id, ordinal));
+                }
+                super::block_in_place_if_multithread(|| {
+                    let mut add = || builder.add_batch(quantizer, bytes.as_slice(), &labels);
+                    if let Some(pool) = &self.background_pool {
+                        pool.install(add)
+                    } else {
+                        add()
+                    }
+                })
+                .map_err(crate::Error::Io)?;
+                vector_count = vector_count.checked_add(batch_count).ok_or_else(|| {
+                    crate::Error::Corruption(format!(
+                        "binary IVF rebuild vector count overflows for field {}",
+                        field.0,
+                    ))
+                })?;
+            }
+        }
+
+        if vector_count == 0 {
+            return Ok(None);
+        }
+        let num_clusters = quantizer.num_clusters;
+        let index = builder.finish().map_err(crate::Error::Io)?;
+        crate::structures::vector::index::report_binary_build_quality(
+            self.schema.index_label(),
+            field.0,
+            &index,
+        );
+        log::debug!(
+            "[dense_vector_merge] index={} field {}: binary IVF rebuilt ({} vectors, {} clusters, estimated {})",
+            self.schema.index_label(),
+            field.0,
+            vector_count,
+            num_clusters,
+            crate::format_bytes(index.estimated_memory_bytes() as u64),
+        );
+        Ok(Some(index))
+    }
+
+    async fn rebuild_binary_scann(
+        &self,
+        field: crate::dsl::Field,
+        entry: &crate::dsl::FieldEntry,
+        segments: &[SegmentReader],
+        doc_offs: &[u32],
+        trained: Option<&TrainedVectorStructures>,
+    ) -> Result<Option<crate::structures::vector::scann::ScannSegmentPayload>> {
+        let Some(config) = entry
+            .binary_dense_vector_config
+            .as_ref()
+            .filter(|config| config.index_type == crate::dsl::BinaryIndexType::Scann)
+        else {
+            return Ok(None);
+        };
+        let Some(artifact) = trained.and_then(|trained| trained.scann_artifacts.get(&field.0))
+        else {
+            return Ok(None);
+        };
+        if artifact.config().dimension as usize != config.dim {
+            return Err(crate::Error::Corruption(format!(
+                "binary ScaNN artifact dimension mismatch for field {}",
+                field.0
+            )));
+        }
+        const CODE_BATCH: usize = 65_536;
+        let mut builder = crate::segment::ann_build::BinaryScannPayloadBuilder::new(
+            artifact,
+            config.soar.as_ref(),
+        );
+        let mut labels = Vec::with_capacity(CODE_BATCH);
+        let mut count = 0usize;
+        for (segment_index, segment) in segments.iter().enumerate() {
+            let Some(flat) = segment.flat_vectors().get(&field.0) else {
+                continue;
+            };
+            for batch_start in (0..flat.num_vectors).step_by(CODE_BATCH) {
+                let batch_count = CODE_BATCH.min(flat.num_vectors - batch_start);
+                let codes = flat
+                    .read_vectors_batch(batch_start, batch_count)
+                    .await
+                    .map_err(crate::Error::Io)?;
+                labels.clear();
+                for row in 0..batch_count {
+                    let (doc_id, ordinal) = flat.get_doc_id(batch_start + row);
+                    labels.push((
+                        doc_id.checked_add(doc_offs[segment_index]).ok_or_else(|| {
+                            crate::Error::Corruption("binary ScaNN doc ID overflows".into())
+                        })?,
+                        ordinal,
+                    ));
+                }
+                builder.add_batch(&labels, codes.as_slice())?;
+                count = count.checked_add(batch_count).ok_or_else(|| {
+                    crate::Error::Corruption("binary ScaNN vector count overflows".into())
+                })?;
+            }
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        let doc_count = segments.iter().try_fold(0u32, |total, segment| {
+            total.checked_add(segment.meta().num_docs).ok_or_else(|| {
+                crate::Error::Corruption("binary ScaNN document count overflows".into())
+            })
+        })?;
+        Ok(Some(builder.finish(doc_count)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::SegmentMerger;
+    use crate::directories::RamDirectory;
+    use crate::dsl::{DenseVectorConfig, Document, SchemaBuilder};
+    use crate::index::{IndexConfig, IndexWriter};
+    use crate::segment::reader::SegmentReader;
+    use crate::segment::types::SegmentId;
+
+    async fn committed_segment_ids(dir: &RamDirectory) -> Vec<String> {
+        crate::index::IndexMetadata::load(dir)
+            .await
+            .unwrap()
+            .segment_ids()
+    }
+
+    async fn newly_committed_segment(dir: &RamDirectory, known: &mut Vec<String>) -> String {
+        let ids = committed_segment_ids(dir).await;
+        let new: Vec<String> = ids
+            .iter()
+            .filter(|id| !known.contains(id))
+            .cloned()
+            .collect();
+        assert_eq!(
+            new.len(),
+            1,
+            "expected exactly one new segment, got {new:?}"
+        );
+        *known = ids;
+        new.into_iter().next().unwrap()
+    }
+
+    /// Regression: ANN merge sources must retain their matching position in
+    /// the full per-segment doc-offset array. With sources [A(has field),
+    /// B(no field), C(has field)], C must not inherit B's offset.
+    #[tokio::test]
+    async fn ann_run_copy_skips_offsets_of_segments_without_the_field() {
+        let dim = 8;
+        let mut sb = SchemaBuilder::default();
+        let title = sb.add_text_field("title", true, true);
+        let embedding = sb.add_dense_vector_field_with_config(
+            "embedding",
+            true,
+            true,
+            DenseVectorConfig::ivf_tq(dim, Some(1), 1),
+        );
+        let schema = sb.build();
+
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            num_indexing_threads: 1,
+            ..Default::default()
+        };
+        let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config)
+            .await
+            .unwrap();
+
+        // Training segment: provides the sample, stays out of the merge.
+        for i in 0..4 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("train {i}"));
+            doc.add_dense_vector(embedding, vec![i as f32 + 1.0; dim]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        writer.build_vector_index().await.unwrap();
+        let mut known = committed_segment_ids(&dir).await;
+
+        // Segment A: 2 docs WITH the field (gets a per-segment IVF at flush).
+        for i in 0..2 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("a {i}"));
+            doc.add_dense_vector(embedding, vec![0.5; dim]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let seg_a = newly_committed_segment(&dir, &mut known).await;
+
+        // Segment B: 3 docs WITHOUT the field (no flat entry, no ANN entry).
+        for i in 0..3 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("b {i}"));
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let seg_b = newly_committed_segment(&dir, &mut known).await;
+
+        // Segment C: 2 docs WITH the field.
+        for i in 0..2 {
+            let mut doc = Document::new();
+            doc.add_text(title, format!("c {i}"));
+            doc.add_dense_vector(embedding, vec![0.25; dim]);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        let seg_c = newly_committed_segment(&dir, &mut known).await;
+
+        // Open the merge sources in a fixed order: [A, B, C].
+        let schema = Arc::new(schema);
+        let mut readers = Vec::new();
+        for id in [&seg_a, &seg_b, &seg_c] {
+            readers.push(
+                SegmentReader::open(
+                    &dir,
+                    SegmentId::from_hex(id).unwrap(),
+                    Arc::clone(&schema),
+                    16,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        assert!(matches!(
+            readers[0].get_vector_index(embedding),
+            Some(crate::segment::VectorIndex::IvfTq { .. })
+        ));
+        assert!(
+            readers[1].get_vector_index(embedding).is_none(),
+            "segment B must not carry the dense field"
+        );
+        assert!(matches!(
+            readers[2].get_vector_index(embedding),
+            Some(crate::segment::VectorIndex::IvfTq { .. })
+        ));
+
+        let merged_id = SegmentId::new();
+        let trained = writer.segment_manager().trained().unwrap();
+        SegmentMerger::new(Arc::clone(&schema))
+            .merge(&dir, &readers, merged_id, Some(trained.as_ref()))
+            .await
+            .unwrap();
+
+        let mut merged = SegmentReader::open(&dir, merged_id, Arc::clone(&schema), 16)
+            .await
+            .unwrap();
+        merged.set_trained_vectors(Arc::clone(&trained));
+        let mut doc_ids: Vec<u32> = merged
+            .search_dense_vector(
+                embedding,
+                &[0.5; 8],
+                4,
+                1,
+                1.0,
+                crate::query::MultiValueCombiner::Max,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|result| result.doc_id)
+            .collect();
+        doc_ids.sort_unstable();
+        // A occupies merged docs 0..2, B (no vectors) 2..5, C 5..7. C's
+        // vectors must be remapped with C's own offset (5), not B's (2).
+        assert_eq!(
+            doc_ids,
+            vec![0, 1, 5, 6],
+            "merged ANN doc ids must use each field-bearing segment's own offset"
+        );
+    }
+}

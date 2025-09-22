@@ -1,0 +1,16 @@
+remote_theme: just-the-docs/just-the-docs
+plugins:
+  - jekyll-remote-theme
+  - jekyll-relative-links
+title: Summa
+description: Fast full-text search server
+show_downloads: false
+aux_links:
+  "Our GitHub":
+    - "//github.com/SpaceFrontiers/summa"
+favicon_ico: "/assets/favicon.ico"
+logo: "/assets/favicon.ico"
+color_scheme: dark
+permalink: pretty
+url: "https://spacefrontiers.github.io"
+baseurl: "/summa"

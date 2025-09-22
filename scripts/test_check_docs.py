@@ -31,18 +31,16 @@ class DocumentationChecks(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             (root / "docs").mkdir()
-            (root / "hermes-core").mkdir()
-            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["hermes-core"]\n')
-            (root / "hermes-core/Cargo.toml").write_text(
-                '[package]\nname = "hermes-core"\n'
+            (root / "summa-core").mkdir()
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["summa-core"]\n')
+            (root / "summa-core/Cargo.toml").write_text(
+                '[package]\nname = "summa-core"\n'
             )
             (root / "docs/README.md").write_text(
                 "# Guides\n\n[guide](guide.md)\n\n"
                 "[missing](missing.md)\n\n[anchor](guide.md#missing)\n"
             )
-            (root / "docs/guide.md").write_text(
-                "# Guide\n\n| `hermes-core` | `removed` |\n"
-            )
+            (root / "docs/guide.md").write_text("# Guide\n")
             (root / "docs/orphan.md").write_text("# Orphan\n")
             errors, _, _ = check(root, list(root.rglob("*.md")))
             report = "\n".join(errors)

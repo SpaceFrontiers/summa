@@ -9,16 +9,16 @@ iterations after 20 warmups; lower latency is better.
 
 | Implementation            |      Forward | Core forward + backward | With router losses |
 | ------------------------- | -----------: | ----------------------: | -----------------: |
-| Hermes grouped + fused    | **1.503 ms** |            **3.363 ms** |           4.237 ms |
+| Summa grouped + fused     | **1.503 ms** |            **3.363 ms** |           4.237 ms |
 | PyTorch 2.12 `grouped_mm` |     1.625 ms |                3.610 ms |       **4.235 ms** |
 
-Hermes is 7.5% faster in forward and 6.8% faster in the apples-to-apples core
+Summa is 7.5% faster in forward and 6.8% faster in the apples-to-apples core
 training step. With the model's load-balancing coefficient `0.01` and router
 z-loss coefficient `0.001` enabled in both implementations, the results differ
 by 0.04%, which is measurement noise. A repeated process-level run preserved
 the forward and core-training wins; the full-loss result stayed within 1.3%.
 
-The optimized Hermes path consists of:
+The optimized Summa path consists of:
 
 - deterministic GPU-resident route counting and stable packing;
 - direct route gather and weighted route combine kernels, with specialized

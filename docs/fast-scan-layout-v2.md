@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented in `hermes-core/src/structures/vector/scann/fast_scan.rs`. The
+Implemented in `summa-core/src/structures/vector/scann/fast_scan.rs`. The
 segment payload format version (`SCANN_SEGMENT_PAYLOAD_VERSION`) is bumped
 from 1 to 2; version-1 payloads are refused with an actionable error.
 Migration is a rebuild of every float ScaNN generation (`alter_vector_index`

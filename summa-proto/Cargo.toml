@@ -1,0 +1,10 @@
+[package]
+name = "summa-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Canonical protobuf sources for Summa"
+include = ["Cargo.toml", "README.md", "src/lib.rs", "*.proto", "mutations.rs"]

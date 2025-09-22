@@ -80,7 +80,7 @@ and winner hydration. `seismic_filter_scans` counts selective or underfilled
 filtered executions that scan forward values; `seismic_budget_truncations`
 identifies finite nomination budgets reached before traversal completes.
 
-BMP reports its own phase and work metrics through `hermes_bmp_*`: preparation,
+BMP reports its own phase and work metrics through `summa_bmp_*`: preparation,
 grid scoring, prefetch, block scoring, document-map lookup, and LSP selection;
 visit/skip counts and prefetched bytes explain the work behind those phases.
 These are metrics captures, not fields in `QueryWork`. Sparse MaxScore has no

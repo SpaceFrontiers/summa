@@ -116,7 +116,7 @@ adds 48 bytes of logical batch state and no heap allocations or persisted bytes.
 Apple M4 alternating runs reduced the million-document piecewise scan from
 3.325/3.643 ms to 1.614/1.684 ms. Unaffected controls were noisy and sometimes
 slower, so a dedicated Cascade Lake machine repeated the comparison with matching
-Hermes 1.8.146 binaries, Rust 1.98.1, unchanged release flags and CPU affinity.
+Summa 1.8.146 binaries, Rust 1.98.1, unchanged release flags and CPU affinity.
 Both run orders confirmed the compressed-data improvement and the ordinary-filter
 regression. Compiler outlining shifted between the shared codec dispatcher and
 bitset packing; explicit inline hints did not remove the tradeoff. A final

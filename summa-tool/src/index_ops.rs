@@ -1,0 +1,1024 @@
+//! Index management operations: create, index, commit, merge, info, warmup
+
+use std::collections::HashMap;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader};
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use tracing::info;
+
+use summa_core::{Document, IndexConfig, IndexWriter, MmapDirectory, parse_schema};
+
+use crate::release_memory_to_os;
+
+pub async fn create_index(index_path: PathBuf, schema_path: PathBuf) -> Result<()> {
+    let schema_content = fs::read_to_string(&schema_path)
+        .with_context(|| format!("Failed to read schema file: {:?}", schema_path))?;
+
+    let schema = parse_schema(&schema_content)
+        .map_err(|e| anyhow::anyhow!("Failed to parse schema: {}", e))?;
+
+    info!("Parsed schema with {} fields", schema.fields().count());
+
+    std::fs::create_dir_all(&index_path)
+        .with_context(|| format!("Failed to create index directory: {:?}", index_path))?;
+
+    let dir = MmapDirectory::new(&index_path);
+    let config = IndexConfig::default();
+
+    let _writer = IndexWriter::create(dir, schema, config).await?;
+
+    info!("Created index at {:?}", index_path);
+
+    Ok(())
+}
+
+pub async fn init_index_from_sdl(index_path: PathBuf, sdl: String) -> Result<()> {
+    let schema =
+        parse_schema(&sdl).map_err(|e| anyhow::anyhow!("Failed to parse schema: {}", e))?;
+
+    std::fs::create_dir_all(&index_path)
+        .with_context(|| format!("Failed to create index directory: {:?}", index_path))?;
+
+    let dir = MmapDirectory::new(&index_path);
+    let config = IndexConfig::default();
+
+    let _writer = IndexWriter::create(dir, schema.clone(), config).await?;
+
+    info!("Created index at {:?}", index_path);
+    info!("Schema has {} fields", schema.fields().count());
+
+    Ok(())
+}
+
+async fn index_from_reader<R: BufRead>(
+    writer: &mut IndexWriter<MmapDirectory>,
+    reader: R,
+    progress_interval: usize,
+) -> Result<usize> {
+    let schema = writer.schema().clone();
+    let mut count = 0usize;
+    let mut errors = 0usize;
+    let mut duplicates = 0usize;
+    let start_time = std::time::Instant::now();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let json: serde_json::Value = match sonic_rs::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                if errors < 10 {
+                    tracing::warn!("Failed to parse JSON at line {}: {}", count + 1, e);
+                }
+                errors += 1;
+                continue;
+            }
+        };
+
+        let doc = match Document::from_json(&json, &schema) {
+            Some(d) => d,
+            None => {
+                if errors < 10 {
+                    tracing::warn!("Failed to parse document at line {}", count + 1);
+                }
+                errors += 1;
+                continue;
+            }
+        };
+
+        match writer.add_document(doc) {
+            Ok(()) => {}
+            Err(summa_core::Error::DuplicatePrimaryKey(key)) => {
+                if duplicates < 10 {
+                    tracing::warn!("Skipping document with duplicate primary key: {}", key);
+                }
+                duplicates += 1;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        count += 1;
+
+        if progress_interval > 0 && count.is_multiple_of(progress_interval) {
+            let elapsed = start_time.elapsed().as_secs_f64();
+            let rate = count as f64 / elapsed;
+            info!(
+                "Progress: {} documents indexed ({:.0} docs/sec)",
+                count, rate
+            );
+        }
+    }
+
+    writer.commit().await?;
+
+    // Wait for any in-flight background merges to complete before returning
+    // Otherwise they will be cancelled when the IndexWriter/runtime is dropped
+    info!("Waiting for background merges to complete...");
+    writer.wait_for_merging_thread().await;
+
+    release_memory_to_os();
+
+    let elapsed = start_time.elapsed();
+    let rate = count as f64 / elapsed.as_secs_f64();
+
+    if errors > 0 {
+        tracing::warn!("Skipped {} documents due to parse errors", errors);
+    }
+    if duplicates > 0 {
+        tracing::warn!(
+            "Skipped {} documents with duplicate primary keys",
+            duplicates
+        );
+    }
+
+    info!(
+        "Indexed {} documents in {:.2}s ({:.0} docs/sec)",
+        count,
+        elapsed.as_secs_f64(),
+        rate
+    );
+
+    Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn index_documents(
+    index_path: PathBuf,
+    documents_path: Option<PathBuf>,
+    use_stdin: bool,
+    progress_interval: usize,
+    max_indexing_memory_mb: usize,
+    indexing_threads: Option<usize>,
+    compression_threads: Option<usize>,
+    optimization: summa_core::structures::IndexOptimization,
+    posting_codec: Option<summa_core::structures::PostingCodec>,
+    posting_ratio_bounds: bool,
+    posting_impact_bounds: bool,
+    no_background_merges: bool,
+    term_dict_block_size: summa_core::structures::SSTableBlockSize,
+) -> Result<()> {
+    let optimization_mode = optimization;
+
+    let dir = MmapDirectory::new(&index_path);
+    let default_config = IndexConfig::default();
+    let config = IndexConfig {
+        max_indexing_memory_bytes: max_indexing_memory_mb * 1024 * 1024,
+        num_indexing_threads: indexing_threads.unwrap_or(default_config.num_indexing_threads),
+        num_compression_threads: compression_threads
+            .unwrap_or(default_config.num_compression_threads),
+        optimization: optimization_mode,
+        posting_codec,
+        posting_ratio_bounds,
+        posting_impact_bounds,
+        merge_policy: if no_background_merges {
+            Box::new(summa_core::merge::NoMergePolicy)
+        } else {
+            default_config.merge_policy.clone()
+        },
+        term_dict_block_size,
+        ..default_config
+    };
+    let mut writer = IndexWriter::open(dir, config.clone()).await?;
+
+    // Enforce the schema's primary-key unique constraint (no-op when the
+    // schema declares no primary key). Mirrors summa-server, which always
+    // initializes dedup when opening a writer.
+    writer.init_primary_key_dedup().await?;
+
+    info!("Opened index at {:?}", index_path);
+    info!(
+        "Schema fields: {:?}",
+        writer
+            .schema()
+            .fields()
+            .map(|(_, e)| &e.name)
+            .collect::<Vec<_>>()
+    );
+    info!(
+        "Indexing threads: {}, Compression threads: {}, Optimization: {:?}, posting codec: {}, ratio bounds: {}, impact bounds: {}, background merges: {}, term dictionary block bytes: {}",
+        config.num_indexing_threads,
+        config.num_compression_threads,
+        optimization_mode,
+        config.effective_posting_codec(),
+        config.effective_posting_bounds().ratio,
+        config.effective_posting_bounds().impact,
+        !no_background_merges,
+        config.term_dict_block_size,
+    );
+
+    let count = if use_stdin {
+        info!("Reading documents from stdin...");
+        let stdin = io::stdin();
+        let reader = stdin.lock();
+        index_from_reader(&mut writer, reader, progress_interval).await?
+    } else if let Some(path) = documents_path {
+        info!("Reading documents from {:?}", path);
+        let file = File::open(&path)
+            .with_context(|| format!("Failed to open documents file: {:?}", path))?;
+        let reader = BufReader::new(file);
+        index_from_reader(&mut writer, reader, progress_interval).await?
+    } else {
+        anyhow::bail!("Either --documents or --stdin must be specified");
+    };
+
+    info!("Successfully indexed {} documents", count);
+    Ok(())
+}
+
+pub async fn commit_index(index_path: PathBuf) -> Result<()> {
+    let dir = MmapDirectory::new(&index_path);
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::open(dir, config).await?;
+
+    writer.commit().await?;
+    info!("Committed index at {:?}", index_path);
+
+    Ok(())
+}
+
+pub async fn merge_index(
+    index_path: PathBuf,
+    compact: bool,
+    term_dict_block_size: summa_core::structures::SSTableBlockSize,
+) -> Result<()> {
+    let dir = MmapDirectory::new(&index_path);
+    let config = IndexConfig {
+        term_dict_block_size,
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::open(dir, config).await?;
+
+    info!("Starting force merge...");
+    let result = writer.force_merge_with_compaction(compact).await;
+    finish_local_maintenance(writer, result).await?;
+    info!("Force merge completed");
+
+    Ok(())
+}
+
+pub async fn reorder_index(
+    index_path: PathBuf,
+    term_dict_block_size: summa_core::structures::SSTableBlockSize,
+) -> Result<()> {
+    let dir = MmapDirectory::new(&index_path);
+    let config = IndexConfig {
+        term_dict_block_size,
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::open(dir, config).await?;
+
+    info!("Starting BP reorder...");
+    writer.reorder().await?;
+    info!("Reorder completed");
+
+    Ok(())
+}
+
+/// Read-side `IndexConfig` for `summa-tool search`. Limits
+/// (`term_cache_blocks <= 65536`, non-zero
+/// search threads) are enforced by summa-core when the index is opened.
+pub fn search_config(
+    term_cache_blocks: usize,
+    term_cache_bytes: Option<usize>,
+    search_threads: Option<usize>,
+) -> IndexConfig {
+    let mut config = IndexConfig {
+        term_cache_blocks,
+        term_cache_budget_bytes: term_cache_bytes,
+        ..Default::default()
+    };
+    if let Some(threads) = search_threads {
+        config.num_threads = threads;
+    }
+    config
+}
+
+pub async fn search_index(
+    index_path: PathBuf,
+    query_str: &str,
+    limit: usize,
+    offset: usize,
+    config: IndexConfig,
+) -> Result<()> {
+    let dir = MmapDirectory::new(&index_path);
+    let index = summa_core::Index::open(dir, config).await?;
+    let schema = index.schema().clone();
+
+    let response = index
+        .query_offset(query_str, limit, offset)
+        .await
+        .with_context(|| format!("Search failed for query: {}", query_str))?;
+
+    info!(
+        "Found {} results (total: {})",
+        response.hits.len(),
+        response.total_hits
+    );
+
+    for (i, hit) in response.hits.iter().enumerate() {
+        println!(
+            "--- Result {} (score: {:.4}) ---",
+            offset + i + 1,
+            hit.score
+        );
+        if let Some(doc) = index.get_document(&hit.address).await? {
+            let json = doc.to_json(&schema);
+            println!("{}", serde_json::to_string_pretty(&json)?);
+        }
+    }
+
+    println!("---");
+    println!(
+        "Showing {}-{} of {} results",
+        offset + 1,
+        offset + response.hits.len(),
+        response.total_hits
+    );
+
+    Ok(())
+}
+
+/// Run many queries against an index opened once, emitting one JSON line per
+/// query in input order: `{"line": <1-based input line>, "total_hits": N,
+/// "hits": [{"score", "doc"}]}`. Queries execute `concurrency` at a time;
+/// output is flushed per chunk so a driving process can stream. Logs stay on
+/// stderr — stdout carries only result JSONL.
+pub async fn search_batch(
+    index_path: PathBuf,
+    queries_path: PathBuf,
+    limit: usize,
+    concurrency: usize,
+    config: IndexConfig,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::Arc;
+
+    anyhow::ensure!(concurrency > 0, "--concurrency must be at least 1");
+    let dir = MmapDirectory::new(&index_path);
+    let index = Arc::new(summa_core::Index::open(dir, config).await?);
+    let schema = Arc::new(index.schema().clone());
+
+    let file = File::open(&queries_path)
+        .with_context(|| format!("Failed to open queries file: {:?}", queries_path))?;
+    let queries: Vec<(usize, String)> = BufReader::new(file)
+        .lines()
+        .enumerate()
+        .filter_map(|(line_no, line)| match line {
+            Ok(line) => {
+                let query = line.trim();
+                if query.is_empty() {
+                    None
+                } else {
+                    Some(Ok((line_no + 1, query.to_string())))
+                }
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<std::result::Result<_, _>>()?;
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    let mut done = 0usize;
+    for chunk in queries.chunks(concurrency) {
+        let mut handles = Vec::with_capacity(chunk.len());
+        for (line_no, query_str) in chunk {
+            let line_no = *line_no;
+            let query_str = query_str.clone();
+            let index = Arc::clone(&index);
+            let schema = Arc::clone(&schema);
+            handles.push(tokio::spawn(async move {
+                let response = index
+                    .query_offset(&query_str, limit, 0)
+                    .await
+                    .with_context(|| format!("Search failed for query on line {}", line_no))?;
+                let mut hits = Vec::with_capacity(response.hits.len());
+                for hit in &response.hits {
+                    let doc = match index.get_document(&hit.address).await? {
+                        Some(doc) => doc.to_json(&schema),
+                        None => serde_json::Value::Null,
+                    };
+                    hits.push(serde_json::json!({"score": hit.score, "doc": doc}));
+                }
+                anyhow::Ok(serde_json::json!({
+                    "line": line_no,
+                    "total_hits": response.total_hits,
+                    "hits": hits,
+                }))
+            }));
+        }
+        for handle in handles {
+            let row = handle.await??;
+            serde_json::to_writer(&mut out, &row)?;
+            out.write_all(b"\n")?;
+        }
+        out.flush()?;
+        done += chunk.len();
+    }
+    info!("Ran {} queries from {:?}", done, queries_path);
+    Ok(())
+}
+
+pub async fn show_info(index_path: PathBuf) -> Result<()> {
+    let dir = MmapDirectory::new(&index_path);
+    let config = IndexConfig::default();
+    let index = summa_core::Index::open(dir, config).await?;
+
+    println!("Index: {:?}", index_path);
+    println!("Documents: {}", index.num_docs().await?);
+    let segments = index.segment_readers().await?;
+    println!("Segments: {}", segments.len());
+    println!();
+    println!("Schema:");
+    for (_field, entry) in index.schema().fields() {
+        println!(
+            "  {} ({:?}) - indexed: {}, stored: {}",
+            entry.name, entry.field_type, entry.indexed, entry.stored
+        );
+    }
+
+    // Per-field sparse vector statistics (postings, avg vector length)
+    let mut sparse_vectors: HashMap<u32, u64> = HashMap::new();
+    let mut sparse_postings: HashMap<u32, u64> = HashMap::new();
+    for segment in &segments {
+        for (field_id, stats) in segment.seismic_stats() {
+            *sparse_vectors.entry(field_id).or_default() += u64::from(stats.total_vectors);
+            *sparse_postings.entry(field_id).or_default() += stats.forward_entries;
+        }
+        for (&field_id, idx) in segment.sparse_indexes() {
+            *sparse_vectors.entry(field_id).or_default() += idx.total_vectors as u64;
+            *sparse_postings.entry(field_id).or_default() += idx.total_postings();
+        }
+        for (&field_id, idx) in segment.bmp_indexes() {
+            *sparse_vectors.entry(field_id).or_default() += idx.total_vectors as u64;
+            *sparse_postings.entry(field_id).or_default() += idx.total_postings();
+        }
+    }
+    if !sparse_vectors.is_empty() {
+        println!();
+        println!("Sparse vectors:");
+        let mut fields: Vec<_> = sparse_vectors.keys().copied().collect();
+        fields.sort_unstable();
+        let schema = index.schema();
+        for field_id in fields {
+            let name = schema
+                .get_field_name(summa_core::dsl::Field(field_id))
+                .unwrap_or("unknown");
+            let vectors = sparse_vectors[&field_id];
+            let postings = sparse_postings.get(&field_id).copied().unwrap_or(0);
+            let avg = if vectors > 0 {
+                postings as f64 / vectors as f64
+            } else {
+                0.0
+            };
+            println!(
+                "  {}: {} vectors, {} postings, avg length {:.1} terms/vector",
+                name, vectors, postings, avg
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn heatmap_bmp_grid(
+    index_path: PathBuf,
+    field_name: Option<String>,
+    width: Option<usize>,
+    height: Option<usize>,
+    segment_idx: usize,
+) -> Result<()> {
+    use summa_core::{FieldType, Index};
+
+    let dir = MmapDirectory::new(&index_path);
+    let config = IndexConfig::default();
+    let index = Index::open(dir, config).await?;
+    let schema = index.schema().clone();
+    let segments = index.segment_readers().await?;
+
+    anyhow::ensure!(!segments.is_empty(), "Index has no segments");
+    anyhow::ensure!(
+        segment_idx < segments.len(),
+        "Segment index {} out of range (have {} segments)",
+        segment_idx,
+        segments.len()
+    );
+
+    let segment = &segments[segment_idx];
+
+    // Find BMP field
+    let (field, field_name) = if let Some(name) = &field_name {
+        let f = schema
+            .get_field(name)
+            .ok_or_else(|| anyhow::anyhow!("Field '{}' not found in schema", name))?;
+        (f, name.clone())
+    } else {
+        // Auto-detect first BMP field
+        schema
+            .fields()
+            .find(|(_, entry)| {
+                entry.field_type == FieldType::SparseVector
+                    && entry
+                        .sparse_vector_config
+                        .as_ref()
+                        .is_some_and(|cfg| cfg.format == summa_core::structures::SparseFormat::Bmp)
+            })
+            .map(|(f, entry)| (f, entry.name.clone()))
+            .ok_or_else(|| anyhow::anyhow!("No BMP sparse vector field found in schema"))?
+    };
+
+    let bmp = segment.bmp_index(field).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No BMP index for field '{}' in segment {}",
+            field_name,
+            segment_idx
+        )
+    })?;
+
+    let dims = bmp.dims() as usize;
+    let num_blocks = bmp.num_blocks as usize;
+
+    // Get terminal size
+    let (term_cols, term_rows) = terminal_size();
+    let out_cols = width.unwrap_or(term_cols.saturating_sub(8)).max(10);
+    // ×2 for half-block packing (each char row = 2 pixel rows)
+    let out_pixel_rows = height.unwrap_or(term_rows.saturating_sub(6)).max(4) * 2;
+
+    let dim_bin_size = dims.div_ceil(out_pixel_rows).max(1);
+    let block_bin_size = num_blocks.div_ceil(out_cols).max(1);
+    let actual_rows = dims.div_ceil(dim_bin_size);
+    let actual_cols = num_blocks.div_ceil(block_bin_size);
+
+    // Downsample grid via max aggregation
+    let mut heatmap = vec![vec![0u8; actual_cols]; actual_rows];
+    let mut nonzero_cells = 0u64;
+    let mut total_cells = 0u64;
+
+    for d in 0..dims {
+        let row = (d / dim_bin_size).min(actual_rows - 1);
+        bmp.for_each_block_grid_chunk(d as u32, |start, count, values| {
+            total_cells += count as u64;
+            let Some(values) = values else {
+                return;
+            };
+            for (within, &value) in values.iter().enumerate() {
+                let block = start + within;
+                let col = (block / block_bin_size).min(actual_cols - 1);
+                if value > 0 {
+                    nonzero_cells += 1;
+                }
+                heatmap[row][col] = heatmap[row][col].max(value);
+            }
+        })?;
+    }
+
+    let sparsity = if total_cells > 0 {
+        100.0 * (1.0 - nonzero_cells as f64 / total_cells as f64)
+    } else {
+        100.0
+    };
+
+    // Print header
+    println!(
+        "BMP Grid Heatmap: field={}, segment={}",
+        field_name, segment_idx
+    );
+    println!(
+        "  dims={}, blocks={}, real_docs={}, total_terms={}, total_postings={}",
+        dims,
+        num_blocks,
+        bmp.num_real_docs(),
+        bmp.total_terms(),
+        bmp.total_postings()
+    );
+    println!(
+        "  grid: {}x{} -> {}x{} (bin: {}d x {}b), sparsity: {:.1}%",
+        dims, num_blocks, actual_rows, actual_cols, dim_bin_size, block_bin_size, sparsity
+    );
+    println!();
+
+    // Render heatmap using Unicode half-blocks
+    for row_pair in (0..actual_rows).step_by(2) {
+        // Dim axis label
+        let dim_start = row_pair * dim_bin_size;
+        print!("{:>6} ", dim_start);
+
+        let top_row = &heatmap[row_pair];
+        let bot_row = if row_pair + 1 < actual_rows {
+            Some(&heatmap[row_pair + 1])
+        } else {
+            None
+        };
+        for (col, &top) in top_row.iter().enumerate() {
+            let bot = bot_row.map_or(0, |r| r[col]);
+            let fg = nibble_to_color(top);
+            let bg = nibble_to_color(bot);
+            print!("\x1b[38;5;{}m\x1b[48;5;{}m\u{2580}", fg, bg);
+        }
+        println!("\x1b[0m");
+    }
+
+    // Block axis labels
+    print!("       ");
+    let label_step = actual_cols / 5;
+    if label_step > 0 {
+        for i in 0..5 {
+            let block_start = i * label_step * block_bin_size;
+            let padding = label_step;
+            print!("{:<width$}", block_start, width = padding);
+        }
+    }
+    println!();
+
+    // Color scale legend
+    print!("       ");
+    for v in 0..=15u8 {
+        let c = nibble_to_color(v);
+        print!("\x1b[38;5;{}m\u{2588}", c);
+    }
+    println!("\x1b[0m  0..............15");
+
+    Ok(())
+}
+
+/// Map a 4-bit nibble value (0-15) to an ANSI 256-color index.
+fn nibble_to_color(val: u8) -> u8 {
+    match val {
+        0 => 232, // near-black
+        1 => 17,  // dark blue
+        2 => 18,
+        3 => 19,
+        4 => 20, // blue
+        5 => 27,
+        6 => 33, // cyan
+        7 => 39,
+        8 => 44,
+        9 => 40, // green
+        10 => 46,
+        11 => 118, // yellow-green
+        12 => 226, // yellow
+        13 => 220,
+        14 => 196, // red
+        _ => 231,  // white
+    }
+}
+
+/// Detect terminal size. Tries `stty size`, then COLUMNS/LINES env vars, falls back to 80x24.
+fn terminal_size() -> (usize, usize) {
+    // Try `stty size` which returns "rows cols"
+    if let Ok(output) = std::process::Command::new("stty")
+        .arg("size")
+        .arg("-F")
+        .arg("/dev/tty")
+        .output()
+        && let Ok(s) = std::str::from_utf8(&output.stdout)
+    {
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        if parts.len() == 2
+            && let (Ok(rows), Ok(cols)) = (parts[0].parse(), parts[1].parse())
+        {
+            return (cols, rows);
+        }
+    }
+    // Fallback to env vars
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(80);
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    (cols, rows)
+}
+
+pub async fn warmup_cache(index_path: PathBuf, cache_size: usize) -> Result<()> {
+    use summa_core::{DirectoryWriter, SLICE_CACHE_FILENAME, SliceCachingDirectory};
+
+    info!(
+        "Opening index with slice caching (max {})...",
+        summa_core::format_bytes(cache_size as u64)
+    );
+
+    let dir = MmapDirectory::new(&index_path);
+    let caching_dir = SliceCachingDirectory::new(dir.clone(), cache_size);
+    let config = IndexConfig::default();
+
+    let index = summa_core::Index::open(caching_dir, config).await?;
+
+    info!(
+        "Index opened: {} documents, {} segments",
+        index.num_docs().await?,
+        index.segment_readers().await?.len()
+    );
+
+    let stats = index.directory().stats();
+    info!(
+        "Cache populated: {} in {} slices across {} files",
+        summa_core::format_bytes(stats.total_bytes as u64),
+        stats.total_slices,
+        stats.files_cached
+    );
+
+    // Serialize cache data
+    let cache_data = index.directory().serialize();
+    let cache_file = index_path.join(SLICE_CACHE_FILENAME);
+    dir.write(cache_file.as_path(), &cache_data).await?;
+
+    let cache_file_size = std::fs::metadata(&cache_file).map(|m| m.len()).unwrap_or(0);
+
+    info!(
+        "Slice cache saved to {:?} ({})",
+        cache_file,
+        summa_core::format_bytes(cache_file_size)
+    );
+
+    Ok(())
+}
+
+pub async fn delete_rows(index_path: PathBuf, keys: Vec<String>) -> Result<()> {
+    anyhow::ensure!(
+        !keys.is_empty() && keys.len() <= 100_000,
+        "supply 1..=100000 keys"
+    );
+    anyhow::ensure!(
+        keys.iter().all(|key| !key.is_empty() && key.len() <= 65536),
+        "keys must contain 1..=65536 bytes"
+    );
+    anyhow::ensure!(
+        keys.iter().map(String::len).sum::<usize>() <= 8 * 1024 * 1024,
+        "deletion keys exceed 8 MiB"
+    );
+    let mut writer =
+        IndexWriter::open(MmapDirectory::new(&index_path), IndexConfig::default()).await?;
+    writer.init_primary_key_dedup().await?;
+    for key in &keys {
+        writer.delete_primary_key(key)?;
+    }
+    let result = writer.commit().await;
+    finish_local_maintenance(writer, result).await?;
+    info!(
+        "Committed deletion of {} requested primary keys",
+        keys.len()
+    );
+    Ok(())
+}
+
+pub async fn upsert_row(index_path: PathBuf, json: String) -> Result<()> {
+    anyhow::ensure!(
+        json.len() <= 8 * 1024 * 1024,
+        "replacement document exceeds 8 MiB"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&json).context("invalid replacement JSON")?;
+    let mut writer =
+        IndexWriter::open(MmapDirectory::new(&index_path), IndexConfig::default()).await?;
+    writer.init_primary_key_dedup().await?;
+    let doc =
+        Document::from_json(&value, &writer.schema()).context("invalid replacement document")?;
+    writer.upsert_document(doc).await?;
+    let result = writer.commit().await;
+    finish_local_maintenance(writer, result).await?;
+    info!("Committed replacement document");
+    Ok(())
+}
+
+pub async fn compact_rows(
+    index_path: PathBuf,
+    segment: Option<String>,
+    memory_budget_mb: usize,
+    term_dict_block_size: summa_core::structures::SSTableBlockSize,
+) -> Result<()> {
+    let budget = memory_budget_mb
+        .checked_mul(1024 * 1024)
+        .filter(|bytes| *bytes >= 1024 * 1024)
+        .context("compaction budget must be at least 1 MiB and fit usize")?;
+    if let Some(id) = &segment {
+        anyhow::ensure!(
+            summa_core::segment::SegmentId::from_hex(id).is_some(),
+            "invalid segment ID"
+        );
+    }
+    let mut writer = IndexWriter::open(
+        MmapDirectory::new(&index_path),
+        IndexConfig {
+            term_dict_block_size,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let result = match segment {
+        Some(id) => writer.compact_segment(&id, budget).await.map(usize::from),
+        None => writer.compact(budget).await,
+    };
+    let count = finish_local_maintenance(writer, result).await?;
+    info!("Compacted {count} segment(s)");
+    Ok(())
+}
+
+/// A command exits its runtime on return, so drain core-owned cleanup after
+/// releasing the writer's snapshots, including when maintenance failed.
+async fn finish_local_maintenance<T>(
+    mut writer: IndexWriter<MmapDirectory>,
+    result: summa_core::Result<T>,
+) -> Result<T> {
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    let shutdown = writer.shutdown().await;
+    drop(writer);
+    manager.wait_for_shutdown().await;
+    let value = result?;
+    shutdown?;
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn compacting_merge_drains_retired_files_before_returning() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index");
+        init_index_from_sdl(
+            path.clone(),
+            "index rows { field id: text<raw> [primary, fast, stored] }".into(),
+        )
+        .await
+        .unwrap();
+        let mut writer = IndexWriter::open(MmapDirectory::new(&path), IndexConfig::default())
+            .await
+            .unwrap();
+        writer.init_primary_key_dedup().await.unwrap();
+        let id = writer.schema().primary_field().unwrap();
+        for key in ["dead", "live"] {
+            let mut doc = Document::new();
+            doc.add_text(id, key);
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        writer.delete_primary_key("dead").unwrap();
+        writer.commit().await.unwrap();
+        let manager = std::sync::Arc::clone(writer.segment_manager());
+        writer.shutdown().await.unwrap();
+        drop(writer);
+        manager.wait_for_shutdown().await;
+        drop(manager);
+
+        merge_index(path.clone(), true, Default::default())
+            .await
+            .unwrap();
+        // Do not yield: returning from the CLI must mean cleanup has drained,
+        // because its runtime is about to exit.
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(path.join("metadata.json")).unwrap()).unwrap();
+        let metas = metadata["segment_metas"].as_object().unwrap();
+        assert_eq!(metas.len(), 1);
+        let (id, meta) = metas.iter().next().unwrap();
+        assert_eq!(meta["num_docs"], 1);
+        for entry in fs::read_dir(&path).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            if name.starts_with("seg_") {
+                assert!(
+                    name.starts_with(&format!("seg_{id}.")),
+                    "retired file remains at CLI return: {name}"
+                );
+            }
+        }
+    }
+
+    /// `summa-tool search --term-cache-blocks/--term-cache-bytes` reach the config and
+    /// out-of-range values fail at open with summa-core's message.
+    #[tokio::test]
+    async fn search_flags_reach_index_config_and_core_limits_apply() {
+        let config = search_config(1024, Some(0), Some(2));
+        assert_eq!(config.term_cache_blocks, 1024);
+        assert_eq!(config.term_cache_budget_bytes, Some(0));
+        assert_eq!(config.num_threads, 2);
+        let defaults = search_config(256, None, None);
+        assert_eq!(defaults.term_cache_budget_bytes, None);
+        assert_eq!(defaults.num_threads, IndexConfig::default().num_threads);
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("index");
+        init_index_from_sdl(path.clone(), "index rows { field body: text }".into())
+            .await
+            .unwrap();
+        for (config, needle) in [(search_config(65_537, None, None), "term_cache_blocks")] {
+            let error = search_index(path.clone(), "body:x", 10, 0, config)
+                .await
+                .expect_err("out-of-range search option must fail at open");
+            assert!(format!("{error:#}").contains(needle), "{error:#}");
+        }
+        search_index(
+            path,
+            "body:x",
+            10,
+            0,
+            search_config(65_536, Some(0), Some(1)),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Regression: the CLI `index` command must enforce a schema-declared
+    /// primary-key unique constraint (init_primary_key_dedup, mirroring
+    /// summa-server). Duplicate keys are skipped with a warning, both within
+    /// one run and against keys committed by a previous run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cli_index_enforces_primary_key_dedup() {
+        let tmp = std::env::temp_dir().join(format!(
+            "summa_tool_pk_dedup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let index_path = tmp.join("idx");
+
+        let schema_path = tmp.join("schema.sdl");
+        fs::write(
+            &schema_path,
+            "index t {\n    field id: text [indexed, stored, primary]\n    field body: text [indexed, stored]\n}\n",
+        )
+        .unwrap();
+        create_index(index_path.clone(), schema_path).await.unwrap();
+
+        let docs_path = tmp.join("docs.jsonl");
+        fs::write(
+            &docs_path,
+            concat!(
+                "{\"id\":\"a\",\"body\":\"one\"}\n",
+                "{\"id\":\"b\",\"body\":\"two\"}\n",
+                "{\"id\":\"a\",\"body\":\"duplicate\"}\n",
+            ),
+        )
+        .unwrap();
+
+        index_documents(
+            index_path.clone(),
+            Some(docs_path.clone()),
+            false,
+            0,
+            256,
+            None,
+            None,
+            summa_core::structures::IndexOptimization::default(),
+            None,
+            false,
+            false,
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let index =
+            summa_core::Index::open(MmapDirectory::new(&index_path), IndexConfig::default())
+                .await
+                .unwrap();
+        assert_eq!(
+            index.num_docs().await.unwrap(),
+            2,
+            "duplicate primary key must be rejected during CLI ingestion"
+        );
+        drop(index);
+
+        // Second run over the same file: every id is already committed, so
+        // nothing new must be indexed (committed-key dedup on a fresh writer).
+        index_documents(
+            index_path.clone(),
+            Some(docs_path),
+            false,
+            0,
+            256,
+            None,
+            None,
+            summa_core::structures::IndexOptimization::default(),
+            None,
+            false,
+            false,
+            false,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+
+        let index =
+            summa_core::Index::open(MmapDirectory::new(&index_path), IndexConfig::default())
+                .await
+                .unwrap();
+        assert_eq!(
+            index.num_docs().await.unwrap(),
+            2,
+            "keys committed by a previous CLI run must still dedup"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

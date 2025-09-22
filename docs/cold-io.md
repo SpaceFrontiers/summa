@@ -25,7 +25,7 @@ kernel cannot evict it. The remaining eviction source is bulk one-shot IO:
 
 `O_DIRECT` requires sector-aligned buffers, offsets, and lengths, needs
 special handling for the final unaligned tail, and silently degrades to
-buffered IO on some filesystems. Hermes instead limits cache pollution with a
+buffered IO on some filesystems. Summa instead limits cache pollution with a
 write-behind discipline; writeback and eviction advice do not provide the same
 cache-bypass guarantee as successful direct I/O:
 
@@ -65,7 +65,7 @@ not a limit on a RAM directory's owned output or on backend-specific caches.
   behaviour for merge/reorder output, with no configuration.
 - Used by all merge output files (postings, positions, term dict, store,
   fast, vectors, sparse) and all reorder output files.
-- Observability: `hermes_cold_write_bytes_total` counter (metrics feature)
+- Observability: `summa_cold_write_bytes_total` counter (metrics feature)
   and a per-file debug log of dropped bytes; the mechanism logs once at
   first use.
 

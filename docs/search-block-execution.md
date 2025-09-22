@@ -56,9 +56,9 @@ change. The fastest official configuration is compact/exact, with RGB off.
 | Top 100 + exact count | 1166.682 | 800.381 | 875.478 |     815.863 |         830.820 |
 | Exact count           |  477.260 | 406.881 | 431.714 |     405.058 |         410.488 |
 
-Selected Hermes is 4.0% faster for top 10, 1.8% faster for top 1000, 8.6% faster for top 100 + exact count, 5.8% faster for exact count.
+Selected Summa is 4.0% faster for top 10, 1.8% faster for top 1000, 8.6% faster for top 100 + exact count, 5.8% faster for exact count.
 
-Against starting Hermes on the same index, elapsed time falls 17.3%, 16.4%, 31.4%, 14.7% in command order. These are same-run comparisons, not multiplied stage gains.
+Against starting Summa on the same index, elapsed time falls 17.3%, 16.4%, 31.4%, 14.7% in command order. These are same-run comparisons, not multiplied stage gains.
 
 ### Supplemental 714 standalone queries, x86
 
@@ -84,7 +84,7 @@ The selected cumulative reader improves ARM by 6.1%, 5.1%, 7.9%, 5.8% in command
 
 ### Official query families
 
-Ratios below are selected Hermes time / Tantivy time; below one is faster.
+Ratios below are selected Summa time / Tantivy time; below one is faster.
 
 | Family                                                     | Top 10 | Top 1000 | Top 100 + count |  Count |
 | ---------------------------------------------------------- | -----: | -------: | --------------: | -----: |

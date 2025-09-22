@@ -1,4 +1,4 @@
-# Hermes engineering harness
+# Summa engineering harness
 
 Read [the search system contract](docs/search-system-contract.md) before changing
 core, server, broker, protocol, tool, or WASM search code. It is the shared source

@@ -1,6 +1,6 @@
-# Hermes Web UX Configuration DSL
+# Summa Web UX Configuration DSL
 
-The `ux.dsl` file lives alongside the Hermes index (next to `schema.json`) and configures how the web interface renders search results.
+The `ux.dsl` file lives alongside the Summa index (next to `schema.json`) and configures how the web interface renders search results.
 
 ## File Location
 
@@ -183,7 +183,7 @@ styles {
 
 If no `ux.dsl` file is present:
 
-- Title defaults to "Hermes Search"
+- Title defaults to "Summa Search"
 - All fields from schema are displayed
 - No click actions
 - Default styling applied

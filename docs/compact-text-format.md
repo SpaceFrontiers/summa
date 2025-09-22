@@ -87,7 +87,7 @@ speedup. Record retained and rejected experiments in the performance review.
 
 ## Trusted query reads
 
-Normal segment reads trust Hermes writers for document order, skip bounds,
+Normal segment reads trust Summa writers for document order, skip bounds,
 position checkpoints and payload semantics. Opening a term parses its footer and
 constructs borrowed views; it does not scan every block, retain admission proofs,
 or verify decoded document order. This applies equally to sync, async and WASM.

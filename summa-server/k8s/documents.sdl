@@ -1,0 +1,35 @@
+# Document index schema for summa
+# Fields: id, title, abstract, content, uris, sparse/dense vectors with spans
+
+index documents {
+    # Unique document identifier
+    field id: text<raw> [indexed, stored]
+
+    # Title with English stemming for full-text search
+    field title: text<en_stem> [indexed, stored]
+
+    # Abstract with English stemming for full-text search
+    field abstract: text<en_stem> [indexed, stored]
+
+    # Main content with English stemming for full-text search
+    field content: text<en_stem> [indexed, stored]
+
+    # List of URIs - multi-valued, lowercase tokenizer for exact matching
+    field uris: text<default> [indexed, stored<multi>]
+
+    # Multi sparse vectors for title (e.g., SPLADE embeddings)
+    # uint8 quantization reduces memory ~4x vs float32, weight_threshold prunes low values
+    field title_sparse_vectors: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
+
+    # Span metadata for title sparse vectors - stored JSON list, not indexed
+    field title_sparse_span: json [stored<multi>]
+
+    # Multi dense vectors (e.g., sentence embeddings)
+    # f16 storage quantization halves memory with <0.1% recall loss
+    # Global IVF-PQ uses HNSW coarse routing and exact bounded reranking.
+    # The corpus-trained leaf count is selected automatically at index build.
+    field dense_vectors: dense_vector<1024, f16> [indexed<ivf_pq, routing: hnsw, nprobe: 64>, stored<multi>]
+
+    # Span metadata for dense vectors - stored JSON list, not indexed
+    field dense_span: json [stored<multi>]
+}

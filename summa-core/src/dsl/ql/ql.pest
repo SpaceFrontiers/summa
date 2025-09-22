@@ -1,0 +1,67 @@
+// Summa Query Language Grammar
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+// Basic tokens
+term = @{ (LETTER | NUMBER | "_" | "-" | "." | "'" | "\\" ~ ANY)+ }
+quoted_string = @{ "\"" ~ inner_string ~ "\"" }
+inner_string = @{ (!("\"" | "\\") ~ ANY | "\\" ~ ANY)* }
+number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+
+// Field specification
+field_name = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+field_spec = { field_name ~ ":" }
+
+// Query types
+term_query = { field_spec? ~ !("regex" ~ "(") ~ term }
+phrase_query = { field_spec? ~ quoted_string }
+
+// Complete token patterns; consume interior/leading operators as one query.
+// An escaped operator is literal; at least one unescaped operator is required.
+pattern_literal = _{ "\\" ~ ANY | !(WHITESPACE | "\"" | "(" | ")" | "*" | "?") ~ ANY }
+term_pattern = @{ pattern_literal* ~ ("*" | "?") ~ (pattern_literal | "*" | "?")* }
+term_pattern_query = { field_spec? ~ term_pattern }
+
+// Explicit whole-term patterns, with JSON string escaping.
+regex_query = { field_spec? ~ "regex" ~ "(" ~ quoted_string ~ ")" }
+wildcard_query = { field_spec? ~ "wildcard" ~ "(" ~ quoted_string ~ ")" }
+
+// Vector query: field:ann([1.0, 2.0, 3.0], k=10, nprobe=32)
+// or field:ann([1.0, 2.0, 3.0], 10)
+vector_array = { "[" ~ number ~ ("," ~ number)* ~ "]" }
+ann_param = { ("k" | "nprobe" | "rerank") ~ "=" ~ number }
+ann_params = { number | ann_param ~ ("," ~ ann_param)* }
+ann_query = { field_spec ~ "ann" ~ "(" ~ vector_array ~ ("," ~ ann_params)? ~ ")" }
+
+// Sparse vector query: field:sparse({1: 0.5, 5: 0.3}, k=10)
+sparse_entry = { number ~ ":" ~ number }
+sparse_map = { "{" ~ sparse_entry ~ ("," ~ sparse_entry)* ~ "}" }
+sparse_query = { field_spec ~ "sparse" ~ "(" ~ sparse_map ~ ("," ~ ann_params)? ~ ")" }
+
+// Boolean operators
+// Atomic keywords inspect the immediate boundary, without implicit whitespace
+// skipping. Do not split identifiers, field names or prefix values (NOTHING,
+// NOT:term, NOT*). Symbolic operators do not need a word boundary.
+keyword_end = _{ &(WHITESPACE | "(" | "\"" | EOI) }
+and_op = @{ "AND" ~ keyword_end | "&&" }
+or_op = @{ "OR" ~ keyword_end | "||" }
+not_op = @{ "NOT" ~ keyword_end | "!" }
+// Modifiers bind to the immediately following operand; a bare `+`/`-`
+// followed by whitespace is ordinary text.
+required_op = @{ "+" ~ !WHITESPACE }
+prohibited_op = @{ "-" ~ !WHITESPACE }
+
+// Grouping
+group = { "(" ~ or_expr ~ ")" }
+
+// Primary expression (vector queries added)
+primary = { (required_op | prohibited_op | not_op)? ~ !("+" | "-" | "!") ~ (group | ann_query | sparse_query | regex_query | wildcard_query | phrase_query | term_pattern_query | term_query) }
+
+// Boolean expressions
+and_expr = { primary ~ (and_op ~ primary)* }
+// Implicit OR: space-separated and_exprs without an explicit OR operator
+// are treated as OR (matching parse_plain_text semantics).
+or_expr = { and_expr ~ (or_op ~ and_expr | and_expr)* }
+
+// Top-level query
+query = { SOI ~ or_expr ~ EOI }
