@@ -714,15 +714,16 @@ pub(super) fn extract_all_sparse_infos(
 /// terms and nested disjunctions). Push available document predicates into
 /// those children before constructing their candidate windows. Keep the
 /// original clauses: eligibility must not change their scores or positions.
+/// Returns whether the eligibility now holds every document predicate.
 pub(super) fn push_down_text_predicates(
     must: &[Arc<dyn super::Query>],
     should: &[Arc<dyn super::Query>],
     must_not: &[Arc<dyn super::Query>],
     reader: &SegmentReader,
     options: &mut super::ScorerOptions,
-) -> crate::Result<()> {
+) -> crate::Result<bool> {
     if must.is_empty() && must_not.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let mut terms = Vec::new();
     let bounded_text = must.iter().chain(should).any(|query| {
@@ -734,7 +735,7 @@ pub(super) fn push_down_text_predicates(
                 .any(|(field, _)| reader.is_chunked_field(*field))
     });
     if !bounded_text {
-        return Ok(());
+        return Ok(false);
     }
     // Predicate construction may itself materialize a prefix filter. Check
     // the segment budget before asking any clause to construct one.
@@ -759,7 +760,7 @@ pub(super) fn push_down_text_predicates(
         }
     }
     if predicates.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     // Reuse selective posting-list materialization when the backend supports
     // it; scanning a whole fast column is the portable/fast-only fallback.
@@ -767,7 +768,7 @@ pub(super) fn push_down_text_predicates(
         build_combined_bitset(&required_filters, &excluded_filters, reader, options)
     {
         options.eligibility = Some(Arc::new(combined));
-        return Ok(());
+        return Ok(true);
     }
     let mut combined = super::DocBitset::new(reader.num_docs());
     let mut doc = options
@@ -777,7 +778,7 @@ pub(super) fn push_down_text_predicates(
     let mut visited = 0usize;
     while let Some(id) = doc.filter(|&id| id < reader.num_docs()) {
         if visited.is_multiple_of(1024) && options.stop_if_expired() {
-            return Ok(());
+            return Ok(false);
         }
         if predicates
             .iter()
@@ -791,10 +792,11 @@ pub(super) fn push_down_text_predicates(
             .as_ref()
             .map_or(Some(id + 1), |bits| bits.next_set_bit(id + 1));
     }
-    if !options.stop_if_expired() {
-        options.eligibility = Some(Arc::new(combined));
+    if options.stop_if_expired() {
+        return Ok(false);
     }
-    Ok(())
+    options.eligibility = Some(Arc::new(combined));
+    Ok(true)
 }
 
 /// Chain multiple predicates into a single combined predicate.

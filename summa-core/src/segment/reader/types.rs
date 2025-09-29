@@ -1,7 +1,9 @@
 //! Types for segment reader
 
 mod candidate_probes;
+mod sparse_reads;
 pub(crate) use candidate_probes::SparseProbeBudget;
+pub(crate) use sparse_reads::SparseReadWindow;
 
 use std::sync::Arc;
 
@@ -253,6 +255,8 @@ impl DimensionTable {
 pub struct SparseIndex {
     /// File handle for block data reads (Inline for mmap, Lazy for HTTP)
     handle: FileHandle,
+    /// Optional explicit demand reads; metadata and bulk copies keep `handle`.
+    payload_handle: Option<FileHandle>,
     /// SoA dimension table (sorted by dim_id)
     dims: Arc<DimensionTable>,
     /// Zero-copy skip section: all SparseSkipEntry structs contiguous (20B each)
@@ -318,11 +322,25 @@ impl SparseIndex {
     ) -> Self {
         Self {
             handle,
+            payload_handle: None,
             dims: Arc::new(dims),
             skip_bytes: Arc::new(skip_bytes),
             total_docs,
             total_vectors,
         }
+    }
+
+    pub(super) fn set_payload_handle(&mut self, handle: FileHandle) {
+        self.payload_handle = Some(handle);
+    }
+
+    #[cfg(feature = "sync")]
+    pub(crate) fn has_explicit_payload_reads(&self) -> bool {
+        self.payload_handle.is_some()
+    }
+
+    fn payload_handle(&self) -> &FileHandle {
+        self.payload_handle.as_ref().unwrap_or(&self.handle)
     }
 
     /// Total number of skip entries across all dimensions
@@ -352,7 +370,7 @@ impl SparseIndex {
         let base = self.dims.block_offsets[dim_idx];
         let range = checked_sparse_block_range(base, entry, self.handle.len())?;
         let data = self
-            .handle
+            .payload_handle()
             .read_bytes_range(range)
             .await
             .map_err(crate::Error::Io)?;
@@ -458,7 +476,7 @@ impl SparseIndex {
 
         // Single coalesced mmap read
         let range_data = self
-            .handle
+            .payload_handle()
             .read_bytes_range(first_range.start..last_range.end)
             .await
             .map_err(crate::Error::Io)?;
@@ -530,7 +548,7 @@ impl SparseIndex {
         let base = block_data_offset;
         let range = checked_sparse_block_range(base, entry, self.handle.len())?;
         let data = self
-            .handle
+            .payload_handle()
             .read_bytes_range(range)
             .await
             .map_err(crate::Error::Io)?;

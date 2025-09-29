@@ -1016,11 +1016,10 @@ macro_rules! boolean_plan {
         }
 
         // ── 4. Standard BooleanScorer fallback ───────────────────────────
-        if scorer_options.physical_text_field.is_none() {
-            super::planner::push_down_text_predicates(
+        let predicates_pushed = scorer_options.physical_text_field.is_none()
+            && super::planner::push_down_text_predicates(
                 must, should, must_not, reader, &mut scorer_options,
             )?;
-        }
         if scorer_options.stop_if_expired()
             || scorer_options.eligibility.as_ref()
                 .is_some_and(|bits| bits.next_set_bit(0).is_none()) {
@@ -1028,8 +1027,12 @@ macro_rules! boolean_plan {
         }
         let mut must_scorers = Vec::with_capacity(must.len());
         // A child top-k is not a safe candidate set for a summed parent:
-        // a document outside every child heap may still have the best total.
+        // a document outside every child heap may still have the best total,
+        // and one outside the filters' eligibility may fill it.
         let child_options = if scorer_options.complete_text_matches
+            || !predicates_pushed
+                && must.iter().chain(must_not)
+                    .any(|query| query.as_doc_predicate(reader).is_some())
             || should.len() > 1
             || !should.is_empty() && !must.is_empty()
             || must.iter().filter(|query| query.as_doc_predicate(reader).is_none()).count() > 1
@@ -1090,6 +1093,13 @@ impl Query for BooleanQuery {
             return None;
         }
         let mut clauses = self.must.iter().chain(&self.should).chain(&self.must_not);
+        // A scored query ranks ties by stable ID: next to a scored clause a
+        // constant-score expansion keeps its logical union, which stops after
+        // `k` IDs. A constant-score query ranks its matches in physical order
+        // (`docs/physical-tie-order.md`).
+        if !complete && !self.constant_score() && clauses.clone().any(|q| q.is_filter()) {
+            return None;
+        }
         let field = clauses.next()?.physical_text_field(reader, true)?;
         clauses
             .all(|q| q.physical_text_field(reader, true) == Some(field))
@@ -1206,6 +1216,57 @@ impl Query for BooleanQuery {
                 .all(|query| matches!(query.decompose(), super::QueryDecomposition::TextTerm(_)))
         {
             self.must[0].count_equivalent_term()
+        } else {
+            None
+        }
+    }
+
+    fn exact_count<'a>(&self, reader: &'a SegmentReader) -> Option<CountFuture<'a>> {
+        if self.must_not.is_empty()
+            && self.proximity.is_none()
+            && self.text_heap_factor == 1.0
+            && self.max_terms == 0
+            && self.must.len() + self.should.len() == 1
+        {
+            self.must
+                .iter()
+                .chain(&self.should)
+                .next()?
+                .exact_count(reader)
+        } else {
+            None
+        }
+    }
+
+    /// One scoring clause that scores every match alike; exclusions do not
+    /// score.
+    fn constant_score(&self) -> bool {
+        self.proximity.is_none()
+            && self.max_terms == 0
+            && self.must.len() + self.should.len() == 1
+            && self
+                .must
+                .iter()
+                .chain(&self.should)
+                .all(|q| q.constant_score())
+    }
+
+    fn word_pair_term(&self, reader: &SegmentReader) -> Option<super::TermQueryInfo> {
+        if self.must.len() == 1
+            && self.should.is_empty()
+            && self.must_not.is_empty()
+            && self.proximity.is_none()
+            && self.text_heap_factor == 1.0
+            && self.max_terms == 0
+        {
+            self.must[0].word_pair_term(reader)
+        } else if self.should.len() == 1
+            && self.must.is_empty()
+            && self.must_not.is_empty()
+            && self.proximity.is_none()
+            && self.max_terms == 0
+        {
+            self.should[0].word_pair_term(reader)
         } else {
             None
         }
@@ -2244,6 +2305,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let dir = crate::RamDirectory::new();
             let mut schema = crate::SchemaBuilder::default();

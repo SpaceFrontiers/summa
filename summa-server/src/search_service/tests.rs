@@ -1417,3 +1417,79 @@ async fn rrf_in_symbolic_formula_participates_before_passage_selection() {
     );
     registry.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn payload_backends_hydrate_rpc_results_and_survive_other_index_deletion() {
+    use summa_core::directories::{PayloadReadBackend, PayloadReadService};
+    let mut backends = vec![PayloadReadBackend::Pool];
+    if cfg!(all(target_os = "linux", feature = "io-uring")) {
+        backends.push(PayloadReadBackend::IoUring);
+    }
+    for backend in backends {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = PayloadReadService::with_buffer_budget(backend, 8 * 1024 * 1024).unwrap();
+        let registry = Arc::new(
+            IndexRegistry::new(
+                temp.path().into(),
+                summa_core::IndexConfig {
+                    num_threads: 1,
+                    num_indexing_threads: 1,
+                    store_cache_budget_bytes: 0,
+                    ..Default::default()
+                },
+            )
+            .with_payload_reads(Some(payload.clone()), false),
+        );
+        let mut schema = summa_core::SchemaBuilder::default();
+        let body = schema.add_text_field("body", true, true);
+        let schema = schema.build();
+        for name in ["first", "second"] {
+            registry.create_index(name, schema.clone()).await.unwrap();
+            let writer = registry.get_writer(name).await.unwrap();
+            let mut writer = writer.write().await;
+            for _ in 0..40 {
+                let mut document = summa_core::Document::new();
+                document.add_text(body, "payload value");
+                writer.add_document(document).unwrap();
+            }
+            writer.commit().await.unwrap();
+        }
+        let rpc = SearchServiceImpl::new(registry.clone(), 2, SearchLimits::default());
+        let request = || {
+            Request::new(SearchRequest {
+                index_name: "second".into(),
+                query: Some(all_query()),
+                limit: 40,
+                fields_to_load: vec!["body".into()],
+                ..Default::default()
+            })
+        };
+        let first = rpc.search(request()).await.unwrap().into_inner();
+        assert_eq!(first.hits.len(), 40);
+        for hit in &first.hits {
+            assert_eq!(hit.fields.len(), 1);
+            assert_eq!(hit.fields["body"].values.len(), 1);
+            assert_eq!(
+                hit.fields["body"].values[0].value,
+                Some(crate::proto::field_value::Value::Text(
+                    "payload value".into()
+                ))
+            );
+        }
+        assert!(payload.stats().submitted > 0);
+        registry
+            .begin_delete("first")
+            .await
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        assert!(!temp.path().join("first").exists());
+        let after = rpc.search(request()).await.unwrap().into_inner();
+        assert_eq!(first.hits, after.hits);
+        registry.shutdown().await.unwrap();
+        assert_eq!(payload.stats().active, 0);
+        assert_eq!(payload.stats().idle_buffer_bytes, 0);
+        assert_eq!(payload.stats().quarantined_bytes, 0);
+    }
+}

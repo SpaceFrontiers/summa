@@ -3,6 +3,10 @@
 //! This module provides `Searcher` for read-only search access to indexes.
 //! It can be used standalone (for wasm/read-only) or via `IndexReader` (for native).
 
+mod hydration;
+pub use hydration::{DOCUMENT_READ_BATCH_SIZE, DocumentReadBatch};
+
+use crate::segment::TermCachePolicy;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -21,8 +25,7 @@ use crate::segment::{SegmentSnapshot, SegmentTracker};
 #[cfg(feature = "native")]
 #[derive(Clone)]
 pub(crate) struct SearcherResources {
-    pub(crate) term_cache_blocks: usize,
-    pub(crate) term_cache_budget_bytes: Option<usize>,
+    pub(crate) term_cache: TermCachePolicy,
     pub(crate) store_cache: Arc<crate::segment::SharedStoreCache>,
     pub(crate) sparse_io_gate: Arc<super::SparseIoGate>,
     pub(crate) sparse_io_concurrency: usize,
@@ -35,8 +38,7 @@ impl SearcherResources {
     /// Cache and CPU policy of an `Index` opened with `config`.
     pub(crate) fn from_config(config: &super::IndexConfig) -> Result<Self> {
         Self::new(
-            config.term_cache_blocks,
-            config.term_cache_budget_bytes,
+            super::term_cache_policy(config)?,
             config.store_cache_budget_bytes,
             config.num_threads,
             config.sparse_io_concurrency,
@@ -44,17 +46,14 @@ impl SearcherResources {
     }
 
     /// Validates every load-time limit once, before any segment or file is
-    /// touched: the dictionary block cap and
-    /// the CPU/I-O widths. Later per-segment constructors re-check only what
-    /// they own.
+    /// touched: the CPU/I-O widths here, the dictionary cache policy by its
+    /// constructor. Later per-segment constructors re-check only what they own.
     pub(crate) fn new(
-        term_cache_blocks: usize,
-        term_cache_budget_bytes: Option<usize>,
+        term_cache: TermCachePolicy,
         store_cache_budget_bytes: usize,
         num_threads: usize,
         sparse_io_concurrency: usize,
     ) -> Result<Self> {
-        super::validate_term_cache_blocks(term_cache_blocks)?;
         if num_threads == 0 {
             return Err(crate::Error::Internal(
                 "IndexConfig.num_threads must be greater than zero".into(),
@@ -70,8 +69,7 @@ impl SearcherResources {
         let search_pool = super::shared_search_pool(num_threads)?;
 
         Ok(Self {
-            term_cache_blocks,
-            term_cache_budget_bytes,
+            term_cache,
             store_cache: super::shared_store_cache(store_cache_budget_bytes),
             sparse_io_gate: super::shared_sparse_io_gate(sparse_io_concurrency),
             sparse_io_concurrency,
@@ -160,8 +158,7 @@ impl<D: Directory + 'static> Searcher<D> {
             &schema,
             snapshot.segment_ids(),
             &trained_vectors,
-            resources.term_cache_blocks,
-            resources.term_cache_budget_bytes,
+            &resources.term_cache,
             Arc::clone(&resources.store_cache),
             &[],
             snapshot.deletions(),
@@ -203,8 +200,7 @@ impl<D: Directory + 'static> Searcher<D> {
             &schema,
             snapshot.segment_ids(),
             &trained_vectors,
-            resources.term_cache_blocks,
-            resources.term_cache_budget_bytes,
+            &resources.term_cache,
             Arc::clone(&resources.store_cache),
             existing_segments,
             snapshot.deletions(),
@@ -261,8 +257,10 @@ impl<D: Directory + 'static> Searcher<D> {
             &schema,
             segment_ids,
             &trained_vectors,
-            term_cache_blocks,
-            None,
+            &TermCachePolicy::PerSegment {
+                blocks: term_cache_blocks,
+                budget_bytes: None,
+            },
             store_cache,
             &[],
             &deletions,
@@ -311,8 +309,7 @@ impl<D: Directory + 'static> Searcher<D> {
         schema: &Arc<Schema>,
         segment_ids: &[String],
         trained_vectors: &Arc<TrainedVectorStructures>,
-        term_cache_blocks: usize,
-        term_cache_budget_bytes: Option<usize>,
+        term_cache: &TermCachePolicy,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
@@ -328,8 +325,7 @@ impl<D: Directory + 'static> Searcher<D> {
             schema,
             segment_ids,
             trained_vectors,
-            term_cache_blocks,
-            term_cache_budget_bytes,
+            term_cache,
             store_cache,
             existing_segments,
             deletions,
@@ -356,8 +352,7 @@ impl<D: Directory + 'static> Searcher<D> {
         schema: &Arc<Schema>,
         segment_ids: &[String],
         trained_vectors: &Arc<TrainedVectorStructures>,
-        term_cache_blocks: usize,
-        term_cache_budget_bytes: Option<usize>,
+        term_cache: &TermCachePolicy,
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
@@ -420,8 +415,8 @@ impl<D: Directory + 'static> Searcher<D> {
         // scratch must not multiply by every new segment during reload.
         const MAX_CONCURRENT_SEGMENT_OPENS: usize = 2;
         use futures::{StreamExt, TryStreamExt};
-        // Separate independent copied indexes' shared document-cache keys.
-        let store_cache_directory_namespace = Arc::as_ptr(directory) as usize;
+        // Separate independent copied indexes' shared cache keys.
+        let cache_directory_namespace = Arc::as_ptr(directory) as usize;
         let results: Vec<_> =
             futures::stream::iter(to_load.into_iter().map(|(idx, sid, existing)| {
                 let store_cache = Arc::clone(&store_cache);
@@ -437,13 +432,12 @@ impl<D: Directory + 'static> Searcher<D> {
                                 .await?
                         }
                         None => {
-                            let mut reader = SegmentReader::open_with_store_cache(
+                            let mut reader = SegmentReader::open_with_shared_caches(
                                 directory.as_ref(),
                                 sid,
                                 Arc::clone(schema),
-                                term_cache_blocks,
-                                term_cache_budget_bytes,
-                                store_cache_directory_namespace,
+                                term_cache.clone(),
+                                cache_directory_namespace,
                                 store_cache,
                             )
                             .await
@@ -677,6 +671,33 @@ impl<D: Directory + 'static> Searcher<D> {
         }
     }
 
+    /// Run request-level work as one job on this index's search pool and
+    /// await it without blocking an async worker.
+    ///
+    /// A blocking thread that then enters the pool costs two thread handoffs
+    /// and a parked thread per request; this is one handoff each way. Searches
+    /// inside `work` run inline on the pool thread, so the pool still bounds
+    /// search CPU. A panic in `work` is returned as an error instead of
+    /// reaching the pool's panic handler; dropping the future lets the job
+    /// finish and discards its result.
+    #[cfg(feature = "sync")]
+    pub async fn run_on_search_pool<R: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<R> {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        self.search_pool.spawn(move || {
+            let _ = sender.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)));
+        });
+        match receiver.await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(crate::Error::Internal("search pool job panicked".into())),
+            Err(_) => Err(crate::Error::Internal(
+                "search pool dropped a job before completing it".into(),
+            )),
+        }
+    }
+
     /// Async-only/WASM builds execute inline because Rayon is not available.
     /// Keeping this overload free of `Send` bounds allows browser-backed file
     /// handles, whose callbacks are deliberately thread-local, to be scored.
@@ -838,6 +859,60 @@ impl<D: Directory + 'static> Searcher<D> {
     ) -> Result<(Vec<crate::query::SearchResult>, u32, bool)> {
         self.search_internal_budgeted(query, limit, 0, false, deadline, stats)
             .await
+    }
+
+    /// Owned-handle form of [`Self::search_with_count_budgeted_stats`] and
+    /// [`Self::search_with_positions_budgeted_stats`] for request handlers.
+    ///
+    /// Where the borrowed methods hand a blocked async worker to the search
+    /// pool (`block_in_place` + `install`), this runs the identical sync
+    /// search as one pool job awaited without blocking
+    /// ([`Self::run_on_search_pool`]); on the benchmark host that removed a
+    /// per-request floor worth 35–70% on cheap queries. Searches the sync
+    /// path cannot serve keep the borrowed async path.
+    ///
+    /// The pool job outlives a dropped (cancelled) future. `hold` — typically
+    /// the caller's admission permit — is moved into the job and released only
+    /// when the search finishes, so cancelled requests cannot run outside
+    /// admission.
+    #[cfg(feature = "sync")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_budgeted_on_pool(
+        self: &Arc<Self>,
+        query: Arc<dyn crate::query::Query>,
+        limit: usize,
+        collect_positions: bool,
+        deadline: Option<std::time::Instant>,
+        stats_override: Option<Arc<crate::query::GlobalStats>>,
+        hold: impl Send + 'static,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32, bool)> {
+        if self.segments.is_empty() || self.has_explicit_sparse_reads() {
+            return self
+                .search_internal_budgeted(
+                    query.as_ref(),
+                    limit,
+                    0,
+                    collect_positions,
+                    deadline,
+                    stats_override,
+                )
+                .await;
+        }
+        let fetch_limit = checked_search_window(limit, 0)?;
+        let text_stats = self.query_text_stats(query.as_ref(), stats_override);
+        let searcher = Arc::clone(self);
+        self.run_on_search_pool(move || {
+            let _hold = hold;
+            searcher.search_internal_sync_budgeted(
+                query.as_ref(),
+                fetch_limit,
+                0,
+                collect_positions,
+                deadline,
+                text_stats,
+            )
+        })
+        .await?
     }
 
     /// Text statistics a query scores with: the caller's override when
@@ -1120,6 +1195,19 @@ impl<D: Directory + 'static> Searcher<D> {
         Ok((results, seen))
     }
 
+    // Async entry points must not silently bypass the selected sparse backend.
+    // A mixed index uses the async executor, whose text/BMP kernels are shared
+    // with sync execution. Explicit sync APIs remain available on the readers.
+    #[cfg(feature = "sync")]
+    fn has_explicit_sparse_reads(&self) -> bool {
+        self.segments.iter().any(|segment| {
+            segment
+                .sparse_indexes()
+                .values()
+                .any(|index| index.has_explicit_payload_reads())
+        })
+    }
+
     async fn search_internal_budgeted(
         &self,
         query: &dyn crate::query::Query,
@@ -1139,6 +1227,7 @@ impl<D: Directory + 'static> Searcher<D> {
         // Only works on multi-threaded tokio runtime (block_in_place panics on current_thread).
         #[cfg(feature = "sync")]
         if !self.segments.is_empty()
+            && !self.has_explicit_sparse_reads()
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
@@ -1152,6 +1241,26 @@ impl<D: Directory + 'static> Searcher<D> {
             );
         }
 
+        self.run_search_cpu(self.search_internal_async_budgeted(
+            query,
+            fetch_limit,
+            offset,
+            collect_positions,
+            deadline,
+            text_stats,
+        ))
+        .await
+    }
+
+    async fn search_internal_async_budgeted(
+        &self,
+        query: &dyn crate::query::Query,
+        fetch_limit: usize,
+        offset: usize,
+        collect_positions: bool,
+        deadline: Option<std::time::Instant>,
+        text_stats: Option<Arc<crate::query::GlobalStats>>,
+    ) -> Result<(Vec<crate::query::SearchResult>, u32, bool)> {
         // No segments, no sync feature, or current_thread runtime: use an
         // explicitly bounded async stream. Starting every segment at once can
         // retain `segments × top_k` results while the slowest I/O completes.
@@ -1519,6 +1628,7 @@ impl<D: Directory + 'static> Searcher<D> {
         // `par_iter` preserves input order for deterministic rank ties.
         #[cfg(feature = "sync")]
         if !self.segments.is_empty()
+            && !self.has_explicit_sparse_reads()
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {
@@ -1635,6 +1745,7 @@ impl<D: Directory + 'static> Searcher<D> {
         }
         #[cfg(feature = "sync")]
         let lists = if !self.segments.is_empty()
+            && !self.has_explicit_sparse_reads()
             && tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread
         {

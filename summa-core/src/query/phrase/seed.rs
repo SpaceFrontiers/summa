@@ -152,6 +152,7 @@ mod tests {
                 PostingCodec::Packed,
                 PostingCodec::Pfor,
                 PostingCodec::Simd4x,
+                PostingCodec::RoundedBitmap,
             ] {
                 let lengths: Vec<u16> = (0..2181)
                     .map(|doc| if doc < 2048 { 100 } else { 3 })
@@ -231,6 +232,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut lists = Vec::new();
             let mut positions = Vec::new();

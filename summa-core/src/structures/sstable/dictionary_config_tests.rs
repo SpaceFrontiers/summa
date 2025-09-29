@@ -92,27 +92,27 @@ async fn zero_dictionary_cache_budget_prevents_bulk_payload_reads() {
 #[test]
 fn dictionary_cache_counts_bytes_through_eviction_duplicates_and_oversized_bypass() {
     let mut cache = BlockCache::new(2, Some(1000));
-    cache.insert(1, Arc::from(vec![1; 600]));
-    cache.insert(2, Arc::from(vec![2; 300]));
+    cache.insert(1, Arc::new(DecodedBlock::new(vec![1; 600])));
+    cache.insert(2, Arc::new(DecodedBlock::new(vec![2; 300])));
     assert_eq!(cache.retained_bytes, 900);
-    cache.insert(3, Arc::from(vec![3; 800]));
+    cache.insert(3, Arc::new(DecodedBlock::new(vec![3; 800])));
     assert!(cache.peek(1).is_none() && cache.peek(2).is_none());
     let held_by_reader = cache.peek(3).unwrap();
-    cache.insert(3, Arc::from(vec![0; 100]));
+    cache.insert(3, Arc::new(DecodedBlock::new(vec![0; 100])));
     assert_eq!(cache.retained_bytes, 800);
     assert_eq!(cache.peek(3).unwrap().len(), 800);
-    cache.insert(4, Arc::from(vec![4; 1100]));
+    cache.insert(4, Arc::new(DecodedBlock::new(vec![4; 1100])));
     assert!(cache.peek(4).is_none());
     assert_eq!(cache.retained_bytes, 800);
-    cache.insert(5, Arc::from(vec![5; 500]));
+    cache.insert(5, Arc::new(DecodedBlock::new(vec![5; 500])));
     assert_eq!(cache.retained_bytes, 500);
-    assert_eq!(held_by_reader.as_ref(), vec![3; 800]);
-    cache.insert(6, Arc::from(vec![6; 1000]));
+    assert_eq!(&held_by_reader[..], &[3; 800][..]);
+    cache.insert(6, Arc::new(DecodedBlock::new(vec![6; 1000])));
     assert_eq!(cache.retained_bytes, 1000);
     assert_eq!(cache.blocks.len(), 1);
     for budget in [None, Some(0), Some(1), Some(10)] {
         let mut cache = BlockCache::new(0, budget);
-        cache.insert(0, Arc::from(vec![0; 10]));
+        cache.insert(0, Arc::new(DecodedBlock::new(vec![0; 10])));
         assert_eq!(cache.retained_bytes, 0);
         assert!(cache.blocks.is_empty());
     }

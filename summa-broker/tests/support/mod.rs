@@ -4,6 +4,7 @@
 // Each tests/*.rs crate includes this module and uses a different subset.
 #![allow(dead_code)]
 
+use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -338,55 +339,57 @@ impl Drop for BrokerProc {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 /// Spawn the broker with static discovery. `backends` are
 /// "id=..,addr=..,shard=.." specs; `extra_args` appends e.g. --placement.
 ///
-/// Ports come from a bind-then-drop probe, so two tests spawning brokers
-/// concurrently can race for the same port; the loser exits at bind time.
-/// Detect an early exit and retry with a fresh port instead of letting the
-/// test time out against a dead process.
+/// The broker binds port 0 itself and logs the address it bound, so tests
+/// running in parallel cannot race for a probed port.
 pub fn spawn_broker(backends: &[String], extra_args: &[&str]) -> BrokerProc {
-    for attempt in 0..5 {
-        let port = free_port();
-        let addr = format!("127.0.0.1:{port}");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_summa-broker"));
-        cmd.args([
-            "--addr",
-            &addr,
-            "--metrics-addr",
-            "off",
-            "--discovery",
-            "static",
-            "--index-poll-interval-secs",
-            "1",
-            "--probe-interval-secs",
-            "1",
-        ]);
-        for backend in backends {
-            cmd.args(["--backend", backend]);
-        }
-        cmd.args(extra_args);
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::inherit());
-        cmd.env("RUST_LOG", "summa_broker=info");
-        let mut child = cmd.spawn().expect("spawn summa-broker");
-        std::thread::sleep(Duration::from_millis(300));
-        match child.try_wait().expect("query broker child") {
-            None => return BrokerProc { child, addr },
-            Some(status) => {
-                eprintln!("broker attempt {attempt} exited early ({status}); retrying");
-            }
-        }
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_summa-broker"));
+    cmd.args([
+        "--addr",
+        "127.0.0.1:0",
+        "--metrics-addr",
+        "off",
+        "--discovery",
+        "static",
+        "--index-poll-interval-secs",
+        "1",
+        "--probe-interval-secs",
+        "1",
+    ]);
+    for backend in backends {
+        cmd.args(["--backend", backend]);
     }
-    panic!("summa-broker failed to start after 5 attempts");
+    cmd.args(extra_args);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    cmd.env("RUST_LOG", "summa_broker=info");
+    let mut child = cmd.spawn().expect("spawn summa-broker");
+    let mut stderr = BufReader::new(child.stderr.take().expect("broker stderr"));
+    let mut addr = None;
+    let mut line = String::new();
+    while addr.is_none() {
+        line.clear();
+        if stderr.read_line(&mut line).expect("read broker log") == 0 {
+            let status = child.wait().expect("wait for summa-broker");
+            panic!("summa-broker exited before listening ({status})");
+        }
+        eprint!("{line}");
+        addr = line
+            .split_once("listening on ")
+            .map(|(_, bound)| bound.trim().to_string());
+    }
+    // Keep draining the log so the broker never blocks on a full pipe.
+    std::thread::spawn(move || {
+        for line in stderr.lines().map_while(Result::ok) {
+            eprintln!("{line}");
+        }
+    });
+    BrokerProc {
+        child,
+        addr: addr.unwrap(),
+    }
 }
 
 pub async fn broker_search_client(

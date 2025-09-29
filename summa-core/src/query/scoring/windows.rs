@@ -6,6 +6,11 @@ use super::{
 };
 use log::{debug, warn};
 
+/// How much sparser a window's drivers must be than every globally
+/// non-essential term for those terms to be bounded per candidate instead of
+/// across the window.
+const LAZY_DENSITY_RATIO: u64 = 64;
+
 impl MaxScoreExecutor<'_> {
     /// Probe once per common group interval. Bounds are summed in query order,
     /// so positive f32 addition preserves the per-term upper-bound invariant.
@@ -204,6 +209,12 @@ impl MaxScoreExecutor<'_> {
                 *cost = 1.0 / f64::from(list.doc_count().max(1));
             }
         }
+        let mut doc_counts = [0u32; crate::query::MAX_QUERY_TERMS];
+        for (count, cursor) in doc_counts.iter_mut().zip(&self.cursors) {
+            if let CursorVariant::Text { list, .. } = &cursor.variant {
+                *count = list.doc_count();
+            }
+        }
         let mask_words = WINDOW_IDS / 64;
         let group_pruning = self.cursors.iter().any(TermCursor::has_group_impacts);
         let mut checked_group_end = None;
@@ -303,10 +314,60 @@ impl MaxScoreExecutor<'_> {
                     continue;
                 }
             }
+            // Globally non-essential cursors first take their list maxima.
+            // A window that loses even so is skipped without bounding each of
+            // their blocks across it (or_high_low: a dense non-essential term
+            // spans about five blocks per window, and most windows lose).
+            // With nonnegative scores they keep those maxima and are bounded
+            // per surviving candidate below, by the one block holding it.
+            let global = if heap_full && !REQUIRED {
+                self.find_partition().min(n)
+            } else {
+                0
+            };
             for (i, bound) in wmax.iter_mut().enumerate() {
-                *bound = self.cursors[i].window_upper_bound(from, to);
+                *bound = if i < global {
+                    self.cursors[i].max_score
+                } else {
+                    self.cursors[i].window_upper_bound(from, to)
+                };
+            }
+            // Whether `wmax[..global]` still holds list maxima.
+            let mut lazy = false;
+            if global > 0 {
+                let mut loose = [0.0f32; crate::query::MAX_QUERY_TERMS];
+                loose[..n].copy_from_slice(wmax);
+                loose[..n].sort_unstable_by(f32::total_cmp);
+                if loose[..n].iter().sum::<f32>() < threshold {
+                    for cursor in &mut self.cursors {
+                        if !cursor.exhausted && cursor.doc() <= to {
+                            cursor.skip_past_sync(to)?;
+                        }
+                    }
+                    windows_skipped += 1;
+                    continue;
+                }
+                // Per-candidate bounds pay off only when the window's drivers
+                // are far sparser than the terms they would otherwise bound
+                // block by block across it.
+                let essential: u64 = doc_counts[global..n].iter().map(|&c| u64::from(c)).sum();
+                let dense = doc_counts[..global].iter().copied().min().unwrap_or(0);
+                lazy = nonnegative_scores
+                    && essential.saturating_mul(LAZY_DENSITY_RATIO) <= u64::from(dense);
+                if !lazy {
+                    for (i, bound) in wmax.iter_mut().enumerate().take(global) {
+                        *bound = self.cursors[i].window_upper_bound(from, to);
+                    }
+                }
             }
             order.sort_unstable_by(|&a, &b| {
+                if lazy && (a < global || b < global) {
+                    // Cursors still at their list maxima rank first, in
+                    // cursor order: their prefix sums then equal the global
+                    // partition's, below the threshold, so none of them can
+                    // become essential in this window.
+                    return (a >= global, a).cmp(&(b >= global, b));
+                }
                 if cost_partition {
                     (f64::from(wmax[a]) * inverse_costs[a])
                         .total_cmp(&(f64::from(wmax[b]) * inverse_costs[b]))
@@ -324,6 +385,7 @@ impl MaxScoreExecutor<'_> {
             } else {
                 0
             };
+            debug_assert!(!lazy || wpartition >= global);
             if wpartition >= n {
                 // Nothing in the window can compete: every cursor jumps past it.
                 for cursor in &mut self.cursors {
@@ -461,6 +523,19 @@ impl MaxScoreExecutor<'_> {
                 let i = order[rank];
                 if heap_full {
                     filter_competitive(cand_docs, cand_scores, remaining, threshold);
+                }
+                if heap_full && i < global && lazy {
+                    let rest = if rank > 0 { wprefix[rank - 1] } else { 0.0 };
+                    let cursor = &self.cursors[i];
+                    let mut kept = 0;
+                    for j in 0..cand_docs.len() {
+                        let (doc, score) = (cand_docs[j], cand_scores[j]);
+                        cand_docs[kept] = doc;
+                        cand_scores[kept] = score;
+                        kept += (score + rest + cursor.text_bound_at(doc) >= threshold) as usize;
+                    }
+                    cand_docs.truncate(kept);
+                    cand_scores.truncate(kept);
                 }
                 if cand_docs.is_empty() {
                     break;

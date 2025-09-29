@@ -23,19 +23,23 @@ pub(super) fn validate_descriptor(
     }
     let (codec, width) = PostingCodec::from_header_byte(header[2])?;
     let tf_width = header[3];
+    let bitmap = width == PostingCodec::BITMAP_WIDTH;
     if codec == PostingCodec::Pfor
         || tf_width > 32
         || (codec == PostingCodec::Rounded
-            && (!matches!(width, 0 | 8 | 16 | 32) || !matches!(tf_width, 0 | 8 | 16 | 32)))
+            && (!(bitmap || matches!(width, 0 | 8 | 16 | 32))
+                || !matches!(tf_width, 0 | 8 | 16 | 32)))
     {
         return Err(invalid("invalid compact posting codec"));
     }
-    let gaps = if codec == PostingCodec::Simd4x && count == BLOCK_SIZE {
-        count
+    let docs = if bitmap {
+        bitmap_bytes(last - first)
+    } else if codec == PostingCodec::Simd4x && count == BLOCK_SIZE {
+        packed_bytes(count, width)
     } else {
-        count - 1
+        packed_bytes(count - 1, width)
     };
-    if packed_bytes(gaps, width) + packed_bytes(count, tf_width) != payload_bytes {
+    if docs + packed_bytes(count, tf_width) != payload_bytes {
         return Err(invalid(
             "compact posting payload length disagrees with descriptor",
         ));
@@ -48,7 +52,7 @@ fn payload_len(input: &[u8], codec: PostingCodec, count: usize, bits: u8) -> io:
         return Err(invalid("invalid posting width"));
     }
     let len = match codec {
-        PostingCodec::Rounded => {
+        PostingCodec::Rounded | PostingCodec::RoundedBitmap => {
             if !matches!(bits, 0 | 8 | 16 | 32) {
                 return Err(invalid("invalid rounded posting width"));
             }
@@ -82,6 +86,26 @@ fn payload_len(input: &[u8], codec: PostingCodec, count: usize, bits: u8) -> io:
     Ok(len)
 }
 
+/// A bitmap block's first and last IDs are its directory range, its
+/// population is its count, and no bit lies past the range.
+fn validate_bitmap(words: &[u8], span: u32, count: usize) -> io::Result<()> {
+    let bit = |index: u32| words[index as usize / 8] >> (index % 8) & 1 == 1;
+    let population: u32 = words.iter().map(|byte| byte.count_ones()).sum();
+    let end = span as usize + 1;
+    let tail_clear = words
+        .iter()
+        .enumerate()
+        .skip(end / 8)
+        .all(|(index, &byte)| {
+            let inside = end.saturating_sub(index * 8).min(8);
+            u16::from(byte) >> inside == 0
+        });
+    if !bit(0) || !bit(span) || population as usize != count || !tail_clear {
+        return Err(invalid("bitmap posting block disagrees with its directory"));
+    }
+    Ok(())
+}
+
 /// Returns the bounded posting count; no posting-sized allocation or decode.
 pub(super) fn validate_block(stream: &[u8], first: u32, last: u32) -> io::Result<usize> {
     if stream.len() < 8 {
@@ -99,10 +123,18 @@ pub(super) fn validate_block(stream: &[u8], first: u32, last: u32) -> io::Result
     }
     let (codec, bits) = PostingCodec::from_header_byte(stream[6])?;
     // Validate widths even when a singleton has no delta payload.
-    if codec == PostingCodec::Rounded && !matches!(bits, 0 | 8 | 16 | 32) {
+    let bitmap = bits == PostingCodec::BITMAP_WIDTH;
+    if codec == PostingCodec::Rounded && !(bitmap || matches!(bits, 0 | 8 | 16 | 32)) {
         return Err(invalid("invalid rounded posting width"));
     }
-    let gaps = if codec == PostingCodec::Simd4x && count == BLOCK_SIZE {
+    let gaps = if bitmap {
+        let bytes = bitmap_bytes(last - first);
+        let words = stream
+            .get(8..8 + bytes)
+            .ok_or_else(|| invalid("truncated bitmap posting block"))?;
+        validate_bitmap(words, last - first, count)?;
+        bytes
+    } else if codec == PostingCodec::Simd4x && count == BLOCK_SIZE {
         let bytes = payload_len(&stream[8..], codec, count, bits)?;
         if !bitpacking4x::first_gap_is_zero(&stream[8..8 + bytes], bits) {
             return Err(invalid("SIMD posting first gap must be zero"));
@@ -223,6 +255,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let list = BlockPostingList::from_posting_list_with_codec(&postings, codec).unwrap();
             let mut original = Vec::new();

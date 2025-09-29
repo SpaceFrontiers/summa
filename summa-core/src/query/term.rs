@@ -18,6 +18,9 @@ pub struct TermQuery {
     pub term: Vec<u8>,
     /// Optional global statistics for cross-segment IDF
     global_stats: Option<Arc<GlobalStats>>,
+    /// Segment-local (idf, average length) replacing the term's own: a common
+    /// word pair scores as its phrase (`docs/common-word-pairs.md`).
+    statistics: Option<(f32, f32)>,
 }
 
 impl std::fmt::Debug for TermQuery {
@@ -47,6 +50,7 @@ impl TermQuery {
             field,
             term: term.into(),
             global_stats: None,
+            statistics: None,
         }
     }
 
@@ -55,6 +59,7 @@ impl TermQuery {
             field,
             term: text.to_lowercase().into_bytes(),
             global_stats: None,
+            statistics: None,
         }
     }
 
@@ -64,12 +69,20 @@ impl TermQuery {
             field,
             term: text.to_lowercase().into_bytes(),
             global_stats: Some(stats),
+            statistics: None,
         }
     }
 
     /// Set global statistics for cross-segment IDF
     pub fn set_global_stats(&mut self, stats: Arc<GlobalStats>) {
         self.global_stats = Some(stats);
+    }
+
+    /// Score with a phrase's summed idf and average length instead of the
+    /// term's own (a common word pair standing in for its phrase).
+    pub(super) fn with_statistics(mut self, idf: f32, avg_field_len: f32) -> Self {
+        self.statistics = Some((idf, avg_field_len));
+        self
     }
 
     fn fast_field_bitset(
@@ -164,7 +177,7 @@ fn can_rank_term(
 //   $($aw)*          – .await  (present for async, absent for sync)
 macro_rules! term_plan {
     ($field:expr, $term:expr, $global_stats:expr, $reader:expr, $limit:expr,
-     $load_positions:expr, $eligibility:expr, $budget:expr, $complete:expr, $skip_scoring_setup:expr, $initial_threshold:expr, $physical_field:expr, $get_postings_fn:ident, $get_positions_fn:ident
+     $load_positions:expr, $eligibility:expr, $budget:expr, $complete:expr, $skip_scoring_setup:expr, $initial_threshold:expr, $physical_field:expr, $statistics:expr, $get_postings_fn:ident, $get_positions_fn:ident
      $(, $aw:tt)*) => {{
         let field: Field = $field;
         let term: &[u8] = $term;
@@ -172,6 +185,7 @@ macro_rules! term_plan {
         let reader: &SegmentReader = $reader;
         let limit: usize = $limit;
         let budget: Option<&super::SharedThreshold> = $budget;
+        let statistics: Option<(f32, f32)> = $statistics;
         if budget.is_some_and(super::SharedThreshold::stop_if_expired) {
             return Ok(Box::new(EmptyScorer) as Box<dyn Scorer + '_>);
         }
@@ -192,7 +206,7 @@ macro_rules! term_plan {
             Some(posting_list) if reader.chunk_map(field).is_some_and(|map| map.is_document_map())
                 && ($complete || $load_positions || $physical_field == Some(field)) => {
                 let map = reader.chunk_map(field).unwrap();
-                let (idf, avg_field_len) = compute_term_idf(&posting_list, field, reader, global_stats, term);
+                let (idf, avg_field_len) = statistics.unwrap_or_else(|| compute_term_idf(&posting_list, field, reader, global_stats, term));
                 let mut scorer = TermScorer::new(posting_list, idf, avg_field_len, 1.0)
                     .with_params(super::Bm25Params::for_field(reader.schema(), field));
                 scorer.chunk_lengths = Some(map.clone());
@@ -212,8 +226,9 @@ macro_rules! term_plan {
             // Chunked field: postings are keyed by virtual chunk id. Score the
             // chunks, fold them back to documents and report the ordinals.
             Some(posting_list) if reader.has_text_mapping(field) => {
-                let (idf, avg_field_len) =
-                    compute_term_idf(&posting_list, field, reader, global_stats, term);
+                let (idf, avg_field_len) = statistics.unwrap_or_else(|| {
+                    compute_term_idf(&posting_list, field, reader, global_stats, term)
+                });
                 if $complete {
                     return complete_text_scorer(vec![(posting_list, idf)], avg_field_len, reader, field, &super::ScorerOptions {
                         shared_threshold: budget.cloned(), eligibility: $eligibility.clone(),
@@ -236,8 +251,9 @@ macro_rules! term_plan {
                 )
             }
             Some(posting_list) => {
-                let (idf, avg_field_len) =
-                    compute_term_idf(&posting_list, field, reader, global_stats, term);
+                let (idf, avg_field_len) = statistics.unwrap_or_else(|| {
+                    compute_term_idf(&posting_list, field, reader, global_stats, term)
+                });
 
                 // Ranked term requests can use the same block bounds as a text
                 // union. Complete membership and positioned callers keep a cursor.
@@ -318,6 +334,7 @@ impl Query for TermQuery {
             .clone()
             .or_else(|| options.global_stats.clone());
         let load_positions = options.collect_positions;
+        let statistics = self.statistics;
         Box::pin(async move {
             term_plan!(
                 field,
@@ -332,6 +349,7 @@ impl Query for TermQuery {
                 options.skip_scoring_setup,
                 options.initial_threshold,
                 options.physical_text_field,
+                statistics,
                 get_postings,
                 get_positions,
                 await
@@ -378,6 +396,7 @@ impl Query for TermQuery {
             options.skip_scoring_setup,
             options.initial_threshold,
             options.physical_text_field,
+            self.statistics,
             get_postings_sync,
             get_positions_sync
         )
@@ -1094,6 +1113,7 @@ mod score_window_tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let postings = BlockPostingList::from_posting_list_with_codec(&list, codec).unwrap();
             for with_lengths in [false, true] {
@@ -1223,6 +1243,7 @@ mod score_window_tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let postings = BlockPostingList::from_posting_list_with_codec(&list, codec).unwrap();
             for with_lengths in [false, true] {

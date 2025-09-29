@@ -83,8 +83,9 @@ impl SearchService for SearchServiceImpl {
 
         // Bound expensive pipelines across all HTTP/2 connections without an
         // unbounded waiter queue retaining decoded requests under overload.
-        // Dropping the owned permit on completion/error/cancellation is safe.
-        let _search_permit = self.acquire_search_permit()?;
+        // The search-pool job shares the permit: it outlives a cancelled
+        // request, so admission is released when both have finished.
+        let search_permit = Arc::new(self.acquire_search_permit()?);
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let _ = metric_index.set(canonical_metric_index_label(&index.schema()).to_owned());
@@ -314,31 +315,22 @@ impl SearchService for SearchServiceImpl {
                     .text_stats
                     .as_ref()
                     .map(|stats| Arc::new(text_stats_from_proto(stats, searcher.schema())));
-                if let Some(config) = rerank_setup {
-                    let (candidates, seen, hit_budget) = searcher
-                        .search_with_count_budgeted_stats(
-                            core_query.as_ref(),
-                            candidate_limit,
-                            deadline,
-                            stats_override,
-                        )
-                        .await
-                        .map_err(crate::error::summa_error_to_status)?;
-                    truncated = hit_budget;
-                    (candidates, seen, Some((config, limit)))
-                } else {
-                    let (results, seen, hit_budget) = searcher
-                        .search_with_positions_budgeted_stats(
-                            core_query.as_ref(),
-                            candidate_limit,
-                            deadline,
-                            stats_override,
-                        )
-                        .await
-                        .map_err(crate::error::summa_error_to_status)?;
-                    truncated = hit_budget;
-                    (results, seen, None)
-                }
+                // Reranking consumes plain candidates; direct results keep
+                // per-ordinal positions for multi-valued fields.
+                let collect_positions = rerank_setup.is_none();
+                let (results, seen, hit_budget) = searcher
+                    .search_budgeted_on_pool(
+                        Arc::from(core_query),
+                        candidate_limit,
+                        collect_positions,
+                        deadline,
+                        stats_override,
+                        Arc::clone(&search_permit),
+                    )
+                    .await
+                    .map_err(crate::error::summa_error_to_status)?;
+                truncated = hit_budget;
+                (results, seen, rerank_setup.map(|config| (config, limit)))
             };
         let search_us = (t_search.elapsed().as_micros() as u64).saturating_sub(candidate_scoring_us);
 
@@ -418,7 +410,24 @@ impl SearchService for SearchServiceImpl {
         }
 
         let mut hits = Vec::with_capacity(results.len());
-        for result in results {
+        let prepare_reads = !requested_fields.is_empty() && searcher.has_lazy_document_reads();
+        let mut prepared = None;
+        let mut batch_position = 0;
+        // Consume hits so their position buffers are released as response rows
+        // are built. IntoIter still exposes bounded lookahead for read planning.
+        let mut results = results.into_iter();
+        while let Some(result) = results.next() {
+            if prepare_reads && batch_position == 0 {
+                // Release the previous window before admitting another 8 MiB.
+                drop(prepared.take());
+                let addresses: Vec<_> = std::iter::once(&result)
+                    .chain(results.as_slice().iter())
+                    .take(summa_core::index::DOCUMENT_READ_BATCH_SIZE)
+                    .map(|hit| summa_core::query::DocAddress::new(hit.segment_id, hit.doc_id))
+                    .collect();
+                prepared = Some(searcher.prepare_document_reads(&addresses)
+                    .await.map_err(crate::error::summa_error_to_status)?);
+            }
             // Convert ordinal scores before hydration so their retained memory
             // is charged before reading potentially large stored fields.
             let mut ordinal_scores: Vec<OrdinalScore> = result
@@ -442,13 +451,13 @@ impl SearchService for SearchServiceImpl {
             let mut fields: HashMap<String, FieldValueList> = HashMap::new();
 
             if !requested_fields.is_empty() {
-                let doc = searcher
-                    .get_document_with_fields(
+                let doc = match &prepared {
+                    Some(batch) => batch.get(batch_position, requested_field_ids.as_ref()).await,
+                    None => searcher.get_document_with_fields(
                         &summa_core::query::DocAddress::new(result.segment_id, result.doc_id),
                         requested_field_ids.as_ref(),
-                    )
-                    .await
-                    .map_err(crate::error::summa_error_to_status)?;
+                    ).await,
+                }.map_err(crate::error::summa_error_to_status)?;
 
                 if let Some(doc) = doc {
                     for requested in &requested_fields {
@@ -489,6 +498,7 @@ impl SearchService for SearchServiceImpl {
             };
             response_budget.reserve_hit(&hit)?;
             hits.push(hit);
+            batch_position = (batch_position + 1) % summa_core::index::DOCUMENT_READ_BATCH_SIZE;
         }
         let load_us = t_load.elapsed().as_micros() as u64;
 

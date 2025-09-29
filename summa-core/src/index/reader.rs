@@ -67,9 +67,12 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         reload_interval_ms: u64,
     ) -> Result<Self> {
         const STANDALONE_STORE_CACHE_BYTES: usize = 32 * 1024 * 1024;
+        super::validate_term_cache_blocks(term_cache_blocks)?;
         let resources = SearcherResources::new(
-            term_cache_blocks,
-            None,
+            crate::segment::TermCachePolicy::PerSegment {
+                blocks: term_cache_blocks,
+                budget_bytes: None,
+            },
             STANDALONE_STORE_CACHE_BYTES,
             crate::default_search_threads(),
             4,

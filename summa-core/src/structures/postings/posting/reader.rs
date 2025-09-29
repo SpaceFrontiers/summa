@@ -225,6 +225,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let bytes = fixture(codec);
             let reader = PostingListReader::new(
@@ -305,6 +306,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let bytes = fixture(codec);
             let strict = BlockPostingList::deserialize(&bytes).unwrap();

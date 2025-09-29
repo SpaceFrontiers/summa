@@ -5,11 +5,14 @@
 
 use crate::dsl::Field;
 use crate::segment::SegmentReader;
+use crate::segment::reader::ExpandedPosting;
 
 #[cfg(test)]
 use super::term_union::materialize_union;
-use super::term_union::{TermUnionScorer, reject_chunked};
-use super::traits::{CountFuture, Query, Scorer, ScorerFuture};
+use super::term_union::{
+    TermUnionScorer, physical_union_field, union_map, validate_expansion_field,
+};
+use super::traits::{CountFuture, Query, Scorer, ScorerFuture, ScorerOptions};
 
 /// Prefix query — matches documents containing any term starting with `prefix`.
 #[derive(Debug, Clone)]
@@ -30,6 +33,17 @@ impl std::fmt::Display for PrefixQuery {
 }
 
 impl PrefixQuery {
+    async fn expand(&self, reader: &SegmentReader) -> crate::Result<Vec<ExpandedPosting>> {
+        validate_expansion_field(reader, self.field, "PrefixQuery")?;
+        reader.get_prefix_expansion(self.field, &self.prefix).await
+    }
+
+    #[cfg(feature = "sync")]
+    fn expand_sync(&self, reader: &SegmentReader) -> crate::Result<Vec<ExpandedPosting>> {
+        validate_expansion_field(reader, self.field, "PrefixQuery")?;
+        reader.get_prefix_expansion_sync(self.field, &self.prefix)
+    }
+
     /// Create from raw bytes.
     pub fn new(field: Field, prefix: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -49,15 +63,22 @@ impl PrefixQuery {
 
 impl Query for PrefixQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
-        let field = self.field;
-        let prefix = self.prefix.clone();
+        self.scorer_with_options(reader, limit, ScorerOptions::default())
+    }
+
+    fn scorer_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: ScorerOptions,
+    ) -> ScorerFuture<'a> {
+        let query = self.clone();
         Box::pin(async move {
-            reject_chunked(reader, field, "PrefixQuery")?;
-            let postings = reader.get_prefix_expansion(field, &prefix).await?;
+            let postings = query.expand(reader).await?;
             Ok(Box::new(TermUnionScorer::from_expanded(
                 postings,
                 reader.num_docs(),
-                reader.chunk_map(field),
+                union_map(reader, query.field, &options),
                 limit,
             )) as Box<dyn Scorer>)
         })
@@ -69,21 +90,33 @@ impl Query for PrefixQuery {
         reader: &'a SegmentReader,
         limit: usize,
     ) -> crate::Result<Box<dyn Scorer + 'a>> {
-        reject_chunked(reader, self.field, "PrefixQuery")?;
-        let postings = reader.get_prefix_expansion_sync(self.field, &self.prefix)?;
+        self.scorer_sync_with_options(reader, limit, ScorerOptions::default())
+    }
+
+    #[cfg(feature = "sync")]
+    fn scorer_sync_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: ScorerOptions,
+    ) -> crate::Result<Box<dyn Scorer + 'a>> {
+        let postings = self.expand_sync(reader)?;
         Ok(Box::new(TermUnionScorer::from_expanded(
             postings,
             reader.num_docs(),
-            reader.chunk_map(self.field),
+            union_map(reader, self.field, &options),
             limit,
         )))
     }
 
+    fn physical_text_field(&self, reader: &SegmentReader, _complete: bool) -> Option<Field> {
+        physical_union_field(reader, self.field)
+    }
+
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
-        let field = self.field;
-        let prefix = self.prefix.clone();
+        let query = self.clone();
         Box::pin(async move {
-            let postings = reader.get_prefix_expansion(field, &prefix).await?;
+            let postings = query.expand(reader).await?;
             Ok(postings
                 .iter()
                 .fold(0u32, |sum, posting| sum.saturating_add(posting.doc_count()))
@@ -93,6 +126,17 @@ impl Query for PrefixQuery {
 
     fn is_filter(&self) -> bool {
         true
+    }
+
+    fn exact_count<'a>(&self, reader: &'a SegmentReader) -> Option<CountFuture<'a>> {
+        let query = self.clone();
+        Some(Box::pin(async move {
+            let postings = query.expand(reader).await?;
+            Ok(super::term_union::count_expanded(
+                postings,
+                reader.num_docs(),
+            ))
+        }))
     }
 
     #[cfg(feature = "sync")]
@@ -105,9 +149,9 @@ impl Query for PrefixQuery {
 
     #[cfg(feature = "sync")]
     fn as_doc_bitset(&self, reader: &SegmentReader) -> Option<super::DocBitset> {
-        if reader.is_chunked_field(self.field) {
-            return None;
-        }
+        // A failed optional predicate must fall back to the scorer, which
+        // returns the validation error instead of treating it as an empty set.
+        validate_expansion_field(reader, self.field, "PrefixQuery").ok()?;
         let postings = reader
             .get_prefix_postings_sync(self.field, &self.prefix)
             .ok()?;
