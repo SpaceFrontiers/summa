@@ -260,11 +260,14 @@ pub fn merge_search_responses(
                 .extend(branch.candidates);
         }
     }
+    // Ties break by segment; the stable sort keeps each shard's order within
+    // a segment, which is physical for constant-score queries on reordered
+    // fields (docs/physical-tie-order.md).
     hits.sort_by(|a, b| {
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| address_key(a).cmp(&address_key(b)))
+            .then_with(|| address_key(a).0.cmp(address_key(b).0))
     });
     if matches!(
         ranking_method.as_deref(),
@@ -685,6 +688,23 @@ mod tests {
         assert_eq!(merged.took_ms, 9);
         assert_eq!(merged.timings.unwrap().search_us, 300);
         assert!(merged.truncated);
+    }
+
+    #[test]
+    fn tied_hits_keep_each_shard_order_within_a_segment() {
+        // A constant-score query on a reordered field returns its ties in
+        // physical order, which need not follow document IDs.
+        let a = SearchResponse {
+            hits: vec![hit("b", 7, 1.0), hit("b", 2, 1.0)],
+            ..Default::default()
+        };
+        let b = SearchResponse {
+            hits: vec![hit("a", 9, 1.0), hit("a", 4, 1.0)],
+            ..Default::default()
+        };
+        let merged = merge_search_responses(vec![a, b], 0, 4).unwrap();
+        let order: Vec<(&str, u32)> = merged.hits.iter().map(address_key).collect();
+        assert_eq!(order, vec![("a", 9), ("a", 4), ("b", 7), ("b", 2)]);
     }
 
     #[test]

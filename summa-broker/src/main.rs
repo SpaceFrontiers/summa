@@ -489,12 +489,22 @@ async fn async_main(args: Args) -> Result<()> {
         args.coordinator_max_transfer_mb, args.max_concurrent_searches, args.backend_max_searches,
     );
 
+    // Bind before serving so the log reports the bound address: `--addr
+    // host:0` then selects a free port without a probe-then-bind race.
+    // Nodelay and keepalive match tonic's `serve(addr)` with this builder.
+    const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
+    let incoming = tonic::transport::server::TcpIncoming::bind(addr)
+        .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?
+        .with_nodelay(Some(true))
+        .with_keepalive(Some(TCP_KEEPALIVE));
+    info!("Summa broker listening on {}", incoming.local_addr()?);
+
     let signal_flag = Arc::clone(&shutting_down);
     let signal_shutdown = shutdown_tx.clone();
     let drain_health = health_reporter.clone();
     let internal_shutdown_rx = shutdown_rx.clone();
     let serve_result = Server::builder()
-        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_keepalive(Some(TCP_KEEPALIVE))
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .http2_adaptive_window(Some(true))
@@ -521,7 +531,7 @@ async fn async_main(args: Args) -> Result<()> {
                 .send_compressed(CompressionEncoding::Zstd),
         )
         .add_service(BrokerServiceServer::new(admin_service))
-        .serve_with_shutdown(addr, async move {
+        .serve_with_incoming_shutdown(incoming, async move {
             // OS signal, or internal failure (e.g. discovery crash flips the
             // shutdown channel): either way exit rather than linger as a
             // routing-dead process.

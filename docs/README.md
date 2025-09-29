@@ -30,7 +30,13 @@
 - [Lexical execution and formats](lexical-vertical.md)
 - [Posting codecs](posting-codecs.md) and [block execution](search-block-execution.md)
 - [Compact text and norms](compact-text-format.md)
-- [Document store v3](document-store-v3.md)
+- [Bitmap posting blocks](bitmap-posting-blocks.md) (default `RoundedBitmap`)
+- [Document store v3](document-store-v3.md) and [batched payload reads](batched-payload-reads.md)
+- [Process-wide term dictionary cache](term-dictionary-cache.md)
+- [Suffix filters for cached dictionary blocks](dictionary-suffix-filters.md)
+- [Entry offsets for cached dictionary blocks](dictionary-entry-offsets.md)
+- [Common word pairs for exact phrases](common-word-pairs.md)
+- [Physical tie order for constant-score queries](physical-tie-order.md)
 - [Owned byte views](owned-byte-views.md)
 - [Text reordering](maxscore-text-reordering.md)
 - [Merge-time BP](merge-time-reorder.md), [budgeted BP](budgeted-reorder.md), and [block reorder](block-level-reorder.md)
@@ -65,6 +71,7 @@
 ## Additional guides
 
 - [Contributing](../CONTRIBUTING.md)
+- [FST term dictionary note](fst-term-dictionary.md)
 - [IResearch optimization and Linux I/O audit](iresearch-optimization-audit.md)
 - [Topic-aware placement and redistribution proposal](topic-aware-placement.md)
 - [Range bitset word materialization](range-word-materialization.md)

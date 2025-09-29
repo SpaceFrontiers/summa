@@ -190,7 +190,9 @@ async fn plan_field(
     let mut iter = crate::segment::merger::MergedTerms::new(readers, cancellation).await?;
     while let Some(key) = iter.next(&mut sources).await? {
         check_cancelled(cancellation)?;
-        if key[..4] != prefix {
+        // Common word pairs are derived from the words; they follow the
+        // permutation but do not shape it (`docs/common-word-pairs.md`).
+        if key[..4] != prefix || crate::structures::word_pairs::is_word_pair_term(&key[4..]) {
             continue;
         }
         if dfs.len() == dfs.capacity() {
@@ -261,7 +263,9 @@ async fn plan_field(
     let mut ordinal = 0usize;
     while let Some(key) = iter.next(&mut sources).await? {
         check_cancelled(cancellation)?;
-        if key[..4] != prefix {
+        // Common word pairs are derived from the words; they follow the
+        // permutation but do not shape it (`docs/common-word-pairs.md`).
+        if key[..4] != prefix || crate::structures::word_pairs::is_word_pair_term(&key[4..]) {
             continue;
         }
         let compact_id = active[ordinal];
@@ -438,6 +442,7 @@ pub(crate) async fn rewrite_text_files<D: Directory + DirectoryWriter>(
         &mut term_dict_out,
         crate::structures::SSTableWriterConfig {
             block_size: term_dict_block_size,
+            bloom_sizing: super::merger::rewrite_bloom_sizing(std::slice::from_ref(reader)),
             ..crate::structures::SSTableWriterConfig::from_optimization(optimization)
         },
     );
@@ -865,6 +870,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let schema = |mapped| {
                 let mut b = Schema::builder();

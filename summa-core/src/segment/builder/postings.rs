@@ -32,6 +32,31 @@ pub(super) struct TermKey {
     pub term: Spur,
 }
 
+/// Marks a key whose interned term is a common word pair `first\0second`;
+/// serialization writes it as `0xFF first 0xFF second` in the field's term
+/// space. Field ids stay far below this bit.
+pub(super) const WORD_PAIR_FIELD_FLAG: u32 = 1 << 31;
+
+/// The serialized dictionary key of `term_key`: field id, then term bytes.
+fn term_key_bytes(term_key: &TermKey, term_interner: &Rodeo) -> Vec<u8> {
+    let term = term_interner.resolve(&term_key.term);
+    let field = term_key.field & !WORD_PAIR_FIELD_FLAG;
+    let mut key = Vec::with_capacity(size_of::<u32>() + term.len() + 1);
+    key.extend_from_slice(&field.to_le_bytes());
+    if term_key.field & WORD_PAIR_FIELD_FLAG != 0 {
+        let (first, second) = term
+            .split_once('\0')
+            .expect("word pairs are interned as first\\0second");
+        key.extend_from_slice(&crate::structures::word_pairs::word_pair_term(
+            first.as_bytes(),
+            second.as_bytes(),
+        ));
+    } else {
+        key.extend_from_slice(term.as_bytes());
+    }
+    key
+}
+
 /// Compact posting entry for in-memory storage
 #[derive(Clone, Copy)]
 pub(super) struct CompactPosting {
@@ -43,7 +68,7 @@ pub(super) struct CompactPosting {
 /// High-frequency terms exceeding this are spilled to a temp file to reduce
 /// peak memory. 16384 postings × 6 bytes = ~96KB per term before spill.
 #[cfg(feature = "native")]
-const SPILL_THRESHOLD: usize = 16384;
+pub(super) const SPILL_THRESHOLD: usize = 16384;
 
 /// In-memory posting list for a term, with optional spill-to-disk for large lists.
 ///
@@ -270,13 +295,7 @@ pub(super) fn build_postings_streaming(
     // Phase 1: Consume HashMap into sorted Vec (frees HashMap overhead)
     let mut term_entries: Vec<(Vec<u8>, PostingListBuilder)> = inverted_index
         .into_iter()
-        .map(|(term_key, posting_list)| {
-            let term_str = term_interner.resolve(&term_key.term);
-            let mut key = Vec::with_capacity(4 + term_str.len());
-            key.extend_from_slice(&term_key.field.to_le_bytes());
-            key.extend_from_slice(term_str.as_bytes());
-            (key, posting_list)
-        })
+        .map(|(term_key, posting_list)| (term_key_bytes(&term_key, &term_interner), posting_list))
         .collect();
 
     drop(term_interner);
@@ -411,13 +430,7 @@ pub(super) fn build_positions_streaming(
     // Consume HashMap into Vec for sorting (owned, no borrowing)
     let mut entries: Vec<(Vec<u8>, PositionPostingListBuilder)> = position_index
         .into_iter()
-        .map(|(term_key, pos_builder)| {
-            let term_str = term_interner.resolve(&term_key.term);
-            let mut key = Vec::with_capacity(size_of::<u32>() + term_str.len());
-            key.extend_from_slice(&term_key.field.to_le_bytes());
-            key.extend_from_slice(term_str.as_bytes());
-            (key, pos_builder)
-        })
+        .map(|(term_key, pos_builder)| (term_key_bytes(&term_key, term_interner), pos_builder))
         .collect();
 
     entries.sort_by(|a, b| a.0.cmp(&b.0));

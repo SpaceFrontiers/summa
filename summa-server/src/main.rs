@@ -18,6 +18,7 @@ use log::{info, warn};
 use tonic::{codec::CompressionEncoding, transport::Server};
 
 use summa_core::IndexConfig;
+use summa_core::directories::{PayloadReadBackend, PayloadReadService};
 use summa_core::segment::pin::{PinMode, PinPolicy, set_pin_policy};
 
 pub mod proto {
@@ -27,6 +28,38 @@ pub mod proto {
 
 use proto::index_service_server::IndexServiceServer;
 use proto::search_service_server::SearchServiceServer;
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum PayloadIo {
+    #[default]
+    Mmap,
+    Pool,
+    IoUring,
+}
+impl PayloadIo {
+    fn service(self, idle_mb: usize, sparse: bool) -> Result<Option<Arc<PayloadReadService>>> {
+        if idle_mb > 8 {
+            anyhow::bail!("--payload-buffer-mb must be in 0..=8");
+        }
+        let backend = match self {
+            Self::Mmap => {
+                if sparse {
+                    anyhow::bail!("--sparse-payload-reads requires pool or io-uring");
+                }
+                if idle_mb != 0 {
+                    anyhow::bail!("--payload-buffer-mb requires pool or io-uring");
+                }
+                return Ok(None);
+            }
+            Self::Pool => PayloadReadBackend::Pool,
+            Self::IoUring => PayloadReadBackend::IoUring,
+        };
+        Ok(Some(PayloadReadService::with_buffer_budget(
+            backend,
+            idle_mb * 1024 * 1024,
+        )?))
+    }
+}
 
 /// Summa gRPC Search Server
 #[derive(Parser, Debug)]
@@ -55,6 +88,26 @@ struct Args {
     /// ordinary result blocks. Set to 0 to disable decompressed store caching.
     #[arg(long, default_value = "2048")]
     store_cache_budget_mb: usize,
+
+    /// Process-wide budget (MB) for decompressed term-dictionary blocks read
+    /// by searches, shared by every index and segment. Broad wildcard, regex
+    /// and prefix scans reuse retained blocks instead of decompressing them
+    /// again. Set to 0 to use small per-segment dictionary caches instead.
+    #[arg(long, default_value_t = summa_core::index::DEFAULT_TERM_CACHE_PROCESS_BYTES / (1024 * 1024))]
+    term_cache_budget_mb: usize,
+
+    /// Stored-document I/O backend; metadata remains mapped. Ring requires
+    /// a Linux build with --features io-uring and kernel synchronous cancellation.
+    #[arg(long, value_enum, default_value = "mmap")]
+    payload_io: PayloadIo,
+
+    /// Also read async MaxScore blocks through the payload service (requires pool or io-uring).
+    #[arg(long)]
+    sparse_payload_reads: bool,
+
+    /// Additional idle payload buffer budget in MiB (0 disables reuse, max 8).
+    #[arg(long, default_value = "0")]
+    payload_buffer_mb: usize,
 
     /// Maximum number of vectors sampled for one field's global ANN training.
     /// The memory limit below is enforced simultaneously.
@@ -591,6 +644,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .store_cache_budget_mb
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--store-cache-budget-mb is too large"))?;
+    let term_cache_process_bytes = args
+        .term_cache_budget_mb
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--term-cache-budget-mb is too large"))?;
     if args.vector_training_max_samples == 0 || args.vector_training_memory_mb == 0 {
         return Err(anyhow::anyhow!(
             "--vector-training-max-samples and --vector-training-memory-mb must be greater than zero"
@@ -681,6 +738,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         num_threads: search_threads,
         sparse_io_concurrency: args.sparse_io_concurrency,
         store_cache_budget_bytes,
+        term_cache_process_bytes,
         max_indexing_memory_bytes,
         vector_training_max_samples: args.vector_training_max_samples,
         vector_training_memory_bytes,
@@ -707,7 +765,17 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             started.elapsed()
         );
     }
-    let registry = Arc::new(registry::IndexRegistry::new(args.data_dir.clone(), config));
+    let payload_reads = args
+        .payload_io
+        .service(args.payload_buffer_mb, args.sparse_payload_reads)?;
+    info!(
+        "Payload backend: {:?}, sparse blocks: {}, idle buffer budget: {} MiB",
+        args.payload_io, args.sparse_payload_reads, args.payload_buffer_mb
+    );
+    let registry = Arc::new(
+        registry::IndexRegistry::new(args.data_dir.clone(), config)
+            .with_payload_reads(payload_reads, args.sparse_payload_reads),
+    );
 
     // Clean up index directories from incomplete deletes (e.g. server crashed mid-delete)
     registry.cleanup_incomplete_deletes();
@@ -756,6 +824,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!(
         "Shared document-store cache budget: {} MB",
         args.store_cache_budget_mb
+    );
+    info!(
+        "Shared term-dictionary cache budget: {} MB",
+        args.term_cache_budget_mb
     );
     info!(
         "Vector training sample: max {} vectors / {} MB per field",
@@ -920,6 +992,26 @@ fn merge_bp_time_budget(seconds: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn payload_cli_rejects_invalid_budgets_and_preserves_mmap_default() {
+        let defaults = Args::try_parse_from(["summa-server"]).unwrap();
+        assert!(matches!(defaults.payload_io, PayloadIo::Mmap));
+        assert!(
+            defaults
+                .payload_io
+                .service(defaults.payload_buffer_mb, defaults.sparse_payload_reads)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!defaults.sparse_payload_reads);
+        assert!(PayloadIo::Mmap.service(0, true).is_err());
+        assert!(PayloadIo::Mmap.service(1, false).is_err());
+        assert!(PayloadIo::Pool.service(9, false).is_err());
+        assert!(PayloadIo::Pool.service(usize::MAX, false).is_err());
+        let chosen = Args::try_parse_from(["summa-server", "--payload-io", "io-uring"]).unwrap();
+        assert!(matches!(chosen.payload_io, PayloadIo::IoUring));
+    }
 
     #[test]
     fn vector_training_sample_cli_defaults_and_overrides() {

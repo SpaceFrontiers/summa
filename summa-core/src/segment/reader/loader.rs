@@ -1196,6 +1196,23 @@ async fn load_sparse_component<D: Directory>(
         ));
     }
 
+    // Keep metadata and synchronous callers on the original mapping. The same
+    // optional service as document hydration owns explicit block requests.
+    if !maxscore_indexes.is_empty()
+        && let Some(payload) = dir.open_sparse_payload(path).await?
+    {
+        if payload.len() != file_size {
+            return Err(crate::Error::Corruption(
+                "sparse payload and metadata handles have different lengths".into(),
+            ));
+        }
+        if !payload.is_sync() {
+            for index in maxscore_indexes.values_mut() {
+                index.set_payload_handle(payload.clone());
+            }
+        }
+    }
+
     log::debug!(
         "Sparse file loaded: maxscore_fields={:?}, bmp_fields={:?}",
         maxscore_indexes.keys().collect::<Vec<_>>(),

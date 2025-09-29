@@ -107,6 +107,8 @@ impl SegmentMerger {
             term_dict,
             crate::structures::SSTableWriterConfig {
                 block_size: self.term_dict_block_size,
+                // Distinct merged terms never exceed the sources' total.
+                bloom_sizing: super::rewrite_bloom_sizing(segments),
                 ..crate::structures::SSTableWriterConfig::from_optimization(self.optimization)
             },
         );

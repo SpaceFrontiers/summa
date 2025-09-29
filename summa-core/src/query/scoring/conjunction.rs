@@ -198,6 +198,8 @@ impl MaxScoreExecutor<'_> {
         };
         let mut pairs = [(0u8, 0u8); crate::structures::postings::POSTING_BLOCK_SIZE];
         let mut count = 0;
+        // Per-frequency bounds of the rarer cursor's current block.
+        let mut tf_bounds: Option<(usize, Option<[f32; 16]>)> = None;
         while count < docs.len() && !left.exhausted && !right.exhausted {
             if self
                 .budget
@@ -215,19 +217,85 @@ impl MaxScoreExecutor<'_> {
             if PRUNE && (left.exhausted || right.exhausted) {
                 break;
             }
-            if PRUNE
-                && left.text_block_bound(left.block_idx) + right.text_block_bound(right.block_idx)
-                    < threshold
-            {
-                // Every possible intersection in the shorter block loses.
-                // Advancing it alone preserves progress without decoding TFs.
-                let left_last = left.block_last_doc(left.block_idx);
-                let right_last = right.block_last_doc(right.block_idx);
-                if left_last <= right_last {
-                    left.skip_to_next_block();
+            if PRUNE {
+                let left_bound = left.text_block_bound(left.block_idx);
+                if left_bound + right.text_block_bound(right.block_idx) < threshold {
+                    // Every possible intersection in the shorter block loses.
+                    // Advancing it alone preserves progress without decoding TFs.
+                    let left_last = left.block_last_doc(left.block_idx);
+                    let right_last = right.block_last_doc(right.block_idx);
+                    if left_last <= right_last {
+                        left.skip_to_next_block();
+                    }
+                    if right_last < left_last && left_bound + right.max_score < threshold {
+                        // No common document can lift this rarer block: skip
+                        // it, and move the common cursor to its next block
+                        // without decoding or bounding the blocks in between.
+                        left.skip_to_next_block();
+                        right.seek_block_shallow(left.doc());
+                    } else if right_last <= left_last {
+                        right.skip_to_next_block();
+                    }
+                    continue;
                 }
-                if right_last <= left_last {
-                    right.skip_to_next_block();
+            }
+            // A bitmap block on the common side answers membership by bit
+            // tests and frequency slots by rank; decoding its IDs for a few
+            // probes cost more than the probes (docs/bitmap-posting-blocks.md).
+            if let Some(mut bitmap) = right.unloaded_bitmap_block() {
+                if !left.ensure_block_loaded_sync()? {
+                    break;
+                }
+                // The same per-frequency pruning as the decoded path below.
+                if PRUNE && tf_bounds.is_none_or(|(block, _)| block != left.block_idx) {
+                    tf_bounds = Some((left.block_idx, left.block_tf_bounds()));
+                }
+                let filter = match tf_bounds {
+                    Some((_, Some(bounds))) if PRUNE => {
+                        left.decode_deferred_tfs();
+                        Some((bounds, threshold - right.text_block_bound(right.block_idx)))
+                    }
+                    _ => None,
+                };
+                let mut a = left.pos;
+                let mut found = 0;
+                while a < left.doc_ids.len() && found < docs.len() - count {
+                    let doc = left.doc_ids[a];
+                    if doc > bitmap.last {
+                        break;
+                    }
+                    let tf = left.tfs.get(a).map_or(0, |&tf| tf as usize);
+                    if filter.is_some_and(|(bounds, need)| {
+                        (1..=16).contains(&tf) && bounds[tf - 1] < need
+                    }) {
+                        a += 1;
+                        continue;
+                    }
+                    if let Some(rank) = bitmap.rank_of(doc) {
+                        pairs[found] = (a as u8, rank as u8);
+                        found += 1;
+                    }
+                    a += 1;
+                }
+                let tf_state = bitmap.tf_state;
+                *iterations += (a - left.pos) as u64;
+                if found > 0 {
+                    right.defer_block_tfs(tf_state);
+                    count = collect_pairs(
+                        self.predicate.as_ref(),
+                        [left, right],
+                        &pairs[..found],
+                        docs,
+                        tfs,
+                        pair,
+                        count,
+                    );
+                }
+                if a == left.doc_ids.len() {
+                    left.pos = a - 1;
+                    left.advance_pos();
+                } else {
+                    left.pos = a;
                 }
                 continue;
             }
@@ -257,34 +325,41 @@ impl MaxScoreExecutor<'_> {
                 pairs[0] = (left.pos as u8, right.pos as u8);
                 1
             } else {
-                crate::structures::simd::intersect_posting_blocks(
-                    &left.doc_ids,
-                    &mut a,
-                    &right.doc_ids,
-                    &mut b,
-                    &mut pairs[..docs.len() - count],
-                )
+                if PRUNE && tf_bounds.is_none_or(|(block, _)| block != left.block_idx) {
+                    tf_bounds = Some((left.block_idx, left.block_tf_bounds()));
+                }
+                match tf_bounds {
+                    Some((_, Some(bounds))) if PRUNE => {
+                        left.decode_deferred_tfs();
+                        probe_competitive(
+                            [&left.doc_ids, &left.tfs],
+                            &mut a,
+                            &right.doc_ids,
+                            &mut b,
+                            &mut pairs[..docs.len() - count],
+                            &bounds,
+                            threshold - right.text_block_bound(right.block_idx),
+                        )
+                    }
+                    _ => crate::structures::simd::intersect_posting_blocks(
+                        &left.doc_ids,
+                        &mut a,
+                        &right.doc_ids,
+                        &mut b,
+                        &mut pairs[..docs.len() - count],
+                    ),
+                }
             };
             *iterations += (a - left.pos + b - right.pos) as u64;
-            let mut frequencies_loaded = false;
-            for &(a, b) in &pairs[..found] {
-                let doc = left.doc_ids[a as usize];
-                if self
-                    .predicate
-                    .as_ref()
-                    .is_none_or(|predicate| predicate(doc))
-                {
-                    if !frequencies_loaded {
-                        left.decode_deferred_tfs();
-                        right.decode_deferred_tfs();
-                        frequencies_loaded = true;
-                    }
-                    docs[count] = doc;
-                    tfs[pair[0] * docs.len() + count] = left.tfs[a as usize];
-                    tfs[pair[1] * docs.len() + count] = right.tfs[b as usize];
-                    count += 1;
-                }
-            }
+            count = collect_pairs(
+                self.predicate.as_ref(),
+                [left, right],
+                &pairs[..found],
+                docs,
+                tfs,
+                pair,
+                count,
+            );
             for (cursor, pos) in [(&mut *left, a), (&mut *right, b)] {
                 if pos == cursor.doc_ids.len() {
                     cursor.pos = pos - 1;
@@ -343,4 +418,74 @@ impl MaxScoreExecutor<'_> {
         }
         true
     }
+}
+
+/// Pruned pair intersection: a rarer-block document whose bound (by its
+/// frequency) plus the common block's bound cannot reach the threshold never
+/// enters the top k, so only the others are probed in the common block. On
+/// and_high_med about three in four rarer documents are skipped, and the
+/// probes replace a merge that walked the whole common block per call.
+/// Frequencies above 16 are always probed.
+fn probe_competitive(
+    [left, left_tfs]: [&[u32]; 2],
+    a: &mut usize,
+    right: &[u32],
+    b: &mut usize,
+    pairs: &mut [(u8, u8)],
+    bounds: &[f32; 16],
+    need: f32,
+) -> usize {
+    let last = *right.last().unwrap();
+    let (mut l, mut r, mut found) = (*a, *b, 0);
+    while l < left.len() && found < pairs.len() {
+        let doc = left[l];
+        if doc > last {
+            // The common block holds no later match.
+            r = right.len();
+            break;
+        }
+        let tf = left_tfs[l] as usize;
+        if !(1..=16).contains(&tf) || bounds[tf - 1] >= need {
+            r = crate::structures::simd::find_first_ge_block_from(right, r, doc);
+            if right[r] == doc {
+                pairs[found] = (l as u8, r as u8);
+                found += 1;
+            }
+        }
+        l += 1;
+    }
+    *a = l;
+    *b = r;
+    found
+}
+
+/// Append the matches among `pairs` (left doc index, right frequency slot)
+/// that pass `predicate`, with both frequencies, and return the new count.
+/// Frequencies decode once, on the first accepted match.
+#[allow(clippy::too_many_arguments)]
+fn collect_pairs(
+    predicate: Option<&crate::query::DocPredicate<'_>>,
+    [left, right]: [&mut super::TermCursor<'_>; 2],
+    pairs: &[(u8, u8)],
+    docs: &mut [DocId],
+    tfs: &mut [u32],
+    pair: [usize; 2],
+    mut count: usize,
+) -> usize {
+    let mut frequencies_loaded = false;
+    for &(a, b) in pairs {
+        let doc = left.doc_ids[a as usize];
+        if predicate.is_none_or(|predicate| predicate(doc)) {
+            if !frequencies_loaded {
+                left.decode_deferred_tfs();
+                right.decode_deferred_tfs();
+                frequencies_loaded = true;
+            }
+            docs[count] = doc;
+            tfs[pair[0] * docs.len() + count] = left.tfs[a as usize];
+            tfs[pair[1] * docs.len() + count] = right.tfs[b as usize];
+            count += 1;
+        }
+    }
+    count
 }

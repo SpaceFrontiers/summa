@@ -10,6 +10,7 @@ fn skewed_conjunction_preserves_frequency_rows_across_seeks_and_partial_batches(
         PostingCodec::Packed,
         PostingCodec::Pfor,
         PostingCodec::Simd4x,
+        PostingCodec::RoundedBitmap,
     ] {
         let mut common = PostingList::new();
         let mut rare = PostingList::new();
@@ -73,6 +74,195 @@ fn skewed_conjunction_preserves_frequency_rows_across_seeks_and_partial_batches(
                     assert_eq!(actual, wanted, "{codec:?} reversed={reversed} k={k}");
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn pruned_conjunction_keeps_a_winner_opening_the_next_rarer_block_inside_a_common_block() {
+    use crate::structures::{BlockPostingList, PostingCodec, PostingList};
+    let params = super::super::Bm25Params::default();
+    let n = 150_000u32;
+    let mut common = PostingList::new();
+    for doc in (0..n).filter(|doc| doc % 7 != 0) {
+        common.push(doc, 1);
+    }
+    for codec in [PostingCodec::Rounded, PostingCodec::RoundedBitmap] {
+        // A strong early match fills the heap; after several 128-match
+        // batches (a warm threshold), the rarer term's fourth block ends
+        // inside a common block and its fifth block opens in that same
+        // common block with the query's best document.
+        let probe = BlockPostingList::from_posting_list_with_codec(&common, codec).unwrap();
+        let boundary = 200 * 511;
+        let block = (0..probe.num_blocks())
+            .find(|&b| probe.block_last_doc(b).unwrap() > boundary)
+            .unwrap();
+        let winner = probe.block_last_doc(block).unwrap();
+        assert!(probe.block_first_doc(block).unwrap() <= boundary && winner < boundary + 200);
+        // The fourth block also starts strong, so block bounds keep it.
+        let strong = 200 * 384;
+        let length = |doc: u32| -> u32 {
+            match doc {
+                1 => 10,
+                doc if doc == strong => 10,
+                doc if doc == winner => 5,
+                _ => 100,
+            }
+        };
+        let lengths = crate::segment::chunk_map::DocLengths::from_lengths(
+            &(0..n).map(|doc| length(doc) as u16).collect::<Vec<_>>(),
+        );
+        let mut rare = PostingList::new();
+        rare.push(1, 16);
+        for i in 1..700 {
+            if i == 512 {
+                rare.push(winner, 20);
+            } else if 200 * i == strong {
+                rare.push(strong, 16);
+            } else {
+                rare.push(200 * i, 1);
+            }
+        }
+        let score = |doc: u32, rare_tf: u32| {
+            params.score(1.0, 1.0, length(doc) as f32, 100.0)
+                + params.score(rare_tf as f32, 2.0, length(doc) as f32, 100.0)
+        };
+        let mut expected: Vec<(u32, f32)> = rare
+            .iter()
+            .filter(|p| p.doc_id % 7 != 0)
+            .map(|p| (p.doc_id, score(p.doc_id, p.term_freq)))
+            .collect();
+        expected.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let lists = vec![
+            (
+                BlockPostingList::from_posting_list_with_options(
+                    &common,
+                    false,
+                    Some(&length),
+                    codec,
+                )
+                .unwrap(),
+                1.0,
+            ),
+            (
+                BlockPostingList::from_posting_list_with_options(
+                    &rare,
+                    false,
+                    Some(&length),
+                    codec,
+                )
+                .unwrap(),
+                2.0,
+            ),
+        ];
+        for k in [1, 2, 5] {
+            let hits = MaxScoreExecutor::text_with_lengths(
+                lists.clone(),
+                100.0,
+                k,
+                Some(LengthSource::Docs(&lengths)),
+                params,
+                1.0,
+            )
+            .require_all_terms()
+            .execute_sync()
+            .unwrap();
+            let actual: Vec<_> = hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect();
+            let wanted: Vec<_> = expected
+                .iter()
+                .take(k)
+                .map(|&(doc, score)| (doc, score.to_bits()))
+                .collect();
+            assert_eq!(actual, wanted, "{codec:?} k={k}");
+        }
+    }
+}
+
+#[test]
+fn pruned_conjunction_passes_a_losing_rarer_block_without_bounding_the_common_blocks_it_spans() {
+    use crate::structures::{BlockPostingList, PostingCodec, PostingList};
+    let params = super::super::Bm25Params::default();
+    let n = 200_000u32;
+    let winner = 140_500;
+    let strong = |doc: u32| doc < 1_280 && doc.is_multiple_of(10);
+    let length = |doc: u32| -> u32 {
+        match doc {
+            doc if strong(doc) => 10,
+            doc if doc == winner => 5,
+            _ => 100,
+        }
+    };
+    let lengths = crate::segment::chunk_map::DocLengths::from_lengths(
+        &(0..n).map(|doc| length(doc) as u16).collect::<Vec<_>>(),
+    );
+    let mut common = PostingList::new();
+    for doc in 0..n {
+        common.push(doc, 1);
+    }
+    // Block 1 fills the heap with strong matches; block 2 spans about a
+    // thousand common blocks but cannot reach the threshold even with the
+    // common list's maximum; block 3 holds the best document.
+    let mut rare = PostingList::new();
+    for i in 0..128 {
+        rare.push(10 * i, 16);
+    }
+    for i in 0..128 {
+        rare.push(2_000 + 1_000 * i, 1);
+    }
+    for i in 0..128 {
+        let doc = 140_000 + 10 * i;
+        rare.push(doc, if doc == winner { 20 } else { 1 });
+    }
+    let score = |doc: u32, rare_tf: u32| {
+        params.score(1.0, 1.0, length(doc) as f32, 100.0)
+            + params.score(rare_tf as f32, 2.0, length(doc) as f32, 100.0)
+    };
+    let mut expected: Vec<(u32, f32)> = rare
+        .iter()
+        .map(|p| (p.doc_id, score(p.doc_id, p.term_freq)))
+        .collect();
+    expected.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    assert_eq!(expected[0].0, winner);
+    for codec in [PostingCodec::Rounded, PostingCodec::RoundedBitmap] {
+        let list = |postings: &PostingList| {
+            BlockPostingList::from_posting_list_with_options(postings, false, Some(&length), codec)
+                .unwrap()
+        };
+        let lists = vec![(list(&common), 1.0), (list(&rare), 2.0)];
+        for k in [1, 2, 5] {
+            let run = || {
+                MaxScoreExecutor::text_with_lengths(
+                    lists.clone(),
+                    100.0,
+                    k,
+                    Some(LengthSource::Docs(&lengths)),
+                    params,
+                    1.0,
+                )
+                .require_all_terms()
+                .execute_sync()
+                .unwrap()
+            };
+            // Without the skip, each common block under rarer block 2 is bounded.
+            #[cfg(feature = "query-diagnostics")]
+            let hits = {
+                let (hits, work) = crate::search_diagnostics::capture_sync(run);
+                assert!(
+                    work.block_bound_calls < 300,
+                    "{codec:?} k={k}: {} block bounds",
+                    work.block_bound_calls
+                );
+                hits
+            };
+            #[cfg(not(feature = "query-diagnostics"))]
+            let hits = run();
+            let actual: Vec<_> = hits.iter().map(|h| (h.doc_id, h.score.to_bits())).collect();
+            let wanted: Vec<_> = expected
+                .iter()
+                .take(k)
+                .map(|&(doc, score)| (doc, score.to_bits()))
+                .collect();
+            assert_eq!(actual, wanted, "{codec:?} k={k}");
         }
     }
 }
@@ -270,6 +460,7 @@ fn mapped_windows_preserve_exhaustive_bits_for_gaps_ties_filters_and_late_winner
                 PostingCodec::Packed,
                 PostingCodec::Pfor,
                 PostingCodec::Simd4x,
+                PostingCodec::RoundedBitmap,
             ] {
                 for with_lengths in [false, true] {
                     let mut builder = ChunkMapBuilder::default();
@@ -462,6 +653,7 @@ fn text_cursor_seeks_preserve_postings_and_scores_across_lazy_block_boundaries()
         PostingCodec::Packed,
         PostingCodec::Pfor,
         PostingCodec::Simd4x,
+        PostingCodec::RoundedBitmap,
     ] {
         for len in [0, 1, 127, 128, 129, 389, 2049] {
             for base in [0, u32::MAX - 50_000] {
@@ -650,6 +842,7 @@ fn candidate_runs_preserve_score_bits_when_switching_to_and_from_full_block_scor
         PostingCodec::Packed,
         PostingCodec::Pfor,
         PostingCodec::Simd4x,
+        PostingCodec::RoundedBitmap,
     ] {
         let list = BlockPostingList::from_posting_list_with_codec(&postings, codec).unwrap();
         for with_lengths in [false, true] {
@@ -921,6 +1114,7 @@ fn sparse_posting_windows_preserve_canonical_bits_with_absent_terms_and_duplicat
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let lists: Vec<_> = corpus
                 .postings
@@ -1328,6 +1522,7 @@ fn sparse_candidate_runs_preserve_gaps_frequencies_and_terminal_ids() {
         PostingCodec::Packed,
         PostingCodec::Pfor,
         PostingCodec::Simd4x,
+        PostingCodec::RoundedBitmap,
     ] {
         let mut postings = PostingList::new();
         for &(doc, tf) in &source {
@@ -1426,6 +1621,7 @@ fn required_windows_preserve_optional_membership_zero_tf_ties_and_late_winners()
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let lists: Vec<_> = corpus
                 .postings
@@ -1763,6 +1959,86 @@ fn windowed_text_maxscore_matches_exhaustive_and_doc_at_a_time() {
         }
     }
     assert!(cases > 400);
+}
+
+/// Dense terms at least `LAZY_DENSITY_RATIO` times more frequent than the
+/// window drivers keep their list maxima in each window and are bounded per
+/// candidate, by the block holding it, instead of block by block across the
+/// window; results stay exact.
+#[test]
+fn windowed_maxscore_bounds_a_dense_nonessential_term_per_candidate_exactly() {
+    let params = super::super::Bm25Params::default();
+    let predicate_fn = |doc: u32| !doc.is_multiple_of(3);
+    for seed in 1..=4u64 {
+        for densities in [
+            &[0.6, 0.003][..],
+            &[0.45, 0.002, 0.004],
+            &[0.6, 0.5, 0.004],
+            &[0.6, 0.5, 0.4, 0.003],
+        ] {
+            let n_docs = 60_000u32;
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let lengths: Vec<u16> = (0..n_docs)
+                .map(|_| 1 + (xorshift(&mut state) % 400) as u16)
+                .collect();
+            let postings = densities
+                .iter()
+                .map(|&density| {
+                    let cutoff = (density * u32::MAX as f64) as u64;
+                    let mut postings = Vec::new();
+                    for doc in 0..n_docs {
+                        if (xorshift(&mut state) & 0xFFFF_FFFF) < cutoff {
+                            let tf = if xorshift(&mut state) % 100 < 70 {
+                                1
+                            } else {
+                                4
+                            };
+                            postings.push((doc, tf));
+                        }
+                    }
+                    postings
+                })
+                .collect::<Vec<_>>();
+            let dense = densities.iter().filter(|&&density| density > 0.1).count();
+            let sparse: usize = postings[dense..].iter().map(Vec::len).sum();
+            assert!(
+                postings[..dense].iter().all(|p| p.len() >= 64 * sparse),
+                "seed {seed}: not skewed enough"
+            );
+            let corpus = Corpus {
+                postings,
+                lengths,
+                n_docs,
+            };
+            let doc_lengths = crate::segment::chunk_map::DocLengths::from_lengths(&corpus.lengths);
+            let lists = build_lists(&corpus, Some(&doc_lengths));
+            let avg = doc_lengths.avg_len();
+            let truth = exhaustive(&corpus, &lists, true, avg, params);
+            for k in [1usize, 10, 100] {
+                for with_predicate in [false, true] {
+                    let label = format!(
+                        "seed={seed} terms={} k={k} pred={with_predicate}",
+                        densities.len()
+                    );
+                    let pred: Option<&dyn Fn(u32) -> bool> =
+                        with_predicate.then_some(&predicate_fn);
+                    let mut executor = MaxScoreExecutor::text(
+                        lists.clone(),
+                        avg,
+                        k,
+                        Some(&doc_lengths),
+                        params,
+                        1.0,
+                    );
+                    if with_predicate {
+                        executor = executor.with_predicate(Box::new(predicate_fn));
+                    }
+                    let windowed = executor.execute_windowed().unwrap();
+                    check_top_k(&label, &windowed, &truth, k, pred);
+                }
+            }
+        }
+    }
 }
 
 /// The approximate mode returns a subset of the exact top-k with exact
@@ -2845,6 +3121,9 @@ fn mapped_batch_admission_resolves_only_competitive_scores_and_keeps_stable_ties
                     .collect::<Vec<_>>()
             };
             assert_eq!(bits(actual), bits(expected));
+            if seed > 0.0 {
+                assert_eq!(calls.get(), 2, "seeded batch resolved losing IDs");
+            }
             if k == 1 {
                 assert!(calls.get() <= 9, "resolved {} IDs", calls.get());
             }

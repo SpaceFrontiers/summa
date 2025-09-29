@@ -24,6 +24,7 @@ fn unaddressed_posting_trailers_are_rejected_before_read_or_merge() {
         PostingCodec::Packed,
         PostingCodec::Pfor,
         PostingCodec::Simd4x,
+        PostingCodec::RoundedBitmap,
     ] {
         let mut bytes = encoded(codec);
         bytes.insert(bytes.len() - FOOTER_V2_SIZE, 0);
@@ -41,6 +42,7 @@ fn streaming_merge_rejects_corrupt_blocks_before_any_output() {
         PostingCodec::Packed,
         PostingCodec::Pfor,
         PostingCodec::Simd4x,
+        PostingCodec::RoundedBitmap,
     ] {
         let valid = encoded(codec);
         let footer = Footer::parse(&valid).unwrap();
@@ -104,6 +106,7 @@ fn checked_streaming_merge_matches_encoded_copy_and_materialized_output() {
         PostingCodec::Packed,
         PostingCodec::Pfor,
         PostingCodec::Simd4x,
+        PostingCodec::RoundedBitmap,
     ] {
         let bytes = encoded(codec);
         let list = BlockPostingList::deserialize(&bytes).unwrap();

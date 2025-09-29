@@ -67,6 +67,59 @@ def commands(args):
     packages = [arg for package in PACKAGES for arg in ("-p", package)]
     if args.mode == "contracts":
         return []
+    if args.mode == "io-uring":
+        if sys.platform != "linux":
+            raise ValueError("io-uring validation requires a Linux 6.0+ host")
+        features = ["--features", "io-uring"]
+        return [
+            [
+                "cargo",
+                "clippy",
+                "--locked",
+                "-p",
+                "summa-core",
+                "-p",
+                "summa-server",
+                *features,
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            [
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "summa-core",
+                *features,
+                "--lib",
+                "directories::",
+            ],
+            [
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "summa-core",
+                *features,
+                "--test",
+                "document_read_batches",
+                "--test",
+                "sparse_payload_reads",
+            ],
+            [
+                "cargo",
+                "test",
+                "--locked",
+                "-p",
+                "summa-server",
+                *features,
+                "--bin",
+                "summa-server",
+                "payload_backends_hydrate_rpc_results_and_survive_other_index_deletion",
+            ],
+        ]
     steps = [
         ["cargo", "fmt", "--all", "--", "--check"],
         [
@@ -206,7 +259,7 @@ def run_command(command, log, timeout, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("contracts", "check", "full"))
+    parser.add_argument("mode", choices=("contracts", "check", "full", "io-uring"))
     parser.add_argument(
         "--plan", action="store_true", help="print commands without running checks"
     )

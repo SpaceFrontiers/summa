@@ -30,11 +30,15 @@ const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 /// [`OLDEST_MIGRATABLE_FORMAT_VERSION`]). Anything else is a clean rebuild
 /// boundary; serde_json would otherwise silently drop fields it does not know
 /// and a later save could destructively rewrite index state.
-pub const INDEX_META_FORMAT_VERSION: u32 = 9;
+pub const INDEX_META_FORMAT_VERSION: u32 = 11;
 
 /// Oldest metadata.json format `load` upgrades in place.
 ///
-/// Format 9 adds optional SIMD blocks, compact posting/position directories
+/// Format 11 adds common word pairs (`docs/common-word-pairs.md`): terms of
+/// a text field starting with `0xFF`, which earlier readers would expose to
+/// dictionary scans as words. Format 10 adds bitmap posting blocks (`PostingCodec::RoundedBitmap`),
+/// which earlier readers reject as an invalid document width. Format 9 adds
+/// optional SIMD blocks, compact posting/position directories
 /// and byte norms; older encodings retain their scoring semantics. Format 8
 /// protects the optional content-hash field marker from older writers. Format 7 added the optional per-segment `deletions` entry,
 /// so format 6 metadata (1.8.121..=1.8.133) is also readable. The

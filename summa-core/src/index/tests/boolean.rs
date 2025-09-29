@@ -1372,3 +1372,60 @@ async fn exclusion_only_boolean_filters_match_the_remaining_documents() {
         assert_eq!(bits.next_set_bit(100), None);
     }
 }
+
+/// A ranked conjunction of a filter-like clause (prefix) and a scored term
+/// must intersect the filter with every term match, not with the term's own
+/// top-k: the best-scoring term matches here all miss the prefix.
+#[tokio::test]
+async fn ranked_must_filter_and_term_returns_filtered_top_k() {
+    let mut schema = SchemaBuilder::default();
+    let body = schema.add_text_field("body", true, false);
+    let config = IndexConfig {
+        num_threads: 1,
+        num_indexing_threads: 1,
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let dir = crate::directories::RamDirectory::new();
+    let mut writer = IndexWriter::create(dir.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    for row in 0..3000u32 {
+        let mut doc = Document::new();
+        doc.add_text(
+            body,
+            match row % 3 {
+                0 => "alpha beta gamma",
+                1 => "alpine omega",
+                _ => "lambda beta",
+            },
+        );
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    writer.shutdown().await.unwrap();
+
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    let excluded = BooleanQuery::new()
+        .must(TermQuery::text(body, "beta"))
+        .must_not(PrefixQuery::text(body, "lam"));
+    let queries = [
+        BooleanQuery::new()
+            .must(PrefixQuery::text(body, "alp"))
+            .must(TermQuery::text(body, "beta")),
+        excluded,
+    ];
+    let expected: Vec<u32> = (0..3000u32).filter(|doc| doc % 3 == 0).take(10).collect();
+    for query in &queries {
+        let hits = searcher.search(query, 10).await.unwrap();
+        assert_eq!(
+            hits.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            expected,
+            "{query}"
+        );
+        let (_, count) = searcher.search_with_count(query, 10).await.unwrap();
+        assert_eq!(count, 1000, "{query}");
+    }
+}

@@ -235,6 +235,12 @@ impl RemoteIndex {
                     stats.total_requests,
                     summa_core::format_bytes(stats.total_bytes)
                 );
+                if stats.omitted_operations != 0 {
+                    log::debug!(
+                        "  {} older HTTP operations omitted",
+                        stats.omitted_operations
+                    );
+                }
                 for op in &stats.operations {
                     log::debug!(
                         "  HTTP: {}, {}ms, range={:?}, url={}",

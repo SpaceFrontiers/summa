@@ -21,6 +21,8 @@ async fn dictionary_block_and_cache_policies_survive_build_merge_compaction_and_
             term_dict_block_size: SSTableBlockSize::try_from(512).unwrap(),
             term_cache_blocks: 100,
             term_cache_budget_bytes: Some(1024),
+            // Pin the per-segment policy; the process-wide cache is separate.
+            term_cache_process_bytes: 0,
             merge_policy: Box::new(summa_core::merge::NoMergePolicy),
             ..Default::default()
         },

@@ -13,7 +13,7 @@ pub(crate) use postings::PostingMergeStats;
 mod sparse;
 mod store;
 mod terms;
-pub(crate) use terms::MergedTerms;
+pub(crate) use terms::{MergedTerms, rewrite_bloom_sizing};
 
 pub(crate) use dense::AnnWriteMode;
 

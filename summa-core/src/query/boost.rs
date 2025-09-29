@@ -130,6 +130,10 @@ impl Query for BoostQuery {
         self.boost == 1.0 && self.inner.is_filter()
     }
 
+    fn constant_score(&self) -> bool {
+        self.inner.constant_score()
+    }
+
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<super::DocPredicate<'a>> {
         (self.boost == 1.0)
             .then(|| self.inner.as_doc_predicate(reader))

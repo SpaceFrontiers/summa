@@ -5,7 +5,9 @@ Status: design (2026-07-09), implemented.
 These writers use buffered filesystem I/O and cache advice, not io_uring. The
 [September 20 I/O audit](iresearch-optimization-audit.md#io_uring-source-and-running-host-findings)
 traces the active server path and separates proposed async payload reads/writes
-from the existing mmap reader.
+from the existing mmap reader. The [batched payload read design](batched-payload-reads.md)
+records bounded preparation and the optional directory-owned Linux payload
+service. Bulk writers remain buffered filesystem writers.
 
 ## Problem
 

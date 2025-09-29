@@ -203,6 +203,15 @@ non-finite values and stable-ID ties retain the same admission semantics. There
 is no allocation or second collector. Exact counts and persisted bytes are
 unchanged. Paired probes justify selection; the final combined measurement is
 
+September 25: batch admission now uses the collector's conceptual length when
+checking whether its threshold is valid. A seeded heap has virtual occupied
+slots even before real hits fill it. Previously the batch screen used only the
+physical heap length, resolving losing mapped IDs that canonical insertion
+then rejected. The regression preserves identical IDs/score bits/ties while
+requiring only the two competitive ID resolutions in a 257-hit seeded batch,
+including k larger than the batch. BMP's integer screen already uses conceptual
+length; both paths retain the same `ScoreCollector` and seeding protocol.
+
 ### Earlier local-window experiments
 
 Adaptive mapped windows were first tested as an isolated hypothesis. The
@@ -471,3 +480,12 @@ results, preserve ties, and observe expired budgets. A strong-prefix fixture
 scores 256 of 8,192 matches; tied scores still require all 8,192, and counted
 execution remains exhaustive in either case. Final validation and independent
 paired timing are recorded in the performance review.
+
+## Term expansions on reordered fields (September 29)
+
+Complete streams (counts) do not depend on the numbering: expansions opt into
+physical traversal like term queries, building their unions without the map
+(2.3× faster pattern counts on the RGB build, level with an ordinary build).
+A ranked Boolean query mixing an expansion with a scored clause keeps the
+logical path and stable-ID ties. Test:
+`expanded_term_counts_on_rgb_fields_traverse_physical_ids`.

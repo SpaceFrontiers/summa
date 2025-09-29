@@ -381,6 +381,7 @@ impl SegmentMerger {
             &mut terms_out,
             crate::structures::SSTableWriterConfig {
                 block_size: self.term_dict_block_size,
+                bloom_sizing: super::rewrite_bloom_sizing(std::slice::from_ref(source)),
                 ..crate::structures::SSTableWriterConfig::from_optimization(self.optimization)
             },
         );
