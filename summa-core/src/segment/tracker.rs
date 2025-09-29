@@ -36,6 +36,7 @@ struct TrackerInner {
 /// Tracks segment references and pending deletions
 pub struct SegmentTracker {
     inner: Mutex<TrackerInner>,
+    deletion_finished: tokio::sync::Notify,
 }
 
 impl SegmentTracker {
@@ -47,6 +48,7 @@ impl SegmentTracker {
                 pending_deletions: HashMap::new(),
                 scheduled_deletions: HashSet::new(),
             }),
+            deletion_finished: tokio::sync::Notify::new(),
         }
     }
 
@@ -148,6 +150,26 @@ impl SegmentTracker {
         let mut inner = self.inner.lock();
         for segment_id in segment_ids {
             inner.scheduled_deletions.remove(&segment_id.to_hex());
+        }
+        self.deletion_finished.notify_waiters();
+    }
+
+    /// Drain deletion attempts already scheduled at this boundary. Reader-held
+    /// retirements remain pending; waiting for them could block forever on a
+    /// caller's own searcher. Later unrelated deletions do not extend this wait.
+    pub(crate) async fn wait_for_scheduled_deletions(&self) {
+        let scheduled = self.inner.lock().scheduled_deletions.clone();
+        while !scheduled.is_empty() {
+            let notified = self.deletion_finished.notified();
+            if self
+                .inner
+                .lock()
+                .scheduled_deletions
+                .is_disjoint(&scheduled)
+            {
+                return;
+            }
+            notified.await;
         }
     }
 
