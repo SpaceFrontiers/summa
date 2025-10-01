@@ -117,26 +117,102 @@ impl MaxScoreExecutor<'_> {
                 threshold,
             )?;
             let mut count = pair_count;
-            if n > 2 {
+            if !PRUNE && n > 2 {
                 let mut origins: [u8; BATCH] = std::array::from_fn(|i| i as u8);
                 for &i in &order[2..n] {
                     let cursor = &mut self.cursors[i];
                     let mut kept = 0;
-                    for row in 0..count {
-                        if row.is_multiple_of(64)
-                            && self
-                                .budget
-                                .as_ref()
-                                .is_some_and(SharedThreshold::stop_if_expired)
+                    // Batching pays when candidates occupy a substantial part
+                    // of the current block. RGB can change that density locally.
+                    let batch_dense = if cfg!(any(target_arch = "x86_64", target_arch = "aarch64"))
+                        && count >= 16
+                    {
+                        if self
+                            .budget
+                            .as_ref()
+                            .is_some_and(SharedThreshold::stop_if_expired)
                         {
                             return Ok((self.finish(), matched));
                         }
-                        if cursor.seek_sync(docs[row])? == docs[row] {
-                            cursor.decode_deferred_tfs();
-                            tfs[i * BATCH + origins[row] as usize] = cursor.tfs[cursor.pos];
-                            docs[kept] = docs[row];
-                            origins[kept] = origins[row];
-                            kept += 1;
+                        cursor.seek_sync(docs[0])?;
+                        if cursor.exhausted {
+                            false
+                        } else {
+                            let candidate_span = u64::from(docs[count - 1] - docs[0]) + 1;
+                            let block_span = u64::from(
+                                cursor.block_last_doc(cursor.block_idx)
+                                    - cursor.block_first_doc(cursor.block_idx),
+                            ) + 1;
+                            candidate_span * 32 <= block_span * count as u64
+                        }
+                    } else {
+                        false
+                    };
+                    if batch_dense {
+                        let mut row = 0;
+                        let mut pairs = [(0u8, 0u8); BATCH];
+                        while row < count && !cursor.exhausted {
+                            if self
+                                .budget
+                                .as_ref()
+                                .is_some_and(SharedThreshold::stop_if_expired)
+                            {
+                                return Ok((self.finish(), matched));
+                            }
+                            cursor.seek_sync(docs[row])?;
+                            if !cursor.ensure_block_loaded_sync()? {
+                                break;
+                            }
+                            let mut pos = cursor.pos;
+                            debug_assert!(docs[row..count].windows(2).all(|ids| ids[0] < ids[1]));
+                            let found = crate::structures::simd::intersect_posting_blocks(
+                                &docs[..count],
+                                &mut row,
+                                &cursor.doc_ids,
+                                &mut pos,
+                                &mut pairs,
+                            );
+                            if found != 0 {
+                                // Kernels may retain already-matched candidates
+                                // at a group boundary. Consume that prefix before
+                                // compaction can overwrite it with duplicate IDs.
+                                row = row.max(pairs[found - 1].0 as usize + 1);
+                                cursor.decode_deferred_tfs();
+                            }
+                            // Kept rows precede every unread candidate, so
+                            // compaction preserves both IDs and TF origins.
+                            for &(origin_row, slot) in &pairs[..found] {
+                                let origin_row = origin_row as usize;
+                                tfs[i * BATCH + origins[origin_row] as usize] =
+                                    cursor.tfs[slot as usize];
+                                docs[kept] = docs[origin_row];
+                                origins[kept] = origins[origin_row];
+                                kept += 1;
+                            }
+                            if pos == cursor.doc_ids.len() {
+                                cursor.pos = pos - 1;
+                                cursor.advance_pos();
+                            } else {
+                                cursor.pos = pos;
+                            }
+                        }
+                    } else {
+                        for row in 0..count {
+                            if row.is_multiple_of(64)
+                                && self
+                                    .budget
+                                    .as_ref()
+                                    .is_some_and(SharedThreshold::stop_if_expired)
+                            {
+                                return Ok((self.finish(), matched));
+                            }
+                            if cursor.seek_sync(docs[row])? == docs[row] {
+                                cursor.decode_deferred_tfs();
+                                tfs[i * BATCH + origins[row] as usize] = cursor.tfs[cursor.pos];
+                                docs[kept] = docs[row];
+                                origins[kept] = origins[row];
+                                kept += 1;
+                            }
                         }
                     }
                     count = kept;
