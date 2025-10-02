@@ -896,8 +896,21 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         args.max_sparse_token_dimensions,
     );
 
+    // grpc.health.v1 reports NOT_SERVING until every index on disk is open,
+    // then SERVING until shutdown begins. A TCP check cannot distinguish a
+    // listening process from one that can answer: opening a large index
+    // takes minutes while requests wait for it.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    set_health(&health_reporter, tonic_health::ServingStatus::NotServing).await;
+    let startup_registry = Arc::clone(&registry);
+    let startup_health = health_reporter.clone();
+    let startup = tokio::spawn(async move {
+        open_indexes_then_serve(&startup_registry, &startup_health).await;
+    });
+
     let signal_registry = Arc::clone(&registry);
     let signal_shutdown = shutdown_tx.clone();
+    let signal_health = health_reporter.clone();
     let serve_result = Server::builder()
         // Connection management
         .tcp_keepalive(Some(Duration::from_secs(60)))
@@ -910,6 +923,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         // Concurrency limits: prevent single connection from monopolizing
         .max_concurrent_streams(Some(256))
         .concurrency_limit_per_connection(128)
+        .add_service(health_service)
         .add_service(
             SearchServiceServer::new(search_service)
                 .max_decoding_message_size(service_limits.search_max_decode_bytes)
@@ -931,6 +945,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             // Stop new requests/optimizer scans immediately. Accepted commits
             // keep segment-build admission until they release the writer.
             signal_registry.begin_shutdown();
+            set_health(&signal_health, tonic_health::ServingStatus::NotServing).await;
             let _ = signal_shutdown.send(true);
         })
         .await;
@@ -938,7 +953,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     // A transport failure also takes the complete application through the
     // same ordered shutdown path.
     registry.begin_shutdown();
+    set_health(&health_reporter, tonic_health::ServingStatus::NotServing).await;
     let _ = shutdown_tx.send(true);
+    // Opening stops at the next index once admission is closed.
+    let _ = startup.await;
 
     info!("[shutdown] gRPC server drained; waiting for background work");
     // Stop managers only after accepted commits release their writer guards.
@@ -955,6 +973,46 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     registry_result?;
     info!("Summa server shut down gracefully");
     Ok(())
+}
+
+/// Health service names: the server as a whole ("") and each RPC service.
+const HEALTH_SERVICES: [&str; 3] = ["", "summa.SearchService", "summa.IndexService"];
+
+async fn set_health(
+    reporter: &tonic_health::server::HealthReporter,
+    status: tonic_health::ServingStatus,
+) {
+    for service in HEALTH_SERVICES {
+        reporter.set_service_status(service, status).await;
+    }
+}
+
+/// Open every index on disk, then report SERVING unless shutdown has begun.
+async fn open_indexes_then_serve(
+    registry: &registry::IndexRegistry,
+    health: &tonic_health::server::HealthReporter,
+) {
+    let started = std::time::Instant::now();
+    match registry.open_all_indexes().await {
+        Ok((opened, failed)) => {
+            info!(
+                "[startup] opened {} index(es) in {:.1?} ({} failed); serving",
+                opened,
+                started.elapsed(),
+                failed
+            );
+        }
+        Err(status) => {
+            warn!("[startup] index opening stopped: {}", status.message());
+            return;
+        }
+    }
+    set_health(health, tonic_health::ServingStatus::Serving).await;
+    // Shutdown closes admission before reporting NOT_SERVING. If it began
+    // while SERVING was being reported, restore NOT_SERVING here.
+    if !registry.is_running() {
+        set_health(health, tonic_health::ServingStatus::NotServing).await;
+    }
 }
 
 async fn shutdown_signal() {
@@ -992,6 +1050,59 @@ fn merge_bp_time_budget(seconds: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn health_status(reporter: &tonic_health::server::HealthReporter) -> i32 {
+        use tonic_health::pb::health_server::Health;
+        tonic_health::server::HealthService::from_health_reporter(reporter.clone())
+            .check(tonic::Request::new(tonic_health::pb::HealthCheckRequest {
+                service: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .status
+    }
+
+    #[tokio::test]
+    async fn health_reports_serving_only_after_indexes_open_and_until_shutdown() {
+        use tonic_health::pb::health_check_response::ServingStatus as Wire;
+        let root = std::env::temp_dir().join(format!(
+            "summa_server_health_{}",
+            summa_core::segment::SegmentId::new().to_hex()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = IndexConfig {
+            num_indexing_threads: 1,
+            ..Default::default()
+        };
+        let creator = registry::IndexRegistry::new(root.clone(), config.clone());
+        creator
+            .create_index("social", summa_core::SchemaBuilder::default().build())
+            .await
+            .unwrap();
+        creator.shutdown().await.unwrap();
+        drop(creator);
+
+        let registry = registry::IndexRegistry::new(root.clone(), config);
+        let reporter = tonic_health::server::HealthReporter::new();
+        set_health(&reporter, tonic_health::ServingStatus::NotServing).await;
+        assert_eq!(health_status(&reporter).await, Wire::NotServing as i32);
+
+        open_indexes_then_serve(&registry, &reporter).await;
+        assert_eq!(health_status(&reporter).await, Wire::Serving as i32);
+        assert_eq!(registry.list_indexes().await.unwrap(), vec!["social"]);
+
+        // The signal path closes admission, then reports NOT_SERVING; a
+        // later startup pass must not report SERVING again.
+        registry.begin_shutdown();
+        set_health(&reporter, tonic_health::ServingStatus::NotServing).await;
+        open_indexes_then_serve(&registry, &reporter).await;
+        assert_eq!(health_status(&reporter).await, Wire::NotServing as i32);
+
+        registry.shutdown().await.unwrap();
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn payload_cli_rejects_invalid_budgets_and_preserves_mmap_default() {

@@ -7078,7 +7078,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "summa-broker"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -7109,7 +7109,7 @@ dependencies = [
 
 [[package]]
 name = "summa-core"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "arc-swap",
  "async-channel",
@@ -7163,7 +7163,7 @@ dependencies = [
 
 [[package]]
 name = "summa-llm"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -7197,7 +7197,7 @@ dependencies = [
 
 [[package]]
 name = "summa-mal"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "pest",
@@ -7209,7 +7209,7 @@ dependencies = [
 
 [[package]]
 name = "summa-mal-python"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "pyo3",
  "serde_json",
@@ -7218,11 +7218,11 @@ dependencies = [
 
 [[package]]
 name = "summa-proto"
-version = "2.0.1"
+version = "2.0.2"
 
 [[package]]
 name = "summa-server"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -7244,13 +7244,14 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-build",
+ "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
 ]
 
 [[package]]
 name = "summa-tokenizer"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "ahash",
  "aho-corasick",
@@ -7269,7 +7270,7 @@ dependencies = [
 
 [[package]]
 name = "summa-tool"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "bincode",
@@ -7292,7 +7293,7 @@ dependencies = [
 
 [[package]]
 name = "summa-train"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "anyhow",
  "burn-core",
@@ -7321,7 +7322,7 @@ dependencies = [
 
 [[package]]
 name = "summa-wasm"
-version = "2.0.1"
+version = "2.0.2"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",

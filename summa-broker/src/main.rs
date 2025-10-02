@@ -114,6 +114,14 @@ struct Args {
     #[arg(long)]
     max_concurrent_searches: Option<usize>,
 
+    /// Serve Search and GetTextStats of a partitioned index from the
+    /// partitions that are up when others have no routable replica or answer
+    /// UNAVAILABLE, reporting them in `missing_partitions` and
+    /// summa_broker_partial_reads_total. Writes, commits, GetIndexInfo and
+    /// other failures stay strict. Off: any missing partition fails the read.
+    #[arg(long)]
+    partial_partition_reads: bool,
+
     /// Steady-state seconds between ListIndexes polls of a healthy backend
     #[arg(long, default_value = "15")]
     index_poll_interval_secs: u64,
@@ -438,6 +446,7 @@ async fn async_main(args: Args) -> Result<()> {
         read_rotation: AtomicUsize::new(0),
         shutting_down: Arc::clone(&shutting_down),
         primary_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
+        partial_partition_reads: args.partial_partition_reads,
     });
 
     let search_service = search_service::BrokerSearchService {
@@ -462,6 +471,14 @@ async fn async_main(args: Args) -> Result<()> {
     info!("Summa broker v{}", env!("CARGO_PKG_VERSION"));
     info!("Starting Summa broker on {addr}");
     info!("Discovery: {:?}", args.discovery);
+    info!(
+        "Partitioned reads: {}",
+        if args.partial_partition_reads {
+            "partial (missing partitions are left out and reported)"
+        } else {
+            "strict (every partition must answer)"
+        }
+    );
     info!(
         "Per-backend search admission: {}",
         args.backend_max_searches

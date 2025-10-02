@@ -387,6 +387,10 @@ async fn get_index_info_and_get_document_pass_through() {
 /// Three partitions of `documents` on shards 2, 3 and 4 (a multi-shard
 /// placement rule): writes hash by primary key, reads fan out and merge.
 async fn partitioned_fixture() -> (Vec<MockBackend>, BrokerProc) {
+    partitioned_fixture_with(&[]).await
+}
+
+async fn partitioned_fixture_with(extra_args: &[&str]) -> (Vec<MockBackend>, BrokerProc) {
     let mocks: Vec<MockBackend> = (0..3).map(|_| MockBackend::new(&["documents"])).collect();
     let mut specs = Vec::new();
     for (i, mock) in mocks.iter().enumerate() {
@@ -396,7 +400,9 @@ async fn partitioned_fixture() -> (Vec<MockBackend>, BrokerProc) {
         let addr = mock.spawn().await;
         specs.push(backend_spec(&format!("m{i}"), &addr, &(i + 2).to_string()));
     }
-    let broker = spawn_broker(&specs, &["--placement", "documents*=2,3,4"]);
+    let mut args = vec!["--placement", "documents*=2,3,4"];
+    args.extend_from_slice(extra_args);
+    let broker = spawn_broker(&specs, &args);
     wait_for_indexes(&broker, &["documents"], Duration::from_secs(10)).await;
     (mocks, broker)
 }
@@ -752,6 +758,210 @@ async fn partitioned_reads_aggregate_and_fail_on_any_partition() {
         "{}",
         failed.message()
     );
+}
+
+fn quantum_match(index_name: &str) -> SearchRequest {
+    let mut request = simple_search_request(index_name);
+    request.query = Some(Query {
+        query: Some(query::Query::Match(MatchQuery {
+            field: "title".to_string(),
+            text: "quantum".to_string(),
+            ..Default::default()
+        })),
+    });
+    request.limit = 10;
+    request
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_partition_reads_serve_the_partitions_that_are_up() {
+    let (mocks, broker) = partitioned_fixture_with(&[
+        "--partial-partition-reads",
+        "--backend-unreachable-grace-secs",
+        "2",
+    ])
+    .await;
+    for (i, mock) in mocks.iter().enumerate() {
+        mock.state.lock().search_response = SearchResponse {
+            hits: vec![scored_hit(&format!("p{i}"), 9.0 - i as f32)],
+            total_hits: 100,
+            ..Default::default()
+        };
+    }
+    let mut search = broker_search_client(&broker).await;
+    let full = search
+        .search(quantum_match("documents"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(full.missing_partitions, 0);
+    assert_eq!(full.hits.len(), 3);
+
+    // The partition answers UNAVAILABLE while the broker still routes to it
+    // (suspect window): left out of the statistics and of the search.
+    mocks[1].state.lock().unavailable = true;
+    let partial = search
+        .search(quantum_match("documents"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(partial.missing_partitions, 1);
+    assert_eq!(
+        partial.hits.iter().map(hit_id).collect::<Vec<_>>(),
+        ["p0", "p2"]
+    );
+    assert_eq!(partial.total_hits, 200);
+    for i in [0, 2] {
+        let state = mocks[i].state.lock();
+        let sent = state.search_requests.last().unwrap();
+        // Scores use the statistics of the partitions that answered.
+        assert_eq!(sent.text_stats.as_ref().map(|s| s.total_docs), Some(84));
+    }
+    let stats = search
+        .get_text_stats(GetTextStatsRequest {
+            index_name: "documents".to_string(),
+            query: quantum_match("documents").query,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(stats.missing_partitions, 1);
+    assert_eq!(stats.stats.unwrap().total_docs, 84);
+
+    // Counts, documents that may live on the missing partition and writes
+    // stay strict.
+    let info = search
+        .get_index_info(GetIndexInfoRequest {
+            index_name: "documents".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(info.code(), tonic::Code::Unavailable);
+    for i in [0, 2] {
+        mocks[i].state.lock().document_missing = true;
+    }
+    let document = search
+        .get_document(GetDocumentRequest {
+            index_name: "documents".to_string(),
+            address: Some(DocAddress {
+                segment_id: "seg".to_string(),
+                doc_id: 1,
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(document.code(), tonic::Code::Unavailable, "{document:?}");
+    let commit = broker_index_client(&broker)
+        .await
+        .commit(CommitRequest {
+            index_name: "documents".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(commit.code(), tonic::Code::Unavailable, "{commit:?}");
+
+    // Once the broker evicts the backend, the partition has no routable
+    // replica and is skipped before any RPC; reads keep succeeding.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        let response = search
+            .search(quantum_match("documents"))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.missing_partitions, 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Losing every partition still fails.
+    for i in [0, 2] {
+        mocks[i].state.lock().unavailable = true;
+    }
+    let failed = search.search(quantum_match("documents")).await.unwrap_err();
+    assert!(
+        matches!(
+            failed.code(),
+            tonic::Code::Unavailable | tonic::Code::NotFound
+        ),
+        "{failed:?}"
+    );
+
+    // Recovery restores complete answers.
+    for mock in &mocks {
+        mock.state.lock().unavailable = false;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(response) = search.search(quantum_match("documents")).await
+            && response.get_ref().missing_partitions == 0
+        {
+            assert_eq!(response.into_inner().hits.len(), 3);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "partitions never recovered"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn partial_partition_reads_cover_coordinated_fusion() {
+    let (mocks, broker) = partitioned_fixture_with(&[
+        "--partial-partition-reads",
+        "--backend-unreachable-grace-secs",
+        "2",
+    ])
+    .await;
+    for mock in &mocks {
+        mock.state.lock().search_response = SearchResponse {
+            ranking_method: "fusion_candidates_v1".into(),
+            fusion_candidates: (0..2)
+                .map(|query_index| FusionCandidateList {
+                    query_index,
+                    candidates: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+    }
+    let branch = |query| WeightedQuery {
+        query: Some(Query { query: Some(query) }),
+        weight: 1.0,
+        ..Default::default()
+    };
+    let mut hybrid = simple_search_request("documents");
+    hybrid.query = Some(Query {
+        query: Some(query::Query::Fusion(FusionQuery {
+            queries: vec![
+                branch(query::Query::SparseVector(SparseVectorQuery {
+                    field: "sparse_vectors".to_string(),
+                    ..Default::default()
+                })),
+                branch(query::Query::Match(MatchQuery {
+                    field: "content".to_string(),
+                    text: "quantum".to_string(),
+                    ..Default::default()
+                })),
+            ],
+            ..Default::default()
+        })),
+    });
+    let mut search = broker_search_client(&broker).await;
+    let full = search.search(hybrid.clone()).await.unwrap().into_inner();
+    assert_eq!(full.missing_partitions, 0);
+    mocks[2].state.lock().unavailable = true;
+    let partial = search.search(hybrid.clone()).await.unwrap().into_inner();
+    assert_eq!(partial.missing_partitions, 1);
+    // After eviction the partition is skipped at routing, before the plan's
+    // statistics round; the coordinated search keeps answering.
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    while std::time::Instant::now() < deadline {
+        let response = search.search(hybrid.clone()).await.unwrap().into_inner();
+        assert_eq!(response.missing_partitions, 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// Exercise compressed transport, the three-way decode split and the combined

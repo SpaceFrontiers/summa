@@ -236,6 +236,12 @@ field content: text<lex(by: languages, default: en, stop_words: true)> [indexed<
   (MaxScore bounds and scores, term and phrase scorers) at query time; the
   stored block bounds are parameter-free, so no rebuild is needed to change
   them.
+- `indexed<token_position, common_grams: ["data", "model"]>` also indexes
+  every adjacent pair of the listed words as one term, so an exact two-word
+  phrase of them reads one posting list
+  ([common word pairs](common-word-pairs.md)). Plain (not chunked) text fields
+  with token positions only; every word must be a single token of the field's
+  tokenizer (stop words are not). The list is fixed when the index is created.
 
 See `docs/dynamic-tokenizer-and-phrase.md` for the design.
 

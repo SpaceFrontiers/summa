@@ -925,6 +925,14 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             if entry.chunked {
                 idx_params.push("chunked".to_string());
             }
+            if !entry.common_grams.is_empty() {
+                let words: Vec<String> = entry
+                    .common_grams
+                    .iter()
+                    .map(|word| format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\"")))
+                    .collect();
+                idx_params.push(format!("common_grams: [{}]", words.join(", ")));
+            }
             // BM25 parameters of a text field
             if let Some(k1) = entry.bm25_k1 {
                 idx_params.push(format!("k1: {k1}"));
@@ -2417,6 +2425,31 @@ mod tests {
             .unwrap();
         assert_eq!(entry.bm25_k1, Some(0.9));
         assert_eq!(entry.bm25_b, Some(0.4));
+    }
+
+    #[test]
+    fn schema_to_sdl_round_trips_common_grams() {
+        let input = r#"
+            index documents {
+                field title: text<simple> [indexed<token_position, common_grams: ["of", "the", "q\"x"]>]
+            }
+        "#;
+        let schema = summa_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let words = |schema: &Schema| {
+            schema
+                .get_field_entry(schema.get_field("title").unwrap())
+                .unwrap()
+                .common_grams
+                .clone()
+        };
+        assert_eq!(words(&schema), ["of", "the", "q\"x"]);
+        let rendered = schema_to_sdl(&schema);
+        assert!(
+            rendered.contains(r#"common_grams: ["of", "the", "q\"x"]"#),
+            "{rendered}"
+        );
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        assert_eq!(words(&reparsed), words(&schema));
     }
 
     #[test]

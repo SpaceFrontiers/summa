@@ -126,7 +126,7 @@ impl BrokerIndexService {
                 record_backend(&target.backend_id, "batch_index_documents", started, code);
                 Ok(result?.into_inner())
             }
-            Route::Partitioned(targets) => {
+            Route::Partitioned { targets, .. } => {
                 let primary_key = self.ctx.primary_key_field(index_name, &targets[0]).await?;
                 let routed = partition::route_documents(documents, &primary_key, targets.len());
                 let calls = routed
