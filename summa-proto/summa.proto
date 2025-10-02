@@ -344,6 +344,8 @@ message GetTextStatsRequest {
 
 message GetTextStatsResponse {
   TextStats stats = 1;
+  // Broker only: partitions left out of a partial read (see SearchResponse).
+  uint32 missing_partitions = 2;
 }
 
 // BM25 statistics of a set of text terms.
@@ -463,6 +465,10 @@ message SearchResponse {
   // Capability 4 acknowledgment, true only when every backend honored the
   // requested document-only passage seeding policy. Old adapters default false.
   bool seeded_document_passages = 9;
+  // Broker only: partitions of a partitioned index that did not contribute
+  // (no routable replica or UNAVAILABLE) when the broker serves partial
+  // reads. Zero means every partition answered.
+  uint32 missing_partitions = 10;
 }
 
 message SearchTrace {

@@ -135,8 +135,19 @@ what local development and the integration tests use.
 One logical index across several shards, declared by a multi-shard placement
 rule: `--placement "documents*=2,3,4"`. Partition order = rule order (an
 immutable contract: repartitioning or reordering = full rebuild). Every
-partition must host the index; a partition without it fails the request
-with `FAILED_PRECONDITION` instead of serving a partial view.
+partition must host the index; by default a partition without a routable
+copy fails the request instead of serving a partial view.
+
+`--partial-partition-reads` trades completeness for availability, e.g. to
+restart one partition at a time. `Search` (pointwise and coordinated fusion)
+and `GetTextStats` then skip partitions that have no routable replica or
+answer `UNAVAILABLE`, score with the statistics of the partitions that
+answered and report the rest in `missing_partitions` and
+`summa_broker_partial_reads_total{index,rpc,shard}`; clients that need a
+complete answer must check that field. Any other partition error, or losing
+every partition, still fails. `GetIndexInfo`, writes and commits stay strict,
+and `GetDocument` returns `UNAVAILABLE` instead of `NOT_FOUND` when the
+document may live on a missing partition.
 
 Writes:
 

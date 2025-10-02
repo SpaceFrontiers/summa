@@ -165,6 +165,9 @@ pub struct TopologySnapshot {
     pub indexes: BTreeMap<String, IndexRoute>,
 }
 
+/// Partition shards in rule order and the ones without a routable copy.
+pub type PartitionAvailability<'a> = (&'a [ShardId], Vec<&'a ShardId>);
+
 /// Outcome of read-path backend selection.
 #[derive(Debug)]
 pub struct ReadSelection<'a> {
@@ -269,15 +272,10 @@ impl TopologySnapshot {
     /// several; every partition must advertise the index (a partially
     /// present partitioned index cannot answer correctly).
     pub fn partitions(&self, index_name: &str) -> Result<Option<&[ShardId]>, Status> {
-        let route = self.route(index_name)?;
-        let Some(partitions) = route.partitions() else {
+        let Some((partitions, missing)) = self.partition_availability(index_name)? else {
             return Ok(None);
         };
-        let missing: Vec<&str> = partitions
-            .iter()
-            .filter(|shard| !route.shards.contains(shard))
-            .map(|shard| shard.0.as_str())
-            .collect();
+        let missing: Vec<&str> = missing.iter().map(|shard| shard.0.as_str()).collect();
         if !missing.is_empty() {
             return Err(Status::unavailable(format!(
                 "index '{index_name}' is partitioned over {} shards but partition(s) [{}] carry no healthy copy",
@@ -286,6 +284,23 @@ impl TopologySnapshot {
             )));
         }
         Ok(Some(partitions))
+    }
+
+    /// Partition shards of `index_name` in rule order, plus those on which no
+    /// routable backend advertises it. `None` = the index is not partitioned.
+    pub fn partition_availability(
+        &self,
+        index_name: &str,
+    ) -> Result<Option<PartitionAvailability<'_>>, Status> {
+        let route = self.route(index_name)?;
+        let Some(partitions) = route.partitions() else {
+            return Ok(None);
+        };
+        let missing = partitions
+            .iter()
+            .filter(|shard| !route.shards.contains(shard))
+            .collect();
+        Ok(Some((partitions, missing)))
     }
 
     /// Pick the backend serving a read for `index_name` on one shard.

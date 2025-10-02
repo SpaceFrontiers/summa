@@ -557,7 +557,11 @@ export interface GetTextStatsRequest {
 }
 
 export interface GetTextStatsResponse {
-  stats: TextStats | undefined;
+  stats:
+    | TextStats
+    | undefined;
+  /** Broker only: partitions left out of a partial read (see SearchResponse). */
+  missingPartitions: number;
 }
 
 /** BM25 statistics of a set of text terms. */
@@ -726,6 +730,12 @@ export interface SearchResponse {
    * requested document-only passage seeding policy. Old adapters default false.
    */
   seededDocumentPassages: boolean;
+  /**
+   * Broker only: partitions of a partitioned index that did not contribute
+   * (no routable replica or UNAVAILABLE) when the broker serves partial
+   * reads. Zero means every partition answered.
+   */
+  missingPartitions: number;
 }
 
 export interface SearchTrace {
@@ -4119,13 +4129,16 @@ export const GetTextStatsRequest: MessageFns<GetTextStatsRequest> = {
 };
 
 function createBaseGetTextStatsResponse(): GetTextStatsResponse {
-  return { stats: undefined };
+  return { stats: undefined, missingPartitions: 0 };
 }
 
 export const GetTextStatsResponse: MessageFns<GetTextStatsResponse> = {
   encode(message: GetTextStatsResponse, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.stats !== undefined) {
       TextStats.encode(message.stats, writer.uint32(10).fork()).join();
+    }
+    if (message.missingPartitions !== 0) {
+      writer.uint32(16).uint32(message.missingPartitions);
     }
     return writer;
   },
@@ -4145,6 +4158,14 @@ export const GetTextStatsResponse: MessageFns<GetTextStatsResponse> = {
           message.stats = TextStats.decode(reader, reader.uint32());
           continue;
         }
+        case 2: {
+          if (tag !== 16) {
+            break;
+          }
+
+          message.missingPartitions = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -4155,13 +4176,23 @@ export const GetTextStatsResponse: MessageFns<GetTextStatsResponse> = {
   },
 
   fromJSON(object: any): GetTextStatsResponse {
-    return { stats: isSet(object.stats) ? TextStats.fromJSON(object.stats) : undefined };
+    return {
+      stats: isSet(object.stats) ? TextStats.fromJSON(object.stats) : undefined,
+      missingPartitions: isSet(object.missingPartitions)
+        ? globalThis.Number(object.missingPartitions)
+        : isSet(object.missing_partitions)
+        ? globalThis.Number(object.missing_partitions)
+        : 0,
+    };
   },
 
   toJSON(message: GetTextStatsResponse): unknown {
     const obj: any = {};
     if (message.stats !== undefined) {
       obj.stats = TextStats.toJSON(message.stats);
+    }
+    if (message.missingPartitions !== 0) {
+      obj.missingPartitions = Math.round(message.missingPartitions);
     }
     return obj;
   },
@@ -4174,6 +4205,7 @@ export const GetTextStatsResponse: MessageFns<GetTextStatsResponse> = {
     message.stats = (object.stats !== undefined && object.stats !== null)
       ? TextStats.fromPartial(object.stats)
       : undefined;
+    message.missingPartitions = object.missingPartitions ?? 0;
     return message;
   },
 };
@@ -5894,6 +5926,7 @@ function createBaseSearchResponse(): SearchResponse {
     fusionCandidates: [],
     trace: undefined,
     seededDocumentPassages: false,
+    missingPartitions: 0,
   };
 }
 
@@ -5925,6 +5958,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     }
     if (message.seededDocumentPassages !== false) {
       writer.uint32(72).bool(message.seededDocumentPassages);
+    }
+    if (message.missingPartitions !== 0) {
+      writer.uint32(80).uint32(message.missingPartitions);
     }
     return writer;
   },
@@ -6008,6 +6044,14 @@ export const SearchResponse: MessageFns<SearchResponse> = {
           message.seededDocumentPassages = reader.bool();
           continue;
         }
+        case 10: {
+          if (tag !== 80) {
+            break;
+          }
+
+          message.missingPartitions = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -6048,6 +6092,11 @@ export const SearchResponse: MessageFns<SearchResponse> = {
         : isSet(object.seeded_document_passages)
         ? globalThis.Boolean(object.seeded_document_passages)
         : false,
+      missingPartitions: isSet(object.missingPartitions)
+        ? globalThis.Number(object.missingPartitions)
+        : isSet(object.missing_partitions)
+        ? globalThis.Number(object.missing_partitions)
+        : 0,
     };
   },
 
@@ -6080,6 +6129,9 @@ export const SearchResponse: MessageFns<SearchResponse> = {
     if (message.seededDocumentPassages !== false) {
       obj.seededDocumentPassages = message.seededDocumentPassages;
     }
+    if (message.missingPartitions !== 0) {
+      obj.missingPartitions = Math.round(message.missingPartitions);
+    }
     return obj;
   },
 
@@ -6101,6 +6153,7 @@ export const SearchResponse: MessageFns<SearchResponse> = {
       ? SearchTrace.fromPartial(object.trace)
       : undefined;
     message.seededDocumentPassages = object.seededDocumentPassages ?? false;
+    message.missingPartitions = object.missingPartitions ?? 0;
     return message;
   },
 };
