@@ -130,4 +130,3 @@ the schema and tokenizer errors.
 - The QL phrase parser tokenizes with `Purpose::Index`, which emits variants
   at repeated positions (`dsl/ql/mod.rs:760`); unrelated to pairs, but found
   while reviewing phrase construction.
-- SDL syntax for `common_grams`.
