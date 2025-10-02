@@ -120,7 +120,12 @@ Kubernetes mode watches **Pods** (not EndpointSlices — shard identity and
 role are pod labels, and the pod carries labels, IP, and readiness in one
 object) in `--namespace` with a label-existence selector on the shard label.
 Readiness = PodReady ∧ has IP ∧ not terminating; unready pods are visible in
-the admin surface but never routed or polled. RBAC: `get/list/watch pods` in
+the admin surface but never routed or polled. summa-server serves
+`grpc.health.v1`: `NOT_SERVING` until every index in its data directory is
+open (opening a large index pins its metadata and takes minutes), `SERVING`
+until shutdown begins. Use a gRPC readiness probe so a restarting shard is
+not routed while it loads; keep liveness on TCP, because loading is not a
+hang. RBAC: `get/list/watch pods` in
 the summa namespace. Static mode (`--discovery static --backend
 "id=..,addr=..,shard=..[,role=..]"`) feeds the identical machinery and is
 what local development and the integration tests use.
@@ -204,7 +209,9 @@ oplog: a follower that diverges beyond the client's retry horizon is rebuilt.
   `RefreshTopology`.
 - Metrics: `summa_broker_*`, documented in [metrics.md](metrics.md).
 - Shutdown mirrors summa-server: SIGTERM → refuse new RPCs with
-  `UNAVAILABLE("Summa broker is shutting down")`, drain, stop.
+  `UNAVAILABLE("Summa broker is shutting down")`, drain, stop. summa-server
+  also commits each index's admitted documents before stopping its writers;
+  only a crash discards an uncommitted generation.
 
 ## Testing
 
