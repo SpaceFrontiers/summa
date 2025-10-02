@@ -907,6 +907,51 @@ async fn partial_partition_reads_serve_the_partitions_that_are_up() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slow_partitions_are_left_out_after_the_straggler_budget() {
+    let (mocks, broker) = partitioned_fixture_with(&[
+        "--partial-partition-reads",
+        "--partition-straggler-ms",
+        "300",
+    ])
+    .await;
+    for (i, mock) in mocks.iter().enumerate() {
+        mock.state.lock().search_response = SearchResponse {
+            hits: vec![scored_hit(&format!("p{i}"), 9.0 - i as f32)],
+            total_hits: 100,
+            ..Default::default()
+        };
+    }
+    // A partition still loading its segments answers far beyond the budget.
+    mocks[1].state.lock().read_delay = Some(Duration::from_secs(20));
+    let mut search = broker_search_client(&broker).await;
+    let started = std::time::Instant::now();
+    let response = search
+        .search(quantum_match("documents"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "waited {:?} for the slow partition",
+        started.elapsed()
+    );
+    assert_eq!(response.missing_partitions, 1);
+    assert_eq!(
+        response.hits.iter().map(hit_id).collect::<Vec<_>>(),
+        ["p0", "p2"]
+    );
+    // Partitions within the budget are never dropped.
+    mocks[1].state.lock().read_delay = Some(Duration::from_millis(100));
+    let response = search
+        .search(quantum_match("documents"))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(response.missing_partitions, 0);
+    assert_eq!(response.hits.len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn partial_partition_reads_cover_coordinated_fusion() {
     let (mocks, broker) = partitioned_fixture_with(&[
         "--partial-partition-reads",

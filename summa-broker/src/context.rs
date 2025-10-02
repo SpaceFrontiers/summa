@@ -36,6 +36,10 @@ pub struct BrokerContext {
     /// Serve searches and text statistics of a partitioned index from the
     /// partitions that are up (`--partial-partition-reads`).
     pub partial_partition_reads: bool,
+    /// With partial reads: how long the remaining partitions may take after
+    /// the first one answers before they are left out
+    /// (`--partition-straggler-ms`). None = wait for every partition.
+    pub partition_straggler: Option<std::time::Duration>,
 }
 
 impl BrokerContext {

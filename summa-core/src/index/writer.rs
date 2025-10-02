@@ -502,6 +502,33 @@ fn try_acquire_writer_lock<D: DirectoryWriter + 'static>(directory: &D) -> Resul
     }
 }
 
+/// Lock-free view of a writer's memory for periodic metrics: sampling never
+/// waits for the writer lock a commit or flush holds.
+#[derive(Clone)]
+pub struct WriterMemoryProbe {
+    builder_memory: Arc<[AtomicUsize]>,
+    primary_key_index: Arc<parking_lot::RwLock<Option<super::primary_key::PrimaryKeyIndex>>>,
+}
+
+impl WriterMemoryProbe {
+    /// Estimated bytes of the open segment builders (uncommitted documents).
+    pub fn indexing_buffer_bytes(&self) -> usize {
+        self.builder_memory
+            .iter()
+            .map(|bytes| bytes.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Bytes held by the primary-key dedup index (bloom filter and staged
+    /// keys); zero for an index without a primary key.
+    pub fn primary_key_bytes(&self) -> usize {
+        self.primary_key_index
+            .read()
+            .as_ref()
+            .map_or(0, |index| index.memory_bytes())
+    }
+}
+
 /// Async IndexWriter for adding documents and committing segments.
 ///
 /// **Backpressure:** `add_document()` is sync and O(1). It returns
@@ -589,6 +616,10 @@ struct WorkerState<D: DirectoryWriter + 'static> {
     tokenizers: parking_lot::RwLock<FxHashMap<Field, BoxedTokenizer>>,
     /// Fixed per-worker memory budget (bytes). When a builder exceeds this, segment is built.
     memory_budget_per_worker: usize,
+    /// Estimated bytes held by each worker's open builder, including while it
+    /// builds a segment; zero when the worker holds none. Read by
+    /// [`WriterMemoryProbe`].
+    builder_memory: Arc<[AtomicUsize]>,
     /// Limits live segment finalization to N - 1 workers, reserving
     /// queue-draining capacity; closed-queue tail flushes may use all N.
     segment_build_limiter: SegmentBuildLimiter,
@@ -684,6 +715,14 @@ impl<D: DirectoryWriter + 'static> Drop for PreparedSegment<D> {
 }
 
 impl<D: DirectoryWriter + 'static> IndexWriter<D> {
+    /// A probe for this writer's memory gauges.
+    pub fn memory_probe(&self) -> WriterMemoryProbe {
+        WriterMemoryProbe {
+            builder_memory: Arc::clone(&self.worker_state.builder_memory),
+            primary_key_index: Arc::clone(&self.primary_key_index),
+        }
+    }
+
     /// Create a new index in the directory
     pub async fn create(directory: D, schema: Schema, config: IndexConfig) -> Result<Self> {
         let builder_config = default_builder_config(&config);
@@ -872,6 +911,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             builder_config,
             tokenizers: parking_lot::RwLock::new(tokenizers),
             memory_budget_per_worker: config.max_indexing_memory_bytes / num_workers,
+            builder_memory: (0..num_workers).map(|_| AtomicUsize::new(0)).collect(),
             segment_build_limiter: SegmentBuildLimiter::new(num_workers),
             segment_manager: Arc::clone(&segment_manager),
             built_segments: parking_lot::Mutex::new(Vec::new()),
@@ -1437,6 +1477,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     }
 
                     let builder_memory = b.estimated_memory_bytes();
+                    state.builder_memory[worker_id].store(builder_memory, Ordering::Relaxed);
 
                     if b.num_docs() & 0x3FFF == 0 {
                         log::debug!(
@@ -1475,6 +1516,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                             std::mem::take(&mut staged_rows),
                             &handle,
                         );
+                        state.builder_memory[worker_id].store(0, Ordering::Relaxed);
                     }
                 }
 
@@ -1487,6 +1529,8 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     Self::build_segment_inline(&state, b, staged_rows, &handle);
                 }
             }));
+            // The cycle's builder is gone: flushed, discarded or unwound.
+            state.builder_memory[worker_id].store(0, Ordering::Relaxed);
 
             if build_result.is_err() {
                 log::error!(
