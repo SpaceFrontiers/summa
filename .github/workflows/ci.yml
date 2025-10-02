@@ -126,6 +126,7 @@ jobs:
 
       - name: Check shell scripts and test relaunch supervisor
         run: |
+          python3 -m unittest discover -s scripts -p 'test_publish_version.py'
           git ls-files '*.sh' -z | xargs -0 shellcheck -x -e SC1091
           python3 -m py_compile summa-train/scripts/*.py
           python3 summa-train/scripts/test_wandb_tail.py
