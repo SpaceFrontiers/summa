@@ -1,100 +1,82 @@
-"""Merge a release-only PR before tagging its exact merge commit.
-
-Requires contents/pull-requests write permissions and the repository setting
-allowing Actions to create PRs. Normal branch protection applies: a required
-review or check stops publication; this helper never approves or bypasses it.
-"""
+"""Tag a version already reviewed and merged; never write a protected branch."""
 
 import json
 import os
 import re
 import subprocess
 import sys
+from pathlib import Path
 
-RELEASE_FILES = (
-    "Cargo.toml",
-    "Cargo.lock",
-    "summa-client-python/pyproject.toml",
-    "summa-client-python/uv.lock",
-    "summa-mal-python/pyproject.toml",
-    "summa-client-typescript/package.json",
-)
+import tomllib
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def command(*args, input=None):
+def command(*args):
     return subprocess.run(
-        args, input=input, check=True, text=True, stdout=subprocess.PIPE
+        args, check=True, text=True, stdout=subprocess.PIPE
     ).stdout.strip()
 
 
-def publish(version, branch, base, repo, run=command):
+def release_version(root, requested=""):
+    def toml(path):
+        return tomllib.loads((root / path).read_text())
+
+    workspace = toml("Cargo.toml")["workspace"]
+    version = workspace["package"]["version"]
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("Expected a numeric major.minor.patch release version")
-    if not branch.startswith(f"release/v{version}-") or branch == base:
-        raise ValueError("Release changes require a separate release branch")
-    changed = set(run("git", "diff", "--name-only", "HEAD").splitlines())
-    if changed - set(RELEASE_FILES):
-        raise ValueError(
-            f"Unexpected release changes: {sorted(changed - set(RELEASE_FILES))}"
+    if requested and requested != version:
+        raise ValueError(f"Requested {requested}, but checked-out version is {version}")
+    versions = {
+        path: toml(path)["project"]["version"]
+        for path in (
+            "summa-client-python/pyproject.toml",
+            "summa-mal-python/pyproject.toml",
         )
-    run("git", "switch", "-c", branch)
-    run("git", "add", "--", *RELEASE_FILES)
-    run("git", "commit", "-m", f"chore: bump version to {version}")
+    }
+    versions["TypeScript client"] = json.loads(
+        (root / "summa-client-typescript/package.json").read_text()
+    )["version"]
+    for name, spec in workspace["dependencies"].items():
+        if isinstance(spec, dict) and "path" in spec and name.startswith("summa-"):
+            versions[f"workspace dependency {name}"] = spec["version"]
+    for package in toml("Cargo.lock")["package"]:
+        if "source" not in package and package["name"].startswith("summa-"):
+            versions[f"Cargo.lock {package['name']}"] = package["version"]
+    client = next(
+        package
+        for package in toml("summa-client-python/uv.lock")["package"]
+        if package["name"] == "summa-client-python"
+    )
+    versions["Python client lockfile"] = client["version"]
+    mismatches = {name: value for name, value in versions.items() if value != version}
+    if mismatches:
+        raise ValueError(f"Release versions must all match {version}: {mismatches}")
+    return version
+
+
+def publish(version, run=command):
+    if run("git", "status", "--porcelain"):
+        raise ValueError("Release must use a clean, committed checkout")
     head = run("git", "rev-parse", "HEAD")
-    run("git", "push", "origin", f"HEAD:refs/heads/{branch}")
-    pr = run(
-        "gh",
-        "pr",
-        "create",
-        "--repo",
-        repo,
-        "--base",
-        base,
-        "--head",
-        branch,
-        "--title",
-        f"chore: bump version to {version}",
-        "--body-file",
-        "-",
-        input=f"Prepare version {version} for publish.yml. Only package versions and "
-        "lockfiles change. Publishing starts only after this PR is merged; "
-        "the release tag points to its exact merge commit.\n",
-    )
-    print(f"Release pull request: {pr}", flush=True)
-    run(
-        "gh", "pr", "merge", pr, "--repo", repo, "--squash", "--match-head-commit", head
-    )
-    merged = json.loads(
-        run(
-            "gh",
-            "pr",
-            "view",
-            pr,
-            "--repo",
-            repo,
-            "--json",
-            "state,headRefOid,mergeCommit",
-        )
-    )
-    if merged["state"] != "MERGED":
-        raise ValueError(f"Release PR is not merged; no tag was created: {pr}")
-    if merged["headRefOid"] != head:
-        raise ValueError("Release PR head changed; refusing to tag another revision")
-    merge_sha = merged["mergeCommit"]["oid"]
-    run("git", "fetch", "origin", merge_sha)
-    # A merge may include newer main commits, but all prepared version files
-    # must still match the release we are about to publish.
-    run("git", "diff", "--exit-code", head, merge_sha, "--", *RELEASE_FILES)
-    run("git", "tag", f"v{version}", merge_sha)
-    run("git", "push", "origin", f"refs/tags/v{version}")
-    return merge_sha
+    tag = f"v{version}"
+    ref = f"refs/tags/{tag}"
+    if run("git", "ls-remote", "--tags", "origin", ref):
+        run("git", "fetch", "origin", f"{ref}:{ref}")
+        if run("git", "rev-parse", f"{tag}^{{commit}}") != head:
+            raise ValueError(
+                f"{tag} already tags another commit; bump versions through a PR first"
+            )
+    else:
+        run("git", "tag", tag, head)
+        run("git", "push", "origin", ref)
+    return head
 
 
 if __name__ == "__main__":
-    version = sys.argv[1]
-    branch = f"release/v{version}-{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
-    sha = publish(
-        version, branch, os.environ["BASE_BRANCH"], os.environ["GITHUB_REPOSITORY"]
-    )
+    os.chdir(ROOT)
+    version = release_version(ROOT, sys.argv[1] if len(sys.argv) > 1 else "")
+    sha = publish(version)
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-        output.write(f"release_sha={sha}\n")
+        output.write(f"new_version={version}\nrelease_sha={sha}\n")
