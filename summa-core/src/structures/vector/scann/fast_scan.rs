@@ -480,7 +480,7 @@ mod tests {
         }
     }
 
-    /// The 16-bit accumulators fold into 32-bit lanes every 64 words; a
+    /// The 16-bit accumulators fold into 32-bit lanes at the configured word limit; a
     /// query with more words than one flush window and saturated table
     /// entries must still match the scalar reference exactly.
     #[test]
@@ -499,6 +499,25 @@ mod tests {
         let mut dispatched = [0i32; FAST_SCAN_LANES];
         accumulate(&fast_query, &packed, &mut dispatched);
         assert_eq!(dispatched, scalar);
+    }
+
+    #[test]
+    fn fast_scan_unsigned_extremes_survive_flush_boundaries() {
+        for blocks in [2, 126, 128, 130, 254, 256, 258, 510, 512, 514, 768] {
+            let query = FastScanQuery {
+                blocks,
+                lookup: vec![255; padded_blocks(blocks) * CENTERS_PER_BLOCK],
+                bias: 0.0,
+                multiplier: 1.0,
+                inverse_multiplier: 1.0,
+                kernel: FastScanKernel::resolve(),
+                degenerate: false,
+            };
+            let codes = vec![0; query.packed_block_bytes()];
+            let mut scores = [0; FAST_SCAN_LANES];
+            query.accumulate_block(&codes, &mut scores).unwrap();
+            assert_eq!(scores, [blocks as i32 * 255; FAST_SCAN_LANES]);
+        }
     }
 
     /// FastScan is the only leaf scorer for complete groups, so its error

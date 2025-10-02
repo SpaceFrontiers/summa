@@ -1793,6 +1793,39 @@ mod tests {
     }
 
     #[test]
+    fn integer_accumulation_preserves_extremes_across_flush_boundaries() {
+        for dims in [8, 126, 128, 130, 254, 256, 258, 510, 512, 514, 768, 1024] {
+            for value in [i8::MIN, -127, 0, i8::MAX] {
+                let base_lut = vec![value; dims * 16];
+                let qjl_lut: Vec<i8> = (0..dims * 16).map(|i| i as i8).collect();
+                let codes: Vec<u8> = (0..dims * 8).map(|i| i as u8).collect();
+                let mut expected_base = [0; TQ_BLOCK_LANES];
+                let mut expected_qjl = [0; TQ_BLOCK_LANES];
+                lut16::accumulate_block_scalar(
+                    &base_lut,
+                    &qjl_lut,
+                    &codes,
+                    dims,
+                    &mut expected_base,
+                    &mut expected_qjl,
+                );
+                let mut actual_base = [0; TQ_BLOCK_LANES];
+                let mut actual_qjl = [0; TQ_BLOCK_LANES];
+                lut16::accumulate_block(
+                    &base_lut,
+                    &qjl_lut,
+                    &codes,
+                    dims,
+                    &mut actual_base,
+                    &mut actual_qjl,
+                );
+                assert_eq!(actual_base, expected_base, "dims={dims}, value={value}");
+                assert_eq!(actual_qjl, expected_qjl, "dims={dims}, value={value}");
+            }
+        }
+    }
+
+    #[test]
     fn epilogue_matches_scalar_reference_bit_exactly() {
         let mut state = 4242u64;
         for trial in 0..256 {

@@ -2189,6 +2189,18 @@ fn score_binary_task(
         .enumerate()
     {
         let threshold = collector.prune_threshold().unwrap_or(f32::NEG_INFINITY);
+        // Hamming scores are finite. A non-short-circuit reduction lets LLVM
+        // compare a whole rejected window with SIMD before entering the
+        // metadata/collector loop. Equality must remain competitive. Portable
+        // scalar targets retain the single-pass loop below.
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        if threshold != f32::NEG_INFINITY
+            && !block
+                .iter()
+                .fold(false, |any, &score| any | (score >= threshold))
+        {
+            continue;
+        }
         for (lane, &score) in block.iter().enumerate() {
             if score < threshold {
                 continue;
