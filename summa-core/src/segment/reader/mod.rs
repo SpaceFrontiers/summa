@@ -3589,7 +3589,14 @@ impl SegmentReader {
                 checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
             let (documents, ordinal_scores) = lazy
                 .get()
-                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner, 0)
+                .search_binary_combined_documents(
+                    candidate_limit,
+                    query,
+                    &clusters,
+                    combiner,
+                    0,
+                    None,
+                )
                 .map_err(|error| {
                     Error::Corruption(format!(
                         "invalid binary ScaNN payload for field {}: {error}",
@@ -3667,6 +3674,7 @@ impl SegmentReader {
                         &clusters,
                         combiner,
                         config.effective_prefix_rerank(),
+                        Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                     .map_err(|error| {
                         Error::Corruption(format!(
@@ -3704,6 +3712,7 @@ impl SegmentReader {
                         candidate_docs,
                         &clusters,
                         config.effective_prefix_rerank(),
+                        Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 } else {
                     ivf.search_binary_clusters::<true>(
@@ -3711,6 +3720,7 @@ impl SegmentReader {
                         candidate_docs,
                         &clusters,
                         config.effective_prefix_rerank(),
+                        Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 }
                 .map_err(|error| {
@@ -4282,7 +4292,14 @@ impl SegmentReader {
                 checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
             let (documents, ordinal_scores) = lazy
                 .get()
-                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner, 0)
+                .search_binary_combined_documents(
+                    candidate_limit,
+                    query,
+                    &clusters,
+                    combiner,
+                    0,
+                    None,
+                )
                 .map_err(|error| {
                     Error::Corruption(format!(
                         "invalid binary ScaNN payload for field {}: {error}",
@@ -4359,6 +4376,7 @@ impl SegmentReader {
                         &clusters,
                         combiner,
                         config.effective_prefix_rerank(),
+                        Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                     .map_err(|error| {
                         Error::Corruption(format!(
@@ -4391,6 +4409,7 @@ impl SegmentReader {
                         candidate_docs,
                         &clusters,
                         config.effective_prefix_rerank(),
+                        Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 } else {
                     ivf.search_binary_clusters::<true>(
@@ -4398,6 +4417,7 @@ impl SegmentReader {
                         candidate_docs,
                         &clusters,
                         config.effective_prefix_rerank(),
+                        Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 }
                 .map_err(|error| {

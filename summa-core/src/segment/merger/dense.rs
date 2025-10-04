@@ -1307,7 +1307,7 @@ impl SegmentMerger {
         let mut builder = crate::structures::vector::index::BinaryIvfBuilder::new(
             quantizer,
             cfg.ivf_routing,
-            cfg.soar.is_some(),
+            crate::structures::vector::index::BinarySpill::for_config(cfg),
         )
         .map_err(crate::Error::Io)?;
         let mut labels = Vec::with_capacity(CODE_BATCH);
