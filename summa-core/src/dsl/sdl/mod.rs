@@ -1095,9 +1095,21 @@ fn apply_index_config_to_binary_dense_vector(
         {
             config.soar = Some(soar.clone());
         }
+        SoarDirective::Enabled(soar)
+            if config.index_type == super::schema::BinaryIndexType::Ivf && !soar.selective =>
+        {
+            config.soar = Some(soar.clone());
+        }
+        SoarDirective::Enabled(_) if config.index_type == super::schema::BinaryIndexType::Ivf => {
+            return Err(Error::Schema(
+                "binary IVF supports only 'soar: full' (one SOAR secondary leaf per vector); \
+                 selective spilling is available on binary ScaNN"
+                    .to_string(),
+            ));
+        }
         SoarDirective::Enabled(_) => {
             return Err(Error::Schema(
-                "'soar' on a binary dense vector requires the ScaNN index".to_string(),
+                "'soar' on a binary dense vector requires the IVF or ScaNN index".to_string(),
             ));
         }
     }
@@ -2618,7 +2630,7 @@ mod tests {
     }
 
     #[test]
-    fn binary_scann_accepts_selective_spilling_but_binary_ivf_rejects_it() {
+    fn binary_ivf_accepts_only_full_spilling_and_scann_accepts_selective() {
         let indexes = parse_sdl(
             "index valid { field hash: binary_dense_vector<256> [indexed<scann, soar: selective>] }",
         )
@@ -2635,8 +2647,31 @@ mod tests {
         let error = parse_sdl(
             "index invalid { field hash: binary_dense_vector<256> [indexed<ivf, soar: selective>] }",
         )
-        .expect_err("binary IVF spilling must fail loudly");
-        assert!(error.to_string().contains("requires the ScaNN"), "{error}");
+        .expect_err("selective binary IVF spilling must fail loudly");
+        assert!(error.to_string().contains("only 'soar: full'"), "{error}");
+
+        // Binary IVF accepts full one-secondary SOAR spilling.
+        let indexes = parse_sdl(
+            "index valid { field hash: binary_dense_vector<256> [indexed<ivf, soar: full>] }",
+        )
+        .unwrap();
+        let config = indexes[0].fields[0]
+            .binary_dense_vector_config
+            .as_ref()
+            .unwrap();
+        let soar = config
+            .soar
+            .as_ref()
+            .expect("binary IVF retains full spilling");
+        assert!(!soar.selective);
+        assert!(
+            crate::dsl::schema::reject_removed_vector_index_types(&indexes[0].to_schema()).is_ok()
+        );
+        let error = parse_sdl(
+            "index invalid { field hash: binary_dense_vector<256> [indexed<flat, soar: full>] }",
+        )
+        .expect_err("flat binary spilling must fail loudly");
+        assert!(error.to_string().contains("IVF or ScaNN"), "{error}");
     }
 
     #[test]

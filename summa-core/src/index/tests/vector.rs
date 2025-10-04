@@ -2956,3 +2956,142 @@ async fn test_binary_prefix_scan_end_to_end() {
         );
     }
 }
+
+/// `soar: full` on binary IVF stores up to one secondary posting per vector
+/// through indexing, merge and ALTER, and every query returns each document
+/// once with its exact Hamming score: probing every leaf reproduces the exact
+/// brute-force top-k scores, with or without the prefix stage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_ivf_soar_end_to_end() {
+    use crate::dsl::{BinaryDenseVectorConfig, VectorIndexAlter};
+    use crate::query::BinaryDenseVectorQuery;
+    use rand::{Rng, SeedableRng};
+
+    let dim_bits = 128;
+    let byte_len = dim_bits / 8;
+    let clusters = 8;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(29);
+    let codes: Vec<Vec<u8>> = (0..400)
+        .map(|_| (0..byte_len).map(|_| rng.random()).collect())
+        .collect();
+    let queries: Vec<Vec<u8>> = (0..10)
+        .map(|_| (0..byte_len).map(|_| rng.random()).collect())
+        .collect();
+    let exact_top = |query: &[u8]| -> Vec<f32> {
+        let mut scores: Vec<f32> = codes
+            .iter()
+            .map(|code| {
+                let distance: u32 = query
+                    .iter()
+                    .zip(code)
+                    .map(|(a, b)| (a ^ b).count_ones())
+                    .sum();
+                1.0 - distance as f32 / dim_bits as f32
+            })
+            .collect();
+        scores.sort_by(|a, b| b.total_cmp(a));
+        scores.truncate(10);
+        scores
+    };
+
+    let mut sb = SchemaBuilder::default();
+    let base = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(clusters), clusters);
+    // A rescoring depth covering every posting makes the prefix stage exact;
+    // a narrow depth is checked below for deduplication and exact scores.
+    let mut soar_config = base.clone().with_prefix(64, Some(codes.len() * 2));
+    soar_config.soar = Some(crate::structures::SoarConfig::full());
+    let field =
+        sb.add_binary_dense_vector_field_with_config("bvec", true, true, soar_config.clone());
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), sb.build(), config.clone())
+        .await
+        .unwrap();
+    for (batch, chunk) in codes.chunks(200).enumerate() {
+        for code in chunk {
+            let mut doc = Document::new();
+            doc.add_binary_dense_vector(field, code.clone());
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+        if batch == 0 {
+            writer.build_vector_index().await.unwrap();
+        }
+    }
+
+    let check = |expect_spill: bool| {
+        let dir = dir.clone();
+        let config = config.clone();
+        let queries = queries.clone();
+        async move {
+            let index = Index::open(dir, config).await.unwrap();
+            let mut postings = 0usize;
+            let mut logical = 0usize;
+            for segment in index.segment_readers().await.unwrap() {
+                let Some(crate::segment::VectorIndex::BinaryIvf(lazy)) =
+                    segment.vector_indexes().get(&field.0)
+                else {
+                    panic!("binary IVF payload expected");
+                };
+                assert_eq!(lazy.get().header().spilled, expect_spill);
+                postings += lazy.get().header().vector_count;
+                logical += segment.flat_vectors().get(&field.0).unwrap().num_vectors;
+            }
+            if expect_spill {
+                assert!(
+                    postings > logical && postings <= 2 * logical,
+                    "{postings} vs {logical}"
+                );
+            } else {
+                assert_eq!(postings, logical);
+            }
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            let mut results = Vec::new();
+            for query in &queries {
+                let hits = searcher
+                    .search(&BinaryDenseVectorQuery::new(field, query.clone()), 10)
+                    .await
+                    .unwrap();
+                let mut keys: Vec<_> = hits
+                    .iter()
+                    .map(|hit| (hit.segment_id, hit.doc_id))
+                    .collect();
+                keys.sort_unstable();
+                keys.dedup();
+                assert_eq!(
+                    keys.len(),
+                    hits.len(),
+                    "spilled copies must be deduplicated"
+                );
+                results.push(hits.iter().map(|hit| hit.score).collect::<Vec<_>>());
+            }
+            results
+        }
+    };
+    let expected: Vec<Vec<f32>> = queries.iter().map(|query| exact_top(query)).collect();
+    assert_eq!(check(true).await, expected, "two spilled segments");
+    writer.force_merge().await.unwrap();
+    assert_eq!(check(true).await, expected, "merged spilled segment");
+
+    // A narrow prefix stage is approximate but still unique and exact-scored.
+    let mut narrow = soar_config.clone();
+    narrow.prefix_rerank = Some(20);
+    writer
+        .alter_vector_index(field, VectorIndexAlter::Binary(narrow))
+        .await
+        .unwrap();
+    for (scores, exact) in check(true).await.iter().zip(&expected) {
+        assert_eq!(scores.len(), 10);
+        assert!(scores[0] <= exact[0]);
+    }
+
+    writer
+        .alter_vector_index(
+            field,
+            VectorIndexAlter::Binary(base.with_prefix(64, Some(codes.len() * 2))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(check(false).await, expected, "SOAR removed by ALTER");
+}
