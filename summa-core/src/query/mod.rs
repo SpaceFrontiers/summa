@@ -4,6 +4,30 @@
 /// Queries exceeding this limit are trimmed to the top-weighted terms.
 pub const MAX_QUERY_TERMS: usize = 64;
 
+/// Distinct tokens a text match query keeps when neither the request nor
+/// the field's `query<max_terms>` sets a cap: its rarest ones. Long text
+/// queries spend most MaxScore work on common terms that barely move the
+/// ranking.
+pub const DEFAULT_TEXT_MAX_TERMS: usize = 20;
+
+/// Mark the `cap` rarest terms of a long query from their document
+/// frequencies; `None` entries are not ranked and stay unmarked. Absent
+/// terms (frequency 0) match nothing, so they rank last; ties keep the
+/// earlier term.
+pub fn rarest_terms(doc_freqs: &[Option<u64>], cap: usize) -> Vec<bool> {
+    let mut ranked: Vec<(bool, u64, usize)> = doc_freqs
+        .iter()
+        .enumerate()
+        .filter_map(|(position, df)| df.map(|df| (df == 0, df, position)))
+        .collect();
+    ranked.sort_unstable();
+    let mut keep = vec![false; doc_freqs.len()];
+    for &(_, _, position) in ranked.iter().take(cap) {
+        keep[position] = true;
+    }
+    keep
+}
+
 /// Maximum candidate depth relative to the result window.
 ///
 /// This is the single query-level oversubscription policy used by fusion,

@@ -155,10 +155,57 @@ pub fn convert_fusion_combiner(combiner: i32) -> MultiValueCombiner {
     convert_combiner(combiner, 0.0, 0, 0.0)
 }
 
+/// Document frequencies that decide which tokens a capped `MatchQuery`
+/// keeps (`max_terms`, the field's `query<max_terms>`, or
+/// `DEFAULT_TEXT_MAX_TERMS`). The cap is resolved once per query, so every segment
+/// scores the same tokens and the result stays a plain term disjunction that
+/// keeps the text fast paths and L1 decomposition.
+#[derive(Clone, Copy)]
+pub enum TermRarity<'a> {
+    /// The searcher's index-wide frequencies.
+    Index(&'a LazyGlobalStats),
+    /// Broker-supplied cross-shard frequencies: every shard keeps the same
+    /// tokens.
+    Shared(&'a summa_core::query::GlobalStats),
+    /// Keep every token: text statistics must cover the complete query.
+    Uncapped,
+    /// No statistics: an explicit cap falls back to each segment's own
+    /// frequencies inside the executor.
+    Unavailable,
+}
+
+/// Keep the `cap` rarest distinct tokens of a match query in query order.
+fn keep_rarest_tokens(
+    distinct: &mut Vec<(String, f32)>,
+    cap: usize,
+    doc_freq: impl Fn(&str) -> u64,
+) {
+    let doc_freqs: Vec<Option<u64>> = distinct
+        .iter()
+        .map(|(token, _)| Some(doc_freq(token)))
+        .collect();
+    let mut keep = summa_core::query::rarest_terms(&doc_freqs, cap).into_iter();
+    distinct.retain(|_| keep.next().unwrap_or(false));
+}
+
 pub fn convert_query(
     query: &proto::Query,
     schema: &Schema,
     global_stats: Option<&LazyGlobalStats>,
+    idf_cache_dir: Option<&std::path::Path>,
+    shape: &QueryShapeLimits,
+) -> Result<Box<dyn Query>, String> {
+    let rarity = global_stats.map_or(TermRarity::Unavailable, TermRarity::Index);
+    convert_query_with_rarity(query, schema, global_stats, rarity, idf_cache_dir, shape)
+}
+
+/// [`convert_query`] with an explicit source of token rarity for capped
+/// match queries.
+pub fn convert_query_with_rarity(
+    query: &proto::Query,
+    schema: &Schema,
+    global_stats: Option<&LazyGlobalStats>,
+    rarity: TermRarity<'_>,
     idf_cache_dir: Option<&std::path::Path>,
     shape: &QueryShapeLimits,
 ) -> Result<Box<dyn Query>, String> {
@@ -256,6 +303,33 @@ pub fn convert_query(
                 }
             };
 
+            // Long-query cap: the request's `max_terms`, else the field's
+            // `query<max_terms>`, else the default, bounded by the engine's
+            // term limit.
+            let cap = (match_query.max_terms > 0)
+                .then_some(match_query.max_terms as usize)
+                .or_else(|| {
+                    schema
+                        .get_field_entry(field)
+                        .and_then(|entry| entry.text_max_terms)
+                        .map(|max_terms| max_terms as usize)
+                })
+                .unwrap_or(summa_core::query::DEFAULT_TEXT_MAX_TERMS)
+                .min(summa_core::query::MAX_QUERY_TERMS);
+            let mut per_segment_cap = 0;
+            if distinct.len() > cap {
+                match rarity {
+                    TermRarity::Uncapped => {}
+                    TermRarity::Unavailable => per_segment_cap = cap,
+                    TermRarity::Index(stats) => keep_rarest_tokens(&mut distinct, cap, |token| {
+                        stats.text_df(field, token.as_bytes())
+                    }),
+                    TermRarity::Shared(stats) => keep_rarest_tokens(&mut distinct, cap, |token| {
+                        stats.text_df(field, token).unwrap_or(0)
+                    }),
+                }
+            }
+
             if distinct.len() == 1 && heap_factor == 1.0 {
                 // Exact single token: keep the direct path. Tuned text must
                 // reach the text executor even when tokenization leaves one term.
@@ -277,8 +351,8 @@ pub fn convert_query(
             if heap_factor < 1.0 {
                 query = query.with_text_heap_factor(heap_factor);
             }
-            if match_query.max_terms > 0 {
-                query = query.with_max_terms(match_query.max_terms as usize);
+            if per_segment_cap > 0 {
+                query = query.with_max_terms(per_segment_cap);
             }
             Ok(Box::new(query))
         }
@@ -309,9 +383,14 @@ pub fn convert_query(
                 PhraseQuery::with_offsets(field, terms).with_slop(phrase_query.slop),
             ))
         }
-        Some(ProtoQueryType::Boolean(bool_query)) => {
-            convert_boolean_query(bool_query, schema, global_stats, idf_cache_dir, shape)
-        }
+        Some(ProtoQueryType::Boolean(bool_query)) => convert_boolean_query(
+            bool_query,
+            schema,
+            global_stats,
+            rarity,
+            idf_cache_dir,
+            shape,
+        ),
         Some(ProtoQueryType::Boost(boost_query)) => {
             if !boost_query.boost.is_finite() {
                 return Err("Boost must be a finite number".to_string());
@@ -320,7 +399,14 @@ pub fn convert_query(
                 .query
                 .as_ref()
                 .ok_or_else(|| "Boost query requires inner query".to_string())?;
-            let inner_query = convert_query(inner, schema, global_stats, idf_cache_dir, shape)?;
+            let inner_query = convert_query_with_rarity(
+                inner,
+                schema,
+                global_stats,
+                rarity,
+                idf_cache_dir,
+                shape,
+            )?;
             Ok(Box::new(BoostQuery {
                 inner: inner_query.into(),
                 boost: boost_query.boost,
@@ -737,6 +823,7 @@ fn convert_boolean_query(
     bool_query: &proto::BooleanQuery,
     schema: &Schema,
     global_stats: Option<&LazyGlobalStats>,
+    rarity: TermRarity<'_>,
     idf_cache_dir: Option<&std::path::Path>,
     shape: &QueryShapeLimits,
 ) -> Result<Box<dyn Query>, String> {
@@ -755,21 +842,24 @@ fn convert_boolean_query(
         if skip(q)? {
             continue;
         }
-        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
+        let inner =
+            convert_query_with_rarity(q, schema, global_stats, rarity, idf_cache_dir, shape)?;
         bq.must.push(inner.into());
     }
     for q in &bool_query.should {
         if skip(q)? {
             continue;
         }
-        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
+        let inner =
+            convert_query_with_rarity(q, schema, global_stats, rarity, idf_cache_dir, shape)?;
         bq.should.push(inner.into());
     }
     for q in &bool_query.must_not {
         if skip(q)? {
             continue;
         }
-        let inner = convert_query(q, schema, global_stats, idf_cache_dir, shape)?;
+        let inner =
+            convert_query_with_rarity(q, schema, global_stats, rarity, idf_cache_dir, shape)?;
         bq.must_not.push(inner.into());
     }
     Ok(Box::new(bq))
@@ -939,6 +1029,10 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             }
             if let Some(b) = entry.bm25_b {
                 idx_params.push(format!("b: {b}"));
+            }
+            // Default long-query cap of a text field
+            if let Some(max_terms) = entry.text_max_terms {
+                idx_params.push(format!("query<max_terms: {max_terms}>"));
             }
 
             // Positions (for text/sparse)
@@ -2450,6 +2544,27 @@ mod tests {
         );
         let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
         assert_eq!(words(&reparsed), words(&schema));
+    }
+
+    #[test]
+    fn schema_to_sdl_round_trips_text_query_max_terms() {
+        let input = r#"
+            index documents {
+                field title: text<simple> [indexed<query<max_terms: 12>>]
+            }
+        "#;
+        let schema = summa_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let max_terms = |schema: &Schema| {
+            schema
+                .get_field_entry(schema.get_field("title").unwrap())
+                .unwrap()
+                .text_max_terms
+        };
+        assert_eq!(max_terms(&schema), Some(12));
+        let rendered = schema_to_sdl(&schema);
+        assert!(rendered.contains("query<max_terms: 12>"), "{rendered}");
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        assert_eq!(max_terms(&reparsed), Some(12));
     }
 
     #[test]

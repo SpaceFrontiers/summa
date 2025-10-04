@@ -1493,3 +1493,226 @@ async fn payload_backends_hydrate_rpc_results_and_survive_other_index_deletion()
         assert_eq!(payload.stats().quarantined_bytes, 0);
     }
 }
+
+/// 70 filler tokens shared by every document: a query over all of them plus
+/// one rare token exceeds `MAX_QUERY_TERMS` with the rare token last.
+fn match_cap_fillers() -> Vec<String> {
+    (0..69).map(|i| format!("filler{i}")).collect()
+}
+
+/// "common" is in every document, "mid" in half, "rare" only in doc 7.
+/// `capped` repeats `body` with a schema-level `query<max_terms: 1>`.
+async fn match_cap_fixture() -> (tempfile::TempDir, Arc<IndexRegistry>, SearchServiceImpl) {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));
+    let mut schema = summa_core::Schema::builder();
+    let body = schema.add_text_field_with_tokenizer("body", true, true, "simple");
+    let capped = schema.add_text_field_with_tokenizer("capped", true, false, "simple");
+    schema.set_text_max_terms(capped, Some(1));
+    registry
+        .create_index("match-cap", schema.build())
+        .await
+        .unwrap();
+    let writer = registry.get_writer("match-cap").await.unwrap();
+    {
+        let mut writer = writer.write().await;
+        for doc in 0..8 {
+            let mut words = vec!["common".to_string()];
+            if doc % 2 == 0 {
+                words.push("mid".into());
+            }
+            if doc == 7 {
+                words.push("rare".into());
+            }
+            words.extend(match_cap_fillers());
+            let text = words.join(" ");
+            let mut document = summa_core::Document::new();
+            document.add_text(body, &text);
+            document.add_text(capped, &text);
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    let index = registry.get_or_open_index("match-cap").await.unwrap();
+    index.reader().await.unwrap().reload().await.unwrap();
+    let service = SearchServiceImpl::new(registry.clone(), 1, limits());
+    (temp, registry, service)
+}
+
+fn match_query(field: &str, text: &str, max_terms: u32) -> Query {
+    Query {
+        query: Some(query::Query::Match(MatchQuery {
+            field: field.into(),
+            text: text.into(),
+            max_terms,
+            ..Default::default()
+        })),
+    }
+}
+
+async fn converted_match(
+    registry: &IndexRegistry,
+    query: &Query,
+    rarity: Option<crate::converters::TermRarity<'_>>,
+) -> String {
+    let index = registry.get_or_open_index("match-cap").await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+    let rarity = rarity.unwrap_or(crate::converters::TermRarity::Index(
+        searcher.global_stats(),
+    ));
+    crate::converters::convert_query_with_rarity(
+        query,
+        searcher.schema(),
+        Some(searcher.global_stats()),
+        rarity,
+        None,
+        &QueryShapeLimits::default(),
+    )
+    .unwrap()
+    .to_string()
+}
+
+async fn match_hits(service: &SearchServiceImpl, query: Query) -> Vec<(u32, u32)> {
+    let response = service
+        .search(Request::new(SearchRequest {
+            index_name: "match-cap".into(),
+            query: Some(query),
+            limit: 10,
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    response
+        .hits
+        .iter()
+        .map(|hit| (hit.address.as_ref().unwrap().doc_id, hit.score.to_bits()))
+        .collect()
+}
+
+/// `MatchQuery.max_terms` is resolved once, at conversion, against
+/// index-wide document frequencies: the result is the plain query over the
+/// rarest tokens (no per-segment `~max_terms` marker that would disable the
+/// text fast paths and L1 decomposition) and scores like that query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn match_max_terms_keeps_the_index_rarest_tokens_as_a_plain_query() {
+    let (_temp, registry, service) = match_cap_fixture().await;
+    let capped = match_query("body", "common mid rare", 1);
+    let rare = match_query("body", "rare", 0);
+    let converted = converted_match(&registry, &capped, None).await;
+    assert_eq!(converted, converted_match(&registry, &rare, None).await);
+    assert!(!converted.contains("max_terms"), "{converted}");
+    assert_eq!(
+        match_hits(&service, capped).await,
+        match_hits(&service, rare).await
+    );
+    let two = converted_match(&registry, &match_query("body", "common mid rare", 2), None).await;
+    assert_eq!(
+        two,
+        converted_match(&registry, &match_query("body", "mid rare", 0), None).await,
+        "kept tokens retain query order"
+    );
+    registry.shutdown().await.unwrap();
+}
+
+/// Behind the broker every shard ranks rarity by the same cross-shard
+/// statistics, so all shards keep the same tokens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn match_max_terms_ranks_by_broker_statistics_when_supplied() {
+    let (_temp, registry, _service) = match_cap_fixture().await;
+    let index = registry.get_or_open_index("match-cap").await.unwrap();
+    let schema = index.schema().clone();
+    let body = schema.get_field("body").unwrap();
+    let mut builder = summa_core::query::GlobalStatsBuilder::new();
+    builder.total_docs = 1000;
+    builder.add_text_df(body, "common".into(), 1);
+    builder.add_text_df(body, "mid".into(), 500);
+    builder.add_text_df(body, "rare".into(), 900);
+    let shared = builder.build(0);
+    let converted = converted_match(
+        &registry,
+        &match_query("body", "common mid rare", 1),
+        Some(crate::converters::TermRarity::Shared(&shared)),
+    )
+    .await;
+    assert_eq!(
+        converted,
+        converted_match(&registry, &match_query("body", "common", 0), None).await
+    );
+    registry.shutdown().await.unwrap();
+}
+
+/// Statistics collection sees every token of a capped match query: the
+/// broker must merge frequencies for all of them before shards choose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn text_stats_report_every_token_of_a_capped_match_query() {
+    let (_temp, registry, service) = match_cap_fixture().await;
+    let stats = service
+        .get_text_stats(Request::new(GetTextStatsRequest {
+            index_name: "match-cap".into(),
+            query: Some(match_query("body", "common mid rare", 1)),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .stats
+        .unwrap();
+    let mut terms: Vec<String> = stats.fields[0]
+        .terms
+        .iter()
+        .map(|term| String::from_utf8(term.term.clone()).unwrap())
+        .collect();
+    terms.sort();
+    assert_eq!(terms, ["common", "mid", "rare"]);
+    registry.shutdown().await.unwrap();
+}
+
+/// A text field's `query<max_terms: N>` caps match queries that leave
+/// `max_terms` unset; an explicit request value overrides it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn schema_max_terms_caps_match_queries_unless_the_request_overrides_it() {
+    let (_temp, registry, _service) = match_cap_fixture().await;
+    assert_eq!(
+        converted_match(
+            &registry,
+            &match_query("capped", "common mid rare", 0),
+            None
+        )
+        .await,
+        converted_match(&registry, &match_query("capped", "rare", 0), None).await
+    );
+    assert_eq!(
+        converted_match(
+            &registry,
+            &match_query("capped", "common mid rare", 2),
+            None
+        )
+        .await,
+        // The expected side needs an explicit cap too, or the schema's 1 applies.
+        converted_match(&registry, &match_query("capped", "mid rare", 2), None).await
+    );
+    registry.shutdown().await.unwrap();
+}
+
+/// Without a request or schema cap a long match query keeps its
+/// `DEFAULT_TEXT_MAX_TERMS` rarest tokens; an explicit cap may reach the
+/// engine's `MAX_QUERY_TERMS`. Either way the discriminating token at the end
+/// survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_match_queries_keep_the_rarest_tokens_by_default_and_up_to_the_engine_limit() {
+    let (_temp, registry, service) = match_cap_fixture().await;
+    let mut words = match_cap_fillers();
+    words.push("rare".into());
+    let text = words.join(" ");
+    for (max_terms, kept) in [
+        (0, summa_core::query::DEFAULT_TEXT_MAX_TERMS),
+        (64, summa_core::query::MAX_QUERY_TERMS),
+    ] {
+        let long = match_query("body", &text, max_terms);
+        let converted = converted_match(&registry, &long, None).await;
+        assert_eq!(converted.matches("Term(").count(), kept, "{converted}");
+        assert!(converted.contains("\"rare\""), "{converted}");
+        assert_eq!(match_hits(&service, long).await[0].0, 7);
+    }
+    registry.shutdown().await.unwrap();
+}

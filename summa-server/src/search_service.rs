@@ -8,8 +8,8 @@ use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use crate::converters::{
-    convert_field_value, convert_query, convert_reranker, schema_to_sdl, text_stats_from_proto,
-    text_stats_to_proto,
+    TermRarity, convert_field_value, convert_query_with_rarity, convert_reranker, schema_to_sdl,
+    text_stats_from_proto, text_stats_to_proto,
 };
 use crate::proto::search_service_server::SearchService;
 use crate::proto::*;
@@ -102,6 +102,18 @@ impl SearchService for SearchServiceImpl {
             .query.as_ref()
             .ok_or_else(|| Status::invalid_argument("Query is required"))?;
 
+        // Broker-supplied cross-shard statistics replace this backend's own
+        // segment-aggregated IDF and decide which tokens a capped match
+        // query keeps, so every shard scores the same terms.
+        let shared_text_stats = req
+            .text_stats
+            .as_ref()
+            .map(|stats| Arc::new(text_stats_from_proto(stats, searcher.schema())));
+        let rarity = match shared_text_stats.as_deref() {
+            Some(stats) => TermRarity::Shared(stats),
+            None => TermRarity::Index(searcher.global_stats()),
+        };
+
         // Rank enough results to cover the requested page, then apply the
         // offset only after fusion/reranking so pagination preserves ranking.
         let limit = budget.search_limit;
@@ -138,12 +150,12 @@ impl SearchService for SearchServiceImpl {
             if req.l1.is_some() || req.score_export.is_some() {
                 let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query else { unreachable!("validated fusion scoring request") };
                 let queries: Vec<Arc<dyn summa_core::query::Query>> = fusion.queries.iter().map(|branch| {
-                    convert_query(branch.query.as_ref().expect("validated branch"), searcher.schema(), Some(searcher.global_stats()), Some(index.directory().root()), &self.limits.shape)
+                    convert_query_with_rarity(branch.query.as_ref().expect("validated branch"), searcher.schema(), Some(searcher.global_stats()), rarity, Some(index.directory().root()), &self.limits.shape)
                         .map(Arc::from).map_err(|e| Status::invalid_argument(format!("Invalid scoring branch: {e}")))
                 }).collect::<Result<_, _>>()?;
                 let plan = candidate_scoring::scoring_plan(fusion, &queries, &req, searcher.schema(), budget.model.clone())?;
-                let stats = match req.text_stats.as_ref() {
-                    Some(stats) => Arc::new(text_stats_from_proto(stats, searcher.schema())),
+                let stats = match shared_text_stats.clone() {
+                    Some(stats) => stats,
                     None => searcher.candidate_text_stats(&plan).await.map_err(crate::error::summa_error_to_status)?,
                 };
                 let filters = candidate_scoring::convert_filters(fusion, searcher.schema(), Some(searcher.global_stats()), Some(index.directory().root()), &self.limits.shape)?;
@@ -188,10 +200,11 @@ impl SearchService for SearchServiceImpl {
                         .query
                         .as_ref()
                         .ok_or_else(|| Status::invalid_argument("Fusion sub-query is missing"))?;
-                    let core = convert_query(
+                    let core = convert_query_with_rarity(
                         sub,
                         searcher.schema(),
                         Some(searcher.global_stats()),
+                        rarity,
                         Some(index.directory().root()),
                         &self.limits.shape,
                     )
@@ -208,7 +221,7 @@ impl SearchService for SearchServiceImpl {
                 if fusion.method == crate::proto::FusionMethod::FusionCandidates as i32 {
                     let depth = if fusion.candidate_depth == 0 { candidate_limit } else { fusion.candidate_depth as usize };
                     let queries: Vec<_> = sub_queries.iter().map(|(query, _)| query.clone()).collect();
-                    let stats = req.text_stats.as_ref().map(|stats| Arc::new(text_stats_from_proto(stats, searcher.schema())));
+                    let stats = shared_text_stats.clone();
                     let lists = searcher.search_candidate_lists(&queries, depth, stats).await.map_err(crate::error::summa_error_to_status)?;
                     if !req.tracing { fusion_candidates = candidate_scoring::export_nomination_lists(&lists, &mut response_budget)?; }
                     let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
@@ -291,10 +304,11 @@ impl SearchService for SearchServiceImpl {
                 (fused, seen, rerank_config)
                 }
             } else {
-                let core_query = convert_query(
+                let core_query = convert_query_with_rarity(
                     query,
                     searcher.schema(),
                     Some(searcher.global_stats()),
+                    rarity,
                     Some(index.directory().root()),
                     &self.limits.shape,
                 )
@@ -309,12 +323,6 @@ impl SearchService for SearchServiceImpl {
                     query_desc
                 );
 
-                // Broker-supplied cross-shard statistics replace this
-                // backend's own segment-aggregated IDF.
-                let stats_override = req
-                    .text_stats
-                    .as_ref()
-                    .map(|stats| Arc::new(text_stats_from_proto(stats, searcher.schema())));
                 // Reranking consumes plain candidates; direct results keep
                 // per-ordinal positions for multi-valued fields.
                 let collect_positions = rerank_setup.is_none();
@@ -324,7 +332,7 @@ impl SearchService for SearchServiceImpl {
                         candidate_limit,
                         collect_positions,
                         deadline,
-                        stats_override,
+                        shared_text_stats.clone(),
                         Arc::clone(&search_permit),
                     )
                     .await
@@ -624,10 +632,13 @@ impl SearchService for SearchServiceImpl {
             .searcher()
             .await
             .map_err(crate::error::summa_error_to_status)?;
-        let core_query = convert_query(
+        // Collect every token: the broker merges frequencies for the
+        // complete query before shards choose which capped tokens to keep.
+        let core_query = convert_query_with_rarity(
             &query,
             searcher.schema(),
             Some(searcher.global_stats()),
+            TermRarity::Uncapped,
             Some(index.directory().root()),
             &self.limits.shape,
         )

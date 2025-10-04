@@ -252,21 +252,56 @@ macro_rules! boolean_plan {
             let cursor_count = is_predicate.iter().filter(|&&p| !p).count();
 
             if cursor_count > super::MAX_QUERY_TERMS {
-                let mut kept = Vec::with_capacity(should_all.len());
-                let mut cursor_kept = 0usize;
+                // When every cursor clause is a text term, keep the rarest
+                // ones: a long query's discriminating terms are its rare
+                // terms, and its first terms are often the most common.
+                // Mixed clause kinds keep the first clauses.
+                let mut doc_freqs: Vec<Option<u64>> = Vec::with_capacity(should_all.len());
+                let mut all_text_terms = true;
                 for (q, &is_pred) in should_all.iter().zip(is_predicate.iter()) {
                     if is_pred {
+                        doc_freqs.push(None);
+                        continue;
+                    }
+                    let super::QueryDecomposition::TextTerm(info) = q.decompose() else {
+                        all_text_terms = false;
+                        break;
+                    };
+                    let stats = info.global_stats.as_ref().or(global_stats);
+                    let df = match stats.and_then(|stats| {
+                        stats.text_df(info.field, &String::from_utf8_lossy(&info.term))
+                    }) {
+                        Some(df) => df,
+                        None => reader.$get_postings_fn(info.field, &info.term) $(. $aw)* ?
+                            .map_or(0, |pl| u64::from(pl.doc_count())),
+                    };
+                    doc_freqs.push(Some(df));
+                }
+                let keep = if all_text_terms {
+                    super::rarest_terms(&doc_freqs, super::MAX_QUERY_TERMS)
+                } else {
+                    let mut cursors = 0usize;
+                    is_predicate
+                        .iter()
+                        .map(|&is_pred| {
+                            let first = !is_pred && cursors < super::MAX_QUERY_TERMS;
+                            cursors += usize::from(first);
+                            first
+                        })
+                        .collect()
+                };
+                let mut kept = Vec::with_capacity(should_all.len());
+                for ((q, &is_pred), &selected) in should_all.iter().zip(is_predicate.iter()).zip(&keep) {
+                    if is_pred || selected {
                         kept.push(q.clone());
-                    } else if cursor_kept < super::MAX_QUERY_TERMS {
-                        kept.push(q.clone());
-                        cursor_kept += 1;
                     }
                 }
                 log::warn!(
-                    "BooleanQuery: capping cursor SHOULD from {} to {} ({} fast-field predicates exempt); dropped clauses do not match or score",
+                    "BooleanQuery: capping cursor SHOULD from {} to {} ({}; {} fast-field predicates exempt); dropped clauses do not match or score",
                     cursor_count,
                     super::MAX_QUERY_TERMS,
-                    kept.len() - cursor_kept,
+                    if all_text_terms { "kept the rarest text terms" } else { "kept the first clauses" },
+                    kept.len() - super::MAX_QUERY_TERMS,
                 );
                 should_capped = kept;
                 &should_capped
