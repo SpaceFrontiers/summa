@@ -1812,6 +1812,7 @@ fn validate_binary_ann(
         || header.codebook_version != 0
         || header.routing != config.ivf_routing
         || header.prefix_bytes != config.prefix_bytes()
+        || header.spilled != config.soar.is_some()
         || quantizer.dim_bits != dim
     {
         return Err(Error::Corruption(format!(
