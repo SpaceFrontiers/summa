@@ -85,35 +85,38 @@ At equal recall the combination reads 3.1–3.3× fewer bytes than 4·sqrt(N)
 alone (0.935: 3.19 versus 10.60 MB; 0.95: 4.60 versus 14.13 MB) and reaches
 recall that full-code 4·sqrt(N) does not reach within 256 probes. A 640-bit
 prefix with `M` = 2,000 sits on the same frontier as 1,024 bits with
-`M` = 1,000. Storage is the cost: SOAR doubles codes and labels, and the prefix
-adds `prefix_bits / dim` of the codes, about 2.8× the per-vector code bytes of
-the plain index for SOAR plus a 1,024-bit prefix. SOAR for binary IVF is available as `soar: full`
+`M` = 1,000. Storage: with the split layout and prefix-only SOAR copies (below) this
+configuration stores about 1.38× the bytes per vector of the plain index. SOAR for binary IVF is available as `soar: full`
 ([binary IVF SOAR](binary-ivf-soar.md)).
 
 ## Layout
 
-Each binary IVF leaf run stores, between its ordinals and its exact codes, a
-contiguous prefix column of `count × prefix_bits / 8` bytes holding the leading
-bits of every code in row order. The run directory record is unchanged: the
-prefix column is `[ordinals end, codes offset)`, and open validates that its
-length is exactly `count × prefix_bytes`. Exact codes, exact-vector lookups and
-merge relocation are untouched; storage grows by `prefix_bits / dim` (40% at
-1,024 of 2,560 bits).
+A field with `prefix_bits` stores each leaf run's codes column split: the
+leading `prefix_bits / 8` bytes of every row first, then the remaining bytes of
+every row. The column has exactly the size of plain row-major codes, so the
+prefix costs no storage. The run directory record is unchanged. Exact-vector
+lookups keep addressing rows row-major (`codes start + row × code size`); the
+exact-vector reader and the rescoring stage translate that virtual address into
+the row's prefix and suffix and assemble the vector, so lookup files, span
+validation and merge relocation need no new format. Full scans add the prefix
+and suffix Hamming distances, which is exact because Hamming distance is
+additive over disjoint bytes.
 
 Format and compatibility:
 
 - A prefixed payload is binary IVF layout revision 1, with the prefix byte
-  width in the header tail. Earlier readers reject both, and readers reject a
-  width of zero, a width at least the code size, or a width on any other kind.
-  Fields without `prefix_bits` keep revision 0 and byte-identical payloads.
-- Segment build and generation rebuilds write the column from the codes.
-  Byte-copy merges carry it inside the copied extents; coalescing merges and
-  deletion compaction copy or filter prefix rows in the same order as the
-  codes. Sources with different prefix widths are incompatible generations,
-  and readers reject payloads whose width differs from the schema.
+  width in the low 32 bits of the header tail. Earlier readers reject both, and
+  readers reject a width of zero, a width at least the code size, or a width on
+  any other kind. Fields without `prefix_bits` keep revision 0 and
+  byte-identical payloads.
+- Segment build and generation rebuilds write split columns. Byte-copy merges
+  carry them verbatim; coalescing merges concatenate all prefix blocks and then
+  all suffix blocks of a leaf; deletion compaction filters prefix and suffix
+  rows. Sources with different prefix widths are incompatible generations, and
+  readers reject payloads whose width differs from the schema.
 - Schema: `prefix_bits` must be a positive multiple of 8 below `dim` and
-  requires `ivf`; `prefix_rerank` (default 1,000) requires `prefix_bits` and
-  is query-time only. Changing `prefix_bits` through ALTER rebuilds payloads;
+  requires `ivf`; `prefix_rerank` (default 1,000) requires `prefix_bits` and is
+  query-time only. Changing `prefix_bits` through ALTER rebuilds payloads;
   changing `prefix_rerank` does not.
 
 ## Query algorithm
@@ -127,9 +130,12 @@ When the probed leaves hold more postings than `prefix_rerank`:
    document, ordinal and code offset. That total order makes serial and
    parallel selection agree. Doc IDs are read only for distances that can
    enter the heap.
-3. Read the `M` candidates' full codes and score them exactly. Collectors,
-   multi-value combiners and exact completion then run unchanged, so every
-   returned score is an exact Hamming score.
+3. Read only the `M` candidates' code suffixes (the prefix distance is already
+   known) and add their distances. Candidates found only in a prefix-only SOAR
+   run read the suffix of the vector's primary copy through the exact-vector
+   lookup ([binary IVF SOAR](binary-ivf-soar.md)). Collectors, multi-value
+   combiners and exact completion then run unchanged, so every returned score is
+   an exact Hamming score.
 
 With fewer probed postings than `M` the full scan runs instead.
 

@@ -946,6 +946,29 @@ fn visit_binary_cluster(
     }
 }
 
+/// SOAR secondary postings of a binary IVF build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinarySpill {
+    /// One posting per vector.
+    None,
+    /// Secondary postings carry full codes, in the same leaf runs.
+    Full,
+    /// Secondary postings are kept apart and written as prefix-only runs
+    /// (fields with `prefix_bits`); rescoring reads the primary copy.
+    PrefixOnly,
+}
+
+impl BinarySpill {
+    /// Spill mode for a binary IVF field configuration.
+    pub fn for_config(config: &crate::dsl::BinaryDenseVectorConfig) -> Self {
+        match (config.soar.is_some(), config.prefix_bits.is_some()) {
+            (false, _) => Self::None,
+            (true, false) => Self::Full,
+            (true, true) => Self::PrefixOnly,
+        }
+    }
+}
+
 /// Centroid-free binary IVF payload for one segment. The global quantizer is
 /// loaded once at index scope; segments only retain exact codes partitioned by
 /// leaf ID, making compatible merges O(number of non-empty clusters).
@@ -958,6 +981,8 @@ pub struct BinaryIvfIndex {
     /// per-segment heap memory even when the global codebook has millions of
     /// leaves.
     pub(crate) clusters: Vec<(u32, BinaryCluster)>,
+    /// Sorted prefix-only SOAR secondary postings ([`BinarySpill::PrefixOnly`]).
+    pub(crate) secondary: Vec<(u32, BinaryCluster)>,
     len: usize,
     /// Indexed codes that carry no information (all bits clear).
     zero_codes: usize,
@@ -976,19 +1001,20 @@ pub(crate) struct BinaryIvfBuilder {
     num_clusters: u32,
     routing: IvfRoutingMode,
     clusters: rustc_hash::FxHashMap<u32, BinaryCluster>,
+    secondary: rustc_hash::FxHashMap<u32, BinaryCluster>,
     len: usize,
     zero_codes: usize,
     ones_codes: usize,
-    soar: bool,
+    spill: BinarySpill,
 }
 
 impl BinaryIvfBuilder {
-    /// `soar` adds one SOAR secondary posting per vector
+    /// `spill` adds one SOAR secondary posting per vector
     /// ([`BinaryCoarseQuantizer::soar_secondary`]).
     pub(crate) fn new(
         quantizer: &BinaryCoarseQuantizer,
         routing: IvfRoutingMode,
-        soar: bool,
+        spill: BinarySpill,
     ) -> io::Result<Self> {
         quantizer
             .validate_routing(routing)
@@ -999,10 +1025,11 @@ impl BinaryIvfBuilder {
             num_clusters: quantizer.num_clusters,
             routing,
             clusters: rustc_hash::FxHashMap::default(),
+            secondary: rustc_hash::FxHashMap::default(),
             len: 0,
             zero_codes: 0,
             ones_codes: 0,
-            soar,
+            spill,
         })
     }
 
@@ -1031,7 +1058,8 @@ impl BinaryIvfBuilder {
                 "binary IVF code/label batch is inconsistent",
             ));
         }
-        let soar = self.soar;
+        let soar = self.spill != BinarySpill::None;
+        let separate = self.spill == BinarySpill::PrefixOnly;
         let routing = self.routing;
         let assign = |code: &[u8]| -> io::Result<(u32, Option<u32>)> {
             let primary = quantizer.assign(code, routing)?;
@@ -1067,28 +1095,36 @@ impl BinaryIvfBuilder {
                 self.ones_codes += 1;
             }
         }
-        let mut order: Vec<(u32, u32)> =
+        // `(cluster, prefix_only, row)`: prefix-only secondaries group apart.
+        let mut order: Vec<(u32, bool, u32)> =
             Vec::with_capacity(assignments.len() + if soar { assignments.len() } else { 0 });
         for (row, &(primary, secondary)) in assignments.iter().enumerate() {
-            order.push((primary, row as u32));
+            order.push((primary, false, row as u32));
             if let Some(secondary) = secondary {
-                order.push((secondary, row as u32));
+                order.push((secondary, separate, row as u32));
             }
         }
         order.sort_unstable();
         let mut run_start = 0usize;
         while run_start < order.len() {
-            let cluster_id = order[run_start].0;
+            let (cluster_id, prefix_only, _) = order[run_start];
             let mut run_end = run_start + 1;
-            while run_end < order.len() && order[run_end].0 == cluster_id {
+            while run_end < order.len()
+                && (order[run_end].0, order[run_end].1) == (cluster_id, prefix_only)
+            {
                 run_end += 1;
             }
             let run = &order[run_start..run_end];
-            let cluster = self.clusters.entry(cluster_id).or_default();
+            let target = if prefix_only {
+                &mut self.secondary
+            } else {
+                &mut self.clusters
+            };
+            let cluster = target.entry(cluster_id).or_default();
             cluster.doc_ids.reserve(run.len());
             cluster.ordinals.reserve(run.len());
             cluster.codes.reserve(run.len() * byte_len);
-            for &(_, index) in run {
+            for &(_, _, index) in run {
                 let index = index as usize;
                 let (doc_id, ordinal) = doc_id_ordinals[index];
                 cluster.doc_ids.push(doc_id);
@@ -1108,15 +1144,18 @@ impl BinaryIvfBuilder {
     pub(crate) fn finish(self) -> io::Result<BinaryIvfIndex> {
         let mut clusters: Vec<_> = self.clusters.into_iter().collect();
         clusters.sort_unstable_by_key(|(cluster_id, _)| *cluster_id);
+        let mut secondary: Vec<_> = self.secondary.into_iter().collect();
+        secondary.sort_unstable_by_key(|(cluster_id, _)| *cluster_id);
         let index = BinaryIvfIndex {
             dim_bits: self.dim_bits,
             quantizer_version: self.quantizer_version,
             num_clusters: self.num_clusters,
             clusters,
+            secondary,
             len: self.len,
             zero_codes: self.zero_codes,
             ones_codes: self.ones_codes,
-            spilled: self.soar,
+            spilled: self.spill != BinarySpill::None,
         };
         index
             .validate()
@@ -1129,11 +1168,11 @@ impl BinaryIvfIndex {
     pub fn build(
         quantizer: &BinaryCoarseQuantizer,
         routing: IvfRoutingMode,
-        soar: bool,
+        spill: BinarySpill,
         codes: &[u8],
         doc_id_ordinals: &[(u32, u16)],
     ) -> io::Result<Self> {
-        let mut builder = BinaryIvfBuilder::new(quantizer, routing, soar)?;
+        let mut builder = BinaryIvfBuilder::new(quantizer, routing, spill)?;
         builder.add_batch(quantizer, codes, doc_id_ordinals)?;
         builder.finish()
     }
@@ -1144,21 +1183,24 @@ impl BinaryIvfIndex {
         }
         let byte_len = self.dim_bits.div_ceil(8);
         let mut total = 0usize;
-        let mut previous = None;
-        for (cluster_id, cluster) in &self.clusters {
-            if *cluster_id >= self.num_clusters || previous.is_some_and(|id| id >= *cluster_id) {
-                return Err("global binary IVF cluster IDs are invalid or unsorted".to_string());
+        for list in [&self.clusters, &self.secondary] {
+            let mut previous = None;
+            for (cluster_id, cluster) in list {
+                if *cluster_id >= self.num_clusters || previous.is_some_and(|id| id >= *cluster_id)
+                {
+                    return Err("global binary IVF cluster IDs are invalid or unsorted".to_string());
+                }
+                previous = Some(*cluster_id);
+                let count = cluster.doc_ids.len();
+                if cluster.ordinals.len() != count
+                    || cluster.codes.len() != count.saturating_mul(byte_len)
+                {
+                    return Err("global binary IVF cluster columns are inconsistent".to_string());
+                }
+                total = total
+                    .checked_add(count)
+                    .ok_or_else(|| "global binary IVF vector count overflow".to_string())?;
             }
-            previous = Some(*cluster_id);
-            let count = cluster.doc_ids.len();
-            if cluster.ordinals.len() != count
-                || cluster.codes.len() != count.saturating_mul(byte_len)
-            {
-                return Err("global binary IVF cluster columns are inconsistent".to_string());
-            }
-            total = total
-                .checked_add(count)
-                .ok_or_else(|| "global binary IVF vector count overflow".to_string())?;
         }
         if total != self.len {
             return Err("global binary IVF vector count is inconsistent".to_string());
@@ -1235,6 +1277,7 @@ impl BinaryIvfIndex {
     pub fn estimated_memory_bytes(&self) -> usize {
         self.clusters
             .iter()
+            .chain(&self.secondary)
             .map(|(_, cluster)| cluster.codes.len() + cluster.doc_ids.len() * 6)
             .sum()
     }
@@ -1938,8 +1981,14 @@ mod tests {
         config.train_iters = 4;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, codes, labels.len(), "test").unwrap();
-        let index =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, codes, labels).unwrap();
+        let index = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::None,
+            codes,
+            labels,
+        )
+        .unwrap();
         (quantizer, index)
     }
 
@@ -1992,8 +2041,14 @@ mod tests {
             expected.push((primary, oracle));
         }
 
-        let spilled =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, true, &codes, &labels).unwrap();
+        let spilled = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::Full,
+            &codes,
+            &labels,
+        )
+        .unwrap();
         assert!(spilled.is_spilled());
         let secondaries = expected.iter().filter(|(_, s)| s.is_some()).count();
         assert!(secondaries > n / 2, "most clustered codes spill");
@@ -2010,8 +2065,14 @@ mod tests {
             want.sort_unstable();
             assert_eq!(holders, want, "doc {doc}");
         }
-        let plain = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
-            .unwrap();
+        let plain = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::None,
+            &codes,
+            &labels,
+        )
+        .unwrap();
         assert!(!plain.is_spilled());
         assert_eq!(plain.len(), n);
     }
@@ -2497,7 +2558,8 @@ mod tests {
         let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
         let config = BinaryIvfConfig::new(8, 2);
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, codes.len(), "test").unwrap();
-        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat, false).unwrap();
+        let mut builder =
+            BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat, BinarySpill::None).unwrap();
         builder
             .add_batch(&quantizer, &codes[..3], &labels[..3])
             .unwrap();
@@ -2515,9 +2577,14 @@ mod tests {
         // Batched inserts group by leaf, so pin the payload layout: one batch
         // must produce the same columns as two, and each leaf must keep its
         // entries in ascending input order.
-        let single =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
-                .unwrap();
+        let single = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::None,
+            &codes,
+            &labels,
+        )
+        .unwrap();
         assert_eq!(index.clusters.len(), single.clusters.len());
         for ((left_id, left), (right_id, right)) in index.clusters.iter().zip(&single.clusters) {
             assert_eq!(left_id, right_id);
@@ -2543,8 +2610,14 @@ mod tests {
         config.train_iters = 2;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
-            .unwrap();
+        let index = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::None,
+            &codes,
+            &labels,
+        )
+        .unwrap();
 
         assert_eq!(index.zero_codes(), 4, "four zero codes must be counted");
         assert_eq!(index.len(), labels.len(), "every vector stays indexed");
@@ -2569,8 +2642,14 @@ mod tests {
         config.train_iters = 2;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
-            .unwrap();
+        let index = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::None,
+            &codes,
+            &labels,
+        )
+        .unwrap();
 
         assert_eq!(
             index.ones_codes(),
@@ -2599,8 +2678,14 @@ mod tests {
         config.train_iters = 1;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
-            .unwrap();
+        let index = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::None,
+            &codes,
+            &labels,
+        )
+        .unwrap();
         assert!(!index.is_empty(), "payload must cover every flat vector");
         assert_eq!(index.len(), labels.len());
         assert_eq!(index.zero_codes(), 4);
@@ -2614,8 +2699,14 @@ mod tests {
         config.train_iters = 4;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
-            .unwrap();
+        let index = BinaryIvfIndex::build(
+            &quantizer,
+            IvfRoutingMode::Flat,
+            BinarySpill::None,
+            &codes,
+            &labels,
+        )
+        .unwrap();
         let (_, count) = index.largest_cluster().expect("a populated leaf");
         assert_eq!(count, 6, "the dominant leaf holds every near-duplicate");
     }
@@ -2701,7 +2792,8 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:?}");
             assert!(error.to_string().contains("expects 1"), "{error}");
         }
-        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat, false).unwrap();
+        let mut builder =
+            BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat, BinarySpill::None).unwrap();
         assert!(
             builder
                 .add_batch(&quantizer, &codes[..4], &[(0, 0), (1, 0)])
