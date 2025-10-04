@@ -256,6 +256,14 @@ pub(super) fn execute(
                 if prune && heap.len() == k && bound < info.seismic_factor * heap.threshold() {
                     continue;
                 }
+                // Issue the cluster's scattered row-entry and vector loads
+                // before scoring, as upstream Seismic does per block.
+                for row in cluster.rows() {
+                    index.prefetch_entry(row);
+                }
+                for row in cluster.rows() {
+                    index.prefetch_vector(row);
+                }
                 for row in cluster.rows() {
                     if seen.len().is_multiple_of(1024) && options.stop_if_expired() {
                         break 'terms;
