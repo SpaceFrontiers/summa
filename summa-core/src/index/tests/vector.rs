@@ -2801,3 +2801,158 @@ async fn binary_single_copy_preserves_alter_retrain_compaction_and_all_combiners
 async fn binary_single_copy_preserves_alter_retrain_compaction_and_all_combiners_sync() {
     binary_single_copy_lifecycle().await;
 }
+
+/// A field with `prefix_bits` stores prefix columns through indexing,
+/// training, merge and ALTER, and its two-stage scan returns exact Hamming
+/// scores: identical to the full scan when `prefix_rerank` covers every
+/// probed posting, and exact (never prefix-estimated) when it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_binary_prefix_scan_end_to_end() {
+    use crate::dsl::{BinaryDenseVectorConfig, VectorIndexAlter};
+    use crate::query::BinaryDenseVectorQuery;
+    use rand::{Rng, SeedableRng};
+
+    let dim_bits = 128;
+    let byte_len = dim_bits / 8;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+    let codes: Vec<Vec<u8>> = (0..400)
+        .map(|_| (0..byte_len).map(|_| rng.random()).collect())
+        .collect();
+    let queries: Vec<Vec<u8>> = (0..12)
+        .map(|_| (0..byte_len).map(|_| rng.random()).collect())
+        .collect();
+    fn exact(query: &[u8], code: &[u8]) -> f32 {
+        let distance: u32 = query
+            .iter()
+            .zip(code)
+            .map(|(a, b)| (a ^ b).count_ones())
+            .sum();
+        1.0 - distance as f32 / (query.len() * 8) as f32
+    }
+
+    async fn build(
+        codes: &[Vec<u8>],
+        config: BinaryDenseVectorConfig,
+    ) -> (
+        RamDirectory,
+        IndexConfig,
+        crate::dsl::Field,
+        IndexWriter<RamDirectory>,
+    ) {
+        let mut sb = SchemaBuilder::default();
+        let field = sb.add_binary_dense_vector_field_with_config("bvec", true, true, config);
+        let dir = RamDirectory::new();
+        let index_config = IndexConfig::default();
+        let mut writer = IndexWriter::create(dir.clone(), sb.build(), index_config.clone())
+            .await
+            .unwrap();
+        for (batch, chunk) in codes.chunks(200).enumerate() {
+            for code in chunk {
+                let mut doc = Document::new();
+                doc.add_binary_dense_vector(field, code.clone());
+                writer.add_document(doc).unwrap();
+            }
+            writer.commit().await.unwrap();
+            if batch == 0 {
+                writer.build_vector_index().await.unwrap();
+            }
+        }
+        (dir, index_config, field, writer)
+    }
+    async fn search(
+        dir: &RamDirectory,
+        config: &IndexConfig,
+        field: crate::dsl::Field,
+        query: &[u8],
+    ) -> Vec<(u32, f32)> {
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        let reader = index.reader().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        let hits = searcher
+            .search(&BinaryDenseVectorQuery::new(field, query.to_vec()), 10)
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        for hit in hits {
+            let doc = searcher
+                .doc(hit.segment_id, hit.doc_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let code = doc
+                .get_first(field)
+                .unwrap()
+                .as_binary_dense_vector()
+                .unwrap()
+                .to_vec();
+            out.push((hit.doc_id, hit.score));
+            assert!(
+                (hit.score - exact(query, &code)).abs() < 1e-6,
+                "prefix scans must return exact full-code scores"
+            );
+        }
+        out
+    }
+    async fn prefix_bytes(
+        dir: &RamDirectory,
+        config: &IndexConfig,
+        field: crate::dsl::Field,
+    ) -> Vec<usize> {
+        let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+        index
+            .segment_readers()
+            .await
+            .unwrap()
+            .iter()
+            .map(|segment| match segment.vector_indexes().get(&field.0) {
+                Some(crate::segment::VectorIndex::BinaryIvf(lazy)) => {
+                    lazy.get().header().prefix_bytes
+                }
+                _ => panic!("binary IVF payload expected"),
+            })
+            .collect()
+    }
+
+    let base = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
+    let (plain_dir, plain_cfg, plain_field, _plain_writer) = build(&codes, base.clone()).await;
+    let covering = base.clone().with_prefix(32, Some(codes.len()));
+    let (dir, cfg, field, mut writer) = build(&codes, covering).await;
+    assert_eq!(prefix_bytes(&dir, &cfg, field).await, vec![4, 4]);
+    for query in &queries {
+        assert_eq!(
+            search(&plain_dir, &plain_cfg, plain_field, query).await,
+            search(&dir, &cfg, field, query).await,
+            "a rerank depth covering every posting is the full scan"
+        );
+    }
+
+    // Narrow rescoring still returns exact scores; merge keeps the layout.
+    writer
+        .alter_vector_index(
+            field,
+            VectorIndexAlter::Binary(base.clone().with_prefix(32, Some(5))),
+        )
+        .await
+        .unwrap();
+    writer.force_merge().await.unwrap();
+    assert_eq!(prefix_bytes(&dir, &cfg, field).await, vec![4]);
+    for query in &queries {
+        let hits = search(&dir, &cfg, field, query).await;
+        assert!(!hits.is_empty() && hits.len() <= 10);
+    }
+
+    // Dropping the prefix rebuilds payloads without it.
+    writer
+        .alter_vector_index(field, VectorIndexAlter::Binary(base.clone()))
+        .await
+        .unwrap();
+    assert_eq!(prefix_bytes(&dir, &cfg, field).await, vec![0]);
+    for query in &queries {
+        assert_eq!(
+            search(&plain_dir, &plain_cfg, plain_field, query)
+                .await
+                .len(),
+            search(&dir, &cfg, field, query).await.len()
+        );
+    }
+}

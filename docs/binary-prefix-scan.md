@@ -1,8 +1,8 @@
-# Binary IVF prefix-first scan (proposal)
+# Binary IVF prefix-first scan
 
-Status: proposal. Nothing here is implemented. Measurements below come from
-read-only samples; adopting this needs the implementation and validation plan
-at the end.
+Status: implemented for binary IVF as a per-field SDL option
+(`indexed<ivf, prefix_bits: N, prefix_rerank: M>`); off by default. Binary
+ScaNN does not support it. Measurements below come from read-only samples.
 
 ## Problem
 
@@ -58,53 +58,93 @@ grow with the probed pool; at 3B vectors and 128 probes the pool (about 1.75M)
 is four times this sample, so the retained fraction must be re-measured at that
 pool size before choosing defaults.
 
-## Proposed layout (option B: additional prefix column)
+### Inside a 4·sqrt(N) IVF, with and without SOAR
 
-Keep today's run columns unchanged (`doc_ids`, `ordinals`, exact `codes`) and
-add, per run, a contiguous `prefix` column of `count × P/8` bytes holding the
-first `P` bits of each code in row order. The global quantizer, routing, exact
-lookup and every existing reader path stay as they are; only the leaf scan
-reads the new column. Storage grows by `P / dim` (25% at 640 of 2,560 bits).
+The same production sample, indexed as a 4·sqrt(N) = 2,543-leaf k-majority IVF
+(a NumPy reimplementation of Summa's trainer: k-means++ seeding, 10 iterations)
+and probed for each real query. SOAR adds one secondary leaf per vector chosen
+by the Hamming form of the SOAR loss with λ = 1. Postings count spilled
+duplicates, and bytes read per query are prefix bytes for every probed posting
+plus full codes for the `M` rescored ones. Recall@10 is tie-aware against exact
+Hamming over the whole sample.
 
-Option A (splitting each code into prefix and suffix blocks with no
-duplication) saves that storage but makes every exact-vector read a two-part
-gather and changes lookup span semantics. Option B comes first; A can follow
-if the storage matters.
+| Configuration                             | nprobe | Recall@10 | MB per query |
+| ----------------------------------------- | ------ | --------- | ------------ |
+| 4·sqrt(N), full codes                     | 128    | 0.908     | 7.07         |
+| 4·sqrt(N), full codes                     | 192    | 0.934     | 10.60        |
+| 4·sqrt(N), full codes                     | 256    | 0.950     | 14.13        |
+| 4·sqrt(N), prefix 1,024, M = 1,000        | 128    | 0.907     | 3.15         |
+| 4·sqrt(N) + SOAR, full codes              | 64     | 0.936     | 7.17         |
+| 4·sqrt(N) + SOAR, prefix 1,024, M = 1,000 | 64     | 0.935     | 3.19         |
+| 4·sqrt(N) + SOAR, prefix 1,024, M = 1,000 | 96     | 0.952     | 4.60         |
+| 4·sqrt(N) + SOAR, prefix 640, M = 2,000   | 128    | 0.957     | 4.20         |
+| 4·sqrt(N) + SOAR, prefix 1,024, M = 1,000 | 128    | 0.963     | 6.02         |
+| 4·sqrt(N) + SOAR, prefix 1,024, M = 1,000 | 256    | 0.981     | 11.63        |
+
+At equal recall the combination reads 3.1–3.3× fewer bytes than 4·sqrt(N)
+alone (0.935: 3.19 versus 10.60 MB; 0.95: 4.60 versus 14.13 MB) and reaches
+recall that full-code 4·sqrt(N) does not reach within 256 probes. A 640-bit
+prefix with `M` = 2,000 sits on the same frontier as 1,024 bits with
+`M` = 1,000. Storage is the cost: SOAR doubles codes and labels, and the prefix
+adds `prefix_bits / dim` of the codes, about 2.8× the per-vector code bytes of
+the plain index for SOAR plus a 1,024-bit prefix. SOAR for binary IVF is not
+implemented; this measures what it would buy.
+
+## Layout
+
+Each binary IVF leaf run stores, between its ordinals and its exact codes, a
+contiguous prefix column of `count × prefix_bits / 8` bytes holding the leading
+bits of every code in row order. The run directory record is unchanged: the
+prefix column is `[ordinals end, codes offset)`, and open validates that its
+length is exactly `count × prefix_bytes`. Exact codes, exact-vector lookups and
+merge relocation are untouched; storage grows by `prefix_bits / dim` (40% at
+1,024 of 2,560 bits).
 
 Format and compatibility:
 
-- A new ANN layout revision for `BinaryIvf` (and `ScannBinary` if adopted
-  there) carries `prefix_bits` in the header; readers reject unknown revisions
-  and payloads whose run directory lacks prefix offsets. Fields without
-  `prefix_bits` keep the current layout byte for byte.
-- The run record gains the prefix column offset. Build, rebuild, deletion
-  compaction and the coalescing merge copy the prefix column exactly like the
-  codes: each run's prefix rows move with its codes, so lookup relocation is
-  unchanged.
-- Schema: `indexed<ivf, prefix_bits: 640, prefix_rerank: 2000>`, with
-  `prefix_bits` a positive multiple of 64 below `dim`. Changing `prefix_bits`
-  rewrites payloads from retained exact codes (an ALTER without retraining);
-  `prefix_rerank` is query-time metadata.
+- A prefixed payload is binary IVF layout revision 1, with the prefix byte
+  width in the header tail. Earlier readers reject both, and readers reject a
+  width of zero, a width at least the code size, or a width on any other kind.
+  Fields without `prefix_bits` keep revision 0 and byte-identical payloads.
+- Segment build and generation rebuilds write the column from the codes.
+  Byte-copy merges carry it inside the copied extents; coalescing merges and
+  deletion compaction copy or filter prefix rows in the same order as the
+  codes. Sources with different prefix widths are incompatible generations,
+  and readers reject payloads whose width differs from the schema.
+- Schema: `prefix_bits` must be a positive multiple of 8 below `dim` and
+  requires `ivf`; `prefix_rerank` (default 1,000) requires `prefix_bits` and
+  is query-time only. Changing `prefix_bits` through ALTER rebuilds payloads;
+  changing `prefix_rerank` does not.
 
 ## Query algorithm
 
-1. Route and select probed leaves exactly as today.
-2. Scan the prefix columns of the probed runs with the existing resolved
-   Hamming kernel (AVX-512 masked loads already cover 64–80-byte rows). Keep the
-   best `M` by prefix distance. Prefix distances are small integers (at most
-   `P`), so a histogram threshold selects `M` without a heap. Visibility
-   filtering happens before selection.
-3. Read the `M` candidates' full codes (one scattered read each from the
-   existing codes column) and score them exactly. Multi-value combiners and
-   deduplication then work exactly as today, on exact scores.
-4. Expose `prefix_scanned`, `prefix_rerank_candidates` and the stage-2 bytes
-   read as query diagnostics.
+When the probed leaves hold more postings than `prefix_rerank`:
+
+1. Route and select probed leaves exactly as for a full scan.
+2. Scan only the prefix columns of the probed runs with the resolved Hamming
+   kernel, prefetching labels and prefixes but not codes. Keep the best `M`
+   visible postings in a bounded heap ordered by prefix distance, then
+   document, ordinal and code offset. That total order makes serial and
+   parallel selection agree. Doc IDs are read only for distances that can
+   enter the heap.
+3. Read the `M` candidates' full codes and score them exactly. Collectors,
+   multi-value combiners and exact completion then run unchanged, so every
+   returned score is an exact Hamming score.
+
+With fewer probed postings than `M` the full scan runs instead.
 
 Cold storage: stage 2 is `M` random reads. On warm pages they are cheap; on
 cold NVMe they are about `M` 4-KiB page reads per query, which must be
 measured against the saved sequential bytes before choosing `M`.
 
-## Validation plan
+## Validation
+
+Implemented tests cover the header round trip and rejection of invalid widths;
+alignment of prefix rows with codes after byte-copy merge, coalescing merge and
+deletion compaction; an independent oracle for the two-stage selection in
+serial and parallel modes; SDL parsing and validation errors; and an
+end-to-end index build, train, search, merge and ALTER. Remaining before
+adopting a production default:
 
 - Recall: offline study per production model (this document) and recall@10
   against exact full-code IVF on the real index, per `P` and `M`.

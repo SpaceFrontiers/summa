@@ -412,15 +412,17 @@ impl SegmentMerger {
                             .await?
                         {
                             let data_offset = writer.offset();
-                            let routing = entry
+                            let binary_config = entry
                                 .binary_dense_vector_config
                                 .as_ref()
-                                .expect("binary field configuration validated")
-                                .ivf_routing;
+                                .expect("binary field configuration validated");
+                            let routing = binary_config.ivf_routing;
+                            let prefix_bytes = binary_config.prefix_bytes();
                             super::block_in_place_if_multithread(|| {
                                 crate::segment::ann_disk::write_built_binary_ivf(
                                     &index,
                                     routing,
+                                    prefix_bytes,
                                     &mut writer,
                                     locations.as_mut(),
                                 )
@@ -690,6 +692,7 @@ impl SegmentMerger {
                         || header.quantizer_version != quantizer.version
                         || header.codebook_version != 0
                         || header.routing != config.ivf_routing
+                        || header.prefix_bytes != config.prefix_bytes()
                         || header.vector_count != flat.num_vectors
                     {
                         return Err(crate::Error::Corruption(format!(
