@@ -439,9 +439,8 @@ export interface MatchQuery {
   /**
    * Long queries: keep only the `max_terms` rarest distinct tokens (lowest
    * index-wide, or broker cross-shard, document frequency); dropped tokens
-   * neither match nor score. 0 = the field's `query<max_terms>` default, else
-   * every token up to the engine's 64-term limit (which also keeps the
-   * rarest). Approximate.
+   * neither match nor score. 0 = the field's `query<max_terms>`, else 20.
+   * At most 64. Approximate.
    */
   maxTerms: number;
 }

@@ -156,8 +156,8 @@ pub fn convert_fusion_combiner(combiner: i32) -> MultiValueCombiner {
 }
 
 /// Document frequencies that decide which tokens a capped `MatchQuery`
-/// keeps (`max_terms`, the field's `query<max_terms>`, or the engine's
-/// `MAX_QUERY_TERMS`). The cap is resolved once per query, so every segment
+/// keeps (`max_terms`, the field's `query<max_terms>`, or
+/// `DEFAULT_TEXT_MAX_TERMS`). The cap is resolved once per query, so every segment
 /// scores the same tokens and the result stays a plain term disjunction that
 /// keeps the text fast paths and L1 decomposition.
 #[derive(Clone, Copy)]
@@ -304,23 +304,23 @@ pub fn convert_query_with_rarity(
             };
 
             // Long-query cap: the request's `max_terms`, else the field's
-            // `query<max_terms>`, bounded by the engine's term limit.
-            let requested_cap = (match_query.max_terms > 0)
+            // `query<max_terms>`, else the default, bounded by the engine's
+            // term limit.
+            let cap = (match_query.max_terms > 0)
                 .then_some(match_query.max_terms as usize)
                 .or_else(|| {
                     schema
                         .get_field_entry(field)
                         .and_then(|entry| entry.text_max_terms)
                         .map(|max_terms| max_terms as usize)
-                });
-            let cap = requested_cap
-                .unwrap_or(summa_core::query::MAX_QUERY_TERMS)
+                })
+                .unwrap_or(summa_core::query::DEFAULT_TEXT_MAX_TERMS)
                 .min(summa_core::query::MAX_QUERY_TERMS);
             let mut per_segment_cap = 0;
             if distinct.len() > cap {
                 match rarity {
                     TermRarity::Uncapped => {}
-                    TermRarity::Unavailable => per_segment_cap = requested_cap.unwrap_or(0),
+                    TermRarity::Unavailable => per_segment_cap = cap,
                     TermRarity::Index(stats) => keep_rarest_tokens(&mut distinct, cap, |token| {
                         stats.text_df(field, token.as_bytes())
                     }),
