@@ -122,16 +122,23 @@ fn write_block(
 
 /// Copy immutable lookup rows. Only the small span/block directories are
 /// relocated; no vector or per-vector address is decoded or rewritten.
+///
+/// `relocate_span(source, offset, bytes)` maps a source span's ANN-relative
+/// code offset into the output payload: a constant per-source bias for a
+/// byte-copy merge, or [`crate::segment::ann_disk::CodeRelocations`] when the
+/// merge coalesced clusters. Rows stay valid in both cases because their
+/// addresses are (span, row) pairs, not byte offsets.
 pub(crate) fn write_copied_locations(
-    sources: &[(&crate::segment::vector_data::LazyFlatVectorData, u32, u64)],
+    sources: &[(&crate::segment::vector_data::LazyFlatVectorData, u32)],
     dim: usize,
     count: usize,
     ann_len: u64,
+    relocate_span: impl Fn(usize, u64, u64) -> io::Result<u64>,
     out: &mut (impl Write + ?Sized),
     cancel: Option<&AtomicBool>,
 ) -> io::Result<u64> {
     check(cancel)?;
-    let actual_count = sources.iter().try_fold(0usize, |total, (flat, _, _)| {
+    let actual_count = sources.iter().try_fold(0usize, |total, (flat, _)| {
         if flat.dim != dim {
             return Err(io::Error::other("vector lookup dimensions disagree"));
         }
@@ -144,39 +151,39 @@ pub(crate) fn write_copied_locations(
     }
     let layouts: Vec<_> = sources
         .iter()
-        .map(|(flat, doc_base, bias)| {
+        .map(|(flat, doc_base)| {
             flat.locations()
-                .map(|layout| (flat, *doc_base, *bias, layout))
+                .map(|layout| (flat, *doc_base, layout))
                 .ok_or_else(|| io::Error::other("copy merge requires ANN-backed exact vectors"))
         })
         .collect::<io::Result<_>>()?;
     let blocks: usize = layouts
         .iter()
-        .map(|(_, _, _, layout)| layout.blocks.len())
+        .map(|(_, _, layout)| layout.blocks.len())
         .sum();
+    let width = (dim / 8) as u64;
     write_header(out, dim, count, ann_len, blocks)?;
     let mut written = HEADER_SIZE as u64;
-    for (flat, _, _, _) in &layouts {
+    for (flat, _, _) in &layouts {
         for chunk in flat.location_rows().chunks(1024 * 1024) {
             check(cancel)?;
             out.write_all(chunk)?;
             written += chunk.len() as u64;
         }
     }
-    for (_, _, bias, layout) in &layouts {
+    for (source, (_, _, layout)) in layouts.iter().enumerate() {
         for (i, span) in layout.spans.chunks_exact(SPAN_SIZE).enumerate() {
             if i.is_multiple_of(4096) {
                 check(cancel)?;
             }
-            let offset = u64_at(span, 0)
-                .checked_add(*bias)
-                .ok_or_else(|| io::Error::other("vector span relocation overflow"))?;
+            let rows = u64::from(u32::from_le_bytes(span[8..].try_into().unwrap()));
+            let offset = relocate_span(source, u64_at(span, 0), rows * width)?;
             out.write_all(&offset.to_le_bytes())?;
             out.write_all(&span[8..])?;
             written += SPAN_SIZE as u64;
         }
     }
-    for (_, doc_base, _, layout) in &layouts {
+    for (_, doc_base, layout) in &layouts {
         for block in &layout.blocks {
             check(cancel)?;
             let base = block
