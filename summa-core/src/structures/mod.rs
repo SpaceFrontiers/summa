@@ -2,7 +2,7 @@
 //!
 //! Organized into submodules:
 //! - `postings` - Posting list compression formats
-//! - `vector` - Global IVF-PQ and binary IVF indexing
+//! - `vector` - Global IVF-TQ, ScaNN and binary IVF indexing
 //! - `simd` - SIMD utilities
 //! - `sstable` - SSTable for term dictionary
 

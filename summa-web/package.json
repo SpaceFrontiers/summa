@@ -7,11 +7,6 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "lab:dev": "pnpm --dir ../summa-model-lab dev",
-    "lab:build": "pnpm --dir ../summa-model-lab build",
-    "lab:preview": "pnpm --dir ../summa-model-lab preview",
-    "lab:test": "pnpm --dir ../summa-model-lab test",
-    "lab:lint": "pnpm --dir ../summa-model-lab lint",
     "test": "node --test src/**/*.test.js",
     "lint": "eslint src --max-warnings 0",
     "lint:fix": "eslint src --fix --max-warnings 0"

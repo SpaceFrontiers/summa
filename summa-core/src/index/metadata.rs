@@ -24,30 +24,12 @@ pub const INDEX_META_FILENAME: &str = "metadata.json";
 /// Temp file for atomic writes (write here, then rename to INDEX_META_FILENAME)
 const INDEX_META_TMP_FILENAME: &str = "metadata.json.tmp";
 
-/// Current metadata.json format version written by this build.
+/// The only metadata.json format version this build reads or writes.
 ///
-/// `load` requires this version or one it can upgrade in memory (see
-/// [`OLDEST_MIGRATABLE_FORMAT_VERSION`]). Anything else is a clean rebuild
-/// boundary; serde_json would otherwise silently drop fields it does not know
-/// and a later save could destructively rewrite index state.
+/// Any other stamp is a rebuild boundary: serde_json would otherwise silently
+/// drop fields it does not know and a later save could destructively rewrite
+/// index state. Format 11 adds common word pairs (`docs/common-word-pairs.md`).
 pub const INDEX_META_FORMAT_VERSION: u32 = 11;
-
-/// Oldest metadata.json format `load` upgrades in place.
-///
-/// Format 11 adds common word pairs (`docs/common-word-pairs.md`): terms of
-/// a text field starting with `0xFF`, which earlier readers would expose to
-/// dictionary scans as words. Format 10 adds bitmap posting blocks (`PostingCodec::RoundedBitmap`),
-/// which earlier readers reject as an invalid document width. Format 9 adds
-/// optional SIMD blocks, compact posting/position directories
-/// and byte norms; older encodings retain their scoring semantics. Format 8
-/// protects the optional content-hash field marker from older writers. Format 7 added the optional per-segment `deletions` entry,
-/// so format 6 metadata (1.8.121..=1.8.133) is also readable. The
-/// upgrade is loud and one-way: the writer persists the new stamp on open so
-/// older builds cannot reopen the index and misread position codec tags or
-/// drop deletion generations. No encoded blocks are rewritten by migration.
-/// Segment-level breaks inside the format 6 window (BMP blob
-/// magic BMP9 -> BMPA in 1.8.125) are still refused at segment open.
-pub const OLDEST_MIGRATABLE_FORMAT_VERSION: u32 = 6;
 
 /// Index-level centroids/codebooks are deliberately bounded before they are
 /// read or decoded. Besides limiting ordinary corruption damage, the matching
@@ -172,11 +154,6 @@ pub struct FieldVectorMeta {
     /// Path to centroids file (relative to index dir)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub centroids_file: Option<String>,
-    /// Legacy: path to a trained IVF-PQ codebook. Always `None` for current
-    /// formats; kept so pre-removal metadata deserializes into an actionable
-    /// error instead of dropping the field.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub codebook_file: Option<String>,
     /// ScaNN global model generation encoded into every segment payload.
     /// Absent for legacy IVF/TQ fields and older metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -351,7 +328,6 @@ impl IndexMetadata {
                 index_type,
                 state: VectorIndexState::Flat,
                 centroids_file: None,
-                codebook_file: None,
                 artifact_generation: None,
                 artifact_id: None,
             });
@@ -364,7 +340,6 @@ impl IndexMetadata {
         vector_count: usize,
         num_clusters: usize,
         centroids_file: String,
-        codebook_file: Option<String>,
     ) {
         if let Some(field) = self.vector_fields.get_mut(&field_id) {
             field.state = VectorIndexState::Built {
@@ -372,7 +347,6 @@ impl IndexMetadata {
                 num_clusters,
             };
             field.centroids_file = Some(centroids_file);
-            field.codebook_file = codebook_file;
             field.artifact_generation = None;
             field.artifact_id = None;
             self.refresh_total_vectors();
@@ -415,7 +389,6 @@ impl IndexMetadata {
             num_clusters: num_leaves,
         };
         field.centroids_file = Some(artifact_file);
-        field.codebook_file = None;
         field.artifact_generation = Some(artifact_generation);
         field.artifact_id = Some(artifact_id);
         self.refresh_total_vectors();
@@ -452,46 +425,19 @@ impl IndexMetadata {
     ///
     /// If `metadata.json` is missing but `metadata.json.tmp` exists (crash
     /// between write and rename), recovers from the temp file.
-    ///
-    /// Metadata stamped with a migratable older format is upgraded in memory
-    /// and reported with `log::warn!`; nothing is written here. Writers call
-    /// [`load_reporting_migration`](Self::load_reporting_migration) and persist
-    /// the upgrade themselves.
     pub async fn load<D: crate::directories::Directory>(dir: &D) -> Result<Self> {
-        let (meta, migrated_from) = Self::load_reporting_migration(dir).await?;
-        if let Some(from) = migrated_from {
-            log::warn!(
-                "[metadata_migration] metadata.json format version {from} upgraded in memory \
-                 to {INDEX_META_FORMAT_VERSION} ({} segment(s)); the upgrade is persisted \
-                 when a writer opens this index. Segments from builds before 1.8.125 fail at \
-                 segment open and need a rebuild; segments without .rowstats cannot be \
-                 compacted until they are merged",
-                meta.segment_metas.len()
-            );
-        }
-        Ok(meta)
-    }
-
-    /// [`load`](Self::load) that also returns the on-disk format version when
-    /// it differed from `INDEX_META_FORMAT_VERSION` and was upgraded.
-    ///
-    /// The caller owns the log line and any persistence, so a writer can
-    /// report "persisted" instead of the reader's "in memory only" warning.
-    pub async fn load_reporting_migration<D: crate::directories::Directory>(
-        dir: &D,
-    ) -> Result<(Self, Option<u32>)> {
         let path = Path::new(INDEX_META_FILENAME);
         match dir.open_read(path).await {
             Ok(slice) => {
                 let bytes = slice.read_bytes().await?;
-                Self::deserialize_versioned(bytes.as_slice())
+                Self::deserialize(bytes.as_slice())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Try recovering from temp file (crash between write and rename)
                 let tmp_path = Path::new(INDEX_META_TMP_FILENAME);
                 let slice = dir.open_read(tmp_path).await?;
                 let bytes = slice.read_bytes().await?;
-                let recovered = Self::deserialize_versioned(bytes.as_slice())?;
+                let recovered = Self::deserialize(bytes.as_slice())?;
                 log::warn!("Recovered metadata from temp file (previous crash during save)");
                 Ok(recovered)
             }
@@ -499,35 +445,21 @@ impl IndexMetadata {
         }
     }
 
-    /// Deserialize the current format or upgrade a migratable older one,
-    /// returning the original stamp when an upgrade happened. Vector artifacts
-    /// are intentionally rebuilt when the ANN format changes; accepting
-    /// arbitrary older metadata would mix incompatible segment and
-    /// global-codebook generations.
-    fn deserialize_versioned(bytes: &[u8]) -> Result<(Self, Option<u32>)> {
-        let mut meta: Self =
+    /// Deserialize current-format metadata. Vector artifacts are rebuilt when
+    /// the ANN format changes; accepting other formats would mix incompatible
+    /// segment and global-codebook generations.
+    fn deserialize(bytes: &[u8]) -> Result<Self> {
+        let meta: Self =
             serde_json::from_slice(bytes).map_err(|e| Error::Serialization(e.to_string()))?;
-        meta.schema.validate()?;
-        crate::dsl::reject_removed_vector_index_types(&meta.schema).map_err(Error::Schema)?;
-        let migrated_from = if meta.version == INDEX_META_FORMAT_VERSION {
-            None
-        } else if (OLDEST_MIGRATABLE_FORMAT_VERSION..INDEX_META_FORMAT_VERSION)
-            .contains(&meta.version)
-        {
-            let from = meta.version;
-            meta.version = INDEX_META_FORMAT_VERSION;
-            Some(from)
-        } else {
+        if meta.version != INDEX_META_FORMAT_VERSION {
             return Err(Error::Corruption(format!(
-                "metadata.json format version {} is incompatible with required version {} \
-                 (formats {}..={} are upgraded on open); \
+                "metadata.json format version {} is incompatible with required version {}; \
                  rebuild and republish the index with this Summa version",
-                meta.version,
-                INDEX_META_FORMAT_VERSION,
-                OLDEST_MIGRATABLE_FORMAT_VERSION,
-                INDEX_META_FORMAT_VERSION - 1
+                meta.version, INDEX_META_FORMAT_VERSION
             )));
-        };
+        }
+        meta.schema.validate()?;
+        crate::dsl::validate_persisted_schema(&meta.schema).map_err(Error::Schema)?;
         let mut deletion_ids = std::collections::HashSet::new();
         for info in meta.segment_metas.values() {
             if let Some(deletion) = &info.deletions
@@ -541,28 +473,6 @@ impl IndexMetadata {
                     "invalid or aliased deletion metadata".into(),
                 ));
             }
-        }
-        Ok((meta, migrated_from))
-    }
-
-    /// Load for a writer: upgrade a migratable older format and persist the
-    /// new stamp immediately, so the index is never left readable by a build
-    /// that would silently drop the fields this format added.
-    #[cfg(any(feature = "native", feature = "wasm"))]
-    pub(crate) async fn load_persisting_migration<D: crate::directories::DirectoryWriter>(
-        dir: &D,
-    ) -> Result<Self> {
-        let (meta, migrated_from) = Self::load_reporting_migration(dir).await?;
-        if let Some(from) = migrated_from {
-            meta.save(dir).await?;
-            log::warn!(
-                "[metadata_migration] metadata.json format version {from} upgraded to \
-                 {INDEX_META_FORMAT_VERSION} and persisted ({} segment(s)); builds that do not \
-                 support format {INDEX_META_FORMAT_VERSION} can no longer open this index. Segments from builds before 1.8.125 \
-                 fail at segment open and need a rebuild; segments without .rowstats cannot \
-                 be compacted until they are merged",
-                meta.segment_metas.len()
-            );
         }
         Ok(meta)
     }
@@ -660,12 +570,11 @@ impl IndexMetadata {
 
         for (field_id, field_meta) in built_fields {
             log::debug!(
-                "[trained] index={} field {} state={:?} centroids_file={:?} codebook_file={:?}",
+                "[trained] index={} field {} state={:?} centroids_file={:?}",
                 schema.index_label(),
                 field_id,
                 field_meta.state,
                 field_meta.centroids_file,
-                field_meta.codebook_file,
             );
             if field_meta.field_id != *field_id {
                 return Err(Error::Corruption(format!(
@@ -690,13 +599,6 @@ impl IndexMetadata {
                 ))
             })?;
             match field_meta.index_type {
-                VectorFieldIndexType::Float(VectorIndexType::IvfPq) => {
-                    return Err(Error::Corruption(format!(
-                        "field {field_id} was trained as IVF-PQ, which is no longer \
-                         supported; recreate the index with `ivf_tq` and reindex \
-                         (docs/turboquant-quantization.md)"
-                    )));
-                }
                 VectorFieldIndexType::Float(index_type @ VectorIndexType::IvfTq) => {
                     let entry = schema
                         .get_field_entry(crate::dsl::Field(*field_id))
@@ -753,14 +655,6 @@ impl IndexMetadata {
                                 "invalid trained centroid routing for field {field_id}: {error}"
                             ))
                         })?;
-                    // The TQ leaf codec is derived, never trained; ensure
-                    // `index_type` stays referenced for future variants.
-                    let _ = index_type;
-                    if field_meta.codebook_file.is_some() {
-                        return Err(Error::Corruption(format!(
-                            "trained IVF-TQ field {field_id} unexpectedly references a codebook file"
-                        )));
-                    }
                     centroids.insert(*field_id, Arc::new(c));
                 }
                 VectorFieldIndexType::Binary(BinaryIndexType::Ivf) => {
@@ -810,11 +704,6 @@ impl IndexMetadata {
                 }
                 VectorFieldIndexType::Float(VectorIndexType::Scann)
                 | VectorFieldIndexType::Binary(BinaryIndexType::Scann) => {
-                    if field_meta.codebook_file.is_some() {
-                        return Err(Error::Corruption(format!(
-                            "trained ScaNN field {field_id} unexpectedly references a separate codebook file"
-                        )));
-                    }
                     let expected_generation = field_meta.artifact_generation.ok_or_else(|| {
                         Error::Corruption(format!(
                             "trained ScaNN field {field_id} has no artifact generation"
@@ -1200,149 +1089,27 @@ mod tests {
         }
     }
 
+    /// 2.1 opens only the current metadata format: older stamps (which the
+    /// 2.0 line upgraded in place) and newer ones are both rebuild boundaries.
     #[tokio::test]
-    async fn load_refuses_metadata_stamped_with_a_newer_format_version() {
-        let directory = crate::directories::RamDirectory::new();
-        let mut metadata = IndexMetadata::new(test_schema());
-        metadata.version = INDEX_META_FORMAT_VERSION + 1;
-        metadata.save(&directory).await.unwrap();
-
-        let error = IndexMetadata::load(&directory)
-            .await
-            .expect_err("metadata from a newer format version must be refused, not silently pruned")
-            .to_string();
-        assert!(
-            error.contains(&format!("version {}", INDEX_META_FORMAT_VERSION + 1)),
-            "{error}"
-        );
-        assert!(error.contains("incompatible"), "{error}");
-    }
-
-    fn stamped_previous_format_bytes(metadata: &IndexMetadata) -> Vec<u8> {
-        let mut raw: serde_json::Value =
-            serde_json::from_slice(&metadata.serialize_to_bytes().unwrap()).unwrap();
-        raw["version"] = serde_json::Value::from(INDEX_META_FORMAT_VERSION - 1);
-        serde_json::to_vec(&raw).unwrap()
-    }
-
-    #[tokio::test]
-    async fn read_only_migration_preserves_format_6_and_7_metadata_bytes() {
-        use crate::directories::Directory;
-        for version in [6, 7] {
+    async fn load_refuses_metadata_stamped_with_any_other_format_version() {
+        for version in [
+            6,
+            INDEX_META_FORMAT_VERSION - 1,
+            INDEX_META_FORMAT_VERSION + 1,
+        ] {
             let directory = crate::directories::RamDirectory::new();
             let mut metadata = IndexMetadata::new(test_schema());
             metadata.version = version;
-            metadata.add_segment("kept".into(), 7);
             metadata.save(&directory).await.unwrap();
-            let before = directory
-                .open_read(Path::new(INDEX_META_FILENAME))
+
+            let error = IndexMetadata::load(&directory)
                 .await
-                .unwrap()
-                .read_bytes()
-                .await
-                .unwrap();
-            let (loaded, migrated) = IndexMetadata::load_reporting_migration(&directory)
-                .await
-                .unwrap();
-            assert_eq!(migrated, Some(version));
-            assert_eq!(loaded.version, INDEX_META_FORMAT_VERSION);
-            assert_eq!(loaded.segment_metas["kept"].num_docs, 7);
-            let after = directory
-                .open_read(Path::new(INDEX_META_FILENAME))
-                .await
-                .unwrap()
-                .read_bytes()
-                .await
-                .unwrap();
-            assert_eq!(after.as_slice(), before.as_slice());
-            loaded.save(&directory).await.unwrap();
-            assert_eq!(
-                IndexMetadata::load_reporting_migration(&directory)
-                    .await
-                    .unwrap()
-                    .1,
-                None
-            );
+                .expect_err("only the current format is readable")
+                .to_string();
+            assert!(error.contains(&format!("version {version}")), "{error}");
+            assert!(error.contains("rebuild"), "{error}");
         }
-    }
-
-    #[tokio::test]
-    async fn load_migrates_previous_metadata_to_the_current_format() {
-        let directory = crate::directories::RamDirectory::new();
-        let mut metadata = IndexMetadata::new(test_schema());
-        metadata.add_segment("kept".to_string(), 7);
-        directory
-            .write(
-                Path::new(INDEX_META_FILENAME),
-                &stamped_previous_format_bytes(&metadata),
-            )
-            .await
-            .unwrap();
-
-        let (loaded, migrated_from) = IndexMetadata::load_reporting_migration(&directory)
-            .await
-            .expect("the previous format remains readable");
-        assert_eq!(migrated_from, Some(INDEX_META_FORMAT_VERSION - 1));
-        assert_eq!(loaded.version, INDEX_META_FORMAT_VERSION);
-        assert_eq!(loaded.segment_metas["kept"].num_docs, 7);
-        assert!(loaded.segment_metas["kept"].deletions.is_none());
-
-        let (_, current) = IndexMetadata::load_reporting_migration(&directory)
-            .await
-            .unwrap();
-        assert_eq!(
-            current,
-            Some(INDEX_META_FORMAT_VERSION - 1),
-            "load alone never persists"
-        );
-        metadata.save(&directory).await.unwrap();
-        let (_, current) = IndexMetadata::load_reporting_migration(&directory)
-            .await
-            .unwrap();
-        assert_eq!(
-            current, None,
-            "current-format metadata reports no migration"
-        );
-    }
-
-    #[tokio::test]
-    async fn tmp_recovery_migrates_previous_metadata() {
-        let directory = crate::directories::RamDirectory::new();
-        let mut metadata = IndexMetadata::new(test_schema());
-        metadata.add_segment("kept".to_string(), 3);
-        directory
-            .write(
-                Path::new(INDEX_META_TMP_FILENAME),
-                &stamped_previous_format_bytes(&metadata),
-            )
-            .await
-            .unwrap();
-
-        let loaded = IndexMetadata::load(&directory)
-            .await
-            .expect("temp-file recovery applies the same migration");
-        assert_eq!(loaded.version, INDEX_META_FORMAT_VERSION);
-        assert_eq!(loaded.segment_metas["kept"].num_docs, 3);
-    }
-
-    #[tokio::test]
-    async fn load_refuses_metadata_older_than_format_6() {
-        // Format 5 predates the position-list v3 layout; its segments are
-        // unreadable, so the stamp must stay a rebuild boundary.
-        let directory = crate::directories::RamDirectory::new();
-        let mut metadata = IndexMetadata::new(test_schema());
-        metadata.version = OLDEST_MIGRATABLE_FORMAT_VERSION - 1;
-        metadata.save(&directory).await.unwrap();
-
-        let error = IndexMetadata::load(&directory)
-            .await
-            .expect_err("metadata predating compatible position streams must be refused")
-            .to_string();
-        assert!(
-            error.contains(&format!("version {}", OLDEST_MIGRATABLE_FORMAT_VERSION - 1)),
-            "{error}"
-        );
-        assert!(error.contains("incompatible"), "{error}");
     }
 
     #[tokio::test]
@@ -1396,8 +1163,8 @@ mod tests {
         let mut metadata = IndexMetadata::new(schema.clone());
         metadata.init_field(first.0, VectorIndexType::IvfTq);
         metadata.init_field(second.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(first.0, 10, 1, "field_0_centroids.bin".into(), None);
-        metadata.mark_field_built(second.0, 10, 1, "field_1_centroids.bin".into(), None);
+        metadata.mark_field_built(first.0, 10, 1, "field_0_centroids.bin".into());
+        metadata.mark_field_built(second.0, 10, 1, "field_1_centroids.bin".into());
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
 
         let error = IndexMetadata::try_load_trained_from_fields(
@@ -1419,7 +1186,7 @@ mod tests {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema);
         metadata.init_field(field.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(field.0, 10, 1, "missing_centroids.bin".into(), None);
+        metadata.mark_field_built(field.0, 10, 1, "missing_centroids.bin".into());
         metadata.save(&directory).await.unwrap();
 
         let error = match crate::index::Index::open(directory, crate::index::IndexConfig::default())
@@ -1432,39 +1199,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ivf_tq_built_state_rejects_a_codebook_file() {
-        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
-        let directory = crate::directories::RamDirectory::new();
-        let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(
-            field.0,
-            10,
-            1,
-            "field_0_centroids.bin".into(),
-            Some("field_0_codebook.bin".into()),
-        );
-        write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
-
-        let error = IndexMetadata::try_load_trained_from_fields(
-            &metadata.vector_fields,
-            &schema,
-            &directory,
-        )
-        .await
-        .err()
-        .expect("IVF-TQ Built state with a codebook file must fail")
-        .to_string();
-        assert!(error.contains("codebook"), "{error}");
-    }
-
-    #[tokio::test]
     async fn legacy_ivf_tq_centroid_generation_is_rejected_while_loading() {
         let (schema, field) = dense_schema(VectorIndexType::IvfTq);
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
         metadata.init_field(field.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
+        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into());
         let mut legacy = test_centroids();
         legacy.version = 7;
         write_bincode(&directory, "field_0_centroids.bin", &legacy).await;
@@ -1483,38 +1223,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_ivf_pq_trained_field_fails_with_actionable_error() {
-        // Simulates metadata written by a pre-removal version: the schema
-        // gate rejects `ivf_pq` fields, so build the raw field-state map
-        // directly against a current-format schema.
-        let (schema, field) = dense_schema(VectorIndexType::IvfTq);
-        let directory = crate::directories::RamDirectory::new();
-        let mut metadata = IndexMetadata::new(schema.clone());
-        metadata.init_field(field.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
-        // Overwrite the recorded type the way pre-removal metadata carries it
-        // (init_field never downgrades an existing entry).
-        metadata
-            .vector_fields
-            .get_mut(&field.0)
-            .expect("field initialized")
-            .index_type = VectorFieldIndexType::Float(VectorIndexType::IvfPq);
-        write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
-
-        let error = IndexMetadata::try_load_trained_from_fields(
-            &metadata.vector_fields,
-            &schema,
-            &directory,
-        )
-        .await
-        .err()
-        .expect("legacy IVF-PQ trained state must fail loudly")
-        .to_string();
-        assert!(error.contains("no longer"), "{error}");
-        assert!(error.contains("ivf_tq"), "{error}");
-    }
-
-    #[tokio::test]
     async fn requested_cluster_count_accepts_a_quality_clamped_artifact() {
         let mut builder = crate::dsl::SchemaBuilder::default();
         let field = builder.add_dense_vector_field_with_config(
@@ -1527,7 +1235,7 @@ mod tests {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
         metadata.init_field(field.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(field.0, 1, 4, "field_0_centroids.bin".into(), None);
+        metadata.mark_field_built(field.0, 1, 4, "field_0_centroids.bin".into());
         write_bincode(&directory, "field_0_centroids.bin", &test_centroids()).await;
 
         let trained = IndexMetadata::try_load_trained_from_fields(
@@ -1547,7 +1255,7 @@ mod tests {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
         metadata.init_field(field.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
+        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into());
         let mut bytes =
             bincode::serde::encode_to_vec(test_centroids(), bincode::config::standard()).unwrap();
         bytes.extend_from_slice(&[0xaa, 0xbb]);
@@ -1588,7 +1296,7 @@ mod tests {
         let directory = crate::directories::RamDirectory::new();
         let mut metadata = IndexMetadata::new(schema.clone());
         metadata.init_field(field.0, VectorIndexType::IvfTq);
-        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into(), None);
+        metadata.mark_field_built(field.0, 10, 1, "field_0_centroids.bin".into());
 
         // CoarseCentroids begins with num_clusters=1, dim=2, then the Vec
         // length. Bincode's standard varint marker 253 introduces a u64; this
@@ -1641,7 +1349,7 @@ mod tests {
 
         assert!(!meta.is_field_built(0));
 
-        meta.mark_field_built(0, 10000, 256, "field_0_centroids.bin".to_string(), None);
+        meta.mark_field_built(0, 10000, 256, "field_0_centroids.bin".to_string());
 
         assert!(meta.is_field_built(0));
         let field = meta.get_field_meta(0).unwrap();
@@ -1726,14 +1434,14 @@ mod tests {
 
         // Build in reverse field-id order to ensure the result is not tied to
         // HashMap or training iteration order.
-        meta.mark_field_built(7, 400, 20, "field_7_centroids.bin".to_string(), None);
+        meta.mark_field_built(7, 400, 20, "field_7_centroids.bin".to_string());
         assert_eq!(meta.total_vectors, 400);
-        meta.mark_field_built(3, 250, 15, "field_3_centroids.bin".to_string(), None);
+        meta.mark_field_built(3, 250, 15, "field_3_centroids.bin".to_string());
         assert_eq!(meta.total_vectors, 650);
 
         // Rebuilding a field replaces its contribution; it does not add a
         // duplicate training snapshot.
-        meta.mark_field_built(7, 425, 20, "field_7_centroids.bin".to_string(), None);
+        meta.mark_field_built(7, 425, 20, "field_7_centroids.bin".to_string());
         assert_eq!(meta.total_vectors, 675);
     }
 
@@ -1751,7 +1459,7 @@ mod tests {
         assert!(meta.should_build_field(0, 1000));
 
         // Already built - should not build again
-        meta.mark_field_built(0, 1500, 256, "centroids.bin".to_string(), None);
+        meta.mark_field_built(0, 1500, 256, "centroids.bin".to_string());
         assert!(!meta.should_build_field(0, 1000));
     }
 

@@ -165,9 +165,8 @@ POS5/POS6 are a rebuild boundary. The position readers, merging, compaction,
 and reordering reject earlier formats. No legacy position decoder or migration
 branch remains.
 
-Metadata format 6 introduced this layout. Current writers upgrade metadata
-formats 6–8 to 9 without rewriting segments; older segment encodings can still
-require a rebuild. See [compatibility](row-deletion.md).
+Metadata format 6 introduced this layout. Summa 2.1 opens only the current
+metadata format; see [compatibility](compatibility.md).
 
 ## Doc postings and skip metadata
 
@@ -178,7 +177,7 @@ require a rebuild. See [compatibility](row-deletion.md).
   a query-time choice. The builder derives `min_len` from chunk lengths or
   the document norms; merges copy the words and take the minimum; a list
   rebuilt without lengths stores 1, which every real unit satisfies.
-  Legacy lists keep their `f32` word and the old bound. A cursor uses the
+  Lists without length bounds are rejected at open. A cursor uses the
   stored minimum only when it also scores with real lengths: a `tf`-as-
   length score is not bounded by a real-length bound.
 - **Norms for plain fields** (implemented 2026-09-03). `.chunks` version 2

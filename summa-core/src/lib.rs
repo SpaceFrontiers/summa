@@ -98,8 +98,8 @@ pub use index::{Index, IndexReader, IndexWriter};
 pub use index::{IndexConfig, IndexMetadata, SLICE_CACHE_FILENAME};
 #[cfg(feature = "native")]
 pub use index::{
-    IndexingStats, SchemaConfig, SchemaFieldConfig, create_index_at_path, create_index_from_sdl,
-    index_documents_from_reader, index_json_document, parse_schema,
+    IndexingStats, create_index_at_path, create_index_from_sdl, index_documents_from_reader,
+    index_json_document, parse_schema,
 };
 
 // Re-exports from merge

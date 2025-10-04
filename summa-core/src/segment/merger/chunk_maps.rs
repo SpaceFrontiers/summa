@@ -76,56 +76,26 @@ impl SegmentMerger {
         plain_fields.sort_unstable();
 
         let doc_offs = super::doc_offsets(segments)?;
-        let mut identities = FxHashMap::default();
-        let mut identity_bytes = 0usize;
         for &field_id in &chunked_fields {
             let field = crate::Field(field_id);
             if self.schema.get_field_entry(field).unwrap().chunked {
                 continue;
             }
-            for (index, segment) in segments.iter().enumerate() {
-                if segment.chunk_map(field).is_some() {
-                    continue;
-                }
-                self.ensure_not_cancelled()?;
-                identity_bytes = identity_bytes.saturating_add(segment.num_docs() as usize * 8);
-                if identity_bytes.saturating_add(crate::segment::text_reorder::plan_bytes(plans))
-                    > self.bp_memory_budget
-                {
-                    return Err(crate::Error::Schema(
-                        "plain text map migration exceeds BP memory budget".into(),
-                    ));
-                }
-                if segment.doc_lengths(field).is_none()
-                    && segment
-                        .meta()
-                        .field_stats
-                        .get(&field_id)
-                        .is_some_and(|stats| stats.total_tokens > 0)
-                {
-                    return Err(crate::Error::Schema(
-                        "legacy text without document lengths requires reindexing before RGB"
-                            .into(),
-                    ));
-                }
-                identities.insert(
-                    (field_id, index),
-                    crate::segment::chunk_map::ChunkMap::identity_documents(
-                        segment.num_docs(),
-                        segment.doc_lengths(field),
-                    )?,
-                );
+            if segments
+                .iter()
+                .any(|segment| segment.num_docs() > 0 && segment.chunk_map(field).is_none())
+            {
+                return Err(crate::Error::Schema(format!(
+                    "reordered text field '{}' lacks a document map; rebuild the index",
+                    self.schema.get_field_name(field).unwrap_or("?")
+                )));
             }
         }
         let mut fields: Vec<(u32, Vec<ChunkMapSource<'_>>)> = Vec::new();
         for field_id in chunked_fields {
             let mut sources = Vec::new();
-            for (index, (segment, &doc_offset)) in segments.iter().zip(doc_offs.iter()).enumerate()
-            {
-                if let Some(map) = segment
-                    .chunk_map(crate::dsl::Field(field_id))
-                    .or_else(|| identities.get(&(field_id, index)))
-                {
+            for (segment, &doc_offset) in segments.iter().zip(doc_offs.iter()) {
+                if let Some(map) = segment.chunk_map(crate::dsl::Field(field_id)) {
                     sources.push(ChunkMapSource { map, doc_offset });
                 }
             }

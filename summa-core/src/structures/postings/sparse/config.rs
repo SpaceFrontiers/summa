@@ -22,12 +22,6 @@ pub enum SparseFormat {
     Seismic,
 }
 
-// Metadata written before BMP became the constructor default omitted MaxScore.
-// Keep that serialized meaning stable; new writers always name their backend.
-fn legacy_sparse_format() -> SparseFormat {
-    SparseFormat::MaxScore
-}
-
 /// Size of the index (term/dimension ID) in sparse vectors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[repr(u8)]
@@ -270,7 +264,6 @@ impl SeismicConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SparseVectorConfig {
     /// Index format: BMP (default), MaxScore, or Seismic
-    #[serde(default = "legacy_sparse_format")]
     pub format: SparseFormat,
     #[serde(default)]
     pub seismic: SeismicConfig,

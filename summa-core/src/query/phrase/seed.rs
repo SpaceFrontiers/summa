@@ -31,7 +31,7 @@ impl PhraseScorer {
             }
             // Short-document bounds only nominate blocks. They do not prove
             // a score floor: only the real matches in `heap` below can do that.
-            let score = -(list.block_bounds(block)?.1.unwrap_or(1) as Score);
+            let score = -(list.block_bounds(block)?.1 as Score);
             let at = blocks.partition_point(|&(bound, _, _)| bound >= score);
             if at < block_limit {
                 if blocks.len() == block_limit {

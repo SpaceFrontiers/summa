@@ -3,10 +3,8 @@
 //! Constants are available on all platforms (including WASM).
 //! Builder/serialization functions are native-only.
 
-/// Index type discriminants stored in the vectors file TOC.
-/// Type 2 was IVF-PQ, removed after IVF-TQ superseded it; the loader still
-/// recognizes it to fail with an actionable message. Never reuse it.
-pub const LEGACY_IVF_PQ_TYPE: u8 = 2;
+/// Index type discriminants stored in the vectors file TOC. Type 2 belonged
+/// to the removed IVF-PQ format; never reuse it.
 pub const FLAT_TYPE: u8 = 4;
 /// Document lookup into the same field's exact binary ANN codes.
 pub const EXACT_LOCATIONS_TYPE: u8 = 11;
@@ -36,13 +34,6 @@ pub fn build_ivf_tq(
     doc_id_ordinals: &[(u32, u16)],
     vectors: &[f32],
 ) -> crate::Result<Vec<u8>> {
-    if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
-        return Err(crate::Error::Corruption(
-            "legacy raw IVF-TQ centroids cannot encode a correct cosine index; \
-             rebuild the index with a current Summa version"
-                .into(),
-        ));
-    }
     let codec = crate::structures::vector::quantization::tq_shared_codec(dim);
     let mut index = crate::structures::IvfTqIndex::new(dim, routing, centroids.version, codec);
     index
@@ -469,23 +460,6 @@ mod tests {
         assert!(crate::structures::is_ivf_tq_cosine_generation(
             disk.header().quantizer_version
         ));
-    }
-
-    #[test]
-    fn ivf_tq_build_rejects_legacy_raw_generation() {
-        let centroids = CoarseCentroids {
-            num_clusters: 1,
-            dim: 2,
-            centroids: vec![1.0, 0.0],
-            version: 7,
-            soar_config: None,
-            routing_index: None,
-        };
-        let error = build_ivf_tq(2, IvfRoutingMode::Flat, &centroids, &[(0, 0)], &[1.0, 0.0])
-            .expect_err("legacy IVF-TQ generation must not encode new segments")
-            .to_string();
-        assert!(error.contains("legacy raw IVF-TQ"), "{error}");
-        assert!(error.contains("rebuild the index"), "{error}");
     }
 
     #[test]

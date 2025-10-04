@@ -2414,23 +2414,6 @@ fn sqlite_deduplicator_detects_key_and_text_duplicates() {
 }
 
 #[test]
-fn sqlite_deduplicator_rejects_legacy_catalogs() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("dedup.sqlite");
-    let connection = rusqlite::Connection::open(&path).unwrap();
-    connection
-        .execute_batch("CREATE TABLE discovery_keys(record_key TEXT PRIMARY KEY NOT NULL)")
-        .unwrap();
-    drop(connection);
-
-    let error = SqliteDeduplicator::open(&path, DeduplicationConfig::default())
-        .err()
-        .unwrap();
-    let error = format!("{error:#}");
-    assert!(error.contains("legacy deduplication catalog"), "{error}");
-}
-
-#[test]
 fn production_recipe_is_strict_and_validates_without_live_services() {
     let path =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus.production.example.json");

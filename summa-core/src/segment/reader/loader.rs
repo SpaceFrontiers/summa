@@ -145,14 +145,6 @@ fn validate_ann_schema(schema: &Schema, field_id: u32, index_type: u8) -> Result
         ))
     })?;
 
-    if index_type == ann_build::LEGACY_IVF_PQ_TYPE {
-        return Err(crate::Error::Corruption(format!(
-            "field {field_id} carries an IVF-PQ ANN payload, which is no longer \
-             supported; recreate the index with `ivf_tq` and reindex \
-             (docs/turboquant-quantization.md)"
-        )));
-    }
-
     let matches_schema = match index_type {
         ann_build::BINARY_IVF_TYPE => {
             field.field_type == FieldType::BinaryDenseVector
@@ -231,8 +223,7 @@ fn is_ann_vector_type(index_type: u8) -> bool {
 
     matches!(
         index_type,
-        ann_build::LEGACY_IVF_PQ_TYPE
-            | ann_build::BINARY_IVF_TYPE
+        ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
             | ann_build::IVF_TQ_TYPE
             | ann_build::SCANN_AH_TYPE
@@ -411,8 +402,7 @@ async fn load_vectors_file_impl<D: Directory>(
             ann_build::FLAT_TYPE | ann_build::EXACT_LOCATIONS_TYPE => flat_toc_fields
                 .insert(entry.field_id, entry.index_type)
                 .is_none(),
-            ann_build::LEGACY_IVF_PQ_TYPE
-            | ann_build::BINARY_IVF_TYPE
+            ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
             | ann_build::IVF_TQ_TYPE
             | ann_build::SCANN_AH_TYPE
@@ -564,8 +554,7 @@ async fn load_vectors_file_impl<D: Directory>(
                     )));
                 }
             }
-            ann_build::LEGACY_IVF_PQ_TYPE
-            | ann_build::BINARY_IVF_TYPE
+            ann_build::BINARY_IVF_TYPE
             | ann_build::TQ_FLAT_TYPE
             | ann_build::IVF_TQ_TYPE
             | ann_build::SCANN_AH_TYPE
@@ -1286,18 +1275,25 @@ pub async fn load_fast_fields_file<D: Directory>(
     files: &SegmentFiles,
     schema: &Schema,
 ) -> Result<FxHashMap<u32, crate::structures::fast_field::FastFieldReader>> {
-    // Skip if no fast fields in schema
-    let has_fast = schema.fields().any(|(_, entry)| entry.fast);
+    // Segment builders write `.fast` whenever the schema has a columnar field.
+    let has_fast = schema.fields().any(|(_, entry)| {
+        entry.fast
+            && matches!(
+                entry.field_type,
+                FieldType::U64 | FieldType::I64 | FieldType::F64 | FieldType::Text
+            )
+    });
     if !has_fast {
         return Ok(FxHashMap::default());
     }
 
-    // Try to open the .fast file (may not exist for old segments)
     let handle = match dir.open_read(&files.fast).await {
         Ok(h) => h,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            log::debug!("[fast-fields] .fast file not found ({}), skipping", e);
-            return Ok(FxHashMap::default());
+            return Err(crate::Error::Corruption(format!(
+                "segment file {} is missing; rebuild the index",
+                files.fast.display()
+            )));
         }
         Err(e) => return Err(crate::Error::Io(e)),
     };
@@ -1730,27 +1726,6 @@ mod tests {
             panic!("ANN storage that disagrees with the schema must be rejected");
         };
         assert!(message.contains("does not match schema"));
-    }
-
-    #[tokio::test]
-    async fn legacy_ivf_pq_payload_fails_with_actionable_error() {
-        let mut schema = SchemaBuilder::default();
-        schema.add_dense_vector_field("dense", 2, true, true);
-        let schema = schema.build();
-        let files = SegmentFiles::new(19);
-        let dir = RamDirectory::new();
-        let bytes = vectors_file_with_payloads(vec![
-            (0, ann_build::FLAT_TYPE, one_dense_flat_payload()),
-            (0, ann_build::LEGACY_IVF_PQ_TYPE, vec![0]),
-        ]);
-        dir.write(&files.vectors, &bytes).await.unwrap();
-
-        let result = load_vectors_file(&dir, &files, &schema, 1).await;
-        let Err(crate::Error::Corruption(message)) = result else {
-            panic!("retired IVF-PQ payloads must be rejected loudly");
-        };
-        assert!(message.contains("no longer"), "{message}");
-        assert!(message.contains("ivf_tq"), "{message}");
     }
 
     #[tokio::test]

@@ -33,7 +33,7 @@ pub struct DenseVectorQuery {
     pub rerank_factor: f32,
     /// How to combine scores for multi-valued documents
     pub combiner: MultiValueCombiner,
-    /// Query-global dense plans (IVF-PQ probe route / TQ LUTs), shared by all
+    /// Query-global dense plans (IVF probe route / TQ LUTs), shared by all
     /// segment scorers spawned for this query. The caches are versioned, so a
     /// query reused after an index generation change recomputes safely.
     plan_cache: Arc<crate::segment::DensePlanCache>,

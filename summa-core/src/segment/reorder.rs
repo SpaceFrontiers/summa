@@ -1077,10 +1077,6 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         Vec::new()
     };
     let rewrite_text = !text_plans.is_empty();
-    let upgrade_chunks = reader
-        .chunk_maps()
-        .values()
-        .any(|m| !m.has_logical_addressing());
     let copy_start = std::time::Instant::now();
     let text_file = |path: &Path| {
         path == src_files.term_dict.as_path()
@@ -1121,10 +1117,7 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
         if cancellation_requested(cancellation.as_deref()) {
             return Err(crate::Error::IndexClosed);
         }
-        if (rewrite_text && text_file(src))
-            || (upgrade_chunks && src == &src_files.chunks)
-            || (rewrite_vectors && src == &src_files.vectors)
-        {
+        if (rewrite_text && text_file(src)) || (rewrite_vectors && src == &src_files.vectors) {
             continue;
         }
         clone_segment_file(
@@ -1158,18 +1151,6 @@ pub(crate) async fn reorder_segment<D: Directory + DirectoryWriter>(
     } else {
         true
     };
-    if upgrade_chunks && !rewrite_text {
-        super::text_reorder::write_reordered_chunk_maps(
-            dir,
-            &reader,
-            &dst_files,
-            schema,
-            &[],
-            memory_budget,
-            cancellation.as_deref(),
-        )
-        .await?;
-    }
     // Text plans no longer overlap the BMP graph scratch budget.
     drop(text_plans);
     if rewrite_vectors {

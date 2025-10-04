@@ -1,12 +1,9 @@
 # Row deletion, upserts, and compaction
 
 Implemented in native/portable core, CLI, gRPC server/broker, Python/TypeScript,
-and WASM LocalIndex. Current metadata is **format 10**; formats 6–9 upgrade on
-open without rewriting segments. Readers upgrade in memory and warn; writers
-persist the stamp, after which older builds cannot open the index. Formats 7,
-8, and 9 introduced deletion masks, content hashes, and compact text/norm flags.
-Segments written before 1.8.125 still need rebuilding (BMP blob magic);
-segments without `.rowstats` require a merge before compaction.
+and WASM LocalIndex. Current metadata is **format 11**, the only format
+Summa 2.1 opens ([compatibility](compatibility.md)). Formats 7, 8, and 9
+introduced deletion masks, content hashes, and compact text/norm flags.
 Native mutation APIs require an initialized primary-key index; server and WASM
 writers initialize it automatically. Cross-shard atomic upserts are not supported.
 

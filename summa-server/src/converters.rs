@@ -1048,9 +1048,6 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             if let Some(ref cfg) = entry.dense_vector_config {
                 let idx_name = match cfg.index_type {
                     VectorIndexType::Flat => "flat",
-                    // Unreachable in practice: schemas with the retired
-                    // ivf_pq type are rejected at index create/open.
-                    VectorIndexType::IvfPq => "ivf_pq",
                     VectorIndexType::Tq => "tq",
                     VectorIndexType::IvfTq => "ivf_tq",
                     VectorIndexType::Scann => "scann",
@@ -1078,13 +1075,7 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                         idx_params.push(format!("routing: {routing}"));
                     }
                     if let Some(soar) = &cfg.soar {
-                        let mode = if soar.selective {
-                            "selective"
-                        } else if soar.num_secondary > 1 {
-                            "aggressive"
-                        } else {
-                            "full"
-                        };
+                        let mode = if soar.selective { "selective" } else { "full" };
                         idx_params.push(format!("soar: {mode}"));
                     }
                 }
@@ -2619,7 +2610,7 @@ mod tests {
                 field languages: text<raw_ci> [fast]
                 field content: text<lex(by: languages, segmenter: simple, stem: snowball, variants: false)> [indexed<token_position>]
                 field sparse_emb: sparse_vector<u32> [indexed<quantization: uint8, weight_threshold: 0.01>, stored<multi>]
-                field dense_emb: dense_vector<1024, f16> [indexed<ivf_pq, routing: hnsw, num_clusters: 256>, stored<multi>]
+                field dense_emb: dense_vector<1024, f16> [indexed<ivf_tq, routing: hnsw, num_clusters: 256>, stored<multi>]
                 field scann_emb: dense_vector<768, f16> [indexed<scann, num_clusters: 4096, tree_levels: 2, nprobe: 128>]
                 field binary_scann: binary_dense_vector<512> [indexed<scann, num_clusters: 2048, tree_levels: 2, nprobe: 96>]
                 field meta: json [stored<multi>]

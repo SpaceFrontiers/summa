@@ -272,11 +272,6 @@ impl SegmentId {
         Self(id)
     }
 
-    /// For backwards compatibility with u64-based IDs
-    pub fn from_u64(id: u64) -> Self {
-        Self(id as u128)
-    }
-
     /// Create from hex string (32 chars)
     pub fn from_hex(s: &str) -> Option<Self> {
         u128::from_str_radix(s, 16).ok().map(Self)
@@ -345,22 +340,19 @@ impl SegmentMeta {
         let id = reader.read_u128::<LittleEndian>()?;
         let num_docs = reader.read_u32::<LittleEndian>()?;
 
-        // Read field stats (handle legacy format without field stats)
         let mut field_stats = FxHashMap::default();
-        if reader.position() < data.len() as u64 {
-            let num_fields = reader.read_u32::<LittleEndian>()?;
-            for _ in 0..num_fields {
-                let field_id = reader.read_u32::<LittleEndian>()?;
-                let total_tokens = reader.read_u64::<LittleEndian>()?;
-                let doc_count = reader.read_u32::<LittleEndian>()?;
-                field_stats.insert(
-                    field_id,
-                    FieldStats {
-                        total_tokens,
-                        doc_count,
-                    },
-                );
-            }
+        let num_fields = reader.read_u32::<LittleEndian>()?;
+        for _ in 0..num_fields {
+            let field_id = reader.read_u32::<LittleEndian>()?;
+            let total_tokens = reader.read_u64::<LittleEndian>()?;
+            let doc_count = reader.read_u32::<LittleEndian>()?;
+            field_stats.insert(
+                field_id,
+                FieldStats {
+                    total_tokens,
+                    doc_count,
+                },
+            );
         }
 
         Ok(Self {

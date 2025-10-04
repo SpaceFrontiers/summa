@@ -41,8 +41,8 @@ cache miss. Startup/visibility refresh adds a column scan. These are cost models
 not measured latency claims. The fallback costs a column scan per matching key.
 
 Schema serialization uses a defaulted optional field marker, introduced in
-metadata format 8. Current format 10 upgrades formats 6–9 without rewriting
-segment payloads; older writers cannot silently drop the setting. Validation
+metadata format 8; older writers cannot silently drop the setting. Summa 2.1
+opens only the current format ([compatibility](compatibility.md)). Validation
 applies on SDL/JSON parsing, core creation, and metadata load. Hashes use the
 existing store; no sidecar, second writer, or hash index is introduced.
 

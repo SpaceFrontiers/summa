@@ -636,13 +636,11 @@ impl SegmentMerger {
         let index_type = match entry.field_type {
             FieldType::DenseVector => {
                 // IVF-TQ was intercepted above; every other dense index type
-                // (flat, tq handled separately, removed ivf_pq) must not
-                // reach the trained-copy path with ANN payloads attached.
+                // (flat, tq handled separately) must not reach the
+                // trained-copy path with ANN payloads attached.
                 if has_source_ann {
                     return Err(crate::Error::Corruption(format!(
-                        "dense field {} unexpectedly contains trained ANN payloads \
-                         (was it created as ivf_pq? that format was removed — \
-                         recreate the index with ivf_tq)",
+                        "dense field {} unexpectedly contains trained ANN payloads",
                         field.0,
                     )));
                 }
@@ -1064,13 +1062,6 @@ impl SegmentMerger {
             }
             return Ok(None);
         };
-        if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
-            return Err(crate::Error::Corruption(format!(
-                "IVF-TQ field {} uses the removed legacy raw generation; \
-                 rebuild the index with a current Summa version",
-                field.0,
-            )));
-        }
         let expected_fingerprint =
             crate::structures::vector::quantization::tq_expected_fingerprint(config.dim);
         let max_assignments = centroids
@@ -1163,13 +1154,6 @@ impl SegmentMerger {
         let Some(centroids) = trained.and_then(|trained| trained.centroids.get(&field.0)) else {
             return Ok(None);
         };
-        if !crate::structures::is_ivf_tq_cosine_generation(centroids.version) {
-            return Err(crate::Error::Corruption(format!(
-                "IVF-TQ field {} uses the removed legacy raw generation; \
-                 rebuild the index with a current Summa version",
-                field.0,
-            )));
-        }
 
         let codec = crate::structures::vector::quantization::tq_shared_codec(config.dim);
         let mut index = crate::structures::IvfTqIndex::new(

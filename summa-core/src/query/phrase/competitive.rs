@@ -75,8 +75,7 @@ impl CompetitiveLengths {
             let block_minimum = postings
                 .current_block_metadata()
                 .and_then(|(list, block)| list.block_bounds(block))
-                .and_then(|(_, minimum)| minimum)
-                .unwrap_or(1);
+                .map_or(1, |(_, minimum)| minimum);
             let floor = floor.max(block_minimum);
             let pairs = bytes.as_chunks::<2>().0;
             postings.find_in_block(|docs, tfs| {

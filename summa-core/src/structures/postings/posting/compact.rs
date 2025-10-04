@@ -34,16 +34,16 @@ impl PostingBlockSource {
         check(cancellation)?;
         let len = usize::try_from(file.len()).map_err(|_| invalid("posting file is too large"))?;
         let tail = file
-            .read_bytes_range(file.len().saturating_sub(FOOTER_V2_SIZE as u64)..file.len())
+            .read_bytes_range(file.len().saturating_sub(FOOTER_SIZE as u64)..file.len())
             .await?;
-        if tail.len() != len.min(FOOTER_V2_SIZE) {
+        if tail.len() != len.min(FOOTER_SIZE) {
             return Err(invalid(
                 "posting footer read returned an incorrect byte count",
             ));
         }
         let footer = Footer::parse_tail(tail.as_slice(), len)?;
         let index_end = if footer.impact_bounds {
-            len - FOOTER_V2_SIZE
+            len - FOOTER_SIZE
         } else {
             footer.ratios_end()
         };
@@ -237,7 +237,6 @@ impl PostingBlockSource {
             max_tf: self.footer.max_tf,
             pos_cursors: self.footer.has_cursors.then(|| OwnedBytes::new(vec![0; 8])),
             total_positions: span.end - span.start,
-            len_bounds: self.footer.len_bounds,
             min_len: self.footer.min_len,
         })
     }
@@ -483,14 +482,7 @@ impl<W: Write> PostingStreamWriter<W> {
         {
             return Err(invalid("invalid streaming posting order or size"));
         }
-        let (max_tf, min_len) = unpack_bounds(bounds, block.len_bounds);
-        write_l0(
-            &mut self.l0,
-            first,
-            last,
-            self.written as u32,
-            pack_bounds(max_tf, min_len.unwrap_or(1)),
-        );
+        write_l0(&mut self.l0, first, last, self.written as u32, bounds);
         if self.with_positions {
             self.cursors
                 .extend_from_slice(&self.positions.to_le_bytes());
@@ -516,7 +508,7 @@ impl<W: Write> PostingStreamWriter<W> {
             .checked_add(block.total_positions())
             .ok_or_else(|| invalid("position count overflow"))?;
         self.max_tf = self.max_tf.max(block.max_tf());
-        self.min_len = self.min_len.min(min_len.unwrap_or(1));
+        self.min_len = self.min_len.min(unpack_bounds(bounds).1);
         Ok(())
     }
 
@@ -609,7 +601,7 @@ impl<W: Write> PostingStreamWriter<W> {
             self.max_tf,
             self.positions,
             self.with_positions,
-            Some(if blocks == 0 { 1 } else { self.min_len }),
+            if blocks == 0 { 1 } else { self.min_len },
             true,
             self.has_ratios,
             impacts.is_some(),
@@ -637,7 +629,7 @@ impl<W: Write> PostingStreamWriter<W> {
                     0
                 }
                 + impacts.as_ref().map_or(0, |t| t.bytes().len() as u64)
-                + FOOTER_V2_SIZE as u64,
+                + FOOTER_SIZE as u64,
         ))
     }
 }
@@ -920,7 +912,7 @@ mod tests {
         let mut bytes = Vec::new();
         list.serialize(&mut bytes).unwrap();
         let bytes = OwnedBytes::new(bytes);
-        let footer_start = (bytes.len() - FOOTER_V2_SIZE) as u64;
+        let footer_start = (bytes.len() - FOOTER_SIZE) as u64;
         for returned in [0, 1] {
             let source = bytes.clone();
             let file = FileHandle::lazy(

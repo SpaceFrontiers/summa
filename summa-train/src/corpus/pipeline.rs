@@ -304,16 +304,6 @@ impl SqliteDeduplicator {
         config.validate()?;
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open deduplication catalog {}", path.display()))?;
-        let legacy_table: i64 = connection.query_row(
-            "SELECT count(*) FROM sqlite_master
-             WHERE type = 'table' AND name = 'discovery_keys'",
-            [],
-            |row| row.get(0),
-        )?;
-        ensure!(
-            legacy_table == 0,
-            "legacy deduplication catalog detected; use a clean work directory"
-        );
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;

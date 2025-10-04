@@ -36,5 +36,4 @@ pnpm --dir summa-web build
 ```
 
 Serve `summa-web/dist/` as static files. Keep protocol/configuration helpers in
-`src/lib` so tests need neither Vue nor WASM. Historical `pnpm lab:*` scripts
-forward to Model Lab.
+`src/lib` so tests need neither Vue nor WASM.

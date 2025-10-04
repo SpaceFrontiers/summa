@@ -482,7 +482,7 @@ mod tests {
             for at in [
                 footer.ratios_end(),
                 footer.ratios_end() + (footer.l0_count + 1) * 4,
-                impact_bytes.len() - FOOTER_V2_SIZE - 1,
+                impact_bytes.len() - FOOTER_SIZE - 1,
             ] {
                 let mut bad = impact_bytes.clone();
                 bad[at] = 255;

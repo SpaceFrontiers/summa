@@ -436,8 +436,8 @@ impl SegmentMerger {
 
     /// Merge segments into one, streaming postings/positions/store directly to files.
     ///
-    /// If `trained` is provided, dense vectors use O(1) cluster merge when possible
-    /// (compatible IVF-PQ), otherwise rebuilds ANN from global artifacts.
+    /// If `trained` is provided, dense vectors copy compatible ANN runs when
+    /// possible, otherwise rebuild ANN from global artifacts.
     /// Without trained structures, only flat vectors are merged.
     ///
     /// Uses streaming writers so postings, positions, and store data flow directly
@@ -515,7 +515,6 @@ impl SegmentMerger {
                     self.bp_budget,
                     self.cancellation.as_deref(),
                     self.background_pool.clone(),
-                    true,
                 )
                 .await?
             } else {
@@ -561,7 +560,7 @@ impl SegmentMerger {
                 crate::format_bytes(positions_bytes),
             );
             // Reuse the retained plan after term scratch is released. Do not
-            // overlap legacy map migration with budget-sized term buffers.
+            // overlap map rewriting with budget-sized term buffers.
             if reorder_text {
                 self.merge_chunk_maps(dir, segments, &files, &plans).await?;
             }

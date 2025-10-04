@@ -93,7 +93,6 @@ pub(crate) async fn plan_text_reorders(
         bp_budget,
         cancellation,
         rayon_pool,
-        false,
     )
     .await
 }
@@ -106,7 +105,6 @@ pub(crate) async fn plan_text_reorders_from_sources(
     bp_budget: crate::segment::BpBudget,
     cancellation: Option<&std::sync::atomic::AtomicBool>,
     rayon_pool: Option<Arc<rayon::ThreadPool>>,
-    allow_unmapped: bool,
 ) -> Result<Vec<TextReorderPlan>> {
     check_cancelled(cancellation)?;
     let mut plans = Vec::new();
@@ -122,10 +120,9 @@ pub(crate) async fn plan_text_reorders_from_sources(
                     .field_stats
                     .get(&field.0)
                     .is_some_and(|stats| stats.total_tokens > 0)
-                && (!allow_unmapped || reader.doc_lengths(field).is_none())
             {
                 return Err(crate::Error::Schema(format!(
-                    "text reorder of '{}' requires a document map or legacy document lengths; rebuild or migrate legacy segments through a compatible merge first",
+                    "text reorder of '{}' requires a document map; rebuild the index",
                     entry.name
                 )));
             }
@@ -559,7 +556,7 @@ fn check_chunk_map_budget(
     Ok(())
 }
 
-pub(crate) async fn write_reordered_chunk_maps<D: Directory + DirectoryWriter>(
+async fn write_reordered_chunk_maps<D: Directory + DirectoryWriter>(
     dir: &D,
     reader: &SegmentReader,
     dst_files: &SegmentFiles,
@@ -827,13 +824,10 @@ pub(crate) async fn reorder_term(
             check_cancelled(cancellation)?;
         }
         let reader = &readers[sources[entry.source].0];
-        let length = match reader.chunk_map(plan.field) {
-            Some(map) => map.length(entry.old),
-            None => reader
-                .doc_lengths(plan.field)
-                .ok_or_else(|| crate::Error::Corruption("reordered field lost its lengths".into()))?
-                .length(entry.old),
-        };
+        let length = reader
+            .chunk_map(plan.field)
+            .ok_or_else(|| crate::Error::Corruption("reordered field lost its chunk map".into()))?
+            .length(entry.old);
         output.push(entry.new, entry.tf, length)?;
         if let Some(positions) = &mut positions[entry.source] {
             positions
@@ -873,7 +867,7 @@ mod tests {
             PostingCodec::Simd4x,
             PostingCodec::RoundedBitmap,
         ] {
-            let schema = |mapped| {
+            let schema = || {
                 let mut b = Schema::builder();
                 let plain = b.add_text_field("plain", true, true);
                 let chunks = b.add_text_field("chunks", true, true);
@@ -881,13 +875,13 @@ mod tests {
                 b.set_multi(plain, true);
                 b.set_chunked(chunks, true);
                 for field in [plain, chunks] {
-                    b.set_reorder(field, mapped);
+                    b.set_reorder(field, true);
                     b.set_positions(field, crate::dsl::PositionMode::TokenPosition);
                 }
                 b.set_fast(other, true);
                 (b.build(), plain, chunks)
             };
-            let (target, plain, chunks) = schema(true);
+            let (target, plain, chunks) = schema();
             let target = Arc::new(target);
             let mut sources = Vec::new();
             for source in 0..2 {
@@ -903,7 +897,7 @@ mod tests {
                     merge_policy: Box::new(crate::NoMergePolicy),
                     ..Default::default()
                 };
-                let (source_schema, _, _) = schema(source == 1);
+                let (source_schema, _, _) = schema();
                 let other = source_schema.get_field("other").unwrap();
                 let mut writer = IndexWriter::create(dir.clone(), source_schema, config.clone())
                     .await
@@ -949,7 +943,7 @@ mod tests {
                 let searcher = reader.searcher().await.unwrap();
                 let id = crate::segment::SegmentId(searcher.segment_readers()[0].meta().id);
                 sources.push(
-                    SegmentReader::open(&dir, id, Arc::new(schema(source == 1).0), 256)
+                    SegmentReader::open(&dir, id, Arc::clone(&target), 256)
                         .await
                         .unwrap(),
                 );
@@ -1088,7 +1082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_plain_reorder_requires_explicit_map_migration() {
+    async fn plain_reorder_without_document_map_requires_rebuild() {
         let schema = |reorder| {
             let mut builder = Schema::builder();
             let field = builder.add_text_field("text", true, false);
@@ -1124,7 +1118,7 @@ mod tests {
         )
         .await
         .err()
-        .expect("legacy RGB must not silently skip a requested field");
+        .expect("RGB must not silently skip a requested field");
         assert!(error.to_string().contains("document map"));
     }
 

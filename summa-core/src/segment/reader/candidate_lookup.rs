@@ -58,9 +58,6 @@ impl SegmentReader {
                 let Some(map) = self.chunk_map(field) else {
                     return Ok(locations);
                 };
-                if !map.has_logical_addressing() {
-                    return Err(Error::Query("legacy reordered text needs explicit Reorder to upgrade its chunk map for L1".into()));
-                }
                 for &doc in documents {
                     for (ordinal, physical) in map.slots_for_document(doc) {
                         push(doc, ordinal, physical)?;
@@ -173,24 +170,15 @@ impl SegmentReader {
         self.schema
             .fields()
             .filter_map(|(field, entry)| {
-                let prepared = if let Some(map) = self.chunk_map(field) {
-                    map.has_logical_addressing()
-                } else if self.seismic_index(field).is_some() {
-                    true
-                } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
-                    bmp.forward().is_some() || bmp.logically_ordered()
-                } else {
-                    !(self.vector_indexes.contains_key(&field.0)
-                        && !self.flat_vectors.contains_key(&field.0))
-                        && !(matches!(entry.field_type, FieldType::Text)
-                            && !entry.chunked
-                            && self
-                                .meta
-                                .field_stats
-                                .get(&field.0)
-                                .is_some_and(|stats| stats.total_tokens > 0)
-                            && self.doc_lengths(field).is_none())
-                };
+                let prepared =
+                    if self.chunk_map(field).is_some() || self.seismic_index(field).is_some() {
+                        true
+                    } else if let Some(bmp) = self.bmp_indexes.get(&field.0) {
+                        bmp.forward().is_some() || bmp.logically_ordered()
+                    } else {
+                        !(self.vector_indexes.contains_key(&field.0)
+                            && !self.flat_vectors.contains_key(&field.0))
+                    };
                 (!prepared).then(|| entry.name.clone())
             })
             .collect()
@@ -223,9 +211,6 @@ impl SegmentReader {
         let mut locations = Vec::with_capacity(targets.len());
         for &target in targets {
             let physical = if let Some(map) = self.chunk_map(field) {
-                if !map.has_logical_addressing() {
-                    return Err(Error::Query("legacy reordered text needs explicit Reorder to upgrade its chunk map for L1".into()));
-                }
                 map.slot_for_unit(target)
             } else if let Some(index) = self.seismic_index(field) {
                 index
