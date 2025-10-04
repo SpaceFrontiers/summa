@@ -37,11 +37,26 @@ leaves, so the probe default doubles: 4·sqrt(N) at 128 probes scans 33.1k
 postings for recall@10 0.936 (Hamming) / 0.654 (float), against 65.0k postings
 for 0.942 / 0.657 at sqrt(N) and 64 probes.
 
-The previous sqrt(N) default cited a 15M-row latency sweep. This study counts
-work, not latency, so per-leaf overhead (run directories, probe selection,
-prefetch ranges) is not included. Merges now keep one run per leaf
-([binary vector storage](binary-vector-storage.md)), which bounds that
-overhead; latency should be re-measured on production-sized indexes.
+The previous sqrt(N) default cited a 15M-row latency sweep. End-to-end
+latency on the same 1M real codes confirms the work counts. Each geometry was
+indexed into one merged `MmapDirectory` segment, with explicit `num_clusters`
+and `nprobe` swept through metadata-only ALTERs. The queries were 1,000 real NQ
+queries (tie-aware recall@10 against exact Hamming), two warm passes, on an
+8-vCPU Xeon @ 2.9 GHz with AVX-512 VPOPCNTDQ:
+
+| Recall@10 | sqrt(N) = 1,000 leaves    | 4·sqrt(N) = 4,000 leaves | 16·sqrt(N) = 16,000 leaves |
+| --------- | ------------------------- | ------------------------ | -------------------------- |
+| ≈0.89     | 0.553 ms p50 (nprobe 32)  | 0.318 ms (64)            | 0.364 ms (128)             |
+| ≈0.935    | 1.082 ms p50 (nprobe 64)  | 0.586 ms (128, default)  | 0.801 ms (384)             |
+| ≈0.965    | 2.140 ms p50 (nprobe 128) | 1.153 ms (256)           | 1.642 ms (768)             |
+
+4·sqrt(N) is the latency optimum at every recall level (1.74–1.86× faster than
+sqrt(N)); 16·sqrt(N) pays for routing over four times more centroids. Query
+time is the Hamming scan itself (48% of all profile samples are the kernel on
+the search thread), and it is memory-bandwidth bound: about 8 MB of codes per
+query at roughly 8 GB/s on one core. Bytes read per query, not per-leaf overhead,
+are the cost to reduce. Production-sized indexes on cold storage remain
+unmeasured.
 
 ## Training cost and hierarchical quality
 
@@ -73,3 +88,30 @@ would recover less, so it is not adopted.
 SOAR spill and asymmetric rescoring are the remaining worthwhile changes; both
 need design work (a versioned payload with duplicate postings, and a float
 query path respectively) before implementation.
+
+## Candidate: prefix-first two-stage scan
+
+Because the scan is bandwidth bound, reading fewer bytes per posting matters
+more than fewer instructions. Ranking probed postings by Hamming distance on a
+code prefix, keeping the best M, and rescoring only those on the full code
+gives, at 4·sqrt(N) on the same data:
+
+| nprobe | Full scan: recall / bytes | 512-bit prefix, M = 1,000: recall / bytes | M = 500         |
+| ------ | ------------------------- | ----------------------------------------- | --------------- |
+| 64     | 0.889 / 2.15 MB           | 0.889 / 1.21 MB                           | 0.886 / 1.14 MB |
+| 128    | 0.936 / 4.24 MB           | 0.935 / 2.25 MB                           | 0.930 / 2.18 MB |
+| 192    | 0.955 / 6.31 MB           | 0.952 / 3.28 MB                           | 0.948 / 3.22 MB |
+| 256    | 0.964 / 8.36 MB           | 0.962 / 4.31 MB                           | 0.957 / 4.25 MB |
+
+At equal bytes (about 3.2 MB) the cascade reaches 0.952 recall against 0.917
+for a full scan; at equal recall it reads 1.8–1.9× fewer bytes. A 256-bit prefix
+loses too much (0.889 at M = 1,000 for nprobe 128). These embeddings are not
+Matryoshka-trained, so any 512 bits are as informative as any other.
+Matryoshka-trained models concentrate information in the leading dimensions, so
+a short prefix of their sign codes should do better. That is untested here and
+must be measured on the production model before adopting a prefix length.
+
+Realizing the saving needs a layout in which each run stores the prefix bits of
+all rows contiguously, apart from the remaining bits. That is a payload format
+change touching the scan kernel, exact-vector lookup spans and merge copying,
+so it requires its own design document.
