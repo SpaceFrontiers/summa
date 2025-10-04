@@ -87,8 +87,8 @@ recall that full-code 4·sqrt(N) does not reach within 256 probes. A 640-bit
 prefix with `M` = 2,000 sits on the same frontier as 1,024 bits with
 `M` = 1,000. Storage is the cost: SOAR doubles codes and labels, and the prefix
 adds `prefix_bits / dim` of the codes, about 2.8× the per-vector code bytes of
-the plain index for SOAR plus a 1,024-bit prefix. SOAR for binary IVF is not
-implemented; this measures what it would buy.
+the plain index for SOAR plus a 1,024-bit prefix. SOAR for binary IVF is available as `soar: full`
+([binary IVF SOAR](binary-ivf-soar.md)).
 
 ## Layout
 

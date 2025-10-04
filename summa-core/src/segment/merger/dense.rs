@@ -693,7 +693,10 @@ impl SegmentMerger {
                         || header.codebook_version != 0
                         || header.routing != config.ivf_routing
                         || header.prefix_bytes != config.prefix_bytes()
-                        || header.vector_count != flat.num_vectors
+                        || header.spilled != config.soar.is_some()
+                        || header.vector_count < flat.num_vectors
+                        || header.vector_count
+                            > flat.num_vectors * if header.spilled { 2 } else { 1 }
                     {
                         return Err(crate::Error::Corruption(format!(
                             "ordinary merge source {:032x} field {} uses an incompatible binary IVF generation",
@@ -1301,9 +1304,12 @@ impl SegmentMerger {
         };
 
         const CODE_BATCH: usize = 65536;
-        let mut builder =
-            crate::structures::vector::index::BinaryIvfBuilder::new(quantizer, cfg.ivf_routing)
-                .map_err(crate::Error::Io)?;
+        let mut builder = crate::structures::vector::index::BinaryIvfBuilder::new(
+            quantizer,
+            cfg.ivf_routing,
+            cfg.soar.is_some(),
+        )
+        .map_err(crate::Error::Io)?;
         let mut labels = Vec::with_capacity(CODE_BATCH);
         let mut vector_count = 0usize;
         for (seg_idx, segment) in segments.iter().enumerate() {
