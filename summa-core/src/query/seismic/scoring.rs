@@ -4,8 +4,10 @@ use crate::segment::seismic::SeismicIndex;
 use crate::{Error, Result};
 
 /// A query-local table removes the merge walk from common-vocabulary scoring.
-/// Its allocation is bounded independently of index vocabulary/corpus size.
-pub(super) const MAX_LOOKUP_DIMENSIONS: usize = 65_536;
+/// Its allocation is bounded independently of index vocabulary/corpus size
+/// (512 KiB); 2^17 covers 105,879-token vocabularies, which measured 29-34%
+/// slower on the sorted walk.
+pub(super) const MAX_LOOKUP_DIMENSIONS: usize = 1 << 17;
 
 pub(super) enum PreparedQuery {
     Lookup {

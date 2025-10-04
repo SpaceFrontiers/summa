@@ -360,7 +360,8 @@ this optimization does not turn initial construction into a bounded-memory
 streaming build.
 
 Each segment query prepares its scoring weights once. Unique dimensions below
-65,536 use a query-local Float32 lookup table, capped at 256 KiB; exact forward
+131,072 use a query-local Float32 lookup table, capped at 512 KiB, so
+105,879-token vocabularies avoid the slower sorted walk; exact forward
 scoring reuses that table; summary proxies use the coordinate-transposed lists. Wider U32 dimensions
 and duplicate query dimensions retain the sorted sparse walk. Duplicate terms
 are not folded together because changing multiplication/addition order can
