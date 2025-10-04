@@ -278,6 +278,7 @@ pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), S
                     entry.name,
                 ));
             }
+            validate_binary_prefix(&entry.name, config)?;
             if config.index_type == BinaryIndexType::Scann && !config.dim.is_multiple_of(8) {
                 return Err(format!(
                     "binary dense field '{}' uses ScaNN with dimension {}; binary ScaNN dimensions must be a multiple of 8 bits",
@@ -293,6 +294,37 @@ pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), S
                 config.ivf_routing,
             )?;
         }
+    }
+    Ok(())
+}
+
+fn validate_binary_prefix(
+    field_name: &str,
+    config: &BinaryDenseVectorConfig,
+) -> Result<(), String> {
+    let Some(prefix_bits) = config.prefix_bits else {
+        if config.prefix_rerank.is_some() {
+            return Err(format!(
+                "binary dense field '{field_name}' sets prefix_rerank without prefix_bits"
+            ));
+        }
+        return Ok(());
+    };
+    if config.index_type != BinaryIndexType::Ivf {
+        return Err(format!(
+            "binary dense field '{field_name}' sets prefix_bits, which is only supported by the binary IVF index"
+        ));
+    }
+    if prefix_bits == 0 || !prefix_bits.is_multiple_of(8) || prefix_bits >= config.dim {
+        return Err(format!(
+            "binary dense field '{field_name}' has prefix_bits {prefix_bits}; expected a positive multiple of 8 below the {}-bit dimension",
+            config.dim
+        ));
+    }
+    if config.prefix_rerank == Some(0) {
+        return Err(format!(
+            "binary dense field '{field_name}' has prefix_rerank 0; expected a positive candidate count"
+        ));
     }
     Ok(())
 }
@@ -754,6 +786,19 @@ pub struct BinaryDenseVectorConfig {
     /// float SOAR, packed bits have no continuous residual geometry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soar: Option<crate::structures::SoarConfig>,
+    /// Leading bits of every code also stored contiguously per IVF leaf run.
+    /// Queries rank probed postings on this prefix first and rescore only the
+    /// best `prefix_rerank` on full codes, reading `prefix_bits / dim` of the
+    /// code bytes. Intended for Matryoshka-trained embeddings, whose leading
+    /// dimensions carry the most information (docs/binary-prefix-scan.md).
+    /// A positive multiple of 8 below `dim`; binary IVF only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_bits: Option<usize>,
+    /// Postings rescored on full codes after the prefix stage (default
+    /// [`DEFAULT_BINARY_PREFIX_RERANK`]). Query-time only; requires
+    /// `prefix_bits`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_rerank: Option<usize>,
 }
 
 /// ANN index type for binary dense vector fields
@@ -775,6 +820,11 @@ pub enum BinaryIndexType {
 /// embeddings, 4·sqrt(N) leaves at 128 probes match the float recall@10 of
 /// sqrt(N) at 64 probes (0.654 vs 0.657) while scanning half the postings.
 pub const DEFAULT_BINARY_IVF_NPROBE: usize = 128;
+
+/// Default full-code rescoring depth after a binary prefix scan. On 404K
+/// production 2,560-bit Matryoshka codes a 1,024-bit prefix keeps 0.996 of
+/// the exact top-10 at 1,000 candidates (docs/binary-prefix-scan.md).
+pub const DEFAULT_BINARY_PREFIX_RERANK: usize = 1_000;
 
 impl BinaryIndexType {
     /// Probe count used when a schema does not specify `nprobe`.
@@ -810,7 +860,29 @@ impl BinaryDenseVectorConfig {
             ivf_routing: IvfRoutingMode::Auto,
             nprobe: BinaryIndexType::Ivf.default_nprobe(),
             soar: None,
+            prefix_bits: None,
+            prefix_rerank: None,
         }
+    }
+
+    /// Store and scan a leading-bit prefix of every code (builder pattern).
+    pub fn with_prefix(mut self, prefix_bits: usize, prefix_rerank: Option<usize>) -> Self {
+        self.prefix_bits = Some(prefix_bits);
+        self.prefix_rerank = prefix_rerank;
+        self
+    }
+
+    /// Bytes of the stored per-code prefix, or 0 without a prefix layout.
+    pub fn prefix_bytes(&self) -> usize {
+        self.prefix_bits.map_or(0, |bits| bits / 8)
+    }
+
+    /// Full-code rescoring depth after the prefix stage, or 0 without one.
+    pub fn effective_prefix_rerank(&self) -> usize {
+        if self.prefix_bits.is_none() {
+            return 0;
+        }
+        self.prefix_rerank.unwrap_or(DEFAULT_BINARY_PREFIX_RERANK)
     }
 
     /// Enable the IVF index (builder pattern)
@@ -2201,6 +2273,8 @@ mod tests {
             ivf_routing: IvfRoutingMode::Auto,
             nprobe: 1,
             soar: None,
+            prefix_bits: None,
+            prefix_rerank: None,
         };
         let mut builder = Schema::builder();
         builder.add_binary_dense_vector_field_with_config("hash", true, false, binary);

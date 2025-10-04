@@ -371,6 +371,7 @@ pub(super) fn build_vectors_streaming(
                 let blob_len = crate::segment::ann_disk::write_built_binary_ivf(
                     &index,
                     cfg.ivf_routing,
+                    cfg.prefix_bytes(),
                     &mut output,
                     Some(&mut locations),
                 )

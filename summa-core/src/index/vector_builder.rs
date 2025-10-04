@@ -220,6 +220,7 @@ fn alter_requires_rebuild(current: &IvfFieldConfig, target: &IvfFieldConfig) -> 
                     && current.target_vectors != target.target_vectors)
                 || current.tree_levels != target.tree_levels
                 || current.ivf_routing != target.ivf_routing
+                || current.prefix_bits != target.prefix_bits
                 || !same_soar_layout(current.soar.as_ref(), target.soar.as_ref())
         }
         _ => true,
