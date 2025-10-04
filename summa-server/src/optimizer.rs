@@ -580,8 +580,12 @@ mod tests {
         registry.shutdown().await.unwrap();
     }
 
+    /// Ordinary merges coalesce binary ANN runs themselves, so a merged
+    /// binary-only index carries no ANN maintenance debt: the optimizer must
+    /// not rewrite it. Segments that are still fragmented (written by older
+    /// versions) remain eligible through the persisted `ann_fragmented` flag.
     #[tokio::test]
-    async fn optimizer_coalesces_binary_ann_without_reorder_fields() {
+    async fn optimizer_leaves_merge_coalesced_binary_ann_alone() {
         use summa_core::dsl::BinaryDenseVectorConfig;
 
         let root = tempfile::tempdir().unwrap();
@@ -621,15 +625,10 @@ mod tests {
         let index = registry.get_or_open_index("binary").await.unwrap();
         let reader = index.reader().await.unwrap();
         reader.reload().await.unwrap();
-        let old_searcher = reader.searcher().await.unwrap();
-        let old_segment = &old_searcher.segment_readers()[0];
-        let old_id = old_segment.meta().id;
-        assert!(old_segment.ann_health(vector).unwrap().fragmentation() > 1.0);
-        let exact = old_segment.flat_vectors().get(&vector.0).unwrap();
-        let before = exact
-            .read_vectors_batch(0, exact.num_vectors)
-            .await
-            .unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        let segment = &searcher.segment_readers()[0];
+        let merged_id = segment.meta().id;
+        assert_eq!(segment.ann_health(vector).unwrap().fragmentation(), 1.0);
 
         let config = OptimizerConfig {
             threads: 1,
@@ -660,53 +659,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            tasks.len(),
-            1,
-            "ANN debt must be eligible without BP fields"
-        );
-        while let Some(result) = tasks.join_next().await {
-            result.unwrap();
-        }
-        let searcher = reader.searcher().await.unwrap();
-        let segment = &searcher.segment_readers()[0];
-        assert_ne!(segment.meta().id, old_id);
-        assert_eq!(segment.ann_health(vector).unwrap().fragmentation(), 1.0);
-        let after = segment.flat_vectors().get(&vector.0).unwrap();
-        assert_eq!(
-            before.as_slice(),
-            after
-                .read_vectors_batch(0, after.num_vectors)
-                .await
-                .unwrap()
-                .as_slice()
-        );
-        assert_eq!(
-            before.as_slice(),
-            exact
-                .read_vectors_batch(0, exact.num_vectors)
-                .await
-                .unwrap()
-                .as_slice(),
-            "a reader held across replacement must retain its source vectors"
-        );
-        scan_and_optimize(
-            &registry,
-            &slots,
-            &config,
-            &deepening,
-            &compaction,
-            &mut next,
-            &mut tasks,
-        )
-        .await
-        .unwrap();
         assert!(
             tasks.is_empty(),
-            "converged ANN must not be rewritten on every scan"
+            "a merge-coalesced binary ANN segment must not be rewritten"
         );
+        reader.reload().await.unwrap();
+        let searcher = reader.searcher().await.unwrap();
+        assert_eq!(searcher.segment_readers()[0].meta().id, merged_id);
         drop(searcher);
-        drop(old_searcher);
         registry.shutdown().await.unwrap();
     }
 
