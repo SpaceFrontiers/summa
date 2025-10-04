@@ -745,7 +745,8 @@ pub struct BinaryDenseVectorConfig {
     /// floating-point IVF indexes.
     #[serde(default)]
     pub ivf_routing: IvfRoutingMode,
-    /// Clusters to probe during search (default: 64)
+    /// Clusters to probe during search (default: 128 for IVF, 64 for ScaNN;
+    /// see [`BinaryIndexType::default_nprobe`])
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
     /// Optional one-secondary selective spilling for binary ScaNN. The
@@ -766,6 +767,23 @@ pub enum BinaryIndexType {
     Ivf,
     /// Hierarchical Hamming partitioning with exact packed-code leaf scoring.
     Scann,
+}
+
+/// Default binary IVF probe count, paired with the automatic `4·sqrt(N)`
+/// leaf count. Four times more, four times smaller leaves need about twice the
+/// probes for the recall `sqrt(N)` leaves reached at 64: on 1M real 1,024-bit
+/// embeddings, 4·sqrt(N) leaves at 128 probes match the float recall@10 of
+/// sqrt(N) at 64 probes (0.654 vs 0.657) while scanning half the postings.
+pub const DEFAULT_BINARY_IVF_NPROBE: usize = 128;
+
+impl BinaryIndexType {
+    /// Probe count used when a schema does not specify `nprobe`.
+    pub fn default_nprobe(self) -> usize {
+        match self {
+            Self::Ivf => DEFAULT_BINARY_IVF_NPROBE,
+            Self::Flat | Self::Scann => default_nprobe(),
+        }
+    }
 }
 
 /// Complete target ANN configuration for an atomic vector-index ALTER.
@@ -790,7 +808,7 @@ impl BinaryDenseVectorConfig {
             target_vectors: None,
             tree_levels: None,
             ivf_routing: IvfRoutingMode::Auto,
-            nprobe: 64,
+            nprobe: BinaryIndexType::Ivf.default_nprobe(),
             soar: None,
         }
     }
@@ -835,11 +853,13 @@ impl BinaryDenseVectorConfig {
                     .unwrap_or(usize::MAX)
                     .max(num_vectors)
             });
-            // The 15M-row packed-Hamming sweep found the balanced sqrt(N)
-            // geometry Pareto-optimal for practical recall/latency targets.
-            // Larger, search-quality geometries remain available explicitly.
-            let balanced = (num_vectors as f64).sqrt().ceil() as usize;
-            balanced.clamp(16, 1_048_576)
+            // Four times the balanced sqrt(N) leaf count. On 1M real 1,024-bit
+            // embeddings it scans 1.72-1.78x fewer postings than sqrt(N) at
+            // equal recall@10 (1.5-1.6x including centroid routing); the
+            // smaller leaves need DEFAULT_BINARY_IVF_NPROBE probes. See
+            // docs/binary-ivf-geometry.md.
+            let leaves = (4.0 * (num_vectors as f64).sqrt()).ceil() as usize;
+            leaves.clamp(16, 1_048_576)
         })
     }
 
@@ -1988,18 +2008,23 @@ mod tests {
     }
 
     #[test]
-    fn binary_ivf_uses_measured_balanced_fifteen_million_geometry() {
+    fn binary_ivf_defaults_to_four_sqrt_n_leaves_and_doubled_probes() {
         let config = BinaryDenseVectorConfig::new(2_560);
-        assert_eq!(config.optimal_num_clusters(15_000_000), 3_873);
+        assert_eq!(config.optimal_num_clusters(15_000_000), 15_492);
+        assert_eq!(config.optimal_num_clusters(1_000_000), 4_000);
+        assert_eq!(config.optimal_num_clusters(1), 16);
+        assert_eq!(config.nprobe, DEFAULT_BINARY_IVF_NPROBE);
+        assert_eq!(BinaryIndexType::Scann.default_nprobe(), 64);
 
-        let explicit = config.with_ivf(Some(8_192), 128);
+        let explicit = config.with_ivf(Some(8_192), 64);
         assert_eq!(explicit.optimal_num_clusters(15_000_000), 8_192);
+        assert_eq!(explicit.nprobe, 64);
     }
 
     #[test]
     fn target_vectors_sizes_automatic_topology_but_explicit_clusters_win() {
         let hinted = BinaryDenseVectorConfig::new(2_560).with_target_vectors(1_000_000_000);
-        assert_eq!(hinted.optimal_num_clusters(1_000_000), 31_623);
+        assert_eq!(hinted.optimal_num_clusters(1_000_000), 126_492);
 
         let lower_hint = BinaryDenseVectorConfig::new(2_560).with_target_vectors(1_000_000);
         assert_eq!(

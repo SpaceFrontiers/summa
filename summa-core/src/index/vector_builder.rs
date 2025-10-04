@@ -1928,6 +1928,18 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             (IvfFieldConfig::Binary(config), TrainingSample::Binary(codes))
                 if config.index_type == BinaryIndexType::Ivf =>
             {
+                if config.num_clusters.is_none()
+                    && config.nprobe < crate::dsl::DEFAULT_BINARY_IVF_NPROBE
+                {
+                    log::warn!(
+                        "[vector_training] index={index_label} field={field_id}: automatic binary IVF \
+                         geometry uses 4*sqrt(N) leaves ({num_clusters}), calibrated for nprobe >= {}, \
+                         but the field probes {}; recall@10 drops (0.94 -> 0.89 at 1M vectors). \
+                         Raise nprobe or set num_clusters explicitly",
+                        crate::dsl::DEFAULT_BINARY_IVF_NPROBE,
+                        config.nprobe,
+                    );
+                }
                 let byte_len = dim.div_ceil(8);
                 let training_count = codes.len() / byte_len;
                 let mut binary_config = crate::structures::BinaryIvfConfig::new(dim, num_clusters);
@@ -2263,7 +2275,7 @@ mod tests {
         let binary = IvfFieldConfig::Binary(
             BinaryDenseVectorConfig::new(256).with_target_vectors(1_000_000_000),
         );
-        let leaves = 31_623;
+        let leaves = 126_492;
         let required = leaves * MIN_TRAINING_POINTS_PER_CENTROID;
 
         let error = effective_field_num_clusters(&binary, 1_000_000, required - 1)
