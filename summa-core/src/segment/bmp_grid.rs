@@ -33,6 +33,38 @@ fn selector_bytes(groups: usize) -> usize {
     groups.div_ceil(2)
 }
 
+/// Sum the 4-bit widths of groups `0..within` (`within < META_GROUPS`), or
+/// `None` when any of them exceeds `max_width`.
+///
+/// SWAR over one `u128`: random D-group resolution runs this for every
+/// (query dimension, group) pair a BMP window touches. Each byte lane holds
+/// one nibble (at most 15), so adding `0x7f - max_width` sets a lane's high
+/// bit exactly when the nibble exceeds `max_width`, without carrying into
+/// the next lane. Half-word sums are at most 8 x 30 and fit a byte.
+#[inline]
+fn selector_prefix_units(selectors: &[u8], within: usize, max_width: u8) -> Option<usize> {
+    const LANES: u128 = u128::from_le_bytes([0x0f; 16]);
+    const HIGH_BITS: u128 = u128::from_le_bytes([0x80; 16]);
+    const BYTE_SUM: u64 = 0x0101_0101_0101_0101;
+    debug_assert!(within < META_GROUPS && max_width < 0x80);
+    let full = within / 2;
+    let mut bytes = [0u8; 16];
+    bytes[..full].copy_from_slice(&selectors[..full]);
+    if !within.is_multiple_of(2) {
+        bytes[full] = selectors[full] & 0x0f;
+    }
+    let word = u128::from_le_bytes(bytes);
+    let low = word & LANES;
+    let high = (word >> 4) & LANES;
+    let bias = u128::from_le_bytes([0x7f - max_width; 16]);
+    if ((low + bias) | (high + bias)) & HIGH_BITS != 0 {
+        return None;
+    }
+    let lanes = low + high;
+    let sum = |half: u64| (half.wrapping_mul(BYTE_SUM) >> 56) as usize;
+    Some(sum(lanes as u64) + sum((lanes >> 64) as u64))
+}
+
 #[inline]
 fn selector_width(selectors: &[u8], group: usize) -> u8 {
     let byte = selectors[group / 2];
@@ -997,6 +1029,9 @@ pub(crate) struct CompressedGrid {
     rows: OwnedBytes,
     layout: CompressedGridLayout,
     max_width: u8,
+    /// Shared by clones: residency is a property of the mapping.
+    #[cfg(feature = "native")]
+    prefetch_gate: std::sync::Arc<crate::segment::prefetch_gate::PrefetchGate>,
 }
 
 impl CompressedGrid {
@@ -1006,6 +1041,8 @@ impl CompressedGrid {
             rows: OwnedBytes::empty(),
             layout: CompressedGridLayout::new(0, 0),
             max_width: 0,
+            #[cfg(feature = "native")]
+            prefetch_gate: Default::default(),
         }
     }
 
@@ -1070,6 +1107,8 @@ impl CompressedGrid {
             rows,
             layout,
             max_width,
+            #[cfg(feature = "native")]
+            prefetch_gate: Default::default(),
         })
     }
 
@@ -1173,28 +1212,13 @@ impl CompressedGrid {
                 self.max_width
             )));
         }
-        let mut preceding = 0usize;
-        for &packed in &selectors[..within / 2] {
-            let low = packed & 0x0f;
-            let high = packed >> 4;
-            if low > self.max_width || high > self.max_width {
-                return Err(crate::Error::Corruption(format!(
-                    "BMP compressed-grid selector {packed:#04x} exceeds width {}",
+        let preceding =
+            selector_prefix_units(selectors, within, self.max_width).ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "BMP compressed-grid selector before group {within} exceeds width {}",
                     self.max_width
-                )));
-            }
-            preceding += usize::from(low + high);
-        }
-        if !within.is_multiple_of(2) {
-            let value = selectors[within / 2] & 0x0f;
-            if value > self.max_width {
-                return Err(crate::Error::Corruption(format!(
-                    "BMP compressed-grid width {value} exceeds {}",
-                    self.max_width
-                )));
-            }
-            preceding += usize::from(value);
-        }
+                ))
+            })?;
         let payload_units = checkpoint.checked_add(preceding).ok_or_else(|| {
             crate::Error::Corruption("BMP compressed-grid payload offset overflows usize".into())
         })?;
@@ -1274,31 +1298,50 @@ impl CompressedGrid {
         !self.rows.is_mmap()
     }
 
-    /// Coalesce nearby row ranges and issue bounded `MADV_WILLNEED` hints.
+    /// This grid's residency-sampled prefetch gate.
     #[cfg(feature = "native")]
-    pub(crate) fn prefetch_ranges(&self, ranges: &mut Vec<Range<usize>>) -> (usize, usize) {
+    pub(crate) fn prefetch_gate(&self) -> &crate::segment::prefetch_gate::PrefetchGate {
+        &self.prefetch_gate
+    }
+
+    /// Coalesce nearby row ranges and issue bounded `MADV_WILLNEED` hints,
+    /// subject to `action` from [`Self::prefetch_gate`]. Returns advised
+    /// `(bytes, calls)`; `(0, 0)` when residency sampling withheld the hints.
+    #[cfg(feature = "native")]
+    pub(crate) fn prefetch_ranges(
+        &self,
+        ranges: &mut Vec<Range<usize>>,
+        action: crate::segment::prefetch_gate::PrefetchAction,
+    ) -> (usize, usize) {
         if ranges.is_empty() {
             return (0, 0);
         }
         const PAGE_NEAR_BYTES: usize = 4096;
         ranges.sort_unstable_by_key(|range| (range.start, range.end));
-        let mut advised_bytes = 0usize;
-        let mut calls = 0usize;
-        let mut current = ranges[0].clone();
-        for range in &ranges[1..] {
+        // Coalesce in place so residency probes and hints see the same ranges.
+        let mut coalesced = 0usize;
+        for index in 1..ranges.len() {
+            let range = ranges[index].clone();
+            let current = &mut ranges[coalesced];
             if range.start <= current.end.saturating_add(PAGE_NEAR_BYTES) {
                 current.end = current.end.max(range.end);
-                continue;
+            } else {
+                coalesced += 1;
+                ranges[coalesced] = range;
             }
-            advised_bytes = advised_bytes.saturating_add(current.end - current.start);
-            calls += 1;
-            self.rows
-                .madvise_range(current.clone(), libc::MADV_WILLNEED);
-            current = range.clone();
         }
-        advised_bytes = advised_bytes.saturating_add(current.end - current.start);
-        calls += 1;
-        self.rows.madvise_range(current, libc::MADV_WILLNEED);
+        ranges.truncate(coalesced + 1);
+        let mut advised_bytes = 0usize;
+        let mut calls = 0usize;
+        if self.prefetch_gate.admit(action, ranges, |range| {
+            self.rows.range_resident(range.clone())
+        }) {
+            for range in ranges.iter() {
+                advised_bytes = advised_bytes.saturating_add(range.end - range.start);
+                calls += 1;
+                self.rows.madvise_range(range.clone(), libc::MADV_WILLNEED);
+            }
+        }
         ranges.clear();
         (advised_bytes, calls)
     }
@@ -1765,5 +1808,51 @@ mod tests {
         for (index, &value) in values.iter().enumerate() {
             assert_eq!(output[index], 9 + u32::from(value) * 41);
         }
+    }
+
+    #[test]
+    fn swar_selector_prefix_matches_nibble_loop_and_rejects_wide_selectors() {
+        let reference = |selectors: &[u8], within: usize, max_width: u8| {
+            let mut total = 0usize;
+            for group in 0..within {
+                let width = selector_width(selectors, group);
+                if width > max_width {
+                    return None;
+                }
+                total += usize::from(width);
+            }
+            Some(total)
+        };
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rejected = 0usize;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let max_width = (state % 9) as u8;
+            let mut selectors = [0u8; META_GROUPS / 2];
+            for (index, byte) in selectors.iter_mut().enumerate() {
+                let bits = state.rotate_left(index as u32 * 5);
+                // Mostly within the limit; occasionally one nibble above it.
+                let low = (bits & 0xff) as u8 % (max_width + 1 + u8::from(bits & 0x300 == 0));
+                let high =
+                    ((bits >> 10) & 0xff) as u8 % (max_width + 1 + u8::from(bits & 0xc000 == 0));
+                *byte = low | (high << 4);
+            }
+            for within in 0..META_GROUPS {
+                let expected = reference(&selectors, within, max_width);
+                rejected += usize::from(expected.is_none());
+                assert_eq!(
+                    selector_prefix_units(&selectors, within, max_width),
+                    expected,
+                    "selectors {selectors:02x?} within {within} max {max_width}"
+                );
+            }
+        }
+        assert!(rejected > 0, "the fixture must exercise rejection");
+        // Every nibble at its maximum.
+        let selectors = [0xffu8; META_GROUPS / 2];
+        assert_eq!(selector_prefix_units(&selectors, 31, 15), Some(31 * 15));
+        assert_eq!(selector_prefix_units(&selectors, 1, 14), None);
     }
 }
