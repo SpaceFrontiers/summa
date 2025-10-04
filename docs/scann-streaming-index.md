@@ -138,11 +138,11 @@ After a model is published, commit performs a bounded streaming transform:
    Hamming distance.
 5. Write leaf runs ordered by leaf ID, with locators and document ordinals.
 
-Normal merge never retrains. Binary ANN payloads and exact-vector lookup rows
-copy verbatim; only their run/span/block directories receive new offsets and
-document bases. Source extents remain separate. Float AH rows are streamed through
-the FastScan packer when compaction joins run-relative 32-row blocks. Neither path
-reassigns leaves or changes the global model. Binary exact retrieval shares the
+Normal merge never retrains. Overlapping leaves are coalesced to one run per
+leaf. Binary codes, ordinals and exact-vector lookup rows copy verbatim; document
+labels are rebased and lookup spans follow their copied runs. Float AH rows are
+streamed through the FastScan packer when compaction joins run-relative 32-row
+blocks. Neither path reassigns leaves or changes the global model. Binary exact retrieval shares the
 ANN codes by default; see [exact binary storage](binary-vector-storage.md).
 
 ## Alter operation
