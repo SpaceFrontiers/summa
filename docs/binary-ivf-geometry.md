@@ -111,7 +111,8 @@ Matryoshka-trained models concentrate information in the leading dimensions, so
 a short prefix of their sign codes should do better. That is untested here and
 must be measured on the production model before adopting a prefix length.
 
-Realizing the saving needs a layout in which each run stores the prefix bits of
-all rows contiguously, apart from the remaining bits. That is a payload format
+On the production Matryoshka model the prefix can be much shorter; see the
+[prefix-scan proposal](binary-prefix-scan.md). Realizing the saving needs a
+layout in which each run stores the prefix bits of all rows contiguously. That is a payload format
 change touching the scan kernel, exact-vector lookup spans and merge copying,
 so it requires its own design document.
