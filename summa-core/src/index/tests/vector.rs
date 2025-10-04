@@ -3034,6 +3034,11 @@ async fn test_binary_ivf_soar_end_to_end() {
                     panic!("binary IVF payload expected");
                 };
                 assert_eq!(lazy.get().header().spilled, expect_spill);
+                // With a prefix layout, SOAR copies are prefix-only runs kept
+                // beside each leaf's full run: not fragmentation.
+                let health = lazy.get().health();
+                assert_eq!(health.fragmentation(), 1.0);
+                assert_eq!(health.run_groups > health.clusters_nonempty, expect_spill);
                 postings += lazy.get().header().vector_count;
                 logical += segment.flat_vectors().get(&field.0).unwrap().num_vectors;
             }

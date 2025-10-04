@@ -417,6 +417,50 @@ pub struct LazyFlatVectorData {
     vectors_byte_len: u64,
     /// Exact codes live in ANN; doc-map entries contain span-relative addresses.
     locations: Option<super::vector_locations::VectorLocations>,
+    /// ANN payload with a split prefix layout: each vector is a prefix row and
+    /// a suffix row, located from its row-major ("virtual") code address.
+    split: Option<std::sync::Arc<SplitCodes>>,
+}
+
+/// Full runs of a split binary IVF prefix layout, sorted by code offset:
+/// `(codes start, row count)`; prefix rows first, then suffix rows.
+#[derive(Debug)]
+pub(crate) struct SplitCodes {
+    pub(crate) prefix: usize,
+    pub(crate) runs: Vec<(u64, u64)>,
+}
+
+impl SplitCodes {
+    /// Physical `(prefix row, suffix row)` offsets of a virtual address.
+    fn parts(&self, virtual_offset: u64, width: usize) -> io::Result<(usize, usize)> {
+        let at = self
+            .runs
+            .partition_point(|&(start, _)| start <= virtual_offset);
+        let (start, count) = at
+            .checked_sub(1)
+            .and_then(|at| self.runs.get(at))
+            .copied()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "vector location precedes ANN codes",
+                )
+            })?;
+        let relative = virtual_offset - start;
+        let row = relative / width as u64;
+        if !relative.is_multiple_of(width as u64) || row >= count {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vector location is not a split ANN code row",
+            ));
+        }
+        let prefix = self.prefix as u64;
+        let suffix = (width - self.prefix) as u64;
+        Ok((
+            (start + row * prefix) as usize,
+            (start + count * prefix + row * suffix) as usize,
+        ))
+    }
 }
 
 impl LazyFlatVectorData {
@@ -611,6 +655,7 @@ impl LazyFlatVectorData {
             vbs,
             vectors_byte_len,
             locations: None,
+            split: None,
         })
     }
 
@@ -739,7 +784,18 @@ impl LazyFlatVectorData {
             vbs,
             vectors_byte_len,
             locations: Some(layout),
+            split: ann.split_code_runs().map(std::sync::Arc::new),
         })
+    }
+
+    /// Row-major code address of one stored value in the shared ANN payload,
+    /// for rescoring a SOAR candidate found only in a prefix-only run.
+    pub(crate) fn exact_code_location(&self, doc_id: u32, ordinal: u16) -> Option<u64> {
+        self.locations.as_ref()?;
+        let (start, count) = self.flat_indexes_for_doc_range(doc_id);
+        (start..start + count)
+            .find(|&index| self.get_doc_id(index) == (doc_id, ordinal))
+            .map(|index| self.code_offset(index))
     }
 
     /// Whether exact codes are shared with the ANN payload.
@@ -937,6 +993,26 @@ impl LazyFlatVectorData {
     pub fn prefetch_vectors(&self, sorted_flat_indexes: impl IntoIterator<Item = usize>) {
         /// Gap (in bytes) below which two candidate ranges are merged into one advice call.
         const COALESCE_GAP: u64 = 64 * 1024;
+        if let Some(split) = self.split.as_deref() {
+            // Split prefix layout: each vector is two rows in different blocks.
+            for idx in sorted_flat_indexes {
+                if idx >= self.num_vectors {
+                    continue;
+                }
+                if let Ok((prefix_at, suffix_at)) = split.parts(self.code_offset(idx), self.vbs) {
+                    let (prefix_at, suffix_at) = (prefix_at as u64, suffix_at as u64);
+                    self.handle.madvise_range(
+                        prefix_at..prefix_at + split.prefix as u64,
+                        libc::MADV_WILLNEED,
+                    );
+                    self.handle.madvise_range(
+                        suffix_at..suffix_at + (self.vbs - split.prefix) as u64,
+                        libc::MADV_WILLNEED,
+                    );
+                }
+            }
+            return;
+        }
         let mut ranges = sorted_flat_indexes.into_iter().filter_map(|idx| {
             self.checked_vector_range(idx, 1)
                 .ok()
@@ -1025,6 +1101,11 @@ impl LazyFlatVectorData {
                 ),
             ));
         }
+        if self.split.is_some() {
+            let vector = self.read_vectors_batch(idx, 1).await?;
+            out[..prefix_byte_len].copy_from_slice(&vector.as_slice()[..prefix_byte_len]);
+            return Ok(());
+        }
         let (full_range, _) = self.checked_vector_range(idx, 1)?;
         if prefix_byte_len == 0 {
             return Ok(());
@@ -1088,7 +1169,7 @@ impl LazyFlatVectorData {
                 return Ok(OwnedBytes::empty());
             }
             let first_count = self.contiguous_rows(start_idx, count);
-            if first_count < count {
+            if first_count < count || self.split.is_some() {
                 let bytes = self.handle.read_bytes().await?;
                 return Ok(self.gather_vectors(bytes.as_slice(), start_idx, count, len));
             }
@@ -1109,11 +1190,26 @@ impl LazyFlatVectorData {
 
     /// Gather from the ANN reader's shared immutable byte owner. No per-row
     /// range-read callback, byte-owner clone, or second corpus copy is needed.
+    /// A split prefix layout assembles each vector from its prefix and suffix
+    /// rows.
     fn gather_vectors(&self, bytes: &[u8], start: usize, count: usize, len: usize) -> OwnedBytes {
         let mut gathered = Vec::with_capacity(len);
         for row in start..start + count {
-            let offset = self.code_offset(row) as usize;
-            gathered.extend_from_slice(&bytes[offset..offset + self.vbs]);
+            let offset = self.code_offset(row);
+            match self.split.as_deref() {
+                Some(split) => {
+                    let (prefix_at, suffix_at) = split
+                        .parts(offset, self.vbs)
+                        .expect("validated split vector location");
+                    gathered.extend_from_slice(&bytes[prefix_at..prefix_at + split.prefix]);
+                    gathered
+                        .extend_from_slice(&bytes[suffix_at..suffix_at + self.vbs - split.prefix]);
+                }
+                None => {
+                    let offset = offset as usize;
+                    gathered.extend_from_slice(&bytes[offset..offset + self.vbs]);
+                }
+            }
         }
         OwnedBytes::new(gathered)
     }
@@ -1160,7 +1256,7 @@ impl LazyFlatVectorData {
                 return Ok(OwnedBytes::empty());
             }
             let first_count = self.contiguous_rows(start_idx, count);
-            if first_count < count {
+            if first_count < count || self.split.is_some() {
                 let bytes = self.handle.read_bytes_sync()?;
                 return Ok(self.gather_vectors(bytes.as_slice(), start_idx, count, len));
             }

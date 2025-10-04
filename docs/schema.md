@@ -513,15 +513,17 @@ Queries then rescore only the best `prefix_rerank` probed postings (default
 1,000) on the full codes, so returned scores stay exact. Use it for
 Matryoshka-trained embeddings, whose leading dimensions carry the most
 information. `prefix_bits` must be a positive multiple of 8 below the dimension;
-storage grows by `prefix_bits / dim` ([prefix-first scan](binary-prefix-scan.md)):
+codes are stored split into prefix and suffix rows, so the prefix adds no storage
+([prefix-first scan](binary-prefix-scan.md)):
 
 ```
 field hash: binary_dense_vector<2560> [indexed<ivf, prefix_bits: 1024, prefix_rerank: 1000>]
 ```
 
 `soar: full` on binary IVF stores each vector in a second leaf chosen by the
-Hamming form of the SOAR loss, roughly doubling ANN payload storage in exchange
-for higher recall at the same number of probes. Queries deduplicate the copies.
+Hamming form of the SOAR loss, for higher recall at the same number of probes.
+Without `prefix_bits` the copy is a full code (about twice the ANN payload);
+with it the copy is prefix-only (about 1.4× the plain index in total). Queries deduplicate the copies.
 Selective presets are rejected on binary IVF ([binary IVF SOAR](binary-ivf-soar.md)):
 
 ```

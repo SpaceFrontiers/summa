@@ -11,7 +11,7 @@ pub(crate) use binary_ivf::BinaryIvfBuilder;
 #[cfg(feature = "native")]
 pub(crate) use binary_ivf::report_binary_build_quality;
 pub(crate) use binary_ivf::train_binary_k_majority_codebook;
-pub use binary_ivf::{BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex};
+pub use binary_ivf::{BinaryCoarseQuantizer, BinaryIvfConfig, BinaryIvfIndex, BinarySpill};
 pub use ivf_tq::{
     IvfTqIndex, TqIvfEncodeScratch, TqIvfQueryPlan, is_ivf_tq_cosine_generation,
     mark_ivf_tq_cosine_generation,
