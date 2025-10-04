@@ -298,6 +298,8 @@ struct IndexConfig {
     target_vectors: Option<u64>,
     tree_levels: Option<u8>,
     nprobe: Option<usize>,
+    prefix_bits: Option<usize>,
+    prefix_rerank: Option<usize>,
     ivf_routing: Option<super::schema::IvfRoutingMode>,
     soar: SoarDirective,
     binary_index_type: Option<super::schema::BinaryIndexType>,
@@ -499,6 +501,22 @@ fn parse_single_index_config_param(
                         n.as_str()
                     ))
                 })?);
+            }
+        }
+        Rule::prefix_bits_kwarg | Rule::prefix_rerank_kwarg => {
+            let rule = p.as_rule();
+            if let Some(n) = p.into_inner().next() {
+                let value = n.as_str().parse().map_err(|_| {
+                    Error::Schema(format!(
+                        "prefix option '{}' does not fit on this platform",
+                        n.as_str()
+                    ))
+                })?;
+                if rule == Rule::prefix_bits_kwarg {
+                    config.prefix_bits = Some(value);
+                } else {
+                    config.prefix_rerank = Some(value);
+                }
             }
         }
         Rule::tree_levels_kwarg => {
@@ -1029,6 +1047,8 @@ fn reject_scann_options_for_non_dense_vector(config: &IndexConfig, field_kind: &
         || config.binary_index_type == Some(super::schema::BinaryIndexType::Scann)
         || config.tree_levels.is_some()
         || config.target_vectors.is_some()
+        || config.prefix_bits.is_some()
+        || config.prefix_rerank.is_some()
     {
         return Err(Error::Schema(format!(
             "vector index options require a dense or binary dense vector field, not a {field_kind}"
@@ -1096,6 +1116,8 @@ fn apply_index_config_to_binary_dense_vector(
     if let Some(routing) = idx_cfg.ivf_routing {
         config.ivf_routing = routing;
     }
+    config.prefix_bits = idx_cfg.prefix_bits;
+    config.prefix_rerank = idx_cfg.prefix_rerank;
     Ok(())
 }
 
@@ -1104,6 +1126,11 @@ fn apply_index_config_to_dense_vector(
     config: &mut DenseVectorConfig,
     idx_cfg: IndexConfig,
 ) -> Result<()> {
+    if idx_cfg.prefix_bits.is_some() || idx_cfg.prefix_rerank.is_some() {
+        return Err(Error::Schema(
+            "prefix_bits/prefix_rerank are only supported on binary IVF fields".to_string(),
+        ));
+    }
     if idx_cfg.target_vectors == Some(0) {
         return Err(Error::Schema(
             "target_vectors must be greater than zero".to_string(),
@@ -2800,6 +2827,58 @@ mod tests {
         assert_eq!(nprobe("indexed<ivf, nprobe: 64>"), 64);
         assert_eq!(nprobe("indexed<nprobe: 32, ivf>"), 32);
         assert_eq!(nprobe("indexed<scann, nprobe: 256>"), 256);
+    }
+
+    /// `prefix_bits`/`prefix_rerank` configure the binary IVF prefix-first
+    /// scan per field; misuse fails loudly at parse or schema validation.
+    #[test]
+    fn test_binary_prefix_options_parse_and_validate() {
+        let parse = |spec: &str| {
+            parse_sdl(&format!(
+                "index documents {{ field hash: binary_dense_vector<2560> [{spec}] }}"
+            ))
+        };
+        let config = |spec: &str| {
+            parse(spec).unwrap()[0].fields[0]
+                .binary_dense_vector_config
+                .clone()
+                .unwrap()
+        };
+        let prefixed = config("indexed<ivf, prefix_bits: 1024, prefix_rerank: 2000>");
+        assert_eq!(prefixed.prefix_bits, Some(1024));
+        assert_eq!(prefixed.prefix_rerank, Some(2000));
+        assert_eq!(prefixed.prefix_bytes(), 128);
+        assert_eq!(prefixed.effective_prefix_rerank(), 2000);
+        let defaulted = config("indexed<ivf, prefix_bits: 640>");
+        assert_eq!(
+            defaulted.effective_prefix_rerank(),
+            super::super::schema::DEFAULT_BINARY_PREFIX_RERANK
+        );
+        assert_eq!(config("indexed<ivf>").effective_prefix_rerank(), 0);
+
+        let validate = |spec: &str| {
+            let index = &parse(spec).unwrap()[0];
+            let schema = index.to_schema();
+            crate::dsl::schema::reject_removed_vector_index_types(&schema)
+        };
+        assert!(validate("indexed<ivf, prefix_bits: 1024>").is_ok());
+        for invalid in [
+            "indexed<ivf, prefix_bits: 0>",
+            "indexed<ivf, prefix_bits: 1020>",
+            "indexed<ivf, prefix_bits: 2560>",
+            "indexed<ivf, prefix_rerank: 100>",
+            "indexed<ivf, prefix_bits: 1024, prefix_rerank: 0>",
+            "indexed<scann, prefix_bits: 1024>",
+            "indexed<flat, prefix_bits: 1024>",
+        ] {
+            assert!(validate(invalid).is_err(), "{invalid} must be rejected");
+        }
+        assert!(
+            parse_sdl(
+                "index documents { field e: dense_vector<64> [indexed<ivf_tq, prefix_bits: 32>] }"
+            )
+            .is_err()
+        );
     }
 
     #[test]
