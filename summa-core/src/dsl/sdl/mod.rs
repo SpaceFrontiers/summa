@@ -94,6 +94,8 @@ pub struct FieldDef {
     pub chunked: bool,
     /// Common words whose adjacent pairs are indexed (`indexed<common_grams: [...]>`)
     pub common_grams: Vec<String>,
+    /// Default long-query cap of a text field (`indexed<query<max_terms: N>>`)
+    pub text_max_terms: Option<u32>,
 }
 
 /// Parsed index definition
@@ -194,6 +196,7 @@ impl IndexDef {
             if field.bm25_k1.is_some() || field.bm25_b.is_some() {
                 builder.set_bm25_params(f, field.bm25_k1, field.bm25_b);
             }
+            builder.set_text_max_terms(f, field.text_max_terms);
             // Set positions: explicit > auto (ordinal for multi vectors)
             let positions = field.positions.or({
                 // Auto-set ordinal positions for multi-valued vector fields
@@ -341,6 +344,8 @@ struct IndexConfig {
     // BM25 parameters of a text field
     bm25_k1: Option<f32>,
     bm25_b: Option<f32>,
+    // Default long-query cap of a text field (`query<max_terms: N>`)
+    query_max_terms: Option<u32>,
 }
 
 /// Parsed attributes from SDL field definition
@@ -781,6 +786,13 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                                         }));
                                 }
                             }
+                            Rule::query_max_terms_kwarg => {
+                                if let Some(t) = p.into_inner().next() {
+                                    // An unparsable value fails admission
+                                    // through the range check, loudly.
+                                    config.query_max_terms = Some(t.as_str().parse().unwrap_or(0));
+                                }
+                            }
                             Rule::query_max_dims_kwarg => {
                                 if let Some(t) = p.into_inner().next() {
                                     config.query_max_dims =
@@ -966,6 +978,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut common_grams = Vec::new();
     let mut bm25_k1 = None;
     let mut bm25_b = None;
+    let mut text_max_terms = None;
     if let Some(idx_cfg) = index_config {
         positions = idx_cfg.positions;
         chunked = idx_cfg.chunked;
@@ -976,6 +989,8 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
                 "field '{name}': `common_grams` requires a text field, got {field_type:?}"
             )));
         }
+        // Schema admission validates the field type and range.
+        text_max_terms = idx_cfg.query_max_terms;
         bm25_k1 = idx_cfg.bm25_k1;
         bm25_b = idx_cfg.bm25_b;
         if (bm25_k1.is_some() || bm25_b.is_some()) && field_type != FieldType::Text {
@@ -1039,6 +1054,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         common_grams,
         bm25_k1,
         bm25_b,
+        text_max_terms,
     })
 }
 
@@ -3212,6 +3228,37 @@ mod tests {
         assert_eq!(entry.field_type, FieldType::Json);
         assert!(!entry.indexed); // JSON fields are never indexed
         assert!(entry.stored);
+    }
+
+    #[test]
+    fn text_query_max_terms_is_a_validated_text_field_default() {
+        let schema = parse_single_index(
+            "index docs { field body: text<simple> [indexed<query<max_terms: 8>>] }",
+        )
+        .unwrap()
+        .to_schema();
+        let entry = schema
+            .get_field_entry(schema.get_field("body").unwrap())
+            .unwrap();
+        assert_eq!(entry.text_max_terms, Some(8));
+
+        for (sdl, message) in [
+            (
+                "index docs { field v: sparse_vector<u32> [indexed<format: bmp, query<max_terms: 8>>] }",
+                "requires a text field",
+            ),
+            (
+                "index docs { field body: text<simple> [indexed<query<max_terms: 0>>] }",
+                "between 1 and 64",
+            ),
+            (
+                "index docs { field body: text<simple> [indexed<query<max_terms: 65>>] }",
+                "between 1 and 64",
+            ),
+        ] {
+            let error = parse_single_index(sdl).unwrap_err().to_string();
+            assert!(error.contains(message), "{sdl}: {error}");
+        }
     }
 
     #[test]
