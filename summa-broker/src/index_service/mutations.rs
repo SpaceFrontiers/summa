@@ -18,11 +18,14 @@ impl BrokerIndexService {
         let req = request.into_inner();
         let route = self.ctx.write_route(&req.index_name)?;
         let groups = if route.is_partitioned() {
-            let mut groups: Vec<(Vec<usize>, Vec<String>)> = (0..route.targets().len())
+            let weights = self
+                .ctx
+                .partition_weights(&req.index_name, route.targets().len())?;
+            let mut groups: Vec<(Vec<usize>, Vec<String>)> = (0..weights.len())
                 .map(|_| (Vec::new(), Vec::new()))
                 .collect();
             for (position, key) in req.primary_keys.into_iter().enumerate() {
-                let group = partition::partition_of(key.as_bytes(), groups.len());
+                let group = weights.partition_of(key.as_bytes());
                 groups[group].0.push(position);
                 groups[group].1.push(key);
             }
@@ -52,7 +55,10 @@ impl BrokerIndexService {
                 .ctx
                 .primary_key_field(&req.index_name, &route.targets()[0])
                 .await?;
-            let routed = partition::route_documents(req.documents, &primary, route.targets().len());
+            let weights = self
+                .ctx
+                .partition_weights(&req.index_name, route.targets().len())?;
+            let routed = partition::route_documents(req.documents, &primary, weights);
             (routed.groups, routed.unroutable)
         } else {
             (

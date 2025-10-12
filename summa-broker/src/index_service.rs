@@ -128,7 +128,8 @@ impl BrokerIndexService {
             }
             Route::Partitioned { targets, .. } => {
                 let primary_key = self.ctx.primary_key_field(index_name, &targets[0]).await?;
-                let routed = partition::route_documents(documents, &primary_key, targets.len());
+                let weights = self.ctx.partition_weights(index_name, targets.len())?;
+                let routed = partition::route_documents(documents, &primary_key, weights);
                 let calls = routed
                     .groups
                     .into_iter()

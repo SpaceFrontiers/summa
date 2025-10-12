@@ -9,7 +9,7 @@ use tonic::{Request, Status};
 use crate::client::BackendChannels;
 use crate::context::{BrokerContext, code_label};
 use crate::metrics as m;
-use crate::partition;
+use crate::partition::{self, PartitionWeights};
 use crate::proto::summa::GetIndexInfoRequest;
 
 /// One backend a request goes to.
@@ -205,6 +205,22 @@ impl BrokerContext {
             backend_id: master.endpoint.id.0.clone(),
             channels: self.pool.get(&master.endpoint.addr)?,
         })))
+    }
+
+    /// Routing weights of a partitioned index, one per write target, from
+    /// the placement rule that also ordered the targets.
+    pub fn partition_weights(
+        &self,
+        index_name: &str,
+        partitions: usize,
+    ) -> Result<&PartitionWeights, Status> {
+        match self.placement.weights_for(index_name) {
+            Some(weights) if weights.len() == partitions => Ok(weights),
+            weights => Err(Status::internal(format!(
+                "index '{index_name}' has {partitions} partition targets but its placement rule weighs {}",
+                weights.map_or(0, PartitionWeights::len)
+            ))),
+        }
     }
 
     /// The field a partitioned index hashes documents by, read once from

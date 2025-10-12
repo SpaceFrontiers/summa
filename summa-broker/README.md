@@ -23,7 +23,7 @@ Design doc: [docs/broker.md](../docs/broker.md). Metrics:
   host-to-host migration.
 - Partitions an index across shards with a shard list:
   `--placement "documents*=2,3,4"`. Documents hash by primary key to one
-  partition; searches fan out with shared BM25 statistics and merge by score;
+  partition (integer weights, `2:5,3:5,4:4`, split rows 5:5:4); searches fan out with shared BM25 statistics and merge by score;
   every other RPC fans out to all partitions. See `docs/broker.md`.
 - Evicts unreachable backends after a grace period and recovers them after
   two successful probes; propagates client deadlines untouched (no
