@@ -141,6 +141,40 @@ immutable contract: repartitioning or reordering = full rebuild). Every
 partition must host the index; by default a partition without a routable
 copy fails the request instead of serving a partial view.
 
+### Partition weights
+
+A partition may carry a positive integer weight, `shard:weight` (default 1):
+`--placement "documents*=2:5,3:5,4:4"` splits rows 5:5:4, for example because
+shard 4's disk is smaller. Partition `i` owns its slice of
+`fnv1a64(primary key) % 14`. Weights are reduced by their greatest common
+divisor, so only the ratio matters (`2:10,3:10,4:8` is the same rule), and
+equal weights reduce to all ones, which is exactly `fnv1a64 % n`: the routing
+every generation built before weights existed uses. Fractions, zero and a
+weight on a single-shard rule are refused at startup. The broker logs each
+weighted rule with the share of rows every partition receives, and
+`GetTopology` reports each partition's `weight` (0 for an unpartitioned
+index) next to its `num_docs`.
+
+Weights balance rows, not bytes; documents of very different sizes still
+spread by count. Like partition order, the weights are part of a
+generation's routing contract: changing them moves most keys, so later
+upserts and deletes of existing documents would reach the wrong partition
+(an upsert then adds a duplicate, a delete misses its row). The broker cannot
+detect a mismatch, because the weights live only in its placement rules.
+
+To make a weighted rule the family default, first pin every live generation
+to the rule it was built with, ahead of the family rule (first match wins),
+then change the family rule. New generations get the weights; live ones keep
+their routing until they are deleted, after which their pin can go:
+
+```
+--placement "documents_20260905=2,3,4"   # live generation, unweighted routing
+--placement "documents*=2:5,3:5,4:4"     # default for new generations
+```
+
+List the live generations (`ListIndexes`, `GetTopology`) before deploying:
+an unpinned live generation silently switches to the new routing.
+
 `--partial-partition-reads` trades completeness for availability, e.g. to
 restart one partition at a time. `Search` (pointwise and coordinated fusion)
 and `GetTextStats` then skip partitions that have no routable replica or

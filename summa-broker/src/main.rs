@@ -96,7 +96,9 @@ struct Args {
     /// e.g. "documents*=0". Also pins reads/writes when an index name appears
     /// on several shards during a migration. A shard list ("documents*=2,3,4")
     /// declares a partitioned index: documents hash by primary key across the
-    /// listed shards (in that order) and reads fan out and merge.
+    /// listed shards (in that order) and reads fan out and merge. A partition
+    /// may carry an integer weight ("documents_2026*=2:5,3:5,4:4": rows split
+    /// 5:5:4, default 1); order and weights are fixed per generation.
     #[arg(long = "placement")]
     placements: Vec<String>,
 
@@ -341,11 +343,28 @@ async fn async_main(args: Args) -> Result<()> {
         let shards: Vec<&str> = rule.shards.iter().map(|s| s.0.as_str()).collect();
         if shards.len() == 1 {
             info!("placement rule: {} -> shard '{}'", rule.pattern, shards[0]);
-        } else {
+        } else if rule.weights.is_uniform() {
             info!(
                 "placement rule: {} -> partitions [{}]",
                 rule.pattern,
                 shards.join(", ")
+            );
+        } else {
+            let weighted: Vec<String> = shards
+                .iter()
+                .enumerate()
+                .map(|(i, shard)| {
+                    let (numerator, denominator) = rule.weights.share(i);
+                    format!(
+                        "{shard} (weight {}, {numerator}/{denominator} of rows)",
+                        rule.weights.weight(i)
+                    )
+                })
+                .collect();
+            info!(
+                "placement rule: {} -> weighted partitions [{}]",
+                rule.pattern,
+                weighted.join(", ")
             );
         }
     }

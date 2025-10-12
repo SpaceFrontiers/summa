@@ -6,6 +6,7 @@
 //! is partitioned across shards (phase 2), which makes the ordering an
 //! immutable routing contract — reorder rules only together with a rebuild.
 
+use crate::partition::PartitionWeights;
 use crate::topology::ShardId;
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct PlacementRule {
     /// across them, in this (immutable) order: writes hash the primary key
     /// to a position in this list, reads fan out to all of them.
     pub shards: Vec<ShardId>,
+    /// Share of rows each partition receives (`shard:weight`, default 1).
+    pub weights: PartitionWeights,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -46,6 +49,14 @@ impl PlacementRules {
             .map(|r| r.shards.as_slice())
     }
 
+    /// Partition weights of the first matching rule.
+    pub fn weights_for(&self, index_name: &str) -> Option<&PartitionWeights> {
+        self.rules
+            .iter()
+            .find(|r| glob_match(&r.pattern, index_name))
+            .map(|r| &r.weights)
+    }
+
     /// First shard of the first matching rule (the whole placement for an
     /// unpartitioned index).
     pub fn shard_for(&self, index_name: &str) -> Option<&ShardId> {
@@ -58,16 +69,34 @@ impl PlacementRules {
 /// last `=` so patterns themselves may not contain `=` (index names cannot
 /// either, per summa-server's index-name validation).
 /// `pattern=shard` or `pattern=shardA,shardB,...` (partitions in order).
+/// A partition may carry a positive integer weight, `pattern=a:5,b:5,c:4`:
+/// partitions receive rows in proportion to their weights (default 1).
 pub fn parse_placement(s: &str) -> anyhow::Result<PlacementRule> {
     let (pattern, shards) = s.rsplit_once('=').ok_or_else(|| {
-        anyhow::anyhow!("invalid --placement '{s}': expected 'pattern=shard[,shard...]'")
+        anyhow::anyhow!("invalid --placement '{s}': expected 'pattern=shard[:weight][,shard...]'")
     })?;
     if pattern.is_empty() || shards.is_empty() {
         anyhow::bail!("invalid --placement '{s}': empty pattern or shard");
     }
     let mut parsed: Vec<ShardId> = Vec::new();
-    for shard in shards.split(',') {
-        let shard = shard.trim();
+    let mut weights = Vec::new();
+    let mut weighted = false;
+    for entry in shards.split(',') {
+        let (shard, weight) = match entry.split_once(':') {
+            Some((shard, weight)) => {
+                weighted = true;
+                (
+                    shard.trim(),
+                    parse_weight(weight.trim()).map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid --placement '{s}': weight of shard '{}': {e}",
+                            shard.trim()
+                        )
+                    })?,
+                )
+            }
+            None => (entry.trim(), 1),
+        };
         if shard.is_empty() {
             anyhow::bail!("invalid --placement '{s}': empty shard id");
         }
@@ -75,11 +104,31 @@ pub fn parse_placement(s: &str) -> anyhow::Result<PlacementRule> {
             anyhow::bail!("invalid --placement '{s}': shard '{shard}' listed twice");
         }
         parsed.push(ShardId(shard.to_string()));
+        weights.push(weight);
+    }
+    if weighted && parsed.len() == 1 {
+        anyhow::bail!(
+            "invalid --placement '{s}': a weight only applies to a partition of a multi-shard rule"
+        );
     }
     Ok(PlacementRule {
         pattern: pattern.to_string(),
         shards: parsed,
+        weights: PartitionWeights::new(weights),
     })
+}
+
+/// A positive integer weight. Decimal fractions are refused: weights decide
+/// where every key is routed, so they are compared exactly.
+fn parse_weight(weight: &str) -> anyhow::Result<u32> {
+    if weight.is_empty() || !weight.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("'{weight}' is not a positive integer such as 4");
+    }
+    match weight.parse::<u32>() {
+        Ok(0) => anyhow::bail!("'{weight}' must be greater than 0"),
+        Ok(weight) => Ok(weight),
+        Err(_) => anyhow::bail!("'{weight}' is larger than {}", u32::MAX),
+    }
 }
 
 /// Glob match supporting `*` (any run of characters, including empty).
@@ -151,6 +200,61 @@ mod tests {
         assert_eq!(rule.pattern, "social*");
         assert_eq!(rule.shards.len(), 1);
         assert_eq!(rule.shards[0].0, "fin2");
+    }
+
+    #[test]
+    fn placement_parses_partition_weights() {
+        let rule = parse_placement("documents_2026*=2:5,3:5,4:4").unwrap();
+        let shards: Vec<&str> = rule.shards.iter().map(|s| s.0.as_str()).collect();
+        assert_eq!(shards, vec!["2", "3", "4"]);
+        assert_eq!(rule.weights, PartitionWeights::new(vec![5, 5, 4]));
+        let spaced = parse_placement("documents_2026*=2:5, 3:5 ,4: 4").unwrap();
+        assert_eq!(spaced.weights, rule.weights);
+        // Unlisted weights default to 1.
+        assert_eq!(
+            parse_placement("documents*=2,3,4:2").unwrap().weights,
+            PartitionWeights::new(vec![1, 1, 2])
+        );
+        // No weights: the unweighted routing every existing generation uses.
+        assert_eq!(
+            parse_placement("documents*=2,3,4").unwrap().weights,
+            PartitionWeights::uniform(3)
+        );
+        for bad in [
+            "documents*=2,3,4:0",
+            "documents*=2,3,4:-1",
+            "documents*=2,3,4:+4",
+            "documents*=2,3,4:0.8",
+            "documents*=2,3,4:1.0",
+            "documents*=2,3,4:abc",
+            "documents*=2,3,4:",
+            "documents*=2,3,4:1e3",
+            "documents*=2,3,4:4294967296",
+            "documents*=2:5",
+            "documents*=:5,3",
+        ] {
+            assert!(parse_placement(bad).is_err(), "{bad} must be refused");
+        }
+        let rules = PlacementRules::new(
+            vec![
+                parse_placement("documents_20261020=2:5,3:5,4:4").unwrap(),
+                parse_placement("documents*=2,3,4").unwrap(),
+            ],
+            PlacementDefault::Single,
+        );
+        assert!(
+            !rules
+                .weights_for("documents_20261020")
+                .unwrap()
+                .is_uniform()
+        );
+        assert!(
+            rules
+                .weights_for("documents_20260905")
+                .unwrap()
+                .is_uniform()
+        );
+        assert!(rules.weights_for("social").is_none());
     }
 
     #[test]

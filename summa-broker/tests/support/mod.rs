@@ -45,6 +45,9 @@ pub struct MockState {
     pub search_timeouts: Vec<Option<String>>,
     /// Recorded (index_name, num_docs) per BatchIndexDocuments call.
     pub batches: Vec<(String, usize)>,
+    /// Text `id` of every document written (batch or upsert) and every
+    /// primary key deleted, in arrival order.
+    pub routed_keys: Vec<String>,
     /// Recorded index names per Commit / CreateIndex / DeleteIndex call.
     pub commits: Vec<String>,
     pub creates: Vec<String>,
@@ -236,7 +239,12 @@ impl IndexService for MockBackend {
         self.check_available()?;
         let req = request.into_inner();
         let count = req.documents.len();
-        self.state.lock().batches.push((req.index_name, count));
+        let mut state = self.state.lock();
+        state.batches.push((req.index_name, count));
+        state
+            .routed_keys
+            .extend(req.documents.iter().filter_map(text_id));
+        drop(state);
         Ok(Response::new(BatchIndexDocumentsResponse {
             indexed_count: count as u32,
             error_count: 0,
@@ -249,8 +257,11 @@ impl IndexService for MockBackend {
         request: Request<DeleteDocumentsRequest>,
     ) -> Result<Response<DocumentMutationResponse>, Status> {
         self.check_available()?;
+        let keys = request.into_inner().primary_keys;
+        let accepted_count = keys.len() as u32;
+        self.state.lock().routed_keys.extend(keys);
         Ok(Response::new(DocumentMutationResponse {
-            accepted_count: request.into_inner().primary_keys.len() as u32,
+            accepted_count,
             errors: vec![],
         }))
     }
@@ -260,8 +271,13 @@ impl IndexService for MockBackend {
         request: Request<UpsertDocumentsRequest>,
     ) -> Result<Response<DocumentMutationResponse>, Status> {
         self.check_available()?;
+        let documents = request.into_inner().documents;
+        self.state
+            .lock()
+            .routed_keys
+            .extend(documents.iter().filter_map(text_id));
         Ok(Response::new(DocumentMutationResponse {
-            accepted_count: request.into_inner().documents.len() as u32,
+            accepted_count: documents.len() as u32,
             errors: vec![],
         }))
     }
@@ -428,6 +444,25 @@ pub async fn broker_index_client(
 pub async fn direct_search_client(addr: &str) -> SearchServiceClient<tonic::transport::Channel> {
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
     SearchServiceClient::new(endpoint.connect_lazy())
+}
+
+fn text_id(document: &NamedDocument) -> Option<String> {
+    document
+        .fields
+        .iter()
+        .find(|entry| entry.name == "id")
+        .and_then(|entry| match entry.value.as_ref()?.value.as_ref()? {
+            field_value::Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+}
+
+pub async fn broker_admin_client(
+    broker: &BrokerProc,
+) -> broker_proto::broker_service_client::BrokerServiceClient<tonic::transport::Channel> {
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", broker.addr)).unwrap();
+    broker_proto::broker_service_client::BrokerServiceClient::new(endpoint.connect_lazy())
 }
 
 /// Wait until the broker reports every configured backend healthy. Backends

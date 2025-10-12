@@ -45,6 +45,9 @@ message IndexTopology {
 message Partition {
   string shard_id = 1;
   repeated ReplicaState replicas = 2;
+  // Routing weight of this partition (placement `shard:weight`, default 1;
+  // compare num_docs against it). 0 for an unpartitioned index.
+  uint32 weight = 3;
 }
 
 message ReplicaState {

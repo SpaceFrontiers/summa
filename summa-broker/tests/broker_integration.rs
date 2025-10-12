@@ -391,6 +391,13 @@ async fn partitioned_fixture() -> (Vec<MockBackend>, BrokerProc) {
 }
 
 async fn partitioned_fixture_with(extra_args: &[&str]) -> (Vec<MockBackend>, BrokerProc) {
+    partitioned_fixture_ruled("documents*=2,3,4", extra_args).await
+}
+
+async fn partitioned_fixture_ruled(
+    placement: &str,
+    extra_args: &[&str],
+) -> (Vec<MockBackend>, BrokerProc) {
     let mocks: Vec<MockBackend> = (0..3).map(|_| MockBackend::new(&["documents"])).collect();
     let mut specs = Vec::new();
     for (i, mock) in mocks.iter().enumerate() {
@@ -400,7 +407,7 @@ async fn partitioned_fixture_with(extra_args: &[&str]) -> (Vec<MockBackend>, Bro
         let addr = mock.spawn().await;
         specs.push(backend_spec(&format!("m{i}"), &addr, &(i + 2).to_string()));
     }
-    let mut args = vec!["--placement", "documents*=2,3,4"];
+    let mut args = vec!["--placement", placement];
     args.extend_from_slice(extra_args);
     let broker = spawn_broker(&specs, &args);
     wait_for_indexes(&broker, &["documents"], Duration::from_secs(10)).await;
@@ -467,6 +474,114 @@ async fn partitioned_create_and_commit_fan_out_to_every_partition() {
         let state = mock.state.lock();
         assert_eq!(state.creates, vec!["documents_20260904"]);
         assert_eq!(state.commits, vec!["documents"]);
+    }
+}
+
+/// FNV-1a 64, restated independently of the broker: the routing contract.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// Batch writes, upserts and deletes of a weighted partitioned index all
+/// land on `fnv1a64(id) % 14` sliced 5:5:4 for `2:5,3:5,4:4`, while an
+/// unweighted rule keeps the `fnv1a64(id) % 3` routing existing generations
+/// were built with; GetTopology reports the weights.
+#[tokio::test(flavor = "multi_thread")]
+async fn weighted_partitions_route_batches_upserts_and_deletes_by_weight() {
+    use support::broker_proto::GetTopologyRequest;
+
+    let slice_5_5_4 = |key: &str| -> usize {
+        match fnv1a64(key.as_bytes()) % 14 {
+            0..5 => 0,
+            5..10 => 1,
+            _ => 2,
+        }
+    };
+    let unweighted = |key: &str| (fnv1a64(key.as_bytes()) % 3) as usize;
+    for (placement, expected, weights) in [
+        (
+            "documents*=2:5,3:5,4:4",
+            &slice_5_5_4 as &dyn Fn(&str) -> usize,
+            [5, 5, 4],
+        ),
+        ("documents*=2,3,4", &unweighted, [1, 1, 1]),
+    ] {
+        let (mocks, broker) = partitioned_fixture_ruled(placement, &[]).await;
+        let ids: Vec<String> = (0..1400).map(|i| format!("doc-{i}")).collect();
+        let mut client = broker_index_client(&broker).await;
+        let response = client
+            .batch_index_documents(BatchIndexDocumentsRequest {
+                index_name: "documents".to_string(),
+                documents: ids[..700].iter().map(|id| text_doc(id)).collect(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.indexed_count, 700);
+        let upserted = client
+            .upsert_documents(UpsertDocumentsRequest {
+                index_name: "documents".to_string(),
+                documents: ids[700..].iter().map(|id| text_doc(id)).collect(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(upserted.accepted_count, 700);
+        let deleted = client
+            .delete_documents(DeleteDocumentsRequest {
+                index_name: "documents".to_string(),
+                primary_keys: ids.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(deleted.accepted_count, 1400);
+
+        let mut written = Vec::new();
+        for (partition, mock) in mocks.iter().enumerate() {
+            let keys = mock.state.lock().routed_keys.clone();
+            for key in &keys {
+                assert_eq!(
+                    expected(key),
+                    partition,
+                    "{placement}: '{key}' reached partition {partition}"
+                );
+            }
+            // Each key arrives once as a write and once as a delete.
+            assert_eq!(keys.len() % 2, 0);
+            written.push(keys.len() / 2);
+        }
+        assert_eq!(written.iter().sum::<usize>(), 1400, "{placement}");
+        if placement.ends_with(":4") {
+            assert!(
+                written[2] < written[0] && written[2] < written[1],
+                "the weight-4 partition gets fewer rows: {written:?}"
+            );
+        }
+
+        let topology = broker_admin_client(&broker)
+            .await
+            .get_topology(GetTopologyRequest {
+                index_name: "documents".to_string(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let reported: Vec<(String, u32)> = topology.indexes[0]
+            .partitions
+            .iter()
+            .map(|p| (p.shard_id.clone(), p.weight))
+            .collect();
+        assert_eq!(
+            reported,
+            vec![
+                ("2".to_string(), weights[0]),
+                ("3".to_string(), weights[1]),
+                ("4".to_string(), weights[2]),
+            ]
+        );
     }
 }
 

@@ -28,10 +28,82 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Partition (0-based) of a primary key among `partitions`.
-pub fn partition_of(primary_key: &[u8], partitions: usize) -> usize {
-    debug_assert!(partitions > 0);
-    (fnv1a64(primary_key) % partitions as u64) as usize
+/// Relative share of rows each partition receives, in placement order
+/// (`--placement "documents*=2:5,3:5,4:4"`). Partition `i` owns the slice
+/// `[bounds[i-1], bounds[i])` of `fnv1a64(key) % total`, where the slices are
+/// the configured weights reduced by their greatest common divisor. Weights
+/// with the same ratio therefore route identically, and equal weights reduce
+/// to all ones, which is exactly the unweighted `hash % n` routing every
+/// partitioned index used before weights existed. Like partition order, the
+/// weights are part of an index generation's routing contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionWeights {
+    /// Configured weights, in partition order.
+    weights: Vec<u32>,
+    /// Exclusive upper bound of each partition's slice; the last one is the
+    /// modulus.
+    bounds: Vec<u64>,
+}
+
+impl PartitionWeights {
+    /// Every partition gets the same share (the unweighted routing).
+    #[cfg(test)]
+    pub fn uniform(partitions: usize) -> Self {
+        Self::new(vec![1; partitions])
+    }
+
+    /// Positive integer weights, one per partition.
+    pub fn new(weights: Vec<u32>) -> Self {
+        assert!(!weights.is_empty(), "a partitioned index has partitions");
+        assert!(
+            weights.iter().all(|w| *w > 0),
+            "partition weights are validated at parse time: {weights:?}"
+        );
+        let divisor = weights.iter().copied().fold(0, gcd);
+        let bounds = weights
+            .iter()
+            .scan(0u64, |sum, w| {
+                *sum += u64::from(w / divisor);
+                Some(*sum)
+            })
+            .collect();
+        Self { weights, bounds }
+    }
+
+    pub fn len(&self) -> usize {
+        self.weights.len()
+    }
+
+    /// True when every partition has the same weight.
+    pub fn is_uniform(&self) -> bool {
+        self.weights.windows(2).all(|pair| pair[0] == pair[1])
+    }
+
+    /// Configured weight of partition `i`.
+    pub fn weight(&self, i: usize) -> u32 {
+        self.weights[i]
+    }
+
+    /// Exact fraction of rows partition `i` receives, as (numerator,
+    /// denominator) of the reduced weights.
+    pub fn share(&self, i: usize) -> (u64, u64) {
+        let low = if i == 0 { 0 } else { self.bounds[i - 1] };
+        (
+            self.bounds[i] - low,
+            *self.bounds.last().expect("non-empty"),
+        )
+    }
+
+    /// Partition (0-based) of a primary key.
+    pub fn partition_of(&self, primary_key: &[u8]) -> usize {
+        let total = *self.bounds.last().expect("non-empty");
+        let point = fnv1a64(primary_key) % total;
+        self.bounds.partition_point(|&bound| bound <= point)
+    }
+}
+
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Name of the field declared `primary` in a schema SDL, e.g.
@@ -88,10 +160,11 @@ pub struct RoutedBatch {
 pub fn route_documents(
     documents: Vec<NamedDocument>,
     primary_key: &str,
-    partitions: usize,
+    weights: &PartitionWeights,
 ) -> RoutedBatch {
-    let mut groups: Vec<(Vec<usize>, Vec<NamedDocument>)> =
-        (0..partitions).map(|_| (Vec::new(), Vec::new())).collect();
+    let mut groups: Vec<(Vec<usize>, Vec<NamedDocument>)> = (0..weights.len())
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
     let mut unroutable = Vec::new();
     for (position, document) in documents.into_iter().enumerate() {
         let key = document
@@ -102,7 +175,7 @@ pub fn route_documents(
             .and_then(key_bytes);
         match key {
             Some(key) if !key.is_empty() => {
-                let partition = partition_of(&key, partitions);
+                let partition = weights.partition_of(&key);
                 groups[partition].0.push(position);
                 groups[partition].1.push(document);
             }
@@ -511,8 +584,9 @@ mod tests {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fnv1a64(b"foobar"), 0x85944171f73967e8);
-        let a = partition_of(b"doc-1", 3);
-        assert_eq!(partition_of(b"doc-1", 3), a);
+        let uniform = PartitionWeights::uniform(3);
+        let a = uniform.partition_of(b"doc-1");
+        assert_eq!(uniform.partition_of(b"doc-1"), a);
         // Numbers route like their decimal text.
         let text = key_bytes(&FieldValue {
             value: Some(field_value::Value::Text("42".to_string())),
@@ -521,6 +595,82 @@ mod tests {
             value: Some(field_value::Value::U64(42)),
         });
         assert_eq!(text, number);
+    }
+
+    #[test]
+    fn equal_partition_weights_route_exactly_like_unweighted_partitions() {
+        // Generations built before weights existed hash `fnv1a64 % n`; equal
+        // weights of any scale must keep every key where it was.
+        for weights in [
+            PartitionWeights::uniform(3),
+            PartitionWeights::new(vec![4, 4, 4]),
+            PartitionWeights::new(vec![7, 7, 7]),
+            PartitionWeights::new(vec![u32::MAX; 3]),
+        ] {
+            assert!(weights.is_uniform());
+            for i in 0..10_000 {
+                let key = format!("doc-{i}");
+                assert_eq!(
+                    weights.partition_of(key.as_bytes()),
+                    (fnv1a64(key.as_bytes()) % 3) as usize,
+                    "{key} moved under {weights:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn weighted_partitions_receive_rows_in_proportion_to_their_weight() {
+        // documents*=2:5,3:5,4:4 -> slices 5:5:4 of fnv1a64 % 14.
+        let weights = PartitionWeights::new(vec![5, 5, 4]);
+        assert!(!weights.is_uniform());
+        assert_eq!(weights.bounds, vec![5, 10, 14]);
+        assert_eq!(weights.weight(2), 4);
+        assert_eq!(weights.share(0), (5, 14));
+        assert_eq!(weights.share(2), (4, 14));
+        let mut counts = [0usize; 3];
+        let keys = 140_000;
+        for i in 0..keys {
+            let key = format!("doc-{i}");
+            let partition = weights.partition_of(key.as_bytes());
+            assert_eq!(
+                partition,
+                match fnv1a64(key.as_bytes()) % 14 {
+                    0..5 => 0,
+                    5..10 => 1,
+                    _ => 2,
+                }
+            );
+            counts[partition] += 1;
+        }
+        for (partition, count) in counts.iter().enumerate() {
+            let (numerator, denominator) = weights.share(partition);
+            let expected = keys as u64 * numerator / denominator;
+            assert!(
+                (*count as u64).abs_diff(expected) < expected / 50,
+                "partition {partition}: {count} rows, expected ~{expected}"
+            );
+        }
+        // Only the ratio matters: 10:10:8 and 5:5:4 are the same contract.
+        assert_eq!(
+            PartitionWeights::new(vec![10, 10, 8]).bounds,
+            weights.bounds
+        );
+    }
+
+    #[test]
+    fn weighted_batches_split_by_weight() {
+        let weights = PartitionWeights::new(vec![5, 5, 4]);
+        let docs: Vec<NamedDocument> = (0..30).map(|i| doc(&format!("doc-{i}"))).collect();
+        let routed = route_documents(docs, "id", &weights);
+        assert_eq!(routed.groups.len(), 3);
+        for (partition, (positions, documents)) in routed.groups.iter().enumerate() {
+            assert_eq!(positions.len(), documents.len());
+            for position in positions {
+                let key = format!("doc-{position}");
+                assert_eq!(weights.partition_of(key.as_bytes()), partition);
+            }
+        }
     }
 
     #[test]
@@ -604,7 +754,7 @@ mod tests {
         });
         let mut all = docs;
         all.push(unkeyed);
-        let routed = route_documents(all, "id", 3);
+        let routed = route_documents(all, "id", &PartitionWeights::uniform(3));
         assert_eq!(routed.groups.len(), 3);
         let routed_count: usize = routed.groups.iter().map(|(_, d)| d.len()).sum();
         assert_eq!(routed_count, 30);
@@ -615,7 +765,7 @@ mod tests {
         assert_eq!(routed.unroutable.len(), 1);
         assert_eq!(routed.unroutable[0].index, 30);
         // The same key always lands on the same partition.
-        let again = route_documents(vec![doc("doc-7")], "id", 3);
+        let again = route_documents(vec![doc("doc-7")], "id", &PartitionWeights::uniform(3));
         let first = routed
             .groups
             .iter()

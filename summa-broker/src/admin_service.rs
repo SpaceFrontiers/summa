@@ -65,6 +65,8 @@ impl BrokerService for BrokerAdminService {
             .iter()
             .filter(|(name, _)| filter.is_empty() || *name == &filter)
         {
+            let ruled = route.partitions().unwrap_or_default();
+            let weights = self.ctx.placement.weights_for(name);
             let mut partitions = Vec::new();
             for shard in &route.shards {
                 let Some(group) = snapshot.shards.get(shard) else {
@@ -78,9 +80,15 @@ impl BrokerService for BrokerAdminService {
                     Some(self.replica_state(&snapshot, backend, name))
                 }))
                 .await;
+                let weight = ruled
+                    .iter()
+                    .position(|ruled| ruled == shard)
+                    .zip(weights)
+                    .map_or(0, |(i, weights)| weights.weight(i));
                 partitions.push(Partition {
                     shard_id: shard.0.clone(),
                     replicas,
+                    weight,
                 });
             }
             let partitioned = route.partitions().is_some();
