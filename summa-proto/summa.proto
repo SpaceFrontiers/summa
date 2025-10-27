@@ -202,6 +202,11 @@ message BinaryDenseVectorQuery {
   float combiner_temperature = 4;
   uint32 combiner_top_k = 5;
   float combiner_decay = 6;
+  uint32 nprobe = 7; // 0: schema default; explicit maximum 65536.
+  uint32 prefix_rerank = 8; // 0: schema default; requires prefix IVF; maximum 65536.
+  // Highest-scoring ordinals nominated per document, ties by ordinal.
+  // 0: all ordinals; maximum 64. Document scores still combine all values.
+  uint32 max_ordinals_per_doc = 9;
 }
 
 message TermQuery {
@@ -553,6 +558,9 @@ message GetIndexInfoResponse {
   uint64 physical_num_docs = 10; // Includes tombstones; num_docs counts live rows.
   uint64 num_deleted_docs = 11;
   double deleted_ratio = 12; // num_deleted_docs / physical_num_docs; zero for an empty index.
+  // 1: binary filters precede nomination; binary query controls are supported.
+  // Check every partition's support before sending nondefault controls.
+  uint32 binary_retrieval_version = 13;
 }
 
 // Tokenization facts of one text field.

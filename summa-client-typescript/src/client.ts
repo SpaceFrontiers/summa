@@ -157,6 +157,7 @@ export class SummaClient {
       numDeletedDocs: response.numDeletedDocs,
       deletedRatio: response.deletedRatio,
       candidateScoringVersion: response.candidateScoringVersion,
+      binaryRetrievalVersion: response.binaryRetrievalVersion,
       unpreparedCandidateFields: response.unpreparedCandidateFields,
       vectorStats: (response.vectorStats ?? []).map((stats) => ({
         fieldName: stats.fieldName,

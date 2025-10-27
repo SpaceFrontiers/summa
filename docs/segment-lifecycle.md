@@ -88,12 +88,18 @@ writes continue into a removed directory. Summa therefore drains blocking
 merge/reorder work instead of pretending to cancel it.
 
 Process shutdown first rejects new registry requests and stops optimizer scans.
-It waits for accepted commits to release their owned writer guards before
-closing segment-build admission and stopping writers/managers. Manager shutdown
-signals BP cancellation before joining the optimizer supervisor. This preserves
-pending commit flushes without waiting for an uncancelled full BP pass. Forced
-process termination is still outside the guarantee; deployments must allow
-adequate termination grace and drain/commit ingestion before restarting.
+It then stops optional maintenance on every open index (`stop_maintenance`):
+merge, reorder, compaction and vector-rewrite admission closes and in-flight work
+observes cancellation at its next safe point, while segment builds and commit
+visibility outputs stay admitted. Each writer then runs `commit_for_shutdown`
+under its writer lock: it flushes and publishes admitted documents, including
+upsert/delete visibility, but starts no merge or vector upgrade and skips the
+in-memory primary-key refresh because the writer closes to admission
+immediately; the next open folds the new segments into dedup state. Only then
+does it close segment-build admission and drain managers. Phases log their
+duration (`[shutdown_commit]`, `[commit]`, `[row_mutation]`, `[shutdown]`).
+Forced process termination is still outside the guarantee; deployments must
+allow adequate termination grace and drain/commit ingestion before restarting.
 
 Forward construction also observes cancellation: document-map validation, forward
 payload validation, frequency counting and CSR construction check between bounded
@@ -101,8 +107,10 @@ units of work in both record and block modes. Parallel errors join the started
 workers and discard the partial graph before returning `IndexClosed`. This cannot
 interrupt an individual kernel I/O call or allocator operation already in progress.
 
-Upsert/deletion publication runs its serial primary-key and row-visibility scans
-on Tokio's blocking executor. It must not queue these scans on the bulk BP pool
+Upsert/deletion publication probes every committed segment for the admitted
+delete keys (sorted, at most 8 segments concurrently) and rewrites the masks of
+segments with matches; its cost scales with the index, not the batch. The
+probes and row-visibility scans run on Tokio's blocking executor. It must not queue these scans on the bulk BP pool
 while holding publication state: a reorder on another index can occupy every BP
 worker, preventing the commit from releasing its writer lock. The existing
 per-index transaction and commit-finalizer ownership still serialize publication

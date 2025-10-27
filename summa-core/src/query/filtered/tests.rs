@@ -5,6 +5,119 @@ use crate::query::{
 use crate::structures::{SparseFormat, SparseVectorConfig, WeightQuantization};
 use crate::{Document, Field, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
 
+#[tokio::test]
+async fn binary_filters_select_eligible_top_k_before_flat_and_ann_shortlists() {
+    use crate::dsl::BinaryDenseVectorConfig;
+    use crate::query::{BinaryDenseVectorQuery, MultiValueCombiner};
+    use rand::{Rng, SeedableRng};
+
+    for trained in [false, true] {
+        for (prefix, soar) in [(false, false), (true, false), (true, true)] {
+            for multi in [false, true] {
+                let mut schema = Schema::builder();
+                let allowed = schema.add_u64_field("allowed", true, false);
+                schema.set_fast(allowed, true);
+                let mut vector_config = BinaryDenseVectorConfig::new(128).with_ivf(Some(4), 4);
+                if prefix {
+                    vector_config = vector_config.with_prefix(32, Some(2));
+                }
+                if soar {
+                    vector_config.soar = Some(crate::structures::SoarConfig::full());
+                }
+                let binary = schema.add_binary_dense_vector_field_with_config(
+                    "binary",
+                    true,
+                    false,
+                    vector_config,
+                );
+                schema.set_multi(binary, multi);
+                let directory = RamDirectory::new();
+                let config = IndexConfig::default();
+                let mut writer =
+                    IndexWriter::create(directory.clone(), schema.build(), config.clone())
+                        .await
+                        .unwrap();
+                let mut rng = rand::rngs::StdRng::seed_from_u64(73);
+                for id in 0..200 {
+                    let mut doc = Document::new();
+                    doc.add_u64(allowed, u64::from(id >= 198));
+                    let code: Vec<u8> = if id >= 198 {
+                        vec![0x01; 16]
+                    } else {
+                        (0..16).map(|_| rng.random::<u8>() | 0x80).collect()
+                    };
+                    doc.add_binary_dense_vector(binary, code.clone());
+                    if multi {
+                        doc.add_binary_dense_vector(binary, code);
+                    }
+                    writer.add_document(doc).unwrap();
+                }
+                writer.commit().await.unwrap();
+                if trained {
+                    writer.build_vector_index().await.unwrap();
+                }
+                let index = Index::open(directory, config).await.unwrap();
+                for combiner in [MultiValueCombiner::Max, MultiValueCombiner::Avg] {
+                    // Even the prefix heap must exclude the stronger, disallowed
+                    // documents. Multi-value prefix ties can admit only one doc.
+                    let query = eligible(
+                        BinaryDenseVectorQuery::new(binary, vec![0xff; 16]).with_combiner(combiner),
+                        allowed,
+                    );
+                    assert_selected(&index, &query, 1, &[198]).await;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn bounded_binary_nomination_keeps_best_ordinals_without_changing_document_score() {
+    use crate::query::{BinaryDenseVectorQuery, BinaryRetrievalOptions, MultiValueCombiner};
+    let mut schema = Schema::builder();
+    let field = schema.add_binary_dense_vector_field("binary", 8, true, false);
+    schema.set_multi(field, true);
+    let directory = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    let mut document = Document::new();
+    for byte in [0, 255, 127, 255, 63] {
+        document.add_binary_dense_vector(field, vec![byte]);
+    }
+    writer.add_document(document).unwrap();
+    writer.commit().await.unwrap();
+    let index = Index::open(directory, config).await.unwrap();
+    let readers = index.segment_readers().await.unwrap();
+    for combiner in [
+        MultiValueCombiner::Max,
+        MultiValueCombiner::Sum,
+        MultiValueCombiner::Avg,
+    ] {
+        let baseline = BinaryDenseVectorQuery::new(field, vec![255]).with_combiner(combiner);
+        let original = baseline.scorer(&readers[0], 1).await.unwrap();
+        assert_eq!(original.matched_positions().unwrap()[0].1.len(), 5);
+        let bounded = baseline.with_retrieval_options(BinaryRetrievalOptions {
+            max_ordinals_per_doc: 3,
+            ..Default::default()
+        });
+        let check = |scorer: Box<dyn Scorer + '_>| {
+            assert_eq!(scorer.score().to_bits(), original.score().to_bits());
+            let positions = scorer.matched_positions().unwrap();
+            let ordinals: Vec<_> = positions[0]
+                .1
+                .iter()
+                .map(|position| position.position)
+                .collect();
+            assert_eq!(ordinals, [1, 2, 3]);
+        };
+        check(bounded.scorer(&readers[0], 1).await.unwrap());
+        #[cfg(feature = "sync")]
+        check(bounded.scorer_sync(&readers[0], 1).unwrap());
+    }
+}
+
 async fn fixture() -> (Index<RamDirectory>, Field, Field, Field, Field) {
     let mut schema = Schema::builder();
     let text = schema.add_text_field_with_tokenizer("body", true, false, "simple");

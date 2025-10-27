@@ -4,6 +4,118 @@ use super::validation::MAX_FUSION_SUB_QUERIES;
 use super::*;
 use tonic::Code;
 
+#[tokio::test]
+async fn binary_retrieval_bounds_fail_before_index_open_or_admission() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SearchServiceImpl::new(
+        Arc::new(IndexRegistry::new(temp.path().into(), Default::default())),
+        1,
+        limits(),
+    );
+    let _permit = try_acquire_search_permit(&service.search_permits).unwrap();
+    for (field, options) in [
+        (
+            "nprobe",
+            crate::proto::BinaryDenseVectorQuery {
+                nprobe: 65_537,
+                ..Default::default()
+            },
+        ),
+        (
+            "prefix_rerank",
+            crate::proto::BinaryDenseVectorQuery {
+                prefix_rerank: 65_537,
+                ..Default::default()
+            },
+        ),
+        (
+            "max_ordinals_per_doc",
+            crate::proto::BinaryDenseVectorQuery {
+                max_ordinals_per_doc: 65,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let error = service
+            .search(Request::new(SearchRequest {
+                index_name: "absent".into(),
+                query: Some(Query {
+                    query: Some(query::Query::BinaryDenseVector(options)),
+                }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains(field), "{error}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn binary_passage_limit_bounds_fusion_export_and_keeps_document_scores() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));
+    let mut schema = summa_core::Schema::builder();
+    let binary = schema.add_binary_dense_vector_field("binary", 8, true, false);
+    schema.set_multi(binary, true);
+    registry
+        .create_index("binary-test", schema.build())
+        .await
+        .unwrap();
+    let writer = registry.get_writer("binary-test").await.unwrap();
+    {
+        let mut writer = writer.write().await;
+        let mut document = summa_core::Document::new();
+        for _ in 0..2000 {
+            document.add_binary_dense_vector(binary, vec![255]);
+        }
+        writer.add_document(document).unwrap();
+        writer.commit().await.unwrap();
+    }
+    let index = registry.get_or_open_index("binary-test").await.unwrap();
+    index.reader().await.unwrap().reload().await.unwrap();
+    let service = SearchServiceImpl::new(registry.clone(), 1, limits());
+    let result = service
+        .search(Request::new(SearchRequest {
+            index_name: "binary-test".into(),
+            limit: 1,
+            query: Some(Query {
+                query: Some(query::Query::Fusion(FusionQuery {
+                    candidate_depth: 1,
+                    method: crate::proto::FusionMethod::FusionCandidates as i32,
+                    queries: vec![WeightedQuery {
+                        name: "body_binary".into(),
+                        scope: crate::proto::ScoreScope::Chunk as i32,
+                        query: Some(Query {
+                            query: Some(query::Query::BinaryDenseVector(
+                                crate::proto::BinaryDenseVectorQuery {
+                                    field: "binary".into(),
+                                    vector: vec![255],
+                                    combiner: crate::proto::MultiValueCombiner::CombinerMax as i32,
+                                    max_ordinals_per_doc: 3,
+                                    ..Default::default()
+                                },
+                            )),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.hits.len(), 1);
+    assert_eq!(result.fusion_candidates.len(), 1);
+    let candidate = &result.fusion_candidates[0];
+    assert_eq!(candidate.candidates.len(), 1);
+    assert_eq!(candidate.candidates[0].score, 1.0);
+    assert_eq!(candidate.candidates[0].ordinal_scores.len(), 3);
+    registry.shutdown().await.unwrap();
+}
+
 #[test]
 fn text_stats_accepts_broker_flattened_terms_but_keeps_aggregate_limit() {
     let shape = QueryShapeLimits::default();
@@ -893,6 +1005,7 @@ async fn l1_rpc_backfills_the_union_before_top_k_and_preserves_required_phrases(
         .unwrap()
         .into_inner();
     assert_eq!(info.candidate_scoring_version, 4);
+    assert_eq!(info.binary_retrieval_version, 1);
     assert!(info.unprepared_candidate_fields.is_empty());
     registry.shutdown().await.unwrap();
 }

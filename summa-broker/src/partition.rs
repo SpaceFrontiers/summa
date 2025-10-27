@@ -442,6 +442,9 @@ pub fn merge_index_info(parts: Vec<GetIndexInfoResponse>) -> GetIndexInfoRespons
         merged.candidate_scoring_version = merged
             .candidate_scoring_version
             .min(part.candidate_scoring_version);
+        merged.binary_retrieval_version = merged
+            .binary_retrieval_version
+            .min(part.binary_retrieval_version);
         merged
             .unprepared_candidate_fields
             .extend(part.unprepared_candidate_fields);
@@ -538,6 +541,21 @@ pub fn partition_failure(index_name: &str, shard: &str, status: Status) -> Statu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_controls_require_support_from_every_partition() {
+        for versions in [vec![1, 1], vec![1, 0], vec![0, 1]] {
+            let expected = *versions.iter().min().unwrap();
+            let parts = versions
+                .into_iter()
+                .map(|version| GetIndexInfoResponse {
+                    binary_retrieval_version: version,
+                    ..Default::default()
+                })
+                .collect();
+            assert_eq!(merge_index_info(parts).binary_retrieval_version, expected);
+        }
+    }
 
     #[test]
     fn deleted_share_is_weighted_by_physical_rows_across_partitions() {

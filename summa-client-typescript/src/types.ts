@@ -83,6 +83,7 @@ export interface IndexInfo {
   numDeletedDocs?: number;
   deletedRatio?: number;
   candidateScoringVersion?: number;
+  binaryRetrievalVersion?: number;
   unpreparedCandidateFields?: string[];
 }
 
@@ -193,6 +194,9 @@ export interface BinaryDenseVectorQuery {
   combinerTemperature?: number;
   combinerTopK?: number;
   combinerDecay?: number;
+  nprobe?: number;
+  prefixRerank?: number;
+  maxOrdinalsPerDoc?: number;
 }
 
 export interface RangeQuery {

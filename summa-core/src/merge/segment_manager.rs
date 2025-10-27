@@ -273,12 +273,20 @@ struct ActiveOperationState {
     /// merge/reorder work is paused so its source set cannot change midway;
     /// indexing producers remain allowed and deliberately emit flat vectors.
     non_indexing_paused: bool,
+    /// Process shutdown stops optional maintenance (merge, reorder,
+    /// compaction, vector rewrites) before its final commit. Indexing
+    /// producers and commit visibility outputs remain admitted until
+    /// `accepting` closes.
+    maintenance_stopped: bool,
 }
 
 struct ActiveSegmentOperations {
     inner: parking_lot::Mutex<ActiveOperationState>,
     idle: Notify,
-    shutdown: Notify,
+    maintenance_stop: Notify,
+    /// Cancels in-flight maintenance at its next safe point.
+    maintenance_cancelled: Arc<AtomicBool>,
+    /// Cancels commit visibility scans; raised only when admission closes.
     shutdown_requested: Arc<AtomicBool>,
     /// Owning index, so lifecycle decisions are attributable when several
     /// indexes register and defer operations concurrently.
@@ -295,9 +303,11 @@ impl ActiveSegmentOperations {
                 next_operation_token: 0,
                 accepting: true,
                 non_indexing_paused: false,
+                maintenance_stopped: false,
             }),
             idle: Notify::new(),
-            shutdown: Notify::new(),
+            maintenance_stop: Notify::new(),
+            maintenance_cancelled: Arc::new(AtomicBool::new(false)),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             index_label,
         }
@@ -338,6 +348,13 @@ impl ActiveSegmentOperations {
         if !inner.accepting {
             log::debug!(
                 "[segment_lifecycle] index={} rejected operation during shutdown",
+                self.index_label
+            );
+            return None;
+        }
+        if !indexing && inner.maintenance_stopped {
+            log::debug!(
+                "[segment_lifecycle] index={} rejected maintenance after shutdown began",
                 self.index_label
             );
             return None;
@@ -409,13 +426,21 @@ impl ActiveSegmentOperations {
         (tokens, inner.indexing_tokens.len())
     }
 
+    /// Reject new maintenance and cancel in-flight maintenance at its next
+    /// safe point, while indexing producers can still flush and publish.
+    fn stop_maintenance(&self) {
+        self.maintenance_cancelled.store(true, Ordering::Release);
+        self.inner.lock().maintenance_stopped = true;
+        self.maintenance_stop.notify_waiters();
+    }
+
     /// Atomically prevent new lifecycle work from starting. Existing guards
     /// remain valid and can be drained with [`Self::wait_until_idle`].
     fn stop_accepting(&self) {
+        self.stop_maintenance();
         self.shutdown_requested.store(true, Ordering::Release);
         let mut inner = self.inner.lock();
         inner.accepting = false;
-        self.shutdown.notify_waiters();
         if inner.segment_ids.is_empty() {
             self.idle.notify_waiters();
         }
@@ -434,7 +459,18 @@ impl ActiveSegmentOperations {
         self.inner.lock().accepting
     }
 
+    fn accepts_maintenance(&self) -> bool {
+        !self.inner.lock().maintenance_stopped
+    }
+
+    /// Cancellation for optional maintenance (merge, reorder, compaction).
     fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.maintenance_cancelled)
+    }
+
+    /// Cancellation for commit visibility work, which must keep running
+    /// through the shutdown commit and stops only when admission closes.
+    fn shutdown_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shutdown_requested)
     }
 
@@ -461,12 +497,12 @@ impl ActiveSegmentOperations {
         }
     }
 
-    /// Resolve when shutdown starts, without missing a notification between
-    /// checking the state and registering the waiter.
-    async fn wait_for_shutdown(&self) {
+    /// Resolve when maintenance stops (shutdown begins), without missing a
+    /// notification between checking the state and registering the waiter.
+    async fn wait_for_maintenance_stop(&self) {
         loop {
-            let notified = self.shutdown.notified();
-            if !self.inner.lock().accepting {
+            let notified = self.maintenance_stop.notified();
+            if self.inner.lock().maintenance_stopped {
                 return;
             }
             notified.await;
@@ -1162,6 +1198,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         self.active_operations.stop_accepting();
     }
 
+    /// Stop optional maintenance before a process-shutdown commit: merges,
+    /// reorders, compactions and vector rewrites can no longer start, and
+    /// in-flight ones stop at their next cancellation point while the commit
+    /// runs. Indexing flushes and commit publication remain admitted.
+    /// Irreversible; [`Self::begin_shutdown`] completes the shutdown.
+    pub fn stop_maintenance(&self) {
+        self.active_operations.stop_maintenance();
+    }
+
     /// Run a lifecycle mutation independently of its requesting future.
     ///
     /// Metadata writes contain an atomic rename. If an RPC is cancelled while
@@ -1430,7 +1475,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let future = async move {
             let capacity = tokio::select! {
                 biased;
-                () = manager.active_operations.wait_for_shutdown() => None,
+                () = manager.active_operations.wait_for_maintenance_stop() => None,
                 permit = Arc::clone(&manager.global_merge_permits).acquire_owned() => permit.ok(),
             };
 
@@ -1874,9 +1919,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// The hard merge semaphore is acquired before lifecycle ownership, so
     /// concurrent triggers cannot exceed configured merge capacity.
     pub async fn maybe_merge(self: &Arc<Self>) {
-        if !self.active_operations.is_accepting() {
+        if !self.active_operations.accepts_maintenance() {
             log::debug!(
-                "[maybe_merge] index={} manager is shutting down, skipping",
+                "[maybe_merge] index={} maintenance stopped for shutdown, skipping",
                 self.schema.index_label()
             );
             return;
@@ -2234,7 +2279,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 () = tokio::time::sleep(retry_delay) => {
                     manager.maybe_merge().await;
                 }
-                () = manager.active_operations.wait_for_shutdown() => {}
+                () = manager.active_operations.wait_for_maintenance_stop() => {}
             }
         };
         let runtime = tokio::runtime::Handle::current();
@@ -2948,7 +2993,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let mut logged_held_wait = false;
 
         loop {
-            if !self.active_operations.is_accepting() {
+            if !self.active_operations.accepts_maintenance() {
                 return Err(Error::IndexClosed);
             }
 
@@ -3074,7 +3119,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     .fetch_add(1, Ordering::Relaxed);
                 tokio::select! {
                     biased;
-                    () = self.active_operations.wait_for_shutdown() => {
+                    () = self.active_operations.wait_for_maintenance_stop() => {
                         return Err(Error::IndexClosed);
                     }
                     () = tokio::time::sleep(FORCE_MERGE_HELD_BACKOFF) => {}
@@ -3103,7 +3148,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             };
             let _group_guard = Arc::new(match group_guard {
                 Some(guard) => guard,
-                None if !self.active_operations.is_accepting() => {
+                None if !self.active_operations.accepts_maintenance() => {
                     return Err(Error::IndexClosed);
                 }
                 None => {
@@ -3144,7 +3189,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 let capacity_start = std::time::Instant::now();
                 let permit = tokio::select! {
                     biased;
-                    () = self.active_operations.wait_for_shutdown() => {
+                    () = self.active_operations.wait_for_maintenance_stop() => {
                         return Err(Error::IndexClosed);
                     }
                     permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
@@ -3213,7 +3258,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 let step_global_merge_permit = if group_global_merge_permit.is_none() {
                     Some(Arc::new(tokio::select! {
                         biased;
-                        () = self.active_operations.wait_for_shutdown() => {
+                        () = self.active_operations.wait_for_maintenance_stop() => {
                             return Err(Error::IndexClosed);
                         }
                         permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
@@ -3433,7 +3478,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     ) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
         let global = tokio::select! {
             biased;
-            () = self.active_operations.wait_for_shutdown() => {
+            () = self.active_operations.wait_for_maintenance_stop() => {
                 return Err(Error::IndexClosed);
             }
             permit = Arc::clone(&self.global_merge_permits).acquire_owned() => {
@@ -3444,7 +3489,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         };
         let local = tokio::select! {
             biased;
-            () = self.active_operations.wait_for_shutdown() => {
+            () = self.active_operations.wait_for_maintenance_stop() => {
                 return Err(Error::IndexClosed);
             }
             permit = Arc::clone(&self.merge_permits).acquire_owned() => {
@@ -3560,7 +3605,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     .try_register_vector_update(vec![segment_id.clone(), output_hex.clone()])
             }
             .ok_or_else(|| {
-                if self.active_operations.is_accepting() {
+                if self.active_operations.accepts_maintenance() {
                     Error::Internal(format!(
                         "vector generation could not claim stable source {segment_id}"
                     ))
@@ -3662,7 +3707,9 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         };
         let _operation = match operation {
             Some(operation) => operation,
-            None if !self.active_operations.is_accepting() => return Err(Error::IndexClosed),
+            None if !self.active_operations.accepts_maintenance() => {
+                return Err(Error::IndexClosed);
+            }
             None => return Ok(VectorSegmentRewriteOutcome::Conflict),
         };
 
@@ -3765,7 +3812,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             }
             tokio::select! {
                 biased;
-                () = self.active_operations.wait_for_shutdown() => {
+                () = self.active_operations.wait_for_maintenance_stop() => {
                     return Err(Error::IndexClosed);
                 }
                 () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
@@ -3779,6 +3826,16 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     /// generation are detected and skipped without rewriting.
     pub(crate) fn schedule_vector_segment_upgrades(self: &Arc<Self>, segment_ids: Vec<String>) {
         if segment_ids.is_empty() || self.trained_for_segment_build().is_none() {
+            return;
+        }
+        if !self.active_operations.accepts_maintenance() {
+            // Search stays correct on flat vectors; the segment's next merge
+            // or vector rebuild encodes it against the trained generation.
+            log::warn!(
+                "[dense_vector_rewrite] index={} shutdown stopped maintenance; newly committed flat segment(s) {:?} stay flat until their next merge or vector rebuild",
+                self.schema.index_label(),
+                segment_ids,
+            );
             return;
         }
         let manager = Arc::clone(self);
@@ -4064,7 +4121,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         let reorder_gate = Arc::clone(&self.reorder_permits);
         let _reorder_permit = tokio::select! {
             biased;
-            () = self.active_operations.wait_for_shutdown() => {
+            () = self.active_operations.wait_for_maintenance_stop() => {
                 return Err(Error::IndexClosed);
             }
             permit = reorder_gate.acquire(ReorderPriority::Optimizer) => {
@@ -4141,7 +4198,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         run_bp,
                     )
                 }
-                None if !self.active_operations.is_accepting() => {
+                None if !self.active_operations.accepts_maintenance() => {
                     return Err(Error::IndexClosed);
                 }
                 None => {
@@ -4877,6 +4934,51 @@ mod tests {
             .await
             .expect("shutdown waiter missed the final guard notification")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_maintenance_cancels_merges_but_keeps_indexing_and_commits_admitted() {
+        let manager = lifecycle_test_manager();
+        let active = &manager.active_operations;
+        let merge = active
+            .try_register(vec!["source".into(), "output".into()])
+            .unwrap();
+        let merge_cancellation = active.cancellation_flag();
+        let commit_cancellation = active.shutdown_flag();
+
+        manager.stop_maintenance();
+        // In-flight merges observe cancellation at their next safe point.
+        assert!(merge_cancellation.load(Ordering::Acquire));
+        // The shutdown commit's visibility scan must not be cancelled.
+        assert!(!commit_cancellation.load(Ordering::Acquire));
+        // No new merge, reorder or compaction can claim segments...
+        assert!(active.try_register(vec!["other".into()]).is_none());
+        assert!(
+            active
+                .try_register_vector_update(vec!["vec".into()])
+                .is_none()
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            active.wait_for_maintenance_stop(),
+        )
+        .await
+        .expect("maintenance waiters must wake when shutdown stops maintenance");
+        manager.maybe_merge().await;
+        assert!(manager.merge_handles.lock().is_empty());
+        // ...but the final flush and commit visibility outputs still can.
+        let indexing = manager
+            .protect_new_segment(SegmentId::new().to_hex())
+            .expect("shutdown flush must still claim its output");
+
+        drop(merge);
+        drop(indexing);
+        manager.begin_shutdown();
+        assert!(commit_cancellation.load(Ordering::Acquire));
+        assert!(matches!(
+            manager.protect_new_segment(SegmentId::new().to_hex()),
+            Err(Error::IndexClosed)
+        ));
     }
 
     #[tokio::test]

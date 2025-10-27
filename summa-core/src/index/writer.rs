@@ -1879,6 +1879,32 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         self.prepare_commit().await?.commit().await
     }
 
+    /// Process-shutdown commit: publish every admitted document, then close
+    /// the writer to further admission.
+    ///
+    /// Optional maintenance stops first: no merge, reorder, compaction or
+    /// vector upgrade can start (including from this commit), and in-flight
+    /// ones stop at their next cancellation point while this commit runs.
+    /// Publication is exactly as durable as [`Self::commit`], including
+    /// upsert/delete visibility. The in-memory primary-key refresh is skipped
+    /// because nothing can be admitted afterwards; the next open folds the new
+    /// segments into dedup state. A `CommitFlushTimeout` may be retried. Call
+    /// [`Self::shutdown`] afterwards in every case.
+    pub async fn commit_for_shutdown(&mut self) -> Result<bool> {
+        self.segment_manager.stop_maintenance();
+        let schema = Arc::clone(&self.schema);
+        let flush_start = std::time::Instant::now();
+        let prepared = self.prepare_commit().await?;
+        log::info!(
+            "[shutdown_commit] index={} flushed admitted documents in {:.3}s",
+            schema.index_label(),
+            flush_start.elapsed().as_secs_f64()
+        );
+        let changed = prepared.commit_with_mode(CommitMode::Shutdown).await?;
+        self.signal_worker_shutdown();
+        Ok(changed)
+    }
+
     /// Commit admitted mutations, then physically remove deleted rows from
     /// the selected segment using a bounded scratch budget. Row addresses can
     /// change; primary keys remain stable.
@@ -2218,6 +2244,19 @@ struct OwnedCommitFinalization<D: DirectoryWriter + 'static> {
     finalization: Option<CommitFinalizationGuard<D>>,
     publication_observed: Arc<AtomicBool>,
     pk_reservations_retained: Arc<AtomicBool>,
+    mode: CommitMode,
+}
+
+/// What the writer does after a generation is published.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitMode {
+    /// Keep ingesting: refresh primary-key state, resume workers, and
+    /// re-evaluate merge policy.
+    Continue,
+    /// Process shutdown: the writer closes after publication, so the
+    /// in-memory primary-key refresh is skipped and workers stay paused.
+    /// The next open folds the published segments into dedup state.
+    Shutdown,
 }
 
 #[derive(Clone, Copy)]
@@ -2343,6 +2382,39 @@ fn write_pk_bloom_stream(
     writer.finish()
 }
 
+/// Commit phases scale with the published index, not with the admitted batch:
+/// upsert tombstones probe every committed segment and the primary-key refresh
+/// reloads each segment whose visibility changed. Slow phases are logged at
+/// info so a stalled commit or shutdown can be attributed from production logs.
+fn log_commit_phases(
+    schema: &Schema,
+    segments: usize,
+    delete_keys: usize,
+    publish: std::time::Duration,
+    primary_key_refresh: Option<std::time::Duration>,
+) {
+    let slow = std::time::Duration::from_secs(1);
+    let level = if publish + primary_key_refresh.unwrap_or_default() >= slow {
+        log::Level::Info
+    } else {
+        log::Level::Debug
+    };
+    let refresh = primary_key_refresh.map_or_else(
+        || "skipped".to_owned(),
+        |elapsed| format!("{:.3}s", elapsed.as_secs_f64()),
+    );
+    log::log!(
+        level,
+        "[commit] index={} published {} segment(s) and {} delete key(s) in {:.3}s; \
+         primary-key refresh {}",
+        schema.index_label(),
+        segments,
+        delete_keys,
+        publish.as_secs_f64(),
+        refresh,
+    );
+}
+
 async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     mut commit: OwnedCommitFinalization<D>,
 ) -> Result<bool> {
@@ -2357,6 +2429,8 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
         .read()
         .as_ref()
         .map_or_else(Vec::new, |pk| pk.pending_deletes());
+    let delete_keys = deletes.len();
+    let publish_start = std::time::Instant::now();
     commit
         .segment_manager
         .commit_with_deletes(
@@ -2365,6 +2439,7 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
             commit.prepared.staged_deletions(),
         )
         .await?;
+    let publish_elapsed = publish_start.elapsed();
     commit.publication_observed.store(true, Ordering::Release);
     if let Some(pk) = commit.primary_key_index.read().as_ref() {
         pk.mark_deletes_published();
@@ -2378,6 +2453,25 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     commit
         .segment_manager
         .schedule_vector_segment_upgrades(published_segment_ids);
+    if commit.mode == CommitMode::Shutdown {
+        // The writer closes after this commit, so no admission can consult
+        // the in-memory dedup state again. Keep the generation's reservations
+        // (fail-closed) instead of reloading every segment whose visibility
+        // changed; reopening rebuilds dedup state from published metadata.
+        commit
+            .pk_reservations_retained
+            .store(true, Ordering::Release);
+        log_commit_phases(
+            &commit.schema,
+            metadata_entries.len(),
+            delete_keys,
+            publish_elapsed,
+            None,
+        );
+        drop(commit.finalization.take());
+        return Ok(true);
+    }
+
     // Publication is irreversible. From here onward every exit path, including
     // panic unwind, must make the writer available again while PK reservations
     // remain fail-closed until refresh succeeds.
@@ -2391,7 +2485,8 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
     // retaining the generation's uncommitted keys may cause conservative
     // duplicate rejections, but can never admit a duplicate or turn a durable
     // commit into an API error.
-    match refresh_primary_key_snapshot(
+    let refresh_start = std::time::Instant::now();
+    let refresh = refresh_primary_key_snapshot(
         &commit.directory,
         &commit.schema,
         &commit.segment_manager,
@@ -2399,8 +2494,15 @@ async fn finalize_prepared_commit<D: DirectoryWriter + 'static>(
         &commit.primary_key_refresh_lock,
         PrimaryKeyRefresh::Commit,
     )
-    .await
-    {
+    .await;
+    log_commit_phases(
+        &commit.schema,
+        metadata_entries.len(),
+        delete_keys,
+        publish_elapsed,
+        Some(refresh_start.elapsed()),
+    );
+    match refresh {
         // A successful refresh folded every committed key into committed_data
         // and cleared the reservations — nothing retained anymore.
         Ok(()) => commit
@@ -2434,7 +2536,11 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
     /// Finalize: register segments in metadata, evaluate merge policy, resume workers.
     ///
     /// Returns `true` if new segments were committed, `false` if nothing changed.
-    pub async fn commit(mut self) -> Result<bool> {
+    pub async fn commit(self) -> Result<bool> {
+        self.commit_with_mode(CommitMode::Continue).await
+    }
+
+    async fn commit_with_mode(mut self, mode: CommitMode) -> Result<bool> {
         let segments = std::mem::take(&mut *self.writer.flushed_segments.lock());
 
         // Fast path: nothing to commit
@@ -2483,6 +2589,7 @@ impl<'a, D: DirectoryWriter + 'static> PreparedCommit<'a, D> {
             }),
             publication_observed: Arc::clone(&publication_observed),
             pk_reservations_retained: Arc::clone(&self.writer.pk_reservations_retained),
+            mode,
         };
 
         // From this point the owned value, not this cancel-sensitive guard,

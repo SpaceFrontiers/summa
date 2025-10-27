@@ -173,6 +173,13 @@ impl IndexRegistry {
         let mut managers = Vec::with_capacity(handles.len());
         let mut first_error = None;
 
+        // Cancel optional maintenance everywhere before the first (possibly
+        // long) commit, so merges and reorders of every index reach their
+        // cancellation points while admitted documents are published.
+        for handle in handles.values() {
+            handle.index.segment_manager().stop_maintenance();
+        }
+
         for (name, handle) in handles {
             let manager = Arc::clone(handle.index.segment_manager());
             let mut writer = handle.writer.write().await;
@@ -188,19 +195,30 @@ impl IndexRegistry {
                 );
                 first_error.get_or_insert_with(|| crate::error::summa_error_to_status(error));
             }
+            let writer_start = std::time::Instant::now();
             if let Err(error) = writer.shutdown().await
                 && first_error.is_none()
             {
                 first_error = Some(crate::error::summa_error_to_status(error));
             }
+            info!(
+                "[shutdown] index '{}' writer stopped in {:.3}s",
+                name,
+                writer_start.elapsed().as_secs_f64()
+            );
             drop(writer);
             drop(handle);
             managers.push((name, manager));
         }
 
         for (name, manager) in managers {
+            let drain_start = std::time::Instant::now();
             manager.wait_for_shutdown().await;
-            info!("[shutdown] index '{}' drained", name);
+            info!(
+                "[shutdown] index '{}' drained merges and lifecycle work in {:.3}s",
+                name,
+                drain_start.elapsed().as_secs_f64()
+            );
         }
 
         if let Some(service) = &self.payload_reads {
@@ -224,13 +242,16 @@ impl IndexRegistry {
         writer: &mut IndexWriter<MmapDirectory>,
     ) -> summa_core::Result<()> {
         let mut attempts = 0;
+        let started = std::time::Instant::now();
         loop {
             attempts += 1;
-            match writer.commit().await {
+            match writer.commit_for_shutdown().await {
                 Ok(changed) => {
                     info!(
-                        "[shutdown] index '{}' committed (changed={})",
-                        name, changed
+                        "[shutdown] index '{}' committed (changed={}) in {:.3}s",
+                        name,
+                        changed,
+                        started.elapsed().as_secs_f64()
                     );
                     return Ok(());
                 }
@@ -1125,6 +1146,120 @@ mod tests {
         reopened.shutdown().await.unwrap();
         drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Production evidence (2026-10-29): the social shard spent six silent
+    /// minutes inside its shutdown commit. A shutdown commit must publish the
+    /// admitted generation, including upsert tombstones in every older
+    /// segment, without starting merges from that commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn graceful_shutdown_publishes_upserts_without_scheduling_merges() {
+        const SEGMENTS: usize = 8;
+        const DOCS_PER_SEGMENT: usize = 2_000;
+        const UPSERTS_PER_SEGMENT: usize = 200;
+        let _ = env_logger::builder().is_test(true).try_init();
+        let root = tempfile::tempdir().unwrap();
+        // One more committed segment makes the tier eligible: the shutdown
+        // commit's own output is the segment that would trigger a merge.
+        let merge_policy = summa_core::merge::TieredMergePolicy {
+            segments_per_tier: SEGMENTS + 1,
+            max_merge_at_once: SEGMENTS + 1,
+            tier_floor: 1,
+            floor_segment_docs: 1,
+            ..Default::default()
+        };
+        let config = IndexConfig {
+            num_indexing_threads: 1,
+            merge_policy: Box::new(merge_policy),
+            ..Default::default()
+        };
+        let registry = IndexRegistry::new(root.path().into(), config);
+        let mut schema = summa_core::SchemaBuilder::default();
+        let id = schema.add_text_field("id", true, true);
+        schema.set_primary_key(id);
+        let body = schema.add_text_field("body", true, false);
+        registry
+            .create_index("social", schema.build())
+            .await
+            .unwrap();
+        {
+            let writer = registry.get_writer("social").await.unwrap();
+            let mut writer = writer.write().await;
+            for segment in 0..SEGMENTS {
+                for row in 0..DOCS_PER_SEGMENT {
+                    let mut doc = summa_core::Document::new();
+                    doc.add_text(id, format!("{segment}-{row}"));
+                    doc.add_text(body, format!("original {segment} {row}"));
+                    while let Err(error) = writer.add_document(doc.clone()) {
+                        assert!(matches!(error, summa_core::Error::QueueFull), "{error}");
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+                writer.commit().await.unwrap();
+            }
+            writer.wait_for_all_merges().await;
+            assert_eq!(
+                writer.segment_manager().get_segment_ids().await.len(),
+                SEGMENTS
+            );
+            // Admitted but uncommitted upserts reach every committed segment.
+            for segment in 0..SEGMENTS {
+                for row in 0..UPSERTS_PER_SEGMENT {
+                    let mut doc = summa_core::Document::new();
+                    doc.add_text(id, format!("{segment}-{row}"));
+                    doc.add_text(body, format!("replacement {segment} {row}"));
+                    while let Err(error) = writer.upsert_document(doc.clone()).await {
+                        assert!(matches!(error, summa_core::Error::QueueFull), "{error}");
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        }
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_secs(60), registry.shutdown())
+            .await
+            .expect("registry shutdown timed out")
+            .unwrap();
+        eprintln!(
+            "[test] shutdown with {} upserts over {} segments took {:.3?}",
+            SEGMENTS * UPSERTS_PER_SEGMENT,
+            SEGMENTS,
+            started.elapsed()
+        );
+        drop(registry);
+
+        let reopened = IndexRegistry::new(
+            root.path().into(),
+            IndexConfig {
+                num_indexing_threads: 1,
+                merge_policy: Box::new(summa_core::merge::NoMergePolicy),
+                ..Default::default()
+            },
+        );
+        let index = reopened.get_or_open_index("social").await.unwrap();
+        // Replacements are visible exactly once and the old rows are gone.
+        assert_eq!(
+            index.num_docs().await.unwrap(),
+            (SEGMENTS * DOCS_PER_SEGMENT) as u32
+        );
+        // The shutdown commit published one segment and started no merge.
+        assert_eq!(
+            index.segment_manager().get_segment_ids().await.len(),
+            SEGMENTS + 1
+        );
+        {
+            let writer = reopened.get_writer("social").await.unwrap();
+            let writer = writer.read().await;
+            let mut duplicate = summa_core::Document::new();
+            duplicate.add_text(id, "0-0");
+            assert!(matches!(
+                writer.add_document(duplicate),
+                Err(summa_core::Error::DuplicatePrimaryKey(_))
+            ));
+        }
+        drop(index);
+        reopened.shutdown().await.unwrap();
     }
 
     #[tokio::test]

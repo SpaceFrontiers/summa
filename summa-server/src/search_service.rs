@@ -801,6 +801,7 @@ impl SearchService for SearchServiceImpl {
             vector_stats,
             text_fields,
             candidate_scoring_version: 4,
+            binary_retrieval_version: 1,
             unprepared_candidate_fields: searcher
                 .segment_readers()
                 .iter()

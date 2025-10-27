@@ -788,7 +788,14 @@ pub fn convert_query_with_rarity(
                     config.byte_len()
                 ));
             }
-            let mut query = BinaryDenseVectorQuery::new(field, bv_query.vector.clone());
+            let retrieval = summa_core::query::BinaryRetrievalOptions {
+                nprobe: bv_query.nprobe as usize,
+                prefix_rerank: bv_query.prefix_rerank as usize,
+                max_ordinals_per_doc: bv_query.max_ordinals_per_doc as usize,
+            };
+            retrieval.validate_field(config)?;
+            let mut query = BinaryDenseVectorQuery::new(field, bv_query.vector.clone())
+                .with_retrieval_options(retrieval);
             let combiner = convert_combiner(
                 bv_query.combiner,
                 bv_query.combiner_temperature,
