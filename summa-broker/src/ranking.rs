@@ -2,9 +2,9 @@
 //! this module validates the wire contract and assembles global candidate lists.
 mod rrf;
 
-use crate::proto::summa as proto;
 use prost::Message;
 use std::collections::{BTreeMap, BTreeSet};
+use summa_broker::proto::summa as proto;
 use summa_core::query::{
     CandidateScores, MultiValueCombiner, PassageFeatures, RankingModel, ScoredPosition,
     SearchResult,

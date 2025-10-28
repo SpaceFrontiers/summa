@@ -138,13 +138,13 @@ silently.
 
 ### Manager metrics (`summa-k8s-manager`)
 
-Emitted by the operator (see [summa-k8s-manager.md](summa-k8s-manager.md)). Blocked
-and invalid passes leave workloads unchanged; the `SearchCluster` conditions
-carry the reason.
+Emitted by the operator (see [summa-k8s-manager.md](summa-k8s-manager.md)). Invalid
+passes leave workloads unchanged; the `SearchCluster` conditions carry the
+reason.
 
-| Metric                              | Type    | Labels   | Meaning                                                                                                                         |
-| ----------------------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `summa_k8s_manager_reconcile_total` | counter | `result` | reconcile passes: `ok`, `progressing` (applied, not yet ready), `blocked` (placement or shard removal held), `invalid`, `error` |
+| Metric                              | Type    | Labels   | Meaning                                                                                                 |
+| ----------------------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------- |
+| `summa_k8s_manager_reconcile_total` | counter | `result` | reconcile passes: `ok`, `progressing` (applied, not yet ready or index not created), `invalid`, `error` |
 
 ### Pre-existing indexes and `index="unknown"`
 

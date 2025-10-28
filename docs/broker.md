@@ -119,7 +119,9 @@ fields (`SearchHit.fields`) may re-serialize entries in a different order.
 Kubernetes mode watches **Pods** (not EndpointSlices — shard identity and
 role are pod labels, and the pod carries labels, IP, and readiness in one
 object) in `--namespace` with a label-existence selector on the shard label.
-Readiness = PodReady ∧ has IP ∧ not terminating; unready pods are visible in
+`--pod-selector` narrows the watch further (for example
+`summa.spacefrontiers.org/cluster=social`), so several brokers in one
+namespace each serve their own shards. Readiness = PodReady ∧ has IP ∧ not terminating; unready pods are visible in
 the admin surface but never routed or polled. summa-server serves
 `grpc.health.v1`: `NOT_SERVING` until every index in its data directory is
 open and its searcher built (every segment reader opened and its hot metadata
@@ -261,10 +263,11 @@ oplog: a follower that diverges beyond the client's retry horizon is rebuilt.
 - Admin: `summa.broker.BrokerService` — `GetTopology` (per-replica live
   `num_docs`/`num_segments`, for migration verification), `GetBackends`,
   `RefreshTopology`.
-- Deployment: [summa-k8s-manager](summa-k8s-manager.md) renders the broker's
-  `--placement` arguments from a `SearchCluster` resource and refuses rule
-  changes that reroute a live index. The rule syntax lives in the broker's
-  library (`summa_broker::placement_rules`), shared by both.
+- Deployment: [summa-k8s-manager](summa-k8s-manager.md) runs one broker per
+  index (`SearchCluster`), narrowed to that cluster's shards with
+  `--pod-selector` and serving the cluster's single placement rule. The rule
+  syntax lives in the broker's library (`summa_broker::placement_rules`),
+  shared by both.
 - Metrics: `summa_broker_*`, documented in [metrics.md](metrics.md).
 - Shutdown mirrors summa-server: SIGTERM → refuse new RPCs with
   `UNAVAILABLE("Summa broker is shutting down")`, drain, stop. summa-server

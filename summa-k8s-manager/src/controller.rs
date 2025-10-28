@@ -1,11 +1,9 @@
-//! Operator: reconciles each `SearchCluster` into shard replica Deployments,
-//! the broker Deployment and the broker Service.
+//! Operator: reconciles each `SearchCluster` into its shard Deployments,
+//! broker Deployment and Service, then creates the index.
 //!
-//! Order per pass: validate, prune replicas no longer in the spec (removed
-//! shards only when the broker confirms they are empty), apply replicas (a
-//! new one waits until no pod on its node holds its directories), apply the
-//! broker (a placement change waits until it reroutes no live index), and
-//! write status.
+//! One pass: validate; apply the workloads (a new shard waits until no pod
+//! holds its directories); once every shard and the broker serve, create the
+//! index or confirm it exists; write status.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -20,46 +18,90 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use k8s_openapi::chrono::Utc;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
-use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use log::{info, warn};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 
-use crate::broker::{BrokerClient, LiveIndex};
-use crate::crd::{BrokerStatus, ReplicaStatus, SearchCluster, SearchClusterStatus, ShardStatus};
+use crate::broker;
+use crate::crd::{BrokerStatus, SearchCluster, SearchClusterStatus, ShardSpec, ShardStatus};
 use crate::render::{
-    CLUSTER_LABEL, COMPONENT_LABEL, MANAGED_BY_LABEL, MANAGER, ReplicaWorkload, SHARD_LABEL,
-    broker_address, broker_deployment, broker_name, broker_service, placement_args,
-    placement_values, shard_workloads,
+    CLUSTER_LABEL, COMPONENT_LABEL, MANAGER, Owner, broker_deployment, broker_name, broker_service,
+    index_name, routing, shard_deployment, shard_name, shard_paths,
 };
-use crate::safety::{self, parse_rules};
-use crate::validate::{normalize_path, paths_overlap, validate};
+use crate::validate::{HostPath, host_paths, normalize_path, paths_overlap, validate};
 
 const SETTLED_REQUEUE: Duration = Duration::from_secs(300);
-const PENDING_REQUEUE: Duration = Duration::from_secs(30);
-const BLOCKED_REQUEUE: Duration = Duration::from_secs(60);
+const PENDING_REQUEUE: Duration = Duration::from_secs(10);
+const ERROR_REQUEUE: Duration = Duration::from_secs(30);
+
+const READY: &str = "Ready";
+const INDEX_CREATED: &str = "IndexCreated";
+/// `IndexCreated` reasons under which the index may exist on some shard, so
+/// its routing must not change.
+const PINNING_REASONS: &[&str] = &["Exists", "Creating", "PartiallyCreated"];
 
 pub struct Context {
     pub client: Client,
-    /// Broker address override (local development); default is the
-    /// cluster's broker Service.
-    pub broker_override: Option<String>,
+    pub namespace: String,
+    /// Broker address of a cluster; `{cluster}` and `{namespace}` are
+    /// replaced (`--broker-endpoint`).
+    pub broker_endpoint: String,
 }
 
 impl Context {
-    pub fn broker(
+    pub fn broker(&self, cluster: &str) -> String {
+        broker::endpoint(&self.broker_endpoint, cluster, &self.namespace)
+    }
+
+    pub fn clusters(&self) -> Api<SearchCluster> {
+        self.api()
+    }
+
+    fn api<K: Resource<Scope = k8s_openapi::NamespaceResourceScope>>(&self) -> Api<K>
+    where
+        K::DynamicType: Default,
+    {
+        Api::namespaced(self.client.clone(), &self.namespace)
+    }
+
+    /// Directories claimed by clusters created before `cluster` (all others
+    /// when it does not exist yet): on an overlap the older cluster keeps
+    /// running and the newer one is invalid.
+    pub async fn claimed_paths(
         &self,
         cluster: &str,
-        namespace: &str,
-        spec: &crate::crd::SearchClusterSpec,
-    ) -> BrokerClient {
-        BrokerClient::new(
-            self.broker_override
-                .clone()
-                .unwrap_or_else(|| broker_address(cluster, namespace, spec)),
-        )
+        created: Option<&Time>,
+    ) -> kube::Result<Vec<HostPath>> {
+        let key = |time: Option<&Time>, name: String| (time.map(|t| t.0), name);
+        let own = created.map(|time| key(Some(time), cluster.to_string()));
+        Ok(self
+            .clusters()
+            .list(&ListParams::default())
+            .await?
+            .items
+            .iter()
+            .filter(|other| other.name_any() != cluster)
+            .filter(|other| {
+                own.as_ref().is_none_or(|own| {
+                    &key(other.creation_timestamp().as_ref(), other.name_any()) < own
+                })
+            })
+            .flat_map(|other| host_paths(&other.name_any(), &other.spec))
+            .collect())
     }
+}
+
+/// Routing fixed because the index may exist on some shard.
+pub fn pinned_routing(cluster: &SearchCluster) -> Option<&str> {
+    let status = cluster.status.as_ref()?;
+    let pinned = status
+        .conditions
+        .iter()
+        .any(|c| c.type_ == INDEX_CREATED && PINNING_REASONS.contains(&c.reason.as_str()));
+    pinned.then_some(status.routing.as_deref()).flatten()
 }
 
 #[derive(Debug)]
@@ -73,29 +115,16 @@ impl fmt::Display for ReconcileError {
 
 impl std::error::Error for ReconcileError {}
 
-impl From<anyhow::Error> for ReconcileError {
-    fn from(error: anyhow::Error) -> Self {
-        Self(error)
-    }
-}
-
 impl From<kube::Error> for ReconcileError {
     fn from(error: kube::Error) -> Self {
         Self(error.into())
     }
 }
 
-pub async fn run(ctx: Arc<Context>, namespace: String) {
-    let client = ctx.client.clone();
-    let clusters: Api<SearchCluster> = Api::namespaced(client.clone(), &namespace);
-    let deployments: Api<Deployment> = Api::namespaced(client, &namespace);
-    let managed = watcher::Config::default().labels(&format!("{MANAGED_BY_LABEL}={MANAGER}"));
-    Controller::new(clusters, watcher::Config::default())
-        .watches(deployments, managed, move |deployment| {
-            let cluster = deployment.labels().get(CLUSTER_LABEL)?.clone();
-            let namespace = deployment.namespace()?;
-            Some(ObjectRef::<SearchCluster>::new(&cluster).within(&namespace))
-        })
+pub async fn run(ctx: Arc<Context>) {
+    Controller::new(ctx.clusters(), watcher::Config::default())
+        .owns(ctx.api::<Deployment>(), watcher::Config::default())
+        .owns(ctx.api::<Service>(), watcher::Config::default())
         .shutdown_on_signal()
         .run(reconcile, error_policy, ctx)
         .for_each(|result| async move {
@@ -106,42 +135,34 @@ pub async fn run(ctx: Arc<Context>, namespace: String) {
         .await;
 }
 
-fn error_policy(cluster: Arc<SearchCluster>, error: &ReconcileError, _ctx: Arc<Context>) -> Action {
+fn error_policy(cluster: Arc<SearchCluster>, error: &ReconcileError, _: Arc<Context>) -> Action {
     warn!("SearchCluster {}: {error}", cluster.name_any());
-    metrics::counter!("summa_k8s_manager_reconcile_total", "result" => "error").increment(1);
-    Action::requeue(PENDING_REQUEUE)
+    count("error");
+    Action::requeue(ERROR_REQUEUE)
 }
 
-/// Condition outcomes of one pass.
-struct Outcome {
-    ready: Result<(), (String, String)>,
-    placement: Result<(), String>,
-    pruned: Result<(), String>,
+fn count(result: &'static str) {
+    metrics::counter!("summa_k8s_manager_reconcile_total", "result" => result).increment(1);
 }
+
+type Failure = (&'static str, String);
 
 async fn reconcile(
     cluster: Arc<SearchCluster>,
     ctx: Arc<Context>,
 ) -> Result<Action, ReconcileError> {
-    let namespace = cluster.namespace().context("SearchCluster is namespaced")?;
-    let name = cluster.name_any();
-    let client = ctx.client.clone();
-    let clusters: Api<SearchCluster> = Api::namespaced(client.clone(), &namespace);
-
-    // The broker discovers every shard pod in the namespace, so a second
-    // cluster there would route to the first one's shards.
-    let all = clusters.list(&ListParams::default()).await?;
-    if let Some(owner) = namespace_owner(&all.items)
-        && owner != name
-    {
-        let message = format!("namespace {namespace} is managed by SearchCluster {owner}");
-        write_invalid(&clusters, &cluster, "NamespaceTaken", &message).await?;
-        metrics::counter!("summa_k8s_manager_reconcile_total", "result" => "invalid").increment(1);
-        return Ok(Action::requeue(SETTLED_REQUEUE));
+    if cluster.metadata.deletion_timestamp.is_some() {
+        return Ok(Action::await_change());
     }
-
+    let name = cluster.name_any();
     let spec = &cluster.spec;
-    let errors = validate(&name, spec);
+    let mut status = cluster.status.clone().unwrap_or_default();
+    status.observed_generation = cluster.metadata.generation;
+    let pinned = pinned_routing(&cluster).map(str::to_string);
+    let claimed = ctx
+        .claimed_paths(&name, cluster.creation_timestamp().as_ref())
+        .await?;
+    let errors = validate(&name, spec, pinned.as_deref(), &claimed);
     if !errors.is_empty() {
         let message = errors
             .iter()
@@ -149,355 +170,351 @@ async fn reconcile(
             .collect::<Vec<_>>()
             .join("; ");
         warn!("SearchCluster {name} is invalid, nothing changed: {message}");
-        write_invalid(&clusters, &cluster, "Invalid", &message).await?;
-        metrics::counter!("summa_k8s_manager_reconcile_total", "result" => "invalid").increment(1);
+        set_condition(&mut status, &cluster, READY, Err(("Invalid", message)));
+        write_status(&ctx, &cluster, status).await?;
+        count("invalid");
         return Ok(Action::requeue(SETTLED_REQUEUE));
     }
 
-    let deployments: Api<Deployment> = Api::namespaced(client.clone(), &namespace);
-    let services: Api<Service> = Api::namespaced(client.clone(), &namespace);
-    let pods: Api<Pod> = Api::namespaced(client, &namespace);
-    let apply = PatchParams::apply(MANAGER).force();
-    let broker = ctx.broker(&name, &namespace, spec);
-    let workloads = shard_workloads(&name, &namespace, spec);
-
-    let pruned = prune_replicas(&deployments, &broker, &name, spec, &workloads).await?;
-
-    let pod_list = pods.list(&ListParams::default()).await?.items;
-    let mut live = Vec::with_capacity(workloads.len());
-    for workload in &workloads {
-        live.push(deployments.get_opt(&workload.name).await?);
-    }
-    // A spec change restarts a shard (Recreate) and reopens every index on
-    // it. Restart one shard at a time: hold changes while another shard is
-    // not ready, so a shared image or argument change never takes every
-    // partition down together.
-    let mut restarting: Option<String> = workloads
-        .iter()
-        .zip(&live)
-        .find(|(_, deployment)| deployment.as_ref().is_some_and(|d| !deployment_ready(d)))
-        .map(|(workload, _)| workload.name.clone());
-    let mut waiting = Vec::new();
-    for (workload, existing) in workloads.iter().zip(&live) {
-        let patch = Patch::Apply(&workload.deployment);
-        match existing {
-            None => {
-                if let Some(conflict) = host_path_conflict(&pod_list, workload) {
-                    waiting.push(conflict);
-                    continue;
-                }
-            }
-            Some(existing) => {
-                let preview = deployments
-                    .patch(&workload.name, &apply.clone().dry_run(), &patch)
-                    .await
-                    .with_context(|| format!("dry-run apply Deployment {}", workload.name))?;
-                let restarts = preview.metadata.generation != existing.metadata.generation;
-                match &restarting {
-                    Some(other) if restarts && other != &workload.name => {
-                        waiting.push(format!(
-                            "{} waits for {other} to become ready before restarting",
-                            workload.name
-                        ));
-                        continue;
-                    }
-                    None if restarts => restarting = Some(workload.name.clone()),
-                    _ => {}
-                }
-            }
+    let rule = pinned.unwrap_or_else(|| routing(&name, spec).to_string());
+    status.routing = Some(rule.clone());
+    let workloads = match apply_workloads(&ctx, &cluster, &rule).await {
+        Ok(workloads) => workloads,
+        Err(error) => {
+            let message = format!("{error:#}");
+            warn!("SearchCluster {name}: {message}");
+            set_condition(&mut status, &cluster, READY, Err(("ApplyFailed", message)));
+            write_status(&ctx, &cluster, status).await?;
+            count("error");
+            return Ok(Action::requeue(ERROR_REQUEUE));
         }
-        deployments
-            .patch(&workload.name, &apply, &patch)
-            .await
-            .with_context(|| format!("apply Deployment {}", workload.name))?;
+    };
+    status.shards = workloads.shards.clone();
+    status.broker = Some(BrokerStatus {
+        ready_replicas: workloads.broker_ready_replicas,
+    });
+
+    let serving = workloads.serving();
+    if serving {
+        let index = check_index(&ctx, &cluster, &mut status).await?;
+        set_condition(&mut status, &cluster, INDEX_CREATED, index);
+    } else if !status.conditions.iter().any(|c| c.type_ == INDEX_CREATED) {
+        // Keep an earlier result while shards restart: it may pin the routing.
+        set_condition(
+            &mut status,
+            &cluster,
+            INDEX_CREATED,
+            Err((
+                "Pending",
+                "checked once every shard and the broker serve".into(),
+            )),
+        );
     }
-
-    let broker_deployment_name = broker_name(&name, spec);
-    services
-        .patch(
-            &broker_deployment_name,
-            &apply,
-            &Patch::Apply(&broker_service(&name, &namespace, spec)),
-        )
-        .await
-        .with_context(|| format!("apply Service {broker_deployment_name}"))?;
-    let existing_broker = deployments.get_opt(&broker_deployment_name).await?;
-    let running_placement = existing_broker.as_ref().map(container_placement);
-    let desired_placement = placement_args(spec);
-    let placement = match &running_placement {
-        Some(running) if running != &desired_placement => {
-            placement_gate(&broker, running, spec).await
-        }
-        _ => Ok(()),
+    let ready = ready_outcome(&name, spec.shards.as_slice(), &workloads, &status);
+    let settled = match &ready {
+        Ok(_) => true,
+        Err((reason, _)) => ["Suspended", "MissingSchema", "PartiallyCreated"].contains(reason),
     };
-    let applied_placement = if placement.is_ok() {
-        deployments
-            .patch(
-                &broker_deployment_name,
-                &apply,
-                &Patch::Apply(&broker_deployment(&name, &namespace, spec)),
-            )
-            .await
-            .with_context(|| format!("apply Deployment {broker_deployment_name}"))?;
-        desired_placement
-    } else {
-        running_placement.unwrap_or_default()
-    };
-
-    // Status from the Deployments as they are now.
-    let mut shard_statuses: Vec<ShardStatus> = Vec::new();
-    let mut not_ready = Vec::new();
-    for workload in &workloads {
-        let deployment = deployments.get_opt(&workload.name).await?;
-        let message = waiting
-            .iter()
-            .find(|w| w.starts_with(&format!("{} ", workload.name)))
-            .cloned();
-        let ready = deployment.as_ref().is_some_and(deployment_ready);
-        if !ready {
-            not_ready.push(workload.name.clone());
-        }
-        let replica = ReplicaStatus {
-            name: workload.name.clone(),
-            node: workload.node.clone(),
-            ready,
-            message,
-        };
-        match shard_statuses
-            .iter_mut()
-            .find(|s| s.id == workload.shard_id)
-        {
-            Some(status) => status.replicas.push(replica),
-            None => shard_statuses.push(ShardStatus {
-                id: workload.shard_id.clone(),
-                replicas: vec![replica],
-            }),
-        }
-    }
-    let broker_deployment = deployments.get_opt(&broker_deployment_name).await?;
-    let broker_ready = broker_deployment
-        .as_ref()
-        .and_then(|d| d.status.as_ref())
-        .and_then(|s| s.ready_replicas)
-        .unwrap_or(0);
-    if broker_deployment
-        .as_ref()
-        .is_none_or(|d| !deployment_ready(d))
-    {
-        not_ready.push(broker_deployment_name.clone());
-    }
-
-    let ready = if !waiting.is_empty() {
-        Err(("Waiting".to_string(), waiting.join("; ")))
-    } else if let Err(message) = &placement {
-        Err(("PlacementBlocked".to_string(), message.clone()))
-    } else if let Err(message) = &pruned {
-        Err(("ShardRemovalBlocked".to_string(), message.clone()))
-    } else if !not_ready.is_empty() {
-        Err((
-            "Progressing".to_string(),
-            format!("not ready: {}", not_ready.join(", ")),
-        ))
-    } else {
-        Ok(())
-    };
-    let settled = ready.is_ok();
-    let blocked = placement.is_err() || pruned.is_err();
-    let outcome = Outcome {
-        ready,
-        placement,
-        pruned,
-    };
-    let status = SearchClusterStatus {
-        observed_generation: cluster.metadata.generation,
-        shards: shard_statuses,
-        broker: Some(BrokerStatus {
-            name: broker_deployment_name,
-            replicas: spec.broker.replicas,
-            ready_replicas: broker_ready,
-        }),
-        placement: applied_placement,
-        conditions: conditions(&cluster, outcome),
-    };
-    clusters
-        .patch_status(
-            &name,
-            &PatchParams::default(),
-            &Patch::Merge(json!({ "status": status })),
-        )
-        .await
-        .context("write SearchCluster status")?;
-
-    let result = if settled {
-        "ok"
-    } else if blocked {
-        "blocked"
-    } else {
-        "progressing"
-    };
-    metrics::counter!("summa_k8s_manager_reconcile_total", "result" => result).increment(1);
+    set_condition(&mut status, &cluster, READY, ready);
+    write_status(&ctx, &cluster, status).await?;
+    count(if settled { "ok" } else { "progressing" });
     Ok(Action::requeue(if settled {
         SETTLED_REQUEUE
-    } else if blocked {
-        BLOCKED_REQUEUE
     } else {
         PENDING_REQUEUE
     }))
 }
 
-/// Oldest `SearchCluster` in the namespace (name breaks ties).
-pub fn namespace_owner(clusters: &[SearchCluster]) -> Option<String> {
-    clusters
-        .iter()
-        .min_by_key(|c| {
-            (
-                c.metadata.creation_timestamp.clone().map(|t| t.0),
-                c.name_any(),
-            )
-        })
-        .map(ResourceExt::name_any)
+/// Shards and broker as applied in this pass.
+struct Workloads {
+    shards: Vec<ShardStatus>,
+    broker_ready_replicas: i32,
+    broker_ready: bool,
 }
 
-/// Delete replica Deployments that left the spec. A replica whose shard id
-/// stays (rename or move) goes immediately; a removed shard goes only when
-/// the broker shows it hosts no index.
-async fn prune_replicas(
-    deployments: &Api<Deployment>,
-    broker: &BrokerClient,
-    cluster: &str,
-    spec: &crate::crd::SearchClusterSpec,
-    workloads: &[ReplicaWorkload],
-) -> anyhow::Result<Result<(), String>> {
-    let selector =
-        format!("{MANAGED_BY_LABEL}={MANAGER},{CLUSTER_LABEL}={cluster},{COMPONENT_LABEL}=server");
-    let managed = deployments
-        .list(&ListParams::default().labels(&selector))
-        .await?;
-    let desired: BTreeSet<&str> = workloads.iter().map(|w| w.name.as_str()).collect();
-    let shard_ids: BTreeSet<&str> = spec.shards.iter().map(|s| s.id.as_str()).collect();
-    let stale: Vec<(String, String)> = managed
-        .items
-        .iter()
-        .filter(|d| !desired.contains(d.name_any().as_str()))
-        .map(|d| {
-            (
-                d.name_any(),
-                d.labels().get(SHARD_LABEL).cloned().unwrap_or_default(),
-            )
-        })
-        .collect();
-    let removed: Vec<String> = stale
-        .iter()
-        .map(|(_, shard)| shard.clone())
-        .filter(|shard| !shard_ids.contains(shard.as_str()))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let removals = if removed.is_empty() {
-        Vec::new()
-    } else {
-        match broker.backends().await {
-            Ok(backends) => safety::shard_removals(&backends, &removed),
-            Err(error) => removed
-                .iter()
-                .map(|shard| safety::ShardRemoval {
-                    shard: shard.clone(),
-                    indexes: Vec::new(),
-                    blocked: Some(format!("cannot confirm shard {shard} is empty: {error:#}")),
-                })
-                .collect(),
-        }
+impl Workloads {
+    fn serving(&self) -> bool {
+        self.broker_ready && self.shards.iter().all(|s| s.ready)
+    }
+}
+
+async fn apply_workloads(
+    ctx: &Context,
+    cluster: &SearchCluster,
+    rule: &str,
+) -> anyhow::Result<Workloads> {
+    let name = cluster.name_any();
+    let spec = &cluster.spec;
+    let owner = Owner {
+        cluster: &name,
+        namespace: &ctx.namespace,
+        reference: cluster
+            .controller_owner_ref(&())
+            .context("SearchCluster has a name and uid")?,
     };
-    let mut blocked = Vec::new();
-    for (deployment, shard) in &stale {
-        if let Some(reason) = removals
-            .iter()
-            .find(|r| &r.shard == shard)
-            .and_then(|r| r.blocked.clone())
+    let deployments = ctx.api::<Deployment>();
+    if pinned_routing(cluster).is_none() {
+        prune_shards(&deployments, &name, spec.shards.len()).await?;
+    }
+    let mut shards = Vec::with_capacity(spec.shards.len());
+    for (i, shard) in spec.shards.iter().enumerate() {
+        let shard_name = shard_name(&name, i);
+        let existing = deployments.get_opt(&shard_name).await?;
+        if existing.is_none()
+            && let Some(conflict) = host_path_conflict(ctx, shard).await?
         {
-            blocked.push(format!("kept {deployment}: {reason}"));
+            shards.push(ShardStatus {
+                ready: false,
+                message: Some(conflict),
+            });
             continue;
         }
-        info!(
-            "deleting Deployment {deployment} (shard {shard}) removed from SearchCluster {cluster}"
-        );
-        deployments
-            .delete(deployment, &DeleteParams::default())
-            .await
-            .with_context(|| format!("delete Deployment {deployment}"))?;
+        let applied = apply_owned(
+            &deployments,
+            &owner,
+            existing,
+            &shard_deployment(&owner, spec, i),
+        )
+        .await?;
+        shards.push(ShardStatus {
+            ready: deployment_ready(&applied),
+            message: shard.suspended.then(|| "suspended".to_string()),
+        });
     }
-    Ok(if blocked.is_empty() {
-        Ok(())
-    } else {
-        Err(blocked.join("; "))
+    let services = ctx.api::<Service>();
+    let existing = services.get_opt(&name).await?;
+    apply_owned(&services, &owner, existing, &broker_service(&owner)).await?;
+    let broker = broker_name(&name);
+    let existing = deployments.get_opt(&broker).await?;
+    let broker = apply_owned(
+        &deployments,
+        &owner,
+        existing,
+        &broker_deployment(&owner, spec, rule),
+    )
+    .await?;
+    Ok(Workloads {
+        shards,
+        broker_ready_replicas: broker
+            .status
+            .as_ref()
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0),
+        broker_ready: deployment_ready(&broker),
     })
 }
 
-/// A pod on the workload's node that mounts one of its directories (for
-/// example the terminating pod of the replica's previous Deployment).
-fn host_path_conflict(pods: &[Pod], workload: &ReplicaWorkload) -> Option<String> {
-    let wanted = [
-        normalize_path(&workload.data_path),
-        normalize_path(&workload.cache_path),
-    ];
-    pods.iter().find_map(|pod| {
-        let spec = pod.spec.as_ref()?;
-        if spec.node_name.as_deref() != Some(workload.node.as_str()) {
-            return None;
+/// Server-side apply, refusing an existing object this cluster does not
+/// control (for example a hand-written Service of the same name).
+async fn apply_owned<K>(
+    api: &Api<K>,
+    owner: &Owner<'_>,
+    existing: Option<K>,
+    desired: &K,
+) -> anyhow::Result<K>
+where
+    K: Resource + Clone + Serialize + DeserializeOwned + fmt::Debug,
+    K::DynamicType: Default,
+{
+    let name = desired.meta().name.clone().unwrap_or_default();
+    if let Some(existing) = existing
+        && !existing
+            .owner_references()
+            .iter()
+            .any(|r| r.uid == owner.reference.uid && r.controller == Some(true))
+    {
+        anyhow::bail!(
+            "{} {name} exists and is not owned by SearchCluster {}; delete or rename it",
+            K::kind(&K::DynamicType::default()),
+            owner.cluster
+        );
+    }
+    api.patch(
+        &name,
+        &PatchParams::apply(MANAGER).force(),
+        &Patch::Apply(desired),
+    )
+    .await
+    .with_context(|| format!("apply {name}"))
+}
+
+/// Delete shard Deployments past the spec's shard count. Only runs while
+/// the routing is not pinned, before any shard may host the index.
+async fn prune_shards(
+    deployments: &Api<Deployment>,
+    cluster: &str,
+    count: usize,
+) -> kube::Result<()> {
+    let selector = format!("{CLUSTER_LABEL}={cluster},{COMPONENT_LABEL}=shard");
+    let wanted: BTreeSet<String> = (0..count).map(|i| shard_name(cluster, i)).collect();
+    for deployment in deployments
+        .list(&ListParams::default().labels(&selector))
+        .await?
+    {
+        let name = deployment.name_any();
+        if !wanted.contains(&name) {
+            info!("deleting {name}: shard removed from SearchCluster {cluster}");
+            deployments.delete(&name, &DeleteParams::default()).await?;
         }
-        spec.volumes.iter().flatten().find_map(|volume| {
-            let path = normalize_path(&volume.host_path.as_ref()?.path);
-            wanted.iter().any(|w| paths_overlap(w, &path)).then(|| {
-                format!(
-                    "{} waits for pod {} to release {path} on {}",
-                    workload.name,
-                    pod.name_any(),
-                    workload.node
-                )
+    }
+    Ok(())
+}
+
+/// A running pod on the shard's node that mounts one of its directories,
+/// for example the terminating pod of a replaced Deployment.
+async fn host_path_conflict(ctx: &Context, shard: &ShardSpec) -> kube::Result<Option<String>> {
+    let on_node = ListParams::default().fields(&format!("spec.nodeName={}", shard.node));
+    let pods = ctx.api::<Pod>().list(&on_node).await?.items;
+    Ok(conflicting_pod(&pods, shard))
+}
+
+fn conflicting_pod(pods: &[Pod], shard: &ShardSpec) -> Option<String> {
+    let wanted = shard_paths(shard).map(|path| normalize_path(&path));
+    pods.iter()
+        .filter(|pod| {
+            // Finished pods (evicted, completed copy jobs) hold no mounts.
+            let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+            !matches!(phase, Some("Succeeded" | "Failed"))
+        })
+        .find_map(|pod| {
+            let spec = pod.spec.as_ref()?;
+            if spec.node_name.as_deref() != Some(shard.node.as_str()) {
+                return None;
+            }
+            spec.volumes.iter().flatten().find_map(|volume| {
+                let path = normalize_path(&volume.host_path.as_ref()?.path);
+                wanted.iter().any(|w| paths_overlap(w, &path)).then(|| {
+                    format!(
+                        "waits for pod {} to release {path} on {}",
+                        pod.name_any(),
+                        shard.node
+                    )
+                })
             })
         })
-    })
 }
 
-/// `--placement` values of the broker container.
-pub fn container_placement(deployment: &Deployment) -> Vec<String> {
-    deployment
-        .spec
-        .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .and_then(|s| s.containers.first())
-        .and_then(|c| c.args.as_ref())
-        .map(|args| placement_values(args))
-        .unwrap_or_default()
+/// What the index needs, from how many shards host it.
+#[derive(Debug, PartialEq, Eq)]
+enum IndexDecision {
+    Exists,
+    Create,
+    MissingSchema,
+    Partial(usize),
 }
 
-/// `Err(reason)` when switching the running broker to the spec's rules would
-/// reroute a live index, or when that cannot be checked.
-pub async fn placement_gate(
-    broker: &BrokerClient,
-    running: &[String],
-    spec: &crate::crd::SearchClusterSpec,
-) -> Result<(), String> {
-    let current = parse_rules(running)
-        .map_err(|e| format!("running broker placement does not parse: {e:#}"))?;
-    let proposed = parse_rules(&placement_args(spec))
-        .map_err(|e| format!("spec placement does not parse: {e:#}"))?;
-    let topology = broker
-        .topology()
-        .await
-        .map_err(|e| format!("cannot verify live indexes before changing placement: {e:#}"))?;
-    let live: Vec<LiveIndex> = topology.iter().map(LiveIndex::from).collect();
-    let blocked: Vec<String> = safety::placement_changes(&live, &current, &proposed)
-        .into_iter()
-        .filter_map(|change| change.blocked)
-        .collect();
-    if blocked.is_empty() {
-        Ok(())
-    } else {
-        Err(blocked.join("; "))
+fn decide_index(hosting: usize, shards: usize, has_schema: bool) -> IndexDecision {
+    match hosting {
+        n if n == shards => IndexDecision::Exists,
+        0 if has_schema => IndexDecision::Create,
+        0 => IndexDecision::MissingSchema,
+        n => IndexDecision::Partial(n),
     }
 }
 
+/// Create the index when no shard has it. The routing is pinned in status
+/// before `CreateIndex` so it can never change under a created partition.
+async fn check_index(
+    ctx: &Context,
+    cluster: &SearchCluster,
+    status: &mut SearchClusterStatus,
+) -> Result<Result<&'static str, Failure>, ReconcileError> {
+    let name = cluster.name_any();
+    let index = index_name(&name);
+    let address = ctx.broker(&name);
+    let shards = cluster.spec.shards.len();
+    let hosting = match broker::index_shards(&address, &index).await {
+        Ok(hosting) => hosting.len(),
+        Err(error) => return Ok(Err(("BrokerUnavailable", format!("{error:#}")))),
+    };
+    Ok(
+        match decide_index(hosting, shards, cluster.spec.schema.is_some()) {
+            IndexDecision::Exists => Ok("Exists"),
+            IndexDecision::MissingSchema => Err((
+                "MissingSchema",
+                format!("index {index} does not exist and spec.schema is empty"),
+            )),
+            IndexDecision::Partial(n) => Err((
+                "PartiallyCreated",
+                format!(
+                    "{n} of {shards} shards host {index}; reads and writes fail until every shard has it"
+                ),
+            )),
+            IndexDecision::Create => {
+                set_condition(
+                    status,
+                    cluster,
+                    INDEX_CREATED,
+                    Err(("Creating", format!("creating {index} through {address}"))),
+                );
+                write_status(ctx, cluster, status.clone()).await?;
+                info!("creating index {index} through {address}");
+                let schema = cluster.spec.schema.as_deref().unwrap_or_default();
+                match broker::create_index(&address, &index, schema).await {
+                    Ok(()) => Err((
+                        "Creating",
+                        format!("created {index}; waiting for every shard to report it"),
+                    )),
+                    Err(error) => Err(("Creating", format!("{error:#}"))),
+                }
+            }
+        },
+    )
+}
+
+fn ready_outcome(
+    cluster: &str,
+    shards: &[ShardSpec],
+    workloads: &Workloads,
+    status: &SearchClusterStatus,
+) -> Result<&'static str, Failure> {
+    let waiting: Vec<&str> = workloads
+        .shards
+        .iter()
+        .filter(|s| !s.ready)
+        .filter_map(|s| s.message.as_deref())
+        .filter(|m| m.starts_with("waits"))
+        .collect();
+    if !waiting.is_empty() {
+        return Err(("Waiting", waiting.join("; ")));
+    }
+    let suspended: Vec<String> = (0..shards.len())
+        .filter(|&i| shards[i].suspended)
+        .map(|i| shard_name(cluster, i))
+        .collect();
+    if !suspended.is_empty() {
+        return Err(("Suspended", format!("suspended: {}", suspended.join(", "))));
+    }
+    if !workloads.serving() {
+        let not_ready: Vec<String> = workloads
+            .shards
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| !s.ready)
+            .map(|(i, _)| shard_name(cluster, i))
+            .chain((!workloads.broker_ready).then(|| broker_name(cluster)))
+            .collect();
+        return Err((
+            "Progressing",
+            format!("not ready: {}", not_ready.join(", ")),
+        ));
+    }
+    match status.conditions.iter().find(|c| c.type_ == INDEX_CREATED) {
+        Some(c) if c.status == "True" => Ok("Reconciled"),
+        Some(c) => Err((
+            PINNING_REASONS
+                .iter()
+                .chain(&["MissingSchema", "BrokerUnavailable", "Pending"])
+                .find(|r| **r == c.reason)
+                .copied()
+                .unwrap_or("Progressing"),
+            c.message.clone(),
+        )),
+        None => Err(("Progressing", String::new())),
+    }
+}
+
+/// Every replica runs the current template and is ready.
 fn deployment_ready(deployment: &Deployment) -> bool {
     let Some(status) = &deployment.status else {
         return false;
@@ -507,128 +524,113 @@ fn deployment_ready(deployment: &Deployment) -> bool {
         .as_ref()
         .and_then(|s| s.replicas)
         .unwrap_or(1);
-    status.observed_generation >= deployment.metadata.generation
-        && status.updated_replicas.unwrap_or(0) >= wanted
-        && status.ready_replicas.unwrap_or(0) >= wanted
+    let at = |count: Option<i32>| count.unwrap_or(0) == wanted;
+    wanted > 0
+        && status.observed_generation >= deployment.metadata.generation
+        && at(status.replicas)
+        && at(status.updated_replicas)
+        && at(status.ready_replicas)
+        && at(status.available_replicas)
 }
 
-async fn write_invalid(
-    clusters: &Api<SearchCluster>,
-    cluster: &SearchCluster,
-    reason: &str,
-    message: &str,
-) -> anyhow::Result<()> {
-    let previous = cluster
-        .status
-        .as_ref()
-        .map_or(&[][..], |s| &s.conditions[..]);
-    let condition = make_condition(previous, cluster, "Ready", false, reason, message);
-    let mut conditions: Vec<Condition> = previous.to_vec();
-    match conditions.iter_mut().find(|c| c.type_ == "Ready") {
-        Some(ready) => *ready = condition,
-        None => conditions.insert(0, condition),
-    }
-    clusters
-        .patch_status(
-            &cluster.name_any(),
-            &PatchParams::default(),
-            &Patch::Merge(json!({
-                "status": {
-                    "observedGeneration": cluster.metadata.generation,
-                    "conditions": conditions,
-                }
-            })),
-        )
-        .await
-        .context("write SearchCluster status")?;
-    Ok(())
-}
-
-fn conditions(cluster: &SearchCluster, outcome: Outcome) -> Vec<Condition> {
-    let previous = cluster
-        .status
-        .as_ref()
-        .map_or(&[][..], |s| &s.conditions[..]);
-    let (ready, ready_reason, ready_message) = match outcome.ready {
-        Ok(()) => (
-            true,
-            "Reconciled".to_string(),
-            "all workloads are ready".to_string(),
-        ),
-        Err((reason, message)) => (false, reason, message),
-    };
-    let (placement_ok, placement_reason, placement_message) = match outcome.placement {
-        Ok(()) => (
-            true,
-            "Applied",
-            "broker runs the spec's placement".to_string(),
-        ),
-        Err(message) => (false, "Blocked", message),
-    };
-    let (pruned_ok, pruned_reason, pruned_message) = match outcome.pruned {
-        Ok(()) => (true, "Pruned", "no Deployment outside the spec".to_string()),
-        Err(message) => (false, "Blocked", message),
-    };
-    vec![
-        make_condition(
-            previous,
-            cluster,
-            "Ready",
-            ready,
-            &ready_reason,
-            &ready_message,
-        ),
-        make_condition(
-            previous,
-            cluster,
-            "PlacementApplied",
-            placement_ok,
-            placement_reason,
-            &placement_message,
-        ),
-        make_condition(
-            previous,
-            cluster,
-            "ShardsPruned",
-            pruned_ok,
-            pruned_reason,
-            &pruned_message,
-        ),
-    ]
-}
-
-/// A condition that keeps its transition time while its status is unchanged.
-fn make_condition(
-    previous: &[Condition],
+/// Set a condition, keeping its transition time while its status holds.
+fn set_condition(
+    status: &mut SearchClusterStatus,
     cluster: &SearchCluster,
     type_: &str,
-    ok: bool,
-    reason: &str,
-    message: &str,
-) -> Condition {
-    let status = if ok { "True" } else { "False" };
-    let last_transition_time = previous
+    outcome: Result<&str, Failure>,
+) {
+    let (value, reason, message) = match outcome {
+        Ok(reason) => ("True", reason.to_string(), String::new()),
+        Err((reason, message)) => ("False", reason.to_string(), message),
+    };
+    let last_transition_time = status
+        .conditions
         .iter()
-        .find(|c| c.type_ == type_ && c.status == status)
+        .find(|c| c.type_ == type_ && c.status == value)
         .map_or_else(|| Time(Utc::now()), |c| c.last_transition_time.clone());
-    Condition {
+    let condition = Condition {
         type_: type_.to_string(),
-        status: status.to_string(),
-        reason: reason.to_string(),
-        message: message.to_string(),
+        status: value.to_string(),
+        reason,
+        message,
         observed_generation: cluster.metadata.generation,
         last_transition_time,
+    };
+    match status.conditions.iter_mut().find(|c| c.type_ == type_) {
+        Some(existing) => *existing = condition,
+        None => status.conditions.push(condition),
     }
+}
+
+/// Server-side apply of the whole status, so fields that become empty are
+/// removed rather than left behind by a merge. Skipped when unchanged.
+async fn write_status(
+    ctx: &Context,
+    cluster: &SearchCluster,
+    status: SearchClusterStatus,
+) -> kube::Result<()> {
+    if cluster.status.as_ref() == Some(&status) {
+        return Ok(());
+    }
+    let patch = json!({
+        "apiVersion": SearchCluster::api_version(&()),
+        "kind": SearchCluster::kind(&()),
+        "status": status,
+    });
+    ctx.clusters()
+        .patch_status(
+            &cluster.name_any(),
+            &PatchParams::apply(MANAGER).force(),
+            &Patch::Apply(&patch),
+        )
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k8s_openapi::api::core::v1::{HostPathVolumeSource, PodSpec, Volume};
+    use k8s_openapi::api::core::v1::{HostPathVolumeSource, PodSpec, PodStatus, Volume};
     use kube::api::ObjectMeta;
 
-    fn pod(name: &str, node: &str, path: &str) -> Pod {
-        Pod {
+    #[test]
+    fn index_is_created_only_when_no_shard_has_it() {
+        assert_eq!(decide_index(3, 3, false), IndexDecision::Exists);
+        assert_eq!(decide_index(0, 3, true), IndexDecision::Create);
+        assert_eq!(decide_index(0, 3, false), IndexDecision::MissingSchema);
+        // Creating again would fail on the shards that have it.
+        assert_eq!(decide_index(1, 3, true), IndexDecision::Partial(1));
+    }
+
+    #[test]
+    fn routing_is_pinned_from_the_create_attempt_on() {
+        let mut cluster = SearchCluster::new("documents-1", crate::render::tests::spec());
+        let mut status = SearchClusterStatus {
+            routing: Some("documents_1=0:5,1:4".into()),
+            ..Default::default()
+        };
+        for (reason, pinned) in [
+            ("Pending", false),
+            ("MissingSchema", false),
+            ("Creating", true),
+            ("PartiallyCreated", true),
+            ("Exists", true),
+        ] {
+            let outcome = if reason == "Exists" {
+                Ok(reason)
+            } else {
+                Err((reason, String::new()))
+            };
+            set_condition(&mut status, &cluster, INDEX_CREATED, outcome);
+            cluster.status = Some(status.clone());
+            assert_eq!(pinned_routing(&cluster).is_some(), pinned, "{reason}");
+        }
+    }
+
+    #[test]
+    fn a_new_shard_waits_only_for_running_pods_holding_its_directories() {
+        let pod = |name: &str, node: &str, path: &str, phase: &str| Pod {
             metadata: ObjectMeta {
                 name: Some(name.into()),
                 ..Default::default()
@@ -639,33 +641,27 @@ mod tests {
                     name: "data".into(),
                     host_path: Some(HostPathVolumeSource {
                         path: path.into(),
-                        type_: Some("Directory".into()),
+                        type_: None,
                     }),
                     ..Default::default()
                 }]),
                 ..Default::default()
             }),
-            status: None,
-        }
-    }
-
-    #[test]
-    fn a_new_replica_waits_for_any_pod_holding_its_directories() {
-        let spec = crate::render::tests::sample_spec();
-        let workloads = shard_workloads("summa", "summa", &spec);
-        let old = pod("summa-server-old-abc", "node-a", "/data2/summa-server/");
-        let conflict = host_path_conflict(&[old], &workloads[0]).unwrap();
-        assert!(conflict.starts_with("summa-server-s2 waits for pod summa-server-old-abc"));
-        // Same path on another node, or an unrelated directory, is free.
-        let elsewhere = pod("other", "node-b", "/data2/summa-server");
-        let unrelated = pod("db", "node-a", "/data2/postgres");
-        assert!(host_path_conflict(&[elsewhere, unrelated], &workloads[0]).is_none());
-    }
-
-    #[test]
-    fn placement_is_read_back_from_the_broker_container() {
-        let spec = crate::render::tests::sample_spec();
-        let deployment = broker_deployment("summa", "summa", &spec);
-        assert_eq!(container_placement(&deployment), placement_args(&spec));
+            status: Some(PodStatus {
+                phase: Some(phase.into()),
+                ..Default::default()
+            }),
+        };
+        let spec = crate::render::tests::spec();
+        let shard = &spec.shards[0];
+        let old = pod("old", "node-a", "/data2/summa/documents_1/", "Running");
+        assert!(conflicting_pod(&[old], shard).unwrap().contains("pod old"));
+        let finished = [
+            pod("evicted", "node-a", "/data2/summa/documents_1", "Failed"),
+            pod("copy", "node-a", "/data2/summa/documents_1", "Succeeded"),
+            pod("other", "node-b", "/data2/summa/documents_1", "Running"),
+            pod("db", "node-a", "/data2/postgres", "Running"),
+        ];
+        assert!(conflicting_pod(&finished, shard).is_none());
     }
 }

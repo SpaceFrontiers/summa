@@ -1,6 +1,6 @@
 //! Primary-key routing for staged mutations; no retries or publication here.
 use super::*;
-use crate::proto::summa::DocumentError;
+use summa_broker::proto::summa::DocumentError;
 
 enum MutationBatch {
     Delete(Vec<String>),

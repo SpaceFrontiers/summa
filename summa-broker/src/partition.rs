@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use summa_broker::placement_rules;
 use tonic::Status;
 
-use crate::proto::summa::{
+use summa_broker::proto::summa::{
     BatchIndexDocumentsResponse, BooleanQuery, DocumentError, FieldValue, GetIndexInfoResponse,
     IndexingBufferStats, MemoryStats, NamedDocument, Query, SearchHit, SearchResponse,
     SearchTimings, SegmentReaderStats, TermDocFreq, TextFieldStats, TextStats, VectorFieldStats,
@@ -292,8 +292,9 @@ pub fn merge_search_responses(
             .iter()
             .all(|response| response.seeded_document_passages);
     let mut ranking_method: Option<String> = None;
-    let mut trace: Option<crate::proto::summa::SearchTrace> = None;
-    let mut fusion_candidates = BTreeMap::<u32, Vec<crate::proto::summa::FusionCandidate>>::new();
+    let mut trace: Option<summa_broker::proto::summa::SearchTrace> = None;
+    let mut fusion_candidates =
+        BTreeMap::<u32, Vec<summa_broker::proto::summa::FusionCandidate>>::new();
     for response in responses {
         if ranking_method
             .as_ref()
@@ -363,7 +364,7 @@ pub fn merge_search_responses(
         fusion_candidates: fusion_candidates
             .into_iter()
             .map(
-                |(query_index, candidates)| crate::proto::summa::FusionCandidateList {
+                |(query_index, candidates)| summa_broker::proto::summa::FusionCandidateList {
                     query_index,
                     candidates,
                 },
@@ -576,7 +577,7 @@ mod tests {
         assert_eq!(info.deleted_ratio, 11.0 / 102.0);
         assert_eq!(info.num_docs, 91);
     }
-    use crate::proto::summa::{
+    use summa_broker::proto::summa::{
         DocAddress, FieldEntry, FusionQuery, MatchQuery, PhraseQuery, SparseVectorQuery,
         WeightedQuery,
     };
@@ -876,7 +877,7 @@ mod tests {
     #[test]
     fn linear_shard_scores_and_features_merge_directly_and_reject_mixed_versions() {
         let mut a = hit("a", 1, -2.0);
-        a.candidate_scores = Some(crate::proto::summa::CandidateScores {
+        a.candidate_scores = Some(summa_broker::proto::summa::CandidateScores {
             document: std::collections::HashMap::from([("dense".into(), -2.0)]),
             ..Default::default()
         });

@@ -24,12 +24,12 @@ use crate::client::{capacity_exhausted, forward_timeout};
 use crate::context::{BrokerContext, code_label};
 use crate::metrics as m;
 use crate::partition;
-use crate::proto::summa::search_service_server::SearchService;
-use crate::proto::summa::{
+use crate::routes::{Route, Target, record_backend, record_partial};
+use summa_broker::proto::summa::search_service_server::SearchService;
+use summa_broker::proto::summa::{
     GetDocumentRequest, GetDocumentResponse, GetIndexInfoRequest, GetIndexInfoResponse,
     GetTextStatsRequest, GetTextStatsResponse, SearchRequest, SearchResponse,
 };
-use crate::routes::{Route, Target, record_backend, record_partial};
 
 /// summa-server refuses result windows above this; a partitioned search
 /// widens every partition's window to `offset + limit`, which must fit.

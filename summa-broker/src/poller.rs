@@ -25,8 +25,8 @@ use tonic::Status;
 use crate::client::ClientPool;
 use crate::metrics as m;
 use crate::placement::PlacementRules;
-use crate::proto::summa::ListIndexesRequest;
 use crate::topology::{BackendId, BackendKnowledge, DiscoveredEndpoint, Health, TopologySnapshot};
+use summa_broker::proto::summa::ListIndexesRequest;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PollerConfig {
