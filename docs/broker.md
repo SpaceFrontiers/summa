@@ -261,6 +261,10 @@ oplog: a follower that diverges beyond the client's retry horizon is rebuilt.
 - Admin: `summa.broker.BrokerService` — `GetTopology` (per-replica live
   `num_docs`/`num_segments`, for migration verification), `GetBackends`,
   `RefreshTopology`.
+- Deployment: [summa-k8s-manager](summa-k8s-manager.md) renders the broker's
+  `--placement` arguments from a `SearchCluster` resource and refuses rule
+  changes that reroute a live index. The rule syntax lives in the broker's
+  library (`summa_broker::placement_rules`), shared by both.
 - Metrics: `summa_broker_*`, documented in [metrics.md](metrics.md).
 - Shutdown mirrors summa-server: SIGTERM → refuse new RPCs with
   `UNAVAILABLE("Summa broker is shutting down")`, drain, stop. summa-server

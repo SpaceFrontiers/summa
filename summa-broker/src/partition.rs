@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use summa_broker::placement_rules;
 use tonic::Status;
 
 use crate::proto::summa::{
@@ -59,11 +60,10 @@ impl PartitionWeights {
             weights.iter().all(|w| *w > 0),
             "partition weights are validated at parse time: {weights:?}"
         );
-        let divisor = weights.iter().copied().fold(0, gcd);
-        let bounds = weights
-            .iter()
+        let bounds = placement_rules::reduced_weights(&weights)
+            .into_iter()
             .scan(0u64, |sum, w| {
-                *sum += u64::from(w / divisor);
+                *sum += u64::from(w);
                 Some(*sum)
             })
             .collect();
@@ -100,10 +100,6 @@ impl PartitionWeights {
         let point = fnv1a64(primary_key) % total;
         self.bounds.partition_point(|&bound| bound <= point)
     }
-}
-
-fn gcd(a: u32, b: u32) -> u32 {
-    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Name of the field declared `primary` in a schema SDL, e.g.

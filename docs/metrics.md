@@ -107,11 +107,11 @@ Sampled every `--memory-metrics-interval-secs` (15 s) without taking writer
 locks or loading readers, so RSS can be attributed before the OOM killer acts.
 summa-server uses jemalloc.
 
-| Metric | Type | Labels | Meaning |
-| --- | --- | --- | --- |
-| `summa_memory_allocator_bytes` | gauge | `kind` | jemalloc `allocated` (live objects), `active`, `resident`, `retained`, `metadata` |
-| `summa_memory_process_bytes` | gauge | `kind` | `/proc/self/status` `rss_anon`, `rss_file`, `locked` (mlock-pinned metadata) |
-| `summa_index_memory_bytes` | gauge | `index`, `kind` | `indexing_buffer` (open segment builders), `primary_key` (dedup index), `reader_heap` (estimated segment-reader heap), `pinned_metadata` |
+| Metric                         | Type  | Labels          | Meaning                                                                                                                                  |
+| ------------------------------ | ----- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `summa_memory_allocator_bytes` | gauge | `kind`          | jemalloc `allocated` (live objects), `active`, `resident`, `retained`, `metadata`                                                        |
+| `summa_memory_process_bytes`   | gauge | `kind`          | `/proc/self/status` `rss_anon`, `rss_file`, `locked` (mlock-pinned metadata)                                                             |
+| `summa_index_memory_bytes`     | gauge | `index`, `kind` | `indexing_buffer` (open segment builders), `primary_key` (dedup index), `reader_heap` (estimated segment-reader heap), `pinned_metadata` |
 
 ### Broker metrics (`summa-broker`)
 
@@ -135,6 +135,16 @@ silently.
 | `summa_broker_write_rejected_total`             | counter   | `index`, `reason`        | write RPCs the broker itself refused (reason = gRPC code label)                                          |
 | `summa_broker_partial_reads_total`              | counter   | `index`, `rpc`, `shard`  | partitions a partial read (`--partial-partition-reads`) left out, one per missing partition              |
 | `summa_broker_stream_flushes_total`             | counter   | `index`                  | streaming IndexDocuments runs forwarded as BatchIndexDocuments                                           |
+
+### Manager metrics (`summa-k8s-manager`)
+
+Emitted by the operator (see [summa-k8s-manager.md](summa-k8s-manager.md)). Blocked
+and invalid passes leave workloads unchanged; the `SearchCluster` conditions
+carry the reason.
+
+| Metric                              | Type    | Labels   | Meaning                                                                                                                         |
+| ----------------------------------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `summa_k8s_manager_reconcile_total` | counter | `result` | reconcile passes: `ok`, `progressing` (applied, not yet ready), `blocked` (placement or shard removal held), `invalid`, `error` |
 
 ### Pre-existing indexes and `index="unknown"`
 
