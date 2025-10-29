@@ -236,6 +236,15 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
                 new_count
             );
             self.reload_with_segments(new_segment_ids).await?;
+        } else if !self.inline_reload {
+            // Background owners can retry after old readers release allocations.
+            // Inline query checks never start a cache build on an unchanged index.
+            let state = self.state.load_full();
+            Searcher::<D>::prepare_prefix_caches(
+                state.searcher.segment_readers(),
+                &self.resources.binary_prefix_cache,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -274,10 +283,15 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             self.reload_with_segments(new_segment_ids).await
         } else {
             log::debug!(
-                "[reload] index={} segments unchanged, skipping",
+                "[reload] index={} segments unchanged, retrying optional cache admission",
                 self.schema.index_label()
             );
-            Ok(())
+            let state = self.state.load_full();
+            Searcher::<D>::prepare_prefix_caches(
+                state.searcher.segment_readers(),
+                &self.resources.binary_prefix_cache,
+            )
+            .await
         }
     }
 
@@ -322,6 +336,11 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         }));
 
         Ok(())
+    }
+
+    /// Prefix-cache budget shared across current and retained readers of this Index.
+    pub fn binary_prefix_cache_stats(&self) -> crate::segment::BinaryPrefixCacheStats {
+        self.resources.binary_prefix_cache.stats()
     }
 
     /// Get schema

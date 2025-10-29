@@ -360,6 +360,10 @@ pub struct IndexConfig {
     /// holds its own validation scratch, so raise this only with memory to
     /// spare. Zero is invalid.
     pub segment_open_concurrency: usize,
+    /// Optional native binary-IVF prefix heap cache. One budget per Index, shared
+    /// across segments and retained readers. Zero disables; does not mlock pages.
+    #[cfg(feature = "native")]
+    pub binary_prefix_cache_budget_bytes: usize,
     /// Number of parallel segment builders (documents distributed round-robin)
     pub num_indexing_threads: usize,
     /// Width of the document-store compression pool. Concurrent segment
@@ -642,6 +646,8 @@ impl Default for IndexConfig {
             num_threads: search_threads,
             sparse_io_concurrency: 4,
             segment_open_concurrency: DEFAULT_SEGMENT_OPEN_CONCURRENCY,
+            #[cfg(feature = "native")]
+            binary_prefix_cache_budget_bytes: 0,
             num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
             term_cache_blocks: DEFAULT_TERM_CACHE_BLOCKS,

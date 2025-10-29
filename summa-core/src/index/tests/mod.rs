@@ -1,4 +1,6 @@
 mod basic;
+#[cfg(feature = "native")]
+mod binary_prefix_cache;
 mod bmp;
 mod boolean;
 mod chunked;
