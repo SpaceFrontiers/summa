@@ -8,6 +8,10 @@
 pub(crate) mod ann_build;
 mod ann_disk;
 pub use ann_disk::AnnHealth;
+#[cfg(feature = "native")]
+pub use ann_disk::prefix_cache::BinaryPrefixCacheStats;
+#[cfg(feature = "native")]
+pub(crate) use ann_disk::prefix_cache::PrefixCacheBudget;
 pub(crate) mod bmp_adaptive;
 pub(crate) mod bmp_forward;
 pub(crate) mod bmp_grid;
