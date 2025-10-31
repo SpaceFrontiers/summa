@@ -420,8 +420,9 @@ fn search_budget_caps_candidate_depth_at_two_x_the_result_window() {
 #[test]
 fn explicit_l1_depth_may_exceed_the_oversubscribed_window_up_to_the_floor() {
     let with_depth = |depth: u32| {
-        let mut req = fusion_request(2, 0);
+        let mut req = named_l1_request();
         req.limit = 10;
+        req.candidate_limit = 0;
         let Some(Query {
             query: Some(query::Query::Fusion(fusion)),
         }) = req.query.as_mut()
