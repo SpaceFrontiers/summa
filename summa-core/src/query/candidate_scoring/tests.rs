@@ -1063,7 +1063,14 @@ async fn stored_only_vectors_rescore_candidates_and_never_nominate() {
     document.add_sparse_vector(sparse, vec![(1, 0.5)]);
     document.add_sparse_vector(sparse, vec![(1, 0.9)]);
     document.add_dense_vector(dense, vec![-1.0, 0.0]);
-    document.add_dense_vector(dense, vec![0.5, 0.5]);
+    // Unit vectors, so the score is the cosine under either dense metric.
+    document.add_dense_vector(
+        dense,
+        vec![
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ],
+    );
     document.add_binary_dense_vector(binary, vec![0x00, 0x00]);
     document.add_binary_dense_vector(binary, vec![0xFF, 0xFF]);
     writer.add_document(document).unwrap();
@@ -1120,7 +1127,10 @@ async fn stored_only_vectors_rescore_candidates_and_never_nominate() {
     let first = rows.iter().find(|p| p.ordinal == 0).unwrap();
     let second = rows.iter().find(|p| p.ordinal == 1).unwrap();
     assert!(first.values[1].unwrap() < -0.99, "{first:?}");
-    assert!((second.values[1].unwrap() - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3);
+    assert!(
+        (second.values[1].unwrap() - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3,
+        "{second:?}"
+    );
     assert_eq!(first.values[2], Some(0.0));
     assert_eq!(second.values[2], Some(1.0));
 
