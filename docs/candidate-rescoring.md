@@ -518,6 +518,12 @@ and is checked for eligibility before union, so selective filters may underfill
 an ANN branch. Broader L0 depth is the recall control; raw backfill is exact over
 the union that survives. No claim of exhaustive ANN recall is made.
 
+An explicit L1 `FusionQuery.candidate_depth` may exceed twice the result window up
+to `MIN_EXPLICIT_CANDIDATE_DEPTH` (1024), on the server and the broker alike; an
+implicit depth stays the candidate limit, at most twice the window. This lets a
+sparse-only nomination be rescored by score-only vector branches (flat vector
+fields read per candidate) without widening the returned page.
+
 Common filter bitmaps are capped at 16 MiB per segment and 64 clauses. Native
 materializable text/phrase/fast-field filters use the existing bitset paths.
 Other filters and portable builds use ordinary complete filter scorers only on
