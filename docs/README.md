@@ -52,6 +52,7 @@
 - [Binary IVF geometry](binary-ivf-geometry.md)
 - [Binary IVF prefix-first scan](binary-prefix-scan.md)
 - [Optional resident binary-prefix cache](binary-prefix-cache.md)
+- [Query encoders of vector fields](query-encoders.md)
 - [Binary IVF SOAR spill](binary-ivf-soar.md)
 - [Binary eligibility, ANN controls, and bounded passage nomination](binary-retrieval-controls.md)
 - [BMP grid compression](bmp-grid-compression.md) and [forward storage](bmp-forward-index.md)

@@ -250,6 +250,10 @@ field content: text<lex(by: languages, default: en, stop_words: true)> [indexed<
   frequency behind a broker, resolved once per query, so every segment and
   shard scores the same tokens and the query keeps the text fast paths and
   L1 decomposition. Dropped tokens neither match nor score.
+- `indexed<query<encoder: "akin_embed_v1">>` on a vector field names the model
+  its queries are encoded with; clients read it from `GetIndexInfo.query_encoders`.
+  Sparse fields declaring one accept explicit vectors only
+  ([query encoders](query-encoders.md)).
 
 See `docs/dynamic-tokenizer-and-phrase.md` for the design.
 
