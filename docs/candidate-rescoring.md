@@ -518,6 +518,20 @@ and is checked for eligibility before union, so selective filters may underfill
 an ANN branch. Broader L0 depth is the recall control; raw backfill is exact over
 the union that survives. No claim of exhaustive ANN recall is made.
 
+An explicit L1 `FusionQuery.candidate_depth` may exceed twice the result window up
+to `MIN_EXPLICIT_CANDIDATE_DEPTH` (1024), on the server and the broker alike; an
+implicit depth stays the candidate limit, at most twice the window. This lets a
+sparse-only nomination be rescored by score-only vector branches (flat vector
+fields read per candidate) without widening the returned page.
+
+Stored-only (`[stored]`, not indexed) dense and binary vector fields have no
+index: their rows live in the segment's flat `.vectors` data, doc-major, so one
+document's chunk vectors are one contiguous range, and merges copy those bytes
+without decoding. L1 accepts them in score-only branches, which read each
+candidate's rows (a batch is prefetched with one coalesced advice before the
+reads). A search that would nominate from such a field is refused rather than
+brute-forcing every stored vector.
+
 Common filter bitmaps are capped at 16 MiB per segment and 64 clauses. Native
 materializable text/phrase/fast-field filters use the existing bitset paths.
 Other filters and portable builds use ordinary complete filter scorers only on

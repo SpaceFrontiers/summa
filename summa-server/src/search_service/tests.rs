@@ -418,6 +418,42 @@ fn search_budget_caps_candidate_depth_at_two_x_the_result_window() {
 }
 
 #[test]
+fn explicit_l1_depth_may_exceed_the_oversubscribed_window_up_to_the_floor() {
+    let with_depth = |depth: u32| {
+        let mut req = named_l1_request();
+        req.limit = 10;
+        req.candidate_limit = 0;
+        let Some(Query {
+            query: Some(query::Query::Fusion(fusion)),
+        }) = req.query.as_mut()
+        else {
+            unreachable!()
+        };
+        fusion.candidate_depth = depth;
+        validate_search_budget(&req, &limits())
+    };
+    let floor = summa_core::query::MIN_EXPLICIT_CANDIDATE_DEPTH as u32;
+    let budget = with_depth(floor).unwrap();
+    // The window and its candidate limit stay as requested.
+    assert_eq!((budget.search_limit, budget.candidate_limit), (10, 10));
+    assert_eq!(
+        with_depth(floor + 1).unwrap_err().code(),
+        Code::InvalidArgument
+    );
+    // Implicit depth is still the candidate limit, bounded at twice the window.
+    assert!(with_depth(0).is_ok());
+    let mut ordinary = ordinary_request();
+    ordinary.limit = 10;
+    ordinary.candidate_limit = 21;
+    assert_eq!(
+        validate_search_budget(&ordinary, &limits())
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
+}
+
+#[test]
 fn explicit_candidate_budget_is_not_expanded_again() {
     let mut request = ordinary_request();
     request.limit = 100;

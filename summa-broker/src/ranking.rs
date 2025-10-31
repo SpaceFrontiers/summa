@@ -276,8 +276,13 @@ impl CoordinatorPlan {
             .iter()
             .filter(|branch| !branch.score_only)
             .count();
+        let max_depth = if fusion.candidate_depth == 0 {
+            summa_core::query::max_candidate_limit(window)
+        } else {
+            summa_core::query::max_explicit_candidate_depth(window)
+        };
         if nominating == 0
-            || depth > summa_core::query::max_candidate_limit(window)
+            || depth > max_depth
             || depth.saturating_mul(nominating).saturating_mul(shards)
                 > summa_core::query::MAX_FUSION_CANDIDATE_SLOTS
         {
@@ -845,6 +850,28 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn explicit_l1_depth_may_exceed_the_oversubscribed_window_up_to_the_floor() {
+        let with_depth = |depth: u32| {
+            let mut req = request(true);
+            let Some(proto::query::Query::Fusion(fusion)) =
+                req.query.as_mut().and_then(|q| q.query.as_mut())
+            else {
+                unreachable!()
+            };
+            fusion.candidate_depth = depth;
+            CoordinatorPlan::new(req, 2, DEFAULT_MAX_TRANSFER_BYTES)
+        };
+        // Window 1: the implicit bound is 2, an explicit depth may reach the floor.
+        let floor = summa_core::query::MIN_EXPLICIT_CANDIDATE_DEPTH as u32;
+        assert!(with_depth(floor).is_ok());
+        let Err(error) = with_depth(floor + 1) else {
+            panic!("depth above the floor must be rejected");
+        };
+        assert!(error.message().contains("nomination budget"), "{error:?}");
+        assert!(with_depth(0).is_ok());
     }
 
     #[test]

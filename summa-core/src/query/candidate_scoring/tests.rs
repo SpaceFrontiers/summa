@@ -1,7 +1,8 @@
 use super::*;
 use crate::dsl::{DenseVectorConfig, DenseVectorQuantization, PositionMode, VectorIndexType};
 use crate::query::{
-    DenseVectorQuery, MultiValueCombiner, PhraseQuery, Query, SparseVectorQuery, TermQuery,
+    BinaryDenseVectorQuery, DenseVectorQuery, MultiValueCombiner, PhraseQuery, Query,
+    SparseVectorQuery, TermQuery,
 };
 use crate::structures::{SparseFormat, SparseVectorConfig, WeightQuantization};
 use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
@@ -1033,4 +1034,120 @@ async fn single_copy_sparse_backfill_preserves_missing_zero_and_organic_scores()
             .score,
         -1.0
     );
+}
+
+/// Stored-only vector fields have no index: they rescore sparse-nominated
+/// candidates per chunk through score-only branches and refuse to nominate.
+#[tokio::test]
+async fn stored_only_vectors_rescore_candidates_and_never_nominate() {
+    let mut schema = Schema::builder();
+    let sparse = schema.add_sparse_vector_field_with_config(
+        "sparse",
+        true,
+        false,
+        SparseVectorConfig {
+            format: SparseFormat::Bmp,
+            dims: Some(32),
+            weight_quantization: WeightQuantization::UInt8,
+            ..Default::default()
+        },
+    );
+    let dense = schema.add_dense_vector_field("dense", 2, false, true);
+    let binary = schema.add_binary_dense_vector_field("binary", 16, false, true);
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.build(), config.clone())
+        .await
+        .unwrap();
+    let mut document = Document::new();
+    document.add_sparse_vector(sparse, vec![(1, 0.5)]);
+    document.add_sparse_vector(sparse, vec![(1, 0.9)]);
+    document.add_dense_vector(dense, vec![-1.0, 0.0]);
+    // Unit vectors, so the score is the cosine under either dense metric.
+    document.add_dense_vector(
+        dense,
+        vec![
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        ],
+    );
+    document.add_binary_dense_vector(binary, vec![0x00, 0x00]);
+    document.add_binary_dense_vector(binary, vec![0xFF, 0xFF]);
+    writer.add_document(document).unwrap();
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+    let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+
+    let sparse_query = SparseVectorQuery::new(sparse, vec![(1, 1.0)]);
+    let candidates = searcher
+        .search_with_positions(&sparse_query, 1)
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(candidates.len(), 1);
+    let dense_query = DenseVectorQuery::new(dense, vec![1.0, 0.0]);
+    let binary_query = BinaryDenseVectorQuery::new(binary, vec![0xFF, 0xFF]);
+    let plan = CandidateScoringPlan {
+        backfill: true,
+        features: vec![
+            CandidateFeature {
+                name: "sparse".into(),
+                scope: ScoreScope::Chunk,
+                query: sparse_query.candidate_query().unwrap(),
+            },
+            CandidateFeature {
+                name: "dense".into(),
+                scope: ScoreScope::Chunk,
+                query: dense_query.candidate_query().unwrap(),
+            },
+            CandidateFeature {
+                name: "binary".into(),
+                scope: ScoreScope::Chunk,
+                query: binary_query.candidate_query().unwrap(),
+            },
+        ],
+        model: Some(
+            RankingModel::compile(
+                "sparse + dense + binary",
+                &["sparse", "dense", "binary"],
+                &Default::default(),
+            )
+            .unwrap(),
+        ),
+        export_passages: 10,
+        all_passages: true,
+        seed_document_passages: false,
+        document_combiner: crate::query::MultiValueCombiner::Max,
+    };
+    let scored = searcher
+        .score_candidates(&candidates, &plan, None)
+        .await
+        .unwrap();
+    let rows = &scored[0].features.passages;
+    let first = rows.iter().find(|p| p.ordinal == 0).unwrap();
+    let second = rows.iter().find(|p| p.ordinal == 1).unwrap();
+    assert!(first.values[1].unwrap() < -0.99, "{first:?}");
+    assert!(
+        (second.values[1].unwrap() - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-3,
+        "{second:?}"
+    );
+    assert_eq!(first.values[2], Some(0.0));
+    assert_eq!(second.values[2], Some(1.0));
+
+    // The fields have no index, so they can never nominate.
+    for error in [
+        searcher
+            .search_with_positions(&dense_query, 1)
+            .await
+            .unwrap_err(),
+        searcher
+            .search_with_positions(&binary_query, 1)
+            .await
+            .unwrap_err(),
+    ] {
+        assert!(
+            error.to_string().contains("score-only rescoring"),
+            "{error}"
+        );
+    }
 }
