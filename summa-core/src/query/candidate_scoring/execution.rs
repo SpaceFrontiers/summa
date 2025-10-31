@@ -70,9 +70,18 @@ impl CandidateScoringPlan {
             let entry = schema
                 .get_field_entry(feature.query.field)
                 .ok_or_else(|| Error::FieldNotFound(feature.query.field.0.to_string()))?;
-            if !entry.indexed {
+            // Stored-only dense/binary fields keep their vectors in the flat
+            // `.vectors` data (doc-major rows) with no ANN: they rescore
+            // candidates and can never nominate them (the segment search
+            // refuses them), which keeps such branches score-only.
+            let stored_vectors = entry.stored
+                && matches!(
+                    entry.field_type,
+                    crate::FieldType::DenseVector | crate::FieldType::BinaryDenseVector
+                );
+            if !entry.indexed && !stored_vectors {
                 return Err(Error::Query(format!(
-                    "L1 branch '{}' needs an indexed field",
+                    "L1 branch '{}' needs an indexed field or stored vectors",
                     feature.name
                 )));
             }
