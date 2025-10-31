@@ -775,6 +775,7 @@ impl SearchService for SearchServiceImpl {
         vector_stats.sort_by(|a, b| a.field_name.cmp(&b.field_name));
 
         let text_fields = text_field_infos(&index.schema());
+        let query_encoders = query_encoder_infos(&index.schema());
         let (physical_num_docs, num_deleted_docs) =
             searcher
                 .segment_readers()
@@ -800,6 +801,7 @@ impl SearchService for SearchServiceImpl {
             memory_stats: Some(memory_stats),
             vector_stats,
             text_fields,
+            query_encoders,
             candidate_scoring_version: 4,
             binary_retrieval_version: 1,
             unprepared_candidate_fields: searcher
@@ -815,6 +817,22 @@ impl SearchService for SearchServiceImpl {
 
 /// Tokenization facts of every text field, for clients that pick query
 /// forms without parsing the schema SDL.
+/// Vector fields declaring a query encoder, in schema order.
+pub fn query_encoder_infos(schema: &summa_core::Schema) -> Vec<QueryEncoderInfo> {
+    schema
+        .fields()
+        .filter_map(|(_, entry)| {
+            entry
+                .query_encoder
+                .as_ref()
+                .map(|encoder| QueryEncoderInfo {
+                    field: entry.name.clone(),
+                    encoder: encoder.clone(),
+                })
+        })
+        .collect()
+}
+
 pub fn text_field_infos(schema: &summa_core::Schema) -> Vec<TextFieldInfo> {
     schema
         .fields()
