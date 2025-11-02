@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
-use log::{info, warn};
+use log::{error, info, warn};
 use tonic::{codec::CompressionEncoding, transport::Server};
 
 use summa_core::IndexConfig;
@@ -161,6 +161,15 @@ struct Args {
     /// across all indexes and queries.
     #[arg(long, default_value = "4")]
     sparse_io_concurrency: usize,
+
+    /// Restart the server when every search admission permit has been held
+    /// this many seconds without a completed search; 0 disables. Request
+    /// cancellation cannot release a permit held by running search-pool
+    /// work, so a wedged pool would otherwise reject every search until an
+    /// operator restarts the process. The stall report names each admitted
+    /// search's phase and the pool/sparse-gate occupancy.
+    #[arg(long, default_value = "300")]
+    search_stall_restart_secs: u64,
 
     /// Segment readers opened (validated and pinned) concurrently when an
     /// index loads at startup or picks up new segments. Each open holds its
@@ -831,6 +840,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         max_concurrent_searches,
         service_limits.search,
     );
+    let stall_monitor = search_service.stall_monitor();
 
     let index_service = index_service::IndexServiceImpl {
         registry: Arc::clone(&registry),
@@ -839,6 +849,18 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     // One application-level signal coordinates tonic admission, optimizer
     // admission, and index lifecycle cancellation.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let search_stall = Arc::new(tokio::sync::Notify::new());
+    let search_stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stall_watchdog = (args.search_stall_restart_secs > 0).then(|| {
+        spawn_stall_watchdog(
+            stall_monitor,
+            Duration::from_secs(args.search_stall_restart_secs),
+            Arc::clone(&search_stall),
+            Arc::clone(&search_stalled),
+            shutdown_rx.clone(),
+        )
+    });
 
     // Spawn background optimizer
     let optimizer_handle = optimizer::spawn_optimizer(
@@ -887,6 +909,14 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         args.sparse_io_concurrency
     );
     info!("Maximum concurrent searches: {}", max_concurrent_searches);
+    match args.search_stall_restart_secs {
+        0 => warn!(
+            "Search stall restart disabled: exhausted admission is never recovered automatically"
+        ),
+        secs => info!(
+            "Search stall restart: after {secs}s of exhausted admission without a completed search"
+        ),
+    }
     info!(
         "Reload interval: {} ms (background); segment open concurrency: {}",
         args.reload_interval_ms, args.segment_open_concurrency
@@ -1007,7 +1037,12 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
                 .send_compressed(CompressionEncoding::Zstd),
         )
         .serve_with_shutdown(addr, async move {
-            shutdown_signal().await;
+            tokio::select! {
+                _ = shutdown_signal() => {}
+                _ = search_stall.notified() => {
+                    warn!("[search_stall] starting graceful shutdown");
+                }
+            }
             // Stop new requests/optimizer scans immediately. Accepted commits
             // keep segment-build admission until they release the writer.
             signal_registry.begin_shutdown();
@@ -1025,6 +1060,9 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let _ = startup.await;
     let _ = refresher.await;
     let _ = memory_gauges.await;
+    if let Some(watchdog) = stall_watchdog {
+        let _ = watchdog.await;
+    }
 
     info!("[shutdown] gRPC server drained; waiting for background work");
     // Stop managers only after accepted commits release their writer guards.
@@ -1039,8 +1077,69 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     serve_result?;
     optimizer_result?;
     registry_result?;
+    if search_stalled.load(std::sync::atomic::Ordering::Acquire) {
+        // Exit non-zero so the supervisor restarts the process and records why.
+        return Err(anyhow::anyhow!(
+            "search admission stalled; shut down gracefully for a restart"
+        ));
+    }
     info!("Summa server shut down gracefully");
     Ok(())
+}
+
+/// How long a stall-triggered graceful shutdown may take before the process
+/// exits anyway: shutdown must not wait forever on the wedged work it is
+/// escaping. Indexes are committed by then in the normal case.
+const SEARCH_STALL_EXIT_GRACE: Duration = Duration::from_secs(120);
+/// Exit status of a stall restart that graceful shutdown could not finish.
+const SEARCH_STALL_EXIT_CODE: i32 = 70;
+
+/// Watch search admission; on a stall, log the report and trigger the
+/// ordinary graceful shutdown, with a hard-exit backstop.
+fn spawn_stall_watchdog(
+    monitor: search_service::StallMonitor,
+    stall_after: Duration,
+    trigger: Arc<tokio::sync::Notify>,
+    stalled: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(report) = wait_for_search_stall(&monitor, stall_after, shutdown).await else {
+            return;
+        };
+        error!("[search_stall] {report}");
+        error!(
+            "[search_stall] restarting: cancellation cannot release permits held by search-pool work"
+        );
+        stalled.store(true, std::sync::atomic::Ordering::Release);
+        trigger.notify_one();
+        std::thread::spawn(|| {
+            std::thread::sleep(SEARCH_STALL_EXIT_GRACE);
+            error!(
+                "[search_stall] graceful shutdown did not finish in {}s; exiting",
+                SEARCH_STALL_EXIT_GRACE.as_secs()
+            );
+            std::process::exit(SEARCH_STALL_EXIT_CODE);
+        });
+    })
+}
+
+/// Poll admission until it stalls (`Some`) or shutdown begins (`None`).
+async fn wait_for_search_stall(
+    monitor: &search_service::StallMonitor,
+    stall_after: Duration,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<search_service::StallReport> {
+    let interval = (stall_after / 4).clamp(Duration::from_secs(1), Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = shutdown.changed() => return None,
+        }
+        if let Some(report) = monitor.check(stall_after) {
+            return Some(report);
+        }
+    }
 }
 
 /// Health service names: the server as a whole ("") and each RPC service.
@@ -1124,6 +1223,48 @@ fn merge_bp_time_budget(seconds: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_stall_watchdog_reports_exhausted_admission_and_stops_on_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let service = search_service::SearchServiceImpl::new(
+            Arc::new(registry::IndexRegistry::new(
+                temp.path().into(),
+                Default::default(),
+            )),
+            1,
+            Default::default(),
+        );
+        let monitor = service.stall_monitor();
+        assert_eq!(
+            Args::try_parse_from(["summa-server"])
+                .unwrap()
+                .search_stall_restart_secs,
+            300
+        );
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let idle = tokio::spawn({
+            let monitor = monitor.clone();
+            async move { wait_for_search_stall(&monitor, Duration::from_secs(1), shutdown_rx).await }
+        });
+        // Free admission never stalls, however long nothing completes.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(!idle.is_finished());
+        let _ = shutdown_tx.send(true);
+        assert!(idle.await.unwrap().is_none());
+
+        let _held = monitor.permits.clone().try_acquire_owned().unwrap();
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let report = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait_for_search_stall(&monitor, Duration::from_secs(1), shutdown_rx),
+        )
+        .await
+        .expect("held admission without completions must be reported")
+        .unwrap();
+        assert_eq!(report.capacity, 1);
+    }
 
     #[test]
     fn binary_prefix_cache_budget_is_opt_in_and_rejects_overflow() {
