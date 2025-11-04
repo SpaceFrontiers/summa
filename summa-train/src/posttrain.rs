@@ -1608,7 +1608,7 @@ impl AuthenticatedPostTrainingInput {
             path: path.to_owned(),
             identity: PinnedPostTrainingInput {
                 path: path_text,
-                sha256: format!("sha256:{:x}", hasher.finalize()),
+                sha256: format!("sha256:{}", crate::artifact_io::lower_hex(hasher.finalize())),
                 bytes,
             },
             file,
@@ -4605,7 +4605,7 @@ impl JsonDigestWriter {
     }
 
     fn finish(self) -> (u64, String) {
-        (self.bytes, format!("{:x}", self.digest.finalize()))
+        (self.bytes, crate::artifact_io::lower_hex(self.digest.finalize()))
     }
 }
 
@@ -5008,7 +5008,7 @@ mod tests {
         let encoded = serde_json::to_vec(&value).unwrap();
         let (bytes, digest) = serialized_json_digest(&value, "test serialization").unwrap();
         assert_eq!(bytes, u64::try_from(encoded.len()).unwrap());
-        assert_eq!(digest, format!("{:x}", Sha256::digest(&encoded)));
+        assert_eq!(digest, crate::artifact_io::lower_hex(Sha256::digest(&encoded)));
         assert_eq!(
             canonical_sha256(&value).unwrap(),
             format!("sha256:{digest}")

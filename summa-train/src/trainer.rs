@@ -2413,7 +2413,7 @@ mod tests {
         let path = directory.path().join("checkpoint.safetensors");
         let bytes = b"authenticated checkpoint fixture";
         fs::write(&path, bytes).unwrap();
-        let expected = format!("sha256:{:x}", Sha256::digest(bytes));
+        let expected = format!("sha256:{}", crate::artifact_io::lower_hex(Sha256::digest(bytes)));
         assert_eq!(
             read_pinned_checkpoint_bytes(&path, &expected).unwrap(),
             bytes
