@@ -321,7 +321,7 @@ impl<const BY_DOCUMENT: bool, const HIGHER_IS_BETTER: bool>
 #[cfg(test)]
 mod tests {
     use super::{BoundedAnnCollector, BoundedUniqueAnnCollector};
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     type BoundedDistanceCollector = BoundedAnnCollector<false, false>;
     type BoundedDocumentDistanceCollector = BoundedAnnCollector<true, false>;

@@ -9,7 +9,7 @@ use crate::{Document, Field, Index, IndexConfig, IndexWriter, RamDirectory, Sche
 async fn binary_filters_select_eligible_top_k_before_flat_and_ann_shortlists() {
     use crate::dsl::BinaryDenseVectorConfig;
     use crate::query::{BinaryDenseVectorQuery, MultiValueCombiner};
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     for trained in [false, true] {
         for (prefix, soar) in [(false, false), (true, false), (true, true)] {

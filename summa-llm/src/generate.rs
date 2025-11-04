@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use burn::tensor::activation::softmax;
 use burn::tensor::{Int, Tensor, TensorData};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 
 use crate::{Device, InferenceState, Transformer};
 
