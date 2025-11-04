@@ -1068,6 +1068,17 @@ fn errno_slot() -> Option<*mut libc::c_int> {
     None
 }
 
+/// Lowercase hex of a digest; sha2 0.11 outputs no longer implement `LowerHex`.
+pub fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1306,15 +1317,4 @@ mod tests {
             "{error}"
         );
     }
-}
-
-/// Lowercase hex of a digest; sha2 0.11 outputs no longer implement `LowerHex`.
-pub fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write as _;
-    let bytes = bytes.as_ref();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
