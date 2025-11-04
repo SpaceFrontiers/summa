@@ -110,6 +110,9 @@ web-sys = { version = "0.3", features = ["console", "Window", "Response", "Heade
 serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
+# ahash, rand_core 0.9 and tokenizers still use getrandom 0.3, whose wasm
+# backend needs its own activation.
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
 
 # Testing
 tempfile = "3.24"

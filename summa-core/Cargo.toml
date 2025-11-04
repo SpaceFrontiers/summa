@@ -78,6 +78,11 @@ optional = true
 version = "0.4"
 features = ["wasm_js"]
 
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom_03]
+package = "getrandom"
+version = "0.3"
+features = ["wasm_js"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "test-util"] }
 metrics-util = "0.20"
@@ -120,3 +125,7 @@ io-uring = { version = "=0.7.14", optional = true }
 [[example]]
 name = "bmp_replay"
 required-features = ["native"]
+
+[package.metadata.cargo-machete]
+# Feature-activation dep: enables the wasm_js backend for getrandom 0.3 users on wasm32.
+ignored = ["getrandom_03"]
