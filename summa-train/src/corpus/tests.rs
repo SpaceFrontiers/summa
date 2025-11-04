@@ -1698,7 +1698,8 @@ fn manifest_verification_rejects_out_of_vocabulary_tokens_and_shard_limit_forger
         bytes.push(b'\n');
     }
     fs::write(&shard_path, &bytes).unwrap();
-    out_of_vocabulary.build.shards[0].sha256 = crate::artifact_io::lower_hex(Sha256::digest(&bytes));
+    out_of_vocabulary.build.shards[0].sha256 =
+        crate::artifact_io::lower_hex(Sha256::digest(&bytes));
     rehash_manifest_body(&mut out_of_vocabulary);
     let error = out_of_vocabulary.verify(&path).unwrap_err().to_string();
     assert!(error.contains("outside vocabulary size"), "{error}");
