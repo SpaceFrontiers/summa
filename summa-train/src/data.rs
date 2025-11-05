@@ -21,7 +21,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use anyhow::{Context, Result, ensure};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use sha2::{Digest, Sha256};
 use summa_llm::Tokenizer;
 use summa_train::corpus::AuthenticatedCorpus;
@@ -376,7 +376,13 @@ fn hash_stable_phase_file(
         path.display()
     );
     file.rewind()?;
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    // Also compiled into the binary crate, so no `crate::artifact_io` path here.
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("sha256:{digest}"))
 }
 
 fn with_decoded_reader<T, R: Read>(

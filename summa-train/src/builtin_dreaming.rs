@@ -843,7 +843,10 @@ impl BuiltinDreamOps {
         self.config
             .artifact_directory
             .join("receipts")
-            .join(format!("generation-{:x}.json", key.finalize()))
+            .join(format!(
+                "generation-{}.json",
+                crate::artifact_io::lower_hex(key.finalize())
+            ))
     }
 
     fn generation_policy_identity(&self) -> (Option<&str>, Option<&str>) {

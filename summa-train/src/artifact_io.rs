@@ -35,7 +35,7 @@ const SHA256_IDENTITY_PREFIX: &str = "sha256:";
 
 /// Return the SHA-256 digest as exactly 64 lowercase hexadecimal characters.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::artifact_io::lower_hex(Sha256::digest(bytes))
 }
 
 /// Return the canonical content identity `sha256:<64 lowercase hex>`.
@@ -207,7 +207,7 @@ fn consume_open_file(
     );
     Ok((
         observed,
-        hasher.map(|hasher| format!("{:x}", hasher.finalize())),
+        hasher.map(|hasher| crate::artifact_io::lower_hex(hasher.finalize())),
         captured,
     ))
 }
@@ -1066,6 +1066,17 @@ fn errno_slot() -> Option<*mut libc::c_int> {
 ))]
 fn errno_slot() -> Option<*mut libc::c_int> {
     None
+}
+
+/// Lowercase hex of a digest; sha2 0.11 outputs no longer implement `LowerHex`.
+pub fn lower_hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 #[cfg(test)]

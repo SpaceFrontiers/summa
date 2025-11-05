@@ -2810,7 +2810,7 @@ async fn binary_single_copy_preserves_alter_retrain_compaction_and_all_combiners
 async fn test_binary_prefix_scan_end_to_end() {
     use crate::dsl::{BinaryDenseVectorConfig, VectorIndexAlter};
     use crate::query::{BinaryDenseVectorQuery, Query};
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     let dim_bits = 128;
     let byte_len = dim_bits / 8;
@@ -2995,7 +2995,7 @@ async fn test_binary_prefix_scan_end_to_end() {
 async fn test_binary_ivf_soar_end_to_end() {
     use crate::dsl::{BinaryDenseVectorConfig, VectorIndexAlter};
     use crate::query::BinaryDenseVectorQuery;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     let dim_bits = 128;
     let byte_len = dim_bits / 8;

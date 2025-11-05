@@ -3,7 +3,7 @@
 //! The anisotropic encoding objective is adapted from Google ScaNN 1.4.2,
 //! `asymmetric_hashing_impl.cc`, Apache-2.0. See the adjacent `NOTICE` file.
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::{ScannAhCodebook, ScannAhCodebookRef, ScannFormatError, ScannResult};
 

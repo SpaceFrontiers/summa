@@ -501,7 +501,12 @@ impl UreqSearchApiTransport {
     pub fn from_config(config: &SearchApiConfig) -> Result<Self> {
         config.validate()?;
         let timeout = Duration::from_secs(config.timeout_seconds);
-        let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+        // Statuses are handled below, so non-2xx responses are not transport errors.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build()
+            .into();
         let auth = config
             .auth
             .as_ref()
@@ -532,28 +537,30 @@ impl SearchApiTransport for UreqSearchApiTransport {
             let mut request = self
                 .agent
                 .post(endpoint)
-                .set("Content-Type", "application/json")
-                .set("X-Request-Source", "training-corpus");
+                .header("Content-Type", "application/json")
+                .header("X-Request-Source", "training-corpus");
             if let Some((header, value)) = &self.auth {
-                request = request.set(header, value);
+                request = request.header(header, value);
             }
             match request.send_json(body) {
-                Ok(response) => {
+                Ok(response) if response.status().is_success() => {
                     return parse_bounded_json_response(
-                        response.into_reader(),
+                        response.into_body().into_reader(),
                         self.max_response_bytes,
                     );
                 }
-                Err(ureq::Error::Status(status, response)) => {
-                    let retryable = matches!(status, 429 | 500 | 502 | 503 | 504);
+                Ok(response) => {
+                    let status = response.status();
+                    let retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
                     if !retryable || attempt == self.max_retries {
                         bail!(
-                            "search_api request failed with HTTP {status}: {}",
-                            response.status_text()
+                            "search_api request failed with HTTP {}: {}",
+                            status.as_u16(),
+                            status.canonical_reason().unwrap_or("")
                         );
                     }
                 }
-                Err(ureq::Error::Transport(error)) => {
+                Err(error) => {
                     if attempt == self.max_retries {
                         return Err(error).context("search_api transport failed");
                     }

@@ -156,7 +156,7 @@ export function useIpfs() {
         }
         const friendlyError = parseIpfsError(e, path)
         console.error('IPFS fetch error:', friendlyError)
-        throw new Error(friendlyError)
+        throw new Error(friendlyError, { cause: e })
       }
     }
   }
@@ -192,7 +192,7 @@ export function useIpfs() {
         }
         const friendlyError = parseIpfsError(e, path)
         console.error('IPFS size error:', friendlyError)
-        throw new Error(friendlyError)
+        throw new Error(friendlyError, { cause: e })
       }
     }
   }
