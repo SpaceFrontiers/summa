@@ -32,11 +32,11 @@
   "pnpm": {
     "overrides": {
       "rollup": "^4.62.2",
-      "postcss": "^8.5.19",
+      "postcss": "^8.5.32",
       "picomatch": "^4.0.5",
       "flatted": "^3.4.2",
       "uuid": "^11.1.1",
-      "js-yaml@4": "^4.3.0",
+      "js-yaml@4": "^4.3.2",
       "minimatch@3": "^3.1.5"
     }
   }
