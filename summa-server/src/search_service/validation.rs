@@ -421,6 +421,44 @@ fn validate_query_shape<'a>(
 
 /// Validate decoded request structure before acquiring scarce search capacity
 /// or recursively converting the protobuf query tree.
+/// Most ordinals an ordinal window keeps per hit before widening.
+pub(super) const MAX_ORDINAL_WINDOW_TOP: u32 = 64;
+/// Most neighbours an ordinal window adds on each side.
+pub(super) const MAX_ORDINAL_WINDOW_RADIUS: u32 = 16;
+
+fn validate_ordinal_window(
+    window: &OrdinalWindow,
+    fields_to_load: &[String],
+) -> Result<(), Status> {
+    if window.fields.is_empty() {
+        return Err(Status::invalid_argument(
+            "SearchRequest.ordinal_window.fields must name at least one field",
+        ));
+    }
+    if let Some(field) = window
+        .fields
+        .iter()
+        .find(|field| !fields_to_load.contains(field))
+    {
+        return Err(Status::invalid_argument(format!(
+            "SearchRequest.ordinal_window.fields entry '{field}' must also be in fields_to_load"
+        )));
+    }
+    if !(1..=MAX_ORDINAL_WINDOW_TOP).contains(&window.top) {
+        return Err(Status::invalid_argument(format!(
+            "SearchRequest.ordinal_window.top must be 1..={MAX_ORDINAL_WINDOW_TOP} (got {})",
+            window.top
+        )));
+    }
+    if window.radius > MAX_ORDINAL_WINDOW_RADIUS {
+        return Err(Status::invalid_argument(format!(
+            "SearchRequest.ordinal_window.radius must be at most {MAX_ORDINAL_WINDOW_RADIUS} (got {})",
+            window.radius
+        )));
+    }
+    Ok(())
+}
+
 fn validate_search_request_shape(
     req: &SearchRequest,
     root: &Query,
@@ -452,6 +490,10 @@ fn validate_search_request_shape(
              {} bytes (got {selected_name_bytes})",
             shape.max_fields_to_load_name_bytes
         )));
+    }
+
+    if let Some(window) = &req.ordinal_window {
+        validate_ordinal_window(window, &req.fields_to_load)?;
     }
 
     if req.include_rrf_scores

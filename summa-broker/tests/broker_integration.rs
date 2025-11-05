@@ -433,6 +433,7 @@ fn scored_hit(id: &str, score: f32) -> SearchHit {
             values: vec![FieldValue {
                 value: Some(field_value::Value::Text(id.to_string())),
             }],
+            ordinals: Vec::new(),
         },
     );
     SearchHit {
@@ -1139,6 +1140,7 @@ async fn configured_coordinator_budget_accepts_large_compressed_partition_respon
                 values: vec![FieldValue {
                     value: Some(field_value::Value::Text("x".repeat(24 * MIB))),
                 }],
+                ordinals: Vec::new(),
             },
         );
         mock.state.lock().search_response = SearchResponse {

@@ -238,6 +238,7 @@ mod tests {
                     values: vec![FieldValue {
                         value: Some(field_value::Value::Text("x".repeat(128))),
                     }],
+                    ordinals: Vec::new(),
                 },
             )]),
             ordinal_scores: Vec::new(),
