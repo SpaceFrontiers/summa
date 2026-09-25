@@ -14,8 +14,10 @@ The search `check` harness passes all five stages, including strict Clippy,
 2,075 tests (25 ignored), native-without-sync and standalone broker compilation.
 The WASM release build and 41 JavaScript tests pass; TypeScript has 17 passing
 tests, Model Lab has seven, and the search UI has two. Both web applications
-build. Documentation links and package source builds pass. Full RPC validation
-is recorded below once complete. No performance improvement is claimed or
+build. Documentation links and package source builds pass. The full nine-stage harness also passes, including portable core and API docs,
+a real server build, and five real-server broker tests. All 28 Python client
+tests pass against the renamed server. Workspace-wide strict Clippy passes
+through the required pre-push hook. No performance improvement is claimed or
 benchmark defaults changed.
 
 Historical evidence labels were mechanically renamed. The retained split ZIP
