@@ -1,15 +1,7 @@
 ---
-title: Rust
+title: Rust API
 parent: APIs
+source_doc: summa-core/README.md
 ---
 
-> Historical Summa 0.x guide. For Summa 2, use the [current documentation](https://github.com/SpaceFrontiers/summa/blob/main/docs/README.md).
-
-[![Crates.io](https://img.shields.io/crates/v/summa-proto.svg?label=summa-proto)](https://crates.io/crates/summa-proto)
-
-# Crate `summa_proto`
-
-The most direct and native way for accessing Summa through Rust
-is [summa_proto](https://docs.rs/summa-proto/latest/summa_proto/index.html) crate. It contains
-proto bindings used in `summa-server`. Examples of usage may be found
-in [summa/examples](https://github.com/SpaceFrontiers/summa/tree/master/examples)
+[Read the maintained guide](../../summa-core/README.md).

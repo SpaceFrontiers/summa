@@ -8,15 +8,17 @@ nav_order: 1
 Summa is a Rust search engine with full-text, sparse and dense vector search,
 a gRPC server and broker, and browser search and indexing through WebAssembly.
 
-Summa 2 is the current implementation. It has a new API and storage engine;
-original Summa 0.x indexes must be rebuilt from source documents.
+These guides describe **Summa 2**. Start with a local server or embed the same
+engine in Rust or a browser.
 
-- [Get started with Summa 2](https://github.com/SpaceFrontiers/summa#readme)
-- [Current documentation](https://github.com/SpaceFrontiers/summa/blob/main/docs/README.md)
-- [Summa 2 migration](https://github.com/SpaceFrontiers/summa/blob/main/docs/summa-2-migration.md)
-- [Source and releases](https://github.com/SpaceFrontiers/summa)
-- [Blog](blog/index.md)
+- [Quick start](quick-start.md): launch the SpaceFrontiers container, index documents and search.
+- [Core](core/index.md): schemas, query syntax and retrieval backends.
+- [APIs](apis/index.md): Python, TypeScript, Rust, gRPC and browser WASM.
+- [Guides](guides/index.md): server operations, sharding, updates and recovery.
+- [Migrating to Summa 2](guides/migration.md): package names, RPC namespaces and index compatibility.
+- [Blog](blog/index.md): search algorithms and the research behind them.
+- [Source and releases](https://github.com/SpaceFrontiers/summa).
 
-The blog covers search engine internals, dense and sparse retrieval, privacy,
-and decentralized search. The other guides on this site document the original
-0.x implementation and are retained for historical reference.
+Original Summa 0.x indexes must be rebuilt from source documents. The original
+blog articles retain their historical context; the API guides describe the
+current implementation.

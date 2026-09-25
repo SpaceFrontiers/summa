@@ -1,55 +1,29 @@
 ---
 title: Core
-nav_order: 2
+nav_order: 3
 has_children: true
-has_toc: true
 ---
 
-Summa is composed of multiple parts, the most important of which are
+# Core concepts
 
-- [Tantivy](https://github.com/quickwit-oss/tantivy) for creating indices and searching in them
-- [IPFS](https://github.com/ipfs/kubo) for downloading and distributing indices through [IPFS](https://ipfs.tech) network
-- [WASM](https://github.com/SpaceFrontiers/summa/tree/master/summa-wasm) for compiling and launching the subset of Summa in browsers
+`summa-core` owns storage, indexing, scoring and immutable segment publication.
+The server, broker, clients and WASM bindings expose that shared engine.
+Summa 2 uses its own Rust search engine; the original Tantivy-based API does
+not describe its schema or index format.
 
-Summa Server operates indices. The main object in Summa is `Index` that represents a set of data with common [schema](https://spacefrontiers.github.io/summa/core/schema) and backed with one of available `IndexEngine`.
-`IndexEngine` encapsulates all I/O operations. There are ready implementations for `Memory`, `File`, `IPFS` and `Remote`-backed indices.
+An index has a [schema](schema.md), a set of immutable segments and a writer.
+Indexing stages documents. A commit publishes a new searchable generation;
+merges combine compatible segments while preserving their stored semantics.
+Document addresses contain a segment ID and a segment-local document ID.
 
-### Index Engines
+- [Schema Definition Language](schema.md): field types, tokenizers, multi-value semantics and storage.
+- [Query language](query-dsl.md): Boolean clauses, phrases, fields, filters and vectors.
+- [Ranking and result collection](collectors.md): candidate generation, formulas, fusion and limits.
+- [Chunked text](chunked-text.md): passage indexing and document identity.
+- [Dense vectors](dense-vectors.md) and [sparse vectors](sparse-vectors.md).
+- [Rust API](../apis/rust-api.md): RAM, native filesystem and portable profiles.
 
-#### Memory
-
-Ephemeral index, with only the schema persisted, but data is wiped on every server restart
-
-```bash
-# Create new index
-summa-cli 0.0.0.0:8082 create-index test_index Memory \
-'[{"name": "title", "type": "text", "options": {"indexing": {"fieldnorms": True, "record": "position", "tokenizer": "default"}, "stored": True}}]'
-
-# Add 3 documents
-summa-cli 0.0.0.0:8082 index-document test_index '{"title": "Star Wars"}'
-summa-cli 0.0.0.0:8082 index-document test_index '{"title": "2001: A Space Odyssey"}'
-summa-cli 0.0.0.0:8082 index-document test_index '{"title": "War of the Worlds"}'
-
-# Commit index
-summa-cli 0.0.0.0:8082 commit-index test_index
-
-# Do search
-summa-cli 0.0.0.0:8082 search \
-'[{"index_alias": "test_index", "query": {"term": {"field": "title", "value": "war"}}, "collectors": [{"top_docs": {"limit": 10}}, {"count": {}}]}]'
-```
-
-#### File
-
-Main engine for creating persistent search index. It is the same as memory but backed with files.
-
-#### Remote
-
-`Remote` engine allows you to create search that retrieves index files from any remote HTTP storage (s3 including) on demand.
-
-### Aliases
-
-Server tracks aliases for indices and allows to atomically switch aliases:
-
-```bash
-summa-cli 0.0.0.0:8082 set-index-alias test_index test_index_20220113
-```
+Use the [server](../guides/server.md) for persistent indexes accessed over gRPC,
+or the [browser API](../apis/js-api.md) for writable local indexes and read-only
+HTTP/IPFS readers. Storage capabilities depend on the entry point; an old
+`IndexEngine` configuration cannot be passed to the new server.

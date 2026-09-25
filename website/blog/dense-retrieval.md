@@ -46,6 +46,30 @@ an explicit rule for combining passage hits into document results. Training,
 tokenization, truncation and query instructions all need to be versioned with
 the embeddings.
 
+## Teaching the geometry what matters
+
+Let's look at the training step. Suppose we have a query, a relevant passage
+$$d^+$$, and a set of negative passages $$\mathcal N$$. One common contrastive
+objective is
+
+$$\mathcal L=-\log\frac{\exp(s(q,d^+)/T)}{\exp(s(q,d^+)/T)+\sum_{d^-\in\mathcal N}\exp(s(q,d^-)/T)}.$$
+
+Here $$T>0$$ is a temperature; setting it to one gives the unscaled softmax.
+The loss asks the positive passage to win against the chosen alternatives.
+[Dense Passage Retrieval](https://arxiv.org/abs/2004.04906) made this dual-encoder
+approach practical for open-domain question answering, including the use of
+other examples in a training batch as negatives. Passage encoding can happen
+offline because the passage encoder does not need to see the query.
+
+What should count as a negative? A random page about gardening is an easy
+alternative to a password-reset guide. A page about resetting a two-factor
+authenticator is harder and may teach a useful distinction. But an unlabelled
+page can also answer the question. [RocketQA](https://doi.org/10.48550/arxiv.2010.08191)
+addresses this training problem with cross-batch negatives, denoised hard
+negatives and data augmentation. Harder examples are not automatically better
+labels. The model learns the distinctions represented by its training data;
+changing the index cannot teach a missing distinction afterward.
+
 ## Begin with an exact reference
 
 A flat search scores every stored vector. For N vectors of dimension D, the
@@ -84,6 +108,33 @@ latency. A selective filter can also change which execution strategy is best.
 Retrieving an unfiltered top-k and discarding forbidden rows afterward can
 leave too few eligible results.
 
+### Following the graph, or choosing a partition
+
+In HNSW, a search starts in sparse upper graph layers and descends toward a
+more detailed neighborhood. At the bottom layer, it maintains a set of
+promising candidates and explores their neighbors. A wider exploration set
+usually improves recall but requires more distance computations and reads.
+Graph connectivity and construction effort affect which routes exist in the
+first place. Raising the query budget cannot create an absent edge.
+The [HNSW paper](https://arxiv.org/abs/1603.09320) describes the hierarchy and
+neighbor-selection heuristic; it does not make every query logarithmic under
+arbitrary data, filters and update patterns.
+
+For IVF, let the corpus contain N vectors divided into C lists. Under the
+simplifying assumption of balanced lists, probing P lists examines about
+$$NP/C$$ vectors, in addition to routing work. This is a cost estimate, not a
+recall guarantee: the true neighbors may fall across a partition boundary.
+A long list or a filter selecting only a few documents can invalidate the
+average-case intuition. Measure the actual visited candidates and eligible
+results, not just the number of partitions.
+
+A useful back-of-the-envelope memory calculation is just as concrete. One
+million 768-dimensional float32 vectors occupy 3.072 GB before IDs, graph
+edges or metadata. Four bits per coordinate would occupy 384 MB for the codes
+alone. If exact reranking retains the original float32 values, those 3.072 GB
+still exist somewhere. Moving them to SSD changes residency and read latency;
+it does not remove them from the storage bill.
+
 ## Compression is a second source of approximation
 
 Quantization replaces full-precision vectors with smaller codes. Those codes
@@ -110,7 +161,13 @@ different losses.
 with compression designed for maximum inner-product search. Its anisotropic
 quantization objective treats errors differently according to their effect on
 important inner products. This is more specific than simply minimizing vector
-reconstruction error.
+reconstruction error. If a stored vector $$x$$ becomes $$\hat x$$, its score
+error is $$q^T(x-\hat x)$$. A small Euclidean reconstruction error is useful,
+but it treats every error direction alike. ScaNN's objective decomposes the
+residual into components parallel and perpendicular to $$x$$ and weights them
+differently to protect the high inner products that matter for retrieval.
+The practical consequence is that codec quality should be judged by recovered
+neighbors and score errors on queries, not only by reconstruction loss.
 
 [TurboQuant, published at ICLR 2026](https://proceedings.iclr.cc/paper_files/paper/2026/hash/5c802ef38ab6e366c2ea06eee554c088-Abstract-Conference.html),
 is a newer example of data-oblivious quantization. It uses randomized rotation,
@@ -148,6 +205,17 @@ and compute trade-off; it is not interchangeable with a single-vector ANN
 index. Support for multiple values in a field alone does not establish that an
 engine implements a complete ColBERT retrieval pipeline.
 
+A simplified late-interaction score makes the distinction explicit:
+
+$$s(q,d)=\sum_{i=1}^{|q|}\max_{j=1}^{|d|}q_i^T d_j.$$
+
+Each query token selects its best document-token match, then the matches are
+summed. Averaging all document tokens into one vector generally cannot
+preserve those query-dependent maxima. ColBERTv2 combines this interaction
+with residual compression and improved supervision. Candidate generation and
+the final MaxSim calculation remain separate costs; a multi-vector field
+needs the correct aggregation semantics as well as storage for repeated vectors.
+
 Dense and [sparse retrieval](sparse-retrieval.md) can also contribute different
 candidates to a hybrid system. Rank-based fusion avoids directly comparing
 unrelated raw score scales, but fusion depth, deduplication and subsequent
@@ -167,3 +235,15 @@ Treat a published result as evidence for its measured setting. The useful
 choice is the configuration that meets your quality and operating budget on
 your data, rather than whichever system most recently described itself as
 state of the art.
+
+## Papers to Read Next
+
+- [Karpukhin et al., Dense Passage Retrieval (2020)](https://arxiv.org/abs/2004.04906): the dual encoder and its training examples.
+- [Qu et al., RocketQA (2021)](https://doi.org/10.48550/arxiv.2010.08191): negative sampling and the problem of unlabelled positives.
+- [Malkov and Yashunin, HNSW](https://arxiv.org/abs/1603.09320): graph construction and search.
+- [Guo et al., Anisotropic Vector Quantization (2020)](https://proceedings.mlr.press/v119/guo20h.html): score-aware compression behind ScaNN.
+- [Santhanam et al., ColBERTv2 (2022)](https://arxiv.org/abs/2112.01488): multi-vector interaction and residual compression.
+
+These papers answer different questions. Use the training papers to understand
+representation quality, the index papers to understand candidate coverage,
+and end-to-end experiments to decide whether the complete system helps users.

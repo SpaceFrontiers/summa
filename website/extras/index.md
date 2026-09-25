@@ -1,10 +1,13 @@
 ---
 title: Extras
-nav_order: 5
+nav_order: 6
 has_children: true
-has_toc: true
 ---
 
-# Extras
+# Development and operations
 
-Section provides information related to development, performance and deployment
+- [Development](development.md): building and testing the workspace.
+- [Benchmarking](benchmark.md): fixtures, commands and reporting rules.
+- [Index diagnostics](diagnostics.md): inspecting index state and work.
+- [Deployment and proxying](proxy.md): protocol boundaries.
+- [Full architecture and research index](https://github.com/SpaceFrontiers/summa/blob/main/docs/README.md).
