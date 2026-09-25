@@ -1368,30 +1368,30 @@
       "sha256": "baea41f7e9bb3bb9807a0cdbe2571b01375a4790bffa12e8a547c63950ddc2fa",
       "archive_path": "count-batches/download.py"
     },
-    "count-batches/files/hermes-core/src/query/boolean.rs": {
+    "count-batches/files/summa-core/src/query/boolean.rs": {
       "bytes": 101035,
       "sha256": "99ac97387e647b8b5df8c2f3a2e2338b3d30673f777357e957bbb02e9b5dcfeb",
-      "archive_path": "count-batches/files/hermes-core/src/query/boolean.rs"
+      "archive_path": "count-batches/files/summa-core/src/query/boolean.rs"
     },
-    "count-batches/files/hermes-core/src/query/collector.rs": {
+    "count-batches/files/summa-core/src/query/collector.rs": {
       "bytes": 74162,
       "sha256": "2e9f357785c04d3629483684e487db49ffb3b0e64aa9dadd9ef68a53f4d2e853",
-      "archive_path": "count-batches/files/hermes-core/src/query/collector.rs"
+      "archive_path": "count-batches/files/summa-core/src/query/collector.rs"
     },
-    "count-batches/files/hermes-core/src/query/docset.rs": {
+    "count-batches/files/summa-core/src/query/docset.rs": {
       "bytes": 24265,
       "sha256": "df8b549900c66052f17b87406220540b12a1922167add661a1ce87fa77276629",
-      "archive_path": "count-batches/files/hermes-core/src/query/docset.rs"
+      "archive_path": "count-batches/files/summa-core/src/query/docset.rs"
     },
-    "count-batches/files/hermes-core/src/query/term.rs": {
+    "count-batches/files/summa-core/src/query/term.rs": {
       "bytes": 38962,
       "sha256": "dba98f94908b79ea197bc70ba8d87c9fed737b57b29ba11bb209de634c251281",
-      "archive_path": "count-batches/files/hermes-core/src/query/term.rs"
+      "archive_path": "count-batches/files/summa-core/src/query/term.rs"
     },
-    "count-batches/files/hermes-core/src/structures/postings/posting.rs": {
+    "count-batches/files/summa-core/src/structures/postings/posting.rs": {
       "bytes": 174674,
       "sha256": "478f4d37fd99455ce707ee8b079025fb7c9c8377217332e5e7c3bccf99236778",
-      "archive_path": "count-batches/files/hermes-core/src/structures/postings/posting.rs"
+      "archive_path": "count-batches/files/summa-core/src/structures/postings/posting.rs"
     },
     "count-batches/memory-summary.json": {
       "bytes": 181,
@@ -1833,25 +1833,25 @@
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "archive_path": "block-intersection/arm-canonical-groups-oracle.log"
     },
-    "exact-candidates/files/hermes-core/src/query/boolean.rs": {
+    "exact-candidates/files/summa-core/src/query/boolean.rs": {
       "bytes": 98396,
       "sha256": "43c3f514a4095c02383d969fb2d08d4391e81eacc546c8ed533b862a4aed11cf",
-      "archive_path": "exact-candidates/files/hermes-core/src/query/boolean.rs"
+      "archive_path": "exact-candidates/files/summa-core/src/query/boolean.rs"
     },
-    "exact-candidates/files/hermes-core/src/query/boolean/conjunction_window_tests.rs": {
+    "exact-candidates/files/summa-core/src/query/boolean/conjunction_window_tests.rs": {
       "bytes": 8651,
       "sha256": "4e8d086432441cb4002f9e59098b975459ea93850b6e9a096b1adadb37cb12bd",
-      "archive_path": "exact-candidates/files/hermes-core/src/query/boolean/conjunction_window_tests.rs"
+      "archive_path": "exact-candidates/files/summa-core/src/query/boolean/conjunction_window_tests.rs"
     },
-    "exact-candidates/files/hermes-core/src/query/term.rs": {
+    "exact-candidates/files/summa-core/src/query/term.rs": {
       "bytes": 39400,
       "sha256": "63c775922511425ea0529c0ad59c6910a68c14f249087fe706a4b25b058f0d1f",
-      "archive_path": "exact-candidates/files/hermes-core/src/query/term.rs"
+      "archive_path": "exact-candidates/files/summa-core/src/query/term.rs"
     },
-    "exact-candidates/files/hermes-core/src/query/traits.rs": {
+    "exact-candidates/files/summa-core/src/query/traits.rs": {
       "bytes": 28419,
       "sha256": "7f1645dc3699cf28aa1ec241f743a5100f660a7cc6a8d21c14f2a091a8e7c2c4",
-      "archive_path": "exact-candidates/files/hermes-core/src/query/traits.rs"
+      "archive_path": "exact-candidates/files/summa-core/src/query/traits.rs"
     },
     "exact-candidates/memory-summary.json": {
       "bytes": 181,
@@ -2658,15 +2658,15 @@
       "sha256": "8ebcaf5540de7616e03b43f4ca79bc211fa969fe9dcf7408b886fd455c89878c",
       "archive_path": "format-audit/download.py"
     },
-    "format-audit/hermes-provisional.json": {
+    "format-audit/summa-provisional.json": {
       "bytes": 1635,
       "sha256": "72d28ad9f3dbe80249702d6c632c7f6aaf187648651c8945362bcd049671b38b",
-      "archive_path": "format-audit/hermes-provisional.json"
+      "archive_path": "format-audit/summa-provisional.json"
     },
-    "format-audit/hermes_format_audit.rs": {
+    "format-audit/summa_format_audit.rs": {
       "bytes": 9643,
       "sha256": "ff4e3a0a56562370a00555926850f9ad29de636887535a9abd243ebf5b7dcc48",
-      "archive_path": "format-audit/hermes_format_audit.rs"
+      "archive_path": "format-audit/summa_format_audit.rs"
     },
     "format-audit/norm-table-verification.log": {
       "bytes": 114,
@@ -2763,22 +2763,22 @@
       "sha256": "1a79b86414f974720fc7b2c1b15c07aee19cca37799a19317eba6da595e48f7b",
       "archive_path": "format-audit/traversal-format-evidence/evidence-manifest.json"
     },
-    "format-audit/traversal-format-evidence/hermes-binary.sha256": {
+    "format-audit/traversal-format-evidence/summa-binary.sha256": {
       "bytes": 65,
       "sha256": "bdac917e69eb97a7c3837ea8128b38be45416b7ef30c3c4f91cd60ae7ff642a2",
-      "archive_path": "format-audit/traversal-format-evidence/hermes-binary.sha256"
+      "archive_path": "format-audit/traversal-format-evidence/summa-binary.sha256"
     },
-    "format-audit/traversal-format-evidence/hermes-build.log": {
+    "format-audit/traversal-format-evidence/summa-build.log": {
       "bytes": 145,
       "sha256": "0c741600cda644be3a782e9a3bb3251d86882f4d97fb0dbfffdf261120d1e4b2",
-      "archive_path": "format-audit/traversal-format-evidence/hermes-build.log"
+      "archive_path": "format-audit/traversal-format-evidence/summa-build.log"
     },
-    "format-audit/traversal-format-evidence/hermes.json": {
+    "format-audit/traversal-format-evidence/summa.json": {
       "bytes": 1635,
       "sha256": "72d28ad9f3dbe80249702d6c632c7f6aaf187648651c8945362bcd049671b38b",
-      "archive_path": "format-audit/hermes-provisional.json"
+      "archive_path": "format-audit/summa-provisional.json"
     },
-    "format-audit/traversal-format-evidence/hermes.stderr": {
+    "format-audit/traversal-format-evidence/summa.stderr": {
       "bytes": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "archive_path": "block-intersection/arm-canonical-groups-oracle.log"
@@ -5873,15 +5873,15 @@
       "sha256": "1aa7076ee7fe2ed9c63346b054e8b1b02c282b74f7d71ac89e12d675d596774b",
       "archive_path": "phrase-blocks/download.py"
     },
-    "phrase-blocks/files/hermes-core/src/query/phrase.rs": {
+    "phrase-blocks/files/summa-core/src/query/phrase.rs": {
       "bytes": 86923,
       "sha256": "0ee60dce12cd5c6deb71dc3c1a1a1f1adfd15d83b80b1b75e23384c6f8f274a5",
-      "archive_path": "phrase-blocks/files/hermes-core/src/query/phrase.rs"
+      "archive_path": "phrase-blocks/files/summa-core/src/query/phrase.rs"
     },
-    "phrase-blocks/files/hermes-core/src/structures/postings/posting.rs": {
+    "phrase-blocks/files/summa-core/src/structures/postings/posting.rs": {
       "bytes": 175100,
       "sha256": "595cdf1f5cb61f651eae1000ec3400fc82ee3643071624f47d4d1b38fadd18f5",
-      "archive_path": "phrase-blocks/files/hermes-core/src/structures/postings/posting.rs"
+      "archive_path": "phrase-blocks/files/summa-core/src/structures/postings/posting.rs"
     },
     "phrase-blocks/paired.py": {
       "bytes": 4372,
@@ -6563,35 +6563,35 @@
       "sha256": "aa09e1e9c726f1aac46fbede735932d0cc93f4b8649f806359ce9dbfacfbef73",
       "archive_path": "scored-batches/download.py"
     },
-    "scored-batches/files/hermes-core/src/query/boolean.rs": {
+    "scored-batches/files/summa-core/src/query/boolean.rs": {
       "bytes": 105943,
       "sha256": "98b3f697d3a3adff931215848253e9514f73c2502263c26a035d8d792f590c2d",
-      "archive_path": "scored-batches/files/hermes-core/src/query/boolean.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/boolean.rs"
     },
-    "scored-batches/files/hermes-core/src/query/collector.rs": {
+    "scored-batches/files/summa-core/src/query/collector.rs": {
       "bytes": 77054,
       "sha256": "088256c99c58da772c981b948ba8beadc06b68ef594f07ee630662256c4c5909",
-      "archive_path": "scored-batches/files/hermes-core/src/query/collector.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/collector.rs"
     },
-    "scored-batches/files/hermes-core/src/query/scoring.rs": {
+    "scored-batches/files/summa-core/src/query/scoring.rs": {
       "bytes": 231640,
       "sha256": "8a9864430ffbe18614eddbde05be9b1a7946d4c94566a2d18486a94ae6320f70",
-      "archive_path": "scored-batches/files/hermes-core/src/query/scoring.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/scoring.rs"
     },
-    "scored-batches/files/hermes-core/src/query/term.rs": {
+    "scored-batches/files/summa-core/src/query/term.rs": {
       "bytes": 45210,
       "sha256": "717fb5dca5e94e3c0c4be196a424174701807f0ba34310772ec2c7b4badd096a",
-      "archive_path": "scored-batches/files/hermes-core/src/query/term.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/term.rs"
     },
-    "scored-batches/files/hermes-core/src/query/traits.rs": {
+    "scored-batches/files/summa-core/src/query/traits.rs": {
       "bytes": 30047,
       "sha256": "f77da1ac9cfd8df9d9b13bea2684e8d0abe9206c6157db5e4af2bf1289456b8a",
-      "archive_path": "scored-batches/files/hermes-core/src/query/traits.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/traits.rs"
     },
-    "scored-batches/files/hermes-core/src/structures/postings/posting.rs": {
+    "scored-batches/files/summa-core/src/structures/postings/posting.rs": {
       "bytes": 175815,
       "sha256": "6e7097c61289c0bae80db86058becffdc4e7f9eda789195215eb39fb71fb92ce",
-      "archive_path": "scored-batches/files/hermes-core/src/structures/postings/posting.rs"
+      "archive_path": "scored-batches/files/summa-core/src/structures/postings/posting.rs"
     },
     "scored-batches/freeze.py": {
       "bytes": 3479,
@@ -6998,15 +6998,15 @@
       "sha256": "5ee68c56ded05e4709885c6402514be5c7a27f1e1c5d0cebf2eef058f1d4963d",
       "archive_path": "scored-mask/candidate.patch"
     },
-    "scored-mask/files/hermes-core/src/query/collector.rs": {
+    "scored-mask/files/summa-core/src/query/collector.rs": {
       "bytes": 72080,
       "sha256": "802139a67d9bc7f417367bc8b75ec56f436f1e5aedf244acdac2c47633eae374",
-      "archive_path": "scored-mask/files/hermes-core/src/query/collector.rs"
+      "archive_path": "scored-mask/files/summa-core/src/query/collector.rs"
     },
-    "scored-mask/files/hermes-core/src/query/scoring.rs": {
+    "scored-mask/files/summa-core/src/query/scoring.rs": {
       "bytes": 231927,
       "sha256": "efc3b857c86720ae466f41b26e92c3cdd6da09bcc7d52bc706a37ef28d963509",
-      "archive_path": "scored-mask/files/hermes-core/src/query/scoring.rs"
+      "archive_path": "scored-mask/files/summa-core/src/query/scoring.rs"
     },
     "scored-mask/prepare.py": {
       "bytes": 3672,
@@ -7433,50 +7433,50 @@
       "sha256": "acd17492061e59fb7d80f7df863adf3fa86202acf394c7a82ac69ae49a587c18",
       "archive_path": "traversal-final/exact-top-count-integration.patch"
     },
-    "traversal-final/files/hermes-core/examples/search_benchmark_game.rs": {
+    "traversal-final/files/summa-core/examples/search_benchmark_game.rs": {
       "bytes": 15212,
       "sha256": "af04c4a054ada197049c43e799b7469171db5c0a46d1aae90088db853b3f80a1",
-      "archive_path": "traversal-final/files/hermes-core/examples/search_benchmark_game.rs"
+      "archive_path": "traversal-final/files/summa-core/examples/search_benchmark_game.rs"
     },
-    "traversal-final/files/hermes-core/src/query/boolean.rs": {
+    "traversal-final/files/summa-core/src/query/boolean.rs": {
       "bytes": 105943,
       "sha256": "98b3f697d3a3adff931215848253e9514f73c2502263c26a035d8d792f590c2d",
-      "archive_path": "scored-batches/files/hermes-core/src/query/boolean.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/boolean.rs"
     },
-    "traversal-final/files/hermes-core/src/query/collector.rs": {
+    "traversal-final/files/summa-core/src/query/collector.rs": {
       "bytes": 97916,
       "sha256": "298500a26545b571fbd057c35bb19d8d6498c5bfc69b390b917cce43c68db177",
-      "archive_path": "traversal-final/files/hermes-core/src/query/collector.rs"
+      "archive_path": "traversal-final/files/summa-core/src/query/collector.rs"
     },
-    "traversal-final/files/hermes-core/src/query/docset.rs": {
+    "traversal-final/files/summa-core/src/query/docset.rs": {
       "bytes": 24265,
       "sha256": "df8b549900c66052f17b87406220540b12a1922167add661a1ce87fa77276629",
-      "archive_path": "count-batches/files/hermes-core/src/query/docset.rs"
+      "archive_path": "count-batches/files/summa-core/src/query/docset.rs"
     },
-    "traversal-final/files/hermes-core/src/query/planner.rs": {
+    "traversal-final/files/summa-core/src/query/planner.rs": {
       "bytes": 44660,
       "sha256": "20265abce1084d353987c62b0241da724b66995a7fb16a724d84aedb13546325",
-      "archive_path": "traversal-final/files/hermes-core/src/query/planner.rs"
+      "archive_path": "traversal-final/files/summa-core/src/query/planner.rs"
     },
-    "traversal-final/files/hermes-core/src/query/scoring.rs": {
+    "traversal-final/files/summa-core/src/query/scoring.rs": {
       "bytes": 235692,
       "sha256": "e459e01bb9777658a635806fb7b92baf44740f3f29a5291e933d03f65996c207",
-      "archive_path": "traversal-final/files/hermes-core/src/query/scoring.rs"
+      "archive_path": "traversal-final/files/summa-core/src/query/scoring.rs"
     },
-    "traversal-final/files/hermes-core/src/query/term.rs": {
+    "traversal-final/files/summa-core/src/query/term.rs": {
       "bytes": 45210,
       "sha256": "717fb5dca5e94e3c0c4be196a424174701807f0ba34310772ec2c7b4badd096a",
-      "archive_path": "scored-batches/files/hermes-core/src/query/term.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/term.rs"
     },
-    "traversal-final/files/hermes-core/src/query/traits.rs": {
+    "traversal-final/files/summa-core/src/query/traits.rs": {
       "bytes": 30047,
       "sha256": "f77da1ac9cfd8df9d9b13bea2684e8d0abe9206c6157db5e4af2bf1289456b8a",
-      "archive_path": "scored-batches/files/hermes-core/src/query/traits.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/traits.rs"
     },
-    "traversal-final/files/hermes-core/src/structures/postings/posting.rs": {
+    "traversal-final/files/summa-core/src/structures/postings/posting.rs": {
       "bytes": 175815,
       "sha256": "6e7097c61289c0bae80db86058becffdc4e7f9eda789195215eb39fb71fb92ce",
-      "archive_path": "scored-batches/files/hermes-core/src/structures/postings/posting.rs"
+      "archive_path": "scored-batches/files/summa-core/src/structures/postings/posting.rs"
     },
     "traversal-final/isolated-summary.log": {
       "bytes": 8852,
@@ -7598,1655 +7598,1655 @@
       "sha256": "bb2ec963f450dd13fbae27bb10bfbbd5ed708fdee9045c5ff947a99a871420f3",
       "archive_path": "traversal-final/staging/Cargo.toml"
     },
-    "traversal-final/staging/hermes-broker/Cargo.toml": {
+    "traversal-final/staging/summa-broker/Cargo.toml": {
       "bytes": 1698,
       "sha256": "4877976fa65d8609beffd21fee93a0c93d1442369cf3b5f2b42ba512e866b1f3",
-      "archive_path": "traversal-final/staging/hermes-broker/Cargo.toml"
+      "archive_path": "traversal-final/staging/summa-broker/Cargo.toml"
     },
-    "traversal-final/staging/hermes-broker/Dockerfile": {
+    "traversal-final/staging/summa-broker/Dockerfile": {
       "bytes": 1620,
       "sha256": "6d8710fb91c51056b29ee6a615846694bcf1d320b3639b130c8216b5ba4ea7d7",
-      "archive_path": "traversal-final/staging/hermes-broker/Dockerfile"
+      "archive_path": "traversal-final/staging/summa-broker/Dockerfile"
     },
-    "traversal-final/staging/hermes-broker/README.md": {
+    "traversal-final/staging/summa-broker/README.md": {
       "bytes": 2406,
       "sha256": "ce6a0aa666aadebd4f0f1dd977b7509484be870aa09d0df65f2aadb1e129a555",
-      "archive_path": "traversal-final/staging/hermes-broker/README.md"
+      "archive_path": "traversal-final/staging/summa-broker/README.md"
     },
-    "traversal-final/staging/hermes-broker/build.rs": {
+    "traversal-final/staging/summa-broker/build.rs": {
       "bytes": 847,
       "sha256": "972c593bee8058234f558489a88313c60931dfb5b8a35e7a71175ddfe4359658",
-      "archive_path": "traversal-final/staging/hermes-broker/build.rs"
+      "archive_path": "traversal-final/staging/summa-broker/build.rs"
     },
-    "traversal-final/staging/hermes-broker/src/admin_service.rs": {
+    "traversal-final/staging/summa-broker/src/admin_service.rs": {
       "bytes": 6552,
       "sha256": "fc9566c83f3c8d79e5dba866161c9469e783d1a73b03aa66575dbc2f97d7059c",
-      "archive_path": "traversal-final/staging/hermes-broker/src/admin_service.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/admin_service.rs"
     },
-    "traversal-final/staging/hermes-broker/src/client.rs": {
+    "traversal-final/staging/summa-broker/src/client.rs": {
       "bytes": 7153,
       "sha256": "433518d3a9319be87cc938c3933de78113e87110d68c1a0106cd94e0b36466f8",
-      "archive_path": "traversal-final/staging/hermes-broker/src/client.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/client.rs"
     },
-    "traversal-final/staging/hermes-broker/src/context.rs": {
+    "traversal-final/staging/summa-broker/src/context.rs": {
       "bytes": 2715,
       "sha256": "79d3f9159b1d1552b8b801ce8f1f373bdbbc701586f8313946b8e92ad1e8ca8e",
-      "archive_path": "traversal-final/staging/hermes-broker/src/context.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/context.rs"
     },
-    "traversal-final/staging/hermes-broker/src/discovery.rs": {
+    "traversal-final/staging/summa-broker/src/discovery.rs": {
       "bytes": 2786,
       "sha256": "3fff5acc30cabcfaab3a1dca3617409341f4ae5e8941597f077eb85b4c5b73e1",
-      "archive_path": "traversal-final/staging/hermes-broker/src/discovery.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/discovery.rs"
     },
-    "traversal-final/staging/hermes-broker/src/index_service.rs": {
+    "traversal-final/staging/summa-broker/src/index_service.rs": {
       "bytes": 19704,
       "sha256": "cb7e1b26ccc38f7fda0f37a0dbcfeffa4a95d2e116a5a8abd6fce5d0ab41b610",
-      "archive_path": "traversal-final/staging/hermes-broker/src/index_service.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/index_service.rs"
     },
-    "traversal-final/staging/hermes-broker/src/index_service/mutations.rs": {
+    "traversal-final/staging/summa-broker/src/index_service/mutations.rs": {
       "bytes": 7302,
       "sha256": "c3e33ef5a63d80e6fca1a7edd9d99765aa981aedf69f60a236fae5b608438f30",
-      "archive_path": "traversal-final/staging/hermes-broker/src/index_service/mutations.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/index_service/mutations.rs"
     },
-    "traversal-final/staging/hermes-broker/src/kube_discovery.rs": {
+    "traversal-final/staging/summa-broker/src/kube_discovery.rs": {
       "bytes": 10765,
       "sha256": "06aba6d61f630b6bc2b464369dbc70a736a3b3ac29d82b7580ba548a6ba8a55a",
-      "archive_path": "traversal-final/staging/hermes-broker/src/kube_discovery.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/kube_discovery.rs"
     },
-    "traversal-final/staging/hermes-broker/src/main.rs": {
+    "traversal-final/staging/summa-broker/src/main.rs": {
       "bytes": 23849,
       "sha256": "f4a5a0070ef308497c3d8d18fe957298bb02ce1bf0f3906253bd7559c9e0aa6f",
-      "archive_path": "traversal-final/staging/hermes-broker/src/main.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/main.rs"
     },
-    "traversal-final/staging/hermes-broker/src/metrics.rs": {
+    "traversal-final/staging/summa-broker/src/metrics.rs": {
       "bytes": 2440,
       "sha256": "b6e214d58d329d48656714e4c193b014c3cf572a0b98ec5067deed3a62056665",
-      "archive_path": "traversal-final/staging/hermes-broker/src/metrics.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/metrics.rs"
     },
-    "traversal-final/staging/hermes-broker/src/partition.rs": {
+    "traversal-final/staging/summa-broker/src/partition.rs": {
       "bytes": 30228,
       "sha256": "1a26617de622eac39ffe04a8bcea2e3dde296fc39b066d8f34c30db5ad46da28",
-      "archive_path": "traversal-final/staging/hermes-broker/src/partition.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/partition.rs"
     },
-    "traversal-final/staging/hermes-broker/src/placement.rs": {
+    "traversal-final/staging/summa-broker/src/placement.rs": {
       "bytes": 6275,
       "sha256": "984440cb2df75b54202a2989b01e640e658e15a488ceb2017356f5973ca3b037",
-      "archive_path": "traversal-final/staging/hermes-broker/src/placement.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/placement.rs"
     },
-    "traversal-final/staging/hermes-broker/src/poller.rs": {
+    "traversal-final/staging/summa-broker/src/poller.rs": {
       "bytes": 13650,
       "sha256": "458221f41cbd12219a94af8856e8236435b165e2ba437fab28822d3471c2cafa",
-      "archive_path": "traversal-final/staging/hermes-broker/src/poller.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/poller.rs"
     },
-    "traversal-final/staging/hermes-broker/src/proto.rs": {
+    "traversal-final/staging/summa-broker/src/proto.rs": {
       "bytes": 956,
       "sha256": "0c35916d8c42f5815c5d3bfd373b2cda9eccce55a302f10f6a3de4e953e62aea",
-      "archive_path": "traversal-final/staging/hermes-broker/src/proto.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/proto.rs"
     },
-    "traversal-final/staging/hermes-broker/src/ranking.rs": {
+    "traversal-final/staging/summa-broker/src/ranking.rs": {
       "bytes": 53952,
       "sha256": "b5bf788a89aa31db472d9def8372264c348acc9771a676f190a782bedf3c68aa",
-      "archive_path": "traversal-final/staging/hermes-broker/src/ranking.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/ranking.rs"
     },
-    "traversal-final/staging/hermes-broker/src/ranking/rrf.rs": {
+    "traversal-final/staging/summa-broker/src/ranking/rrf.rs": {
       "bytes": 7494,
       "sha256": "2c52940e9d2d71bca0846e92c80962c0e6e24ab46ecef641b32a17143ca3bf40",
-      "archive_path": "traversal-final/staging/hermes-broker/src/ranking/rrf.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/ranking/rrf.rs"
     },
-    "traversal-final/staging/hermes-broker/src/routes.rs": {
+    "traversal-final/staging/summa-broker/src/routes.rs": {
       "bytes": 6391,
       "sha256": "8482560617d0853d3860db6dabc4c3c1d51c5135830b96a34e268477289b259c",
-      "archive_path": "traversal-final/staging/hermes-broker/src/routes.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/routes.rs"
     },
-    "traversal-final/staging/hermes-broker/src/search_service.rs": {
+    "traversal-final/staging/summa-broker/src/search_service.rs": {
       "bytes": 17426,
       "sha256": "0156ec4866f6a6f9676461a8a507c3b14ac16f7c5a0ba77c157cdb12339c6f82",
-      "archive_path": "traversal-final/staging/hermes-broker/src/search_service.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/search_service.rs"
     },
-    "traversal-final/staging/hermes-broker/src/topology.rs": {
+    "traversal-final/staging/summa-broker/src/topology.rs": {
       "bytes": 29693,
       "sha256": "dc6b53e4df70146738b4ab019ec41d00bcdcc13b87ffc5219281b94db495d04e",
-      "archive_path": "traversal-final/staging/hermes-broker/src/topology.rs"
+      "archive_path": "traversal-final/staging/summa-broker/src/topology.rs"
     },
-    "traversal-final/staging/hermes-broker/tests/broker_integration.rs": {
+    "traversal-final/staging/summa-broker/tests/broker_integration.rs": {
       "bytes": 25824,
       "sha256": "0b9af239be6521b4fcbce22490ba887c9cd9d24412ba509f500a0682fa94dc17",
-      "archive_path": "traversal-final/staging/hermes-broker/tests/broker_integration.rs"
+      "archive_path": "traversal-final/staging/summa-broker/tests/broker_integration.rs"
     },
-    "traversal-final/staging/hermes-broker/tests/e2e_real_server.rs": {
+    "traversal-final/staging/summa-broker/tests/e2e_real_server.rs": {
       "bytes": 40471,
       "sha256": "ef470cd1c5a2d386373fb0aedb37fd491e6af0c7c534ea5c0dc7420472bff3b0",
-      "archive_path": "traversal-final/staging/hermes-broker/tests/e2e_real_server.rs"
+      "archive_path": "traversal-final/staging/summa-broker/tests/e2e_real_server.rs"
     },
-    "traversal-final/staging/hermes-broker/tests/support/mod.rs": {
+    "traversal-final/staging/summa-broker/tests/support/mod.rs": {
       "bytes": 17270,
       "sha256": "73e47a8d4e67c6fed0fb279b19cf5b598c5285ae871d954debfc1fc209eeccc1",
-      "archive_path": "traversal-final/staging/hermes-broker/tests/support/mod.rs"
+      "archive_path": "traversal-final/staging/summa-broker/tests/support/mod.rs"
     },
-    "traversal-final/staging/hermes-core/.gitignore": {
+    "traversal-final/staging/summa-core/.gitignore": {
       "bytes": 15,
       "sha256": "c71aad25b57875d5f10d967e2c4c178fedb1eec5526ca179d5ac7c593c647299",
-      "archive_path": "traversal-final/staging/hermes-core/.gitignore"
+      "archive_path": "traversal-final/staging/summa-core/.gitignore"
     },
-    "traversal-final/staging/hermes-core/Cargo.toml": {
+    "traversal-final/staging/summa-core/Cargo.toml": {
       "bytes": 4822,
       "sha256": "6f0b2a3a35e14a5a00b219d19cc67f694249c24e5e1a00c9dbabf945918de49d",
-      "archive_path": "traversal-final/staging/hermes-core/Cargo.toml"
+      "archive_path": "traversal-final/staging/summa-core/Cargo.toml"
     },
-    "traversal-final/staging/hermes-core/README.md": {
+    "traversal-final/staging/summa-core/README.md": {
       "bytes": 5069,
       "sha256": "99b14603e4c8005004ca462d6480931d4b3aef778c6acd97798aabbedbaf74e0",
-      "archive_path": "traversal-final/staging/hermes-core/README.md"
+      "archive_path": "traversal-final/staging/summa-core/README.md"
     },
-    "traversal-final/staging/hermes-core/benches/binary_vectors.rs": {
+    "traversal-final/staging/summa-core/benches/binary_vectors.rs": {
       "bytes": 13608,
       "sha256": "828912dcde287296f0ec50c15cad547f3c170472f87bfcdf39530c94b3672194",
-      "archive_path": "traversal-final/staging/hermes-core/benches/binary_vectors.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/binary_vectors.rs"
     },
-    "traversal-final/staging/hermes-core/benches/bmp_hot_path.rs": {
+    "traversal-final/staging/summa-core/benches/bmp_hot_path.rs": {
       "bytes": 10531,
       "sha256": "08089e58c032cf3fd8b885482a72d199140d1a5fc378e8a628273ec718a130ed",
-      "archive_path": "traversal-final/staging/hermes-core/benches/bmp_hot_path.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/bmp_hot_path.rs"
     },
-    "traversal-final/staging/hermes-core/benches/bmp_payload_layout.rs": {
+    "traversal-final/staging/summa-core/benches/bmp_payload_layout.rs": {
       "bytes": 18121,
       "sha256": "cc6df7888d48f50863af1c118dea1830b939c01e6ecac95ed038c224a91d755b",
-      "archive_path": "traversal-final/staging/hermes-core/benches/bmp_payload_layout.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/bmp_payload_layout.rs"
     },
-    "traversal-final/staging/hermes-core/benches/bmp_reorder.rs": {
+    "traversal-final/staging/summa-core/benches/bmp_reorder.rs": {
       "bytes": 19186,
       "sha256": "5237c3a652832ced091947d714b5139a9a96f61ff8d5d981b6912455e59b9d92",
-      "archive_path": "traversal-final/staging/hermes-core/benches/bmp_reorder.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/bmp_reorder.rs"
     },
-    "traversal-final/staging/hermes-core/benches/bmp_vs_maxscore.rs": {
+    "traversal-final/staging/summa-core/benches/bmp_vs_maxscore.rs": {
       "bytes": 67585,
       "sha256": "d8fde21c912020103aa1affe1d57bba4719e48249ab26c9be5c41a5d31d67a29",
-      "archive_path": "traversal-final/staging/hermes-core/benches/bmp_vs_maxscore.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/bmp_vs_maxscore.rs"
     },
-    "traversal-final/staging/hermes-core/benches/compression.rs": {
+    "traversal-final/staging/summa-core/benches/compression.rs": {
       "bytes": 3145,
       "sha256": "5d62bc821eb4f7bebcb88f3325130a12104b72601645b5faeb716767fbefe8c0",
-      "archive_path": "traversal-final/staging/hermes-core/benches/compression.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/compression.rs"
     },
-    "traversal-final/staging/hermes-core/benches/core_structures.rs": {
+    "traversal-final/staging/summa-core/benches/core_structures.rs": {
       "bytes": 16363,
       "sha256": "f055736f5c6c83ab5687b1d371dfc4e77efa290bebfdaffdd8fdf7b0efd925e4",
-      "archive_path": "traversal-final/staging/hermes-core/benches/core_structures.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/core_structures.rs"
     },
-    "traversal-final/staging/hermes-core/benches/dense_ann.rs": {
+    "traversal-final/staging/summa-core/benches/dense_ann.rs": {
       "bytes": 14496,
       "sha256": "f9769792b1c10897a597def0f0cbae205a28f1bb1d30dae54fd6497aa9a891c4",
-      "archive_path": "traversal-final/staging/hermes-core/benches/dense_ann.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/dense_ann.rs"
     },
-    "traversal-final/staging/hermes-core/benches/generate_benchmark_data.py": {
+    "traversal-final/staging/summa-core/benches/generate_benchmark_data.py": {
       "bytes": 40150,
       "sha256": "4ce4dd97589942590345283b1b0a7af91f74fcbea7a94272cd150f84ee22711a",
-      "archive_path": "traversal-final/staging/hermes-core/benches/generate_benchmark_data.py"
+      "archive_path": "traversal-final/staging/summa-core/benches/generate_benchmark_data.py"
     },
-    "traversal-final/staging/hermes-core/benches/generate_embeddings.py": {
+    "traversal-final/staging/summa-core/benches/generate_embeddings.py": {
       "bytes": 6053,
       "sha256": "6a616591550f908aeecdee26331892c45a0b189abaf846122e70b955866b812f",
-      "archive_path": "traversal-final/staging/hermes-core/benches/generate_embeddings.py"
+      "archive_path": "traversal-final/staging/summa-core/benches/generate_embeddings.py"
     },
-    "traversal-final/staging/hermes-core/benches/hermes_benchmark/config.rs": {
+    "traversal-final/staging/summa-core/benches/summa_benchmark/config.rs": {
       "bytes": 2273,
       "sha256": "2e8c949fe9d6ca1905c50e171696be5de89b97feec84f6b7583c5ed6b7db14d2",
-      "archive_path": "traversal-final/staging/hermes-core/benches/hermes_benchmark/config.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/summa_benchmark/config.rs"
     },
-    "traversal-final/staging/hermes-core/benches/hermes_benchmark/corpus.rs": {
+    "traversal-final/staging/summa-core/benches/summa_benchmark/corpus.rs": {
       "bytes": 830,
       "sha256": "bd7773f052da0d366d7a209729d4c3ac626645b38de5eb01c8973b5dfc7ade32",
-      "archive_path": "traversal-final/staging/hermes-core/benches/hermes_benchmark/corpus.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/summa_benchmark/corpus.rs"
     },
-    "traversal-final/staging/hermes-core/benches/hermes_benchmark/data.rs": {
+    "traversal-final/staging/summa-core/benches/summa_benchmark/data.rs": {
       "bytes": 7624,
       "sha256": "6bce234e827a394bcc0540ff3cd9e0996b53c4cfbc8e3f190f0cf5ccd7e26db0",
-      "archive_path": "traversal-final/staging/hermes-core/benches/hermes_benchmark/data.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/summa_benchmark/data.rs"
     },
-    "traversal-final/staging/hermes-core/benches/hermes_benchmark/main.rs": {
+    "traversal-final/staging/summa-core/benches/summa_benchmark/main.rs": {
       "bytes": 27716,
       "sha256": "62d606e9839bb6369ceb27c45156da0e031035e35cc25881c083ff334d24917f",
-      "archive_path": "traversal-final/staging/hermes-core/benches/hermes_benchmark/main.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/summa_benchmark/main.rs"
     },
-    "traversal-final/staging/hermes-core/benches/hermes_benchmark/metrics.rs": {
+    "traversal-final/staging/summa-core/benches/summa_benchmark/metrics.rs": {
       "bytes": 2091,
       "sha256": "df63a295334460bfa221097a0b86763ffe143262afd2383d4ff4c5479adbfd6e",
-      "archive_path": "traversal-final/staging/hermes-core/benches/hermes_benchmark/metrics.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/summa_benchmark/metrics.rs"
     },
-    "traversal-final/staging/hermes-core/benches/hermes_benchmark/output.rs": {
+    "traversal-final/staging/summa-core/benches/summa_benchmark/output.rs": {
       "bytes": 6023,
       "sha256": "17c19fb8970f5171ad4a1966050fc42a85de87c8a85ab0bc92a645157d4c338c",
-      "archive_path": "traversal-final/staging/hermes-core/benches/hermes_benchmark/output.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/summa_benchmark/output.rs"
     },
-    "traversal-final/staging/hermes-core/benches/indexing.rs": {
+    "traversal-final/staging/summa-core/benches/indexing.rs": {
       "bytes": 4758,
       "sha256": "1b2d7a7bbe4492b744efdd0b8ec6a8b73654ead0497946a951ac9abaabc7b6d0",
-      "archive_path": "traversal-final/staging/hermes-core/benches/indexing.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/indexing.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/access_patterns.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/access_patterns.rs": {
       "bytes": 18931,
       "sha256": "991d3a794380007ae4edd3bb5b891a209bbbc7f7c2c2952bd808aa1f40901c2d",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/access_patterns.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/access_patterns.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/block_decompression.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/block_decompression.rs": {
       "bytes": 14619,
       "sha256": "3d926628ef80bbcc0e6a12eafe52d81f060e2776aabcfe969a183023d466c02a",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/block_decompression.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/block_decompression.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/common.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/common.rs": {
       "bytes": 8723,
       "sha256": "12ac8cb0b0938dc0c457dac0c86d0d109f73b9f2ab63d1dadbf8889928fa3034",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/common.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/common.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/deserialization.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/deserialization.rs": {
       "bytes": 4104,
       "sha256": "ecdc68968097d0fb2847b373a962b4461facf7314e10fb364ccde41ae1b18c1f",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/deserialization.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/deserialization.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/distribution.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/distribution.rs": {
       "bytes": 5352,
       "sha256": "aa06ece77a8f5b01fb9edf57c38bd9ebf95f5b05f78672dde3aa1fa20e9fe11e",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/distribution.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/distribution.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/encoding.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/encoding.rs": {
       "bytes": 6944,
       "sha256": "6d29e5e80a9eca956913925b0d4cf4c161ecfecbb13988c37393ec1014316514",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/encoding.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/encoding.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/iteration.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/iteration.rs": {
       "bytes": 10656,
       "sha256": "7c58ad866d63d2f737b6f43256746b718fbb5af4b0ffc224c4bd2bbf335530ed",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/iteration.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/iteration.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/main.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/main.rs": {
       "bytes": 1176,
       "sha256": "7971a5fa3a0e20af2ba29968cb6defdfaeb79aa6acfe694bd57d42d43b92f876",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/main.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/main.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/mod.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/mod.rs": {
       "bytes": 999,
       "sha256": "757292673ba8967d4b3197836222f4842b20d688063e8ecb1a48f4f0b1dedb3b",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/mod.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/seek.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/seek.rs": {
       "bytes": 1877,
       "sha256": "98589b2897ed3e67d806b8cfafcbf60754bd119627d3e2134b7b982a4e32d147",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/seek.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/seek.rs"
     },
-    "traversal-final/staging/hermes-core/benches/posting_compression/summary.rs": {
+    "traversal-final/staging/summa-core/benches/posting_compression/summary.rs": {
       "bytes": 12776,
       "sha256": "cfda39f3df88c784d100c40ec6c5f3de8cf1b0d77c38741c082ff06b60d0801b",
-      "archive_path": "traversal-final/staging/hermes-core/benches/posting_compression/summary.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/posting_compression/summary.rs"
     },
-    "traversal-final/staging/hermes-core/benches/rust_hot_paths.rs": {
+    "traversal-final/staging/summa-core/benches/rust_hot_paths.rs": {
       "bytes": 9927,
       "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f",
-      "archive_path": "traversal-final/staging/hermes-core/benches/rust_hot_paths.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/rust_hot_paths.rs"
     },
-    "traversal-final/staging/hermes-core/benches/scann_vectors.rs": {
+    "traversal-final/staging/summa-core/benches/scann_vectors.rs": {
       "bytes": 12271,
       "sha256": "5a0659fce5c51c98f04490351f290e6a8ecd3a0375198d4e49e73fabc613e4e7",
-      "archive_path": "traversal-final/staging/hermes-core/benches/scann_vectors.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/scann_vectors.rs"
     },
-    "traversal-final/staging/hermes-core/benches/search_pipeline.rs": {
+    "traversal-final/staging/summa-core/benches/search_pipeline.rs": {
       "bytes": 9368,
       "sha256": "4d7c46717ac73cdd0a9054e0533282fbc86a5b4efc4e2a7bbc9212a6b04f3f11",
-      "archive_path": "traversal-final/staging/hermes-core/benches/search_pipeline.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/search_pipeline.rs"
     },
-    "traversal-final/staging/hermes-core/benches/segment_merge.rs": {
+    "traversal-final/staging/summa-core/benches/segment_merge.rs": {
       "bytes": 13940,
       "sha256": "334a4be142fbf0f9bd0397ed4aa85bfb96d01e9d0733c99004b7484088f22e8e",
-      "archive_path": "traversal-final/staging/hermes-core/benches/segment_merge.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/segment_merge.rs"
     },
-    "traversal-final/staging/hermes-core/benches/test_triton.py": {
+    "traversal-final/staging/summa-core/benches/test_triton.py": {
       "bytes": 2106,
       "sha256": "2c10cbee3fb4c0f6bfa034de2793d731fbe0fed71c277bef6024919f62d89c2f",
-      "archive_path": "traversal-final/staging/hermes-core/benches/test_triton.py"
+      "archive_path": "traversal-final/staging/summa-core/benches/test_triton.py"
     },
-    "traversal-final/staging/hermes-core/benches/vector_indexing.rs": {
+    "traversal-final/staging/summa-core/benches/vector_indexing.rs": {
       "bytes": 5512,
       "sha256": "6946c6a32470245af50f71d8f7c9b9ba3f0ad618b48ad1dbbca982ed4b128174",
-      "archive_path": "traversal-final/staging/hermes-core/benches/vector_indexing.rs"
+      "archive_path": "traversal-final/staging/summa-core/benches/vector_indexing.rs"
     },
-    "traversal-final/staging/hermes-core/examples/bm25_execution_benchmark.rs": {
+    "traversal-final/staging/summa-core/examples/bm25_execution_benchmark.rs": {
       "bytes": 4164,
       "sha256": "3ffab6782c23514e3ddc6da7c1655cba796d57986e52dd59df559a40bddd8f04",
-      "archive_path": "traversal-final/staging/hermes-core/examples/bm25_execution_benchmark.rs"
+      "archive_path": "traversal-final/staging/summa-core/examples/bm25_execution_benchmark.rs"
     },
-    "traversal-final/staging/hermes-core/examples/indexing_scratch_benchmark.rs": {
+    "traversal-final/staging/summa-core/examples/indexing_scratch_benchmark.rs": {
       "bytes": 2538,
       "sha256": "67a013567ff69b20844439dbe3bed3d4dd0981ae7e2386f2d242424b9b44b6bd",
-      "archive_path": "traversal-final/staging/hermes-core/examples/indexing_scratch_benchmark.rs"
+      "archive_path": "traversal-final/staging/summa-core/examples/indexing_scratch_benchmark.rs"
     },
-    "traversal-final/staging/hermes-core/examples/search_benchmark_game.rs": {
+    "traversal-final/staging/summa-core/examples/search_benchmark_game.rs": {
       "bytes": 15212,
       "sha256": "af04c4a054ada197049c43e799b7469171db5c0a46d1aae90088db853b3f80a1",
-      "archive_path": "traversal-final/files/hermes-core/examples/search_benchmark_game.rs"
+      "archive_path": "traversal-final/files/summa-core/examples/search_benchmark_game.rs"
     },
-    "traversal-final/staging/hermes-core/src/compression/mod.rs": {
+    "traversal-final/staging/summa-core/src/compression/mod.rs": {
       "bytes": 651,
       "sha256": "7c3ff73b9cf5aca64471cb8174a509e50cde33ce56e3cc938ec3edc143a9b01a",
-      "archive_path": "traversal-final/staging/hermes-core/src/compression/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/compression/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/compression/zstd.rs": {
+    "traversal-final/staging/summa-core/src/compression/zstd.rs": {
       "bytes": 20437,
       "sha256": "f911474d04d0f26aa722bac869e75cc07684ab88b1d3df3c4cdbb5560bf1896d",
-      "archive_path": "traversal-final/staging/hermes-core/src/compression/zstd.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/compression/zstd.rs"
     },
-    "traversal-final/staging/hermes-core/src/directories/cold_io.rs": {
+    "traversal-final/staging/summa-core/src/directories/cold_io.rs": {
       "bytes": 11167,
       "sha256": "f2601ef102befcc51d5c1ad48464fb67e825dac1c3f6d62e066cd498ff5c19be",
-      "archive_path": "traversal-final/staging/hermes-core/src/directories/cold_io.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/directories/cold_io.rs"
     },
-    "traversal-final/staging/hermes-core/src/directories/directory.rs": {
+    "traversal-final/staging/summa-core/src/directories/directory.rs": {
       "bytes": 46287,
       "sha256": "ecbb4d836201a40b2a363a59baaa19f38cb7cbc59891ed1bb8559c85c53fd8c5",
-      "archive_path": "traversal-final/staging/hermes-core/src/directories/directory.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/directories/directory.rs"
     },
-    "traversal-final/staging/hermes-core/src/directories/http.rs": {
+    "traversal-final/staging/summa-core/src/directories/http.rs": {
       "bytes": 10995,
       "sha256": "67e124b15a2e5cb9c7eafdeaf1695cd70aa6a0ab9e00920b93d7201a5fe18d0d",
-      "archive_path": "traversal-final/staging/hermes-core/src/directories/http.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/directories/http.rs"
     },
-    "traversal-final/staging/hermes-core/src/directories/mmap.rs": {
+    "traversal-final/staging/summa-core/src/directories/mmap.rs": {
       "bytes": 10335,
       "sha256": "c73ff1d23dc0302d12e58cde988a7695fcd2772d96ae59aa86a0ef5e8a75d1fc",
-      "archive_path": "traversal-final/staging/hermes-core/src/directories/mmap.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/directories/mmap.rs"
     },
-    "traversal-final/staging/hermes-core/src/directories/mod.rs": {
+    "traversal-final/staging/summa-core/src/directories/mod.rs": {
       "bytes": 980,
       "sha256": "f4546aa47d8195e39663eb8e1adf4986a87e2daad97543ee40c518741c2cb384",
-      "archive_path": "traversal-final/staging/hermes-core/src/directories/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/directories/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/directories/slice_cache.rs": {
+    "traversal-final/staging/summa-core/src/directories/slice_cache.rs": {
       "bytes": 52318,
       "sha256": "da1ea985ab63bd044d46ffb66617c06f47b4cca02b9699477a62c61772088a18",
-      "archive_path": "traversal-final/staging/hermes-core/src/directories/slice_cache.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/directories/slice_cache.rs"
     },
-    "traversal-final/staging/hermes-core/src/dsl/mod.rs": {
+    "traversal-final/staging/summa-core/src/dsl/mod.rs": {
       "bytes": 536,
       "sha256": "e966db3d308684d623bf18ba51626a7c925e7185895d5baecf8f6f5f05b14e18",
-      "archive_path": "traversal-final/staging/hermes-core/src/dsl/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/dsl/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/dsl/ql/mod.rs": {
+    "traversal-final/staging/summa-core/src/dsl/ql/mod.rs": {
       "bytes": 44237,
       "sha256": "9cda6cd18c3db6af15b5e223d03b9a6b31c5413313482427c1b619df28e2d366",
-      "archive_path": "traversal-final/staging/hermes-core/src/dsl/ql/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/dsl/ql/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/dsl/ql/ql.pest": {
+    "traversal-final/staging/summa-core/src/dsl/ql/ql.pest": {
       "bytes": 2546,
       "sha256": "4981ae6791ee55ddd4642fc8a805854b77efc10f3282461eb43285a578ce43ca",
-      "archive_path": "traversal-final/staging/hermes-core/src/dsl/ql/ql.pest"
+      "archive_path": "traversal-final/staging/summa-core/src/dsl/ql/ql.pest"
     },
-    "traversal-final/staging/hermes-core/src/dsl/query_field_router.rs": {
+    "traversal-final/staging/summa-core/src/dsl/query_field_router.rs": {
       "bytes": 17745,
       "sha256": "acb0e33fdcc4d972c27cafd57c5c9b867ad37a383d1b88a1694fccd429faa57e",
-      "archive_path": "traversal-final/staging/hermes-core/src/dsl/query_field_router.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/dsl/query_field_router.rs"
     },
-    "traversal-final/staging/hermes-core/src/dsl/schema.rs": {
+    "traversal-final/staging/summa-core/src/dsl/schema.rs": {
       "bytes": 82239,
       "sha256": "5ce5662e98873785def7620be4b5778a8e56db1f2e1e139e9ad018203f1c9f2f",
-      "archive_path": "traversal-final/staging/hermes-core/src/dsl/schema.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/dsl/schema.rs"
     },
-    "traversal-final/staging/hermes-core/src/dsl/sdl/mod.rs": {
+    "traversal-final/staging/summa-core/src/dsl/sdl/mod.rs": {
       "bytes": 123311,
       "sha256": "46404a3d3accfda2f5a6f6cc8c4c72c572448c5d804c8c185891fe0867c410cd",
-      "archive_path": "traversal-final/staging/hermes-core/src/dsl/sdl/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/dsl/sdl/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/dsl/sdl/sdl.pest": {
+    "traversal-final/staging/summa-core/src/dsl/sdl/sdl.pest": {
       "bytes": 12318,
       "sha256": "a06f9caef4e0fb94bfd841a55dc01339cbf872056b19feda95228396a9bdd45b",
-      "archive_path": "traversal-final/staging/hermes-core/src/dsl/sdl/sdl.pest"
+      "archive_path": "traversal-final/staging/summa-core/src/dsl/sdl/sdl.pest"
     },
-    "traversal-final/staging/hermes-core/src/error.rs": {
+    "traversal-final/staging/summa-core/src/error.rs": {
       "bytes": 1404,
       "sha256": "7f4fe807cbb8c33e54da325cfe4a3a1edb05dca4c1030a20d19fa462e163c426",
-      "archive_path": "traversal-final/staging/hermes-core/src/error.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/error.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/helpers.rs": {
+    "traversal-final/staging/summa-core/src/index/helpers.rs": {
       "bytes": 11015,
       "sha256": "1391f470ca4d32fcca2e2b11498e195734c81fb195936c57e51c2f6858e14859",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/helpers.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/helpers.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/metadata.rs": {
+    "traversal-final/staging/summa-core/src/index/metadata.rs": {
       "bytes": 73466,
       "sha256": "ce91f850f8744b48935064450b6e6dfbf5410997c85c0826e2a7c8eb50a136c6",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/metadata.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/metadata.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/mod.rs": {
+    "traversal-final/staging/summa-core/src/index/mod.rs": {
       "bytes": 44770,
       "sha256": "9f83536a405acd17978a109a8d5c4d336e9c0dad2114ea7ec18af79eea31fc7f",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/primary_key.rs": {
+    "traversal-final/staging/summa-core/src/index/primary_key.rs": {
       "bytes": 27956,
       "sha256": "8bff5a12e1ed8314c33684e0a9f538e87813bff16ab58a51f2f3ad836233258c",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/primary_key.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/primary_key.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/reader.rs": {
+    "traversal-final/staging/summa-core/src/index/reader.rs": {
       "bytes": 14398,
       "sha256": "15d2f78d655bcbfcd5f5cc1dd4e9dd677661b1865b979252377218d4a81838e4",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/reader.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/reader.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/searcher.rs": {
+    "traversal-final/staging/summa-core/src/index/searcher.rs": {
       "bytes": 90516,
       "sha256": "7d5d0f823ff78caca4e48d6ee4546f645cd1c4277eeab7f30d9d933c347e114b",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/searcher.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/searcher.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/basic.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/basic.rs": {
       "bytes": 16861,
       "sha256": "9ca7b37b7612e13735898af1d51d1bbf97eb0f1378547241e4ffcfa2e5da1fcd",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/basic.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/basic.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/bmp.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/bmp.rs": {
       "bytes": 180764,
       "sha256": "9f18e083a8e1870c6abaf803c6b697bd4ed70e1fcff884cafe3abd43592fde58",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/bmp.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/bmp.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/boolean.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/boolean.rs": {
       "bytes": 52423,
       "sha256": "767467c3f327f3f998ca5df7c4a19c262e255035ea1979894e288390b04db287",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/boolean.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/boolean.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/chunked.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/chunked.rs": {
       "bytes": 49925,
       "sha256": "d94ed99c65e2c3b22da16e13ed17ee51a11f80c91124fa9172422b67d87b1b8c",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/chunked.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/chunked.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/config_policy.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/config_policy.rs": {
       "bytes": 4603,
       "sha256": "cd6fc5b93d849aa6f2eb7b7184e70afada376347f69047f4f34788d7494cb5d2",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/config_policy.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/config_policy.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/deletion.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/deletion.rs": {
       "bytes": 34423,
       "sha256": "bcce3caaeca69d20900f61545d7aebb28a831c6f03d4d6021459d3a55f67b00c",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/deletion.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/deletion.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/format_migration.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/format_migration.rs": {
       "bytes": 4524,
       "sha256": "07a2b2273368113eb137b20b19a97c287e87da24f0c57cf4f7ed78ca1ab40a4a",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/format_migration.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/format_migration.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/maintenance.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/maintenance.rs": {
       "bytes": 5160,
       "sha256": "55d30bef30089936fd0258ffd9e7ad2591a27ae50a0932b53cc80aa50317f3d1",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/maintenance.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/maintenance.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/merge.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/merge.rs": {
       "bytes": 60224,
       "sha256": "fda6814a2faa55775ef5db1a2b4b3fe66a2cb674f1b4d2d7fc24ac34347e9394",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/merge.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/merge.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/merge_bounds.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/merge_bounds.rs": {
       "bytes": 10525,
       "sha256": "c67b2fafcd286ef9719cd07fa8190eb37667a4855fe90987d1e9f63e1bbf01ce",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/merge_bounds.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/merge_bounds.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/mod.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/mod.rs": {
       "bytes": 7363,
       "sha256": "d84820cdb8adf37e16976637b2ab5a97fc4a14869cf70af2d2dedbad0c1e8db5",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/pin.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/pin.rs": {
       "bytes": 5308,
       "sha256": "a0b6582a07b21d9a7a11574784b8f6fcc9ad3fa7525c76094077565e7f08f5cc",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/pin.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/pin.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/posting_codecs.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/posting_codecs.rs": {
       "bytes": 2327,
       "sha256": "15cb9a5a0f9d5bdf50494d73f3a522e7c8e7e5295ed2a921eb32d2b3a01e4f44",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/posting_codecs.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/posting_codecs.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/primary_key.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/primary_key.rs": {
       "bytes": 50684,
       "sha256": "123c33e22e841ff61e5d17dbba461b03751d24981e437c0f1cf5a852f03f4f8f",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/primary_key.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/primary_key.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/range.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/range.rs": {
       "bytes": 10859,
       "sha256": "3cbad129e3503a981cd1b9ac15dc39e0601ec13dd7a765d3cb628a6601a1b5a1",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/range.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/range.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/search.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/search.rs": {
       "bytes": 70954,
       "sha256": "4d56472bb96b005cec9cf8b7a4bbf4db30ad50132dca4359c9c26300706ae7f9",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/search.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/search.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/search_cpu.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/search_cpu.rs": {
       "bytes": 2738,
       "sha256": "0ea4a1d645843cbc453c983eeb5c498dd8157661a32b68c55ebca0f76c06303d",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/search_cpu.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/search_cpu.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/tq_bench.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/tq_bench.rs": {
       "bytes": 19128,
       "sha256": "64b0224266ae3a3c7143dcf9ed9467db375d32ab18877b6ea4dc1bbdc3aae1e0",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/tq_bench.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/tq_bench.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/tests/vector.rs": {
+    "traversal-final/staging/summa-core/src/index/tests/vector.rs": {
       "bytes": 91672,
       "sha256": "b168326c0e82dc85e4245d9a04c47a98037ab22b484e68220ed99c0f747743e5",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/tests/vector.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/tests/vector.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/vector_builder.rs": {
+    "traversal-final/staging/summa-core/src/index/vector_builder.rs": {
       "bytes": 127398,
       "sha256": "bbea1740c1ffb48113bf4621a027247f08700200461362f6f87844acb3aee044",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/vector_builder.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/vector_builder.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/wasm_writer.rs": {
+    "traversal-final/staging/summa-core/src/index/wasm_writer.rs": {
       "bytes": 16745,
       "sha256": "b1ad07b9e052f6aa7ee0ab5e89952dd20f4ba0b74994eeb610dae84493d728bc",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/wasm_writer.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/wasm_writer.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/wasm_writer/mutations.rs": {
+    "traversal-final/staging/summa-core/src/index/wasm_writer/mutations.rs": {
       "bytes": 11437,
       "sha256": "0cb6c64674f055b73c2cc0c4be1cbfaf6c37fab2e072712dc64ecd0677885e0e",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/wasm_writer/mutations.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/wasm_writer/mutations.rs"
     },
-    "traversal-final/staging/hermes-core/src/index/writer.rs": {
+    "traversal-final/staging/summa-core/src/index/writer.rs": {
       "bytes": 101818,
       "sha256": "a7e3ff1bb92084d8a5961ee390ad0c7cf2c897e6f81ebe46357c1e3f7f59ae94",
-      "archive_path": "traversal-final/staging/hermes-core/src/index/writer.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/index/writer.rs"
     },
-    "traversal-final/staging/hermes-core/src/lib.rs": {
+    "traversal-final/staging/summa-core/src/lib.rs": {
       "bytes": 6377,
       "sha256": "d9071a329a9ddc6737e9d1842d776692f5a23527beedd814200d53867803c29b",
-      "archive_path": "traversal-final/staging/hermes-core/src/lib.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/lib.rs"
     },
-    "traversal-final/staging/hermes-core/src/merge/mod.rs": {
+    "traversal-final/staging/summa-core/src/merge/mod.rs": {
       "bytes": 37194,
       "sha256": "4d2f348561a564e4bd909ffe851bff4718b83bf1055c79e8d6379457a83e69ba",
-      "archive_path": "traversal-final/staging/hermes-core/src/merge/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/merge/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/merge/row_mutation.rs": {
+    "traversal-final/staging/summa-core/src/merge/row_mutation.rs": {
       "bytes": 16271,
       "sha256": "094e4f0bcb6a74ddc2efcf235d43d8cea2ce2334867b3076c3f20758d10c5c5d",
-      "archive_path": "traversal-final/staging/hermes-core/src/merge/row_mutation.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/merge/row_mutation.rs"
     },
-    "traversal-final/staging/hermes-core/src/merge/segment_manager.rs": {
+    "traversal-final/staging/summa-core/src/merge/segment_manager.rs": {
       "bytes": 212354,
       "sha256": "933b88674db2624081d933f2a0cf7ca91fa6cbff490d0878e385205e5996fd65",
-      "archive_path": "traversal-final/staging/hermes-core/src/merge/segment_manager.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/merge/segment_manager.rs"
     },
-    "traversal-final/staging/hermes-core/src/observe.rs": {
+    "traversal-final/staging/summa-core/src/observe.rs": {
       "bytes": 26657,
       "sha256": "9436281d1645d41785aea49632e78d7d2f92af62475be72bd8791ac2d5dcbc17",
-      "archive_path": "traversal-final/staging/hermes-core/src/observe.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/observe.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/all.rs": {
+    "traversal-final/staging/summa-core/src/query/all.rs": {
       "bytes": 5153,
       "sha256": "946f2343799fac946eafd11c59e74f5d63a31735b45dd5ec4dc3d4a03bef2125",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/all.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/all.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/bm25.rs": {
+    "traversal-final/staging/summa-core/src/query/bm25.rs": {
       "bytes": 16898,
       "sha256": "5fca611886184c199f04d825d706f2e700418d10db68725209bbedc7dbd56f38",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/bm25.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/bm25.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/bmp.rs": {
+    "traversal-final/staging/summa-core/src/query/bmp.rs": {
       "bytes": 102206,
       "sha256": "f6a11d8e86dbcf4b5b584aa675635fda67dd64fcd1f19340cbf8c00ed2853092",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/bmp.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/bmp.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/bmp_forward_experiment.rs": {
+    "traversal-final/staging/summa-core/src/query/bmp_forward_experiment.rs": {
       "bytes": 10050,
       "sha256": "04d59655e92c1aeb720451fb895a426cbf8c1ca96206f6274d74d07ca2b88aad",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/bmp_forward_experiment.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/bmp_forward_experiment.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/bmp_forward_lookup_experiment.rs": {
+    "traversal-final/staging/summa-core/src/query/bmp_forward_lookup_experiment.rs": {
       "bytes": 12390,
       "sha256": "b414bf0ce109966762355ad1871e38b930431373771bd489422be3ae0593a13b",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/bmp_forward_lookup_experiment.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/bmp_forward_lookup_experiment.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/boolean.rs": {
+    "traversal-final/staging/summa-core/src/query/boolean.rs": {
       "bytes": 105943,
       "sha256": "98b3f697d3a3adff931215848253e9514f73c2502263c26a035d8d792f590c2d",
-      "archive_path": "scored-batches/files/hermes-core/src/query/boolean.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/boolean.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/boolean/conjunction_window_tests.rs": {
+    "traversal-final/staging/summa-core/src/query/boolean/conjunction_window_tests.rs": {
       "bytes": 8575,
       "sha256": "d508fa837c22d2e891da46d2bb601e59438b773fb16eb9d6e5bc94aa31bbe572",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/boolean/conjunction_window_tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/boolean/conjunction_window_tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/boost.rs": {
+    "traversal-final/staging/summa-core/src/query/boost.rs": {
       "bytes": 5713,
       "sha256": "4360996a87d2d1cd2a85f686ddeef65f49a71d68f1f73a1e45bf77d98c953ee6",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/boost.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/boost.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/candidate_scoring/execution.rs": {
+    "traversal-final/staging/summa-core/src/query/candidate_scoring/execution.rs": {
       "bytes": 39825,
       "sha256": "75bf4246ea049a08a94e54c89eb4a978f640584e9fadf017dbf1caba1c1936ee",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/candidate_scoring/execution.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/candidate_scoring/execution.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/candidate_scoring/formula.rs": {
+    "traversal-final/staging/summa-core/src/query/candidate_scoring/formula.rs": {
       "bytes": 11241,
       "sha256": "36fdc417674b173daa7b1cb941f0305abfe1b8c22c9fe1c2ac264489713ae804",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/candidate_scoring/formula.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/candidate_scoring/formula.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/candidate_scoring/mod.rs": {
+    "traversal-final/staging/summa-core/src/query/candidate_scoring/mod.rs": {
       "bytes": 8866,
       "sha256": "5aea87abb41acb1caddb6dc9292278231f3457841ff01306541c3a0988c9bd36",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/candidate_scoring/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/candidate_scoring/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/candidate_scoring/model.rs": {
+    "traversal-final/staging/summa-core/src/query/candidate_scoring/model.rs": {
       "bytes": 4502,
       "sha256": "62b3ef724d77df1bfe234e8fffbd37c4a584206cec9868b9351f079b744444a9",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/candidate_scoring/model.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/candidate_scoring/model.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/candidate_scoring/retrieved.rs": {
+    "traversal-final/staging/summa-core/src/query/candidate_scoring/retrieved.rs": {
       "bytes": 2860,
       "sha256": "c74686ba023e410d75e167069ceef9282198cd462a5cb98ebad8f028b62000b7",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/candidate_scoring/retrieved.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/candidate_scoring/retrieved.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/candidate_scoring/tests.rs": {
+    "traversal-final/staging/summa-core/src/query/candidate_scoring/tests.rs": {
       "bytes": 42297,
       "sha256": "088d9579380e5395f3e73e671aa75672a92c6e73e72128a7c06aa0b37221dcde",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/candidate_scoring/tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/candidate_scoring/tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/collector.rs": {
+    "traversal-final/staging/summa-core/src/query/collector.rs": {
       "bytes": 97916,
       "sha256": "298500a26545b571fbd057c35bb19d8d6498c5bfc69b390b917cce43c68db177",
-      "archive_path": "traversal-final/files/hermes-core/src/query/collector.rs"
+      "archive_path": "traversal-final/files/summa-core/src/query/collector.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/collector.rs.orig": {
+    "traversal-final/staging/summa-core/src/query/collector.rs.orig": {
       "bytes": 88380,
       "sha256": "467b1613162a61a6fcd49282208fc6e265193239f2a4e43cebab8cc75307a278",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/collector.rs.orig"
+      "archive_path": "traversal-final/staging/summa-core/src/query/collector.rs.orig"
     },
-    "traversal-final/staging/hermes-core/src/query/docset.rs": {
+    "traversal-final/staging/summa-core/src/query/docset.rs": {
       "bytes": 24265,
       "sha256": "df8b549900c66052f17b87406220540b12a1922167add661a1ce87fa77276629",
-      "archive_path": "count-batches/files/hermes-core/src/query/docset.rs"
+      "archive_path": "count-batches/files/summa-core/src/query/docset.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/filtered.rs": {
+    "traversal-final/staging/summa-core/src/query/filtered.rs": {
       "bytes": 8895,
       "sha256": "579f8d21d6d5a858a7d0f8aad69ce6a53aa74f12167512065b9314e9684a40cb",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/filtered.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/filtered.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/filtered/tests.rs": {
+    "traversal-final/staging/summa-core/src/query/filtered/tests.rs": {
       "bytes": 22404,
       "sha256": "4c463e665fa99726c7c044b4e7a78a2a677cbc19e35b14e3384cb3a27b6d69ea",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/filtered/tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/filtered/tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/fusion.rs": {
+    "traversal-final/staging/summa-core/src/query/fusion.rs": {
       "bytes": 27292,
       "sha256": "71f3a5ae61125d55622e6fcb8e75bf4df1ec8d288bf164a60305958701931f71",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/fusion.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/fusion.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/fusion/rrf_scores.rs": {
+    "traversal-final/staging/summa-core/src/query/fusion/rrf_scores.rs": {
       "bytes": 12580,
       "sha256": "b8defa0bb354c1906399da341b99f62a2a947e447d25882627e846da76c4ca2b",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/fusion/rrf_scores.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/fusion/rrf_scores.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/global_stats.rs": {
+    "traversal-final/staging/summa-core/src/query/global_stats.rs": {
       "bytes": 23349,
       "sha256": "4740a4908ffbfcf63abc4d1525d36894f378eff72bea2213ea0e54355cca86c8",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/global_stats.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/global_stats.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/mod.rs": {
+    "traversal-final/staging/summa-core/src/query/mod.rs": {
       "bytes": 1786,
       "sha256": "e31ec587e537ea364b08d3de8c998932fb63ee3e9cacbb49c2258054bf76f73a",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/phrase.rs": {
+    "traversal-final/staging/summa-core/src/query/phrase.rs": {
       "bytes": 87278,
       "sha256": "6ea42fb3ee28ff75f9b0f8f8ab2bf469fcd6ed55247a6405ab7e9a2641e364e4",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/phrase.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/phrase.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/planner.rs": {
+    "traversal-final/staging/summa-core/src/query/planner.rs": {
       "bytes": 44660,
       "sha256": "20265abce1084d353987c62b0241da724b66995a7fb16a724d84aedb13546325",
-      "archive_path": "traversal-final/files/hermes-core/src/query/planner.rs"
+      "archive_path": "traversal-final/files/summa-core/src/query/planner.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/prefix.rs": {
+    "traversal-final/staging/summa-core/src/query/prefix.rs": {
       "bytes": 9727,
       "sha256": "1047115b1e8b1c3bf9b9796185f643ecf1d103e59de5c0fd2aa1d89532eb1606",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/prefix.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/prefix.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/proximity.rs": {
+    "traversal-final/staging/summa-core/src/query/proximity.rs": {
       "bytes": 6737,
       "sha256": "8f7913d6aa39569b7aedcc92e164fe246177ebc490cbff2e8364df8fcbc04e28",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/proximity.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/proximity.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/range.rs": {
+    "traversal-final/staging/summa-core/src/query/range.rs": {
       "bytes": 13077,
       "sha256": "87073af5ede11e9c23cfc8a9f849937d0b2e061462cf858b9b2724a91353e4e1",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/range.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/range.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/required_text.rs": {
+    "traversal-final/staging/summa-core/src/query/required_text.rs": {
       "bytes": 9384,
       "sha256": "3fa28198b29df9a759826184a4b14274d3fe0c332a71e78e5fa04be7d7c2f3a3",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/required_text.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/required_text.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/reranker.rs": {
+    "traversal-final/staging/summa-core/src/query/reranker.rs": {
       "bytes": 55195,
       "sha256": "cc93c709eef3a4aca639c7fa363d4fbc39bc9a680cac330a05e339ba58aca6fd",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/reranker.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/reranker.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/scoring.rs": {
+    "traversal-final/staging/summa-core/src/query/scoring.rs": {
       "bytes": 235692,
       "sha256": "e459e01bb9777658a635806fb7b92baf44740f3f29a5291e933d03f65996c207",
-      "archive_path": "traversal-final/files/hermes-core/src/query/scoring.rs"
+      "archive_path": "traversal-final/files/summa-core/src/query/scoring.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/scoring_tests.rs": {
+    "traversal-final/staging/summa-core/src/query/scoring_tests.rs": {
       "bytes": 53450,
       "sha256": "246b840bfd580ef9c4c0164ecc1a46b0e6b973fd64cc5992ef0f7f9d4bb15180",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/scoring_tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/scoring_tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/term.rs": {
+    "traversal-final/staging/summa-core/src/query/term.rs": {
       "bytes": 45210,
       "sha256": "717fb5dca5e94e3c0c4be196a424174701807f0ba34310772ec2c7b4badd096a",
-      "archive_path": "scored-batches/files/hermes-core/src/query/term.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/term.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/traits.rs": {
+    "traversal-final/staging/summa-core/src/query/traits.rs": {
       "bytes": 30047,
       "sha256": "f77da1ac9cfd8df9d9b13bea2684e8d0abe9206c6157db5e4af2bf1289456b8a",
-      "archive_path": "scored-batches/files/hermes-core/src/query/traits.rs"
+      "archive_path": "scored-batches/files/summa-core/src/query/traits.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/vector/binary_dense.rs": {
+    "traversal-final/staging/summa-core/src/query/vector/binary_dense.rs": {
       "bytes": 3960,
       "sha256": "4cb7b8fa06a474142a718d514752e1d656751c8685af44bb40432defecf25adf",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/vector/binary_dense.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/vector/binary_dense.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/vector/combiner.rs": {
+    "traversal-final/staging/summa-core/src/query/vector/combiner.rs": {
       "bytes": 14303,
       "sha256": "56265b6abeaef3f92a5b60f1cf89ce704c8faa9055b7275024b92267a27a6c66",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/vector/combiner.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/vector/combiner.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/vector/dense.rs": {
+    "traversal-final/staging/summa-core/src/query/vector/dense.rs": {
       "bytes": 6114,
       "sha256": "9a4bcdbf9dbb78b9aa1c5973fbc26728608b5403fa9e07782f1cb94f9c8186ac",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/vector/dense.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/vector/dense.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/vector/mod.rs": {
+    "traversal-final/staging/summa-core/src/query/vector/mod.rs": {
       "bytes": 9915,
       "sha256": "82030b16c92f72785c2882bc230cdba5651bd8c3459917b204749f0f53218d12",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/vector/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/vector/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/query/vector/sparse.rs": {
+    "traversal-final/staging/summa-core/src/query/vector/sparse.rs": {
       "bytes": 36338,
       "sha256": "1a17484c8ce5966a0c3712a12cd2a3f6b79d1dce9baefe93f8e02b0eb155660d",
-      "archive_path": "traversal-final/staging/hermes-core/src/query/vector/sparse.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/query/vector/sparse.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/ann_build.rs": {
+    "traversal-final/staging/summa-core/src/segment/ann_build.rs": {
       "bytes": 24832,
       "sha256": "ea965b393db64f7a03c93021d52c6a373536b8adbe678852ae0303151b62d05b",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/ann_build.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/ann_build.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/ann_disk.rs": {
+    "traversal-final/staging/summa-core/src/segment/ann_disk.rs": {
       "bytes": 239750,
       "sha256": "2082c81f72b6fef1c053645d5fb91f96797edb279e6a95dcd796e9d2c6f9faab",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/ann_disk.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/ann_disk.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/bmp_adaptive.rs": {
+    "traversal-final/staging/summa-core/src/segment/bmp_adaptive.rs": {
       "bytes": 31552,
       "sha256": "db5d0c3fbed3d7b7c044ea15744d973394256987f8b03489cd0cfe3aa89e075d",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/bmp_adaptive.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/bmp_adaptive.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/bmp_forward.rs": {
+    "traversal-final/staging/summa-core/src/segment/bmp_forward.rs": {
       "bytes": 12447,
       "sha256": "8ea0781050699b2ed1a3370e1ccb4f81d666db089d47249d75d4048c6f386867",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/bmp_forward.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/bmp_forward.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/bmp_forward/rewrite.rs": {
+    "traversal-final/staging/summa-core/src/segment/bmp_forward/rewrite.rs": {
       "bytes": 7219,
       "sha256": "bf748711adbe76df0ab7cc650e038f30fdc1e4c49875fc25a54132163071f1c9",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/bmp_forward/rewrite.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/bmp_forward/rewrite.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/bmp_forward/tests.rs": {
+    "traversal-final/staging/summa-core/src/segment/bmp_forward/tests.rs": {
       "bytes": 31643,
       "sha256": "62868bc86dd54e81e2d3ffc6038e1397100986757c9e943753366e24d69e16e6",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/bmp_forward/tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/bmp_forward/tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/bmp_grid.rs": {
+    "traversal-final/staging/summa-core/src/segment/bmp_grid.rs": {
       "bytes": 64345,
       "sha256": "6c5c63211c7fc96ebd948e409da4ebba388c1a13f93f79a4c5db98245e71a320",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/bmp_grid.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/bmp_grid.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/bmp.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/bmp.rs": {
       "bytes": 68778,
       "sha256": "dca0069ec473ca319cecadbf0934a3c09b9afb7d811a44800d9bc097dde166a2",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/bmp.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/bmp.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/config.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/config.rs": {
       "bytes": 4168,
       "sha256": "057e38b22c64bfe4c3ec903006b522fa57037290c5dc0657298708b9c4ec16ac",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/config.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/config.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/dense.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/dense.rs": {
       "bytes": 18565,
       "sha256": "09c76e5c3ae57d01dd6fe7a9b6b3c3840675ea4ea6ee4c5af525a4208d0bb90e",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/dense.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/dense.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/diagnostics.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/diagnostics.rs": {
       "bytes": 1835,
       "sha256": "6d8f2a4c5aceaf6dccfd5d74629ad00b461195809873d7cf2236ece6d0b698ff",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/diagnostics.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/diagnostics.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/graph_bisection.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/graph_bisection.rs": {
       "bytes": 123582,
       "sha256": "4be036da0357716d6755291159801c2e5f46228b0feeebf3afee93465c49fcf7",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/graph_bisection.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/graph_bisection.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/graph_bisection/gain_tests.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/graph_bisection/gain_tests.rs": {
       "bytes": 8551,
       "sha256": "819db5c62b766fe23ef171b9800bde48760f02631f18efd68a01617ff80e4d20",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/graph_bisection/gain_tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/graph_bisection/gain_tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/mod.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/mod.rs": {
       "bytes": 91523,
       "sha256": "134384c257c1e362939dee441d44c72786a35db4c7d9d9e11b56a15dc9eb6f2a",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/postings.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/postings.rs": {
       "bytes": 16680,
       "sha256": "48b8fb6f49d363c96dee9f90dcd082fda4d3c1af1f7b783616ce5ffc15ac6740",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/postings.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/postings.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/sparse.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/sparse.rs": {
       "bytes": 11039,
       "sha256": "9493f9fb0c5c4fb2059ca672bd91f84a2f211b7fe4fb4eb9f113f13127758e20",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/sparse.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/sparse.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/builder/store.rs": {
+    "traversal-final/staging/summa-core/src/segment/builder/store.rs": {
       "bytes": 6253,
       "sha256": "daa2ec3b09d99f9f7963ead0ff5c4165c507448d65a0ec2c4b7cc034df8a713b",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/builder/store.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/builder/store.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/chunk_map.rs": {
+    "traversal-final/staging/summa-core/src/segment/chunk_map.rs": {
       "bytes": 50589,
       "sha256": "fde6265af493bc13a3bc34d6226537f7a3feaf045f92b37bc2da1259aa89da34",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/chunk_map.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/chunk_map.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/deletion.rs": {
+    "traversal-final/staging/summa-core/src/segment/deletion.rs": {
       "bytes": 9622,
       "sha256": "c6946d0f4cfda9ba407a7cac7a4c62858191cedae1ddad95b52db8b143be865d",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/deletion.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/deletion.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/format.rs": {
+    "traversal-final/staging/summa-core/src/segment/format.rs": {
       "bytes": 8909,
       "sha256": "b246c06a8fe743856f3ceed5cf46df8bb91f054d5696930144372cc98eb406b5",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/format.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/format.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/logical_address.rs": {
+    "traversal-final/staging/summa-core/src/segment/logical_address.rs": {
       "bytes": 2554,
       "sha256": "35102a2479970d52342b2acc3f7c05a213c1a290ae40d9750007e77ffd91e1ad",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/logical_address.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/logical_address.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/chunk_maps.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/chunk_maps.rs": {
       "bytes": 6512,
       "sha256": "ce23da8cf15f8aae614ad0bf5fac80f94baac2202e3a8c9987963af01d026322",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/chunk_maps.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/chunk_maps.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/compact.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/compact.rs": {
       "bytes": 34063,
       "sha256": "742bff1ed4fb7d554feae5bc3138284a2f587314d6a331e893db6e863aa11b3c",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/compact.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/compact.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/compact_vectors.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/compact_vectors.rs": {
       "bytes": 11714,
       "sha256": "cb9a81d8519f4a50680ef9a0662dda4ed66c168f1449460dc6f2719ea95d9b31",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/compact_vectors.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/compact_vectors.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/dense.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/dense.rs": {
       "bytes": 62659,
       "sha256": "2876c411998d5651d88100bd97541930c8b031a7b9159885e5ef6111031ac4c0",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/dense.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/dense.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/fast_fields.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/fast_fields.rs": {
       "bytes": 16796,
       "sha256": "fc56867f80b95d83f42621b91bcb9bc33f5ee0b2349881cbe82053ef2c23591c",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/fast_fields.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/fast_fields.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/mod.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/mod.rs": {
       "bytes": 35771,
       "sha256": "47f7700de5def551f631aeddf61fdaf3177e55a62a66504e963477518a3d9ba9",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/postings.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/postings.rs": {
       "bytes": 19796,
       "sha256": "cb4dcf5c3922cdd935acdbfe1bc0a17c878174648831507303333f8d71d85b69",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/postings.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/postings.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/sparse.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/sparse.rs": {
       "bytes": 70239,
       "sha256": "d3f49790b55eb70170422b5d1a7c3db63d9c62b8c8132d514c0a5fe76af6e2d0",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/sparse.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/sparse.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/merger/store.rs": {
+    "traversal-final/staging/summa-core/src/segment/merger/store.rs": {
       "bytes": 3013,
       "sha256": "b6e191b7c210f46164a287a4e65012d10b6b01b659b7d629039cfa9a84d8b152",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/merger/store.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/merger/store.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/mod.rs": {
+    "traversal-final/staging/summa-core/src/segment/mod.rs": {
       "bytes": 10178,
       "sha256": "8593be6c45bbdbe266136bc1aecc5dd7bfb0e9328d2975938af6d43613526d85",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/pin.rs": {
+    "traversal-final/staging/summa-core/src/segment/pin.rs": {
       "bytes": 12809,
       "sha256": "7164325f90e47550b606b1350081edd39895a22caba135fdfc7798b4be010a7f",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/pin.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/pin.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/reader/bmp.rs": {
+    "traversal-final/staging/summa-core/src/segment/reader/bmp.rs": {
       "bytes": 59304,
       "sha256": "73091a8fbd19c67e64d4f6f174e5fb53f51329d6dd2c98b9919aba6f7422e108",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/reader/bmp.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/reader/bmp.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/reader/candidate_lookup.rs": {
+    "traversal-final/staging/summa-core/src/segment/reader/candidate_lookup.rs": {
       "bytes": 19519,
       "sha256": "f007303877ccc8e6b4e510b8d1046e0cf8700edbceb1c484fa2b356f6171f875",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/reader/candidate_lookup.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/reader/candidate_lookup.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/reader/loader.rs": {
+    "traversal-final/staging/summa-core/src/segment/reader/loader.rs": {
       "bytes": 66172,
       "sha256": "088f390177bc82fbfd0c97a9f550c8c53d64bb362075dcd6a534508ea3483d02",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/reader/loader.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/reader/loader.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/reader/mod.rs": {
+    "traversal-final/staging/summa-core/src/segment/reader/mod.rs": {
       "bytes": 184906,
       "sha256": "0e892d7dd04d79aa0a931d34f73a71d573f61827f14c37d0a5d2dc3e375a113a",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/reader/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/reader/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/reader/types.rs": {
+    "traversal-final/staging/summa-core/src/segment/reader/types.rs": {
       "bytes": 30001,
       "sha256": "3e69fafa33fe6ef4689d51edf5761b844b3e1ef4e2a1f9a88143442d10e3a5ae",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/reader/types.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/reader/types.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/reader/types/candidate_probes.rs": {
+    "traversal-final/staging/summa-core/src/segment/reader/types/candidate_probes.rs": {
       "bytes": 5468,
       "sha256": "6e7d292b887c1b817864169e37c8d4464f289d1eba5afa9ddae44b6a40e02283",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/reader/types/candidate_probes.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/reader/types/candidate_probes.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/reorder.rs": {
+    "traversal-final/staging/summa-core/src/segment/reorder.rs": {
       "bytes": 108167,
       "sha256": "a1e579fd3121ced270d637b62426286056c7530ab38f0bbc9c7fc72ef8598ced",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/reorder.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/reorder.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/row_map.rs": {
+    "traversal-final/staging/summa-core/src/segment/row_map.rs": {
       "bytes": 7992,
       "sha256": "d0de89397a3d5707cdba90730dcec324503f25313fd574c3e763eb2872e92438",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/row_map.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/row_map.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/store.rs": {
+    "traversal-final/staging/summa-core/src/segment/store.rs": {
       "bytes": 76353,
       "sha256": "5d3c0d331712883b3f566c2fe071751a397627bacc1cd86ac54ef15c9e618455",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/store.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/store.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/text_reorder.rs": {
+    "traversal-final/staging/summa-core/src/segment/text_reorder.rs": {
       "bytes": 22431,
       "sha256": "be9b8659fa776b129cab24177089c91a56e6dfb2aca9cdad3281b91089ab0eca",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/text_reorder.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/text_reorder.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/tracker.rs": {
+    "traversal-final/staging/summa-core/src/segment/tracker.rs": {
       "bytes": 15379,
       "sha256": "e40d466aa41e020577f60075f8e78d65ef2b2f1aa7fe0de199f5571a42621e52",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/tracker.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/tracker.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/types.rs": {
+    "traversal-final/staging/summa-core/src/segment/types.rs": {
       "bytes": 18109,
       "sha256": "c4f05a3e9c4a62b6b07c297f68cc4b237e12df3a6300501b61db84f199dbd3e2",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/types.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/types.rs"
     },
-    "traversal-final/staging/hermes-core/src/segment/vector_data.rs": {
+    "traversal-final/staging/summa-core/src/segment/vector_data.rs": {
       "bytes": 52875,
       "sha256": "8f50b8a85f718e13af22a1f063e96a847cf9bcdf7468acf64173216bf6cf5d6b",
-      "archive_path": "traversal-final/staging/hermes-core/src/segment/vector_data.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/segment/vector_data.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/fast_field/codec.rs": {
+    "traversal-final/staging/summa-core/src/structures/fast_field/codec.rs": {
       "bytes": 59907,
       "sha256": "fdcd913e5839ad62a394daced1a81f9f61e655157bf2047588e3fea7012d262c",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/fast_field/codec.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/fast_field/codec.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/fast_field/compact.rs": {
+    "traversal-final/staging/summa-core/src/structures/fast_field/compact.rs": {
       "bytes": 4375,
       "sha256": "a1b3d4c5520338da85e5360c1de6ca4e824bf403e33c6a1697e0b0d5f1a63adc",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/fast_field/compact.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/fast_field/compact.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/fast_field/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/fast_field/mod.rs": {
       "bytes": 90946,
       "sha256": "caef6a926c95ad04b7b5a9f97ceff510c6de1beaef25e84a17d950f0e4cb77ea",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/fast_field/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/fast_field/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/mod.rs": {
       "bytes": 3790,
       "sha256": "9b052df340ff93567739290f6490f898af8a2a190d1d045bae57065c3be25b74",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/bitpacking4x.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/bitpacking4x.rs": {
       "bytes": 7254,
       "sha256": "f605c7fd8623730b12522a7d0ada8bb5798a9f2bd716877ba0915d6171b6d960",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/bitpacking4x.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/bitpacking4x.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/elias_fano.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/elias_fano.rs": {
       "bytes": 31716,
       "sha256": "2e052f2259a3d72148b72473b25330cd010889d31ac2a7c96ffb7381b9368146",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/elias_fano.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/elias_fano.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/horizontal_bp128.rs": {
       "bytes": 27687,
       "sha256": "d070cac71a139777ba9fff71de154ba5417ec04b590cf2436c63198ff7dd4a01",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/horizontal_bp128.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/horizontal_bp128.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/mod.rs": {
       "bytes": 3623,
       "sha256": "612fc03ce6beba3550337772383518ed901af8afb14757ce3522a9659ff1213a",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/opt_p4d.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/opt_p4d.rs": {
       "bytes": 28241,
       "sha256": "44e3a54117c6b4911ae787f0b5f33392325f9b79772659fe34d94ce1b729bc7c",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/opt_p4d.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/opt_p4d.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/partitioned_ef.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/partitioned_ef.rs": {
       "bytes": 44202,
       "sha256": "f0717d2da996c7324beb81ab21db50e1b7973cfd8c8855b9ebfb881c545465f9",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/partitioned_ef.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/partitioned_ef.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/positions.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/positions.rs": {
       "bytes": 43487,
       "sha256": "4d182ef4a55f918a4d89f9b783b7ea5bb443791d9eedcf411a54c53a2ba4f8aa",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/positions.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/positions.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/positions_v2.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/positions_v2.rs": {
       "bytes": 50714,
       "sha256": "491583c8e56aafe9dfe1b35e9dea1160e1414d32aa1721489902c57533cc9b76",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/positions_v2.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/positions_v2.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/positions_v2/compact.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/positions_v2/compact.rs": {
       "bytes": 17581,
       "sha256": "f7b5d356e8a7710e7916f70f9e4b07ac97c81259701c8a68ba6b95220ca024a8",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/positions_v2/compact.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/positions_v2/compact.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting.rs": {
       "bytes": 175815,
       "sha256": "6e7097c61289c0bae80db86058becffdc4e7f9eda789195215eb39fb71fb92ce",
-      "archive_path": "scored-batches/files/hermes-core/src/structures/postings/posting.rs"
+      "archive_path": "scored-batches/files/summa-core/src/structures/postings/posting.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting/compact.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting/compact.rs": {
       "bytes": 31262,
       "sha256": "88aadb2fdf99634cdb4b0b082d9c404be008ffed6b2ac7d20d4eb981a8cb08cf",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/posting/compact.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/posting/compact.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting/impacts.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting/impacts.rs": {
       "bytes": 25258,
       "sha256": "cc88be697fe803bda4d40c0679b09cd71016ed6c88a6d6294ec156dd46506f0f",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/posting/impacts.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/posting/impacts.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting/merge_admission_tests.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting/merge_admission_tests.rs": {
       "bytes": 4974,
       "sha256": "9c80f39af560aaddc6a95f7b9a60c79fa43dc599a3ba0141358ec0f9c102244e",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/posting/merge_admission_tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/posting/merge_admission_tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting/reader.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting/reader.rs": {
       "bytes": 23259,
       "sha256": "800260e31778bbca66a0bacb5d27f5a6809e4a8978ab6b17147816d30553ac55",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/posting/reader.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/posting/reader.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting/validation.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting/validation.rs": {
       "bytes": 8876,
       "sha256": "8d8a2244905210a6b2d13b23331d0cb1e5f4cd096703dcb55b0812b9a98bc06c",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/posting/validation.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/posting/validation.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting_common.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting_common.rs": {
       "bytes": 12609,
       "sha256": "65870ee7f9874207cc4aea5e5c73ec5bfe535947c725e0d6b723676729469b85",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/posting_common.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/posting_common.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/posting_format.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/posting_format.rs": {
       "bytes": 24040,
       "sha256": "63f2b30a0d55ffdc6c8ae1fe832f9528ec5f9d89931f7a8aab64256183bc3ec8",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/posting_format.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/posting_format.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/roaring.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/roaring.rs": {
       "bytes": 43347,
       "sha256": "a14797a870ad803b2526f26468d749818ea95d390eb8237b2b5f0ab427f2e4d3",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/roaring.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/roaring.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/rounded_bp128.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/rounded_bp128.rs": {
       "bytes": 20295,
       "sha256": "65dee19017e25bcfe7dccf36ed3567291ced963a9aec75bff648310412a1b314",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/rounded_bp128.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/rounded_bp128.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/sparse/block.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/sparse/block.rs": {
       "bytes": 69265,
       "sha256": "439f60fd2d4e1b4ffae89f7a7cdb3fb2e483a76a3ddfca3399651d9a0c79d8c4",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/sparse/block.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/sparse/block.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/sparse/config.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/sparse/config.rs": {
       "bytes": 27730,
       "sha256": "c396e1088d31e7ec2c05ee51b4f6c51651d311f9b4dd1c9f708adee64efd79cf",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/sparse/config.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/sparse/config.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/sparse/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/sparse/mod.rs": {
       "bytes": 28864,
       "sha256": "2a81aaef783bb1fa3b1dd5bf6e89ee3cc4738eacf036457e7b0bcf11654a0d10",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/sparse/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/sparse/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/sparse/partitioner.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/sparse/partitioner.rs": {
       "bytes": 12314,
       "sha256": "785a2af8c6d25ccf021d8329a3e4498af7006e0593399bece8f3dc81d71b8044",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/sparse/partitioner.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/sparse/partitioner.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/postings/vertical_bp128.rs": {
+    "traversal-final/staging/summa-core/src/structures/postings/vertical_bp128.rs": {
       "bytes": 33008,
       "sha256": "1d972c6128628f186863c9c7c93d26abfa427d180fe7a258c348ecb2a6b6ddf5",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/postings/vertical_bp128.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/postings/vertical_bp128.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/simd.rs": {
+    "traversal-final/staging/summa-core/src/structures/simd.rs": {
       "bytes": 208944,
       "sha256": "26108f4437b3420de48bbda2b95d96c7fe75a6ae8d9e2ccb8d07d68689210b61",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/simd.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/simd.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/sstable.rs": {
+    "traversal-final/staging/summa-core/src/structures/sstable.rs": {
       "bytes": 94654,
       "sha256": "abe2fef78992465b028ad6311dc7dce9a39ae25699866ec62b8d96fc798487e6",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/sstable.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/sstable.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/sstable/dictionary_config_tests.rs": {
+    "traversal-final/staging/summa-core/src/structures/sstable/dictionary_config_tests.rs": {
       "bytes": 13399,
       "sha256": "0fb6f42435711307802f6fd9c96d8d0922fa1a40d7ee6e3a251a2c7ba6f27416",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/sstable/dictionary_config_tests.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/sstable/dictionary_config_tests.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/sstable/testdata/default_v5.bin": {
+    "traversal-final/staging/summa-core/src/structures/sstable/testdata/default_v5.bin": {
       "bytes": 32352,
       "sha256": "57574904dcdec6dc56a317bc4d9623678ab40093e13958440d7f1b611d761205",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/sstable/testdata/default_v5.bin"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/sstable/testdata/default_v5.bin"
     },
-    "traversal-final/staging/hermes-core/src/structures/sstable_index.rs": {
+    "traversal-final/staging/summa-core/src/structures/sstable_index.rs": {
       "bytes": 37507,
       "sha256": "5c8fb2a73ab84255e98438e0923d93170abf3a81801ba3ce58fe4a45a555e134",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/sstable_index.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/sstable_index.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/index/binary_ivf.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/index/binary_ivf.rs": {
       "bytes": 101868,
       "sha256": "6cec07af01810387b8648f1cec58d901c56fc31e8d2e892bfc8d2120e3cce660",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/index/binary_ivf.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/index/binary_ivf.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/index/ivf_tq.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/index/ivf_tq.rs": {
       "bytes": 21669,
       "sha256": "7459d768c60759d179ca2b04a1093695703d7cb2713072180bed47f833eb1f3e",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/index/ivf_tq.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/index/ivf_tq.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/index/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/index/mod.rs": {
       "bytes": 18722,
       "sha256": "7282e89a686e63877574637796cea71f967ed33f5c3bff665ea6dcbfc819a391",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/index/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/index/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/ivf/coarse.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/ivf/coarse.rs": {
       "bytes": 57555,
       "sha256": "407bd3d5d5c4cb99cee7470310fdac4193b6440d4904a09c5ef98998c74d88dd",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/ivf/coarse.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/ivf/coarse.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/ivf/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/ivf/mod.rs": {
       "bytes": 620,
       "sha256": "d482e690fdb9f29d3e0e0bb0f4b97b8dcaff55c28fe9fd4d7339c00c3a4d6de2",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/ivf/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/ivf/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/ivf/routing.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/ivf/routing.rs": {
       "bytes": 62461,
       "sha256": "3debed22201a98dac9553e159a3b29ec21c08995438839929aaffee941ff6106",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/ivf/routing.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/ivf/routing.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/ivf/soar.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/ivf/soar.rs": {
       "bytes": 7451,
       "sha256": "ee3f17feec21de47fa273045587666e46acdde07f0ffc90ef035ce778b8a6bbf",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/ivf/soar.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/ivf/soar.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/kmeans.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/kmeans.rs": {
       "bytes": 31724,
       "sha256": "6fdb936bc8fb6ce1123b356cc2db3093bd176a39a8221a347a4d30138e99d7b6",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/kmeans.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/kmeans.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/mod.rs": {
       "bytes": 1636,
       "sha256": "de5d78fe3751ed0b7db2bada4c30f22402886c7fdaad4f0ee6cc7bde4a8a89f9",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/progress.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/progress.rs": {
       "bytes": 8184,
       "sha256": "5378c2745a9197e6bc9a5dafdcbda5f38ec88aa5ba7206edd121e15e01e17b52",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/progress.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/progress.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/quantization/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/quantization/mod.rs": {
       "bytes": 664,
       "sha256": "f9d414dfe6344aa2b18addfb55761ac4f739bf26fb1a1c9bdb340f8ac8300219",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/quantization/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/quantization/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/quantization/tq.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/quantization/tq.rs": {
       "bytes": 76336,
       "sha256": "cda14aab5c2a105841ac226b2deb76e53b6de85b40841707d0a60e40bb206308",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/quantization/tq.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/quantization/tq.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/LICENSE-APACHE-2.0": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/LICENSE-APACHE-2.0": {
       "bytes": 11357,
       "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/LICENSE-APACHE-2.0"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/LICENSE-APACHE-2.0"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/NOTICE": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/NOTICE": {
       "bytes": 1032,
       "sha256": "c90061909c666474f0573f2dd5f9e981e41ad3d09f49dd5e4d668bdbd7673ea7",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/NOTICE"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/NOTICE"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/ah.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/ah.rs": {
       "bytes": 25119,
       "sha256": "e9f22517bc33372f294ea7763fa127ee35390e5ca0961e6dcfd34015b0747808",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/ah.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/ah.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/artifact.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/artifact.rs": {
       "bytes": 35784,
       "sha256": "0a0698310c5d56ef511b11a94b5962efafce3f56d9a4f478e36d33a29bd9eacb",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/artifact.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/artifact.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/binary.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/binary.rs": {
       "bytes": 73797,
       "sha256": "234db50e4bb9553d0d248079863bbefbb05b4422acc03c33b3ff72fb6421eccf",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/binary.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/binary.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/config.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/config.rs": {
       "bytes": 11072,
       "sha256": "fda55a2bffa2318aaddc6a5f2ad9fefc77894bfbdb541c4cdb3372257b50fc59",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/config.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/config.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/engine.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/engine.rs": {
       "bytes": 73893,
       "sha256": "6c3b5f5eadd04375a0c0d0fe58971156a9e856a80943df357a290106bb04cdf5",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/engine.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/engine.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/fast_scan.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/fast_scan.rs": {
       "bytes": 27059,
       "sha256": "e58671bfcf14042e76a7f26402407ed796b833fa560fbea96f101ece9e02410a",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/fast_scan.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/fast_scan.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/geometry.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/geometry.rs": {
       "bytes": 14041,
       "sha256": "68c65e6bc6534fa8a81e2be200d7d9d1198993ca7cf7dabddf7c41a8b0ea9142",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/geometry.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/geometry.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/mod.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/mod.rs": {
       "bytes": 5257,
       "sha256": "ae1f5427b0df22520caa09e2577f184d08b26e4828a96b153e7845a42799975d",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/mod.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/payload.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/payload.rs": {
       "bytes": 16961,
       "sha256": "799350708db7fe30a7375ce2e4b0fe0359402552f183088807f2687bb3140d20",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/payload.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/payload.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vector/scann/quantized_dot.rs": {
+    "traversal-final/staging/summa-core/src/structures/vector/scann/quantized_dot.rs": {
       "bytes": 8473,
       "sha256": "5f6a5b951808b2b2f4a324c0e2dbfa1471b778a8d099c5dd8decbbd019a1f79e",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vector/scann/quantized_dot.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vector/scann/quantized_dot.rs"
     },
-    "traversal-final/staging/hermes-core/src/structures/vint.rs": {
+    "traversal-final/staging/summa-core/src/structures/vint.rs": {
       "bytes": 2529,
       "sha256": "031318a2e7bb38d5a6c7aea665f582b7f673cb827ac2887cced56783852a5c3d",
-      "archive_path": "traversal-final/staging/hermes-core/src/structures/vint.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/structures/vint.rs"
     },
-    "traversal-final/staging/hermes-core/src/tokenizer/cjk_morph.rs": {
+    "traversal-final/staging/summa-core/src/tokenizer/cjk_morph.rs": {
       "bytes": 6697,
       "sha256": "5a72b3d903884f908ca90ba7fc0121fbde0a7458bc1351b01db5b7588b071506",
-      "archive_path": "traversal-final/staging/hermes-core/src/tokenizer/cjk_morph.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/tokenizer/cjk_morph.rs"
     },
-    "traversal-final/staging/hermes-core/src/tokenizer/han_t2s.rs": {
+    "traversal-final/staging/summa-core/src/tokenizer/han_t2s.rs": {
       "bytes": 87380,
       "sha256": "b85e8ebc200f5a31af26bf2e411442e3a048c65d4028ab72b1d244ba4efcc22d",
-      "archive_path": "traversal-final/staging/hermes-core/src/tokenizer/han_t2s.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/tokenizer/han_t2s.rs"
     },
-    "traversal-final/staging/hermes-core/src/tokenizer/hf_tokenizer.rs": {
+    "traversal-final/staging/summa-core/src/tokenizer/hf_tokenizer.rs": {
       "bytes": 9741,
       "sha256": "f092d37edbf238e7c08cbd8c35e5c967499cfe553cb3bc87758c2c814bde4924",
-      "archive_path": "traversal-final/staging/hermes-core/src/tokenizer/hf_tokenizer.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/tokenizer/hf_tokenizer.rs"
     },
-    "traversal-final/staging/hermes-core/src/tokenizer/idf_weights.rs": {
+    "traversal-final/staging/summa-core/src/tokenizer/idf_weights.rs": {
       "bytes": 12618,
       "sha256": "968afa697eea7bdd3a6becd394614fec04f3f40c962a5b72e727246f7dbbdd0c",
-      "archive_path": "traversal-final/staging/hermes-core/src/tokenizer/idf_weights.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/tokenizer/idf_weights.rs"
     },
-    "traversal-final/staging/hermes-core/src/tokenizer/lex.rs": {
+    "traversal-final/staging/summa-core/src/tokenizer/lex.rs": {
       "bytes": 61319,
       "sha256": "a2bf59cc6aeaf784d4950c555a7508e4ab803b92a6594570f640018b111d8430",
-      "archive_path": "traversal-final/staging/hermes-core/src/tokenizer/lex.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/tokenizer/lex.rs"
     },
-    "traversal-final/staging/hermes-core/src/tokenizer/light_stem.rs": {
+    "traversal-final/staging/summa-core/src/tokenizer/light_stem.rs": {
       "bytes": 35516,
       "sha256": "7ae0cbfa21743f76cf71404adb6760259691e8ece571f4783811eddd7e964ff6",
-      "archive_path": "traversal-final/staging/hermes-core/src/tokenizer/light_stem.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/tokenizer/light_stem.rs"
     },
-    "traversal-final/staging/hermes-core/src/tokenizer/mod.rs": {
+    "traversal-final/staging/summa-core/src/tokenizer/mod.rs": {
       "bytes": 54933,
       "sha256": "33945d1fc0808d9820e86737146790e1bd72a2568c54f7d375098aa9bc4c8421",
-      "archive_path": "traversal-final/staging/hermes-core/src/tokenizer/mod.rs"
+      "archive_path": "traversal-final/staging/summa-core/src/tokenizer/mod.rs"
     },
-    "traversal-final/staging/hermes-core/tests/benchmark_corpus_ids.rs": {
+    "traversal-final/staging/summa-core/tests/benchmark_corpus_ids.rs": {
       "bytes": 1248,
       "sha256": "10e83b0fbb75d0ebb1ceb48880cf85d6c2a61e605ba96fad7540c9246d302883",
-      "archive_path": "traversal-final/staging/hermes-core/tests/benchmark_corpus_ids.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/benchmark_corpus_ids.rs"
     },
-    "traversal-final/staging/hermes-core/tests/benchmark_metrics.rs": {
+    "traversal-final/staging/summa-core/tests/benchmark_metrics.rs": {
       "bytes": 1341,
       "sha256": "049f0bfa0216b30ac8bc9aa14a81b01a0a429e3840598c5230700efa5fa26e48",
-      "archive_path": "traversal-final/staging/hermes-core/tests/benchmark_metrics.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/benchmark_metrics.rs"
     },
-    "traversal-final/staging/hermes-core/tests/corrupt_posting_content.rs": {
+    "traversal-final/staging/summa-core/tests/corrupt_posting_content.rs": {
       "bytes": 6743,
       "sha256": "5e99ba8d146a0bf278395749800e6bb3c062b1ccc26191e02e44af2a30c91806",
-      "archive_path": "traversal-final/staging/hermes-core/tests/corrupt_posting_content.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/corrupt_posting_content.rs"
     },
-    "traversal-final/staging/hermes-core/tests/corrupt_text_positions.rs": {
+    "traversal-final/staging/summa-core/tests/corrupt_text_positions.rs": {
       "bytes": 2966,
       "sha256": "50f3112119f9c474a27a42ab79a716a1b735bb45928785080d35dada97785dac",
-      "archive_path": "traversal-final/staging/hermes-core/tests/corrupt_text_positions.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/corrupt_text_positions.rs"
     },
-    "traversal-final/staging/hermes-core/tests/corrupt_text_postings.rs": {
+    "traversal-final/staging/summa-core/tests/corrupt_text_postings.rs": {
       "bytes": 9827,
       "sha256": "9f67526b64aaeb9b04ba435f64930d33e636d17c021549631ffc225751479fa6",
-      "archive_path": "traversal-final/staging/hermes-core/tests/corrupt_text_postings.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/corrupt_text_postings.rs"
     },
-    "traversal-final/staging/hermes-core/tests/dictionary_policy.rs": {
+    "traversal-final/staging/summa-core/tests/dictionary_policy.rs": {
       "bytes": 3489,
       "sha256": "d82b83e195b6efc5a89fe8b12be5e75e567cca3c12c1bfbc3c786dedbe850522",
-      "archive_path": "traversal-final/staging/hermes-core/tests/dictionary_policy.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/dictionary_policy.rs"
     },
-    "traversal-final/staging/hermes-core/tests/exhaustive_text_collection.rs": {
+    "traversal-final/staging/summa-core/tests/exhaustive_text_collection.rs": {
       "bytes": 7510,
       "sha256": "b3317ceab1b28f1645da6251e1894382138b57228c4f24e404b429997a728c4c",
-      "archive_path": "traversal-final/staging/hermes-core/tests/exhaustive_text_collection.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/exhaustive_text_collection.rs"
     },
-    "traversal-final/staging/hermes-core/tests/filtered_windows.rs": {
+    "traversal-final/staging/summa-core/tests/filtered_windows.rs": {
       "bytes": 4937,
       "sha256": "5fff4a6050655f28826c03195d6ec5b3eb81ea0d2ed983f3c48536bdda1a4e2b",
-      "archive_path": "traversal-final/staging/hermes-core/tests/filtered_windows.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/filtered_windows.rs"
     },
-    "traversal-final/staging/hermes-core/tests/impact_ranked_collection.rs": {
+    "traversal-final/staging/summa-core/tests/impact_ranked_collection.rs": {
       "bytes": 4018,
       "sha256": "8d7bfb2bba87eeeb0ebb711a1326f66e23d1d8b15b1ebbc6e7a0e07477dbff73",
-      "archive_path": "traversal-final/staging/hermes-core/tests/impact_ranked_collection.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/impact_ranked_collection.rs"
     },
-    "traversal-final/staging/hermes-core/tests/index_writer_regressions.rs": {
+    "traversal-final/staging/summa-core/tests/index_writer_regressions.rs": {
       "bytes": 19158,
       "sha256": "b52cf43715342ef58faace3b1a7210e597243243343b10893a230048e4ab7682",
-      "archive_path": "traversal-final/staging/hermes-core/tests/index_writer_regressions.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/index_writer_regressions.rs"
     },
-    "traversal-final/staging/hermes-core/tests/phrase_requirements.rs": {
+    "traversal-final/staging/summa-core/tests/phrase_requirements.rs": {
       "bytes": 6535,
       "sha256": "57b81fa45851410f0c12c7a790cd3e5733c6a3d607126ad0e4ef612a3cc77a73",
-      "archive_path": "traversal-final/staging/hermes-core/tests/phrase_requirements.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/phrase_requirements.rs"
     },
-    "traversal-final/staging/hermes-core/tests/pin_policy_environment.rs": {
+    "traversal-final/staging/summa-core/tests/pin_policy_environment.rs": {
       "bytes": 1575,
       "sha256": "07b7186127bc743e0f9893db3256950f2c618131e586729ed7fcda2a75b9a6f1",
-      "archive_path": "traversal-final/staging/hermes-core/tests/pin_policy_environment.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/pin_policy_environment.rs"
     },
-    "traversal-final/staging/hermes-core/tests/portable_mutations.rs": {
+    "traversal-final/staging/summa-core/tests/portable_mutations.rs": {
       "bytes": 7017,
       "sha256": "893c7a605d61b5dbd6cad02a44115c8cd496b6381163430066246e4aec60429f",
-      "archive_path": "traversal-final/staging/hermes-core/tests/portable_mutations.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/portable_mutations.rs"
     },
-    "traversal-final/staging/hermes-core/tests/posting_validation_resources.rs": {
+    "traversal-final/staging/summa-core/tests/posting_validation_resources.rs": {
       "bytes": 3433,
       "sha256": "76f4f6a1d89a42e4b274130b6f46461bf54f0b8c759409423b630d5306af2d0f",
-      "archive_path": "traversal-final/staging/hermes-core/tests/posting_validation_resources.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/posting_validation_resources.rs"
     },
-    "traversal-final/staging/hermes-core/tests/primary_key_builder_forces_fast.rs": {
+    "traversal-final/staging/summa-core/tests/primary_key_builder_forces_fast.rs": {
       "bytes": 1763,
       "sha256": "58991dc858585dd07b1090562b016f8345494ec26adcf5c48b2d45259d406523",
-      "archive_path": "traversal-final/staging/hermes-core/tests/primary_key_builder_forces_fast.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/primary_key_builder_forces_fast.rs"
     },
-    "traversal-final/staging/hermes-core/tests/query_global_statistics.rs": {
+    "traversal-final/staging/summa-core/tests/query_global_statistics.rs": {
       "bytes": 6614,
       "sha256": "e8857410e807d003aa929c7f5dff8e9138de72303826b9aefb5d52838867b23c",
-      "archive_path": "traversal-final/staging/hermes-core/tests/query_global_statistics.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/query_global_statistics.rs"
     },
-    "traversal-final/staging/hermes-core/tests/query_required_clauses.rs": {
+    "traversal-final/staging/summa-core/tests/query_required_clauses.rs": {
       "bytes": 12649,
       "sha256": "18a7b3e92475142b353af8e8b08f8dd856a0e217eeda8bc4a41fc0b02c55568b",
-      "archive_path": "traversal-final/staging/hermes-core/tests/query_required_clauses.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/query_required_clauses.rs"
     },
-    "traversal-final/staging/hermes-core/tests/range_bitset.rs": {
+    "traversal-final/staging/summa-core/tests/range_bitset.rs": {
       "bytes": 6499,
       "sha256": "1cc439b97569bc2432c18b33d93f3306884f70be396883d6306fb83676978cda",
-      "archive_path": "traversal-final/staging/hermes-core/tests/range_bitset.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/range_bitset.rs"
     },
-    "traversal-final/staging/hermes-core/tests/ranked_boost_handoff.rs": {
+    "traversal-final/staging/summa-core/tests/ranked_boost_handoff.rs": {
       "bytes": 2334,
       "sha256": "16bf75bc0948f87c0c42c9476f6ef6fa0474941ab317a220ce02e1480a983ad2",
-      "archive_path": "traversal-final/staging/hermes-core/tests/ranked_boost_handoff.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/ranked_boost_handoff.rs"
     },
-    "traversal-final/staging/hermes-core/tests/ranked_conjunction.rs": {
+    "traversal-final/staging/summa-core/tests/ranked_conjunction.rs": {
       "bytes": 8723,
       "sha256": "a86a7fc10daeeb9cb38f4de6676a4d495e9c0d6f37b31f97055abd1df534b28d",
-      "archive_path": "traversal-final/staging/hermes-core/tests/ranked_conjunction.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/ranked_conjunction.rs"
     },
-    "traversal-final/staging/hermes-core/tests/ranked_phrase_bounds.rs": {
+    "traversal-final/staging/summa-core/tests/ranked_phrase_bounds.rs": {
       "bytes": 5663,
       "sha256": "da0acd2cf51b7aea330c6f3c4c3056e3cc19b08b36c4b668e220d4203fcb4963",
-      "archive_path": "traversal-final/staging/hermes-core/tests/ranked_phrase_bounds.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/ranked_phrase_bounds.rs"
     },
-    "traversal-final/staging/hermes-core/tests/ranked_required_optional.rs": {
+    "traversal-final/staging/summa-core/tests/ranked_required_optional.rs": {
       "bytes": 11257,
       "sha256": "c8ead9532e0a10b7c2ea1cc85537aa4dca5897b002debe481e95b47ebdacc524",
-      "archive_path": "traversal-final/staging/hermes-core/tests/ranked_required_optional.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/ranked_required_optional.rs"
     },
-    "traversal-final/staging/hermes-core/tests/ranked_term_collection.rs": {
+    "traversal-final/staging/summa-core/tests/ranked_term_collection.rs": {
       "bytes": 9115,
       "sha256": "6b2f9382ba2362c6334806a09da1349b8c5db1f033d57881964f56ed589bd01e",
-      "archive_path": "traversal-final/staging/hermes-core/tests/ranked_term_collection.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/ranked_term_collection.rs"
     },
-    "traversal-final/staging/hermes-core/tests/ratio_chunked_collection.rs": {
+    "traversal-final/staging/summa-core/tests/ratio_chunked_collection.rs": {
       "bytes": 5811,
       "sha256": "ba66acab83af13e2e076e61c972fd68e4f840db8a7cb1a7908e9eb9eae577fd6",
-      "archive_path": "traversal-final/staging/hermes-core/tests/ratio_chunked_collection.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/ratio_chunked_collection.rs"
     },
-    "traversal-final/staging/hermes-core/tests/segment_meta_durability.rs": {
+    "traversal-final/staging/summa-core/tests/segment_meta_durability.rs": {
       "bytes": 5909,
       "sha256": "57e606b94bcb0ab8e6b04500be906e85fb6794bcf65d38552a036e61adc0a862",
-      "archive_path": "traversal-final/staging/hermes-core/tests/segment_meta_durability.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/segment_meta_durability.rs"
     },
-    "traversal-final/staging/hermes-core/tests/simd_posting_format.rs": {
+    "traversal-final/staging/summa-core/tests/simd_posting_format.rs": {
       "bytes": 8264,
       "sha256": "9c8344092e15bce1abcaf58b8fc01b2911353d206e995b3992401935320bfebd",
-      "archive_path": "traversal-final/staging/hermes-core/tests/simd_posting_format.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/simd_posting_format.rs"
     },
-    "traversal-final/staging/hermes-core/tests/text_reordering.rs": {
+    "traversal-final/staging/summa-core/tests/text_reordering.rs": {
       "bytes": 11197,
       "sha256": "5374ce7a9dff7b6071fce8d050b88d81350cab1e5166ccb1a13bb941a69210a8",
-      "archive_path": "traversal-final/staging/hermes-core/tests/text_reordering.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/text_reordering.rs"
     },
-    "traversal-final/staging/hermes-core/tests/tokenizer_scaling_probe.rs": {
+    "traversal-final/staging/summa-core/tests/tokenizer_scaling_probe.rs": {
       "bytes": 5527,
       "sha256": "4d5b2c643834dfe22911173bd7882b7306391f48c38a0a2733d2a4883494e8de",
-      "archive_path": "traversal-final/staging/hermes-core/tests/tokenizer_scaling_probe.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/tokenizer_scaling_probe.rs"
     },
-    "traversal-final/staging/hermes-core/tests/wasm_builder_store_memory_regression.rs": {
+    "traversal-final/staging/summa-core/tests/wasm_builder_store_memory_regression.rs": {
       "bytes": 1979,
       "sha256": "4e232a2e2db3a1785c13f1a664f59d25a4ff1da38359d2c2fe5cf4ce8f1b7142",
-      "archive_path": "traversal-final/staging/hermes-core/tests/wasm_builder_store_memory_regression.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/wasm_builder_store_memory_regression.rs"
     },
-    "traversal-final/staging/hermes-core/tests/wasm_writer_regressions.rs": {
+    "traversal-final/staging/summa-core/tests/wasm_writer_regressions.rs": {
       "bytes": 11532,
       "sha256": "5f247037ef3695339dbbd9f8416956b26dda8bab74524edcc00648f14704ec1c",
-      "archive_path": "traversal-final/staging/hermes-core/tests/wasm_writer_regressions.rs"
+      "archive_path": "traversal-final/staging/summa-core/tests/wasm_writer_regressions.rs"
     },
-    "traversal-final/staging/hermes-proto/README.md": {
+    "traversal-final/staging/summa-proto/README.md": {
       "bytes": 2712,
       "sha256": "abe32475e8dba0a44d8940f8b4625ae4381988449b7ffe3f8c6acd0288136d3e",
-      "archive_path": "traversal-final/staging/hermes-proto/README.md"
+      "archive_path": "traversal-final/staging/summa-proto/README.md"
     },
-    "traversal-final/staging/hermes-proto/hermes-broker.proto": {
+    "traversal-final/staging/summa-proto/summa-broker.proto": {
       "bytes": 2613,
       "sha256": "a1490dd8ef60758284c7685271f9cfe2f14a5541e59acea2b25d1f0ebb0c3f72",
-      "archive_path": "traversal-final/staging/hermes-proto/hermes-broker.proto"
+      "archive_path": "traversal-final/staging/summa-proto/summa-broker.proto"
     },
-    "traversal-final/staging/hermes-proto/hermes.proto": {
+    "traversal-final/staging/summa-proto/summa.proto": {
       "bytes": 26863,
       "sha256": "ab2bf7ef95ecf346159bbe7e293629561608f607bccab361acab23efa57cfdc7",
-      "archive_path": "traversal-final/staging/hermes-proto/hermes.proto"
+      "archive_path": "traversal-final/staging/summa-proto/summa.proto"
     },
-    "traversal-final/staging/hermes-proto/mutations.rs": {
+    "traversal-final/staging/summa-proto/mutations.rs": {
       "bytes": 1086,
       "sha256": "e8cd7310677cb4e69e87a2d4f46fa83527c26596227bc8494b2c5505118e127a",
-      "archive_path": "traversal-final/staging/hermes-proto/mutations.rs"
+      "archive_path": "traversal-final/staging/summa-proto/mutations.rs"
     },
-    "traversal-final/staging/hermes-server/Cargo.toml": {
+    "traversal-final/staging/summa-server/Cargo.toml": {
       "bytes": 1435,
       "sha256": "c8cc43a5eb2be40c6592ec69427ad0433d8f2414050911e5a4413264d81f3750",
-      "archive_path": "traversal-final/staging/hermes-server/Cargo.toml"
+      "archive_path": "traversal-final/staging/summa-server/Cargo.toml"
     },
-    "traversal-final/staging/hermes-server/Dockerfile": {
+    "traversal-final/staging/summa-server/Dockerfile": {
       "bytes": 1642,
       "sha256": "272b5cb58c2379a0534c84c62b305ca6e5ac6f2106b97f06e84e596ef13fb953",
-      "archive_path": "traversal-final/staging/hermes-server/Dockerfile"
+      "archive_path": "traversal-final/staging/summa-server/Dockerfile"
     },
-    "traversal-final/staging/hermes-server/README.md": {
+    "traversal-final/staging/summa-server/README.md": {
       "bytes": 18541,
       "sha256": "b508d15c716e9583dc6c94841238f3a1eb75172cdf609d9afa9003e81143f914",
-      "archive_path": "traversal-final/staging/hermes-server/README.md"
+      "archive_path": "traversal-final/staging/summa-server/README.md"
     },
-    "traversal-final/staging/hermes-server/build.rs": {
+    "traversal-final/staging/summa-server/build.rs": {
       "bytes": 208,
       "sha256": "53a35a275e1b04c943a84002ace25ae1a8da611229e8f3b485fba7aee5f8382b",
-      "archive_path": "traversal-final/staging/hermes-server/build.rs"
+      "archive_path": "traversal-final/staging/summa-server/build.rs"
     },
-    "traversal-final/staging/hermes-server/k8s/deployment.yaml": {
+    "traversal-final/staging/summa-server/k8s/deployment.yaml": {
       "bytes": 1755,
       "sha256": "bd108d7fef35c9f2d6589aa92a777bf74ee7d7d5989d56eaee71c51d52f39bf6",
-      "archive_path": "traversal-final/staging/hermes-server/k8s/deployment.yaml"
+      "archive_path": "traversal-final/staging/summa-server/k8s/deployment.yaml"
     },
-    "traversal-final/staging/hermes-server/k8s/documents.sdl": {
+    "traversal-final/staging/summa-server/k8s/documents.sdl": {
       "bytes": 1571,
       "sha256": "f4da5e1edfb67f5eb3a34b53af6cec72a859c6e30924ee66e2a8060903ddc7a1",
-      "archive_path": "traversal-final/staging/hermes-server/k8s/documents.sdl"
+      "archive_path": "traversal-final/staging/summa-server/k8s/documents.sdl"
     },
-    "traversal-final/staging/hermes-server/k8s/kustomization.yaml": {
+    "traversal-final/staging/summa-server/k8s/kustomization.yaml": {
       "bytes": 297,
       "sha256": "0b2b91134665c985e334b2b7f2c2ea24454b7f2581891d08d15acc2075034d29",
-      "archive_path": "traversal-final/staging/hermes-server/k8s/kustomization.yaml"
+      "archive_path": "traversal-final/staging/summa-server/k8s/kustomization.yaml"
     },
-    "traversal-final/staging/hermes-server/k8s/namespace.yaml": {
+    "traversal-final/staging/summa-server/k8s/namespace.yaml": {
       "bytes": 101,
       "sha256": "69ec27b44748ed0212bd807cd046337587b52afbcc4e3e98e68ec4ab864f3a15",
-      "archive_path": "traversal-final/staging/hermes-server/k8s/namespace.yaml"
+      "archive_path": "traversal-final/staging/summa-server/k8s/namespace.yaml"
     },
-    "traversal-final/staging/hermes-server/k8s/pvc.yaml": {
+    "traversal-final/staging/summa-server/k8s/pvc.yaml": {
       "bytes": 357,
       "sha256": "77ccdb396011b875bb00d516832fde6aab9dbb1b4aa5905feaf85f1b0aead428",
-      "archive_path": "traversal-final/staging/hermes-server/k8s/pvc.yaml"
+      "archive_path": "traversal-final/staging/summa-server/k8s/pvc.yaml"
     },
-    "traversal-final/staging/hermes-server/k8s/service.yaml": {
+    "traversal-final/staging/summa-server/k8s/service.yaml": {
       "bytes": 338,
       "sha256": "218384863a05efb1c82b12494782473e85f1395db8c1dbb6ace79dd395d0a38a",
-      "archive_path": "traversal-final/staging/hermes-server/k8s/service.yaml"
+      "archive_path": "traversal-final/staging/summa-server/k8s/service.yaml"
     },
-    "traversal-final/staging/hermes-server/src/bin/serve_index.rs": {
+    "traversal-final/staging/summa-server/src/bin/serve_index.rs": {
       "bytes": 8053,
       "sha256": "993f9d9637fa2a83a6543ac64e20df8f7df3cfee0945808d2892d9597efe17e5",
-      "archive_path": "traversal-final/staging/hermes-server/src/bin/serve_index.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/bin/serve_index.rs"
     },
-    "traversal-final/staging/hermes-server/src/bin/test_doc_retrieval.rs": {
+    "traversal-final/staging/summa-server/src/bin/test_doc_retrieval.rs": {
       "bytes": 1165,
       "sha256": "e2d4e03f720b25eb57cb47c28538e1044fb17843dcc058394ea275e0c5f57ac8",
-      "archive_path": "traversal-final/staging/hermes-server/src/bin/test_doc_retrieval.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/bin/test_doc_retrieval.rs"
     },
-    "traversal-final/staging/hermes-server/src/converters.rs": {
+    "traversal-final/staging/summa-server/src/converters.rs": {
       "bytes": 96025,
       "sha256": "805ec86cc1d70a1ffc4c053cb8bedad3dd2c117437a43b476f010292d7eaa7f9",
-      "archive_path": "traversal-final/staging/hermes-server/src/converters.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/converters.rs"
     },
-    "traversal-final/staging/hermes-server/src/error.rs": {
+    "traversal-final/staging/summa-server/src/error.rs": {
       "bytes": 1964,
       "sha256": "30ed244146cde88fa7576b34dc29f0db20c2683bb08de92b5a3e25fa131ccefc",
-      "archive_path": "traversal-final/staging/hermes-server/src/error.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/error.rs"
     },
-    "traversal-final/staging/hermes-server/src/index_service.rs": {
+    "traversal-final/staging/summa-server/src/index_service.rs": {
       "bytes": 23866,
       "sha256": "655881b55d056b1715380ee2179062a9e6f3d96c079e06a09854df453621fedc",
-      "archive_path": "traversal-final/staging/hermes-server/src/index_service.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/index_service.rs"
     },
-    "traversal-final/staging/hermes-server/src/index_service/mutations.rs": {
+    "traversal-final/staging/summa-server/src/index_service/mutations.rs": {
       "bytes": 3840,
       "sha256": "a48d318eb0ce230a9af43e011fdc2878e88f5a470c6eddec6b0c7f93fe618162",
-      "archive_path": "traversal-final/staging/hermes-server/src/index_service/mutations.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/index_service/mutations.rs"
     },
-    "traversal-final/staging/hermes-server/src/index_service/tests.rs": {
+    "traversal-final/staging/summa-server/src/index_service/tests.rs": {
       "bytes": 16819,
       "sha256": "5a1d7a375e0e9c19b6dc3cd054d685b1fefc1947e61a9c9d51df64b9af2b30e3",
-      "archive_path": "traversal-final/staging/hermes-server/src/index_service/tests.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/index_service/tests.rs"
     },
-    "traversal-final/staging/hermes-server/src/main.rs": {
+    "traversal-final/staging/summa-server/src/main.rs": {
       "bytes": 40936,
       "sha256": "5f3a987ac6fc6fc86d2d777462029004338fde91ca47c17c403ca5dd196a3c5c",
-      "archive_path": "traversal-final/staging/hermes-server/src/main.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/main.rs"
     },
-    "traversal-final/staging/hermes-server/src/optimizer.rs": {
+    "traversal-final/staging/summa-server/src/optimizer.rs": {
       "bytes": 24376,
       "sha256": "fcba94be44912a832e805e8eff3e4d1fd79f6588ef325e30941aa9b194bdd55f",
-      "archive_path": "traversal-final/staging/hermes-server/src/optimizer.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/optimizer.rs"
     },
-    "traversal-final/staging/hermes-server/src/registry.rs": {
+    "traversal-final/staging/summa-server/src/registry.rs": {
       "bytes": 32300,
       "sha256": "b2436c852cccb2b24a0fbde16696b088b34f551a1a47113d1ff3f84866c074a3",
-      "archive_path": "traversal-final/staging/hermes-server/src/registry.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/registry.rs"
     },
-    "traversal-final/staging/hermes-server/src/search_service.rs": {
+    "traversal-final/staging/summa-server/src/search_service.rs": {
       "bytes": 37444,
       "sha256": "210497eac46fa79dfa0106f89734be4508259d1999137371321c2b9b83b0e6f1",
-      "archive_path": "traversal-final/staging/hermes-server/src/search_service.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/search_service.rs"
     },
-    "traversal-final/staging/hermes-server/src/search_service/candidate_scoring.rs": {
+    "traversal-final/staging/summa-server/src/search_service/candidate_scoring.rs": {
       "bytes": 13198,
       "sha256": "525cdecd2251839bbbdf81b8950a01c9f83213bf638d6e571a99ecc1743ac3ba",
-      "archive_path": "traversal-final/staging/hermes-server/src/search_service/candidate_scoring.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/search_service/candidate_scoring.rs"
     },
-    "traversal-final/staging/hermes-server/src/search_service/response.rs": {
+    "traversal-final/staging/summa-server/src/search_service/response.rs": {
       "bytes": 9046,
       "sha256": "84649a2c64261e28b5f12793effdb76ba4e67ae3fbf6394ee62a79fde7dba106",
-      "archive_path": "traversal-final/staging/hermes-server/src/search_service/response.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/search_service/response.rs"
     },
-    "traversal-final/staging/hermes-server/src/search_service/tests.rs": {
+    "traversal-final/staging/summa-server/src/search_service/tests.rs": {
       "bytes": 48845,
       "sha256": "6a043bfe22de637fe9b04515953cfb9d4c0fac7520e1ad31c1e3cf6838e0dd5f",
-      "archive_path": "traversal-final/staging/hermes-server/src/search_service/tests.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/search_service/tests.rs"
     },
-    "traversal-final/staging/hermes-server/src/search_service/validation.rs": {
+    "traversal-final/staging/summa-server/src/search_service/validation.rs": {
       "bytes": 29175,
       "sha256": "ec0a37cbb7e91288841fd55cc8e619eea2e6c70180808068abb52bac32302346",
-      "archive_path": "traversal-final/staging/hermes-server/src/search_service/validation.rs"
+      "archive_path": "traversal-final/staging/summa-server/src/search_service/validation.rs"
     },
-    "traversal-final/staging/hermes-tool/Cargo.toml": {
+    "traversal-final/staging/summa-tool/Cargo.toml": {
       "bytes": 1164,
       "sha256": "f031613d31b94c0e49ce02d90d532a9b813cb3b6d3f5248c22aeb5d513c6c203",
-      "archive_path": "traversal-final/staging/hermes-tool/Cargo.toml"
+      "archive_path": "traversal-final/staging/summa-tool/Cargo.toml"
     },
-    "traversal-final/staging/hermes-tool/README.md": {
+    "traversal-final/staging/summa-tool/README.md": {
       "bytes": 4039,
       "sha256": "7776bf8e2320e3f182ac4fd5b03e2ec9f9dbbccf86caf2a3700dd4366ac54aa8",
-      "archive_path": "traversal-final/staging/hermes-tool/README.md"
+      "archive_path": "traversal-final/staging/summa-tool/README.md"
     },
-    "traversal-final/staging/hermes-tool/src/data_processing.rs": {
+    "traversal-final/staging/summa-tool/src/data_processing.rs": {
       "bytes": 19453,
       "sha256": "e83ca2dae37916cf8b336d9165e8000b84b8b53cd7ee15ab6dec26c31b5b5844",
-      "archive_path": "traversal-final/staging/hermes-tool/src/data_processing.rs"
+      "archive_path": "traversal-final/staging/summa-tool/src/data_processing.rs"
     },
-    "traversal-final/staging/hermes-tool/src/diagnose.rs": {
+    "traversal-final/staging/summa-tool/src/diagnose.rs": {
       "bytes": 39970,
       "sha256": "b1d013aac46fc4c59a5cda507be6c0694201bbb0c87d9820bc27d7b3b45fc25d",
-      "archive_path": "traversal-final/staging/hermes-tool/src/diagnose.rs"
+      "archive_path": "traversal-final/staging/summa-tool/src/diagnose.rs"
     },
-    "traversal-final/staging/hermes-tool/src/index_ops.rs": {
+    "traversal-final/staging/summa-tool/src/index_ops.rs": {
       "bytes": 34193,
       "sha256": "b5cb4fd71651c9343367d4deca05728877db47ae7c0207e4e168efba4e521337",
-      "archive_path": "traversal-final/staging/hermes-tool/src/index_ops.rs"
+      "archive_path": "traversal-final/staging/summa-tool/src/index_ops.rs"
     },
-    "traversal-final/staging/hermes-tool/src/main.rs": {
+    "traversal-final/staging/summa-tool/src/main.rs": {
       "bytes": 25023,
       "sha256": "7fe832edce9b6b55efaedf97412d09db8006c44b41bef5cac49e6664156932fa",
-      "archive_path": "traversal-final/staging/hermes-tool/src/main.rs"
+      "archive_path": "traversal-final/staging/summa-tool/src/main.rs"
     },
-    "traversal-final/staging/hermes-tool/src/vector_ops.rs": {
+    "traversal-final/staging/summa-tool/src/vector_ops.rs": {
       "bytes": 5434,
       "sha256": "ef2fda1e20cfee64c7cc65fe7137dadf841e7e383bd608c103bb3f58aa089249",
-      "archive_path": "traversal-final/staging/hermes-tool/src/vector_ops.rs"
+      "archive_path": "traversal-final/staging/summa-tool/src/vector_ops.rs"
     },
     "traversal-final/staging/rust-toolchain.toml": {
       "bytes": 66,
@@ -9761,7 +9761,7 @@
     "union-count/planner.rs": {
       "bytes": 44660,
       "sha256": "20265abce1084d353987c62b0241da724b66995a7fb16a724d84aedb13546325",
-      "archive_path": "traversal-final/files/hermes-core/src/query/planner.rs"
+      "archive_path": "traversal-final/files/summa-core/src/query/planner.rs"
     },
     "union-count/prepare.py": {
       "bytes": 3279,

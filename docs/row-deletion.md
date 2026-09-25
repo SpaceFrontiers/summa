@@ -12,12 +12,12 @@ writers initialize it automatically. Cross-shard atomic upserts are not supporte
 
 ## Feasibility and identity
 
-Tantivy's immutable live-document bitset applies to Hermes. A deletion changes
+Tantivy's immutable live-document bitset applies to Summa. A deletion changes
 visibility, not postings or stored values. A replacement document is an insertion
 plus a deletion published in the same metadata transaction. Primary keys remain
 stable through merges; `(segment_id, doc_id)` addresses are snapshot-local.
 
-Hermes differs from Tantivy in three consequential ways: primary keys have a
+Summa differs from Tantivy in three consequential ways: primary keys have a
 uniqueness index, fields can use independent chunk/virtual IDs, and trained ANN
 payloads must retain their global artifact identity. Filtering only final hits
 would underfill top-k, let dead candidates raise pruning thresholds, and affect

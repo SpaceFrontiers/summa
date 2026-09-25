@@ -8,7 +8,7 @@
 - `x86/work/`, `arm/work/`: two passes over all 1,676 queries and four commands;
   structured counters, original stderr and checked protocol responses.
 - `x86/verify/`, `arm/verify/`: exhaustive versus optimized checks for all three
-  Hermes index layouts at k=10/100/1000. VERIFY counters aggregate its sub-runs
+  Summa index layouts at k=10/100/1000. VERIFY counters aggregate its sub-runs
   and must not be interpreted as ordinary query-work measurements.
 - `x86/norm-ablation/`: seven rotated latency passes on the same quantized index,
   table-enabled and canonical controls, temporary patch, build logs and exact

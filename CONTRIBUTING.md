@@ -19,25 +19,25 @@ pre-commit install
 
 Run from the repository root:
 
-| Change                                          | Check                                                                                                        |
-| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| Search stack                                    | `python3 scripts/check_search.py check`                                                                      |
-| Lifecycle or RPC                                | `python3 scripts/check_search.py full`                                                                       |
-| Portable Rust workspace                         | `cargo test --workspace`                                                                                     |
-| Rust formatting                                 | `cargo fmt --all -- --check`                                                                                 |
-| Rust lints                                      | `cargo clippy --workspace --all-targets -- -D warnings`                                                      |
-| Rust API docs                                   | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`                                                 |
-| Markdown links, navigation, benchmark inventory | `uv run scripts/check_docs.py`                                                                               |
-| WASM                                            | `(cd hermes-wasm && bash build.sh && npm ci && npm test -- --run)`                                           |
-| Python client                                   | `(cd hermes-client-python && uv sync --group dev --group test && uv run pytest tests/test_client_unit.py)`   |
-| TypeScript client                               | `pnpm --dir hermes-client-typescript install --frozen-lockfile && pnpm --dir hermes-client-typescript check` |
-| MAL Python wheel                                | `(cd hermes-mal-python && maturin build --release)`                                                          |
-| Search UI                                       | `pnpm --dir hermes-web test && pnpm --dir hermes-web lint && pnpm --dir hermes-web build`                    |
-| Model Lab                                       | `pnpm --dir hermes-model-lab install --frozen-lockfile && pnpm --dir hermes-model-lab check`                 |
+| Change                                          | Check                                                                                                      |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Search stack                                    | `python3 scripts/check_search.py check`                                                                    |
+| Lifecycle or RPC                                | `python3 scripts/check_search.py full`                                                                     |
+| Portable Rust workspace                         | `cargo test --workspace`                                                                                   |
+| Rust formatting                                 | `cargo fmt --all -- --check`                                                                               |
+| Rust lints                                      | `cargo clippy --workspace --all-targets -- -D warnings`                                                    |
+| Rust API docs                                   | `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`                                               |
+| Markdown links, navigation, benchmark inventory | `uv run scripts/check_docs.py`                                                                             |
+| WASM                                            | `(cd summa-wasm && bash build.sh && npm ci && npm test -- --run)`                                          |
+| Python client                                   | `(cd summa-client-python && uv sync --group dev --group test && uv run pytest tests/test_client_unit.py)`  |
+| TypeScript client                               | `pnpm --dir summa-client-typescript install --frozen-lockfile && pnpm --dir summa-client-typescript check` |
+| MAL Python wheel                                | `(cd summa-mal-python && maturin build --release)`                                                         |
+| Search UI                                       | `pnpm --dir summa-web test && pnpm --dir summa-web lint && pnpm --dir summa-web build`                     |
+| Model Lab                                       | `pnpm --dir summa-model-lab install --frozen-lockfile && pnpm --dir summa-model-lab check`                 |
 
 Install web dependencies and build WASM before checking the search UI. Python
-integration tests need `target/debug/hermes-server`. Protocol changes require
-[regenerating both clients](hermes-proto/README.md#regeneration-and-validation).
+integration tests need `target/debug/summa-server`. Protocol changes require
+[regenerating both clients](summa-proto/README.md#regeneration-and-validation).
 
 The search harness checks native-without-sync and standalone broker builds.
 GPU backends require separate Metal/CUDA hosts and checks; `--all-features`

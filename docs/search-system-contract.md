@@ -1,6 +1,6 @@
 # Search system engineering contract
 
-Scope: `hermes-core`, `hermes-server`, and their broker/tool/protocol/WASM
+Scope: `summa-core`, `summa-server`, and their broker/tool/protocol/WASM
 adapters. This consolidates existing contracts and defines how to maintain them.
 It is not a new storage format or permission to change public behavior.
 
@@ -23,9 +23,11 @@ It is not a new storage format or permission to change public behavior.
 | `broker`                                        | Topology, shard routing, distributed statistics and result combination                     | Reimplementation of segment search                        |
 | `tool`, `wasm`, clients, `proto`                | Frontends and transport contracts                                                          | Forks of core algorithms                                  |
 
-Paths above are relative to `hermes-<crate>/src`. This is a responsibility map,
+Paths above are relative to `summa-<crate>/src`. This is a responsibility map,
 not a strict acyclic module graph: existing sibling integrations are allowed.
-The harness checks crate dependency boundaries. Storage must not gain an RPC,
+The harness checks crate dependency boundaries. Server and broker may use the
+source-only `summa-proto` build dependency to package the canonical schemas and
+shared mutation validation; protocol ownership stays in that crate. Storage must not gain an RPC,
 training, or UI dependency to implement an adapter feature.
 
 ### Splitting and naming
@@ -187,7 +189,7 @@ exit code. `--plan` lists commands without running checks.
 | Metadata residency  | Mmap fixture, copy-mode search equivalence and budget accounting; Linux mlock exercise on a suitable host         |
 | Search/planning     | Exact top-k oracle or known expected hits/scores, ordinal/position semantics, native and async paths              |
 | Protocol/conversion | Real RPC behavior, overload/error codes, bounded expansion, generated clients when proto changes                  |
-| Portable core       | Native without sync; `cd hermes-wasm && bash build.sh && npm ci && npm test`                                      |
+| Portable core       | Native without sync; `cd summa-wasm && bash build.sh && npm ci && npm test`                                       |
 
 ### Performance protocol
 

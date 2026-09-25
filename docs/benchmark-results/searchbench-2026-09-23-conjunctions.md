@@ -4,9 +4,9 @@ Count agreement: **15/826 queries**. This is a restricted workload, not the comp
 
 10M Wikipedia chunks; one merged segment; 32-vCPU host (16 physical cores with SMT), 30 server hardware threads and two driver threads on the reserved physical core. Query and request caches disabled. Thirty-second session warmup, full untimed validation, one-second connection warmup, three ten-second repetitions per cell.
 
-Only the seven agreeing `and_high_low` queries are timed here, at one and 32 clients. All four variants run sequentially in isolated loopback networking; all Hermes variants use the same ordinary index, without RGB or impact metadata. Server CPUs: 0–14,16–30; driver CPUs: 15,31. No copying, compilation or indexing overlaps timed runs. Core search algorithms are unchanged by this follow-up.
+Only the seven agreeing `and_high_low` queries are timed here, at one and 32 clients. All four variants run sequentially in isolated loopback networking; all Summa variants use the same ordinary index, without RGB or impact metadata. Server CPUs: 0–14,16–30; driver CPUs: 15,31. No copying, compilation or indexing overlaps timed runs. Core search algorithms are unchanged by this follow-up.
 
-Hermes uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
+Summa uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
 
 | Family             | Included | Published queries |
 | ------------------ | -------: | ----------------: |
@@ -33,20 +33,20 @@ Hermes uses a benchmark HTTP frontend over core, not its production gRPC service
 
 **Throughput (queries/second; higher is better).** Values are the median of three repetitions. The CSV retains repetition min/max and peak process RSS. Raw replay JSON and memory samples accompany each cell.
 
-| Family       | Operation | Clients | Distinct queries | Hermes before (HTTP 2) (QPS) | Hermes encoded (HTTP 2) (QPS) | Hermes encoded (HTTP auto: 4) (QPS) | Luxir (QPS) |
-| ------------ | --------- | ------: | ---------------: | ---------------------------: | ----------------------------: | ----------------------------------: | ----------: |
-| and_high_low | COUNT     |       1 |                7 |                      2,816.8 |                       2,599.6 |                             2,269.4 |     3,226.3 |
-| and_high_low | COUNT     |      32 |                7 |                     51,285.9 |                      50,187.6 |                            68,523.8 |    64,756.2 |
-| and_high_low | TOP_10    |       1 |                7 |                      2,143.1 |                       2,050.2 |                             2,093.8 |     2,717.1 |
-| and_high_low | TOP_10    |      32 |                7 |                     41,427.8 |                      44,770.6 |                            41,721.5 |    53,073.0 |
-| and_high_low | TOP_100   |       1 |                7 |                      1,507.2 |                       1,317.7 |                             1,312.1 |     1,589.2 |
-| and_high_low | TOP_100   |      32 |                7 |                     21,036.2 |                      33,246.0 |                            32,719.8 |    41,003.0 |
+| Family       | Operation | Clients | Distinct queries | Summa before (HTTP 2) (QPS) | Summa encoded (HTTP 2) (QPS) | Summa encoded (HTTP auto: 4) (QPS) | Luxir (QPS) |
+| ------------ | --------- | ------: | ---------------: | --------------------------: | ---------------------------: | ---------------------------------: | ----------: |
+| and_high_low | COUNT     |       1 |                7 |                     2,816.8 |                      2,599.6 |                            2,269.4 |     3,226.3 |
+| and_high_low | COUNT     |      32 |                7 |                    51,285.9 |                     50,187.6 |                           68,523.8 |    64,756.2 |
+| and_high_low | TOP_10    |       1 |                7 |                     2,143.1 |                      2,050.2 |                            2,093.8 |     2,717.1 |
+| and_high_low | TOP_10    |      32 |                7 |                    41,427.8 |                     44,770.6 |                           41,721.5 |    53,073.0 |
+| and_high_low | TOP_100   |       1 |                7 |                     1,507.2 |                      1,317.7 |                            1,312.1 |     1,589.2 |
+| and_high_low | TOP_100   |      32 |                7 |                    21,036.2 |                     33,246.0 |                           32,719.8 |    41,003.0 |
 
 ## Measured result and tradeoffs
 
 At 32 clients, the final automatic configuration improves top-100 **55.5%**
 and count **33.6%** over baseline. Top-10 changes only **0.7%**, too little to
-claim a robust improvement. Hermes exceeds fresh Luxir count throughput by
+claim a robust improvement. Summa exceeds fresh Luxir count throughput by
 **5.8%**, but remains **21.4% below** on top-10 and **20.2% below** on top-100.
 The baseline top-100 gap was 48.7%: the frontend explains a substantial part of
 it, while a material ranked-query gap remains.
@@ -82,7 +82,7 @@ waiting between HTTP,
 blocking-worker and shared Rayon execution before redesigning pool ownership.
 The original profile's work-stealing/epoch samples make scheduling a concrete
 follow-up alongside posting and ID-column costs. Count CPU cost at 32 clients
-is lower for automatic Hermes (341 µs/request) than Luxir (442 µs/request).
+is lower for automatic Summa (341 µs/request) than Luxir (442 µs/request).
 
 These conjunction-only memory figures are not directly comparable with the
 prior all-family report: a different set of queries faults different mmap pages.
@@ -106,7 +106,7 @@ Production gRPC and core search defaults are unchanged. This bounded heuristic
 has been measured on this host; it is not claimed optimal across workloads or
 architectures.
 
-All final Hermes variants were compiled on the same 8-vCPU Cascade Lake build machine
+All final Summa variants were compiled on the same 8-vCPU Cascade Lake build machine
 using Rust 1.98.1, release mode and `RUSTFLAGS='-C target-cpu=native'`, then run on
 the same 32-vCPU Cascade Lake benchmark machine. Builds and transfers finished before
 timing. All use the same immutable ordinary 10M-document index; RGB and impacts
@@ -118,15 +118,15 @@ This does not expand the original 15/826 count-agreement gate.
 
 The initial software user-time profile (`task-clock:u`, 99 Hz, DWARF) used the
 frozen binary from the prior phrase campaign. During a 12-second top-100 replay,
-Hermes consumed about 215 server CPU-seconds (17.9 logical-CPU equivalents),
-versus Luxir's 341 (28.4). Hermes' two HTTP workers each accumulated about 11.7
+Summa consumed about 215 server CPU-seconds (17.9 logical-CPU equivalents),
+versus Luxir's 341 (28.4). Summa' two HTTP workers each accumulated about 11.7
 CPU-seconds during the roughly 15 active seconds including warmup. These are
 profiled diagnostics, not the uninstrumented throughput table above.
 
-Hermes' largest self samples include AVX2 posting-gap unpacking (9.19%), posting
+Summa' largest self samples include AVX2 posting-gap unpacking (9.19%), posting
 intersection (8.92%), block seeking (7.56%), and the conjunction executor (4.85%).
 ID-column blockwise reads account for 4.78%; malloc accounts for 4.34%. The
-samples identify remaining Hermes work, but do not prove Luxir's internal
+samples identify remaining Summa work, but do not prove Luxir's internal
 algorithm is better. Luxir's official release is stripped: 97.4% of user samples
 are attributed to its executable without sufficient function symbols for a
 comparable kernel diagnosis. Kernel time is not included in these user profiles.
@@ -175,7 +175,7 @@ and allocator effect under concurrency.
 
 ## Correctness and remaining work
 
-All three Hermes variants preserve exact counts, ranked external IDs, score bits
+All three Summa variants preserve exact counts, ranked external IDs, score bits
 and exhaustive top-100 results for all 15 admitted queries. Their 45 HTTP response
 bodies (count, top-10 and top-100 for each query) are byte-identical. Every timing
 cell also runs untimed count or ranked-cardinality/unique-ID validation; topology

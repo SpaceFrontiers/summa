@@ -1,5 +1,5 @@
---- a/hermes-core/src/query/collector.rs
-+++ b/hermes-core/src/query/collector.rs
+--- a/summa-core/src/query/collector.rs
++++ b/summa-core/src/query/collector.rs
 @@ -1609,7 +1609,7 @@
                  collector.collect(result_doc, score, &[]);
              }

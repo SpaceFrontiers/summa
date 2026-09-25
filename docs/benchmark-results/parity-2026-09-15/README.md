@@ -51,17 +51,17 @@ against the branch tip is not a substitute for this overlay.
 
 For isolated experiments, start again from the control overlay:
 
-1. Apply `local/scoring-reject.rs` to `hermes-core/src/query/scoring.rs` for the
+1. Apply `local/scoring-reject.rs` to `summa-core/src/query/scoring.rs` for the
    scalar guard control.
 2. For `mask`, `seek` or `required`, replace that file with the corresponding
    `local/<experiment>/scoring.rs`.
 3. For `batch`, replace both scoring and
-   `hermes-core/src/structures/postings/posting.rs` with its two candidate files.
+   `summa-core/src/structures/postings/posting.rs` with its two candidate files.
 4. For `bounds`, keep the guard scoring file and replace `query/bm25.rs` and
    `query/phrase.rs` with its candidate files.
 
 After extracting any source overlay into an existing build directory, run
-`cargo clean -p hermes-core` before rebuilding, or rewrite the source files with
+`cargo clean -p summa-core` before rebuilding, or rewrite the source files with
 fresh mtimes as the corrected recipes do. Copy each control binary out of the
 Cargo target directory first. Require an actual core compile and verify the
 source manifest before timing; source hashes alone do not prove that Cargo
@@ -69,7 +69,7 @@ rebuilt a binary. The recorded final build did compile afresh.
 
 Use Rust 1.98.1, the locked dependencies, `RUSTFLAGS='-C target-cpu=native'`,
 `CARGO_PROFILE_RELEASE_LTO=true`, `CARGO_INCREMENTAL=0` and four build jobs.
-Copy `oracles/traversal_score_oracle.rs` into `hermes-core/examples/` for the
+Copy `oracles/traversal_score_oracle.rs` into `summa-core/examples/` for the
 verification build. Build `search_benchmark_game` and `traversal_score_oracle`
 as release examples. The `run.py`, `paired.py`, ARM scripts and environment
 logs preserve exact commands and fixture paths; adjust machine-local paths.
@@ -94,7 +94,7 @@ line-protocol round trip. Queries comprise 962 official queries and 714
 supplemental terms. Per-query raw durations and per-pass ratios are retained.
 This is the paired driver, not a new execution of the original upstream runner.
 
-Ordered document IDs, raw score bits and exact counts must match across Hermes
+Ordered document IDs, raw score bits and exact counts must match across Summa
 sources, and each pruned top-k must match its exhaustive scorer. Counts also
 match Tantivy. Cross-engine score/rank identity is not claimed because scoring
 representations differ. `/usr/bin/time` captures process peak RSS, including

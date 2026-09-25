@@ -1,9 +1,9 @@
 {
-  "Hermes": {
+  "Summa": {
     "successful": 684,
     "errors": 142
   },
-  "Hermes RGB": {
+  "Summa RGB": {
     "successful": 684,
     "errors": 142
   },
@@ -24,146 +24,146 @@
   "by_family": {
     "and_high_high": {
       "published_queries": 47,
-      "hermes_successful": 47,
-      "hermes_errors": 0,
+      "summa_successful": 47,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 44
     },
     "and_high_low": {
       "published_queries": 50,
-      "hermes_successful": 50,
-      "hermes_errors": 0,
+      "summa_successful": 50,
+      "summa_errors": 0,
       "exact_count_agreement": 7,
       "within_5_percent_reference_count": 32
     },
     "and_high_med": {
       "published_queries": 50,
-      "hermes_successful": 50,
-      "hermes_errors": 0,
+      "summa_successful": 50,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 40
     },
     "high_phrase": {
       "published_queries": 30,
-      "hermes_successful": 30,
-      "hermes_errors": 0,
+      "summa_successful": 30,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 30
     },
     "high_sloppy_phrase": {
       "published_queries": 7,
-      "hermes_successful": 7,
-      "hermes_errors": 0,
+      "summa_successful": 7,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 7
     },
     "high_term": {
       "published_queries": 45,
-      "hermes_successful": 45,
-      "hermes_errors": 0,
+      "summa_successful": 45,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 44
     },
     "low_phrase": {
       "published_queries": 50,
-      "hermes_successful": 50,
-      "hermes_errors": 0,
+      "summa_successful": 50,
+      "summa_errors": 0,
       "exact_count_agreement": 7,
       "within_5_percent_reference_count": 48
     },
     "low_sloppy_phrase": {
       "published_queries": 37,
-      "hermes_successful": 37,
-      "hermes_errors": 0,
+      "summa_successful": 37,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 36
     },
     "low_term": {
       "published_queries": 47,
-      "hermes_successful": 47,
-      "hermes_errors": 0,
+      "summa_successful": 47,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 42
     },
     "med_phrase": {
       "published_queries": 46,
-      "hermes_successful": 46,
-      "hermes_errors": 0,
+      "summa_successful": 46,
+      "summa_errors": 0,
       "exact_count_agreement": 1,
       "within_5_percent_reference_count": 44
     },
     "med_sloppy_phrase": {
       "published_queries": 27,
-      "hermes_successful": 27,
-      "hermes_errors": 0,
+      "summa_successful": 27,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 26
     },
     "med_term": {
       "published_queries": 49,
-      "hermes_successful": 49,
-      "hermes_errors": 0,
+      "summa_successful": 49,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 39
     },
     "or_high_high": {
       "published_queries": 42,
-      "hermes_successful": 42,
-      "hermes_errors": 0,
+      "summa_successful": 42,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 42
     },
     "or_high_low": {
       "published_queries": 46,
-      "hermes_successful": 46,
-      "hermes_errors": 0,
+      "summa_successful": 46,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 42
     },
     "or_high_med": {
       "published_queries": 45,
-      "hermes_successful": 45,
-      "hermes_errors": 0,
+      "summa_successful": 45,
+      "summa_errors": 0,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 43
     },
     "prefix3": {
       "published_queries": 50,
-      "hermes_successful": 4,
-      "hermes_errors": 46,
+      "summa_successful": 4,
+      "summa_errors": 46,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 3
     },
     "regex": {
       "published_queries": 13,
-      "hermes_successful": 0,
-      "hermes_errors": 13,
+      "summa_successful": 0,
+      "summa_errors": 13,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 0
     },
     "wildcard": {
       "published_queries": 49,
-      "hermes_successful": 15,
-      "hermes_errors": 34,
+      "summa_successful": 15,
+      "summa_errors": 34,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 14
     },
     "wildcard_lead": {
       "published_queries": 47,
-      "hermes_successful": 0,
-      "hermes_errors": 47,
+      "summa_successful": 0,
+      "summa_errors": 47,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 0
     },
     "wildcard_scan": {
       "published_queries": 49,
-      "hermes_successful": 47,
-      "hermes_errors": 2,
+      "summa_successful": 47,
+      "summa_errors": 2,
       "exact_count_agreement": 0,
       "within_5_percent_reference_count": 43
     }
   },
-  "hermes_failure_reasons": {
+  "summa_failure_reasons": {
     "term_expansion_limit": 85,
     "dictionary_scan_limit": 57
   }

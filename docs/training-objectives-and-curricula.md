@@ -1,6 +1,6 @@
 # Training workflows and task contracts
 
-Hermes training consumes a strict `WorkflowV2` document. A workflow is an
+Summa training consumes a strict `WorkflowV2` document. A workflow is an
 ordered sequence of named phases; every task-bearing phase selects one task
 adapter and declares its data and execution geometry. Relative paths resolve
 against the workflow file.
@@ -8,10 +8,10 @@ against the workflow file.
 Only version 2 workflows are accepted; phase intent is always explicit and
 unknown versions fail before execution.
 
-The checked-in [`workflow.example.json`](../hermes-train/workflow.example.json)
+The checked-in [`workflow.example.json`](../summa-train/workflow.example.json)
 is directly executable by the built-in trainer. The
-[`workflow.education.example.json`](../hermes-train/workflow.education.example.json)
-and [`workflow.sleep.example.json`](../hermes-train/workflow.sleep.example.json)
+[`workflow.education.example.json`](../summa-train/workflow.education.example.json)
+and [`workflow.sleep.example.json`](../summa-train/workflow.sleep.example.json)
 examples combine phase kinds that require `NativeWorkflowHost`; neither whole
 file is accepted by the wake-only `train` command. To run their wake work with
 the stock trainer, extract a separate wake-only WorkflowV2 file and put the
@@ -78,7 +78,7 @@ strict typed `promotion` evidence contract.
 
 ## Execution surfaces
 
-`hermes-train train` owns the in-process streaming implementation for causal
+`summa-train train` owns the in-process streaming implementation for causal
 LM, summarization, retrieval representation/planning, instruction tuning,
 QA/reasoning, and quantization phases over those objectives. It also executes
 periodic sleep for a memory-enabled MAL when every projected phase carries one
@@ -89,11 +89,11 @@ workflow, seed, and optimizer settings and exits before creating any state. It
 rejects unsupported task/phase combinations.
 
 The strict periodic runtime shape is shown in
-[`sleep-runtime.periodic.example.json`](../hermes-train/sleep-runtime.periodic.example.json).
+[`sleep-runtime.periodic.example.json`](../summa-train/sleep-runtime.periodic.example.json).
 It intentionally has no wake journal or initial tier/parameter-ID state: the
 integrated trainer seals those artifacts at each boundary.
 
-`hermes-train run-workflow` is the algorithm-neutral lifecycle runner. It
+`summa-train run-workflow` is the algorithm-neutral lifecycle runner. It
 launches the configured worker executable and sends one protocol-v2 JSON
 request for each non-sleep, non-promotion phase. Promotion
 uses the built-in acceptance executor; an external worker cannot authorize
@@ -105,7 +105,7 @@ because this lifecycle surface does not own the worker's optimizer boundary.
 the standalone runtime without creating lifecycle state.
 
 The standalone shape is shown in
-[`sleep-runtime.standalone.example.json`](../hermes-train/sleep-runtime.standalone.example.json).
+[`sleep-runtime.standalone.example.json`](../summa-train/sleep-runtime.standalone.example.json).
 Its outer and Dreaming wake-journal pins must be identical, and its initial
 tier-optimizer and parameter-ID artifacts must belong to the phase input
 checkpoint. All-zero hashes in both examples are placeholders and must be
@@ -115,18 +115,18 @@ Progress cursors, typed metric events, yield, and completion are the only
 accepted worker responses. New and resumed runs use:
 
 ```bash
-hermes-train run-workflow \
-  --workflow hermes-train/workflow.example.json \
-  --executor /opt/hermes/bin/phase-worker \
+summa-train run-workflow \
+  --workflow summa-train/workflow.example.json \
+  --executor /opt/summa/bin/phase-worker \
   --state /data/run/workflow-runtime.json \
   --metrics /data/run/metrics.jsonl \
   --run-id workflow-seed-1 \
   --initial-checkpoint-uri checkpoint://initial/generation-manifest.json \
   --initial-checkpoint-sha256 "sha256:$INITIAL_CHECKPOINT_SHA256"
 
-hermes-train run-workflow \
-  --workflow hermes-train/workflow.example.json \
-  --executor /opt/hermes/bin/phase-worker \
+summa-train run-workflow \
+  --workflow summa-train/workflow.example.json \
+  --executor /opt/summa/bin/phase-worker \
   --state /data/run/workflow-runtime.json \
   --metrics /data/run/metrics.jsonl \
   --run-id workflow-seed-1 \
@@ -188,7 +188,7 @@ capacity must remain identical to cycle zero across every observed sleep cycle.
 
 ## Held-out evaluation
 
-`hermes-train eval` scores an existing checkpoint on held-out shards with a
+`summa-train eval` scores an existing checkpoint on held-out shards with a
 forward-only pass. It reuses the trainer's objective forward pass, batching, and
 JSONL/`.jsonl.zst` streaming, so its numbers are directly comparable with
 training-time metrics. It constructs no optimizer, records no autodiff tape,
@@ -199,7 +199,7 @@ never `.autodiff()` — dropout is therefore the identity — and the model is n
 reported loss.
 
 ```bash
-hermes-train eval \
+summa-train eval \
   --config model.mal --tokenizer tokenizer.json \
   --checkpoint out/generations/sha256-.../weights.safetensors \
   --data holdout-a.jsonl.zst --data holdout-b.jsonl.zst \
@@ -277,7 +277,7 @@ The corpus pipeline accepts replaceable search, record-materialization,
 tokenization, and deduplication adapters. The production recipe uses Search API
 for discovery and `PostgresRecordMaterializer` for canonical bodies. It is
 configured in
-[`corpus.production.example.json`](../hermes-train/corpus.production.example.json),
+[`corpus.production.example.json`](../summa-train/corpus.production.example.json),
 not in task or trainer code.
 
 - `request_template` contains the complete provider request shape.
@@ -317,7 +317,7 @@ one or more positively weighted strata. Predicates operate on the generic
 tokenized-row schema (`topic`, `difficulty`, `view`, and exact metadata); search
 request fields never enter trainer logic.
 
-`hermes-train compose-curriculum` streams the verified source into bounded
+`summa-train compose-curriculum` streams the verified source into bounded
 stratum spools, then uses a deterministic weighted scheduler to emit each
 stage. It validates the configured versus actual token fractions, rejects
 ambiguous multi-stratum matches, checks every output shard, and atomically
@@ -343,15 +343,15 @@ Run discovery/materialization first, copy its printed `manifest` digest into
 `source_manifest_sha256`, and then compose the stages:
 
 ```bash
-hermes-train prepare-corpus \
-  --recipe hermes-train/corpus.production.example.json \
+summa-train prepare-corpus \
+  --recipe summa-train/corpus.production.example.json \
   --tokenizer tokenizer.json \
   --output /data/corpora \
   --work-directory /data/corpus-work
 
-hermes-train compose-curriculum \
-  --config hermes-train/curriculum-composition.example.json \
-  --output hermes-train/corpus \
+summa-train compose-curriculum \
+  --config summa-train/curriculum-composition.example.json \
+  --output summa-train/corpus \
   --work-directory /data/curriculum-work
 ```
 
@@ -461,7 +461,7 @@ remain content-pinned.
 
 The checked-in sleep workflow uses placeholder evaluator/reference hashes that
 must be replaced before execution. The implementation is paper-inspired and
-experimental: unlike the paper's growing expert set, Hermes preallocates a
+experimental: unlike the paper's growing expert set, Summa preallocates a
 bounded reserve and performs a versioned final-tier distillation into the base.
 An untrainable rank-matched zero route occupies the reserve lane until a real
 slot activates, so the first activation replaces rather than adds top-k expert

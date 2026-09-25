@@ -7,7 +7,7 @@ Status: design (2026-09-03), implemented.
 A text field has exactly one tokenizer. Multilingual corpora therefore either
 stem everything with one language (wrong stems for the rest), stem nothing, or
 split the corpus into one field per language (many fields, query fan-out,
-fragmented BM25 statistics). Separately, `hermes-core` has a positional
+fragmented BM25 statistics). Separately, `summa-core` has a positional
 `PhraseQuery` with a BM25 scorer, but the gRPC protocol exposes only
 `MatchQuery` (OR of tokens) and the query language's `"..."` syntax degraded
 to an AND of terms.
@@ -115,7 +115,7 @@ message PhraseQuery { string field = 1; string text = 2; uint32 slop = 3; string
 ```
 
 `text` is tokenized server-side with the field's tokenizer (and hint), and
-the token positions become the phrase offsets (`hermes_core::PhraseQuery::
+the token positions become the phrase offsets (`summa_core::PhraseQuery::
 with_offsets`), so terms must occur at their original distances (`slop` 0)
 or within `slop` positions of them; with no stop words dropped that is the
 usual consecutive match. The score is BM25 over the phrase frequency (the

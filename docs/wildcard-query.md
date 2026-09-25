@@ -84,7 +84,7 @@ budget boundaries without constructing large corpora. Native checks and the
 portable build must pass; runtime matching never scans or rewrites index metadata.
 
 ```rust
-use hermes_core::WildcardQuery;
+use summa_core::WildcardQuery;
 let query = WildcardQuery::text(body_field, "foo*bar?")?;
 ```
 

@@ -117,16 +117,16 @@ def skip(results, out):
                     "http_checks": expected * 3 * 2,
                 }
             )
-            paths = measured_paths(first / "hermes")
+            paths = measured_paths(first / "summa")
             assert len(paths) == (
                 27 if variant == "current" else 9 if variant == "no-rare-seek" else 18
             )
             for path in paths:
                 summary = read(path)
-                candidate = metrics([path, second / "hermes" / path.name])
+                candidate = metrics([path, second / "summa" / path.name])
                 control = metrics(
                     [
-                        results / f"{r}-current-{layout}" / "hermes" / path.name
+                        results / f"{r}-current-{layout}" / "summa" / path.name
                         for r in [1, 2]
                     ]
                 )
@@ -179,8 +179,8 @@ def skip(results, out):
 
 def broad(results, out):
     families, queries = [], []
-    for label in ["hermes", "hermes-rgb", "elasticsearch", "opensearch", "luxir"]:
-        engine = "hermes" if label == "hermes-rgb" else label
+    for label in ["summa", "summa-rgb", "elasticsearch", "opensearch", "luxir"]:
+        engine = "summa" if label == "summa-rgb" else label
         folder = results / "broad" / label
         agreement = read(folder / "agreement.json")
         eligible = {r["key"]: r for r in agreement if r["include"]}
@@ -217,8 +217,8 @@ def broad(results, out):
                         "operation": summary["operation"],
                         "count": own_count,
                         "reference_count": reference,
-                        "hermes_relative_count_difference": abs(
-                            row["observed"]["hermes"]["count"] - reference
+                        "summa_relative_count_difference": abs(
+                            row["observed"]["summa"]["count"] - reference
                         )
                         / max(1, reference),
                         "requests": bucket["requests"],

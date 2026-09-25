@@ -15,7 +15,7 @@ preserves the original regression evidence.
 - ARM: Apple M4, first 100,000 canonical Wikipedia documents. x86: Cascade Lake,
   all 5,032,104 documents, engine processes pinned to CPU 2; driver unpinned.
 - Rust 1.98.1 / LLVM 22.1.8, release LTO, `-C target-cpu=native`. Same frozen
-  reader binary and cache limits across Hermes layouts. No concurrent builds,
+  reader binary and cache limits across Summa layouts. No concurrent builds,
   diagnostics, index audits or memory sampling during latency runs.
 - `compact`: selected RGB-off compact/exact index. `identity`: freshly built
   eligible plain-text field with identity mapping. `rgb`: its separately
@@ -214,14 +214,14 @@ Lucene 10.3.0-bp and Tantivy 0.25. Over all 962 queries, geometric means of
 per-query median top-10 latency give 1.33× speedup for Lucene-bp over Lucene and
 1.63× over Tantivy. A 3× figure depends on the selected subset or statistic.
 These are ratios calculated from the [published raw data](https://tantivy-search.github.io/bench/results.json),
-not a same-machine comparison to Hermes. The snapshot and arithmetic are kept
+not a same-machine comparison to Summa. The snapshot and arithmetic are kept
 in this benchmark's evidence.
 
 Lucene reassigns internal document IDs and writes the reordered index, allowing
 ordinary query execution to retain the new locality. Its
 [reorder API](https://lucene.apache.org/core/10_4_0/misc/org/apache/lucene/misc/index/BPIndexReorderer.html)
 and the implementer's [benchmark analysis](https://jpountz.github.io/2025/05/12/analysis-of-Search-Benchmark-the-Game.html)
-describe the mechanism. Hermes keeps stable IDs through field-local maps; that
+describe the mechanism. Summa keeps stable IDs through field-local maps; that
 contract does not require replaying every match in original order internally.
 
 ## Validation and limitations

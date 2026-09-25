@@ -13,7 +13,7 @@
     }
   ],
   "notes": [
-    "Both Hermes binaries carry identical zero-frequency BM25 and Boolean statistics/nested ranking correctness fixes. The candidate additionally extends the existing ranked text window executor to required/optional terms.",
+    "Both Summa binaries carry identical zero-frequency BM25 and Boolean statistics/nested ranking correctness fixes. The candidate additionally extends the existing ranked text window executor to required/optional terms.",
     "All 962 official queries and 714 supplemental terms, four commands, seven full workload passes with rotated engine order, CPU 2, native CPU flags and LTO on the original Cascade Lake host. Fixed rounded index bytes; grouped-impact indexes are correctness-gated separately.",
     "Both binaries independently pass exact count versus Tantivy, pruning versus exhaustive top-10/100/1000, and cross-source ordered top-1000 IDs/raw score bits/counts. Two 100k ARM fixtures also preserve these oracles and index bytes.",
     "Native main harness: 1751 passed, 26 ignored, four stages. The initial broker discovery timeout and passing repeat are both retained. No WASM rebuild, as instructed by the user.",

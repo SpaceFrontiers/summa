@@ -1,6 +1,6 @@
 # Query language
 
-Hermes accepts terms, field-qualified terms, phrases, prefixes, wildcard and regex functions, explicit
+Summa accepts terms, field-qualified terms, phrases, prefixes, wildcard and regex functions, explicit
 `AND`/`OR`/`NOT`, grouping, unary `+`/`-` modifiers, and vector expressions.
 Whitespace between clauses is an implicit OR.
 
@@ -56,7 +56,7 @@ should match a complement.
 
 Quoted phrases containing multiple analyzed tokens require an indexed text
 field with `token_position` or `positions`. Missing or ordinal-only positions
-produce a field-specific error; Hermes does not replace adjacency with AND.
+produce a field-specific error; Summa does not replace adjacency with AND.
 Use an explicit AND for unordered terms, or rebuild the field with token
 positions. Unqualified phrases keep all configured default-field branches,
 including branches that analyze to one token; an unsupported multi-token

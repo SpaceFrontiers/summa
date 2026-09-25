@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug to help us improve Hermes
+about: Report a bug to help us improve Summa
 title: ""
 labels: bug
 assignees: ""
@@ -28,8 +28,8 @@ Describe what actually happened. Include error messages, logs, or stack traces i
 
 - **OS**: (e.g., Ubuntu 24.04, macOS 15, Windows 11)
 - **Rust version**: (output of `rustc --version`)
-- **Hermes version/commit**: (e.g., v1.7.42 or commit hash)
-- **Crate**: (e.g., hermes-core, hermes-server, hermes-tool)
+- **Summa version/commit**: (e.g., v1.7.42 or commit hash)
+- **Crate**: (e.g., summa-core, summa-server, summa-tool)
 
 ## Additional Context
 

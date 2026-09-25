@@ -2,7 +2,7 @@
 
 Status: both dictionary builds have complete, verified full-corpus results.
 The separate Zstd allocation candidate also has verified full-corpus results.
-All settings remain opt-in with unchanged defaults. Hermes has not established
+All settings remain opt-in with unchanged defaults. Summa has not established
 leadership. This report separates frozen candidates from the current workspace.
 
 ## Changes and controls
@@ -21,7 +21,7 @@ The tool exposes `--term-dict-block-bytes` on index/merge/compact/reorder and
 same core settings. No codec, scorer, query-answer cache or STB5 version change
 is involved. This follows the small-block principle in Lucene's
 [block-tree dictionary](https://github.com/apache/lucene/blob/1160d3c8a256ee967b16df7e9e26ec39da3aea01/lucene/core/src/java/org/apache/lucene/codecs/lucene103/blocktree/Lucene103BlockTreeTermsWriter.java),
-while retaining Hermes's existing Zstd/restart representation.
+while retaining Summa's existing Zstd/restart representation.
 
 The experiment also fixes existing failure/resource behavior. Bulk dictionary
 prefetch previously read the entire table and expanded its configured cache cap;
@@ -76,7 +76,7 @@ not a claim about whole-index growth or indexing throughput.
 | TOP100 + exact count   | 886.354 | 770.761 | 770.582 |      238.884 |
 | Exact count            |  49.911 |  10.161 |  10.170 |        6.623 |
 
-The term-only count improvement is 4.91× at 4 KiB; Hermes remains 1.53× slower
+The term-only count improvement is 4.91× at 4 KiB; Summa remains 1.53× slower
 than Tantivy for that command. Its TOP10 gap remains 4.60×, motivating tighter
 score bounds in addition to dictionary work. Peak official ranked RSS is roughly
 973 MiB at 16 KiB versus 971–972 MiB at 4 KiB; supplemental COUNT is 58.22 versus
@@ -109,7 +109,7 @@ results precede the independent decompressor-capacity fix.
 
 The v1/v2 4 KiB control changes are mixed, mostly 1–3%; this does not establish
 a search-speed effect from the writer failure fix. Within v2, 4 KiB improves the
-matched 16 KiB layout by 10–18% on official commands. Hermes still takes
+matched 16 KiB layout by 10–18% on official commands. Summa still takes
 1.94–2.23× Tantivy's time. All three layouts pass the 1,676 exhaustive-ranking /
 exact-count gates. Rewriting the dictionaries with v2 produces exactly the same
 bytes as v1, on both architectures. Fourteen storage tests and three policy tests
@@ -133,7 +133,7 @@ contains raw samples, resource logs, exact source overlays, golden bytes, tests,
 query sets and index manifests. The full executable archive has 136 verified
 members, 27,178,425 bytes, SHA-256
 `5a2129da5db4769146be22af82325cc5b15c3a8604b239263f5a4ff09ea35550`.
-All three fixture manifests and the original Hermes/Tantivy index manifests
+All three fixture manifests and the original Summa/Tantivy index manifests
 remain unchanged after timing. The machine remains in use for the separate allocation
 and conjunction experiments.
 

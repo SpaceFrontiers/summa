@@ -14,7 +14,7 @@ fn p32(b: &mut [u8], p: usize, v: usize) {
 fn p64(b: &mut [u8], p: usize, v: usize) {
     b[p..p + 8].copy_from_slice(&(v as u64).to_le_bytes());
 }
-#[path = "../../../hermes-core/src/structures/postings/sparse/dimensions.rs"]
+#[path = "../../../summa-core/src/structures/postings/sparse/dimensions.rs"]
 mod dimensions;
 fn component(b: &[u8], mode: &str, stats: &mut [u64; 4]) -> Vec<u8> {
     let footer = b.len() - 40;

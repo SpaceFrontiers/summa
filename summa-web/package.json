@@ -1,0 +1,48 @@
+{
+  "name": "summa-web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lab:dev": "pnpm --dir ../summa-model-lab dev",
+    "lab:build": "pnpm --dir ../summa-model-lab build",
+    "lab:preview": "pnpm --dir ../summa-model-lab preview",
+    "lab:test": "pnpm --dir ../summa-model-lab test",
+    "lab:lint": "pnpm --dir ../summa-model-lab lint",
+    "test": "node --test src/**/*.test.js",
+    "lint": "eslint src --max-warnings 0",
+    "lint:fix": "eslint src --fix --max-warnings 0"
+  },
+  "dependencies": {
+    "summa-wasm": "file:../summa-wasm/pkg",
+    "pinia": "^3.0.4",
+    "vue": "^3.5.27"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.2",
+    "@tailwindcss/postcss": "^4.1.18",
+    "@vitejs/plugin-vue": "^6.0.3",
+    "autoprefixer": "^10.4.23",
+    "eslint": "^9.39.2",
+    "eslint-plugin-vue": "^10.7.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.18",
+    "vite": "^7.3.6",
+    "vite-plugin-top-level-await": "^1.6.0",
+    "vite-plugin-wasm": "^3.5.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "rollup": "^4.62.2",
+      "postcss": "^8.5.19",
+      "picomatch": "^4.0.5",
+      "flatted": "^3.4.2",
+      "uuid": "^11.1.1",
+      "js-yaml@4": "^4.3.0",
+      "minimatch@3": "^3.1.5"
+    }
+  }
+}

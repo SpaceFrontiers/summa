@@ -1,0 +1,17 @@
+{
+  "name": "summa-wasm",
+  "private": true,
+  "description": "JavaScript test harness for the Summa WebAssembly package",
+  "scripts": {
+    "test": "vitest"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "vitest": "^4.1.0"
+  },
+  "overrides": {
+    "vite": "^8.1.4",
+    "postcss": "^8.5.19",
+    "picomatch": "^4.0.5"
+  }
+}

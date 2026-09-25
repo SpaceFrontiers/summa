@@ -1,4 +1,4 @@
-# L1 candidate scoring: handoff to the Hermes agent
+# L1 candidate scoring: handoff to the Summa agent
 
 Status: work in progress, handed off on 2026-09-05. The user rejected the new
 inverse lookup maps in this implementation. The code is preserved for review;
@@ -6,11 +6,11 @@ it is not an accepted storage design or a release-ready change.
 
 ## Start here
 
-- Handoff branch: `handoff/l1-scoring-2026-09-05` in `SpaceFrontiers/hermes`.
+- Handoff branch: `handoff/l1-scoring-2026-09-05` in `SpaceFrontiers/summa`.
 - Code at handoff: `7fa5d4cd7743f33f822e284a4636ca92cd601151`, followed by this
   documentation commit. The handoff does not change engine code.
 - Original branch: `feature/l1-candidate-scoring`;
-  [PR #169](https://github.com/SpaceFrontiers/hermes/pull/169) remains open.
+  PR #169 in the archived development repository remains open.
 - Upstream incorporated: `98c86059`, version 1.8.123. Review with
   `git diff 98c86059...HEAD`, preserving the independent upstream text-pruning fixes.
 - Integration repository: `SpaceFrontiers/azeroth`, branch
@@ -27,7 +27,7 @@ dense/binary, and document-profile branches. Every nominated item needs the
 raw score of every requested branch, including branches that did not retrieve
 it. A missing top-K result must not become a fabricated zero score.
 
-Hermes should optionally apply a portable linear formula over those features
+Summa should optionally apply a portable linear formula over those features
 before selecting the pool sent to the external cross-encoder. RRF remains an
 alternative. Apply the formula on shards and the broker, preserve query and
 document combiners, and export raw scores for training and inspection.
@@ -69,16 +69,16 @@ reorder, lookup preparation, index rewrite, or L1 rollout was performed here.
 
 ## Implemented code to review and retain where appropriate
 
-| Area                      | Implementation                                                                                                                                                                                                                          |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Core scoring              | `hermes-core/src/query/candidate_scoring/{mod,execution,model,tests}.rs`: named features, document/chunk scopes, score completion, fixed transforms, linear inference, presence versus zero, nominated passages and bounded diagnostics |
-| Shared scoring primitives | `query/term.rs`, `phrase.rs`, `bmp.rs`, `reranker.rs`: reuse text statistics/positions and stored vector scoring; preserve quantization and negative dense scores                                                                       |
-| Existing addressing       | `segment/reader/bmp.rs`, `segment/chunk_map.rs`, flat-vector readers: inspect existing maps and layouts before redesign                                                                                                                 |
-| Rejected additions        | `segment/ordinal_lookup.rs`, `segment/ordinal_lookup/lifecycle.rs`, `segment/reader/candidate_lookup.rs`; references in reader open, merger, reorder, segment types, diagnostics and tests                                              |
-| Nomination/eligibility    | `query/filtered.rs`, `fusion.rs`, `planner.rs`, `index/searcher.rs`: bounded union, score-only branches, shared hard filters, logical passage deduplication                                                                             |
-| Server                    | `hermes-server/src/search_service/candidate_scoring.rs`, validation/conversion/response modules: limits, branch conversion, complete raw exports and ranking markers                                                                    |
-| Broker                    | `hermes-broker/src/ranking.rs`, `search_service.rs`, `partition.rs`: global statistics, full branch union/global RRF, shared L1 formula, exact final selection and bounded export                                                       |
-| Protocol/clients          | `hermes-proto/hermes.proto`, Python and TypeScript clients/generated bindings: named scopes, `score_only`, `candidate_depth`, `l1`, `score_export`, candidate features and capability reporting                                         |
+| Area                      | Implementation                                                                                                                                                                                                                         |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Core scoring              | `summa-core/src/query/candidate_scoring/{mod,execution,model,tests}.rs`: named features, document/chunk scopes, score completion, fixed transforms, linear inference, presence versus zero, nominated passages and bounded diagnostics |
+| Shared scoring primitives | `query/term.rs`, `phrase.rs`, `bmp.rs`, `reranker.rs`: reuse text statistics/positions and stored vector scoring; preserve quantization and negative dense scores                                                                      |
+| Existing addressing       | `segment/reader/bmp.rs`, `segment/chunk_map.rs`, flat-vector readers: inspect existing maps and layouts before redesign                                                                                                                |
+| Rejected additions        | `segment/ordinal_lookup.rs`, `segment/ordinal_lookup/lifecycle.rs`, `segment/reader/candidate_lookup.rs`; references in reader open, merger, reorder, segment types, diagnostics and tests                                             |
+| Nomination/eligibility    | `query/filtered.rs`, `fusion.rs`, `planner.rs`, `index/searcher.rs`: bounded union, score-only branches, shared hard filters, logical passage deduplication                                                                            |
+| Server                    | `summa-server/src/search_service/candidate_scoring.rs`, validation/conversion/response modules: limits, branch conversion, complete raw exports and ranking markers                                                                    |
+| Broker                    | `summa-broker/src/ranking.rs`, `search_service.rs`, `partition.rs`: global statistics, full branch union/global RRF, shared L1 formula, exact final selection and bounded export                                                       |
+| Protocol/clients          | `summa-proto/summa.proto`, Python and TypeScript clients/generated bindings: named scopes, `score_only`, `candidate_depth`, `l1`, `score_export`, candidate features and capability reporting                                          |
 
 Useful commit landmarks:
 
@@ -100,15 +100,15 @@ and tests; passing those tests does not validate the rejected architecture.
 ## Production facts and the incorrect diagnosis
 
 Last verified during this continuation: all four shards and the broker were
-ready on `ghcr.io/spacefrontiers/hermes/hermes-server:1.8.123`. The API-side
+ready on `ghcr.io/spacefrontiers/summa/summa-server:1.8.123`. The API-side
 integration was already deployed, but candidate scoring capability on the old
-Hermes binary was version 0 and no learned model was enabled.
+Summa binary was version 0 and no learned model was enabled.
 
 Production sparse fields `sparse_vectors` and
 `short_document_sparse_embedding` use **BMP**, with reordering enabled.
 Full-text intentionally uses **MaxScore**. This was checked in actual
-`metadata.json` on `hermes-server-fin`, `hermes-server-fin2-s2`,
-`hermes-server-fin2-s3`, and `hermes-server-fin2-s4`.
+`metadata.json` on `summa-server-fin`, `summa-server-fin2-s2`,
+`summa-server-fin2-s3`, and `summa-server-fin2-s4`.
 
 The previous agent incorrectly inferred sparse MaxScore from `GetIndexInfo` SDL,
 which omitted BMP storage/reorder settings. Commit `7fa5d4cd` fixes that lossy
@@ -126,7 +126,7 @@ real-server broker E2E. Counts include 1,309 core unit tests, 63 server tests,
 The [saved run manifest](2026-09-05-l1/full-harness.json) includes commands,
 return codes, host/compiler, and the pre-commit dirty-diff identity. Full logs
 remain in `.context/search-harness/20260905T150826.682593Z-full/` in the original
-Hermes checkout.
+Summa checkout.
 
 Two preceding parallel runs timed out in different mock-broker discovery tests.
 The recovery test passed alone, then the complete serial run passed. Do not
@@ -141,11 +141,11 @@ an independent full-union formula oracle. The winning scores were approximately
 This fixture used newly built BMP data; it is not production performance evidence
 or validation of a replacement for the lookup design.
 
-At handoff, [CI run 33974102658](https://github.com/SpaceFrontiers/hermes/actions/runs/33974102658)
+At handoff, CI run 33974102658 in the archived development repository
 for `7fa5d4cd` had nine successful jobs, including Python, TypeScript and WASM,
 while Rust CI was still in progress. Its final status was not assumed.
 
-## Remaining Hermes work
+## Remaining Summa work
 
 1. Review/redesign score completion to meet the user's no-new-lookup-maps
    constraint, using the existing index representations. Remove the rejected
@@ -162,6 +162,6 @@ while Rust CI was still in progress. Its final status was not assumed.
    The original task includes PR, merge and `publish.yml`, but this handoff is
    not authorization to merge the rejected design unchanged.
 
-No Hermes release/publish, production rollout, training dataset collection,
+No Summa release/publish, production rollout, training dataset collection,
 teacher-labeling campaign, model fit or learned-model activation was completed.
-The user is transferring engine ownership to a dedicated Hermes agent.
+The user is transferring engine ownership to a dedicated Summa agent.

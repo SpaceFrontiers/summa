@@ -1,10 +1,10 @@
 # IResearch optimization and Linux I/O audit
 
-Audit date: September 20, 2026. Hermes source:
+Audit date: September 20, 2026. Summa source:
 `15b8a3683fd563f03f1b4f8b14310c761303734e`. This checks the mechanisms in the
-maintainer's Search Benchmark Game description against current Hermes call paths.
+maintainer's Search Benchmark Game description against current Summa call paths.
 It is not a new engine benchmark, an exhaustive IResearch review, or a claim that
-implementing each mechanism would make Hermes faster. No runtime/default changes
+implementing each mechanism would make Summa faster. No runtime/default changes
 are made by this audit.
 
 ## Source identities and methodology
@@ -29,19 +29,19 @@ are made by this audit.
 
 The interactive sites do not provide a plain-text leaderboard to the reader used
 here. The quoted universal-win statement is not independently re-established.
-Hermes's [existing benchmark](search-benchmark-current.md) uses its own pinned
+Summa's [existing benchmark](search-benchmark-current.md) uses its own pinned
 corpus, controls, and timing protocol; do not compare unrelated microsecond tables
 as if measured on the same machine or scoring/analyzer configuration.
 
 ## Coverage summary
 
-| Advertised mechanism         | Hermes status                                               | Concrete finding                                                                                                                                             |
+| Advertised mechanism         | Summa status                                                | Concrete finding                                                                                                                                             |
 | ---------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Vectorized scoring / AVX2    | Batch structure present; production ISA coverage incomplete | Contiguous BM25 scoring and score masks exist; BM25 uses ordinary Rust loops, while portable release builds do not request AVX2                              |
 | `nth_element` top-k          | Missing from main text collectors                           | Both `ScoreCollector` and `TopKCollector` retain binary heaps; fusion's partial selection does not cover text collection                                     |
 | Adaptive posting compression | Partial                                                     | Four codecs and per-block widths exist; the writer does not choose among IResearch's constant-gap, bitmap, StreamVByte, and packed representations per block |
 | Lazy sparse evaluation       | Substantially present                                       | Deferred TF, selective intersections, candidate-first phrases, prepared score bounds, and bounded score windows are active                                   |
-| No JVM                       | Already true                                                | Hermes executes native Rust; this is not a remaining implementation task                                                                                     |
+| No JVM                       | Already true                                                | Summa executes native Rust; this is not a remaining implementation task                                                                                      |
 | `io_uring`                   | Absent                                                      | Server search uses mmap, lazy filesystem ranges use blocking positional reads, writes use buffered/cold file writers                                         |
 
 ## Scoring and instruction selection
@@ -52,9 +52,9 @@ scores contiguous arrays using prepared coefficients. Its
 explicitly screens groups of eight scores with AVX2 before selection. These are
 separate mechanisms: vectorized arithmetic and vectorized admission.
 
-Hermes's [score_text_run](../hermes-core/src/query/scoring.rs) gathers lengths and
+Summa's [score_text_run](../summa-core/src/query/scoring.rs) gathers lengths and
 scores contiguous frequency arrays through the canonical
-[Bm25Params](../hermes-core/src/query/bm25.rs). Byte norms have a bounded lookup
+[Bm25Params](../summa-core/src/query/bm25.rs). Byte norms have a bounded lookup
 table and batch path. Ranked collection screens eight scores before heap insertion;
 the generic top-k collector screens a 64-score membership window. Posting decode,
 integer search, and dense-vector kernels also have SIMD paths, but their presence
@@ -62,7 +62,7 @@ does not prove the BM25 arithmetic uses AVX2.
 
 The BM25/admission loops rely on compiler vectorization. The measured benchmark
 builds request native CPU code generation. [Dockerfile.release](../Dockerfile.release)
-and [server Dockerfile](../hermes-server/Dockerfile) run ordinary release Cargo
+and [server Dockerfile](../summa-server/Dockerfile) run ordinary release Cargo
 builds without `target-cpu` flags. Runtime AVX2 dispatch exists for other kernels;
 there is no equivalent target-feature BM25 batch dispatch in this path.
 
@@ -72,7 +72,7 @@ runtime multiversioning or an explicitly documented CPU baseline. Do not silentl
 build on a CI host with `target-cpu=native` and ship an accidental ISA requirement.
 Preserve exact f32 scoring, zero-TF behavior, boosts, missing lengths, and tie
 semantics. IResearch's algebraic expression is not a bit-identical replacement
-for Hermes's arithmetic. No deployed-binary disassembly was performed in this audit.
+for Summa's arithmetic. No deployed-binary disassembly was performed in this audit.
 
 ## Top-k selection
 
@@ -98,10 +98,10 @@ a bounded buffer of 2k score/document entries. Accepted hits fill the spare half
 selection partitions the buffer and publishes a new score threshold. This avoids
 maintaining heap order for every accepted candidate; it is not an all-hits vector.
 
-Hermes's [ScoreCollector](../hermes-core/src/query/scoring.rs) and
-[TopKCollector](../hermes-core/src/query/collector.rs) instead update binary heaps,
+Summa's [ScoreCollector](../summa-core/src/query/scoring.rs) and
+[TopKCollector](../summa-core/src/query/collector.rs) instead update binary heaps,
 with threshold screening and in-place root replacement. `select_nth_unstable_by`
-in [fusion](../hermes-core/src/query/fusion.rs) is a different call path.
+in [fusion](../summa-core/src/query/fusion.rs) is a different call path.
 
 Current IResearch has changed again: its
 [document collector](https://github.com/serenedb/serenedb/blob/fd6d6cacf2e79fd399ed03874c27e841138871f4/iresearch/search/detail/doc_collector.hpp)
@@ -109,7 +109,7 @@ uses [LoserScoreCollector](https://github.com/serenedb/serenedb/blob/fd6d6cacf2e
 The remaining `TopKHeap`/`nth_element` helper is used for term selection, not proof
 that current document collection follows the older benchmark's algorithm.
 
-Priority experiment: compare the current Hermes heap, bounded buffered selection,
+Priority experiment: compare the current Summa heap, bounded buffered selection,
 and the current IResearch-style tournament/loser-tree approach inside existing
 collector ownership. Test k=10/100/1000, rising thresholds, seeded thresholds,
 exact counts, stable document/ordinal ties, exceptional floats, and position
@@ -127,7 +127,7 @@ variants, or a bitmap over a compact document range. Frequency arrays also have
 constant-value choices. Current [FormatBlock128](https://github.com/serenedb/serenedb/blob/fd6d6cacf2e79fd399ed03874c27e841138871f4/iresearch/formats/posting/format_block_128.hpp)
 retains this design and includes an explicit gap-one case.
 
-Hermes [posting codecs](posting-codecs.md) are `Rounded`, `Packed`, `Pfor`, and
+Summa [posting codecs](posting-codecs.md) are `Rounded`, `Packed`, `Pfor`, and
 `Simd4x`. Widths adapt per block; Pfor chooses its exception width; Simd4x uses a
 different tail policy. The main codec family is configured at build time. A
 merged list may contain mixed families because sources were copied, not because
@@ -144,23 +144,23 @@ Report decode/seek time, index bytes, warm/cold residency, and whole-query laten
 
 ## Lazy phrase and Boolean evaluation
 
-Hermes already implements the central idea:
+Summa already implements the central idea:
 
 - Text cursors decode document IDs before TFs. Membership/count paths avoid
   frequency work where it is unnecessary.
-- [Conjunctions](../hermes-core/src/query/scoring/conjunction.rs) order cursors by
+- [Conjunctions](../summa-core/src/query/scoring/conjunction.rs) order cursors by
   document frequency, intersect decoded blocks, and score bounded surviving batches.
-- [PhraseScorer](../hermes-core/src/query/phrase.rs) exposes candidates separately
+- [PhraseScorer](../summa-core/src/query/phrase.rs) exposes candidates separately
   from positional confirmation. Prepared TF/length bounds can reject losing
   ranked candidates before positions are loaded. Exact phrase matching intersects
   positions incrementally; phrase frequency continues only when scoring needs it.
-- [Window execution](../hermes-core/src/query/scoring/windows.rs) uses selective
+- [Window execution](../summa-core/src/query/scoring/windows.rs) uses selective
   required candidates, deferred optional work, score bounds, and threshold-driven
   OR-tail transitions. Count remains separate from competitive ranking where needed.
 
 Current IResearch's [pruned conjunction](https://github.com/serenedb/serenedb/blob/fd6d6cacf2e79fd399ed03874c27e841138871f4/iresearch/search/top/pruned_conjunction.hpp)
 and [pruned phrase](https://github.com/serenedb/serenedb/blob/fd6d6cacf2e79fd399ed03874c27e841138871f4/iresearch/search/top/pruned_phrase.hpp)
-use analogous selective batches and bound-before-confirmation structure. Hermes's
+use analogous selective batches and bound-before-confirmation structure. Summa's
 prior [performance review](search-performance-review.md) already records adopting
 ideas from those paths and rejecting other experiments after measurement.
 
@@ -173,12 +173,12 @@ executor or describe all lazy evaluation as missing.
 ## io_uring: source and running-host findings
 
 There is no `io_uring`, `io-uring`, `tokio-uring`, or `monoio` backend/dependency in
-the audited core/server source and lockfile. The [server registry](../hermes-server/src/registry.rs)
-opens `Index<MmapDirectory>`. [MmapDirectory](../hermes-core/src/directories/mmap.rs)
+the audited core/server source and lockfile. The [server registry](../summa-server/src/registry.rs)
+opens `Index<MmapDirectory>`. [MmapDirectory](../summa-core/src/directories/mmap.rs)
 provides borrowed mapped byte views; touching cold pages invokes kernel demand
 paging, not an application-submitted async read.
 
-[FsDirectory::open_lazy](../hermes-core/src/directories/directory.rs) retains an
+[FsDirectory::open_lazy](../summa-core/src/directories/directory.rs) retains an
 open descriptor and performs positional reads in `spawn_blocking`. Ordinary small
 writes use Tokio file APIs. Tokio [documents](https://docs.rs/tokio/latest/tokio/fs/index.html)
 that its current filesystem implementation uses blocking workers, not io_uring.
@@ -186,7 +186,7 @@ Bulk output uses [cold writers](cold-io.md): buffered writes, Linux writeback/dr
 advice, fsync, and `copy_file_range` for compatible byte ranges.
 
 A read-only check of the index host found kernel `6.8.0-134-generic`,
-`kernel.io_uring_disabled = 0`, and three Hermes server processes with seccomp
+`kernel.io_uring_disabled = 0`, and three Summa server processes with seccomp
 mode 0. Each had zero open io_uring descriptors at the inspection instant. This
 supports the source finding; it is not a syscall trace or proof about every prior
 request. No service was restarted or configuration changed. Host details are in

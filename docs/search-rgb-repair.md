@@ -49,7 +49,7 @@ The latest requirement is RGB top-10 faster than Lucene BP/RGB. Tantivy is still
 a useful control, but beating it alone does not meet the updated target. A
 matched Lucene 10.4.0 BP run uses the pinned upstream adapter and the same
 5,032,104-document corpus on the same x86 machine. The upstream Lucene analyzer
-and BM25 parameters differ from Hermes, as recorded in the
+and BM25 parameters differ from Summa, as recorded in the
 [benchmark contract](search-benchmark-game.md#analyzer-and-scoring-differences).
 
 ## Historical physical-traversal repair measurements
@@ -194,19 +194,19 @@ Pinned upstream Lucene 10.4.0 BP adapter, Java 21, vector module and native acce
 
 Four fresh engines receive at least 60 seconds of whole-workload warmup before seven rotated official passes. Supplemental terms use ten seconds and five passes. Indexing, build, exact-count checks and residency sampling finish outside the timing window. This run is separate from the shorter-warmup repair comparison above.
 
-| Workload     | Hermes RGB µs | Hermes RGB-off µs | Lucene BP/RGB µs | Tantivy µs | Hermes RGB / Lucene |
-| ------------ | ------------: | ----------------: | ---------------: | ---------: | ------------------: |
-| official     |       444.841 |           510.738 |          392.235 |    534.525 |              1.134× |
-| supplemental |       101.493 |           134.319 |           86.781 |     55.645 |              1.170× |
+| Workload     | Summa RGB µs | Summa RGB-off µs | Lucene BP/RGB µs | Tantivy µs | Summa RGB / Lucene |
+| ------------ | -----------: | ---------------: | ---------------: | ---------: | -----------------: |
+| official     |      444.841 |          510.738 |          392.235 |    534.525 |             1.134× |
+| supplemental |      101.493 |          134.319 |           86.781 |     55.645 |             1.170× |
 
-| Official family    | Queries | Hermes RGB µs | Lucene BP/RGB µs |  Ratio |
-| ------------------ | ------: | ------------: | ---------------: | -----: |
-| intersection       |     300 |       325.480 |          306.187 | 1.063× |
-| phrase             |     300 |       486.759 |          505.129 | 0.964× |
-| union              |     301 |       499.622 |          325.063 | 1.537× |
-| negated            |      19 |       432.208 |          361.973 | 1.194× |
-| intersection_union |      40 |       908.803 |         1394.824 | 0.652× |
-| term               |       1 |       312.672 |          912.448 | 0.343× |
+| Official family    | Queries | Summa RGB µs | Lucene BP/RGB µs |  Ratio |
+| ------------------ | ------: | -----------: | ---------------: | -----: |
+| intersection       |     300 |      325.480 |          306.187 | 1.063× |
+| phrase             |     300 |      486.759 |          505.129 | 0.964× |
+| union              |     301 |      499.622 |          325.063 | 1.537× |
+| negated            |      19 |      432.208 |          361.973 | 1.194× |
+| intersection_union |      40 |      908.803 |         1394.824 | 0.652× |
+| term               |       1 |      312.672 |          912.448 | 0.343× |
 
 [Raw evidence and reproduction](benchmark-results/rgb-repair-2026-09-16/README.md).
 
@@ -309,7 +309,7 @@ the stage's test-coverage patch records this test-only difference explicitly. Ea
 portable compilation passes for the unchanged production code, with the existing
 unused-method warning. WASM remains skipped under the standing instruction.
 
-All 1,676 exact references pass for every measured Hermes layout on ARM and x86;
+All 1,676 exact references pass for every measured Summa layout on ARM and x86;
 Lucene/Tantivy counts match the reference. Cross-engine score bits are not equated.
 The complete indexes remain hash-audited. A memory-inventory harness error tried
 to hash `java` without resolving PATH; it failed before launching memory queries.
@@ -340,7 +340,7 @@ quantized lengths only in the scorer would invalidate existing pruning bounds.
 ### Same-permutation SIMD codec result
 
 The completed four-engine x86 comparison uses the same reader and RGB
-permutation for all Hermes layouts. All 1,676 exact references pass, and stored
+permutation for all Summa layouts. All 1,676 exact references pass, and stored
 fields, fast fields, row statistics and document maps remain byte-identical.
 No format version or default changes. The existing Simd4x option is exercised
 through the standalone reorder writer after compact-format preservation.

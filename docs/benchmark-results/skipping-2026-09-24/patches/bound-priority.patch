@@ -1,5 +1,5 @@
---- a/hermes-core/src/query/phrase/seed.rs
-+++ b/hermes-core/src/query/phrase/seed.rs
+--- a/summa-core/src/query/phrase/seed.rs
++++ b/summa-core/src/query/phrase/seed.rs
 @@ -31,7 +31,9 @@
              }
              // Short-document bounds only nominate blocks. They do not prove

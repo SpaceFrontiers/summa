@@ -2,17 +2,17 @@
   "production_sources": {
     "Cargo.toml": "2a6a7cccf98dde2c42a719d1274dcc5803e49914898fb68fb150fb062330f827",
     "Cargo.lock": "21e445f770d13adc4e69010bc9f73b92b8bdb576257daf2d4687032b4d745060",
-    "hermes-core/Cargo.toml": "67db953502ed19eb65b3f3df0ed033652913ae467e592fd8354ec15ba2ab6eeb",
-    "hermes-core/src/query/seismic.rs": "305cc499bb49d8baefd6dfd3f68a208e8f29604d2dfa8a1829fcf3448c4e5c06",
-    "hermes-core/src/query/seismic/scoring.rs": "0d903b25acf549bd14e3aafe4d828ff6e78f86cb86c4b4a89aab976b02824b08",
-    "hermes-core/src/structures/postings/sparse/config.rs": "69a483bfb99ada5902a74860b02c03cc6c9f88aa4adcd2067c78ef6a8997e851",
-    "hermes-core/src/structures/postings/sparse/weights.rs": "ebe75fbff4b2ebbb0fe534e734e055326a5148d91f7be5d77879271a8398e121",
-    "hermes-core/src/segment/seismic/mod.rs": "90a7cc19069c3cccc9022d28ae5480de0d49a82a136bc5ab7c4e5afa5e13a40b",
-    "hermes-core/src/segment/seismic/forward.rs": "be2de834f963c5c5c517b497426db5f949173b0c84cc40253924461e5478ca13",
-    "hermes-core/src/segment/seismic/dimensions.rs": "83d855d3d4952b4f6b9fa7b9edc85b599c5f0ba6214e3c34e1e8b9761f65703e",
-    "hermes-core/src/segment/seismic/build.rs": "c2242960668dc37bd19feee239e8656311d536cdd31e3fe538510450ae325dc1",
-    "hermes-core/src/segment/seismic/parse.rs": "f35c3e1c5af672b2e8f439788d8bd6bc16cdb715bb89cdc4841b6ee51084e16a",
-    "hermes-core/src/segment/seismic/maintain.rs": "f45a92da15c32378669ab998901ed33a78edcc3debe14cb06911c30465ee0427"
+    "summa-core/Cargo.toml": "67db953502ed19eb65b3f3df0ed033652913ae467e592fd8354ec15ba2ab6eeb",
+    "summa-core/src/query/seismic.rs": "305cc499bb49d8baefd6dfd3f68a208e8f29604d2dfa8a1829fcf3448c4e5c06",
+    "summa-core/src/query/seismic/scoring.rs": "0d903b25acf549bd14e3aafe4d828ff6e78f86cb86c4b4a89aab976b02824b08",
+    "summa-core/src/structures/postings/sparse/config.rs": "69a483bfb99ada5902a74860b02c03cc6c9f88aa4adcd2067c78ef6a8997e851",
+    "summa-core/src/structures/postings/sparse/weights.rs": "ebe75fbff4b2ebbb0fe534e734e055326a5148d91f7be5d77879271a8398e121",
+    "summa-core/src/segment/seismic/mod.rs": "90a7cc19069c3cccc9022d28ae5480de0d49a82a136bc5ab7c4e5afa5e13a40b",
+    "summa-core/src/segment/seismic/forward.rs": "be2de834f963c5c5c517b497426db5f949173b0c84cc40253924461e5478ca13",
+    "summa-core/src/segment/seismic/dimensions.rs": "83d855d3d4952b4f6b9fa7b9edc85b599c5f0ba6214e3c34e1e8b9761f65703e",
+    "summa-core/src/segment/seismic/build.rs": "c2242960668dc37bd19feee239e8656311d536cdd31e3fe538510450ae325dc1",
+    "summa-core/src/segment/seismic/parse.rs": "f35c3e1c5af672b2e8f439788d8bd6bc16cdb715bb89cdc4841b6ee51084e16a",
+    "summa-core/src/segment/seismic/maintain.rs": "f45a92da15c32378669ab998901ed33a78edcc3debe14cb06911c30465ee0427"
   },
   "binaries": {
     "forward-evidence/before-bin": "88f011591785f3ed187debdea30d8703fe6c0dcb1764dee7cae955c8d7d4b4a2",
@@ -116,7 +116,7 @@
       }
     },
     "wide": {
-      ".hermes_writer.lock": {
+      ".summa_writer.lock": {
         "bytes": 0,
         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
       },
@@ -218,7 +218,7 @@
   "workers": 4,
   "metadata_pin_mib_per_segment": 64,
   "queries": {
-    "/mnt/hermes-copy-merge/work/.context/seismic-experiment/data/queries.dev.csr": "4181fb0cf8e5e57c1134396bb2c9eec95670c910143e6d0daf546ceb436a81a5",
-    "/mnt/hermes-copy-merge/forward-wide/queries.csr": "671c23982df8a11067cfcf89992f94dcbb20ca8499797646f2037ad1a55e74fb"
+    "/mnt/summa-copy-merge/work/.context/seismic-experiment/data/queries.dev.csr": "4181fb0cf8e5e57c1134396bb2c9eec95670c910143e6d0daf546ceb436a81a5",
+    "/mnt/summa-copy-merge/forward-wide/queries.csr": "671c23982df8a11067cfcf89992f94dcbb20ca8499797646f2037ad1a55e74fb"
   }
 }

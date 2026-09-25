@@ -1,11 +1,11 @@
 # Large-candidate-pool retrieval evaluation
 
-Implemented by [`hermes-train/src/retrieval_pool.rs`](../hermes-train/src/retrieval_pool.rs).
+Implemented by [`summa-train/src/retrieval_pool.rs`](../summa-train/src/retrieval_pool.rs).
 The run-specific examples below describe the motivating experiment.
 
 ## Why
 
-`hermes-train eval --objective contrastive_retrieval` scores retrieval **in
+`summa-train eval --objective contrastive_retrieval` scores retrieval **in
 batch**: the candidate set for a query is whatever the other rows of the same
 batch contributed. At the geometry the 300M MoE run used — `--sequence-length
 1024 --batch-size 4`, one positive and two mined negatives per record — that is
@@ -99,7 +99,7 @@ New subcommand rather than a flag on `eval`, because the flow is two-pass
 because it emits a different report schema:
 
 ```
-hermes-train retrieval-pool-eval \
+summa-train retrieval-pool-eval \
   --config <config.json> --tokenizer <tokenizer.json> --checkpoint <weights.safetensors> \
   --data <shard.jsonl.zst>... [--distractors <shard.jsonl.zst>...] \
   --sequence-length 1024 --batch-size 16 \

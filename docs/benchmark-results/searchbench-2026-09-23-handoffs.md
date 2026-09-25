@@ -4,9 +4,9 @@ Count agreement: **15/826 queries**. This is a restricted workload, not the comp
 
 10M Wikipedia chunks; one merged segment; 32-vCPU host (16 physical cores with SMT), 30 server hardware threads and two driver threads on the reserved physical core. Query and request caches disabled. Thirty-second session warmup, full untimed validation, one-second connection warmup, three ten-second repetitions per cell.
 
-All 15 count-compatible queries are measured at 32 clients; the seven conjunctions are also measured at one and 64 clients. All three variants run sequentially in isolated loopback networking. Both Hermes variants use the same ordinary index, automatic HTTP workers (four), 30 blocking/search workers and 64-request admission. RGB and impacts remain separate. Server CPUs: 0–14,16–30; driver CPUs: 15,31. No copying, compilation or indexing overlaps timing. Core search algorithms are unchanged.
+All 15 count-compatible queries are measured at 32 clients; the seven conjunctions are also measured at one and 64 clients. All three variants run sequentially in isolated loopback networking. Both Summa variants use the same ordinary index, automatic HTTP workers (four), 30 blocking/search workers and 64-request admission. RGB and impacts remain separate. Server CPUs: 0–14,16–30; driver CPUs: 15,31. No copying, compilation or indexing overlaps timing. Core search algorithms are unchanged.
 
-Hermes uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
+Summa uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
 
 | Family             | Included | Published queries |
 | ------------------ | -------: | ----------------: |
@@ -33,23 +33,23 @@ Hermes uses a benchmark HTTP frontend over core, not its production gRPC service
 
 **Throughput (queries/second; higher is better).** Values are the median of three repetitions. The CSV retains repetition min/max and peak process RSS. Raw replay JSON and memory samples accompany each cell.
 
-| Family       | Operation | Clients | Distinct queries | Hermes before (QPS) | Hermes borrowed IDs (QPS) | Luxir (QPS) |
-| ------------ | --------- | ------: | ---------------: | ------------------: | ------------------------: | ----------: |
-| and_high_low | COUNT     |       1 |                7 |             2,486.0 |                   2,344.0 |     3,032.6 |
-| and_high_low | COUNT     |      32 |                7 |            70,461.6 |                  67,035.1 |    65,114.9 |
-| and_high_low | COUNT     |      64 |                7 |            70,138.2 |                  67,562.1 |    69,671.9 |
-| and_high_low | TOP_10    |       1 |                7 |             2,246.7 |                   2,463.2 |     2,465.2 |
-| and_high_low | TOP_10    |      32 |                7 |            41,690.7 |                  44,494.0 |    52,338.7 |
-| and_high_low | TOP_10    |      64 |                7 |            53,978.6 |                  55,548.8 |    55,967.4 |
-| and_high_low | TOP_100   |       1 |                7 |             1,464.3 |                   1,941.7 |     1,510.5 |
-| and_high_low | TOP_100   |      32 |                7 |            33,147.9 |                  38,908.8 |    41,582.1 |
-| and_high_low | TOP_100   |      64 |                7 |            40,015.5 |                  47,106.9 |    44,166.8 |
-| low_phrase   | COUNT     |      32 |                7 |             2,011.8 |                   1,999.3 |     2,054.6 |
-| low_phrase   | TOP_10    |      32 |                7 |            15,694.0 |                  15,656.5 |     7,450.8 |
-| low_phrase   | TOP_100   |      32 |                7 |             4,785.4 |                   4,882.1 |     3,779.9 |
-| med_phrase   | COUNT     |      32 |                1 |               719.3 |                     714.3 |       605.6 |
-| med_phrase   | TOP_10    |      32 |                1 |            15,026.5 |                  15,475.7 |    17,573.9 |
-| med_phrase   | TOP_100   |      32 |                1 |             9,723.4 |                  10,261.7 |     5,972.0 |
+| Family       | Operation | Clients | Distinct queries | Summa before (QPS) | Summa borrowed IDs (QPS) | Luxir (QPS) |
+| ------------ | --------- | ------: | ---------------: | -----------------: | -----------------------: | ----------: |
+| and_high_low | COUNT     |       1 |                7 |            2,486.0 |                  2,344.0 |     3,032.6 |
+| and_high_low | COUNT     |      32 |                7 |           70,461.6 |                 67,035.1 |    65,114.9 |
+| and_high_low | COUNT     |      64 |                7 |           70,138.2 |                 67,562.1 |    69,671.9 |
+| and_high_low | TOP_10    |       1 |                7 |            2,246.7 |                  2,463.2 |     2,465.2 |
+| and_high_low | TOP_10    |      32 |                7 |           41,690.7 |                 44,494.0 |    52,338.7 |
+| and_high_low | TOP_10    |      64 |                7 |           53,978.6 |                 55,548.8 |    55,967.4 |
+| and_high_low | TOP_100   |       1 |                7 |            1,464.3 |                  1,941.7 |     1,510.5 |
+| and_high_low | TOP_100   |      32 |                7 |           33,147.9 |                 38,908.8 |    41,582.1 |
+| and_high_low | TOP_100   |      64 |                7 |           40,015.5 |                 47,106.9 |    44,166.8 |
+| low_phrase   | COUNT     |      32 |                7 |            2,011.8 |                  1,999.3 |     2,054.6 |
+| low_phrase   | TOP_10    |      32 |                7 |           15,694.0 |                 15,656.5 |     7,450.8 |
+| low_phrase   | TOP_100   |      32 |                7 |            4,785.4 |                  4,882.1 |     3,779.9 |
+| med_phrase   | COUNT     |      32 |                1 |              719.3 |                    714.3 |       605.6 |
+| med_phrase   | TOP_10    |      32 |                1 |           15,026.5 |                 15,475.7 |    17,573.9 |
+| med_phrase   | TOP_100   |      32 |                1 |            9,723.4 |                 10,261.7 |     5,972.0 |
 
 ## Measured result and remaining gap
 
@@ -142,7 +142,7 @@ A separate uninstrumented stage command takes 100 samples after 20 warmups per q
 |   100 | before  | 10.36 | 229.75 |   61.60 |      4.98 |          6.55 |
 |   100 | typed   |  8.30 | 215.91 |   30.76 |      2.91 |          0.05 |
 
-For conjunction top-100 at 32 clients, borrowed-ID Hermes now consumes **649 CPU
+For conjunction top-100 at 32 clients, borrowed-ID Summa now consumes **649 CPU
 microseconds/request** versus Luxir's **703**, yet uses only **25.25** CPU
 equivalents versus **29.22**. At 64 clients it reaches **28.17** equivalents and
 **597 µs/request**, versus Luxir's **30.00** and **679 µs/request**. The remaining
@@ -153,7 +153,7 @@ investigation. CPU microseconds include all server threads, not just scoring.
 
 Memory remains a material difference: borrowed responses reduce peak anonymous
 RSS only from 113.6 to 111.3 MiB in this campaign, versus Luxir's 15.1 MiB.
-Hermes' approximately 1.15 GiB process RSS includes mapped index pages. Removing
+Summa' approximately 1.15 GiB process RSS includes mapped index pages. Removing
 per-hit temporary allocations is not a solution to the broader residency gap.
 
 A post-campaign count probe uses separate instrumented servers with the same
@@ -185,7 +185,7 @@ finished; no borrowed data crosses the response boundary.
 The old and new response encodings are byte-identical on all 45 admitted-query
 HTTP cases and on unit cases covering Unicode, quotes, backslashes, control
 characters, empty/duplicate IDs, empty results and extreme exact counts. Both
-Hermes variants preserve all 15 exhaustive top-100 document IDs, score bits and
+Summa variants preserve all 15 exhaustive top-100 document IDs, score bits and
 counts. Every timed cell separately validates exact counts or ranked result
 cardinality/unique IDs, with topology checked before and after each sweep.
 Counts agreeing across engines do not establish ranking/analyzer equivalence.
@@ -193,7 +193,7 @@ Counts agreeing across engines do not establish ranking/analyzer equivalence.
 Scoring, pruning, search-pool ownership, request admission, CPU-based HTTP worker
 selection and persisted index formats are unchanged. Four HTTP workers, 30
 blocking workers, 30 shared search workers and a 64-request admission limit apply
-to both Hermes variants. No indexing or corpus rewriting occurs. RGB and impact
+to both Summa variants. No indexing or corpus rewriting occurs. RGB and impact
 indexes remain separate; impacts remain disabled. Normal builds do not enable
 query diagnostics.
 
@@ -215,7 +215,7 @@ its ownership and merge rules. Completed pool installs count on the calling
 capture; direct async count collection does not create an install and invalid
 windows fail before pool admission.
 
-`GET /diagnostics` exists only with `hermes-server/query-diagnostics`. Storage is
+`GET /diagnostics` exists only with `summa-server/query-diagnostics`. Storage is
 bounded to nine sums/maxima plus completion/error counters, without per-request
 records or query text. Successful-handler totals exclude canceled handlers;
 these probes complete without worker errors. Each diagnostic case uses a fresh

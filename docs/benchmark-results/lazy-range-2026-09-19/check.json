@@ -13,13 +13,13 @@
         "clippy",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "-p",
-        "hermes-server",
+        "summa-server",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "-p",
-        "hermes-tool",
+        "summa-tool",
         "--all-targets",
         "--",
         "-D",
@@ -35,15 +35,15 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "-p",
-        "hermes-server",
+        "summa-server",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "-p",
-        "hermes-tool",
+        "summa-tool",
         "--features",
-        "hermes-core/metrics"
+        "summa-core/metrics"
       ],
       "log": "03-test.log",
       "returncode": 0,
@@ -55,7 +55,7 @@
         "check",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--no-default-features",
         "--features",
         "native",
@@ -71,7 +71,7 @@
         "check",
         "--locked",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "--all-targets"
       ],
       "log": "05-check.log",
@@ -82,7 +82,7 @@
   "success": true,
   "environment": {
     "revision": "05150b9ba26eeb4d3f8e1bdba5572b816412f8b9",
-    "status": "M docs/range-block-scans.md\n M hermes-core/benches/rust_hot_paths.rs\n M hermes-core/src/query/range.rs\n M hermes-core/src/structures/fast_field/mod.rs\n M hermes-core/tests/range_bitset.rs",
+    "status": "M docs/range-block-scans.md\n M summa-core/benches/rust_hot_paths.rs\n M summa-core/src/query/range.rs\n M summa-core/src/structures/fast_field/mod.rs\n M summa-core/tests/range_bitset.rs",
     "working_diff_sha256": "cc9b9171b2f23072125db5da98ead349d69efc7f95ea2e9ad804410bde616bd4",
     "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
     "machine": "arm64",
@@ -99,8 +99,8 @@
       "CARGO_BUILD_JOBS": "",
       "CRITERION_HOME": "",
       "RAYON_NUM_THREADS": "",
-      "HERMES_PIN_MODE": "",
-      "HERMES_PIN_METADATA_BUDGET_MB": ""
+      "SUMMA_PIN_MODE": "",
+      "SUMMA_PIN_METADATA_BUDGET_MB": ""
     }
   }
 }

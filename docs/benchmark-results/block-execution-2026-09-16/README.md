@@ -37,12 +37,12 @@ hash audits and memory measurements do not overlap timed runs on the same host.
 Times include protocol overhead. Small ARM changes are sensitive to shared Mac
 load. Timed binaries do not enable `query-diagnostics`.
 
-Hermes cache budgets are 262,144 bytes of posting validation proofs and
+Summa cache budgets are 262,144 bytes of posting validation proofs and
 8,192 term blocks / 4,194,304 term-cache bytes. `packed` uses the unchanged compact
 exact-norm index; `packed-norm` uses byte norms; `packed-combined` uses existing
 compact directories, Simd4x gaps and impact bounds with exact norms. No RGB.
 Byte norms have their own represented-length scoring reference. Scores need not
-be bit-identical between Hermes and Tantivy.
+be bit-identical between Summa and Tantivy.
 
 `cloud/final-memory/` records three complete official passes for each of the four
 commands in a fresh process per engine, including `/proc` mappings, smaps and

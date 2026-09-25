@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: summa-data
+  namespace: summa
+  labels:
+    app.kubernetes.io/name: summa-server
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  # Uncomment and set your storage class if needed
+  # storageClassName: standard

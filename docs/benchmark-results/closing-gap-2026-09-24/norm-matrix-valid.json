@@ -1,7 +1,7 @@
 [
   {
     "label": "integrity-owner-norm",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 288,
     "query_set_sha256": "b69b192152337d10e5f56757962f7c92f3dc744a8abc3bab9ff81496c3028313",
     "cells": [
@@ -317,7 +317,7 @@
   },
   {
     "label": "integrity-owner-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 288,
     "query_set_sha256": "b69b192152337d10e5f56757962f7c92f3dc744a8abc3bab9ff81496c3028313",
     "cells": [

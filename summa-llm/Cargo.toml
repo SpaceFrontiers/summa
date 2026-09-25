@@ -1,0 +1,94 @@
+[package]
+name = "summa-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "LLM inference and model definition; training lives in summa-train"
+keywords = ["llm", "transformer", "deep-learning", "gpt", "inference"]
+categories = ["science"]
+publish = false
+
+[dependencies]
+# Burn is the sole inference runtime. CPU uses ndarray; GPU backends and the
+# custom selective-scan op use Burn's CubeCL tensor/runtime directly.
+burn = { package = "burn-core", git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std", "extension", "ndarray", "autodiff"] }
+burn-autodiff = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-nn = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-ndarray = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = ["std"] }
+burn-wgpu = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std", "metal", "autotune"] }
+burn-store = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", default-features = false, features = [
+    "safetensors",
+    "std",
+] }
+burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std"] }
+burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std"] }
+burn-ir = { git = "https://github.com/tracel-ai/burn.git", rev = "973605c4be470d8beaed21e24a7e7010d4101068", optional = true, default-features = false, features = ["std"] }
+cubecl = { git = "https://github.com/tracel-ai/cubecl.git", rev = "c0efe74d3d4b820fbf992dbbe443ed7125c5205c", optional = true, default-features = false, features = ["std"] }
+cubek = { git = "https://github.com/tracel-ai/cubek", rev = "7b26a4bdc68c092ecd77ee6ee8a2cd39d61d4a90", optional = true, default-features = false, features = ["attention", "stdlib"] }
+half = { version = "2", optional = true, default-features = false }
+
+# Stable-Rust byte-level BPE shared by training and inference.
+summa-tokenizer = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Model Architecture Language (MAL) parser — single source of truth
+summa-mal = { workspace = true }
+
+# CLI and logging
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Utilities
+rand = { workspace = true }
+
+# Local model-lab server (feature-gated so summa-train does not pull it in)
+axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
+tower-http = { version = "0.6", optional = true, default-features = false, features = ["fs"] }
+
+# Remote artifact loading (s3://, gs://, http(s)://). The pinned upstream
+# 0.14.1 revision includes the quick-xml security update not in crates.io 0.14.0.
+# `version` is the crates.io fallback Cargo uses when packaging this crate.
+object_store = { version = "0.14", git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c7316d29face118e7409eead0cda098f38589428", default-features = false, features = ["aws", "gcp", "http"], optional = true }
+tokio = { version = "1", default-features = false, features = ["fs", "macros", "net", "rt", "rt-multi-thread", "signal", "sync"], optional = true }
+url = { version = "2", optional = true }
+dirs = { version = "6", optional = true }
+
+[features]
+default = ["remote", "lab"]
+# Load weights/config/tokenizer from s3://, gs://, http(s):// (downloads + caches)
+remote = ["dep:object_store", "dep:tokio", "dep:url", "dep:dirs"]
+lab = ["dep:axum", "dep:tokio", "dep:tower-http"]
+metal = ["burn/metal", "burn/autotune", "dep:burn-wgpu", "dep:burn-cubecl", "dep:cubecl", "dep:half"]
+cuda = ["burn/cuda", "burn/autotune", "dep:burn-cubecl", "dep:cubecl", "dep:cubek", "dep:half"]
+# Lazy fusion pays off for large training graphs, but adds substantial graph
+# planning and kernel-launch overhead to single-token autoregressive decoding.
+training-fusion = ["cuda", "burn/fusion", "dep:burn-fusion", "dep:burn-ir"]
+
+[[bin]]
+name = "summa-llm"
+path = "src/main.rs"
+
+[[bench]]
+name = "moe_layer"
+harness = false
+
+[[bench]]
+name = "moe_primitives"
+harness = false
+
+[[bench]]
+name = "memory_reserve"
+harness = false
+
+[dev-dependencies]
+tempfile = { workspace = true }

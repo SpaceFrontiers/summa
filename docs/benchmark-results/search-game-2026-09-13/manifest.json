@@ -139,7 +139,7 @@
     "bytes": 11941,
     "sha256": "e1b7842eca46f7d912dd5e6c4ee45356533d95e2e1da1ebad7c9526209f270e3"
   },
-  "hermes-optimized-search.time": {
+  "summa-optimized-search.time": {
     "bytes": 6387,
     "sha256": "3d795ed748932f507c5d030799e65bc61f4a942ee608146b25f8020acfdf41b1"
   },
@@ -211,7 +211,7 @@
     "bytes": 9144,
     "sha256": "a9441dce10dd7cf5a1266182d57bfedfce8942c3770f6d661d10d725125f4421"
   },
-  "hermes-scalar-v15-manifest.json": {
+  "summa-scalar-v15-manifest.json": {
     "bytes": 3363,
     "sha256": "dc8be4181a4e929b03d2311da67aae99c07e4ff6db2e651126ca63accd7b9917"
   },

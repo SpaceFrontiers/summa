@@ -1,4 +1,4 @@
-use hermes_core::{
+use summa_core::{
     Document, Index, IndexConfig, IndexWriter,
     directories::MmapDirectory,
     dsl::SchemaBuilder,
@@ -20,7 +20,7 @@ fn config() -> IndexConfig {
         num_indexing_threads: 1,
         num_compression_threads: 2,
         max_indexing_memory_bytes: 24 * 1024 * 1024 * 1024,
-        merge_policy: Box::new(hermes_core::NoMergePolicy),
+        merge_policy: Box::new(summa_core::NoMergePolicy),
         ..Default::default()
     }
 }
@@ -85,7 +85,7 @@ async fn main() {
             loop {
                 match writer.add_document(document.clone()) {
                     Ok(()) => break,
-                    Err(hermes_core::Error::QueueFull) => {
+                    Err(summa_core::Error::QueueFull) => {
                         tokio::time::sleep(std::time::Duration::from_millis(1)).await
                     }
                     Err(error) => panic!("{error}"),

@@ -13,13 +13,13 @@
         "clippy",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "-p",
-        "hermes-server",
+        "summa-server",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "-p",
-        "hermes-tool",
+        "summa-tool",
         "--all-targets",
         "--",
         "-D",
@@ -35,15 +35,15 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "-p",
-        "hermes-server",
+        "summa-server",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "-p",
-        "hermes-tool",
+        "summa-tool",
         "--features",
-        "hermes-core/metrics"
+        "summa-core/metrics"
       ],
       "log": "03-test.log",
       "returncode": 0,
@@ -55,7 +55,7 @@
         "check",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--no-default-features",
         "--features",
         "native",
@@ -71,7 +71,7 @@
         "check",
         "--locked",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "--all-targets"
       ],
       "log": "05-check.log",
@@ -82,7 +82,7 @@
   "success": true,
   "environment": {
     "revision": "5b5f843657f85929790339be8cf350a92fbbb37a",
-    "status": "M docs/range-block-scans.md\n M hermes-core/src/query/traits.rs\n M hermes-core/src/structures/fast_field/codec.rs\n?? docs/benchmark-results/range-interpolation-2026-09-19/",
+    "status": "M docs/range-block-scans.md\n M summa-core/src/query/traits.rs\n M summa-core/src/structures/fast_field/codec.rs\n?? docs/benchmark-results/range-interpolation-2026-09-19/",
     "working_diff_sha256": "ab4a37b5e5fc86f1d6809f2761eb1a0339124491c7604cb61ada15933336460e",
     "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
     "machine": "arm64",
@@ -99,8 +99,8 @@
       "CARGO_BUILD_JOBS": "",
       "CRITERION_HOME": "",
       "RAYON_NUM_THREADS": "",
-      "HERMES_PIN_MODE": "",
-      "HERMES_PIN_METADATA_BUDGET_MB": ""
+      "SUMMA_PIN_MODE": "",
+      "SUMMA_PIN_METADATA_BUDGET_MB": ""
     }
   }
 }

@@ -150,7 +150,7 @@ from the largest segment of each shard (`fast-values-summary.json`).
 ## Reproduction and validation
 
 `sample.py INDEX_DIR...` reads only BMPA files and emits private gzip JSON to
-stdout. It is an offline measurement utility, not a legacy reader in Hermes.
+stdout. It is an offline measurement utility, not a legacy reader in Summa.
 `measure.rs` accepts concatenated `[nnz: u32 LE][nnz × (dimension: u32 LE,
 impact: u8)]` rows and an output filename for count-prefixed BMPB row bytes:
 
@@ -169,7 +169,7 @@ strict Clippy, feature-matrix checks, documentation and server build. The
 parallel real-server suite encountered one local port collision; all five
 integration tests passed on a serial rerun. The full harness evidence is
 `.context/search-harness/20260919T080450.635887Z-full`; the serial rerun log is
-`/tmp/hermes-bmp-gap-e2e-serial.log`. No production deployment was performed.
+`/tmp/summa-bmp-gap-e2e-serial.log`. No production deployment was performed.
 
 The [query-latency follow-up](query-latency.md) uses 900,000 real vectors to
 compare raw and packet formats through public search and candidate-scoring APIs.

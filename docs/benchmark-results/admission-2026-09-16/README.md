@@ -6,7 +6,7 @@ RGB off. The final cache-plus-position build is compared directly with the
 preserved September 15 traversal build, a cache-only parent and Tantivy in one
 run. Official top-1000 improves 4.0%, top-100 plus exact count 4.5%, and exact
 count 3.6%, all seven passes faster. Top-10 is nearly flat (-0.5%, five passes).
-Final Hermes/Tantivy ratios are **1.207/1.153/1.305/1.102** respectively for
+Final Summa/Tantivy ratios are **1.207/1.153/1.305/1.102** respectively for
 top-10/top-1000/top-100 plus count/count. Parity remains unmet.
 
 Tradeoffs: union top-10 +1.2% (five slower passes), standalone metadata COUNT
@@ -50,8 +50,8 @@ Every member and the final archive are verified.
   byte manifest and starting source manifest.
 
 The final overlay has 332 files and changes only
-`hermes-core/src/structures/postings/posting/reader.rs` and
-`hermes-core/src/structures/postings/positions_v2.rs` relative to the starting
+`summa-core/src/structures/postings/posting/reader.rs` and
+`summa-core/src/structures/postings/positions_v2.rs` relative to the starting
 build. Source archive SHA-256:
 `722875a6e1a771a600e0edd61187c71cf6a1d0fac4bd3862366c84997feed921`.
 The frozen source matches the main workspace and cloud build exactly.

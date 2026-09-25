@@ -17,7 +17,7 @@ def main():
     modes.add_argument(
         "--followup",
         action="store_true",
-        help="compare before/hermes, optimized/hermes and rgb/hermes",
+        help="compare before/summa, optimized/summa and rgb/summa",
     )
     modes.add_argument(
         "--phrase-followup",
@@ -27,12 +27,12 @@ def main():
     modes.add_argument(
         "--gap-followup",
         action="store_true",
-        help="compare prior/current Hermes, current Hermes with impacts, and rerun Luxir",
+        help="compare prior/current Summa, current Summa with impacts, and rerun Luxir",
     )
     modes.add_argument(
         "--scaling-followup",
         action="store_true",
-        help="32-vCPU comparison of prior/current/RGB Hermes and three reference engines",
+        help="32-vCPU comparison of prior/current/RGB Summa and three reference engines",
     )
     modes.add_argument(
         "--conjunction-followup",
@@ -67,69 +67,69 @@ def main():
     )
     if args.worker_followup:
         variants = [
-            ("current", "current/hermes", "Hermes current workers"),
-            ("candidate", "candidate/hermes", "Hermes candidate workers"),
+            ("current", "current/summa", "Summa current workers"),
+            ("candidate", "candidate/summa", "Summa candidate workers"),
             ("luxir", "luxir/luxir", "Luxir"),
         ]
         title = "worker configuration and count repeatability"
     elif args.handoff_followup:
         variants = [
-            ("before", "before/hermes", "Hermes before"),
-            ("typed", "typed/hermes", "Hermes borrowed IDs"),
+            ("before", "before/summa", "Summa before"),
+            ("typed", "typed/summa", "Summa borrowed IDs"),
             ("luxir", "luxir/luxir", "Luxir"),
         ]
         title = "borrowed-ID responses and search-pool handoffs"
     elif args.conjunction_followup:
         variants = [
-            ("before", "before/hermes", "Hermes before (HTTP 2)"),
-            ("encoded", "encoded/hermes", "Hermes encoded (HTTP 2)"),
-            ("encoded-auto", "encoded-auto/hermes", "Hermes encoded (HTTP auto: 4)"),
+            ("before", "before/summa", "Summa before (HTTP 2)"),
+            ("encoded", "encoded/summa", "Summa encoded (HTTP 2)"),
+            ("encoded-auto", "encoded-auto/summa", "Summa encoded (HTTP auto: 4)"),
             ("luxir", "luxir/luxir", "Luxir"),
         ]
         title = "conjunction response encoding and CPU-based HTTP workers"
     elif args.scaling_followup:
         variants = [
-            ("before", "before/hermes", "Hermes before"),
-            ("optimized", "optimized/hermes", "Hermes optimized"),
-            ("rgb", "rgb/hermes", "Hermes optimized + RGB"),
+            ("before", "before/summa", "Summa before"),
+            ("optimized", "optimized/summa", "Summa optimized"),
+            ("rgb", "rgb/summa", "Summa optimized + RGB"),
             ("elasticsearch", "elasticsearch/elasticsearch", "Elasticsearch"),
             ("opensearch", "opensearch/opensearch", "OpenSearch"),
             ("luxir", "luxir/luxir", "Luxir"),
         ]
         if (root / "impacts").is_dir():
             variants.insert(
-                3, ("impacts", "impacts/hermes", "Hermes optimized + impacts")
+                3, ("impacts", "impacts/summa", "Summa optimized + impacts")
             )
-        title = "32-vCPU host, 32 clients, Hermes/RGB and references"
+        title = "32-vCPU host, 32 clients, Summa/RGB and references"
     elif args.gap_followup:
         variants = [
-            ("before", "before/hermes", "Hermes before"),
-            ("optimized", "optimized/hermes", "Hermes optimized"),
-            ("impacts", "impacts/hermes", "Hermes optimized + impacts"),
+            ("before", "before/summa", "Summa before"),
+            ("optimized", "optimized/summa", "Summa optimized"),
+            ("impacts", "impacts/summa", "Summa optimized + impacts"),
             ("luxir", "luxir/luxir", "Luxir"),
         ]
         title = "phrase scan optimization, optional impacts, and Luxir"
     elif args.phrase_followup:
         variants = [
-            ("before", "before/hermes", "Hermes first-term bounds"),
-            ("optimized", "optimized/hermes", "Hermes certified rare-term bounds"),
+            ("before", "before/summa", "Summa first-term bounds"),
+            ("optimized", "optimized/summa", "Summa certified rare-term bounds"),
             ("luxir", "luxir/luxir", "Luxir"),
         ]
         title = "non-RGB phrase optimization and Luxir"
     elif args.followup:
         variants = [
-            ("before", "before/hermes", "Hermes before"),
-            ("optimized", "optimized/hermes", "Hermes optimized"),
-            ("rgb", "rgb/hermes", "Hermes optimized + RGB"),
+            ("before", "before/summa", "Summa before"),
+            ("optimized", "optimized/summa", "Summa optimized"),
+            ("rgb", "rgb/summa", "Summa optimized + RGB"),
         ]
-        title = "Hermes optimization and RGB"
+        title = "Summa optimization and RGB"
     else:
         variants = [
             (
                 engine,
                 engine,
                 {
-                    "hermes": "Hermes",
+                    "summa": "Summa",
                     "elasticsearch": "Elasticsearch",
                     "opensearch": "OpenSearch",
                     "luxir": "Luxir",
@@ -209,7 +209,7 @@ def main():
         + "Query and request caches disabled. Thirty-second session warmup, full untimed "
         "validation, one-second connection warmup, three ten-second repetitions per cell.",
         "",
-        "Hermes uses a benchmark HTTP frontend over core, not its production gRPC service. "
+        "Summa uses a benchmark HTTP frontend over core, not its production gRPC service. "
         + (
             "Text-analysis differences remain visible in the shared inputs; "
             "errors are excluded from successful-query throughput. "
@@ -253,7 +253,7 @@ def main():
         selection = json.loads((root / "selection.json").read_text())
         lines[6:6] = [
             "All 15 count-compatible queries are measured at 32 clients. "
-            "Both Hermes configurations use the same frozen borrowed-ID executable and "
+            "Both Summa configurations use the same frozen borrowed-ID executable and "
             "ordinary index. Current: 30 search/blocking workers, four HTTP workers. "
             f"Candidate: {selection['workers']} search/blocking workers, "
             f"{selection['http']} HTTP workers. Admission remains 64. "
@@ -267,7 +267,7 @@ def main():
         lines[6:6] = [
             "All 15 count-compatible queries are measured at 32 clients; the seven "
             "conjunctions are also measured at one and 64 clients. All three variants run "
-            "sequentially in isolated loopback networking. Both Hermes variants use the same "
+            "sequentially in isolated loopback networking. Both Summa variants use the same "
             "ordinary index, automatic HTTP workers (four), 30 blocking/search workers and "
             "64-request admission. RGB and impacts remain separate. Server CPUs: 0–14,16–30; "
             "driver CPUs: 15,31. No copying, compilation or indexing overlaps timing. "
@@ -277,7 +277,7 @@ def main():
     elif args.conjunction_followup:
         lines[6:6] = [
             "Only the seven agreeing `and_high_low` queries are timed here, at one and 32 clients. "
-            "All four variants run sequentially in isolated loopback networking; all Hermes "
+            "All four variants run sequentially in isolated loopback networking; all Summa "
             "variants use the same ordinary index, without RGB or impact metadata. "
             "Server CPUs: 0–14,16–30; driver CPUs: 15,31. No copying, compilation or indexing "
             "overlaps timed runs. Core search algorithms are unchanged by this follow-up.",
@@ -286,7 +286,7 @@ def main():
     elif args.scaling_followup:
         lines[6:6] = [
             "All variants run sequentially with isolated loopback networking. "
-            "Prior/current Hermes use the same immutable ordinary index; RGB is a separate "
+            "Prior/current Summa use the same immutable ordinary index; RGB is a separate "
             "current-format build from the same corpus. Impacts are disabled except in "
             "the explicitly labeled optional-impact follow-up, when present. "
             "No indexing, copying or compilation overlaps a timed run. "
@@ -296,7 +296,7 @@ def main():
         ]
     elif args.gap_followup:
         lines[6:6] = [
-            "All four variants run sequentially. The prior and optimized Hermes binaries "
+            "All four variants run sequentially. The prior and optimized Summa binaries "
             "use the same immutable non-RGB index, without impact metadata. The optional "
             "impact variant uses a separate index rebuilt from the same corpus; impacts remain "
             "disabled by default. Luxir is rerun on the same host. "
@@ -305,7 +305,7 @@ def main():
         ]
     elif args.phrase_followup:
         lines[6:6] = [
-            "All three variants are measured sequentially in this run. Both Hermes binaries "
+            "All three variants are measured sequentially in this run. Both Summa binaries "
             "use the same rebuilt non-RGB index, without impact metadata. The comparison "
             "binary disables certified rare-term admission; all other code and writer output "
             "are identical. Luxir is rerun on the same host. "
@@ -314,7 +314,7 @@ def main():
         ]
     elif args.followup:
         lines[6:6] = [
-            "The three Hermes instances run sequentially: the unchanged binary and the optimized "
+            "The three Summa instances run sequentially: the unchanged binary and the optimized "
             "binary use the same original index; RGB uses a separately built index from the same "
             "corpus with the body field reordered. "
             "Reference-engine timings remain in the original report; no mixed-run speedup is claimed.",

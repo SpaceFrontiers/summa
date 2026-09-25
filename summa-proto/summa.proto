@@ -1,0 +1,758 @@
+syntax = "proto3";
+
+package summa;
+
+// Search service
+service SearchService {
+  // Search for documents
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // Get document by ID
+  rpc GetDocument(GetDocumentRequest) returns (GetDocumentResponse);
+
+  // Get index info
+  rpc GetIndexInfo(GetIndexInfoRequest) returns (GetIndexInfoResponse);
+
+  // Text statistics (document frequencies, corpus sizes, average lengths)
+  // of the BM25 terms of a query over this backend's index. A broker that
+  // scatters one index over several shards sums the responses and sends the
+  // total back as `SearchRequest.text_stats`, so every shard scores with
+  // the same IDF.
+  rpc GetTextStats(GetTextStatsRequest) returns (GetTextStatsResponse);
+}
+
+// Index service
+service IndexService {
+  // Create a new index (supports both structured schema and SDL string)
+  rpc CreateIndex(CreateIndexRequest) returns (CreateIndexResponse);
+
+  // Add documents to index (streaming)
+  rpc IndexDocuments(stream IndexDocumentRequest) returns (IndexDocumentsResponse);
+
+  // Add documents in batch
+  rpc BatchIndexDocuments(BatchIndexDocumentsRequest) returns (BatchIndexDocumentsResponse);
+
+  // Stage whole-document deletions by exact primary key, including every chunk.
+  rpc DeleteDocuments(DeleteDocumentsRequest) returns (DocumentMutationResponse);
+
+  // Stage complete replacements (inserts if absent). Commit publishes them.
+  rpc UpsertDocuments(UpsertDocumentsRequest) returns (DocumentMutationResponse);
+
+  // Commit pending changes
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  // Force merge segments
+  rpc ForceMerge(ForceMergeRequest) returns (ForceMergeResponse);
+
+  // Run bounded text, BMP, Seismic, and binary ANN layout maintenance
+  rpc Reorder(ReorderRequest) returns (ReorderResponse);
+
+  // Delete an index
+  rpc DeleteIndex(DeleteIndexRequest) returns (DeleteIndexResponse);
+
+  // List all indexes
+  rpc ListIndexes(ListIndexesRequest) returns (ListIndexesResponse);
+
+  // Retrain global vector codebooks and atomically rebuild every ANN segment
+  rpc RetrainVectorIndex(RetrainVectorIndexRequest) returns (RetrainVectorIndexResponse);
+
+  // Atomically replace one vector field's IVF/ScaNN algorithm or parameters
+  rpc AlterVectorIndex(AlterVectorIndexRequest) returns (AlterVectorIndexResponse);
+}
+
+// Query types
+message Query {
+  oneof query {
+    TermQuery term = 1;
+    BooleanQuery boolean = 2;
+    BoostQuery boost = 3;
+    AllQuery all = 4;
+    SparseVectorQuery sparse_vector = 5;
+    DenseVectorQuery dense_vector = 6;
+    MatchQuery match = 7;
+    RangeQuery range = 8;
+    PrefixQuery prefix = 9;
+    BinaryDenseVectorQuery binary_dense_vector = 10;
+    FusionQuery fusion = 11;  // Top-level only (cannot be nested)
+    PhraseQuery phrase = 12;
+  }
+}
+
+// Method for fusing sub-query result lists
+enum FusionMethod {
+  FUSION_RRF = 0;                      // Reciprocal Rank Fusion (rank-based, default)
+  FUSION_NORMALIZED_WEIGHTED_SUM = 1;  // Min-max normalized weighted score sum
+  // Return complete bounded nomination lists/union for coordinator-side fusion.
+  FUSION_CANDIDATES = 2;
+}
+
+// Weighted sub-query for hybrid fusion
+message WeightedQuery {
+  Query query = 1;
+  float weight = 2;  // Legacy RRF/NWS contribution; 0 or unset = 1.0
+  // Required, unique feature identity when l1 or score_export is supplied.
+  string name = 3;
+  ScoreScope scope = 4;
+  // Backfill this branch without using it to nominate candidates (L1/export only).
+  bool score_only = 5;
+}
+
+// Union fusion of independently-executed sub-queries (e.g. sparse + dense
+// hybrid retrieval). Unlike the reranker (which can only re-score documents
+// the first-stage query found), fusion keeps documents found by ANY
+// sub-query. Only valid at the top level of SearchRequest.query; composes
+// with SearchRequest.reranker (the fused list becomes the L1 candidates).
+message FusionQuery {
+  repeated WeightedQuery queries = 1;
+  FusionMethod method = 2;
+  float rrf_k = 3;         // RRF rank constant; 0 = default 60
+  // Combiner for fused per-chunk (ordinal) scores into a document score.
+  // Fusion runs at chunk granularity: same-chunk hits across sub-queries
+  // compound, and results carry per-chunk ordinal_scores.
+  // Unset (0) = MAX (recommended; LogSumExp is unsuitable at RRF magnitudes).
+  MultiValueCombiner combiner = 5;
+  // Common document eligibility for every branch. Does not create an L1 feature.
+  repeated Query filters = 6;
+  // Independent per-branch nomination depth (L1/export only). 0 uses
+  // candidate_limit. The complete union survives until L1 ranking/export.
+  uint32 candidate_depth = 7;
+}
+
+// Scope is explicit: document features never become body ordinal zero.
+enum ScoreScope {
+  SCORE_SCOPE_UNSPECIFIED = 0;
+  SCORE_SCOPE_DOCUMENT = 1;
+  SCORE_SCOPE_CHUNK = 2;
+}
+
+// Fixed preprocessing trained offline, never derived from a shard/result page.
+// The only L1 scoring contract: a compiled symbolic formula over branch scores.
+message L1Ranking {
+  reserved 1, 2, 3, 6;
+  reserved "weights", "bias", "transforms", "rrf_weight";
+  // Omitted=true: backfill only missing raw cells. False uses organic values.
+  optional bool backfill = 4;
+  // Raw defaults for missing formula variables; omitted variables use zero.
+  map<string, double> missing_values = 5;
+  // Required, nonempty expression over named raw scores and reserved `rrf`.
+  // Runs before passage/document selection. Requires formula_v1.
+  string formula = 7;
+}
+
+message ScoreExport {
+  // Maximum raw passage rows per hit; 0 = all (65536). With l1, exported rows
+  // are the best passages after complete scoring. Without l1, exceeding this
+  // bound fails instead of silently omitting features the caller needs to rank.
+  uint32 passages_per_document = 1;
+  // Diagnostics: score every stored passage of nominated documents. Default
+  // false scores the union of nominated passages only, plus document context.
+  bool all_passages = 2;
+  // Capability 4: score real body ordinals for document-only nominees.
+  // Requires backfill and a chunk-scoped feature. Existing body nominations
+  // retain their original passage union; no organic votes are fabricated.
+  bool seed_document_passages = 3;
+}
+
+// How to combine scores for multi-valued documents
+enum MultiValueCombiner {
+  COMBINER_LOG_SUM_EXP = 0;  // Softmax-weighted smooth maximum (default); count-invariant
+  COMBINER_MAX = 1;          // Take maximum score
+  COMBINER_AVG = 2;          // Average all scores
+  COMBINER_SUM = 3;          // Sum all scores
+  COMBINER_WEIGHTED_TOP_K = 4;  // Weighted top-k with decay
+}
+
+// Sparse vector query for similarity search
+// Either provide (indices, values) directly, or provide text for server-side tokenization
+message SparseVectorQuery {
+  string field = 1;
+  repeated uint32 indices = 2;   // Pre-computed token indices
+  repeated float values = 3;     // Pre-computed token values
+  string text = 4;               // Raw text (tokenized server-side if tokenizer configured)
+  MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
+  float heap_factor = 6; // BMP/MaxScore pruning factor (0 = schema default, 1 = exact).
+  float combiner_temperature = 7;   // Temperature for LogSumExp (default: 1.5)
+  uint32 combiner_top_k = 8;        // K for WeightedTopK (default: 5)
+  float combiner_decay = 9;         // Decay for WeightedTopK (default: 0.7)
+  float weight_threshold = 10;      // Min abs(weight) for query dims (0 = no filtering)
+  uint32 max_query_dims = 11;       // Max query dimensions to process (0 = all)
+  float pruning = 12;               // Fraction of query dims to keep (0 = no pruning, 0.1 = top 10%)
+  optional uint32 lsp_gamma = 13; // BMP LSP gamma (unset = depth-derived, 0 = exhaustive).
+  optional uint32 seismic_cut = 14; // Nomination query dimensions (1..64)
+  optional float seismic_factor = 15; // Summary pruning factor (0..1)
+  optional bool exhaustive = 16; // Exact shared-forward scan; false allows approximation
+}
+
+// Dense vector query for similarity search
+message DenseVectorQuery {
+  string field = 1;
+  repeated float vector = 2;
+  uint32 nprobe = 3;           // Number of clusters to probe (for IVF indexes)
+  MultiValueCombiner combiner = 5;  // How to combine scores for multi-value fields
+  float combiner_temperature = 6;   // Temperature for LogSumExp (default: 1.5)
+  uint32 combiner_top_k = 7;        // K for WeightedTopK (default: 5)
+  float combiner_decay = 8;         // Decay for WeightedTopK (default: 0.7)
+}
+
+// Binary dense vector query for Hamming distance search
+message BinaryDenseVectorQuery {
+  string field = 1;
+  bytes vector = 2;                        // Packed-bit query vector (ceil(dim/8) bytes)
+  MultiValueCombiner combiner = 3;         // How to combine scores for multi-value fields
+  float combiner_temperature = 4;
+  uint32 combiner_top_k = 5;
+  float combiner_decay = 6;
+}
+
+message TermQuery {
+  string field = 1;
+  string term = 2;
+  // Optional hint for the field's tokenizer (see MatchQuery.tokenizer_hint)
+  string tokenizer_hint = 3;
+}
+
+message BooleanQuery {
+  repeated Query must = 1;
+  repeated Query should = 2;
+  repeated Query must_not = 3;
+}
+
+message BoostQuery {
+  Query query = 1;
+  float boost = 2;
+}
+
+message AllQuery {}
+
+// Range query on a fast field (inclusive bounds)
+// Exactly one pair of bounds should be set (u64, i64, or f64)
+message RangeQuery {
+  string field = 1;
+  optional uint64 min_u64 = 2;
+  optional uint64 max_u64 = 3;
+  optional int64 min_i64 = 4;
+  optional int64 max_i64 = 5;
+  optional double min_f64 = 6;
+  optional double max_f64 = 7;
+}
+
+// Full-text match query - tokenizes text server-side and searches as OR of tokens
+// Use this instead of TermQuery when searching with natural language text
+message MatchQuery {
+  string field = 1;
+  string text = 2;
+  // Optional hint passed to the field's tokenizer. Static tokenizers ignore
+  // it; a `lex(by: languages, ...)` tokenizer
+  // reads it as a comma-separated list of language codes ("ru,en") and stems
+  // each query token with the first listed language of the token's script.
+  // Empty = the tokenizer's default.
+  string tokenizer_hint = 3;
+  // Proximity rescoring (sequential dependence): the top candidates of the
+  // BM25 pass gain a bonus for adjacent query terms occurring next to each
+  // other (ordered windows) or within `proximity_window` positions
+  // (unordered windows, half weight), scaled by this weight. 0 = off.
+  // Approximate: the bonus applies to an over-fetched candidate pool.
+  float proximity_weight = 4;
+  // Unordered window size; 0 = 8.
+  uint32 proximity_window = 5;
+  // Approximate MaxScore: scale the pruning threshold by 1/heap_factor
+  // (0/unset or 1 = exact, rank-safe; 0.8 prunes more aggressively at some
+  // recall cost). Must be finite and in [0, 1]. This option applies to text queries.
+  float heap_factor = 6;
+  // Long queries: keep only the `max_terms` rarest (highest idf) tokens for
+  // scoring; 0 = all tokens. Approximate.
+  uint32 max_terms = 7;
+}
+
+// Phrase query - text is tokenized server-side with the field's tokenizer
+// (so stemming matches indexing) and the terms must occur at the distances
+// the tokenizer assigned (consecutively unless the tokenizer dropped stop
+// words between them, whose positions are kept as gaps) or within `slop`
+// positions of that. Requires the field to be indexed with token positions
+// (`indexed<token_position>` or `indexed<positions>`); without positions the
+// engine degrades to a MUST of the terms. Scored with BM25 over the phrase
+// frequency (occurrences of the whole phrase) and the summed idf of its terms.
+// A phrase whose words are all stop words is rejected standalone and dropped
+// (with a server warning) when it is a clause of a BooleanQuery.
+message PhraseQuery {
+  string field = 1;
+  string text = 2;
+  uint32 slop = 3;
+  string tokenizer_hint = 4;  // See MatchQuery.tokenizer_hint
+}
+
+// Prefix query - matches all documents containing any term starting with prefix
+// Score is always 1.0 (filter-style). Efficient as a MUST clause in BooleanQuery.
+message PrefixQuery {
+  string field = 1;
+  string prefix = 2;
+}
+
+// L2 reranker: rerank L1 candidates by exact vector distance
+// For dense vectors: set `vector` (f32). For binary dense vectors: set `binary_vector` (bytes).
+message Reranker {
+  string field = 1;                    // Vector field (dense or binary dense)
+  repeated float vector = 2;           // Query vector (f32, for dense fields)
+  MultiValueCombiner combiner = 4;
+  float combiner_temperature = 5;
+  uint32 combiner_top_k = 6;
+  float combiner_decay = 7;
+  uint32 matryoshka_dims = 8;          // Matryoshka pre-filter dims (0 = disabled)
+  bytes binary_vector = 9;             // Query vector (packed bits, for binary dense fields)
+  float rrf_k = 10;                    // Reciprocal Rank Fusion k (0 = disabled, typical: 60)
+}
+
+// Search request/response
+message SearchRequest {
+  string index_name = 1;
+  Query query = 2;
+  uint32 limit = 3;
+  uint32 offset = 4;
+  repeated string fields_to_load = 5;
+  Reranker reranker = 6;               // Optional L2 reranker
+  // First-stage candidate pool. 0 uses offset + limit; explicit values must
+  // be between offset + limit and the 2x ceiling.
+  uint32 candidate_limit = 7;
+  // Anytime mode: wall-clock budget in milliseconds for the scoring phase.
+  // Text (BM25) MaxScore executors stop at the deadline and return the best
+  // results found so far; `SearchResponse.truncated` reports that it fired.
+  // 0 = unbounded (exact top-k).
+  uint64 time_budget_ms = 8;
+  // Cross-shard text statistics for BM25 (see `GetTextStats`). When set they
+  // replace the backend's own statistics for the listed fields and terms;
+  // unset = the backend aggregates over its own segments.
+  TextStats text_stats = 9;
+  // Requires named, scoped fusion branches. The formula may reference the RRF feature.
+  L1Ranking l1 = 10;
+  // With no l1, exports the complete candidate union for external inference.
+  // Export-only requests require offset=0 and a limit covering the whole union.
+  ScoreExport score_export = 11;
+  // Return RRF diagnostics alongside the requested ranking score. Requires
+  // top-level fusion and complete nomination; does not change ranking.
+  bool include_rrf_scores = 12;
+  // Preserve bounded per-shard nomination and selection traces. Default false;
+  // does not rerun subqueries or change retrieval/ranking budgets.
+  bool tracing = 13;
+}
+
+message GetTextStatsRequest {
+  string index_name = 1;
+  // The query whose BM25 terms are collected (after this backend's own
+  // tokenization); sparse, dense and filter clauses contribute nothing.
+  Query query = 2;
+}
+
+message GetTextStatsResponse {
+  TextStats stats = 1;
+}
+
+// BM25 statistics of a set of text terms.
+message TextStats {
+  // Documents in the index (or the sum over shards).
+  uint64 total_docs = 1;
+  repeated TextFieldStats fields = 2;
+}
+
+message TextFieldStats {
+  string field = 1;
+  // Scoring units of the field: documents for a plain field, chunks for a
+  // chunked one.
+  uint64 corpus_size = 2;
+  // Average length of a scoring unit in tokens.
+  float avg_len = 3;
+  repeated TermDocFreq terms = 4;
+}
+
+message TermDocFreq {
+  // Index-time token bytes.
+  bytes term = 1;
+  uint64 doc_freq = 2;
+}
+
+// Unique document address: segment + local doc_id
+message DocAddress {
+  string segment_id = 1;          // Segment ID (hex, 32 chars)
+  uint32 doc_id = 2;              // Segment-local document ID
+}
+
+message SearchHit {
+  DocAddress address = 1;
+  float score = 2;
+  map<string, FieldValueList> fields = 3;
+  repeated OrdinalScore ordinal_scores = 4;  // Per-ordinal scores for multi-value fields
+  CandidateScores candidate_scores = 5; // Present only when score_export is requested.
+  optional float rrf_score = 6; // Present when include_rrf_scores is requested.
+  repeated RrfContribution rrf_contributions = 7;
+}
+
+// One organic nomination vote. Document context has no ordinal; chunk votes
+// are combined per ordinal before the document's fusion combiner is applied.
+message RrfContribution {
+  uint32 query_index = 1;
+  string query_name = 2; // Empty for unnamed legacy branches.
+  uint32 rank = 3; // One-based rank in the complete merged nomination list.
+  float score = 4; // Branch weight / (k + rank).
+  optional uint32 ordinal = 5;
+}
+
+message CandidateScores {
+  // Branch name -> raw score. Absent key means unavailable indexed data;
+  // a valid nonmatch is explicitly 0. Negative dense scores are preserved.
+  map<string, float> document = 1;
+  repeated PassageScores passages = 2;
+  // Before limiting exported rows; L1 selected from all of these passages.
+  uint32 scored_passages = 3;
+}
+message PassageScores {
+  uint32 ordinal = 1;
+  map<string, float> scores = 2;
+  // Final formula score when l1 is present, otherwise no ranking score.
+  optional float l1_score = 3;
+}
+
+// List of field values — supports multi-value fields (e.g. multiple URIs per document)
+message FieldValueList {
+  repeated FieldValue values = 1;
+}
+
+// Score contribution from a specific ordinal in a multi-valued field
+message OrdinalScore {
+  uint32 ordinal = 1;  // Which value in the multi-valued field (0-indexed)
+  float score = 2;     // Score contribution from this ordinal
+}
+
+message FieldValue {
+  oneof value {
+    string text = 1;
+    uint64 u64 = 2;
+    int64 i64 = 3;
+    double f64 = 4;
+    bytes bytes_value = 5;
+    SparseVector sparse_vector = 6;
+    DenseVector dense_vector = 7;
+    string json_value = 8;  // JSON serialized as string
+    bytes binary_dense_vector = 9;  // Packed-bit binary vector
+  }
+}
+
+// Sparse vector with term indices and weights
+message SparseVector {
+  repeated uint32 indices = 1;
+  repeated float values = 2;
+}
+
+// Dense vector (float32 values)
+message DenseVector {
+  repeated float values = 1;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  uint64 total_hits = 2;
+  uint64 took_ms = 3;
+  SearchTimings timings = 4;
+  // True when `time_budget_ms` expired before every candidate was scored;
+  // the hits are then the best-so-far, not the exact top-k.
+  bool truncated = 5;
+  // Feature contracts: "formula_v1" or "feature_export_v2".
+  string ranking_method = 6;
+  // Present for FUSION_CANDIDATES. Hits hold hydrated union entries once;
+  // these lists preserve independent branch scores and nominated ordinals.
+  repeated FusionCandidateList fusion_candidates = 7;
+  SearchTrace trace = 8; // Present only when tracing is requested.
+  // Capability 4 acknowledgment, true only when every backend honored the
+  // requested document-only passage seeding policy. Old adapters default false.
+  bool seeded_document_passages = 9;
+}
+
+message SearchTrace {
+  repeated ShardSearchTrace shards = 1;
+}
+
+message ShardSearchTrace {
+  string shard_id = 1; // Populated by the broker; empty on direct server calls.
+  string backend_id = 2;
+  string index_name = 3;
+  repeated QueryTrace queries = 4;
+  repeated FusionCandidate selected = 5; // Shard results before broker selection.
+  string ranking_method = 6;
+  bool truncated = 7;
+  repeated Query filters = 8; // Common fusion filters applied during nomination.
+}
+
+message QueryTrace {
+  uint32 query_index = 1;
+  string query_name = 2;
+  Query query = 3; // Original branch/root expression, including nested clauses.
+  ScoreScope scope = 4;
+  bool score_only = 5;
+  uint32 candidate_depth = 6;
+  uint32 total_seen = 7;
+  // All organic nominations within the requested depth, before fusion/L1/L2.
+  repeated FusionCandidate candidates = 8;
+}
+
+message FusionCandidateList {
+  uint32 query_index = 1;
+  repeated FusionCandidate candidates = 2;
+}
+
+message FusionCandidate {
+  DocAddress address = 1;
+  float score = 2;
+  repeated OrdinalScore ordinal_scores = 3;
+}
+
+// Detailed timing breakdown for search phases (all values in microseconds)
+message SearchTimings {
+  uint64 search_us = 1;       // L1 retrieval (query scoring across segments)
+  uint64 rerank_us = 2;       // L2 reranking (dense vector rescoring)
+  uint64 load_us = 3;         // Document field loading from store
+  uint64 total_us = 4;        // Wall-clock total (includes overhead)
+  uint64 candidate_scoring_us = 5; // Missing-only feature backfill and formula selection.
+}
+
+// Get document request/response
+message GetDocumentRequest {
+  string index_name = 1;
+  DocAddress address = 2;
+}
+
+message GetDocumentResponse {
+  map<string, FieldValueList> fields = 1;
+}
+
+// Index info request/response
+message GetIndexInfoRequest {
+  string index_name = 1;
+}
+
+message GetIndexInfoResponse {
+  string index_name = 1;
+  uint32 num_docs = 2;
+  uint32 num_segments = 3;
+  // Schema in SDL format
+  string schema = 4;
+  // Memory usage breakdown (if available)
+  MemoryStats memory_stats = 5;
+  // Per-field vector statistics
+  repeated VectorFieldStats vector_stats = 6;
+  // Per text field: how it is tokenized, so clients pick query forms
+  // without parsing the schema SDL.
+  repeated TextFieldInfo text_fields = 7;
+  uint32 candidate_scoring_version = 8; // 3 requires symbolic L1 formula; preserves organic scores, optional backfill and raw defaults.
+  repeated string unprepared_candidate_fields = 9; // Fields requiring lookup preparation/migration.
+  uint64 physical_num_docs = 10; // Includes tombstones; num_docs counts live rows.
+  uint64 num_deleted_docs = 11;
+  double deleted_ratio = 12; // num_deleted_docs / physical_num_docs; zero for an empty index.
+}
+
+// Tokenization facts of one text field.
+message TextFieldInfo {
+  string field = 1;
+  // The field uses a `lex(...)` tokenizer.
+  bool lexical = 2;
+  // A `lex(by: <field>)` tokenizer: the query's `tokenizer_hint` selects
+  // the stemmer (empty when the field has no hint field).
+  string hint_field = 3;
+  // `lex(variants: true)`: the written word is indexed next to its stem and
+  // folded forms, so one clause per field suffices (phrases match the
+  // written form, match queries the stem).
+  bool variants = 4;
+  // Token positions are indexed, so phrase queries verify adjacency.
+  bool positions = 5;
+  // `indexed<chunked>`: every value is its own BM25 unit with an ordinal.
+  bool chunked = 6;
+}
+
+// Per-field vector statistics (dense or sparse)
+message VectorFieldStats {
+  string field_name = 1;
+  string vector_type = 2;  // "dense" or "sparse"
+  uint64 total_vectors = 3;
+  uint32 dimension = 4;    // dim for dense, num_dimensions for sparse
+  float avg_terms_per_vector = 5;  // sparse only: avg postings per vector (0 for dense)
+}
+
+// Memory usage statistics
+message MemoryStats {
+  // Total estimated memory usage in bytes
+  uint64 total_bytes = 1;
+  // Indexing buffer memory (pending documents not yet flushed)
+  IndexingBufferStats indexing_buffer = 2;
+  // Segment reader memory (loaded for search)
+  SegmentReaderStats segment_reader = 3;
+}
+
+// Indexing buffer memory breakdown
+message IndexingBufferStats {
+  uint64 total_bytes = 1;
+  uint64 postings_bytes = 2;
+  uint64 sparse_vectors_bytes = 3;
+  uint64 dense_vectors_bytes = 4;
+  uint64 interner_bytes = 5;
+  uint64 position_index_bytes = 6;
+  uint32 pending_docs = 7;
+  uint32 unique_terms = 8;
+}
+
+// Segment-reader heap memory (search structures and decompressed caches).
+// File-backed mappings and pinned residency are intentionally excluded:
+// mapped file extent is not equivalent to resident memory.
+message SegmentReaderStats {
+  uint64 total_bytes = 1;
+  uint64 term_dict_cache_bytes = 2;
+  uint64 store_cache_bytes = 3;
+  uint64 sparse_index_bytes = 4;
+  uint64 dense_index_bytes = 5;
+  uint32 num_segments_loaded = 6;
+}
+
+// Create index request/response
+message CreateIndexRequest {
+  string index_name = 1;
+  // Schema definition
+  string schema = 2;
+}
+
+message CreateIndexResponse {
+  bool success = 1;
+}
+
+// Field entry for multi-value field support
+message FieldEntry {
+  string name = 1;
+  FieldValue value = 2;
+}
+
+// Named document for batch indexing
+// Uses repeated FieldEntry to support multi-value fields (same name, multiple values)
+message NamedDocument {
+  repeated FieldEntry fields = 1;
+}
+
+// Batch index documents request
+message BatchIndexDocumentsRequest {
+  string index_name = 1;
+  repeated NamedDocument documents = 2;
+}
+
+message BatchIndexDocumentsResponse {
+  uint32 indexed_count = 1;
+  uint32 error_count = 2;
+  repeated DocumentError errors = 3;
+}
+
+// Requests are bounded before conversion or writer admission. Both require a
+// primary-key schema and an explicit Commit. No cross-partition transaction.
+message DeleteDocumentsRequest {
+  string index_name = 1;
+  repeated string primary_keys = 2; // <=100,000 keys, <=8 MiB total key bytes
+}
+
+message UpsertDocumentsRequest {
+  string index_name = 1;
+  repeated NamedDocument documents = 2; // <=1,000 documents, <=32 MiB encoded request (<=200 MiB for one document)
+}
+
+message DocumentMutationResponse {
+  // Admitted operations, not affected rows. A missing deletion is accepted.
+  // Every input is accepted or has one error; Commit publishes accepted work.
+  uint32 accepted_count = 1;
+  repeated DocumentError errors = 2;
+}
+
+// Per-document error detail (e.g. duplicate primary key)
+message DocumentError {
+  uint32 index = 1;   // 0-based index in the request batch
+  string error = 2;   // Human-readable error message
+}
+
+// Index document request/response
+message IndexDocumentRequest {
+  string index_name = 1;
+  repeated FieldEntry fields = 2;
+}
+
+message IndexDocumentsResponse {
+  uint32 indexed_count = 1;
+  repeated DocumentError errors = 2;
+}
+
+// Commit request/response
+message CommitRequest {
+  string index_name = 1;
+}
+
+message CommitResponse {
+  bool success = 1;
+  uint32 num_docs = 2;
+}
+
+// Force merge request/response
+message ForceMergeRequest {
+  string index_name = 1;
+  // Expensive physical removal of deleted rows, once per final output.
+  // Omitted/false copies encoded data and carries deletion masks unchanged.
+  bool compact = 2;
+}
+
+message ForceMergeResponse {
+  bool success = 1;
+  uint32 num_segments = 2;
+}
+
+// Delete index request/response
+message DeleteIndexRequest {
+  string index_name = 1;
+}
+
+message DeleteIndexResponse {
+  bool success = 1;
+}
+
+// List indexes request/response
+message ListIndexesRequest {}
+
+message ListIndexesResponse {
+  repeated string index_names = 1;
+}
+
+// Retrain vector index request/response
+message RetrainVectorIndexRequest {
+  string index_name = 1;
+}
+
+message RetrainVectorIndexResponse {
+  bool success = 1;
+}
+
+message AlterVectorIndexRequest {
+  string index_name = 1;
+  string field_name = 2;
+  // SDL field type/options, for example:
+  // dense_vector<768, f16> [indexed<scann, tree_levels: 2, nprobe: 1024>]
+  string field_schema = 3;
+}
+
+enum VectorIndexAlterState {
+  VECTOR_INDEX_ALTER_STATE_UNSPECIFIED = 0;
+  VECTOR_INDEX_ALTER_STATE_BUILT = 1;
+  VECTOR_INDEX_ALTER_STATE_DEFERRED_FLAT = 2;
+  VECTOR_INDEX_ALTER_STATE_PARAMETERS_ONLY = 3;
+}
+
+message AlterVectorIndexResponse {
+  uint64 publication_generation = 1;
+  VectorIndexAlterState state = 2;
+}
+
+// Reorder request/response
+message ReorderRequest {
+  string index_name = 1;
+}
+
+message ReorderResponse {
+  bool success = 1;
+  uint32 num_segments = 2;
+}

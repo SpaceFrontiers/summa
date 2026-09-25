@@ -7,7 +7,7 @@ restricted compatibility comparison, not the complete published benchmark.
 All variants use the same ordinary, non-RGB, 10M-document index, one segment,
 compiler (Rust 1.98.1), `-C target-cpu=native`, and 32-vCPU Cascade Lake benchmark
 host. Thirty server hardware threads cover 15 physical cores; the driver uses
-the remaining physical core (CPUs 15,31). Query caches are off. Hermes uses the
+the remaining physical core (CPUs 15,31). Query caches are off. Summa uses the
 benchmark HTTP frontend over core, not the production gRPC server. Luxir is the
 same official 0.1.0 x86-64-v4 executable used in the preceding comparison.
 
@@ -52,7 +52,7 @@ only paired comparisons within each boot are interpreted. The first boot's
 absolute QPS is not used as the corrected campaign's baseline.
 
 Equal counts do not establish general analyzer or relevance equivalence across
-engines. Within Hermes, all admitted queries preserve exact ranked IDs, score
+engines. Within Summa, all admitted queries preserve exact ranked IDs, score
 bits, counts, and all 45 HTTP response bodies. Repetition ranges, CPU cost and
 memory are retained in the accompanying CSVs. These runs do not establish p99
 latency or cold-cache behavior.
@@ -60,17 +60,17 @@ latency or cold-cache behavior.
 **Throughput, queries per second; higher is better.** Each entry is the median
 of three repetitions at 32 clients.
 
-| Family       | Operation | Hermes before (QPS) | Hermes directory, blocking (QPS) | Hermes directory, in-place (QPS) | Luxir (QPS) |
-| ------------ | --------- | ------------------- | -------------------------------- | -------------------------------- | ----------- |
-| and_high_low | TOP_10    | 43,106.1            | 43,681.9                         | 43,024.0                         | 52,523.8    |
-| and_high_low | TOP_100   | 37,927.2            | 39,493.5                         | 38,488.2                         | 38,393.7    |
-| and_high_low | COUNT     | 67,728.5            | 67,761.5                         | 69,054.1                         | 64,576.9    |
-| low_phrase   | TOP_10    | 15,708.3            | 15,655.4                         | 16,201.5                         | 7,448.5     |
-| low_phrase   | TOP_100   | 4,956.4             | 4,925.2                          | 5,033.1                          | 3,779.1     |
-| low_phrase   | COUNT     | 1,990.4             | 1,952.0                          | 1,970.9                          | 2,050.9     |
-| med_phrase   | TOP_10    | 15,335.9            | 15,284.6                         | 16,019.1                         | 17,552.3    |
-| med_phrase   | TOP_100   | 10,205.8            | 10,319.5                         | 10,769.1                         | 5,982.8     |
-| med_phrase   | COUNT     | 716.4               | 713.5                            | 717.8                            | 605.5       |
+| Family       | Operation | Summa before (QPS) | Summa directory, blocking (QPS) | Summa directory, in-place (QPS) | Luxir (QPS) |
+| ------------ | --------- | ------------------ | ------------------------------- | ------------------------------- | ----------- |
+| and_high_low | TOP_10    | 43,106.1           | 43,681.9                        | 43,024.0                        | 52,523.8    |
+| and_high_low | TOP_100   | 37,927.2           | 39,493.5                        | 38,488.2                        | 38,393.7    |
+| and_high_low | COUNT     | 67,728.5           | 67,761.5                        | 69,054.1                        | 64,576.9    |
+| low_phrase   | TOP_10    | 15,708.3           | 15,655.4                        | 16,201.5                        | 7,448.5     |
+| low_phrase   | TOP_100   | 4,956.4            | 4,925.2                         | 5,033.1                         | 3,779.1     |
+| low_phrase   | COUNT     | 1,990.4            | 1,952.0                         | 1,970.9                         | 2,050.9     |
+| med_phrase   | TOP_10    | 15,335.9           | 15,284.6                        | 16,019.1                        | 17,552.3    |
+| med_phrase   | TOP_100   | 10,205.8           | 10,319.5                        | 10,769.1                        | 5,982.8     |
+| med_phrase   | COUNT     | 716.4              | 713.5                           | 717.8                           | 605.5       |
 
 ## Result and decision
 
@@ -94,7 +94,7 @@ and top-100 changes
 relative to updated blocking execution, but this family contains only one query.
 The tradeoff does not establish a generally better scheduling policy.
 
-Updated Hermes is **16.8% behind fresh Luxir on conjunction top-10** and
+Updated Summa is **16.8% behind fresh Luxir on conjunction top-10** and
 **2.9% ahead on top-100** in this run. This does not establish a general lead:
 Luxir top-100 itself varies from 41,581 QPS in the first prototype campaign to
 38,394 in the corrected campaign. The bounded directory is retained for its demonstrated
@@ -102,7 +102,7 @@ lookup/CPU efficiency, and envelope conversion now avoids two allocations;
 neither result implies a universal QPS improvement. Blocking dispatch and the
 CPU-derived HTTP-worker default remain unchanged.
 
-For conjunction top-100, updated Hermes consumes 25.01 busy
+For conjunction top-100, updated Summa consumes 25.01 busy
 CPU equivalents, compared with 24.99 before and
 28.64 for Luxir. A CPU equivalent is process CPU seconds divided
 by elapsed seconds, not a physical-core count. Lower work per request does not
@@ -255,7 +255,7 @@ from the change. This synthetic fixture does not justify changing scheduling
 defaults. Reproduce with:
 
 ```sh
-cargo bench --locked -p hermes-core --bench core_structures -- \
+cargo bench --locked -p summa-core --bench core_structures -- \
   fast_field_sparse_lookup --warm-up-time 1 --measurement-time 3 --sample-size 30
 ```
 
@@ -265,7 +265,7 @@ the campaign evidence.
 ## Artifacts and lifecycle
 
 All **114 cells / 342 repetitions** pass their error and memory-sampling checks.
-Fifteen Hermes server instances preserve all 45 response bodies, and all saved
+Fifteen Summa server instances preserve all 45 response bodies, and all saved
 exhaustive IDs/score-bits/count audits agree. Coverage remains 15/826 queries.
 The separate Luxir validation/control probe is excluded from throughput tables;
 its four-driver-thread CPU assignment can overlap server CPUs, unlike the timed

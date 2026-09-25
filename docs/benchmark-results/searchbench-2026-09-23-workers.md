@@ -4,9 +4,9 @@ Count agreement: **15/826 queries**. This is a restricted workload, not the comp
 
 10M Wikipedia chunks; one merged segment; 32-vCPU host (16 physical cores with SMT), 30 server hardware threads and two driver threads on the reserved physical core. Query and request caches disabled. Thirty-second session warmup, full untimed validation, one-second connection warmup, three ten-second repetitions per cell.
 
-All 15 count-compatible queries are measured at 32 clients. Both Hermes configurations use the same frozen borrowed-ID executable and ordinary index. Current: 30 search/blocking workers, four HTTP workers. Candidate: 30 search/blocking workers, 2 HTTP workers. Admission remains 64. The WORKERS argument couples search and blocking pool sizes; this is not an isolated ablation of either pool. No runtime implementation or default changes. Server CPUs: 0–14,16–30; driver CPUs: 15,31. No copying, compilation or indexing overlaps timing.
+All 15 count-compatible queries are measured at 32 clients. Both Summa configurations use the same frozen borrowed-ID executable and ordinary index. Current: 30 search/blocking workers, four HTTP workers. Candidate: 30 search/blocking workers, 2 HTTP workers. Admission remains 64. The WORKERS argument couples search and blocking pool sizes; this is not an isolated ablation of either pool. No runtime implementation or default changes. Server CPUs: 0–14,16–30; driver CPUs: 15,31. No copying, compilation or indexing overlaps timing.
 
-Hermes uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
+Summa uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
 
 | Family             | Included | Published queries |
 | ------------------ | -------: | ----------------: |
@@ -33,17 +33,17 @@ Hermes uses a benchmark HTTP frontend over core, not its production gRPC service
 
 **Throughput (queries/second; higher is better).** Values are the median of three repetitions. The CSV retains repetition min/max and peak process RSS. Raw replay JSON and memory samples accompany each cell.
 
-| Family       | Operation | Clients | Distinct queries | Hermes current workers (QPS) | Hermes candidate workers (QPS) | Luxir (QPS) |
-| ------------ | --------- | ------: | ---------------: | ---------------------------: | -----------------------------: | ----------: |
-| and_high_low | COUNT     |      32 |                7 |                     76,093.9 |                       61,823.7 |    66,996.2 |
-| and_high_low | TOP_10    |      32 |                7 |                     46,628.4 |                       50,785.2 |    53,968.9 |
-| and_high_low | TOP_100   |      32 |                7 |                     40,727.8 |                       42,720.1 |    42,887.0 |
-| low_phrase   | COUNT     |      32 |                7 |                      2,039.1 |                        2,038.2 |     2,078.0 |
-| low_phrase   | TOP_10    |      32 |                7 |                     16,241.1 |                       16,977.5 |     7,617.6 |
-| low_phrase   | TOP_100   |      32 |                7 |                      5,148.0 |                        5,165.1 |     3,855.9 |
-| med_phrase   | COUNT     |      32 |                1 |                        727.5 |                          726.9 |       606.8 |
-| med_phrase   | TOP_10    |      32 |                1 |                     15,759.5 |                       16,726.4 |    17,656.0 |
-| med_phrase   | TOP_100   |      32 |                1 |                     10,511.7 |                       10,870.7 |     5,980.9 |
+| Family       | Operation | Clients | Distinct queries | Summa current workers (QPS) | Summa candidate workers (QPS) | Luxir (QPS) |
+| ------------ | --------- | ------: | ---------------: | --------------------------: | ----------------------------: | ----------: |
+| and_high_low | COUNT     |      32 |                7 |                    76,093.9 |                      61,823.7 |    66,996.2 |
+| and_high_low | TOP_10    |      32 |                7 |                    46,628.4 |                      50,785.2 |    53,968.9 |
+| and_high_low | TOP_100   |      32 |                7 |                    40,727.8 |                      42,720.1 |    42,887.0 |
+| low_phrase   | COUNT     |      32 |                7 |                     2,039.1 |                       2,038.2 |     2,078.0 |
+| low_phrase   | TOP_10    |      32 |                7 |                    16,241.1 |                      16,977.5 |     7,617.6 |
+| low_phrase   | TOP_100   |      32 |                7 |                     5,148.0 |                       5,165.1 |     3,855.9 |
+| med_phrase   | COUNT     |      32 |                1 |                       727.5 |                         726.9 |       606.8 |
+| med_phrase   | TOP_10    |      32 |                1 |                    15,759.5 |                      16,726.4 |    17,656.0 |
+| med_phrase   | TOP_100   |      32 |                1 |                    10,511.7 |                      10,870.7 |     5,980.9 |
 
 ## Result and decision
 
@@ -82,7 +82,7 @@ universal worker policy.
 
 The only admitted medium-frequency phrase is `"references reflist"`. Two HTTP
 workers narrow its top-10 deficit to **5.3%**, from **10.7%** with four workers;
-Hermes remains substantially ahead on top-100. This should not be generalized to
+Summa remains substantially ahead on top-100. This should not be generalized to
 all medium-frequency phrases: 45 of the 46 published queries in that class are
 outside the agreement gate. Luxir's stripped executable still prevents equivalent
 function-level attribution of its pruning/codec choices.
@@ -99,7 +99,7 @@ For conjunction top-100, two HTTP workers use 598.9 CPU µs/request versus Luxir
 688.7, but keep only 25.59 CPU equivalents busy versus 29.53. The medium phrase's
 top-10 likewise uses less CPU per request than Luxir while leaving more capacity
 idle. The measurements continue to point toward dispatch/utilization work, rather
-than proving that Hermes' scorer performs more CPU work per query. CPU cost here
+than proving that Summa' scorer performs more CPU work per query. CPU cost here
 includes all server threads, not scoring alone.
 
 A separate count-only lead appears in the screen: 15 workers/two HTTP workers
@@ -204,7 +204,7 @@ The build machine remains stopped throughout.
 ## Correctness, scope and validation
 
 Exhaustive top-100 document IDs, score bits and counts match the prior reference
-for each tested worker width. Every Hermes instance checks all 45 response bodies
+for each tested worker width. Every Summa instance checks all 45 response bodies
 against the previous byte-exact reference before timing. The standard campaign
 also validates exact counts/ranked cardinality and unique IDs, plus before/after
 topology. Admission and response semantics are unchanged by worker settings.
@@ -240,7 +240,7 @@ This run's scripts, raw results and local logs are retained under
 
 ## Remaining dispatch question
 
-The pinned Tokio 1.53.1 implementation was inspected locally, alongside Hermes'
+The pinned Tokio 1.53.1 implementation was inspected locally, alongside Summa'
 public async and synchronous search entry points. In
 `runtime/scheduler/multi_thread/worker.rs`, `block_in_place` transfers the runtime
 worker core through `runtime::spawn_blocking`, then attempts to take it back on
@@ -259,7 +259,7 @@ of smaller worker widths do not establish a suitable mixed-workload default.
 
 All **64 cells / 192 repetitions** complete without request or memory-sampling
 errors: 33 screen cells, 27 final comparison cells and four alternating count
-cells. All 17 Hermes instances preserve the same 45 response bodies; all tested
+cells. All 17 Summa instances preserve the same 45 response bodies; all tested
 worker widths preserve the exhaustive audit. Luxir's same-process health control
 also completes without errors at a median 399,693 requests/sec. That separate
 `GET /health` c32/t4 control uses client CPUs 14–15,30–31, overlapping the server

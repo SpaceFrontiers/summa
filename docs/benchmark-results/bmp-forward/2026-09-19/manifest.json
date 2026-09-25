@@ -8,9 +8,9 @@
   "samples": 7,
   "layout_order": "alternates by sample",
   "source_sha256": {
-    "hermes-core/src/structures/postings/sparse/dimensions.rs": "7edd07c08cb4b872ab90c0d31d3e0997d1cb75b51486ac79968df99aa4f32310",
-    "hermes-core/src/segment/bmp_forward/codec.rs": "b842fe282678ce36b0f03dddd88ced57a10b647dfe54b69330bf792c0f18a9b7",
-    "hermes-core/src/query/bmp.rs": "3450bc8b98b15eee5503c7173f1796ba3df02aaac322edb9a2d71dbe40a32784",
+    "summa-core/src/structures/postings/sparse/dimensions.rs": "7edd07c08cb4b872ab90c0d31d3e0997d1cb75b51486ac79968df99aa4f32310",
+    "summa-core/src/segment/bmp_forward/codec.rs": "b842fe282678ce36b0f03dddd88ced57a10b647dfe54b69330bf792c0f18a9b7",
+    "summa-core/src/query/bmp.rs": "3450bc8b98b15eee5503c7173f1796ba3df02aaac322edb9a2d71dbe40a32784",
     "docs/benchmark-results/bmp-forward/2026-09-19/measure.rs": "0129a3553a58db77cc1a7412a3543417af096d56a7bb6ded621ee8d8afa7df0b"
   },
   "fixture_sha256": "8c90f19e28008608640612be4817a56fbeabcc4c7ab12cd9a57a20b851f55ff2",

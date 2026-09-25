@@ -25,13 +25,13 @@ retains its own bounds. Gains in pruning and latency remain to be measured.
 | Rewrite               | Ordinary merge N→1, compaction 1→1, field-specific BP      | Explicit bounded whole-document N→M within one shard                                     |
 | Delete/upsert         | Primary-key hash identifies the shard                      | Same path; an upsert's replacement may enter a different local topic group               |
 
-Code owners: [broker partitioning](../hermes-broker/src/partition.rs),
-[broker writes](../hermes-broker/src/index_service.rs),
-[broker mutations](../hermes-broker/src/index_service/mutations.rs),
-[native writer](../hermes-core/src/index/writer.rs),
-[dense construction](../hermes-core/src/segment/builder/dense.rs),
-[merge policy](../hermes-core/src/merge/mod.rs), and
-[lossless compaction](../hermes-core/src/segment/merger/compact.rs).
+Code owners: [broker partitioning](../summa-broker/src/partition.rs),
+[broker writes](../summa-broker/src/index_service.rs),
+[broker mutations](../summa-broker/src/index_service/mutations.rs),
+[native writer](../summa-core/src/index/writer.rs),
+[dense construction](../summa-core/src/segment/builder/dense.rs),
+[merge policy](../summa-core/src/merge/mod.rs), and
+[lossless compaction](../summa-core/src/segment/merger/compact.rs).
 Direct server, CLI, and embedded writers also exist; they use the same core topic
 assignment and grouping without requiring a broker.
 
@@ -213,7 +213,7 @@ the new redistribution operation.
 
 Reuse the existing Recursive Graph Bisection kernel rather than implementing
 another graph partitioner. The code already shares
-[`ForwardIndex::from_csr` and `graph_bisection_with_progress`](../hermes-core/src/segment/builder/graph_bisection.rs)
+[`ForwardIndex::from_csr` and `graph_bisection_with_progress`](../summa-core/src/segment/builder/graph_bisection.rs)
 between text and BMP. It accepts entity-to-term memberships, returns
 `order[new_position] = old_entity`, and supports depth/time budgets, bounded degree
 scratch, cancellation, and warm starts through input ordering. Text and BMP already

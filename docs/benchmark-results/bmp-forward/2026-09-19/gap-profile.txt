@@ -9,8 +9,8 @@
 # Overhead  Symbol                                                                                                                                                                                                                                                                        IPC   [IPC Coverage]
 # ........  ............................................................................................................................................................................................................................................................................  ....................
 #
-    87.80%  [.] <hermes_core::query::bmp::CandidateBmpPreparation>::score                                                                                                                                                                                                                 -      -
-     3.15%  [.] <core::iter::sources::from_fn::FromFn<<hermes_core::segment::bmp_forward::codec::ForwardVector>::packets::{closure#0}> as core::iter::traits::iterator::Iterator>::next                                                                                                   -      -
+    87.80%  [.] <summa_core::query::bmp::CandidateBmpPreparation>::score                                                                                                                                                                                                                 -      -
+     3.15%  [.] <core::iter::sources::from_fn::FromFn<<summa_core::segment::bmp_forward::codec::ForwardVector>::packets::{closure#0}> as core::iter::traits::iterator::Iterator>::next                                                                                                   -      -
      1.18%  [k] next_uptodate_folio                                                                                                                                                                                                                                                       -      -
 
 

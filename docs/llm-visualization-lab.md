@@ -2,18 +2,18 @@
 
 ## Purpose
 
-Hermes needs one inspectable view of the model described by MAL, the values that
+Summa needs one inspectable view of the model described by MAL, the values that
 flow through a real checkpoint during inference, and the metrics produced by a
 training run. The lab is for education and debugging; it is not a profiler and
 does not participate in model execution.
 
 The implementation has three boundaries:
 
-1. `hermes-llm trace` runs the existing `hermes_llm::Transformer`, captures a
+1. `summa-llm trace` runs the existing `summa_llm::Transformer`, captures a
    bounded diagnostic pass, and writes a portable JSON bundle.
-2. `hermes-llm lab` keeps that same model resident, serves the model-lab page on
+2. `summa-llm lab` keeps that same model resident, serves the model-lab page on
    loopback, and accepts bounded prompt requests through `POST /api/trace`.
-3. The standalone `hermes-model-lab` project can submit a query to that
+3. The standalone `summa-model-lab` project can submit a query to that
    local session or load a saved bundle, then renders architecture, inference,
    and training views. It does not parse MAL or load model weights in
    JavaScript.
@@ -39,7 +39,7 @@ second model or checkpoint format.
 
 ## Trace bundle
 
-Bundles are JSON with `kind: "hermes_model_trace"` and `version: 1`. Readers
+Bundles are JSON with `kind: "summa_model_trace"` and `version: 1`. Readers
 must reject an unknown kind or a version newer than they support. Required top
 level sections are:
 
@@ -99,7 +99,7 @@ prints every token, channel, head, or metric-row reduction.
 
 ## Live local session
 
-`hermes-llm lab` loads the checkpoint and tokenizer once, then moves them to one
+`summa-llm lab` loads the checkpoint and tokenizer once, then moves them to one
 dedicated inference worker. Requests are serialized: one request may wait in a
 bounded queue and further concurrent requests receive an explicit busy response.
 The HTTP runtime never accesses model tensors directly and a failed request does

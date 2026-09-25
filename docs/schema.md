@@ -1,4 +1,4 @@
-# Hermes Schema Definition Language (SDL)
+# Summa Schema Definition Language (SDL)
 
 SDL defines index fields, tokenizers, storage, and search options.
 
@@ -303,7 +303,7 @@ an existing field to this tokenizer requires reindexing its source documents.
 You can register custom tokenizers programmatically:
 
 ```rust
-use hermes_core::TokenizerRegistry;
+use summa_core::TokenizerRegistry;
 
 let registry = TokenizerRegistry::new();
 registry.register("my_tokenizer", MyCustomTokenizer::new());
@@ -343,18 +343,18 @@ index users {
 ### Create index from SDL file
 
 ```bash
-hermes-tool create -i ./myindex -s schema.sdl
+summa-tool create -i ./myindex -s schema.sdl
 ```
 
 ### Create index from inline SDL
 
 ```bash
-hermes-tool init -i ./myindex -s 'index test { field title: text [indexed, stored] }'
+summa-tool init -i ./myindex -s 'index test { field title: text [indexed, stored] }'
 ```
 
 ## Grammar (PEG)
 
-The authoritative grammar is [sdl.pest](../hermes-core/src/dsl/sdl/sdl.pest).
+The authoritative grammar is [sdl.pest](../summa-core/src/dsl/sdl/sdl.pest).
 
 ## Dense Vectors
 
@@ -400,7 +400,7 @@ compatible leaf runs without retraining.
 
 Only the cosine-normalized IVF-TQ generation is supported. Older unmarked
 trained generations and ANN payloads are rejected while opening the index;
-rebuild the index with a current Hermes version.
+rebuild the index with a current Summa version.
 
 `ivf_pq` (residual product quantization) was removed after IVF-TQ superseded
 it on recall, latency, and training cost; indexes created with it must be
@@ -534,7 +534,7 @@ Vectors with at most `min_terms` entries are never cropped.
 field emb: sparse_vector [indexed<quantization: uint8, doc_mass: 0.9>]
 ```
 
-Use `hermes-tool info --index <path>` to inspect the resulting average sparse vector
+Use `summa-tool info --index <path>` to inspect the resulting average sparse vector
 length (`avg terms/vector`).
 
 ### BMP Format Options
@@ -569,7 +569,7 @@ field emb: sparse_vector<u32> [indexed<format: bmp, dims: 105879, max_weight: 5.
   disabled by default because candidate and block selection can still lose
   recall; enable it only after a representative Recall@K benchmark.
 - `query<lsp_gamma: N>` — cap traversal to the global top-N superblocks across
-  all physical segments. When omitted, Hermes derives gamma from candidate
+  all physical segments. When omitted, Summa derives gamma from candidate
   depth (3000 through depth 100, 4000 through depth 1000, then the greater
   of 4000 and depth). Set zero for exhaustive traversal. Query-language
   `emb:sparse({...})` searches inherit this field setting, including zero.
@@ -624,7 +624,7 @@ all ordinal combiners, backfill and maintenance use this one encoded copy.
 
 Ordinary merge copies encoded runs without clustering. The existing background
 optimizer services nomination fragmentation in bounded term passes; retained
-reader generations remain valid across replacement. `hermes-tool diagnose`
+reader generations remain valid across replacement. `summa-tool diagnose`
 reports nominations, clusters, runs, encoded bytes and pending term debt.
 
 ## JSON Fields

@@ -9,7 +9,7 @@ The [design](../../regex-query.md) describes the new query support and its limit
 Reproduce the new probe with:
 
 ```sh
-cargo build -p hermes-server --example searchbench_http
+cargo build -p summa-server --example searchbench_http
 python3 docs/benchmark-results/query-support-2026-09-24/verify.py
 ```
 

@@ -1,4 +1,4 @@
-# Score-guided posting traversal: research and Hermes fit
+# Score-guided posting traversal: research and Summa fit
 
 September 24, 2026. Research assessment and proposed follow-up, not a claim that
 the proposed index structures have been implemented. The current measured work
@@ -94,9 +94,9 @@ for different improvements.
 
 ## Relevant primary sources
 
-| Work                                                                                                                                                                                                         | Relevant mechanism                                                                                                                                                            | Hermes implication                                                                                     |
+| Work                                                                                                                                                                                                         | Relevant mechanism                                                                                                                                                            | Summa implication                                                                                      |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| [Ding and Suel, SIGIR 2011: Block-Max indexes](https://research.engineering.nyu.edu/~suel/papers/bmw.pdf)                                                                                                    | Per-block score upper bounds allow WAND to bypass postings without scoring them.                                                                                              | The basic score-aware skip mechanism already exists in Hermes.                                         |
+| [Ding and Suel, SIGIR 2011: Block-Max indexes](https://research.engineering.nyu.edu/~suel/papers/bmw.pdf)                                                                                                    | Per-block score upper bounds allow WAND to bypass postings without scoring them.                                                                                              | The basic score-aware skip mechanism already exists in Summa.                                          |
 | [Mallia and Porciani, ECIR 2019: Longer Skipping](https://www.antoniomallia.it/uploads/ECIR19a.pdf)                                                                                                          | Skip consecutive blocks whose maxima do not increase; an alternative stores precomputed skip distances.                                                                       | Direct match for "skip pointers with hints" across a long low-score run.                               |
 | [Bortnikov, Carmel and Golan-Gueta, WWW 2017: Conditional Skips](https://archives.iw3c2.org/www2017/proceedings/companion/p653.pdf)                                                                          | A conditional iterator combines document targets and score thresholds. A treap implementation orders by document ID while heap-ordering scores, allowing subtree skips.       | A concrete tree-based alternative; compare its memory and traversal cost with compact block metadata.  |
 | [Mallia et al., SIGIR 2017: variable-sized blocks](https://pages.di.unipi.it/rossano/assets/pdf/papers/SIGIR17A.pdf)                                                                                         | Adapt bound partitions to score variation, reducing contamination of a low-score region by isolated high scores.                                                              | Consider variable bound regions if measurements show fixed boundaries are the limiting factor.         |
@@ -126,7 +126,7 @@ that a region can be skipped for an unseen query.
 
 ## Existing ownership and the proposed next experiment
 
-Hermes text postings already have block and L1 group bounds, including optional
+Summa text postings already have block and L1 group bounds, including optional
 ratio/impact envelopes. `phrase_block_bound` and `phrase_group_bound` consume
 them; typed conjunctions have their own measured admission policy. The sparse
 BMP executor separately has coarse/superblock/block bounds and prioritized
@@ -153,11 +153,11 @@ Current phrase traversal already coalesces consecutive losing L0 blocks,
 bounded to one L1 group, and can skip a losing L1 group directly. The first
 Longer Skipping experiment should therefore ablate these mechanisms before
 adding wider jumps or precomputed distances. Persisted scalar-score hints would
-need to remain valid under Hermes's request scoring parameters and global
+need to remain valid under Summa's request scoring parameters and global
 statistics; do not assume that a BM25 ordering precomputed for one configuration
 holds for another.
 
-This is a proposal inferred from the research and Hermes's current design.
+This is a proposal inferred from the research and Summa's current design.
 Existing group boundaries differ between terms; summing unrelated block maxima
 does not establish a bound over an arbitrarily larger common interval.
 
@@ -168,7 +168,7 @@ should retain the ordinary iterator for small lists where scheduling overhead
 cannot be amortized. An offline exhaustive audit can compare each region's bound
 with its best actual score and record threshold growth against work performed.
 
-Phrases need their own bound: term occurrence does not imply adjacency. Hermes
+Phrases need their own bound: term occurrence does not imply adjacency. Summa
 can bound exact phrase frequency by every term's frequency only with its
 unique-original-first-position certificate; otherwise the original first term
 remains the safe bound. Use those frequencies in the phrase's BM25 score space,
@@ -214,8 +214,8 @@ Ablations preserve the current bounds and cancellation checks wherever that
 mechanism remains enabled. Compare optimized counts and ranked IDs/score bits
 with exhaustive enumeration, including both ordinary and RGB indexes, before
 admitting timing cells. Report unsupported/budget-exceeded queries explicitly.
-Cross-engine count agreement and within-Hermes algorithm equivalence are
-separate gates: analyzer disagreements must not prevent testing Hermes's own
+Cross-engine count agreement and within-Summa algorithm equivalence are
+separate gates: analyzer disagreements must not prevent testing Summa's own
 skipping over the wider accepted workload. Measure CPU and anonymous/resident
 memory alongside throughput, using unchanged indexes, compiler, flags, affinity,
 and query-cache settings. These experiments do not change production defaults.

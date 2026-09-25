@@ -1,4 +1,4 @@
-   Compiling hermes-core v1.8.146 (/Users/pasha/conductor/workspaces/hermes/jerusalem/hermes-core)
+   Compiling summa-core v1.8.146 (/Users/pasha/conductor/workspaces/summa/jerusalem/summa-core)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 19.05s
      Running tests/range_bitset.rs (target/debug/deps/range_bitset-f933ceca86eda15b)
 

@@ -45,7 +45,7 @@ retaining their optimal metric kernels.
 Automatic float IVF training targets 8×sqrt(N) leaves. Binary IVF uses the
 measured balanced sqrt(N) geometry. ScaNN uses sqrt(N) below 100M rows,
 N^(2/3) through 1B, and min(30M, N^(3/4)) above 1B, matching AlloyDB's
-balanced depth-specific guidance within Hermes's format limit. ScaNN never
+balanced depth-specific guidance within Summa's format limit. ScaNN never
 changes the selected shared topology to fit a transient sampling ceiling. Large
 codebooks use hierarchical k-means for tractable training and a compact HNSW
 graph (`M=32`, `efConstruction=200`); query routing uses

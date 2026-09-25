@@ -2,7 +2,7 @@
 
 Rust 1.98 stabilised `f32`/`f64` **algebraic** arithmetic —
 `algebraic_add`, `algebraic_sub`, `algebraic_mul`, `algebraic_div`,
-`algebraic_rem`. Hermes pins `1.98.1` in `rust-toolchain.toml` and uses these
+`algebraic_rem`. Summa pins `1.98.1` in `rust-toolchain.toml` and uses these
 operations in the dense-vector reduction kernels.
 
 ## Why they matter here
@@ -68,7 +68,7 @@ dimension (e.g. dim 768 squared L2: `478.5987549` → `478.5982971`).
 
 ### End to end
 
-`cargo bench -p hermes-core --bench vector_indexing -- ivf_` on the same
+`cargo bench -p summa-core --bench vector_indexing -- ivf_` on the same
 machine, same toolchain, source-only diff (criterion, 10 samples, 3s
 measurement, all `p < 0.05`):
 
@@ -82,7 +82,7 @@ measurement, all `p < 0.05`):
 Coarse training is the k-means path; the plan benchmarks are query-side IVF
 routing.
 
-WASM was not measured. `hermes-wasm` builds without `simd128`, so LLVM cannot
+WASM was not measured. `summa-wasm` builds without `simd128`, so LLVM cannot
 vectorise there; the scalar fallbacks still gain from the broken accumulator
 dependency chain, but do not assume the native multiples carry over.
 
@@ -115,21 +115,21 @@ What this does change:
 
 Do not use algebraic operations where a float is compared for bit-exact
 equality, hashed, or written into a content-addressed artifact. Specifically
-they are **not** used in `hermes-train`: checkpoint resume is content-addressed
+they are **not** used in `summa-train`: checkpoint resume is content-addressed
 (hence `serde_json`'s `float_roundtrip`) and training must stay bit-reproducible
 across restarts.
 
 ## Deferred: `chunks_exact` → `as_chunks`
 
 Clippy 1.98 also added `chunks_exact_to_as_chunks`, which fires on ~40 call
-sites across `hermes-core` and `hermes-train`. The suggestion is worth taking —
+sites across `summa-core` and `summa-train`. The suggestion is worth taking —
 a const-generic chunk width lets LLVM drop the per-chunk length check and
 replaces `bytes.try_into().unwrap()` with a plain array deref — but most of the
 sites sit inside BMP, ScaNN and fast-field wire-format parsers, so the rewrite
 belongs in its own reviewed change rather than riding along with a toolchain
 bump.
 
-The lint is currently allowed at the crate roots of `hermes-core`,
-`hermes-train`, the `hermes-train` binary, and `hermes-core`'s
+The lint is currently allowed at the crate roots of `summa-core`,
+`summa-train`, the `summa-train` binary, and `summa-core`'s
 `vector_indexing` bench. Removing those four `#![allow(...)]` lines is the
 entry point for the migration.

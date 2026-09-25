@@ -43,33 +43,33 @@ Read them before changing the search stack; keep system rules there to avoid dri
   them — see `docs/algebraic-float-reductions.md` for the measured numbers and
   the reproducibility contract. Never use them where a float is compared
   bit-exactly, hashed, or written into a content-addressed artifact; in
-  particular `hermes-train` stays strict IEEE.
+  particular `summa-train` stays strict IEEE.
 
 ## Project Overview
 
-Hermes is a high-performance, embeddable full-text search engine written in Rust. It's a monorepo containing:
+Summa is a high-performance, embeddable full-text search engine written in Rust. It's a monorepo containing:
 
-- **hermes-core**: Core search engine library (async, BM25 ranking, WAND optimization)
-- **hermes-tool**: CLI for index management and data processing pipelines
-- **hermes-server**: gRPC server for remote search operations
-- **hermes-broker**: gRPC routing, partitioned indexes, and cross-shard BM25 statistics
-- **hermes-wasm**: WebAssembly bindings for browsers (search + indexing)
-- **hermes-web**: Vue/WASM search UI
-- **hermes-model-lab**: Standalone local LLM trace and observability UI
-- **hermes-client-python**: Async Python gRPC client
-- **hermes-client-typescript**: TypeScript gRPC client
-- **hermes-proto**: Shared gRPC protocol definition
-- **hermes-mal**: Shared Model Architecture Language parser
-- **hermes-mal-python**: Thin PyO3 binding around `hermes-mal`
-- **hermes-tokenizer**: Stable-Rust byte-level BPE tokenizer
-- **hermes-llm**: Shared Transformer/Mamba model, inference, generation, and MAL integration
-- **hermes-train**: Autodiff training for the shared hermes-llm model
+- **summa-core**: Core search engine library (async, BM25 ranking, WAND optimization)
+- **summa-tool**: CLI for index management and data processing pipelines
+- **summa-server**: gRPC server for remote search operations
+- **summa-broker**: gRPC routing, partitioned indexes, and cross-shard BM25 statistics
+- **summa-wasm**: WebAssembly bindings for browsers (search + indexing)
+- **summa-web**: Vue/WASM search UI
+- **summa-model-lab**: Standalone local LLM trace and observability UI
+- **summa-client-python**: Async Python gRPC client
+- **summa-client-typescript**: TypeScript gRPC client
+- **summa-proto**: Shared gRPC protocol definition
+- **summa-mal**: Shared Model Architecture Language parser
+- **summa-mal-python**: Thin PyO3 binding around `summa-mal`
+- **summa-tokenizer**: Stable-Rust byte-level BPE tokenizer
+- **summa-llm**: Shared Transformer/Mamba model, inference, generation, and MAL integration
+- **summa-train**: Autodiff training for the shared summa-llm model
 
-LLM pipeline: `hermes-train train --config <.mal|.json>` trains the same `hermes_llm::Transformer` used by inference, saves a safetensors checkpoint, and `hermes-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
+LLM pipeline: `summa-train train --config <.mal|.json>` trains the same `summa_llm::Transformer` used by inference, saves a safetensors checkpoint, and `summa-llm generate` loads it strictly. Do not add a second model implementation or checkpoint adapter.
 
-**MAL parser is a single source of truth:** the pest grammar + AST live in the standalone `hermes-mal` crate (`hermes-mal/src/{lib.rs,mal.pest}`, embeds `hermes-mal/well-known/*.mal`). `hermes-llm` re-exports it as `crate::mal`; `hermes-train` consumes that re-export. Change the grammar/AST in one place.
+**MAL parser is a single source of truth:** the pest grammar + AST live in the standalone `summa-mal` crate (`summa-mal/src/{lib.rs,mal.pest}`, embeds `summa-mal/well-known/*.mal`). `summa-llm` re-exports it as `crate::mal`; `summa-train` consumes that re-export. Change the grammar/AST in one place.
 
-MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `hermes-mal/well-known/hybrid_tiny.mal`). GPU training and inference use the custom CubeCL selective-scan kernel.
+MAL supports hybrid Transformer+Mamba models: an `ssm { state_dim, conv_kernel, expand, dt_rank }` def makes a block a Mamba (selective state-space) block, and `pattern: [mamba_block, mamba_block, attn_block]` in a model cycles block types across num_layers (see `summa-mal/well-known/hybrid_tiny.mal`). GPU training and inference use the custom CubeCL selective-scan kernel.
 
 ## Build Commands
 
@@ -86,14 +86,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
 # Build WASM (requires Homebrew LLVM for zstd cross-compilation)
-(cd hermes-wasm && bash build.sh)
+(cd summa-wasm && bash build.sh)
 
 # Build Python packages
-(cd hermes-client-python && uv build)
-(cd hermes-mal-python && maturin build --release)
+(cd summa-client-python && uv build)
+(cd summa-mal-python && maturin build --release)
 
-# hermes-train (LLM training) tests
-cargo test -p hermes-train
+# summa-train (LLM training) tests
+cargo test -p summa-train
 
 # Run pre-commit hooks (rustfmt, clippy, ruff, prettier)
 pre-commit run --all-files
@@ -105,7 +105,7 @@ when changing documentation links or adding benchmark targets.
 
 ## Architecture
 
-### Core Library (hermes-core/src/)
+### Core Library (summa-core/src/)
 
 The index is the central abstraction. Documents are stored in **segments** (write-once chunks that get merged over time).
 
@@ -121,7 +121,7 @@ Key modules:
 - `compression/` - Zstd compression with configurable levels
 - `merge/` - Segment merge strategies (tiered, no-merge)
 
-### CLI Tool (hermes-tool)
+### CLI Tool (summa-tool)
 
 `main.rs` owns clap dispatch; `index_ops.rs`, `data_processing.rs`, and
 `vector_ops.rs` own the corresponding command implementations:
@@ -135,16 +135,16 @@ Key modules:
 - `simhash` - Calculate SimHash for near-duplicate detection
 - `sort` - Sort documents by field
 
-Pipeline example: `zstdcat dump.zst | hermes-tool simhash -f title -o hash | hermes-tool sort -f hash -N | hermes-tool index -i ./my_index --stdin`
+Pipeline example: `zstdcat dump.zst | summa-tool simhash -f title -o hash | summa-tool sort -f hash -N | summa-tool index -i ./my_index --stdin`
 
-### gRPC Server (hermes-server)
+### gRPC Server (summa-server)
 
-- Proto definitions in `hermes-proto/hermes.proto`
+- Proto definitions in `summa-proto/summa.proto`
 - Two services: `SearchService` (search, get document, get info) and `IndexService` (create, index, commit, merge, delete)
 - `IndexRegistry` for multi-index management
 - Default port: 50051
 
-### WASM (hermes-wasm)
+### WASM (summa-wasm)
 
 Browser-compatible search engine with both remote search and local indexing:
 
@@ -153,7 +153,7 @@ Browser-compatible search engine with both remote search and local indexing:
 - **LocalIndex** — full in-browser indexing: create from SDL, add documents, commit, search. Pluggable `IFilesStorage` for persistence (IDB, encrypted, OPFS)
 - **IndexRegistry** — manages multiple named indexes
 
-The WASM build uses `hermes-core` with features `["wasm", "http"]`. The `wasm` feature enables:
+The WASM build uses `summa-core` with features `["wasm", "http"]`. The `wasm` feature enables:
 
 - `fst-index` — FST block index for reading native-built indexes
 - `tokenizers` — HuggingFace tokenizers (pure Rust via `fancy-regex`)
@@ -165,14 +165,14 @@ Key constraint: WASM has no threads, no filesystem, no `SystemTime`. All native-
 
 ### Web interfaces
 
-- `hermes-web` is the Vue/WASM search application. Its source may depend on
-  `hermes-wasm` but must not contain LLM trace or Model Lab code.
-- `hermes-model-lab` is a standalone, dependency-light LLM trace UI served by
-  `hermes-llm lab`. It must not depend on Vue, `hermes-web`, or `hermes-wasm`.
-- The historical `pnpm lab:*` commands in `hermes-web` are forwarding aliases
+- `summa-web` is the Vue/WASM search application. Its source may depend on
+  `summa-wasm` but must not contain LLM trace or Model Lab code.
+- `summa-model-lab` is a standalone, dependency-light LLM trace UI served by
+  `summa-llm lab`. It must not depend on Vue, `summa-web`, or `summa-wasm`.
+- The historical `pnpm lab:*` commands in `summa-web` are forwarding aliases
   only. `/model-lab.html` remains the stable Lab entry route.
 
-### hermes-core Feature Flags
+### summa-core Feature Flags
 
 - **`native`** (default via `sync`): Full native build — tokio, rayon, threads, mmap, lasso, uuid, etc.
 - **`fst-index`**: FST block index support (included in both `native` and `wasm`)
@@ -234,4 +234,4 @@ gh run list --workflow=ci.yml --limit=5
 - **zstd**: Compression
 - **pest**: SDL parsing
 - **tonic/prost**: gRPC
-- **Burn + CubeCL**: ML runtime and GPU kernels (`hermes-llm` inference)
+- **Burn + CubeCL**: ML runtime and GPU kernels (`summa-llm` inference)

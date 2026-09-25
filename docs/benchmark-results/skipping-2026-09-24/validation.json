@@ -13,7 +13,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::phrase",
         "--",
@@ -29,7 +29,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::scoring::tests::skewed_conjunction",
         "--",
@@ -45,7 +45,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::phrase",
         "--",
@@ -61,7 +61,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::scoring::tests::skewed_conjunction",
         "--",
@@ -77,7 +77,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::phrase",
         "--",
@@ -93,7 +93,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::scoring::tests::skewed_conjunction",
         "--",
@@ -109,7 +109,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::phrase",
         "--",
@@ -125,7 +125,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::scoring::tests::skewed_conjunction",
         "--",
@@ -141,7 +141,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::phrase",
         "--",
@@ -157,7 +157,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::scoring::tests::skewed_conjunction",
         "--",
@@ -173,7 +173,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::phrase",
         "--",
@@ -189,7 +189,7 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--lib",
         "query::scoring::tests::skewed_conjunction",
         "--",
@@ -202,40 +202,40 @@
   "linux_control_binary_sha256": "1a259cd22c9243426c2c002019ef383832b04934b41f764da41b37d99875b55b",
   "variant_source_hashes": {
     "current": {
-      "hermes-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
-      "hermes-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
-      "hermes-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
-      "hermes-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
+      "summa-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
+      "summa-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
+      "summa-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
+      "summa-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
     },
     "no-pilot": {
-      "hermes-core/src/query/collector.rs": "faa9726e1e7582704c254badb6fc2c47b12ee503de2612f9e646bd636461eb49",
-      "hermes-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
-      "hermes-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
-      "hermes-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
+      "summa-core/src/query/collector.rs": "faa9726e1e7582704c254badb6fc2c47b12ee503de2612f9e646bd636461eb49",
+      "summa-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
+      "summa-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
+      "summa-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
     },
     "short-pilot": {
-      "hermes-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
-      "hermes-core/src/query/phrase/seed.rs": "9be55ff96524b5a7f02048368c39a377dcf699d1639af4a0b565c3be3e8938ee",
-      "hermes-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
-      "hermes-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
+      "summa-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
+      "summa-core/src/query/phrase/seed.rs": "9be55ff96524b5a7f02048368c39a377dcf699d1639af4a0b565c3be3e8938ee",
+      "summa-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
+      "summa-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
     },
     "bound-priority": {
-      "hermes-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
-      "hermes-core/src/query/phrase/seed.rs": "d1acc0586c507fc481fe476648b8392d45d0c3e373adf4e1e07ca40a33f193c9",
-      "hermes-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
-      "hermes-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
+      "summa-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
+      "summa-core/src/query/phrase/seed.rs": "d1acc0586c507fc481fe476648b8392d45d0c3e373adf4e1e07ca40a33f193c9",
+      "summa-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
+      "summa-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
     },
     "single-block": {
-      "hermes-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
-      "hermes-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
-      "hermes-core/src/query/phrase.rs": "16dd82c0d237ac33190a591e42da81cfce1c887acb3d14d10910622a7de35675",
-      "hermes-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
+      "summa-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
+      "summa-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
+      "summa-core/src/query/phrase.rs": "16dd82c0d237ac33190a591e42da81cfce1c887acb3d14d10910622a7de35675",
+      "summa-core/src/query/scoring/conjunction.rs": "fe299ba1fd3f405f67f4c0a524e94205a6e2bdbd9c47ac967c173391ebd95061"
     },
     "no-rare-seek": {
-      "hermes-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
-      "hermes-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
-      "hermes-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
-      "hermes-core/src/query/scoring/conjunction.rs": "b49aa24ee7492de5bc3f45608cfeebc760f63200a7fc45701ae20cec9032ee98"
+      "summa-core/src/query/collector.rs": "2ca0a9199a9fd044256257a483660c1749e8cf2929d1fcaeab1605623c60d39b",
+      "summa-core/src/query/phrase/seed.rs": "5d2cf863e74adeaf81394f87d590174e69be8eefd8726c179e7abc2c5a56eabe",
+      "summa-core/src/query/phrase.rs": "688ed586918d63e8f26c999392f5a8ac42d64094adaa22a541b6e559b5a94846",
+      "summa-core/src/query/scoring/conjunction.rs": "b49aa24ee7492de5bc3f45608cfeebc760f63200a7fc45701ae20cec9032ee98"
     }
   },
   "full_search_check": {

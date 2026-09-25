@@ -2,492 +2,492 @@
   {
     "class": "and_high_low",
     "query": "+been +category\\:languages",
-    "hermes_count": 54243,
+    "summa_count": 54243,
     "reference_count": 37,
     "relative_difference": 1465.027027027027,
-    "hermes_plan": "Boolean(+Term(0:\"been\") +Boolean(Term(0:\"category\") Term(0:\"languages\")))"
+    "summa_plan": "Boolean(+Term(0:\"been\") +Boolean(Term(0:\"category\") Term(0:\"languages\")))"
   },
   {
     "class": "and_high_low",
     "query": "+4 +ll.b",
-    "hermes_count": 59991,
+    "summa_count": 59991,
     "reference_count": 57,
     "relative_difference": 1051.4736842105262,
-    "hermes_plan": "Boolean(+Term(0:\"4\") +Boolean(Term(0:\"ll\") Term(0:\"b\")))"
+    "summa_plan": "Boolean(+Term(0:\"4\") +Boolean(Term(0:\"ll\") Term(0:\"b\")))"
   },
   {
     "class": "and_high_low",
     "query": "+a +user\\:ed",
-    "hermes_count": 559888,
+    "summa_count": 559888,
     "reference_count": 829,
     "relative_difference": 674.3775633293125,
-    "hermes_plan": "Boolean(+Term(0:\"a\") +Boolean(Term(0:\"user\") Term(0:\"ed\")))"
+    "summa_plan": "Boolean(+Term(0:\"a\") +Boolean(Term(0:\"user\") Term(0:\"ed\")))"
   },
   {
     "class": "and_high_low",
     "query": "+last +user_talk\\:piotrus",
-    "hermes_count": 29767,
+    "summa_count": 29767,
     "reference_count": 61,
     "relative_difference": 486.9836065573771,
-    "hermes_plan": "Boolean(+Term(0:\"last\") +Boolean(Term(0:\"user\") Term(0:\"talk\") Term(0:\"piotrus\")))"
+    "summa_plan": "Boolean(+Term(0:\"last\") +Boolean(Term(0:\"user\") Term(0:\"talk\") Term(0:\"piotrus\")))"
   },
   {
     "class": "and_high_low",
     "query": "+in +user\\:robert",
-    "hermes_count": 571821,
+    "summa_count": 571821,
     "reference_count": 1362,
     "relative_difference": 418.83920704845815,
-    "hermes_plan": "Boolean(+Term(0:\"in\") +Boolean(Term(0:\"user\") Term(0:\"robert\")))"
+    "summa_plan": "Boolean(+Term(0:\"in\") +Boolean(Term(0:\"user\") Term(0:\"robert\")))"
   },
   {
     "class": "and_high_low",
     "query": "+new +term_start5",
-    "hermes_count": 38442,
+    "summa_count": 38442,
     "reference_count": 196,
     "relative_difference": 195.1326530612245,
-    "hermes_plan": "Boolean(+Term(0:\"new\") +Boolean(Term(0:\"term\") Term(0:\"start5\")))"
+    "summa_plan": "Boolean(+Term(0:\"new\") +Boolean(Term(0:\"term\") Term(0:\"start5\")))"
   },
   {
     "class": "and_high_med",
     "query": "+when +books.google.com",
-    "hermes_count": 188594,
+    "summa_count": 188594,
     "reference_count": 9742,
     "relative_difference": 18.358858550605625,
-    "hermes_plan": "Boolean(+Term(0:\"when\") +Boolean(Term(0:\"books\") Term(0:\"google\") Term(0:\"com\")))"
+    "summa_plan": "Boolean(+Term(0:\"when\") +Boolean(Term(0:\"books\") Term(0:\"google\") Term(0:\"com\")))"
   },
   {
     "class": "low_term",
     "query": "file",
-    "hermes_count": 536622,
+    "summa_count": 536622,
     "reference_count": 82102,
     "relative_difference": 5.536040534944338
   },
   {
     "class": "low_phrase",
     "query": "\"the us\"",
-    "hermes_count": 193387,
+    "summa_count": 193387,
     "reference_count": 71394,
     "relative_difference": 1.7087290248480265,
-    "hermes_plan": "Phrase(0:\"the us\")"
+    "summa_plan": "Phrase(0:\"the us\")"
   },
   {
     "class": "or_high_low",
     "query": "who government_location",
-    "hermes_count": 2006536,
+    "summa_count": 2006536,
     "reference_count": 1197682,
     "relative_difference": 0.6753495502144977
   },
   {
     "class": "or_high_low",
     "query": "from www.fas.org",
-    "hermes_count": 5262519,
+    "summa_count": 5262519,
     "reference_count": 3226111,
     "relative_difference": 0.631226885869705
   },
   {
     "class": "or_high_low",
     "query": "publisher district_type",
-    "hermes_count": 2075616,
+    "summa_count": 2075616,
     "reference_count": 1291491,
     "relative_difference": 0.6071470881330183
   },
   {
     "class": "or_high_low",
     "query": "may user\\:rogerd",
-    "hermes_count": 1545833,
+    "summa_count": 1545833,
     "reference_count": 1073293,
     "relative_difference": 0.4402712027377426
   },
   {
     "class": "and_high_low",
     "query": "+no +1393",
-    "hermes_count": 108,
+    "summa_count": 108,
     "reference_count": 82,
     "relative_difference": 0.3170731707317073,
-    "hermes_plan": "Boolean(+Term(0:\"no\") +Term(0:\"1393\"))"
+    "summa_plan": "Boolean(+Term(0:\"no\") +Term(0:\"1393\"))"
   },
   {
     "class": "or_high_med",
     "query": "2011 co",
-    "hermes_count": 1344232,
+    "summa_count": 1344232,
     "reference_count": 1057149,
     "relative_difference": 0.27156342199633166
   },
   {
     "class": "and_high_low",
     "query": "+date +1188",
-    "hermes_count": 198,
+    "summa_count": 198,
     "reference_count": 161,
     "relative_difference": 0.22981366459627328,
-    "hermes_plan": "Boolean(+Term(0:\"date\") +Term(0:\"1188\"))"
+    "summa_plan": "Boolean(+Term(0:\"date\") +Term(0:\"1188\"))"
   },
   {
     "class": "and_high_low",
     "query": "+no +haitian",
-    "hermes_count": 256,
+    "summa_count": 256,
     "reference_count": 212,
     "relative_difference": 0.20754716981132076,
-    "hermes_plan": "Boolean(+Term(0:\"no\") +Term(0:\"haitian\"))"
+    "summa_plan": "Boolean(+Term(0:\"no\") +Term(0:\"haitian\"))"
   },
   {
     "class": "and_high_med",
     "query": "+web +place",
-    "hermes_count": 59159,
+    "summa_count": 59159,
     "reference_count": 49928,
     "relative_difference": 0.18488623618009933,
-    "hermes_plan": "Boolean(+Term(0:\"web\") +Term(0:\"place\"))"
+    "summa_plan": "Boolean(+Term(0:\"web\") +Term(0:\"place\"))"
   },
   {
     "class": "med_term",
     "query": "place",
-    "hermes_count": 771155,
+    "summa_count": 771155,
     "reference_count": 654158,
     "relative_difference": 0.17885128669220585
   },
   {
     "class": "med_term",
     "query": "people",
-    "hermes_count": 928191,
+    "summa_count": 928191,
     "reference_count": 790960,
     "relative_difference": 0.17349929199959543
   },
   {
     "class": "med_term",
     "query": "article",
-    "hermes_count": 716046,
+    "summa_count": 716046,
     "reference_count": 610650,
     "relative_difference": 0.172596413657578
   },
   {
     "class": "low_term",
     "query": "towns",
-    "hermes_count": 91709,
+    "summa_count": 91709,
     "reference_count": 79459,
     "relative_difference": 0.15416755811173058
   },
   {
     "class": "med_phrase",
     "query": "\"the world\"",
-    "hermes_count": 294373,
+    "summa_count": 294373,
     "reference_count": 255987,
     "relative_difference": 0.1499529272970893,
-    "hermes_plan": "Phrase(0:\"the world\")"
+    "summa_plan": "Phrase(0:\"the world\")"
   },
   {
     "class": "and_high_med",
     "query": "+had +reference",
-    "hermes_count": 14807,
+    "summa_count": 14807,
     "reference_count": 12991,
     "relative_difference": 0.13978908475098145,
-    "hermes_plan": "Boolean(+Term(0:\"had\") +Term(0:\"reference\"))"
+    "summa_plan": "Boolean(+Term(0:\"had\") +Term(0:\"reference\"))"
   },
   {
     "class": "and_high_low",
     "query": "+no +magma",
-    "hermes_count": 205,
+    "summa_count": 205,
     "reference_count": 181,
     "relative_difference": 0.13259668508287292,
-    "hermes_plan": "Boolean(+Term(0:\"no\") +Term(0:\"magma\"))"
+    "summa_plan": "Boolean(+Term(0:\"no\") +Term(0:\"magma\"))"
   },
   {
     "class": "and_high_low",
     "query": "+the +1127",
-    "hermes_count": 1245,
+    "summa_count": 1245,
     "reference_count": 1107,
     "relative_difference": 0.12466124661246612,
-    "hermes_plan": "Boolean(+Term(0:\"the\") +Term(0:\"1127\"))"
+    "summa_plan": "Boolean(+Term(0:\"the\") +Term(0:\"1127\"))"
   },
   {
     "class": "wildcard",
     "query": "it*s",
-    "hermes_count": 1228339,
+    "summa_count": 1228339,
     "reference_count": 1393881,
     "relative_difference": 0.11876336645667744
   },
   {
     "class": "and_high_med",
     "query": "+it +man",
-    "hermes_count": 101689,
+    "summa_count": 101689,
     "reference_count": 91060,
     "relative_difference": 0.11672523610806063,
-    "hermes_plan": "Boolean(+Term(0:\"it\") +Term(0:\"man\"))"
+    "summa_plan": "Boolean(+Term(0:\"it\") +Term(0:\"man\"))"
   },
   {
     "class": "and_high_med",
     "query": "+in +sports",
-    "hermes_count": 160556,
+    "summa_count": 160556,
     "reference_count": 144610,
     "relative_difference": 0.1102689993776364,
-    "hermes_plan": "Boolean(+Term(0:\"in\") +Term(0:\"sports\"))"
+    "summa_plan": "Boolean(+Term(0:\"in\") +Term(0:\"sports\"))"
   },
   {
     "class": "med_term",
     "query": "american",
-    "hermes_count": 836357,
+    "summa_count": 836357,
     "reference_count": 758337,
     "relative_difference": 0.10288301902716075
   },
   {
     "class": "and_high_med",
     "query": "+last +english",
-    "hermes_count": 43755,
+    "summa_count": 43755,
     "reference_count": 39788,
     "relative_difference": 0.09970342816929728,
-    "hermes_plan": "Boolean(+Term(0:\"last\") +Term(0:\"english\"))"
+    "summa_plan": "Boolean(+Term(0:\"last\") +Term(0:\"english\"))"
   },
   {
     "class": "med_term",
     "query": "city",
-    "hermes_count": 834431,
+    "summa_count": 834431,
     "reference_count": 760272,
     "relative_difference": 0.09754272155228655
   },
   {
     "class": "low_sloppy_phrase",
     "query": "\"http news.bbc.co.uk\"~4",
-    "hermes_count": 80325,
+    "summa_count": 80325,
     "reference_count": 73334,
     "relative_difference": 0.09533095153680421,
-    "hermes_plan": "Phrase(0:\"http news bbc co uk\"~4)"
+    "summa_plan": "Phrase(0:\"http news bbc co uk\"~4)"
   },
   {
     "class": "prefix3",
     "query": "peo*",
-    "hermes_count": 960524,
+    "summa_count": 960524,
     "reference_count": 879679,
     "relative_difference": 0.09190284183207738
   },
   {
     "class": "and_high_med",
     "query": "+cite +area",
-    "hermes_count": 92399,
+    "summa_count": 92399,
     "reference_count": 85291,
     "relative_difference": 0.08333821856936839,
-    "hermes_plan": "Boolean(+Term(0:\"cite\") +Term(0:\"area\"))"
+    "summa_plan": "Boolean(+Term(0:\"cite\") +Term(0:\"area\"))"
   },
   {
     "class": "wildcard_scan",
     "query": "c*ment",
-    "hermes_count": 154686,
+    "summa_count": 154686,
     "reference_count": 168602,
     "relative_difference": 0.08253757369426222
   },
   {
     "class": "and_high_low",
     "query": "+a +epsilon",
-    "hermes_count": 5771,
+    "summa_count": 5771,
     "reference_count": 5343,
     "relative_difference": 0.08010481003181733,
-    "hermes_plan": "Boolean(+Term(0:\"a\") +Term(0:\"epsilon\"))"
+    "summa_plan": "Boolean(+Term(0:\"a\") +Term(0:\"epsilon\"))"
   },
   {
     "class": "med_term",
     "query": "news",
-    "hermes_count": 812599,
+    "summa_count": 812599,
     "reference_count": 756063,
     "relative_difference": 0.07477683737995379
   },
   {
     "class": "low_phrase",
     "query": "\"the uk\"",
-    "hermes_count": 75739,
+    "summa_count": 75739,
     "reference_count": 70517,
     "relative_difference": 0.07405306521831614,
-    "hermes_plan": "Phrase(0:\"the uk\")"
+    "summa_plan": "Phrase(0:\"the uk\")"
   },
   {
     "class": "med_phrase",
     "query": "\"university of\"",
-    "hermes_count": 292532,
+    "summa_count": 292532,
     "reference_count": 272439,
     "relative_difference": 0.07375228950333836,
-    "hermes_plan": "Phrase(0:\"university of\")"
+    "summa_plan": "Phrase(0:\"university of\")"
   },
   {
     "class": "and_high_low",
     "query": "+who +whiteley",
-    "hermes_count": 118,
+    "summa_count": 118,
     "reference_count": 110,
     "relative_difference": 0.07272727272727272,
-    "hermes_plan": "Boolean(+Term(0:\"who\") +Term(0:\"whiteley\"))"
+    "summa_plan": "Boolean(+Term(0:\"who\") +Term(0:\"whiteley\"))"
   },
   {
     "class": "med_term",
     "query": "br",
-    "hermes_count": 661721,
+    "summa_count": 661721,
     "reference_count": 617824,
     "relative_difference": 0.07105097891956286
   },
   {
     "class": "med_term",
     "query": "world",
-    "hermes_count": 862153,
+    "summa_count": 862153,
     "reference_count": 808563,
     "relative_difference": 0.06627807604354886
   },
   {
     "class": "and_high_low",
     "query": "+4 +turkmen",
-    "hermes_count": 98,
+    "summa_count": 98,
     "reference_count": 92,
     "relative_difference": 0.06521739130434782,
-    "hermes_plan": "Boolean(+Term(0:\"4\") +Term(0:\"turkmen\"))"
+    "summa_plan": "Boolean(+Term(0:\"4\") +Term(0:\"turkmen\"))"
   },
   {
     "class": "and_high_low",
     "query": "+url +selena",
-    "hermes_count": 380,
+    "summa_count": 380,
     "reference_count": 357,
     "relative_difference": 0.06442577030812324,
-    "hermes_plan": "Boolean(+Term(0:\"url\") +Term(0:\"selena\"))"
+    "summa_plan": "Boolean(+Term(0:\"url\") +Term(0:\"selena\"))"
   },
   {
     "class": "low_term",
     "query": "picture",
-    "hermes_count": 86144,
+    "summa_count": 86144,
     "reference_count": 81045,
     "relative_difference": 0.06291566413720773
   },
   {
     "class": "high_term",
     "query": "name",
-    "hermes_count": 2994589,
+    "summa_count": 2994589,
     "reference_count": 2827713,
     "relative_difference": 0.05901447565576846
   },
   {
     "class": "or_high_med",
     "query": "name cd",
-    "hermes_count": 3054168,
+    "summa_count": 3054168,
     "reference_count": 2884544,
     "relative_difference": 0.05880444188058841
   },
   {
     "class": "and_high_med",
     "query": "+it +nature",
-    "hermes_count": 45509,
+    "summa_count": 45509,
     "reference_count": 42983,
     "relative_difference": 0.058767419677546937,
-    "hermes_plan": "Boolean(+Term(0:\"it\") +Term(0:\"nature\"))"
+    "summa_plan": "Boolean(+Term(0:\"it\") +Term(0:\"nature\"))"
   },
   {
     "class": "and_high_med",
     "query": "+title +digital",
-    "hermes_count": 23919,
+    "summa_count": 23919,
     "reference_count": 22597,
     "relative_difference": 0.05850334115148029,
-    "hermes_plan": "Boolean(+Term(0:\"title\") +Term(0:\"digital\"))"
+    "summa_plan": "Boolean(+Term(0:\"title\") +Term(0:\"digital\"))"
   },
   {
     "class": "low_term",
     "query": "executive",
-    "hermes_count": 86802,
+    "summa_count": 86802,
     "reference_count": 82058,
     "relative_difference": 0.05781276657973628
   },
   {
     "class": "med_term",
     "query": "history",
-    "hermes_count": 798674,
+    "summa_count": 798674,
     "reference_count": 755471,
     "relative_difference": 0.05718684105677121
   },
   {
     "class": "med_term",
     "query": "can",
-    "hermes_count": 808856,
+    "summa_count": 808856,
     "reference_count": 765163,
     "relative_difference": 0.05710286566391736
   },
   {
     "class": "and_high_low",
     "query": "+5 +harvests",
-    "hermes_count": 56,
+    "summa_count": 56,
     "reference_count": 53,
     "relative_difference": 0.05660377358490566,
-    "hermes_plan": "Boolean(+Term(0:\"5\") +Term(0:\"harvests\"))"
+    "summa_plan": "Boolean(+Term(0:\"5\") +Term(0:\"harvests\"))"
   },
   {
     "class": "and_high_med",
     "query": "+first +results",
-    "hermes_count": 31978,
+    "summa_count": 31978,
     "reference_count": 30274,
     "relative_difference": 0.056285921913192836,
-    "hermes_plan": "Boolean(+Term(0:\"first\") +Term(0:\"results\"))"
+    "summa_plan": "Boolean(+Term(0:\"first\") +Term(0:\"results\"))"
   },
   {
     "class": "and_high_high",
     "query": "+1 +year",
-    "hermes_count": 306855,
+    "summa_count": 306855,
     "reference_count": 290582,
     "relative_difference": 0.056001404078711,
-    "hermes_plan": "Boolean(+Term(0:\"1\") +Term(0:\"year\"))"
+    "summa_plan": "Boolean(+Term(0:\"1\") +Term(0:\"year\"))"
   },
   {
     "class": "and_high_low",
     "query": "+united +dhl",
-    "hermes_count": 247,
+    "summa_count": 247,
     "reference_count": 234,
     "relative_difference": 0.05555555555555555,
-    "hermes_plan": "Boolean(+Term(0:\"united\") +Term(0:\"dhl\"))"
+    "summa_plan": "Boolean(+Term(0:\"united\") +Term(0:\"dhl\"))"
   },
   {
     "class": "and_high_low",
     "query": "+time +workman",
-    "hermes_count": 247,
+    "summa_count": 247,
     "reference_count": 234,
     "relative_difference": 0.05555555555555555,
-    "hermes_plan": "Boolean(+Term(0:\"time\") +Term(0:\"workman\"))"
+    "summa_plan": "Boolean(+Term(0:\"time\") +Term(0:\"workman\"))"
   },
   {
     "class": "and_high_high",
     "query": "+and +2",
-    "hermes_count": 1122798,
+    "summa_count": 1122798,
     "reference_count": 1063800,
     "relative_difference": 0.05545967287084038,
-    "hermes_plan": "Boolean(+Term(0:\"and\") +Term(0:\"2\"))"
+    "summa_plan": "Boolean(+Term(0:\"and\") +Term(0:\"2\"))"
   },
   {
     "class": "wildcard_scan",
     "query": "m*ster",
-    "hermes_count": 325311,
+    "summa_count": 325311,
     "reference_count": 308461,
     "relative_difference": 0.05462603051925527
   },
   {
     "class": "med_sloppy_phrase",
     "query": "\"cite news\"~4",
-    "hermes_count": 377232,
+    "summa_count": 377232,
     "reference_count": 398559,
     "relative_difference": 0.05351027075037824,
-    "hermes_plan": "Phrase(0:\"cite news\"~4)"
+    "summa_plan": "Phrase(0:\"cite news\"~4)"
   },
   {
     "class": "wildcard_scan",
     "query": "s*read",
-    "hermes_count": 82364,
+    "summa_count": 82364,
     "reference_count": 78211,
     "relative_difference": 0.05309994757770646
   },
   {
     "class": "and_high_high",
     "query": "+4 +there",
-    "hermes_count": 70067,
+    "summa_count": 70067,
     "reference_count": 66657,
     "relative_difference": 0.05115741782558471,
-    "hermes_plan": "Boolean(+Term(0:\"4\") +Term(0:\"there\"))"
+    "summa_plan": "Boolean(+Term(0:\"4\") +Term(0:\"there\"))"
   },
   {
     "class": "wildcard_scan",
     "query": "h*band",
-    "hermes_count": 87041,
+    "summa_count": 87041,
     "reference_count": 82847,
     "relative_difference": 0.050623438386423164
   },
   {
     "class": "low_term",
     "query": "husband",
-    "hermes_count": 86250,
+    "summa_count": 86250,
     "reference_count": 82137,
     "relative_difference": 0.0500748749041236
   }

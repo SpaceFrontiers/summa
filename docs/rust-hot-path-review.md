@@ -93,7 +93,7 @@ latency. No query-planning selectivity threshold changed.
 The isolated decoded-value probe measured 6.88 µs for the generic closure versus
 83.13 µs for the opaque callback in the final run (65,536 values). Earlier runs
 were 6.31/66.81 and 7.50/71.72 µs. Treat this as evidence of lost vectorization,
-not a promised 10× benefit from changing any closure anywhere in Hermes.
+not a promised 10× benefit from changing any closure anywhere in Summa.
 
 The range bitset retains 8,192 bytes for this fixture in both paths. The batch
 path adds a bounded 2,048-byte stack decode buffer and removes the separately
@@ -110,7 +110,7 @@ python3 scripts/check_search.py bench --bench rust_hot_paths --baseline before
 # Run just the decoder experiment:
 python3 scripts/check_search.py bench --bench rust_hot_paths --filter bitpacked_batch --baseline before
 
-cargo bench --locked -p hermes-core --bench rust_hot_paths --no-run
+cargo bench --locked -p summa-core --bench rust_hot_paths --no-run
 # Use the executable path reported by Cargo, excluding its .d file:
 llvm-nm --demangle -n <benchmark-executable>
 llvm-objdump --disassemble --demangle --no-show-raw-insn <benchmark-executable>
@@ -260,7 +260,7 @@ metrics (18 intentionally ignored), formatting, and the native-without-sync
 compile boundary. The range integration test also passed with
 `--no-default-features --features native`, executing the async configuration
 (`.context/range-bitset-native-async.log`). The WASM release build and optimizer
-passed via `cd hermes-wasm && bash build.sh`; after `npm ci`, `npm test -- --run`
+passed via `cd summa-wasm && bash build.sh`; after `npm ci`, `npm test -- --run`
 passed all four tests in two files. Build/install/test logs are
 `.context/rust-review-wasm-{build,npm,test}.log`. The five Python harness self-tests, Ruff, contract/link checks
 and `git diff --check` also passed.

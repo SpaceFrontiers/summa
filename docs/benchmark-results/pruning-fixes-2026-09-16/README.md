@@ -34,7 +34,7 @@ Earlier stages are retained for attribution:
 
 Do not report a prototype's timings as the selected source's performance.
 `latency-rejection-lazy` on ARM predates collector intent. Isolation runs measure
-one stage at a time. Final changes relative to starting Hermes come from the
+one stage at a time. Final changes relative to starting Summa come from the
 same final run, not multiplied improvements from different phases.
 
 ## Protocol
@@ -56,7 +56,7 @@ is 262,144 bytes; term-cache limits are 8,192 blocks / 4,194,304 bytes.
 Each selected reader is checked on all five layouts against preserved exhaustive
 references: 1,676 queries, top-10/100/1000 exact ordered document IDs and score
 bits, and top-100 with exact counts. Byte norms use their own represented-length
-oracle. These checks establish reader equivalence; Hermes and Tantivy scores
+oracle. These checks establish reader equivalence; Summa and Tantivy scores
 are not required to have identical floating-point bits. The timed protocol also
 checks every returned count. The diagnostic feature is absent from timed builds.
 

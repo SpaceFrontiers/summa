@@ -13,7 +13,7 @@ ordered document/score-bit/count oracles, process RSS and index hashes. It
 excludes executables and the copyrighted corpus. Rebuild each variant with the
 same Rust 1.98.1 compiler, `-C target-cpu=native`, release LTO, and original
 fixture. Source overlays are written with fresh mtimes and every build must
-report `Compiling hermes-core`; reusing Cargo artifacts after preserving source
+report `Compiling summa-core`; reusing Cargo artifacts after preserving source
 mtimes is invalid. Native ARM uses the canonical and copy-merged 262,144-document
 fixtures. Cloud x86 uses the unchanged 5,032,104-document fixture and CPU 2.
 
@@ -56,7 +56,7 @@ Official selected/original time changes are -3.2% top-10, -2.6% top-1000, -0.5%
 top-100 plus count, and -0.3% count. Ranked AND top-10 improves 5.7% and phrase
 2.9%, both in all seven passes. AND top-100 plus count regresses 1.6% and AND
 count 2.4%, also in all seven passes. Overall count is essentially flat. Selected
-Hermes/Tantivy ratios remain 1.22 / 1.23 / 1.49 / 1.39: parity is not achieved.
+Summa/Tantivy ratios remain 1.22 / 1.23 / 1.49 / 1.39: parity is not achieved.
 See [the current comparison](../../search-benchmark-current.md) for full tables,
 ARM results, process RSS and limitations. RGB remains disabled throughout.
 

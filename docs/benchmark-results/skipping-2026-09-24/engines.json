@@ -1,6 +1,6 @@
 [
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_high",
     "operation": "COUNT",
     "query_count": 47,
@@ -19,7 +19,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_high",
     "operation": "TOP_10",
     "query_count": 47,
@@ -38,7 +38,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_high",
     "operation": "TOP_100",
     "query_count": 47,
@@ -57,7 +57,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_low",
     "operation": "COUNT",
     "query_count": 50,
@@ -76,7 +76,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_low",
     "operation": "TOP_10",
     "query_count": 50,
@@ -95,7 +95,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_low",
     "operation": "TOP_100",
     "query_count": 50,
@@ -114,7 +114,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_med",
     "operation": "COUNT",
     "query_count": 50,
@@ -133,7 +133,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_med",
     "operation": "TOP_10",
     "query_count": 50,
@@ -152,7 +152,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "and_high_med",
     "operation": "TOP_100",
     "query_count": 50,
@@ -171,7 +171,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_phrase",
     "operation": "COUNT",
     "query_count": 30,
@@ -190,7 +190,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_phrase",
     "operation": "TOP_10",
     "query_count": 30,
@@ -209,7 +209,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_phrase",
     "operation": "TOP_100",
     "query_count": 30,
@@ -228,7 +228,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_sloppy_phrase",
     "operation": "COUNT",
     "query_count": 7,
@@ -247,7 +247,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_sloppy_phrase",
     "operation": "TOP_10",
     "query_count": 7,
@@ -266,7 +266,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_sloppy_phrase",
     "operation": "TOP_100",
     "query_count": 7,
@@ -285,7 +285,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_term",
     "operation": "COUNT",
     "query_count": 45,
@@ -304,7 +304,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_term",
     "operation": "TOP_10",
     "query_count": 45,
@@ -323,7 +323,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "high_term",
     "operation": "TOP_100",
     "query_count": 45,
@@ -342,7 +342,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_phrase",
     "operation": "COUNT",
     "query_count": 50,
@@ -361,7 +361,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_phrase",
     "operation": "TOP_10",
     "query_count": 50,
@@ -380,7 +380,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_phrase",
     "operation": "TOP_100",
     "query_count": 50,
@@ -399,7 +399,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_sloppy_phrase",
     "operation": "COUNT",
     "query_count": 37,
@@ -418,7 +418,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_sloppy_phrase",
     "operation": "TOP_10",
     "query_count": 37,
@@ -437,7 +437,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_sloppy_phrase",
     "operation": "TOP_100",
     "query_count": 37,
@@ -456,7 +456,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_term",
     "operation": "COUNT",
     "query_count": 47,
@@ -475,7 +475,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_term",
     "operation": "TOP_10",
     "query_count": 47,
@@ -494,7 +494,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "low_term",
     "operation": "TOP_100",
     "query_count": 47,
@@ -513,7 +513,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_phrase",
     "operation": "COUNT",
     "query_count": 46,
@@ -532,7 +532,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_phrase",
     "operation": "TOP_10",
     "query_count": 46,
@@ -551,7 +551,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_phrase",
     "operation": "TOP_100",
     "query_count": 46,
@@ -570,7 +570,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_sloppy_phrase",
     "operation": "COUNT",
     "query_count": 27,
@@ -589,7 +589,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_sloppy_phrase",
     "operation": "TOP_10",
     "query_count": 27,
@@ -608,7 +608,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_sloppy_phrase",
     "operation": "TOP_100",
     "query_count": 27,
@@ -627,7 +627,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_term",
     "operation": "COUNT",
     "query_count": 49,
@@ -646,7 +646,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_term",
     "operation": "TOP_10",
     "query_count": 49,
@@ -665,7 +665,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "med_term",
     "operation": "TOP_100",
     "query_count": 49,
@@ -684,7 +684,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_high",
     "operation": "COUNT",
     "query_count": 42,
@@ -703,7 +703,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_high",
     "operation": "TOP_10",
     "query_count": 42,
@@ -722,7 +722,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_high",
     "operation": "TOP_100",
     "query_count": 42,
@@ -741,7 +741,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_low",
     "operation": "COUNT",
     "query_count": 46,
@@ -760,7 +760,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_low",
     "operation": "TOP_10",
     "query_count": 46,
@@ -779,7 +779,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_low",
     "operation": "TOP_100",
     "query_count": 46,
@@ -798,7 +798,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_med",
     "operation": "COUNT",
     "query_count": 45,
@@ -817,7 +817,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_med",
     "operation": "TOP_10",
     "query_count": 45,
@@ -836,7 +836,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "or_high_med",
     "operation": "TOP_100",
     "query_count": 45,
@@ -855,7 +855,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "prefix3",
     "operation": "COUNT",
     "query_count": 4,
@@ -874,7 +874,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "prefix3",
     "operation": "TOP_10",
     "query_count": 4,
@@ -893,7 +893,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "prefix3",
     "operation": "TOP_100",
     "query_count": 4,
@@ -912,7 +912,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "wildcard",
     "operation": "COUNT",
     "query_count": 15,
@@ -931,7 +931,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "wildcard",
     "operation": "TOP_10",
     "query_count": 15,
@@ -950,7 +950,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "wildcard",
     "operation": "TOP_100",
     "query_count": 15,
@@ -969,7 +969,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "wildcard_scan",
     "operation": "COUNT",
     "query_count": 47,
@@ -988,7 +988,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "wildcard_scan",
     "operation": "TOP_10",
     "query_count": 47,
@@ -1007,7 +1007,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes",
+    "engine": "summa",
     "family": "wildcard_scan",
     "operation": "TOP_100",
     "query_count": 47,
@@ -1026,7 +1026,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_high",
     "operation": "COUNT",
     "query_count": 47,
@@ -1045,7 +1045,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_high",
     "operation": "TOP_10",
     "query_count": 47,
@@ -1064,7 +1064,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_high",
     "operation": "TOP_100",
     "query_count": 47,
@@ -1083,7 +1083,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_low",
     "operation": "COUNT",
     "query_count": 50,
@@ -1102,7 +1102,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_low",
     "operation": "TOP_10",
     "query_count": 50,
@@ -1121,7 +1121,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_low",
     "operation": "TOP_100",
     "query_count": 50,
@@ -1140,7 +1140,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_med",
     "operation": "COUNT",
     "query_count": 50,
@@ -1159,7 +1159,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_med",
     "operation": "TOP_10",
     "query_count": 50,
@@ -1178,7 +1178,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "and_high_med",
     "operation": "TOP_100",
     "query_count": 50,
@@ -1197,7 +1197,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_phrase",
     "operation": "COUNT",
     "query_count": 30,
@@ -1216,7 +1216,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_phrase",
     "operation": "TOP_10",
     "query_count": 30,
@@ -1235,7 +1235,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_phrase",
     "operation": "TOP_100",
     "query_count": 30,
@@ -1254,7 +1254,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_sloppy_phrase",
     "operation": "COUNT",
     "query_count": 7,
@@ -1273,7 +1273,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_sloppy_phrase",
     "operation": "TOP_10",
     "query_count": 7,
@@ -1292,7 +1292,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_sloppy_phrase",
     "operation": "TOP_100",
     "query_count": 7,
@@ -1311,7 +1311,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_term",
     "operation": "COUNT",
     "query_count": 45,
@@ -1330,7 +1330,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_term",
     "operation": "TOP_10",
     "query_count": 45,
@@ -1349,7 +1349,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "high_term",
     "operation": "TOP_100",
     "query_count": 45,
@@ -1368,7 +1368,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_phrase",
     "operation": "COUNT",
     "query_count": 50,
@@ -1387,7 +1387,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_phrase",
     "operation": "TOP_10",
     "query_count": 50,
@@ -1406,7 +1406,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_phrase",
     "operation": "TOP_100",
     "query_count": 50,
@@ -1425,7 +1425,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_sloppy_phrase",
     "operation": "COUNT",
     "query_count": 37,
@@ -1444,7 +1444,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_sloppy_phrase",
     "operation": "TOP_10",
     "query_count": 37,
@@ -1463,7 +1463,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_sloppy_phrase",
     "operation": "TOP_100",
     "query_count": 37,
@@ -1482,7 +1482,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_term",
     "operation": "COUNT",
     "query_count": 47,
@@ -1501,7 +1501,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_term",
     "operation": "TOP_10",
     "query_count": 47,
@@ -1520,7 +1520,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "low_term",
     "operation": "TOP_100",
     "query_count": 47,
@@ -1539,7 +1539,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_phrase",
     "operation": "COUNT",
     "query_count": 46,
@@ -1558,7 +1558,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_phrase",
     "operation": "TOP_10",
     "query_count": 46,
@@ -1577,7 +1577,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_phrase",
     "operation": "TOP_100",
     "query_count": 46,
@@ -1596,7 +1596,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_sloppy_phrase",
     "operation": "COUNT",
     "query_count": 27,
@@ -1615,7 +1615,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_sloppy_phrase",
     "operation": "TOP_10",
     "query_count": 27,
@@ -1634,7 +1634,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_sloppy_phrase",
     "operation": "TOP_100",
     "query_count": 27,
@@ -1653,7 +1653,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_term",
     "operation": "COUNT",
     "query_count": 49,
@@ -1672,7 +1672,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_term",
     "operation": "TOP_10",
     "query_count": 49,
@@ -1691,7 +1691,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "med_term",
     "operation": "TOP_100",
     "query_count": 49,
@@ -1710,7 +1710,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_high",
     "operation": "COUNT",
     "query_count": 42,
@@ -1729,7 +1729,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_high",
     "operation": "TOP_10",
     "query_count": 42,
@@ -1748,7 +1748,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_high",
     "operation": "TOP_100",
     "query_count": 42,
@@ -1767,7 +1767,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_low",
     "operation": "COUNT",
     "query_count": 46,
@@ -1786,7 +1786,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_low",
     "operation": "TOP_10",
     "query_count": 46,
@@ -1805,7 +1805,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_low",
     "operation": "TOP_100",
     "query_count": 46,
@@ -1824,7 +1824,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_med",
     "operation": "COUNT",
     "query_count": 45,
@@ -1843,7 +1843,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_med",
     "operation": "TOP_10",
     "query_count": 45,
@@ -1862,7 +1862,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "or_high_med",
     "operation": "TOP_100",
     "query_count": 45,
@@ -1881,7 +1881,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "prefix3",
     "operation": "COUNT",
     "query_count": 4,
@@ -1900,7 +1900,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "prefix3",
     "operation": "TOP_10",
     "query_count": 4,
@@ -1919,7 +1919,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "prefix3",
     "operation": "TOP_100",
     "query_count": 4,
@@ -1938,7 +1938,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "wildcard",
     "operation": "COUNT",
     "query_count": 15,
@@ -1957,7 +1957,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "wildcard",
     "operation": "TOP_10",
     "query_count": 15,
@@ -1976,7 +1976,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "wildcard",
     "operation": "TOP_100",
     "query_count": 15,
@@ -1995,7 +1995,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "wildcard_scan",
     "operation": "COUNT",
     "query_count": 47,
@@ -2014,7 +2014,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "wildcard_scan",
     "operation": "TOP_10",
     "query_count": 47,
@@ -2033,7 +2033,7 @@
     "errors": 0
   },
   {
-    "engine": "hermes-rgb",
+    "engine": "summa-rgb",
     "family": "wildcard_scan",
     "operation": "TOP_100",
     "query_count": 47,

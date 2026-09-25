@@ -9,12 +9,12 @@ grad-accum 8, steady-state steps 5–8.
 ## Prototype
 
 - CubeCL [upstream PR #1440](https://github.com/tracel-ai/cubecl/pull/1440)
-  (the prototype was measured at `463c2952`; Hermes now pins the PR head
+  (the prototype was measured at `463c2952`; Summa now pins the PR head
   `c0efe74d` from the official repository): asynchronous cuBLAS BF16 GEMM server dispatch
   (`GemmDescriptor`/`GemmMatrix` server API), hardened contracts (rejects
   foreign-stream outputs, buffer overlap, non-empty zero-K problems).
 - Burn [upstream PR #5190](https://github.com/tracel-ai/burn/pull/5190)
-  (Hermes pins `973605c4` from the official repository) adds BF16 dispatch in
+  (Summa pins `973605c4` from the official repository) adds BF16 dispatch in
   `burn-cubecl::kernel::matmul` + zero-contract fallback + backport of
   upstream `f31e7513a` "drop from foreign stream drains home stream").
 

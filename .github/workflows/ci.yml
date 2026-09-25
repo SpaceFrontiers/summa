@@ -74,16 +74,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Hermes Core native-without-sync boundary
-        run: cargo check -p hermes-core --no-default-features --features native --all-targets
+      - name: Summa Core native-without-sync boundary
+        run: cargo check -p summa-core --no-default-features --features native --all-targets
 
       - name: Broker minimal-core boundary
         # Workspace feature unification enables native writers; the broker
         # alone only needs portable scoring and must compile independently.
-        run: cargo check --locked -p hermes-broker --all-targets
+        run: cargo check --locked -p summa-broker --all-targets
 
       - name: CUDA training compile boundary
-        run: cargo check -p hermes-train --features cuda --all-targets
+        run: cargo check -p summa-train --features cuda --all-targets
 
       - name: API documentation
         env:
@@ -93,22 +93,22 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Broker end-to-end against real hermes-server
+      - name: Broker end-to-end against real summa-server
         run: |
-          cargo build -p hermes-server --bin hermes-server
-          cargo test -p hermes-broker --test e2e_real_server -- --ignored
+          cargo build -p summa-server --bin summa-server
+          cargo test -p summa-broker --test e2e_real_server -- --ignored
 
       - name: Validate model-bound training workflows
         run: |
-          cargo run -p hermes-train -- validate-workflow \
-            --workflow hermes-train/workflow.example.json \
-            --config hermes-mal/well-known/retriever_300m_moe.mal >/dev/null
-          cargo run -p hermes-train -- validate-workflow \
-            --workflow hermes-train/workflow.sleep.example.json \
-            --config hermes-mal/well-known/retriever_300m_moe_sleep.mal >/dev/null
-          cargo run -p hermes-train -- validate-workflow \
-            --workflow hermes-train/workflow.education.example.json \
-            --config hermes-mal/well-known/retriever_300m_moe_sleep.mal >/dev/null
+          cargo run -p summa-train -- validate-workflow \
+            --workflow summa-train/workflow.example.json \
+            --config summa-mal/well-known/retriever_300m_moe.mal >/dev/null
+          cargo run -p summa-train -- validate-workflow \
+            --workflow summa-train/workflow.sleep.example.json \
+            --config summa-mal/well-known/retriever_300m_moe_sleep.mal >/dev/null
+          cargo run -p summa-train -- validate-workflow \
+            --workflow summa-train/workflow.education.example.json \
+            --config summa-mal/well-known/retriever_300m_moe_sleep.mal >/dev/null
 
       - name: Build
         run: cargo build --workspace --release
@@ -125,20 +125,20 @@ jobs:
       - name: Check shell scripts and test relaunch supervisor
         run: |
           git ls-files '*.sh' -z | xargs -0 shellcheck -x -e SC1091
-          python3 -m py_compile hermes-train/scripts/*.py
-          python3 hermes-train/scripts/test_wandb_tail.py
-          hermes-train/scripts/relaunch_test.sh
+          python3 -m py_compile summa-train/scripts/*.py
+          python3 summa-train/scripts/test_wandb_tail.py
+          summa-train/scripts/relaunch_test.sh
 
       - name: Check training configuration JSON
         run: |
           for config in \
-            hermes-train/workflow.example.json \
-            hermes-train/workflow.sleep.example.json \
-            hermes-train/workflow.education.example.json \
-            hermes-train/sleep-runtime.periodic.example.json \
-            hermes-train/sleep-runtime.standalone.example.json \
-            hermes-train/corpus.production.example.json \
-            hermes-train/curriculum-composition.example.json
+            summa-train/workflow.example.json \
+            summa-train/workflow.sleep.example.json \
+            summa-train/workflow.education.example.json \
+            summa-train/sleep-runtime.periodic.example.json \
+            summa-train/sleep-runtime.standalone.example.json \
+            summa-train/corpus.production.example.json \
+            summa-train/curriculum-composition.example.json
           do
             python3 -m json.tool "$config" >/dev/null
           done
@@ -200,21 +200,21 @@ jobs:
           curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM
-        run: cd hermes-wasm && bash build.sh
+        run: cd summa-wasm && bash build.sh
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "22"
           cache: "npm"
-          cache-dependency-path: hermes-wasm/package-lock.json
+          cache-dependency-path: summa-wasm/package-lock.json
 
       - name: Install dependencies
-        working-directory: hermes-wasm
+        working-directory: summa-wasm
         run: npm ci
 
       - name: Run tests
-        working-directory: hermes-wasm
+        working-directory: summa-wasm
         run: npm test
 
       - name: Install pnpm
@@ -223,11 +223,11 @@ jobs:
           version: 10
 
       - name: Install web dependencies
-        working-directory: hermes-web
+        working-directory: summa-web
         run: pnpm install --frozen-lockfile
 
       - name: Check and build web
-        working-directory: hermes-web
+        working-directory: summa-web
         run: |
           pnpm run lint
           pnpm test
@@ -241,11 +241,11 @@ jobs:
 
       - name: Verify search and Model Lab source ownership
         run: |
-          if git grep -n -E 'hermes-web|hermes-wasm' -- hermes-model-lab/src; then
+          if git grep -n -E 'summa-web|summa-wasm' -- summa-model-lab/src; then
             echo "Model Lab source must not depend on the search UI or WASM package"
             exit 1
           fi
-          if git grep -n -E 'model-lab|hermes-model-lab' -- hermes-web/src; then
+          if git grep -n -E 'model-lab|summa-model-lab' -- summa-web/src; then
             echo "Search UI source must not contain Model Lab code"
             exit 1
           fi
@@ -260,14 +260,14 @@ jobs:
         with:
           node-version: "22"
           cache: "pnpm"
-          cache-dependency-path: hermes-model-lab/pnpm-lock.yaml
+          cache-dependency-path: summa-model-lab/pnpm-lock.yaml
 
       - name: Install dependencies
-        working-directory: hermes-model-lab
+        working-directory: summa-model-lab
         run: pnpm install --frozen-lockfile
 
       - name: Check Model Lab
-        working-directory: hermes-model-lab
+        working-directory: summa-model-lab
         run: pnpm check
 
   # Python lint and unit tests - no native extension compilation
@@ -285,20 +285,20 @@ jobs:
 
       - name: Lint and format Python
         run: |
-          uv run --locked --project hermes-client-python --group dev ruff check .
-          uv run --locked --project hermes-client-python --group dev ruff format --check .
+          uv run --locked --project summa-client-python --group dev ruff check .
+          uv run --locked --project summa-client-python --group dev ruff format --check .
       - name: Check generated Python protocol bindings
-        working-directory: hermes-client-python
+        working-directory: summa-client-python
         run: |
           uv run --locked --group dev python generate_proto.py
           git diff --exit-code -- \
-            src/hermes_client_python/hermes_pb2.py \
-            src/hermes_client_python/hermes_pb2_grpc.py
+            src/summa_client_python/summa_pb2.py \
+            src/summa_client_python/summa_pb2_grpc.py
       - name: Test Python client helpers
         run: |
-          uv run --locked --project hermes-client-python --group test \
-            pytest hermes-client-python/tests/test_client_unit.py \
-              hermes-client-python/stress_test/test_stress_test.py
+          uv run --locked --project summa-client-python --group test \
+            pytest summa-client-python/tests/test_client_unit.py \
+              summa-client-python/stress_test/test_stress_test.py
 
   mal-python:
     name: MAL Python Wheel
@@ -320,9 +320,9 @@ jobs:
           python -m pip install "maturin>=1.7,<2"
           maturin build \
             --release \
-            --manifest-path hermes-mal-python/Cargo.toml \
-            --out hermes-mal-python/dist
-          python -m pip install hermes-mal-python/dist/*.whl
+            --manifest-path summa-mal-python/Cargo.toml \
+            --out summa-mal-python/dist
+          python -m pip install summa-mal-python/dist/*.whl
 
       - name: Smoke-test the installed extension
         run: |
@@ -330,9 +330,9 @@ jobs:
           import json
           from pathlib import Path
 
-          from hermes_mal import parse_mal
+          from summa_mal import parse_mal
 
-          source = Path("hermes-mal/well-known/tiny.mal").read_text()
+          source = Path("summa-mal/well-known/tiny.mal").read_text()
           model = json.loads(parse_mal(source))
           assert model["vocab_size"] == 32_000
           PY
@@ -354,16 +354,16 @@ jobs:
         with:
           node-version: "20"
           cache: "pnpm"
-          cache-dependency-path: hermes-client-typescript/pnpm-lock.yaml
+          cache-dependency-path: summa-client-typescript/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: cd hermes-client-typescript && pnpm install --frozen-lockfile
+        run: cd summa-client-typescript && pnpm install --frozen-lockfile
 
       - name: Generate proto stubs
-        working-directory: hermes-client-typescript
+        working-directory: summa-client-typescript
         run: |
           pnpm run generate
-          git diff --exit-code -- src/generated/hermes.ts
+          git diff --exit-code -- src/generated/summa.ts
 
       - name: Build and test
-        run: cd hermes-client-typescript && pnpm test
+        run: cd summa-client-typescript && pnpm test

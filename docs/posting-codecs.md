@@ -1,7 +1,7 @@
 # Posting block codecs
 
 Reference for the on-disk text posting format written and read by
-`BlockPostingList` (`hermes-core/src/structures/postings/posting.rs`) and its
+`BlockPostingList` (`summa-core/src/structures/postings/posting.rs`) and its
 submodules (`posting/{validation,reader,impacts,compact}.rs`).
 
 ## Status
@@ -148,7 +148,7 @@ tags are rejected at admission.
 | `performance`              | `Rounded`     | 1                    |
 | `size`                     | `Pfor`        | 22                   |
 
-`IndexConfig::posting_codec` (`hermes-tool index --posting-codec`) selects any
+`IndexConfig::posting_codec` (`summa-tool index --posting-codec`) selects any
 codec explicitly. Repository benchmark (`cargo bench --bench
 posting_compression -- summary`, Apple M4): exact packing is ~1.8× smaller than
 `Rounded` for ~10 % slower decoding, `Pfor` ~2.2× smaller for ~30 % slower.
@@ -169,14 +169,14 @@ gates as the rounded control
 
 Metadata format **9** is required; formats 6–8 are upgraded on open (see
 [row deletion](row-deletion.md)), older indexes must be rebuilt. See
-[`INDEX_META_FORMAT_VERSION`](../hermes-core/src/index/metadata.rs) and the
-[SSTable format gates](../hermes-core/src/structures/sstable.rs). The gate is
+[`INDEX_META_FORMAT_VERSION`](../summa-core/src/index/metadata.rs) and the
+[SSTable format gates](../summa-core/src/structures/sstable.rs). The gate is
 what protects older readers from the position codec tag; individual block
 bytes are never converted.
 
 ## Query trust and explicit integrity checks
 
-Normal segment queries trust Hermes-produced postings and positions. The owning
+Normal segment queries trust Summa-produced postings and positions. The owning
 `PostingListReader` parses the footer and constructs borrowed views without
 scanning block headers, directory ordering, pruning metadata or position blocks.
 Decoded document order and endpoints are not rechecked on this path. There is no

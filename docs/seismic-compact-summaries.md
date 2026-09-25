@@ -28,7 +28,7 @@ The previous fixed widths use the largest absolute coordinate and occurrence
 position within a term. Both arrays are monotone, so representing local ranges
 can use fewer bits. The upstream [pinned summary implementation](https://github.com/TusKANNy/seismic/blob/3c267137e202748e69ada8cd093f4c0b7c04479c/src/quantized_summary.rs)
 already uses Elias–Fano offsets; that is supporting precedent, not a measurement
-of the Hermes format measured below.
+of the Summa format measured below.
 
 ## First stage: lossless monotone directories
 

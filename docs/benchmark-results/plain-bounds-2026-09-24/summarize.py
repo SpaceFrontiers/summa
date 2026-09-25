@@ -46,19 +46,19 @@ def summarize(source, output):
                     "http_checks": 334 * 3 * 2,
                 }
             )
-            paths = summary.measured_paths(first / "hermes")
+            paths = summary.measured_paths(first / "summa")
             assert len(paths) == 21
             for path in paths:
                 cell = summary.read(path)
                 value = summary.metrics(
                     [
-                        source / f"{r}-{variant}-{layout}" / "hermes" / path.name
+                        source / f"{r}-{variant}-{layout}" / "summa" / path.name
                         for r in [1, 2]
                     ]
                 )
                 before = summary.metrics(
                     [
-                        source / f"{r}-current-{layout}" / "hermes" / path.name
+                        source / f"{r}-current-{layout}" / "summa" / path.name
                         for r in [1, 2]
                     ]
                 )

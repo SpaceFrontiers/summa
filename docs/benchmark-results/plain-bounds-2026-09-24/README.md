@@ -1,6 +1,6 @@
 # Plain-index block-bound admission
 
-September 24, 2026. Paired measurements against Hermes 1.9.1, using unchanged
+September 24, 2026. Paired measurements against Summa 1.9.1, using unchanged
 10-million-document ordinary and RGB indexes. This is a query execution change;
 no schema, storage format, indexing setting, or rebuild is required.
 
@@ -32,14 +32,14 @@ with the upstream driver's additional connection warmup. These are warm
 throughput measurements, not cold-storage or tail-latency claims.
 
 The same Cascade Lake machine supplies 30 logical CPUs to the server and two
-to the upstream Searchbench driver. Hermes uses 30 search/blocking workers and
+to the upstream Searchbench driver. Summa uses 30 search/blocking workers and
 four HTTP workers, with 64-request admission. Rust 1.98.1 release builds use
 `-C target-cpu=native`; query caches remain off. Network isolation, affinity,
 request adapters, immutable indexes, and timing driver are unchanged. Source
 builds run on a separate machine. CPU/request and anonymous/total RSS accompany
 QPS; mmap residency is not equivalent to heap allocation.
 
-Cross-engine analysis differences are retained: these are before/after Hermes
+Cross-engine analysis differences are retained: these are before/after Summa
 measurements of the exact same input and results, not a claim of equivalent
 Lucene analysis. The earlier [expanded comparison](../skipping-2026-09-24/README.md)
 contains the Luxir, Elasticsearch and OpenSearch reference measurements.

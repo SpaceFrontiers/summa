@@ -1,0 +1,103 @@
+---
+# yamllint disable rule:key-ordering
+blocksize: 131072
+compression: Zstd
+index_name: books
+index_attributes:
+  conflict_strategy: OVERWRITE_ALWAYS
+  description: Wiki
+  multi_fields: ["category"]
+index_engine:
+  file: {}
+schema: >
+  - name: category
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: default
+      stored: true
+  - name: content_model
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: basic
+        tokenizer: default
+      stored: true
+  - name: opening_text
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: default
+      stored: true
+  - name: auxiliary_text
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: default
+      stored: true
+  - name: language
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: basic
+        tokenizer: default
+      stored: true
+  - name: title
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: default
+      stored: true
+  - name: text
+    type: text
+    options:
+      indexing:
+        fieldnorms: true
+        record: position
+        tokenizer: default
+      stored: true
+  - name: timestamp
+    type: date
+    options:
+      fast: true
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: create_timestamp
+    type: date
+    options:
+      fast: true
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: popularity_score
+    type: f64
+    options:
+      fast: true
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: incoming_links
+    type: u64
+    options:
+      fast: true
+      fieldnorms: false
+      indexed: true
+      stored: true
+  - name: namespace
+    type: u64
+    options:
+      fast: true
+      fieldnorms: false
+      indexed: true
+      stored: true

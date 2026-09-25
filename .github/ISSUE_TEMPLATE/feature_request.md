@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Suggest a new feature or improvement for Hermes
+about: Suggest a new feature or improvement for Summa
 title: ""
 labels: enhancement
 assignees: ""

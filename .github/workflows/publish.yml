@@ -32,6 +32,10 @@ on:
         type: boolean
         default: true
 
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 permissions:
   contents: write
   packages: write
@@ -92,26 +96,24 @@ jobs:
         run: |
           # Update workspace package version
           sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
-          # Update hermes-core dependency version in workspace
-          sed -i 's/hermes-core = { version = "[^"]*"/hermes-core = { version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
-          # Update hermes-tokenizer dependency version in workspace
-          sed -i 's/hermes-tokenizer = { version = "[^"]*"/hermes-tokenizer = { version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
+          # Keep every internal requirement aligned with the release.
+          sed -i -E '/^summa-.*path = /s/version = "[^"]*"/version = "${{ steps.bump.outputs.new_version }}"/' Cargo.toml
           echo "Updated Cargo.toml to version ${{ steps.bump.outputs.new_version }}"
 
       - name: Update pyproject.toml versions
         run: |
-          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-client-python/pyproject.toml
-          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' hermes-mal-python/pyproject.toml
+          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' summa-client-python/pyproject.toml
+          sed -i 's/^version = ".*"/version = "${{ steps.bump.outputs.new_version }}"/' summa-mal-python/pyproject.toml
           echo "Updated Python packages to version ${{ steps.bump.outputs.new_version }}"
 
       - uses: astral-sh/setup-uv@v5
 
       - name: Update Python client lockfile
-        run: uv lock --project hermes-client-python
+        run: uv lock --project summa-client-python
 
       - name: Update TypeScript client version
         run: |
-          cd hermes-client-typescript
+          cd summa-client-typescript
           sed -i 's/"version": ".*"/"version": "${{ steps.bump.outputs.new_version }}"/' package.json
           echo "Updated package.json to version ${{ steps.bump.outputs.new_version }}"
 
@@ -121,10 +123,10 @@ jobs:
       - name: Commit and push
         run: |
           git add Cargo.toml Cargo.lock \
-            hermes-client-python/pyproject.toml \
-            hermes-client-python/uv.lock \
-            hermes-mal-python/pyproject.toml \
-            hermes-client-typescript/package.json
+            summa-client-python/pyproject.toml \
+            summa-client-python/uv.lock \
+            summa-mal-python/pyproject.toml \
+            summa-client-typescript/package.json
           git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
           git push
 
@@ -141,7 +143,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: v${{ needs.bump-version.outputs.new_version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -154,32 +156,38 @@ jobs:
       - name: Login to crates.io
         run: cargo login ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      - name: Publish hermes-core
-        run: cargo publish -p hermes-core --no-verify
+      - name: Publish summa-proto
+        run: cargo publish -p summa-proto --no-verify
 
       - name: Wait for crates.io index
         run: sleep 30
 
-      - name: Publish hermes-mal
-        run: cargo publish -p hermes-mal --no-verify
+      - name: Publish summa-core
+        run: cargo publish -p summa-core --no-verify
 
       - name: Wait for crates.io index
         run: sleep 30
 
-      - name: Publish hermes-tokenizer
-        run: cargo publish -p hermes-tokenizer --no-verify
+      - name: Publish summa-mal
+        run: cargo publish -p summa-mal --no-verify
 
       - name: Wait for crates.io index
         run: sleep 30
 
-      - name: Publish hermes-server
-        run: cargo publish -p hermes-server --no-verify
+      - name: Publish summa-tokenizer
+        run: cargo publish -p summa-tokenizer --no-verify
 
-      - name: Publish hermes-broker
-        run: cargo publish -p hermes-broker --no-verify
+      - name: Wait for crates.io index
+        run: sleep 30
 
-      - name: Publish hermes-tool
-        run: cargo publish -p hermes-tool --no-verify
+      - name: Publish summa-server
+        run: cargo publish -p summa-server --no-verify
+
+      - name: Publish summa-broker
+        run: cargo publish -p summa-broker --no-verify
+
+      - name: Publish summa-tool
+        run: cargo publish -p summa-tool --no-verify
 
   publish-npm:
     name: Publish to NPM
@@ -189,7 +197,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: v${{ needs.bump-version.outputs.new_version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -202,17 +210,17 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Build WASM
         run: |
-          cd hermes-wasm
-          wasm-pack build --release --target web
+          cd summa-wasm
+          bash build.sh
 
       - name: Publish to NPM
         run: |
-          cd hermes-wasm/pkg
+          cd summa-wasm/pkg
           npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -225,7 +233,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: v${{ needs.bump-version.outputs.new_version }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -235,20 +243,20 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Install dependencies
-        run: cd hermes-client-typescript && pnpm install --frozen-lockfile
+        run: cd summa-client-typescript && pnpm install --frozen-lockfile
 
       - name: Generate proto stubs
-        run: cd hermes-client-typescript && pnpm run generate
+        run: cd summa-client-typescript && pnpm run generate
 
       - name: Build
-        run: cd hermes-client-typescript && pnpm run build
+        run: cd summa-client-typescript && pnpm run build
 
       - name: Publish to NPM
-        run: cd hermes-client-typescript && pnpm publish --access public --no-git-checks
+        run: cd summa-client-typescript && pnpm publish --access public --no-git-checks
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -260,7 +268,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: v${{ needs.bump-version.outputs.new_version }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -270,19 +278,39 @@ jobs:
 
       - name: Generate proto stubs
         run: |
-          cd hermes-client-python
+          cd summa-client-python
           uv sync --locked --group dev
           uv run --locked --group dev python generate_proto.py
 
       - name: Build package
         run: |
-          cd hermes-client-python
+          cd summa-client-python
           uv build
 
       - name: Publish to PyPI
         run: |
-          cd hermes-client-python
+          cd summa-client-python
           uv publish
+        env:
+          UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
+
+  publish-mal-python:
+    name: Publish MAL Python package
+    runs-on: ubuntu-latest
+    needs: bump-version
+    if: inputs.publish_pypi
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.bump-version.outputs.new_version }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.1
+      - uses: astral-sh/setup-uv@v5
+      - name: Build source distribution
+        run: uvx --from maturin maturin sdist --manifest-path summa-mal-python/Cargo.toml --out dist
+      - name: Publish to PyPI
+        run: uv publish dist/*
         env:
           UV_PUBLISH_TOKEN: ${{ secrets.PYPI_TOKEN }}
 
@@ -294,7 +322,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: v${{ needs.bump-version.outputs.new_version }}
 
       - name: Set up Docker Buildx
         id: buildx
@@ -311,7 +339,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v6
         with:
-          images: ghcr.io/${{ github.repository }}/hermes-server
+          images: ghcr.io/${{ github.repository }}/summa-server
           tags: |
             type=semver,pattern={{version}},value=v${{ needs.bump-version.outputs.new_version }}
             type=semver,pattern={{major}}.{{minor}},value=v${{ needs.bump-version.outputs.new_version }}
@@ -334,23 +362,23 @@ jobs:
             {
               ".buildkit-cargo-cache/registry": {
                 "target": "/usr/local/cargo/registry",
-                "id": "hermes-cargo-registry",
+                "id": "summa-cargo-registry",
                 "sharing": "locked"
               },
               ".buildkit-cargo-cache/git": {
                 "target": "/usr/local/cargo/git",
-                "id": "hermes-cargo-git",
+                "id": "summa-cargo-git",
                 "sharing": "locked"
               },
               ".buildkit-cargo-cache/target": {
                 "target": "/app/target",
-                "id": "hermes-cargo-target",
+                "id": "summa-cargo-target",
                 "sharing": "locked"
               }
             }
           skip-extraction: ${{ steps.cargo-cache.outputs.cache-hit }}
 
-      - name: Build and push Hermes image
+      - name: Build and push Summa image
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -358,5 +386,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=hermes-image
-          cache-to: type=gha,scope=hermes-image,mode=max
+          cache-from: type=gha,scope=summa-image
+          cache-to: type=gha,scope=summa-image,mode=max

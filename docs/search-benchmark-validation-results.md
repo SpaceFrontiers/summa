@@ -72,8 +72,8 @@ Tantivy on a dedicated Cascade Lake machine, with unchanged index bytes and RSS 
 All 5,032,104 documents and all 962 official queries, with a separate 714-term
 coverage workload. Rust 1.98.1, native LTO, n2-highmem-8, pinned CPU 2, ten seconds
 of warmup and seven complete passes per command using the upstream harness.
-Both Hermes builds and Tantivy 0.26 use the same machine; builds and profiles do not
-overlap timing. Hermes index files are identical before/after. Values are
+Both Summa builds and Tantivy 0.26 use the same machine; builds and profiles do not
+overlap timing. Summa index files are identical before/after. Values are
 geometric means of per-query median microseconds, including query parsing and
 pipe round-trip, excluding index open and document hydration.
 
@@ -91,14 +91,14 @@ pipe round-trip, excluding index open and document hydration.
 | TOP100 + exact count   |            870.583 |       865.911 |      860.461 | 236.902 |                 1.012× |
 | Exact count            |             49.162 |        50.310 |       49.684 |   6.569 |                 0.989× |
 
-The cache improves the official workload by 5–10%, but Hermes still takes
+The cache improves the official workload by 5–10%, but Summa still takes
 2.11–2.60× Tantivy's time. Single-term COUNT remains dominated by dictionary
 lookup and does not benefit from posting validation reuse. All 1,676 x86
 exact-count/exhaustive ranking gates pass with both budgets (3,352 checks),
 including ordered IDs and score bits at depths 10, 100 and 1000. Cross-engine
 counts agree; cross-engine ranking identity is not claimed.
 
-Peak RSS is 972–973 MiB for official ranked Hermes runs versus 710–711 MiB for
+Peak RSS is 972–973 MiB for official ranked Summa runs versus 710–711 MiB for
 Tantivy. Enabling the cache adds at most 0.50 MiB relative to the disabled build
 across all eight measured processes; official COUNT changes from 944.19 to
 944.51 MiB. This includes mmap residency and must not be interpreted as heap alone.
@@ -124,7 +124,7 @@ sync and async search reject the corrupt replacement while the original RAM
 reader continues to work. The mmap reload test verifies unchanged reader reuse,
 budget propagation to new segments, old-reader results and prefix serialization.
 
-The frozen source overlay is `hermes-validation-v1.tar.gz` over base
+The frozen source overlay is `summa-validation-v1.tar.gz` over base
 `ce2c96b945fccc4bac58ccc45bb4bc23b809773e`. The later two-test file is retained
 separately from that measured overlay. The current workspace has subsequent dictionary changes; only the frozen overlay
 represents this measured cache pass. The complete local cloud archive is

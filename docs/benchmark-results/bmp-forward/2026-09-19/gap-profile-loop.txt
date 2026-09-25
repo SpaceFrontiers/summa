@@ -2,7 +2,7 @@ Excerpt of perf annotate --stdio for CandidateBmpPreparation::score.
 Percentages are within this function; 254 total process samples in this short profile.
 Full annotation and perf data are in the private evidence archive.
 
-    0.00 :   8776c6:        jmp     0x877749 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1089>
+    0.00 :   8776c6:        jmp     0x877749 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1089>
     0.00 :   8776cb:        nopl    (%rax,%rax)
     0.00 :   8776d0:        movl    0xdc(%rsp), %edi
     0.00 :   8776d7:        movq    0xe0(%rsp), %rax
@@ -22,7 +22,7 @@ Full annotation and perf data are in the private evidence archive.
     0.00 :   877731:        vmovaps 0x6d0(%rsp), %xmm0
     1.79 :   87773a:        vmovups %xmm0, -0x10(%rdx)
     0.00 :   87773f:        cmpq    $0x8, %rbp
-    0.00 :   877743:        je      0x877570 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0xeb0>
+    0.00 :   877743:        je      0x877570 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0xeb0>
     0.45 :   877749:        movl    0x1b0(%rsp,%rbp,4), %edx
     2.69 :   877750:        movq    0x2a0(%rsp), %rax
     1.35 :   877758:        movl    0x2a8(%rsp), %ecx
@@ -41,30 +41,30 @@ Full annotation and perf data are in the private evidence archive.
     0.00 :   8777b7:        movq    %rdi, 0x100(%rsp)
     2.24 :   8777bf:        movl    %edx, 0x108(%rsp)
     0.00 :   8777c6:        cmpq    0x20(%rsp), %rdi
-    0.00 :   8777cb:        jae     0x878724 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x2064>
+    0.00 :   8777cb:        jae     0x878724 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x2064>
     0.00 :   8777d1:        movq    0xd0(%rsp), %rcx
     0.45 :   8777d9:        movl    0xd8(%rsp), %r10d
     1.79 :   8777e1:        cmpq    $-0x1, %rcx
-    0.00 :   8777e5:        jne     0x8776d0 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1010>
+    0.00 :   8777e5:        jne     0x8776d0 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1010>
     0.45 :   8777eb:        movq    $-0x1, %rcx
     0.00 :   8777f2:        testq   %r12, %r12
-    0.00 :   8777f5:        je      0x877881 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x11c1>
+    0.00 :   8777f5:        je      0x877881 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x11c1>
     0.00 :   8777fb:        movzbl  (%r11,%rdi), %esi
     2.69 :   877800:        cmpl    %edx, (%rbx)
-    0.00 :   877802:        jae     0x87782d <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x116d>
+    0.00 :   877802:        jae     0x87782d <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x116d>
     0.00 :   877804:        leaq    (%rbx,%r12,8), %rdi
     0.00 :   877808:        movq    %r12, %rax
     0.00 :   87780b:        nopl    (%rax,%rax)
     0.00 :   877810:        cmpq    $0x1, %rax
-    0.00 :   877814:        je      0x87786e <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x11ae>
+    0.00 :   877814:        je      0x87786e <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x11ae>
     0.00 :   877816:        leaq    0x8(%rbx), %r8
     0.00 :   87781a:        decq    %rax
     0.00 :   87781d:        movq    %rax, %r14
     0.00 :   877820:        movq    %rax, %r12
     0.45 :   877823:        cmpl    %edx, 0x8(%rbx)
     0.00 :   877826:        movq    %r8, %rbx
-    0.00 :   877829:        jb      0x877810 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1150>
-    0.45 :   87782b:        jmp     0x877836 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1176>
+    0.00 :   877829:        jb      0x877810 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1150>
+    0.45 :   87782b:        jmp     0x877836 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1176>
     0.45 :   87782d:        movq    0x8(%rsp), %r8
     0.00 :   877832:        movq    (%rsp), %rax
     0.00 :   877836:        movq    %r8, 0x8(%rsp)

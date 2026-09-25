@@ -435,20 +435,20 @@
       "sha256": "bb31f5475d4aaaddb39910a24820179e202664c04fc9a53fbfbaa2857b49d11d",
       "archive_path": "arm/fix-content-propagation.py"
     },
-    "arm/hermes-byte-gap-arm64.sha256": {
+    "arm/summa-byte-gap-arm64.sha256": {
       "bytes": 88,
       "sha256": "e74724100a26b1e27282d9ef258a91e130c27c9d3fd5cc7ba34b307f241556b3",
-      "archive_path": "arm/hermes-byte-gap-arm64.sha256"
+      "archive_path": "arm/summa-byte-gap-arm64.sha256"
     },
-    "arm/hermes-cleanup-arm64.sha256": {
+    "arm/summa-cleanup-arm64.sha256": {
       "bytes": 87,
       "sha256": "c8431cd4fa8b6d197a164bb816105227b5bf8a370f7f5aaadf5d0c6de9470fd4",
-      "archive_path": "arm/hermes-cleanup-arm64.sha256"
+      "archive_path": "arm/summa-cleanup-arm64.sha256"
     },
-    "arm/hermes-corrected-arm64.sha256": {
+    "arm/summa-corrected-arm64.sha256": {
       "bytes": 89,
       "sha256": "2b9e18daf3cf52c766a1388c0e1481285048a44fe8b475e424753f868641cdb8",
-      "archive_path": "arm/hermes-corrected-arm64.sha256"
+      "archive_path": "arm/summa-corrected-arm64.sha256"
     },
     "arm/inputs.json": {
       "bytes": 571,
@@ -1158,15 +1158,15 @@
       "bytes": 5869,
       "sha256": "bb31f5475d4aaaddb39910a24820179e202664c04fc9a53fbfbaa2857b49d11d"
     },
-    "arm/hermes-byte-gap-arm64.sha256": {
+    "arm/summa-byte-gap-arm64.sha256": {
       "bytes": 88,
       "sha256": "e74724100a26b1e27282d9ef258a91e130c27c9d3fd5cc7ba34b307f241556b3"
     },
-    "arm/hermes-cleanup-arm64.sha256": {
+    "arm/summa-cleanup-arm64.sha256": {
       "bytes": 87,
       "sha256": "c8431cd4fa8b6d197a164bb816105227b5bf8a370f7f5aaadf5d0c6de9470fd4"
     },
-    "arm/hermes-corrected-arm64.sha256": {
+    "arm/summa-corrected-arm64.sha256": {
       "bytes": 89,
       "sha256": "2b9e18daf3cf52c766a1388c0e1481285048a44fe8b475e424753f868641cdb8"
     },

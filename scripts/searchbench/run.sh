@@ -2,9 +2,9 @@
 # Run in the dedicated benchmark directory after source/corpus/driver preparation.
 # References use upstream start/feed/merge scripts. All engines run sequentially.
 set -euo pipefail
-RUN_DIR=$(cd "${1:?usage: run.sh RUN_DIRECTORY HERMES_BINARY}" && pwd)
+RUN_DIR=$(cd "${1:?usage: run.sh RUN_DIRECTORY SUMMA_BINARY}" && pwd)
 RUNNER=$(realpath "$0")
-HERMES_BINARY=$(realpath "${2:?missing Hermes binary}")
+SUMMA_BINARY=$(realpath "${2:?missing Summa binary}")
 cd "$RUN_DIR"
 export SERVER_CORES=0-2,4-6
 export SEARCHBENCH_QUERY_CACHE=off
@@ -15,12 +15,12 @@ export TMPDIR="$RUN_DIR/tmp"
 mkdir -p "$TMPDIR" results
 source "$RUN_DIR/searchbench/scripts/engine-common.sh"
 ACTIVE_ENGINE=
-HERMES_PID=
+SUMMA_PID=
 cleanup() {
   local status=$?
-  if [[ -n "$HERMES_PID" ]] && kill -0 "$HERMES_PID" 2>/dev/null; then
-    kill -INT "$HERMES_PID"
-    wait "$HERMES_PID" || true
+  if [[ -n "$SUMMA_PID" ]] && kill -0 "$SUMMA_PID" 2>/dev/null; then
+    kill -INT "$SUMMA_PID"
+    wait "$SUMMA_PID" || true
   fi
   if [[ -n "$ACTIVE_ENGINE" ]]; then
     "$ROOT/scripts/stop-$ACTIVE_ENGINE.sh" || true
@@ -39,16 +39,16 @@ measure() {
   python3 campaign.py measure --searchbench "$ROOT" --out results \
     --engine "$1" --port "$2" --server-pid "$3"
 }
-start_hermes() {
-  taskset -c "$SERVER_CORES" "$HERMES_BINARY" serve "$RUN_DIR/hermes-index" 9401 6 \
-    >> hermes-serve.log 2>&1 &
-  HERMES_PID=$!
-  wait_ready http://127.0.0.1:9401/health "$HERMES_PID"
+start_summa() {
+  taskset -c "$SERVER_CORES" "$SUMMA_BINARY" serve "$RUN_DIR/summa-index" 9401 6 \
+    >> summa-serve.log 2>&1 &
+  SUMMA_PID=$!
+  wait_ready http://127.0.0.1:9401/health "$SUMMA_PID"
 }
-stop_hermes() {
-  kill -INT "$HERMES_PID"
-  wait "$HERMES_PID"
-  HERMES_PID=
+stop_summa() {
+  kill -INT "$SUMMA_PID"
+  wait "$SUMMA_PID"
+  SUMMA_PID=
 }
 
 # The upstream transform verifies the pinned source SHA and publishes only a
@@ -64,8 +64,8 @@ DIGEST=$(corpus_sha256 "$CORPUS")
 cp "$CORPUS.sha256" results/corpus.sha256
 cp "$ROOT/engines/versions.json" results/reference-versions.json
 cp luxir-release.json results/luxir-release.json
-cp source-identity.json results/hermes-source-identity.json
-sha256sum "$HERMES_BINARY" "$LUXIR_BIN" campaign.py report.py "$RUNNER" "$ROOT/driver/build/bench_replay" > results/binaries.sha256
+cp source-identity.json results/summa-source-identity.json
+sha256sum "$SUMMA_BINARY" "$LUXIR_BIN" campaign.py report.py "$RUNNER" "$ROOT/driver/build/bench_replay" > results/binaries.sha256
 lscpu > results/lscpu.txt
 uname -a > results/kernel.txt
 for engine in elasticsearch opensearch luxir; do
@@ -79,21 +79,21 @@ for engine in elasticsearch opensearch luxir; do
   "$ROOT/scripts/stop-$engine.sh"
   ACTIVE_ENGINE=
 done
-stage 'Indexing and merging Hermes'
-taskset -c "$SERVER_CORES" "$HERMES_BINARY" index "$RUN_DIR/hermes-index" "$CORPUS" 6 \
-  > hermes-index.log 2>&1
-stage 'Probing all 826 queries: Hermes'
-start_hermes
-probe hermes 9401
-stop_hermes
+stage 'Indexing and merging Summa'
+taskset -c "$SERVER_CORES" "$SUMMA_BINARY" index "$RUN_DIR/summa-index" "$CORPUS" 6 \
+  > summa-index.log 2>&1
+stage 'Probing all 826 queries: Summa'
+start_summa
+probe summa 9401
+stop_summa
 stage 'Selecting identical count-agreeing query subset'
 python3 campaign.py gate --searchbench "$ROOT" --out results | tee results/coverage.txt
-for engine in hermes elasticsearch opensearch luxir; do
+for engine in summa elasticsearch opensearch luxir; do
   stage "Measuring $engine: 1/8/32 clients, 3 x 10 seconds per cell"
-  if [[ "$engine" == hermes ]]; then
-    start_hermes
-    measure hermes 9401 "$HERMES_PID"
-    stop_hermes
+  if [[ "$engine" == summa ]]; then
+    start_summa
+    measure summa 9401 "$SUMMA_PID"
+    stop_summa
   else
     ACTIVE_ENGINE=$engine
     "$ROOT/scripts/start-$engine.sh"

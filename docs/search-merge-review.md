@@ -86,7 +86,7 @@ BMP I/O gate remain in place.
 
 Integrated merge-time text RGB is implemented in the September 17 follow-up
 below. The Lucene RGB top-10 target remains open: a fresh matched x86 run puts
-Hermes **6.5%** behind Lucene (426.918 versus 400.954 µs), consistent with the
+Summa **6.5%** behind Lucene (426.918 versus 400.954 µs), consistent with the
 earlier 6.7% gap. Scoring and codec defaults are unchanged.
 
 There are approximately 733 MiB of historical raw benchmark artifacts under
@@ -105,9 +105,9 @@ and real server/broker integration coverage (**4 passed**).
 
 Additional checks:
 
-- `cargo test --locked -p hermes-core --features query-diagnostics --test
+- `cargo test --locked -p summa-core --features query-diagnostics --test
 query_work_diagnostics --test text_reordering`: **6 passed**.
-- `cd hermes-wasm && bash build.sh`, dependency installation with `npm ci`,
+- `cd summa-wasm && bash build.sh`, dependency installation with `npm ci`,
   and `CI=1 npm test`: **32 passed across 7 files**. Native-generated SIMD,
   compact directories, byte norms, impact layouts and phrases decode correctly
   through WASM. wasm-pack reports its existing missing-license-file notice.

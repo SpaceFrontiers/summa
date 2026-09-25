@@ -1,12 +1,12 @@
 # Generation evaluation
 
-Implemented by [`hermes-train/src/generate_eval.rs`](../hermes-train/src/generate_eval.rs).
+Implemented by [`summa-train/src/generate_eval.rs`](../summa-train/src/generate_eval.rs).
 The percentages below describe the motivating 300M experiment, not a fresh
 evaluation of the current checkout.
 
 ## Why
 
-`hermes-train eval` measures teacher-forced cross-entropy: given a correct
+`summa-train eval` measures teacher-forced cross-entropy: given a correct
 target prefix, how well the model predicts the next token. That is the right
 number for tracking training, and it is not a measure of whether the model can
 produce text.
@@ -78,7 +78,7 @@ held-out record must not void an evaluation, but the drop is never silent.
 ## Shape
 
 ```
-hermes-train generate-eval \
+summa-train generate-eval \
   --config <config.json> --tokenizer <tokenizer.json> --checkpoint <weights.safetensors> \
   --data <shard.jsonl.zst> --objective qa_reasoning \
   --sequence-length 2048 --max-new-tokens 60 --max-records 200 \

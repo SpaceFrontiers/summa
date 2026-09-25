@@ -1,5 +1,5 @@
---- a/hermes-core/src/query/scoring/conjunction.rs
-+++ b/hermes-core/src/query/scoring/conjunction.rs
+--- a/summa-core/src/query/scoring/conjunction.rs
++++ b/summa-core/src/query/scoring/conjunction.rs
 @@ -241,7 +241,7 @@
              let mut b = right.pos;
              // RGB can cluster a globally rare term into dense local runs.

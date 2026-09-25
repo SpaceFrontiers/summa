@@ -4,7 +4,7 @@
 
 RGB off. Direct integrated before/after/Tantivy comparison, not multiplied
 isolated gains: official top-10 -2.2%, top-1000 -2.3%, top-100 plus exact count
--10.2%, exact count -18.8%, all seven passes faster. Hermes/Tantivy ratios are
+-10.2%, exact count -18.8%, all seven passes faster. Summa/Tantivy ratios are
 1.211/1.211/1.345/1.137. Standalone top-100 plus count improves 66.4% to 1.002×
 Tantivy; standalone top-10 remains 2.783×. Overall parity is still unmet.
 

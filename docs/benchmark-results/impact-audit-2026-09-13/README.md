@@ -2,7 +2,7 @@
 
 See the [proposal and limits](../../posting-codecs.md#whole-vocabulary-storage-audit-and-narrower-first-experiment).
 This is offline research: no new posting format or query algorithm is enabled.
-The whole-vocabulary audit uses the 100k ARM fixture and canonical Hermes readers;
+The whole-vocabulary audit uses the 100k ARM fixture and canonical Summa readers;
 the earlier 5,032,104-document audit covers only the 714 query terms. Do not
 substitute the latter for full-vocabulary storage costs. The integer comparison
 uses the existing `write_vint`; coordinate estimates use two f32 values per point.

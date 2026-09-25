@@ -1,6 +1,6 @@
 # Attention kernels
 
-Hermes uses Burn tensor and module operations by default. CUDA attention calls
+Summa uses Burn tensor and module operations by default. CUDA attention calls
 Burn's CubeCL integration, which launches CubeK Flash Attention with FP16 inputs
 and FP32 accumulation. CPU and Metal use Burn's portable attention operations.
 There are no cuDNN, C++, or Python runtime dependencies.
@@ -9,7 +9,7 @@ The only custom attention component is the CUDA training autodiff boundary.
 Burn's current attention API returns the output but not the per-row log-sum-exp
 needed by CubeK's experimental fused backward. Materializing the full
 `[batch, heads, sequence, sequence]` autodiff graph is not viable at a
-4096-token context, so Hermes saves Q/K/V and the output, then recomputes exact
+4096-token context, so Summa saves Q/K/V and the output, then recomputes exact
 probabilities in fixed query-row chunks during backward. The chunks use Burn's
 CubeCL matmuls and reductions; no scalar attention kernel is maintained here.
 
@@ -105,7 +105,7 @@ trusting `Tensor::len()`.
 ## Forward LSE emission (landed)
 
 The flash forward now runs through cubek's `launch_ref_with_lse` directly
-(hermes depends on cubek; burn's module op has no LSE surface), emitting the
+(summa depends on cubek; burn's module op has no LSE surface), emitting the
 per-row softmax log-sum-exp as a sixth saved tensor (`[batch * heads,
 seq_q]`, FP32, scaled-score units, natural log, exactly `-inf` on
 fully-masked rows). The cubek side (fork branch `fwd-lse`, rev b4fe978)
@@ -161,7 +161,7 @@ Measured (same box/config, 2026-07-17): 44,044 → **43,442** @B20 (−1.4%),
 Closing the kernel-efficiency gap needs cutlass-grade work (8-plane
 128-row blocks, cp.async pipelines, vectorized staging, smem swizzling)
 for a ~1–2% end-to-end ceiling — poor EV against the remaining arcs. The
-hermes-side dispatch was reverted; the chunked backward (with LSE reuse)
+summa-side dispatch was reverted; the chunked backward (with LSE reuse)
 remains the production path. The kernels stay parked in the cubek fork
 should long-sequence configs (seq ≥ 4k, where materialization traffic
 dominates) ever matter.

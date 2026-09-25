@@ -1,6 +1,6 @@
 # SOTA LLM design (2024–2026) + shared retrieval embeddings — research notes
 
-Compiled 2026-07-15 for the Hermes retriever-100m direction (hybrid
+Compiled 2026-07-15 for the Summa retriever-100m direction (hybrid
 Transformer+Mamba, agentic retrieval-oriented LLM). Status tags: **[Proven]**
 in ≥1 frontier/production model; **[Emerging]** strong results, spreading;
 **[Frontier]** promising research, not yet validated at scale.
@@ -14,7 +14,7 @@ assessment below retains its original date and model-size assumptions.
 ### Attention
 
 - **GQA** [Proven, universal default] — the baseline KV reducer (Llama 3, Qwen3,
-  Mistral, Gemma). Hermes already does GQA.
+  Mistral, Gemma). Summa already does GQA.
 - **MLA (Multi-head Latent Attention)** [Proven at scale] — DeepSeek-V2/V3 cache a
   low-rank latent per token (~an order of magnitude smaller KV than MHA) with a
   decoupled RoPE dim; matches/beats MHA quality but mostly pays off >~100B.
@@ -41,7 +41,7 @@ assessment below retains its original date and model-size assumptions.
   spikes [Emerging]. https://arxiv.org/pdf/2502.02732
 - **QK-norm** [Proven, spreading fast] — RMSNorm on Q,K pre-RoPE bounds attention
   logits, near-"free" stability at high LR/bf16. Gemma 3 _replaced_ logit
-  soft-capping with QK-norm. **Hermes already has QK-norm.**
+  soft-capping with QK-norm. **Summa already has QK-norm.**
 - **z-loss** [Proven] — λ·(logZ)² keeps softmax logits from drifting (PaLM, OLMo 2).
   Cheap; worth adding for long bf16 runs.
 - **MuonClip / QK-clip** [Emerging, frontier] — rescale Q/K weights when max logit
@@ -49,15 +49,15 @@ assessment below retains its original date and model-size assumptions.
 
 ### FFN / MoE
 
-- **SwiGLU** [Proven, universal]. **Hermes already uses SwiGLU.**
+- **SwiGLU** [Proven, universal]. **Summa already uses SwiGLU.**
 - **Fine-grained + shared-expert MoE** [Proven, frontier default] — DeepSeekMoE:
   many small experts + 1 always-on shared expert; **aux-loss-free bias balancing**
   (per-expert routing bias nudged online, no gradient interference) is the 2024→25
   shift, widely copied. https://arxiv.org/abs/2412.19437 · https://arxiv.org/pdf/2408.15664
   Ultra-sparse is the frontier (Qwen3-Next 80B total / 3B active).
-  _Not relevant at 100M dense, but the recipe to adopt if Hermes ever scales._
+  _Not relevant at 100M dense, but the recipe to adopt if Summa ever scales._
 
-### Hybrid attention + SSM/linear-attention — **directly validates Hermes**
+### Hybrid attention + SSM/linear-attention — **directly validates Summa**
 
 - Core thesis, repeatedly confirmed: **a few full-attention layers give precise
   recall; the rest can be cheap linear/SSM** — the hybrid beats both pure stacks at
@@ -67,7 +67,7 @@ assessment below retains its original date and model-size assumptions.
 - Ratios in the wild cluster at **1 attention : 3–7 linear/SSM**: Jamba 1:7,
   MiniMax 7:1, Hunyuan ~8:1, Granite 4 9:1, Nemotron-H ~8% attention, Zamba 6:1;
   the newer gated-delta models (Qwen3-Next, Kimi Linear) run a heavier **3:1**.
-- **Hermes retriever-100m is 2:1 mamba:attn (pattern [mamba, mamba, attn]).** That's
+- **Summa retriever-100m is 2:1 mamba:attn (pattern [mamba, mamba, attn]).** That's
   slightly attention-heavy vs the ~1:3–1:7 band — reasonable for a _retrieval_
   model (recall-sensitive), and cheap to revisit. Mamba-2 / gated-DeltaNet / KDA are
   the modern linear cores if we upgrade from Mamba-1.
@@ -77,23 +77,23 @@ assessment below retains its original date and model-size assumptions.
 
 - **Optimizers**: AdamW [Proven baseline]; **Muon** [Emerging→frontier] ~2× compute
   efficiency on 2D matrices, needs weight decay + update-RMS matching; **MuonClip**
-  scaled it to 1T (Kimi K2). **Hermes already uses Muon+AdamW.** SOAP/Shampoo
+  scaled it to 1T (Kimi K2). **Summa already uses Muon+AdamW.** SOAP/Shampoo
   [Emerging] heavier; Adam-mini [Emerging] cuts optimizer memory ~50%.
 - **Schedule**: **WSD** [Proven] (warmup → flat peak → ~10% decay) beats/matches
   cosine and doesn't fix the token budget upfront (enables continued training +
-  mixing high-quality data in the decay). **Hermes already uses WSD.**
+  mixing high-quality data in the decay). **Summa already uses WSD.**
 - **Precision**: bf16 [Proven universal]; **FP8** [Emerging→frontier] (DeepSeek-V3,
   Kimi K2) ~2× throughput with <0.25% loss error via fine-grained per-tile scaling.
   Caveat: bf16 can break RoPE at long context (https://arxiv.org/pdf/2411.13476).
 - **μP / Tensor Programs V** [Emerging] — tune LR on a small proxy, transfer across
   width. Weight-decay/depth don't transfer. Useful if we sweep HPs before scaling.
 - **Data**: **intra-document masking + best-fit packing** improve ICL/knowledge and
-  become crucial 4k→64k (https://arxiv.org/html/2402.13991). **Hermes already does
+  become crucial 4k→64k (https://arxiv.org/html/2402.13991). **Summa already does
   doc-masking.** **Mid-training / quality annealing** — switch to a curated
   high-quality mix during the LR decay phase (OLMo 2, Phi-4). Long-context is a
   separate late phase (Llama 3.1: θ=500k, 8K→128K over 6 stages, ~800B tokens).
 
-**Net for Hermes:** the architecture already lands on the proven defaults
+**Net for Summa:** the architecture already lands on the proven defaults
 (GQA, SwiGLU, QK-norm, RMSNorm, Muon+AdamW, WSD, doc-masking, hybrid attn+Mamba).
 The highest-value _additions_ if we push quality: **z-loss** (cheap stability),
 **mid-training quality-anneal** in the WSD decay, and — if scaling up — Mamba-2 or
@@ -141,12 +141,12 @@ _backbones_, just as separately-tuned instances, not by reading raw hidden state
    https://arxiv.org/abs/2405.13792 (see also PISCO/COCOM at 5–16× soft compression,
    CLaRa's shared retriever-generator latent space — https://arxiv.org/abs/2501.16075)
 
-### Verdict & recommendation for Hermes (100M hybrid Mamba retriever)
+### Verdict & recommendation for Summa (100M hybrid Mamba retriever)
 
 **Yes to sharing the backbone — as GRIT-style "share backbone, specialize head",
 not raw-state reuse.** Concretely:
 
-- Train Hermes with a **dual objective**: causal LM loss (agentic generation) + a
+- Train Summa with a **dual objective**: causal LM loss (agentic generation) + a
   **contrastive retrieval loss on a pooled projection head**, with query/passage
   instruction prefixes and hard negatives. One small model, one KV cache, no second
   embedder to serve — a big win at 100M where you're compute/memory bound.

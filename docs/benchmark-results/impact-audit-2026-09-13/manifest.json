@@ -15,7 +15,7 @@
     "bytes": 1336,
     "sha256": "af16d5ffdff40bde0a3d74b54378a55a67484628095292ccf17e4394c5200345"
   },
-  "audit/hermes-conjunction-v1-manifest.json": {
+  "audit/summa-conjunction-v1-manifest.json": {
     "bytes": 8135,
     "sha256": "8888b8411a5e332435bc0714f67b09e66f1883005688f69ba3a1ed6c75561a34"
   },
@@ -87,7 +87,7 @@
     "bytes": 265,
     "sha256": "00e7557a979cbed426b3f58fac3654c89465f5240304ff87b6aeb1c759312ae3"
   },
-  "cloud-query-term-probe/hermes-Cargo.lock": {
+  "cloud-query-term-probe/summa-Cargo.lock": {
     "bytes": 231783,
     "sha256": "5ba1b6e7223f4bc72e6a8abf7efcc4ec7c9f2088d75ce15318dbfc054119ca03"
   },
@@ -107,227 +107,227 @@
     "bytes": 41,
     "sha256": "b9ea4c0243533d7859e0f2943df6c2daff03a26bbc0ba5de428705b1f3db6781"
   },
-  "sources/hermes-core/Cargo.toml": {
+  "sources/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 12302,
     "sha256": "5475e86d2985dc559a8514200b2ed3770cf8f514a3e2a5304bfefb57c5a62adb"
   },
-  "sources/hermes-core/src/compression/zstd.rs": {
+  "sources/summa-core/src/compression/zstd.rs": {
     "bytes": 18977,
     "sha256": "ac11de0d68dcce3d7b6f04c54dcdf7ed210a2acdc42527930d654a01d500134d"
   },
-  "sources/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-core/src/index/mod.rs": {
+  "sources/summa-core/src/index/mod.rs": {
     "bytes": 39127,
     "sha256": "358f5d142bfa46c3a8845daa5c14a32a90ad538642de80c4e81a0784fcd60373"
   },
-  "sources/hermes-core/src/index/reader.rs": {
+  "sources/summa-core/src/index/reader.rs": {
     "bytes": 14380,
     "sha256": "8564079f9c70b39c4c0797ebaa82017702ecac3f41a16dab3eab9f36bcdbbd95"
   },
-  "sources/hermes-core/src/index/searcher.rs": {
+  "sources/summa-core/src/index/searcher.rs": {
     "bytes": 89883,
     "sha256": "2fa404e71a84e8515f9c193b4f39f52a1d1e18b331a1bd3fb7720e3b7d790295"
   },
-  "sources/hermes-core/src/index/tests/chunked.rs": {
+  "sources/summa-core/src/index/tests/chunked.rs": {
     "bytes": 49925,
     "sha256": "d94ed99c65e2c3b22da16e13ed17ee51a11f80c91124fa9172422b67d87b1b8c"
   },
-  "sources/hermes-core/src/index/tests/mod.rs": {
+  "sources/summa-core/src/index/tests/mod.rs": {
     "bytes": 6744,
     "sha256": "a40f06e51c99a1c1bfa83c3338ec95452bbd5a28f80eb9a2e96c70b7a52efde8"
   },
-  "sources/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-core/src/index/wasm_writer.rs": {
     "bytes": 16165,
     "sha256": "de342e77f19973c5d355a5d1af7f6874532fc05655f3c487b32ca2c39b6f5546"
   },
-  "sources/hermes-core/src/index/writer.rs": {
+  "sources/summa-core/src/index/writer.rs": {
     "bytes": 101469,
     "sha256": "c29d837c5f65909352ea10341d793c7cfd5b3d4d3b816120fe1ad316d9f9fde4"
   },
-  "sources/hermes-core/src/merge/row_mutation.rs": {
+  "sources/summa-core/src/merge/row_mutation.rs": {
     "bytes": 16271,
     "sha256": "094e4f0bcb6a74ddc2efcf235d43d8cea2ce2334867b3076c3f20758d10c5c5d"
   },
-  "sources/hermes-core/src/merge/segment_manager.rs": {
+  "sources/summa-core/src/merge/segment_manager.rs": {
     "bytes": 212354,
     "sha256": "933b88674db2624081d933f2a0cf7ca91fa6cbff490d0878e385205e5996fd65"
   },
-  "sources/hermes-core/src/query/bm25.rs": {
+  "sources/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-core/src/query/boolean.rs": {
+  "sources/summa-core/src/query/boolean.rs": {
     "bytes": 93197,
     "sha256": "5c7276530716c55170dd8c0e6ce6f7d9e163da6a7d853533cf09f85209ba17e8"
   },
-  "sources/hermes-core/src/query/boolean/conjunction_window_tests.rs": {
+  "sources/summa-core/src/query/boolean/conjunction_window_tests.rs": {
     "bytes": 5426,
     "sha256": "c73148f19bd1f017a1a961e908fcb9e7ff253c862300cd1c3acedd1e4952baa3"
   },
-  "sources/hermes-core/src/query/collector.rs": {
+  "sources/summa-core/src/query/collector.rs": {
     "bytes": 53948,
     "sha256": "0373be07eeb0030ff4fb272b9d70b881445093c1e3181a0aa00a73b9dbcad4e7"
   },
-  "sources/hermes-core/src/query/docset.rs": {
+  "sources/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-core/src/query/phrase.rs": {
+  "sources/summa-core/src/query/phrase.rs": {
     "bytes": 45544,
     "sha256": "4f248bf9307e2a788b13c5eb9b96f900a18b0ed426401e387f5bdb3a0099e2a4"
   },
-  "sources/hermes-core/src/query/planner.rs": {
+  "sources/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-core/src/query/scoring.rs": {
+  "sources/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-core/src/query/term.rs": {
+  "sources/summa-core/src/query/term.rs": {
     "bytes": 36395,
     "sha256": "0d20f72c81a5c425e25ef49cd380a244bafdefebe2a153edfcf48204c8d3e88c"
   },
-  "sources/hermes-core/src/query/traits.rs": {
+  "sources/summa-core/src/query/traits.rs": {
     "bytes": 26813,
     "sha256": "4eabcbef16697b2a3ac28fab97fb29c1558de60c587ccd4e4fe73896796e25c9"
   },
-  "sources/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-core/src/segment/builder/config.rs": {
     "bytes": 3632,
     "sha256": "27c0caafa520cc191086121dc5a590b8fc82fbedf6e0e9835d6def29637e68db"
   },
-  "sources/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-core/src/segment/builder/mod.rs": {
     "bytes": 90331,
     "sha256": "7958699ad31149d2dcc85a034dab6a04123bda027473e501b5430aa3fed274e5"
   },
-  "sources/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16552,
     "sha256": "a97a36905da68756371517104979ae2b9f4cdf35fee075225336c5c75e2388b5"
   },
-  "sources/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33501,
     "sha256": "613c8dfc26e894e4d0376e7d75d7114dadb70fd285ee0ce688b3c3f932e5913f"
   },
-  "sources/hermes-core/src/segment/merger/mod.rs": {
+  "sources/summa-core/src/segment/merger/mod.rs": {
     "bytes": 35020,
     "sha256": "af3d5c444cc4b0a18841f9075859aa09f13256a82c040769ad9d1e309636a63a"
   },
-  "sources/hermes-core/src/segment/merger/postings.rs": {
+  "sources/summa-core/src/segment/merger/postings.rs": {
     "bytes": 14178,
     "sha256": "7ad01c982a6fe041fc1035ff30a1181105dce1fd0047c5661c2d79fd8762a9f9"
   },
-  "sources/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19464,
     "sha256": "65db832b51437251c64fb3dd6eee78dd09c4e51f9cef2f9914ab9cd6168dcf13"
   },
-  "sources/hermes-core/src/segment/reader/mod.rs": {
+  "sources/summa-core/src/segment/reader/mod.rs": {
     "bytes": 183717,
     "sha256": "76a855f14075351f3f3eda1b7e4dcc699160d3d4412314002a49866259525295"
   },
-  "sources/hermes-core/src/segment/reorder.rs": {
+  "sources/summa-core/src/segment/reorder.rs": {
     "bytes": 108167,
     "sha256": "a1e579fd3121ced270d637b62426286056c7530ab38f0bbc9c7fc72ef8598ced"
   },
-  "sources/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21808,
     "sha256": "7410e5f27674a63911b23dae06b69fc4624a511ea2d9045d798d79a81225a019"
   },
-  "sources/hermes-core/src/structures/mod.rs": {
+  "sources/summa-core/src/structures/mod.rs": {
     "bytes": 3790,
     "sha256": "9b052df340ff93567739290f6490f898af8a2a190d1d045bae57065c3be25b74"
   },
-  "sources/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-core/src/structures/postings/mod.rs": {
+  "sources/summa-core/src/structures/postings/mod.rs": {
     "bytes": 3625,
     "sha256": "848cb6373525e35e268c1f551e2d04aefc3eb0bef3596ea9da99ec0f72562e1b"
   },
-  "sources/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-core/src/structures/postings/posting.rs": {
     "bytes": 127773,
     "sha256": "f23c5af55f44b95ad5af8632530ebb7b493799ab126aadcfe5d2d384b710cdb2"
   },
-  "sources/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 20334,
     "sha256": "ff8a12f146f173e26b6916be33af3301d97a6db573f986ff7d3e4084cc5dd1c2"
   },
-  "sources/hermes-core/src/structures/postings/posting/reader.rs": {
+  "sources/summa-core/src/structures/postings/posting/reader.rs": {
     "bytes": 11269,
     "sha256": "b2f55300d5d99c24d385b331917b4f3cd3ab23cbc5313f23787b30329f861645"
   },
-  "sources/hermes-core/src/structures/postings/posting/validation.rs": {
+  "sources/summa-core/src/structures/postings/posting/validation.rs": {
     "bytes": 7619,
     "sha256": "64dd2a27626686d664921d2f7794885930d3f472f45b31f645a0502b49e26cbf"
   },
-  "sources/hermes-core/src/structures/simd.rs": {
+  "sources/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-core/src/structures/sstable.rs": {
+  "sources/summa-core/src/structures/sstable.rs": {
     "bytes": 92904,
     "sha256": "172af136264dbb9dd732a0598fb0d53265d5282dcd865e9608722e99d959040c"
   },
-  "sources/hermes-core/src/structures/sstable/dictionary_config_tests.rs": {
+  "sources/summa-core/src/structures/sstable/dictionary_config_tests.rs": {
     "bytes": 13395,
     "sha256": "c6de077fd078d4f8a1d853ab01606d41d7e172977fa992d1d80e56f1ac58f972"
   },
-  "sources/hermes-core/src/structures/sstable/testdata/default_v5.bin": {
+  "sources/summa-core/src/structures/sstable/testdata/default_v5.bin": {
     "bytes": 32352,
     "sha256": "57574904dcdec6dc56a317bc4d9623678ab40093e13958440d7f1b611d761205"
   },
-  "sources/hermes-core/tests/corrupt_text_postings.rs": {
+  "sources/summa-core/tests/corrupt_text_postings.rs": {
     "bytes": 3358,
     "sha256": "3ba3817fbb71c911891f067e7b0bcc9c3b42fddc4cf7039d65367d90f2a6c94d"
   },
-  "sources/hermes-core/tests/dictionary_policy.rs": {
+  "sources/summa-core/tests/dictionary_policy.rs": {
     "bytes": 3489,
     "sha256": "d82b83e195b6efc5a89fe8b12be5e75e567cca3c12c1bfbc3c786dedbe850522"
   },
-  "sources/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 7349,
     "sha256": "efcd077d6814d6bf84041752b776e3aaec9ca756eb02feaec8a15e390a83da9f"
   },
-  "sources/hermes-core/tests/posting_validation_resources.rs": {
+  "sources/summa-core/tests/posting_validation_resources.rs": {
     "bytes": 3433,
     "sha256": "76f4f6a1d89a42e4b274130b6f46461bf54f0b8c759409423b630d5306af2d0f"
   },
-  "sources/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-tool/src/index_ops.rs": {
+  "sources/summa-tool/src/index_ops.rs": {
     "bytes": 31280,
     "sha256": "293975c955161abaf724dfd839380b70996890c716bf0d58e03e859001a488fa"
   },
-  "sources/hermes-tool/src/main.rs": {
+  "sources/summa-tool/src/main.rs": {
     "bytes": 24525,
     "sha256": "749de8dd63801d19d2a162cfcdd1d73c75840330327106b0fee68b81647ac62d"
   },

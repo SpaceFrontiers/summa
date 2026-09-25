@@ -63,7 +63,7 @@ def main():
         "queries": queries,
         "indexes": {},
     }
-    with tempfile.TemporaryDirectory(prefix="hermes-wasm-codec-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="summa-wasm-codec-") as tmp:
         for codec in (
             ["rounded", "impacts"] if args.impact_bounds else ["rounded", "simd4x"]
         ):

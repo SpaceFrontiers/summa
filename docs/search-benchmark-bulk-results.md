@@ -9,7 +9,7 @@ the cost are included below; this is not a leadership claim.
 
 This follows the [ratio-bound experiment](search-benchmark-ratio-results.md) and
 [Lucene research](lucene-11-performance-research.md). The retained source is
-`hermes-bulk-final-v1`: v2 bulk scoring, standalone term windows and posting
+`summa-bulk-final-v1`: v2 bulk scoring, standalone term windows and posting
 validation, without the experimental phrase hint. Absolute times belong to this
 machine and protocol; compare implementations within each phase.
 
@@ -77,40 +77,40 @@ from this bounded per-query scratch. A separate matched three-repetition run of
 all 962 queries reports peak RSS of 963.7–964.4 MiB for v2 ranked commands and
 935.8 MiB for COUNT. Tantivy uses 714.7–714.8 MiB ranked and 705.2 MiB COUNT.
 These process peaks include resident mmap pages, caches and runtime state; they
-are not heap-only allocations. Hermes still uses materially more resident memory.
+are not heap-only allocations. Summa still uses materially more resident memory.
 
 ## Frozen bulk-scoring prototypes
 
 Geometric means of per-query median microseconds:
 
-| Command       | Previous Hermes |        V1 |        V2 | Tantivy | Previous/V2 | V2/Tantivy |
-| ------------- | --------------: | --------: | --------: | ------: | ----------: | ---------: |
-| TOP_10        |       1,447.345 | 1,463.977 | 1,425.605 | 572.723 |      1.015× |     2.489× |
-| TOP_100       |       1,790.232 | 1,765.611 | 1,708.041 | 739.119 |      1.048× |     2.311× |
-| TOP_1000      |       2,134.872 | 2,110.448 | 2,035.710 | 961.663 |      1.049× |     2.117× |
-| TOP_100_COUNT |       3,076.521 | 2,318.678 | 2,103.758 | 899.927 |      1.462× |     2.338× |
-| COUNT         |       1,003.917 |   985.377 |   987.513 | 428.429 |      1.017× |     2.305× |
+| Command       | Previous Summa |        V1 |        V2 | Tantivy | Previous/V2 | V2/Tantivy |
+| ------------- | -------------: | --------: | --------: | ------: | ----------: | ---------: |
+| TOP_10        |      1,447.345 | 1,463.977 | 1,425.605 | 572.723 |      1.015× |     2.489× |
+| TOP_100       |      1,790.232 | 1,765.611 | 1,708.041 | 739.119 |      1.048× |     2.311× |
+| TOP_1000      |      2,134.872 | 2,110.448 | 2,035.710 | 961.663 |      1.049× |     2.117× |
+| TOP_100_COUNT |      3,076.521 | 2,318.678 | 2,103.758 | 899.927 |      1.462× |     2.338× |
+| COUNT         |      1,003.917 |   985.377 |   987.513 | 428.429 |      1.017× |     2.305× |
 
 For all 301 unions, TOP100+COUNT is 14,112.282 / 5,833.288 / 4,380.319 µs
-for previous / v1 / v2 Hermes. Thus the term-run change adds 1.332× beyond
+for previous / v1 / v2 Summa. Thus the term-run change adds 1.332× beyond
 Boolean windows alone. Tantivy takes 2,683.812 µs. The union COUNT control is
 1,045.372→1,044.431 µs, essentially unchanged, supporting attribution of the
 large full-scoring gain. Small ranking-only changes include movement in paths
 that do not use score windows and should not be attributed entirely to batching.
 
-![Per-query cumulative speedups for the full official workload](benchmark-results/bulk-scoring-2026-09-13/official-speedups.png)
+![Per-query cumulative speedups for the full official workload](benchmark-results/bulk-scoring-2026-09-13/official-speedups.svg)
 
 The plot includes every query; values below one are slower. It separates the
 full suite from its complete union family and retains the count-only control.
 
 All 714 distinct terms from the official queries, with no selection:
 
-| Command       | Previous Hermes |        V2 | Tantivy | Previous/V2 | V2/Tantivy |
-| ------------- | --------------: | --------: | ------: | ----------: | ---------: |
-| TOP_10        |         362.956 |   363.529 |  52.664 |      0.998× |     6.903× |
-| TOP_1000      |         915.677 |   933.267 | 424.255 |      0.981× |     2.200× |
-| TOP_100_COUNT |       1,098.057 | 1,132.276 | 257.253 |      0.970× |     4.401× |
-| COUNT         |          52.649 |    52.058 |   7.159 |      1.011× |     7.271× |
+| Command       | Previous Summa |        V2 | Tantivy | Previous/V2 | V2/Tantivy |
+| ------------- | -------------: | --------: | ------: | ----------: | ---------: |
+| TOP_10        |        362.956 |   363.529 |  52.664 |      0.998× |     6.903× |
+| TOP_1000      |        915.677 |   933.267 | 424.255 |      0.981× |     2.200× |
+| TOP_100_COUNT |      1,098.057 | 1,132.276 | 257.253 |      0.970× |     4.401× |
+| COUNT         |         52.649 |    52.058 |   7.159 |      1.011× |     7.271× |
 
 For TOP100+COUNT, 298/301 unions improve and 296 improve by more than 10%.
 One union is over 10% slower: `shih tzu` (1,372 exact hits) changes
@@ -140,16 +140,16 @@ Ubuntu 24.04, zone `us-east1-b`. Rust engines use rustc 1.98.1, native instructi
 and release LTO. The public benchmark revision is
 `a7c75473e91746280c5f01e69bf594ece5fca560`; corpus and queries follow the previous
 reports. Both indexes contain the same transformed corpus and one segment.
-All Hermes versions read the same ratio-bearing index bytes. Queries and driver
+All Summa versions read the same ratio-bearing index bytes. Queries and driver
 children are pinned to CPU 2. Builds, indexing, tests and profiling are excluded
 from timed search. Official warmups are 60 seconds with ten samples per query;
 the supplement uses ten seconds and five samples. Parsing and pipe round trips
 are included, opening and hydration excluded. These are warm-cache latency
 measurements, not throughput or cold-storage results.
 
-All 1,676 official/supplemental queries pass for each of the three Hermes
+All 1,676 official/supplemental queries pass for each of the three Summa
 versions: exact counts match Tantivy, and pruned top-10/100/1000 IDs and score
-bits match exhaustive Hermes collection. Cross-engine score-bit equality is
+bits match exhaustive Summa collection. Cross-engine score-bit equality is
 not claimed. TOP100+COUNT performs complete scoring and exact membership
 collection; it does not use competitive pruning to estimate its count.
 

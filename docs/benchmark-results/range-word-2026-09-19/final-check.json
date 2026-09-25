@@ -13,13 +13,13 @@
         "clippy",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "-p",
-        "hermes-server",
+        "summa-server",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "-p",
-        "hermes-tool",
+        "summa-tool",
         "--all-targets",
         "--",
         "-D",
@@ -35,15 +35,15 @@
         "test",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "-p",
-        "hermes-server",
+        "summa-server",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "-p",
-        "hermes-tool",
+        "summa-tool",
         "--features",
-        "hermes-core/metrics"
+        "summa-core/metrics"
       ],
       "log": "03-test.log",
       "returncode": 0,
@@ -55,7 +55,7 @@
         "check",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--no-default-features",
         "--features",
         "native",
@@ -71,7 +71,7 @@
         "check",
         "--locked",
         "-p",
-        "hermes-broker",
+        "summa-broker",
         "--all-targets"
       ],
       "log": "05-check.log",
@@ -82,7 +82,7 @@
   "success": true,
   "environment": {
     "revision": "c11169b41aa04fff00fd9c4204cacdedd76d0943",
-    "status": "M docs/README.md\n M docs/search-performance-review.md\n M hermes-core/src/query/range.rs\n M hermes-core/src/query/traits.rs\n M hermes-core/src/structures/fast_field/mod.rs\n M hermes-core/tests/range_bitset.rs\n?? docs/benchmark-results/range-word-2026-09-19/\n?? docs/range-word-materialization.md",
+    "status": "M docs/README.md\n M docs/search-performance-review.md\n M summa-core/src/query/range.rs\n M summa-core/src/query/traits.rs\n M summa-core/src/structures/fast_field/mod.rs\n M summa-core/tests/range_bitset.rs\n?? docs/benchmark-results/range-word-2026-09-19/\n?? docs/range-word-materialization.md",
     "working_diff_sha256": "65efb8d9db0d160963d004ad67d5aaed47b2f6a9b3f2d6fca49a4167f0c71adc",
     "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
     "machine": "arm64",
@@ -99,8 +99,8 @@
       "CARGO_BUILD_JOBS": "",
       "CRITERION_HOME": "",
       "RAYON_NUM_THREADS": "",
-      "HERMES_PIN_MODE": "",
-      "HERMES_PIN_METADATA_BUDGET_MB": ""
+      "SUMMA_PIN_MODE": "",
+      "SUMMA_PIN_METADATA_BUDGET_MB": ""
     }
   }
 }

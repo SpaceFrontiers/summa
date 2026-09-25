@@ -1,4 +1,4 @@
-# Where Hermes spends extra query work
+# Where Summa spends extra query work
 
 September 16, 2026. RGB disabled. This is a diagnosis, not a new speedup claim.
 [Instrumentation and reproduction](query-work-diagnostics.md).
@@ -6,30 +6,30 @@ September 16, 2026. RGB disabled. This is a diagnosis, not a new speedup claim.
 ## The strongest finding: standalone top-k pruning
 
 On the 5,032,104-document Wikipedia fixture, the 714 supplemental standalone
-terms produce these warm-pass totals. Hermes uses compact directories and exact
+terms produce these warm-pass totals. Summa uses compact directories and exact
 norms; Tantivy is the pinned 0.26 benchmark build.
 
-| Operation | Hermes document blocks | Tantivy document blocks | Ratio | Gap-payload byte ratio |
-| --------- | ---------------------: | ----------------------: | ----: | ---------------------: |
-| Top 10    |                314,714 |                  37,987 | 8.29× |                  9.42× |
-| Top 1000  |                716,470 |                 393,649 | 1.82× |                  2.35× |
+| Operation | Summa document blocks | Tantivy document blocks | Ratio | Gap-payload byte ratio |
+| --------- | --------------------: | ----------------------: | ----: | ---------------------: |
+| Top 10    |               314,714 |                  37,987 | 8.29× |                  9.42× |
+| Top 1000  |               716,470 |                 393,649 | 1.82× |                  2.35× |
 
 This is not just one expensive term: **696 of 714** top-10 queries decode more
-blocks in Hermes. The median per-query block ratio is **2.54×**, and its geometric
+blocks in Summa. The median per-query block ratio is **2.54×**, and its geometric
 mean is **3.01×**. The totals weight frequent terms heavily. For example, `is`
 decodes 20,283 versus 145 blocks, and `to` decodes 23,860 versus 278.
 
-The source gives a concrete bound-quality hypothesis: Hermes's selected fixture
+The source gives a concrete bound-quality hypothesis: Summa's selected fixture
 combines independent `max_tf`, `min_len` and minimum length/TF bounds. Tantivy's
 [pinned block writer](https://github.com/quickwit-oss/tantivy/blob/9e63fc508153ef770f9ff980c8fa2f11e8e2e6db/src/postings/serializer.rs)
 chooses a fieldnorm/frequency pair from the block using its BM25 weight. The
 former can combine favorable statistics from different documents and admit
 blocks whose actual scores are all below the threshold. This is a source-based
-hypothesis for the measured excess, not a bound-tightness measurement. Hermes's
+hypothesis for the measured excess, not a bound-tightness measurement. Summa's
 support for changing scoring statistics and parameters prevents copying a
 single-winner bound without proving compatibility.
 
-Byte norms reduce Hermes's top-10 supplemental block count to 302,412, still
+Byte norms reduce Summa's top-10 supplemental block count to 302,412, still
 7.96× Tantivy. The first investigation should target the existing single-term
 block/group score bounds and threshold handling. These measurements establish
 extra decoding; they do not yet separate bound looseness, tie handling, and
@@ -38,7 +38,7 @@ merged-segment semantics, and deterministic ties when testing tighter bounds.
 
 ## Other families have different costs
 
-Ratios below are sums of decoded work, Hermes compact/exact divided by Tantivy.
+Ratios below are sums of decoded work, Summa compact/exact divided by Tantivy.
 They are not geometric-mean query latencies.
 
 | Family / command      | Document blocks | Document-gap bytes | Position blocks | Position bytes |
@@ -62,7 +62,7 @@ changing the posting codec default.
 
 ## Compact directories and quantized scoring
 
-Legacy and compact/exact Hermes have **identical** decoded blocks, values,
+Legacy and compact/exact Summa have **identical** decoded blocks, values,
 payload bytes, seeks, scoring units, phrase checks and selected executor work
 for every captured query on both fixtures. This directly explains why the
 previous compact-format change reduced RSS without materially reducing warm
@@ -158,7 +158,7 @@ No scorer or codec default changes follow from this single-architecture control.
   scope tests cover nested captures, panic, suspension, cancellation, migration
   and concurrent segment workers. Diagnostic Clippy and native-without-sync
   compilation also passed.
-- Both architectures: all 1,676 queries, all three Hermes layouts, exact
+- Both architectures: all 1,676 queries, all three Summa layouts, exact
   optimized-versus-exhaustive score bits/order/counts at k=10/100/1000 passed.
   Every diagnostic response was checked against the existing count oracle.
 - Cold/concurrent latency and a new memory comparison were not run. The previous

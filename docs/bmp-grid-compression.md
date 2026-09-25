@@ -60,7 +60,7 @@ For block 32, the 1B dense reference is 1.693 TiB. A 10%, 20%, 25%, 33%, or
 50% observed encoded/dense ratio projects to approximately 173, 347, 433,
 572, or 867 GiB resident respectively. A machine intended to keep the whole
 grid resident should leave another 15–25% for the process, payload working
-set, document map, and OS. Hermes normally pins H and row-offset tables only;
+set, document map, and OS. Summa normally pins H and row-offset tables only;
 D and E remain pageable.
 
 The other persistent sections are:
@@ -257,23 +257,23 @@ V19 follows the core design in
   `SBMax >= theta`, block-level eta/`heap_factor`, and full-query scoring of
   visited candidates.
 
-Hermes’s codec is equivalent in access granularity and bounds but is not the
+Summa’s codec is equivalent in access granularity and bounds but is not the
 paper implementation’s wire format. Its selector checkpoints are interleaved
 every 32 groups rather than stored as one long selector prefix, which bounds
 random lookup work on very long 1B-scale rows.
 
-The persisted H level is a Hermes exact-search acceleration around LSP/0, not
+The persisted H level is a Summa exact-search acceleration around LSP/0, not
 a new approximation: it is a maximum hierarchy over E and produces the same
 global top-`gamma` membership as a complete E sweep.
 
-The paper reports its best latency around block sizes 4–16. Hermes keeps the
+The paper reports its best latency around block sizes 4–16. Summa keeps the
 requested block size 32 and compensates with eight-block superblocks; this
 satisfies the paper’s `b × c <= 256` recommendation but is a deliberate
 space/build-time tradeoff rather than a claim that 32 is the paper optimum.
 
 ## Flat-Inv versus the paper’s Fwd layout
 
-Hermes does **not** use the paper’s document-major Fwd payload for persistent
+Summa does **not** use the paper’s document-major Fwd payload for persistent
 BMP scoring. Section B is an adaptive block-local Flat-Inv layout:
 
 ```text
@@ -284,8 +284,8 @@ per-term sparse (local_slot, impact) pairs or dense impact rows
 
 The paper finds Fwd faster for small blocks, including `b = 32`, but its
 Compact-Inv format explicitly assumes a vocabulary that fits two-byte term
-IDs. Hermes production fields use roughly 105,879 dimensions, so a direct
-Hermes Fwd layout requires four-byte IDs. At minimum, separate u32 term IDs
+IDs. Summa production fields use roughly 105,879 dimensions, so a direct
+Summa Fwd layout requires four-byte IDs. At minimum, separate u32 term IDs
 and u8 weights cost `5P` bytes plus document offsets. V19 adaptive Flat-Inv
 usually uses approximately `2P + 6.5T + block headers`, and dense terms lower
 the `2P` component. Which representation is smaller therefore depends on the
@@ -295,7 +295,7 @@ Flat-Inv also lets the scorer fetch only postings for query-present terms,
 whereas Fwd streams every term in every candidate document.
 
 At `b = 32` the paper reports a material Fwd latency advantage on its SPLADE
-workload. Hermes’s production-shaped `bmp_payload_layout` benchmark uses u32
+workload. Summa’s production-shaped `bmp_payload_layout` benchmark uses u32
 vocabulary IDs, D-selected SPLADE-like topical blocks, and query widths
 8/32/64. In that benchmark V19 adaptive Flat-Inv reduced Section B by
 17.7–21.1% versus V18. The production decoder was at parity for the
@@ -303,7 +303,7 @@ diffuse eight-term case and 8–45% faster in the other measured
 locality/query-width combinations. Its Fwd variants did not beat that
 combination of size and latency, so V19 keeps Flat-Inv.
 
-“Forward indexes” elsewhere in Hermes are temporary BP/reorder structures
+“Forward indexes” elsewhere in Summa are temporary BP/reorder structures
 used to compute a document or block permutation. They are memory-budgeted,
 discarded after the pass, and are not the on-disk query payload discussed by
 the paper.

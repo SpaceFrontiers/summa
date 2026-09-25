@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare exact counts and check Hermes pruning against exhaustive top-k."""
+"""Compare exact counts and check Summa pruning against exhaustive top-k."""
 
 import argparse
 import json
@@ -38,8 +38,8 @@ def close(process):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     for name in (
-        "hermes",
-        "hermes-index",
+        "summa",
+        "summa-index",
         "tantivy",
         "tantivy-index",
         "queries",
@@ -47,15 +47,15 @@ if __name__ == "__main__":
     ):
         parser.add_argument("--" + name, required=True)
     parser.add_argument(
-        "--hermes-arg",
+        "--summa-arg",
         action="append",
         default=[],
-        help="additional Hermes option (repeat; use --hermes-arg=--option for flags)",
+        help="additional Summa option (repeat; use --summa-arg=--option for flags)",
     )
     args = parser.parse_args()
     output = pathlib.Path(args.output)
     commands = [
-        [args.hermes, "serve", args.hermes_index, *args.hermes_arg],
+        [args.summa, "serve", args.summa_index, *args.summa_arg],
         [args.tantivy, args.tantivy_index],
     ]
     processes = []
@@ -78,16 +78,16 @@ if __name__ == "__main__":
         with open(args.queries) as queries, output.open("x") as results:
             for number, line in enumerate(queries, 1):
                 query = json.loads(line)["query"]
-                hermes = request(processes[0], "VERIFY", query)
-                hermes_count = request(processes[0], "COUNT", query)
+                summa = request(processes[0], "VERIFY", query)
+                summa_count = request(processes[0], "COUNT", query)
                 tantivy = request(processes[1], "COUNT", query)
-                mismatches += not (hermes == hermes_count == tantivy)
+                mismatches += not (summa == summa_count == tantivy)
                 results.write(
                     json.dumps(
                         {
                             "query": query,
-                            "hermes": hermes,
-                            "hermes_count": hermes_count,
+                            "summa": summa,
+                            "summa_count": summa_count,
                             "tantivy": tantivy,
                         }
                     )
@@ -106,5 +106,5 @@ if __name__ == "__main__":
     if mismatches:
         raise SystemExit(f"FAIL: {mismatches} queries have different counts")
     print(
-        "PASS: score-free/exhaustive/Tantivy counts agree; pruned/exhaustive Hermes top-k agrees"
+        "PASS: score-free/exhaustive/Tantivy counts agree; pruned/exhaustive Summa top-k agrees"
     )

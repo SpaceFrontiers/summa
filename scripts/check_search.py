@@ -19,7 +19,7 @@ from pathlib import Path
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
-PACKAGES = ("hermes-core", "hermes-server", "hermes-broker", "hermes-tool")
+PACKAGES = ("summa-core", "summa-server", "summa-broker", "summa-tool")
 BENCHES = (
     "segment_merge",
     "search_pipeline",
@@ -33,11 +33,12 @@ BENCHES = (
 def contracts(root=ROOT):
     """Enforce crate-level ownership without pretending to parse Rust with regex."""
     allowed = {
-        "hermes-core": set(),
-        "hermes-server": {"hermes-core"},
-        "hermes-broker": {"hermes-core"},
-        "hermes-tool": {"hermes-core"},
-        "hermes-wasm": {"hermes-core"},
+        "summa-core": set(),
+        "summa-server": {"summa-core", "summa-proto"},
+        "summa-broker": {"summa-core", "summa-proto"},
+        "summa-proto": set(),
+        "summa-tool": {"summa-core"},
+        "summa-wasm": {"summa-core"},
     }
     workspace = tomllib.loads((root / "Cargo.toml").read_text())
     workspace_deps = workspace["workspace"]["dependencies"]
@@ -54,11 +55,11 @@ def contracts(root=ROOT):
                     name = (
                         spec.get("package", alias) if isinstance(spec, dict) else alias
                     )
-                    if name.startswith("hermes-") and name not in permitted:
+                    if name.startswith("summa-") and name not in permitted:
                         errors.append(
                             f"{package}: {kind} on {name} violates search ownership"
                         )
-                    if package == "hermes-core" and name in {"tonic", "prost", "clap"}:
+                    if package == "summa-core" and name in {"tonic", "prost", "clap"}:
                         errors.append(
                             f"{package}: transport/CLI dependency {name} belongs in an adapter"
                         )
@@ -84,7 +85,7 @@ def commands(args):
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             args.bench,
             "--",
@@ -109,13 +110,13 @@ def commands(args):
             "-D",
             "warnings",
         ],
-        ["cargo", "test", "--locked", *packages, "--features", "hermes-core/metrics"],
+        ["cargo", "test", "--locked", *packages, "--features", "summa-core/metrics"],
         [
             "cargo",
             "check",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--no-default-features",
             "--features",
             "native",
@@ -123,7 +124,7 @@ def commands(args):
         ],
     ]
     # Check the broker alone: workspace feature unification enables core writers.
-    steps.append(["cargo", "check", "--locked", "-p", "hermes-broker", "--all-targets"])
+    steps.append(["cargo", "check", "--locked", "-p", "summa-broker", "--all-targets"])
     if args.mode == "full":
         steps += [
             [
@@ -131,7 +132,7 @@ def commands(args):
                 "check",
                 "--locked",
                 "-p",
-                "hermes-core",
+                "summa-core",
                 "--no-default-features",
                 "--lib",
             ],
@@ -141,16 +142,16 @@ def commands(args):
                 "build",
                 "--locked",
                 "-p",
-                "hermes-server",
+                "summa-server",
                 "--bin",
-                "hermes-server",
+                "summa-server",
             ],
             [
                 "cargo",
                 "test",
                 "--locked",
                 "-p",
-                "hermes-broker",
+                "summa-broker",
                 "--test",
                 "e2e_real_server",
                 "--",
@@ -202,8 +203,8 @@ def environment():
                 "CARGO_BUILD_JOBS",
                 "CRITERION_HOME",
                 "RAYON_NUM_THREADS",
-                "HERMES_PIN_MODE",
-                "HERMES_PIN_METADATA_BUDGET_MB",
+                "SUMMA_PIN_MODE",
+                "SUMMA_PIN_METADATA_BUDGET_MB",
             )
         },
     }

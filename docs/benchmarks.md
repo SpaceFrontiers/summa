@@ -10,32 +10,32 @@ Criterion targets accept a name filter after `--` and write statistical reports
 under `target/criterion/` (or `$CARGO_TARGET_DIR/criterion/`). Standalone targets
 have their own CLI or environment variables and print reports to stdout.
 
-| Package        | Target                | Harness                | Measures                                                                           |
-| -------------- | --------------------- | ---------------------- | ---------------------------------------------------------------------------------- |
-| `hermes-core`  | `compression`         | Criterion              | Zstd encode/decode across sizes and levels                                         |
-| `hermes-core`  | `indexing`            | Criterion              | Text ingestion, commit, and document storage                                       |
-| `hermes-core`  | `posting_compression` | Criterion              | Standalone posting codecs, distributions, seek, decode, and summary                |
-| `hermes-core`  | `vector_indexing`     | Criterion              | Coarse training, TQ block scoring, and IVF-TQ query plans                          |
-| `hermes-core`  | `binary_vectors`      | Criterion              | Hamming kernels and binary coarse routing/build assignment                         |
-| `hermes-core`  | `scann_vectors`       | Criterion              | Persisted float/binary ScaNN routing and FastScan scoring                          |
-| `hermes-core`  | `dense_ann`           | Criterion              | Float routing, on-disk IVF-TQ search, and exact scoring kernels                    |
-| `hermes-core`  | `bmp_vs_maxscore`     | Criterion              | Synthetic sparse retrieval, recall, latency, and build cost                        |
-| `hermes-core`  | `bmp_hot_path`        | Criterion              | Wide-query BMP executor hot paths                                                  |
-| `hermes-core`  | `bmp_reorder`         | Standalone             | Sparse latency/quality before and after reorder                                    |
-| `hermes-core`  | `bmp_payload_layout`  | Criterion              | Sparse payload layouts under diffuse/clustered locality                            |
-| `hermes-core`  | `core_structures`     | Criterion              | Production posting containers, collectors, fast fields, and directories            |
-| `hermes-core`  | `collector_selection` | Criterion              | Heap, bounded partial selection, and loser-tree collection with threshold feedback |
-| `hermes-core`  | `search_pipeline`     | Criterion              | Multi-segment text/vector/fusion search plumbing                                   |
-| `hermes-core`  | `rust_hot_paths`      | Criterion              | Range materialization, closures, and code-generation probes                        |
-| `hermes-core`  | `segment_merge`       | Criterion              | RAM segment merges, deleted-row compaction, and PK deletion commits                |
-| `hermes-core`  | `hermes_benchmark`    | Standalone             | Dataset-driven dense MRL/nprobe, sparse, and single-term BM25 evaluation           |
-| `hermes-llm`   | `moe_layer`           | Standalone; Linux CUDA | MoE forward/backward with and without router losses                                |
-| `hermes-llm`   | `moe_primitives`      | Standalone; Linux CUDA | Routing, packing, and expert-kernel costs                                          |
-| `hermes-llm`   | `memory_reserve`      | Standalone             | Paired static/dormant and active-slot memory overhead                              |
-| `hermes-train` | `wake_tier_step`      | Standalone             | Complete wake step at due/non-due memory-tier clocks                               |
+| Package       | Target                | Harness                | Measures                                                                           |
+| ------------- | --------------------- | ---------------------- | ---------------------------------------------------------------------------------- |
+| `summa-core`  | `compression`         | Criterion              | Zstd encode/decode across sizes and levels                                         |
+| `summa-core`  | `indexing`            | Criterion              | Text ingestion, commit, and document storage                                       |
+| `summa-core`  | `posting_compression` | Criterion              | Standalone posting codecs, distributions, seek, decode, and summary                |
+| `summa-core`  | `vector_indexing`     | Criterion              | Coarse training, TQ block scoring, and IVF-TQ query plans                          |
+| `summa-core`  | `binary_vectors`      | Criterion              | Hamming kernels and binary coarse routing/build assignment                         |
+| `summa-core`  | `scann_vectors`       | Criterion              | Persisted float/binary ScaNN routing and FastScan scoring                          |
+| `summa-core`  | `dense_ann`           | Criterion              | Float routing, on-disk IVF-TQ search, and exact scoring kernels                    |
+| `summa-core`  | `bmp_vs_maxscore`     | Criterion              | Synthetic sparse retrieval, recall, latency, and build cost                        |
+| `summa-core`  | `bmp_hot_path`        | Criterion              | Wide-query BMP executor hot paths                                                  |
+| `summa-core`  | `bmp_reorder`         | Standalone             | Sparse latency/quality before and after reorder                                    |
+| `summa-core`  | `bmp_payload_layout`  | Criterion              | Sparse payload layouts under diffuse/clustered locality                            |
+| `summa-core`  | `core_structures`     | Criterion              | Production posting containers, collectors, fast fields, and directories            |
+| `summa-core`  | `collector_selection` | Criterion              | Heap, bounded partial selection, and loser-tree collection with threshold feedback |
+| `summa-core`  | `search_pipeline`     | Criterion              | Multi-segment text/vector/fusion search plumbing                                   |
+| `summa-core`  | `rust_hot_paths`      | Criterion              | Range materialization, closures, and code-generation probes                        |
+| `summa-core`  | `segment_merge`       | Criterion              | RAM segment merges, deleted-row compaction, and PK deletion commits                |
+| `summa-core`  | `summa_benchmark`     | Standalone             | Dataset-driven dense MRL/nprobe, sparse, and single-term BM25 evaluation           |
+| `summa-llm`   | `moe_layer`           | Standalone; Linux CUDA | MoE forward/backward with and without router losses                                |
+| `summa-llm`   | `moe_primitives`      | Standalone; Linux CUDA | Routing, packing, and expert-kernel costs                                          |
+| `summa-llm`   | `memory_reserve`      | Standalone             | Paired static/dormant and active-slot memory overhead                              |
+| `summa-train` | `wake_tier_step`      | Standalone             | Complete wake step at due/non-due memory-tier clocks                               |
 
-Sources: [core benches](../hermes-core/benches/),
-[LLM benches](../hermes-llm/benches/), and [training benches](../hermes-train/benches/).
+Sources: [core benches](../summa-core/benches/),
+[LLM benches](../summa-llm/benches/), and [training benches](../summa-train/benches/).
 `uv run scripts/check_docs.py` checks this inventory against the Cargo manifests.
 
 ## CPU microbenchmarks
@@ -47,21 +47,21 @@ ten samples after warmup. The deliberately high term frequencies stress phrase
 intersection; it is not a production-query or recall benchmark.
 
 ```bash
-cargo build --locked --release -p hermes-core --example bm25_execution_benchmark
+cargo build --locked --release -p summa-core --example bm25_execution_benchmark
 # macOS: process peak RSS includes fixture construction, not only query scratch.
 /usr/bin/time -l target/release/examples/bm25_execution_benchmark
 ```
 
 ```bash
 # Compile all core benchmark targets without running their workloads.
-cargo bench --locked -p hermes-core --no-run
+cargo bench --locked -p summa-core --no-run
 
 # Production posting containers and ScaNN FastScan kernels.
-cargo bench --locked -p hermes-core --bench core_structures -- block_postings
-cargo bench --locked -p hermes-core --bench scann_vectors -- scann_fast_scan/score_block
+cargo bench --locked -p summa-core --bench core_structures -- block_postings
+cargo bench --locked -p summa-core --bench scann_vectors -- scann_fast_scan/score_block
 
 # A short exploratory run; use longer repeated runs for published evidence.
-cargo bench --locked -p hermes-core --bench vector_indexing -- \
+cargo bench --locked -p summa-core --bench vector_indexing -- \
   ivf_ --warm-up-time 1 --measurement-time 3 --noplot
 ```
 
@@ -85,15 +85,15 @@ in ignored workspace evidence.
 
 ## Dense ANN quality and latency
 
-The ignored release-mode tests in [tq_bench.rs](../hermes-core/src/index/tests/tq_bench.rs)
+The ignored release-mode tests in [tq_bench.rs](../summa-core/src/index/tests/tq_bench.rs)
 compare flat exact search, TQ, IVF-TQ, and selective SOAR using synthetic
 clustered vectors. They resolve stored corpus IDs after merging and report
 recall, p50/p95, sequential query throughput, vector bytes, and build/train time.
 
 ```bash
-cargo test --locked --release -p hermes-core tq_dense_ann_benchmark -- \
+cargo test --locked --release -p summa-core tq_dense_ann_benchmark -- \
   --ignored --nocapture
-cargo test --locked --release -p hermes-core ivf_tq_selective_soar_benchmark -- \
+cargo test --locked --release -p summa-core ivf_tq_selective_soar_benchmark -- \
   --ignored --nocapture
 ```
 
@@ -106,7 +106,7 @@ below the training floor can remain flat.
 
 ## Dataset-driven retrieval
 
-The [unified harness](../hermes-core/benches/hermes_benchmark/main.rs) is a
+The [unified harness](../summa-core/benches/summa_benchmark/main.rs) is a
 Cargo **bench target**, not an installable binary. Its required inputs are:
 
 - `dense_embeddings.bin` and `dense_queries.bin`: little-endian `u32` row count,
@@ -116,8 +116,8 @@ Cargo **bench target**, not an installable binary. Its required inputs are:
 
 Optional sparse, text, and qrels files add other evaluation rows. Their corpus
 and query ordering must match the dense files; count validation cannot detect
-a permutation. The [loaders](../hermes-core/benches/hermes_benchmark/data.rs)
-and [generator](../hermes-core/benches/generate_benchmark_data.py) define their formats.
+a permutation. The [loaders](../summa-core/benches/summa_benchmark/data.rs)
+and [generator](../summa-core/benches/generate_benchmark_data.py) define their formats.
 
 The generator downloads datasets/models and uses a configured Triton Jina-v3
 embedding service. Set `TRITON_URL` and `TRITON_API_KEY` in the environment.
@@ -127,12 +127,12 @@ Install its dependencies in a dedicated environment first:
 uv venv .context/benchmark-venv
 uv pip install --python .context/benchmark-venv/bin/python \
   'tritonclient[grpc]' transformers datasets numpy tqdm torch
-.context/benchmark-venv/bin/python hermes-core/benches/generate_benchmark_data.py \
+.context/benchmark-venv/bin/python summa-core/benches/generate_benchmark_data.py \
   --use-beir --num-docs 100000 --num-queries 1000 \
   --output-dir "$PWD/.context/benchmark-data"
 
 BENCHMARK_DATA="$PWD/.context/benchmark-data" DENSE_DIM=256 NUM_QUERIES=1000 \
-  cargo bench --locked -p hermes-core --bench hermes_benchmark
+  cargo bench --locked -p summa-core --bench summa_benchmark
 ```
 
 Pin and record the Python packages, dataset revision, model revisions, service
@@ -141,7 +141,7 @@ configuration, and generated file checksums for a published run. The generator's
 uses `ground_truth_dense_full.bin`. `generate_embeddings.py` creates a separate
 synthetic embedding fixture and is not a substitute for this dataset generator.
 
-`BENCHMARK_DATA` defaults to `hermes-core/benches/benchmark_data`, anchored to
+`BENCHMARK_DATA` defaults to `summa-core/benches/benchmark_data`, anchored to
 the crate directory. `DENSE_DIM` defaults to 256 (clamped to the input dimension)
 and `NUM_QUERIES` defaults to all queries; the latter applies to all modalities.
 Missing or unreadable required data makes the harness fail.
@@ -165,9 +165,9 @@ The two MoE executables require Linux CUDA and exit unsuccessfully on CPU or
 Metal. Use `training-fusion` for the published MoE training configuration:
 
 ```bash
-cargo bench --locked -p hermes-llm --bench moe_layer --features training-fusion -- \
+cargo bench --locked -p summa-llm --bench moe_layer --features training-fusion -- \
   --tokens 8192 --warmup 20 --iterations 100
-cargo bench --locked -p hermes-llm --bench moe_primitives --features training-fusion -- \
+cargo bench --locked -p summa-llm --bench moe_primitives --features training-fusion -- \
   --tokens 8192 --warmup 20 --iterations 100
 ```
 
@@ -178,9 +178,9 @@ separately, and compare identical model geometry, dtype, and loss modes.
 The embedded memory models support local CPU smoke runs:
 
 ```bash
-cargo bench --locked -p hermes-llm --bench memory_reserve -- \
+cargo bench --locked -p summa-llm --bench memory_reserve -- \
   --tokens 16 --warmup 3 --iterations 10
-cargo bench --locked -p hermes-train --bench wake_tier_step -- \
+cargo bench --locked -p summa-train --bench wake_tier_step -- \
   --batch-size 2 --sequence-length 8 --warmup 3 --iterations 10
 ```
 
@@ -190,14 +190,14 @@ model and output paths below are expanded by your shell at the repository
 root, so the benchmark finds the shared model definitions:
 
 ```bash
-cargo bench --locked -p hermes-llm --bench memory_reserve --features training-fusion -- \
-  --model "$PWD/hermes-mal/well-known/retriever_300m_moe_sleep.mal" \
-  --baseline-model "$PWD/hermes-mal/well-known/retriever_300m_moe.mal" \
+cargo bench --locked -p summa-llm --bench memory_reserve --features training-fusion -- \
+  --model "$PWD/summa-mal/well-known/retriever_300m_moe_sleep.mal" \
+  --baseline-model "$PWD/summa-mal/well-known/retriever_300m_moe.mal" \
   --tokens 8192 --tier 0 --max-active 2 --require-cuda --enforce \
   --output "$PWD/.context/memory-reserve-cuda.json"
 
-cargo bench --locked -p hermes-train --bench wake_tier_step --features cuda -- \
-  --model "$PWD/hermes-mal/well-known/retriever_300m_moe_sleep.mal" \
+cargo bench --locked -p summa-train --bench wake_tier_step --features cuda -- \
+  --model "$PWD/summa-mal/well-known/retriever_300m_moe_sleep.mal" \
   --batch-size 4 --sequence-length 1024 --periods 100,400,3200 \
   --non-due-clock 99 --due-clock 100 --require-cuda \
   --output "$PWD/.context/wake-tier-step-cuda.json"
@@ -210,11 +210,11 @@ includes the optimizer path; memory-reserve timing measures model-only cost.
 
 ## Server load and training evaluation
 
-The [Python stress runner](../hermes-client-python/stress_test/main.py) measures
+The [Python stress runner](../summa-client-python/stress_test/main.py) measures
 concurrent indexing and search against a running gRPC server:
 
 ```bash
-(cd hermes-client-python && uv run --locked python -m stress_test.main --help)
+(cd summa-client-python && uv run --locked python -m stress_test.main --help)
 ```
 
 Use a dedicated test server and index: the runner creates/indexes data and can
@@ -255,7 +255,7 @@ merge 1024-row source segments, and delete respectively one contiguous quarter
 or every fourth row. Setup, deletion publication and count validation occur
 outside timing. Compaction uses a 32 MiB scratch budget and a RAM directory.
 
-Set `HERMES_COMPACTION_BYTES=/path/prefix` to capture each validated `.fast`
+Set `SUMMA_COMPACTION_BYTES=/path/prefix` to capture each validated `.fast`
 output as `prefix-{pattern}-{rows}.fast`. Different legal block boundaries can
 change complete-file bytes; compare copied source blocks byte-for-byte and all
 decoded values in regression tests. Measure process peak RSS separately from
@@ -271,20 +271,20 @@ See the [measured results](search-benchmark-results.md) and
 Build the native adapter and validate it before attaching it to upstream:
 
 ```bash
-cargo build --locked --release -p hermes-core --example search_benchmark_game
+cargo build --locked --release -p summa-core --example search_benchmark_game
 # Protocol smoke gate: exact counts against direct token matching plus the
 # pruned-vs-exhaustive VERIFY check. Run it after any adapter or query change.
 python3 scripts/search_benchmark/smoke.py target/release/examples/search_benchmark_game
 # Download/transform the corpus with the pinned upstream repository first.
-target/release/examples/search_benchmark_game index /path/to/new-hermes-index < /path/to/corpus.json
-# Copy scripts/search_benchmark/Makefile to upstream engines/hermes/Makefile.
+target/release/examples/search_benchmark_game index /path/to/new-summa-index < /path/to/corpus.json
+# Copy scripts/search_benchmark/Makefile to upstream engines/summa/Makefile.
 # Run from the upstream checkout, with absolute paths:
-HERMES_BENCH_BINARY=/path/to/search_benchmark_game HERMES_BENCH_INDEX=/path/to/hermes-index \
-  make bench ENGINES='hermes tantivy-0.26' NUM_ITER=10 WARMUP_TIME=60 \
+SUMMA_BENCH_BINARY=/path/to/search_benchmark_game SUMMA_BENCH_INDEX=/path/to/summa-index \
+  make bench ENGINES='summa tantivy-0.26' NUM_ITER=10 WARMUP_TIME=60 \
     COMMANDS='TOP_10 TOP_100 TOP_1000 TOP_100_COUNT COUNT'
 ```
 
-`COUNT` and `TOP_*_COUNT` disable pruning through Hermes' exhaustive collector.
+`COUNT` and `TOP_*_COUNT` disable pruning through Summa' exhaustive collector.
 `VERIFY` checks pruned top-10, top-100, and top-1000 against exhaustive results
 outside timing. All
 operations require one merged segment for the comparison. Unsupported syntax
@@ -292,7 +292,7 @@ fails; unsupported protocol commands return `UNSUPPORTED`.
 
 For paired runs, build both Rust engines with the same compiler and release
 settings. The upstream Tantivy example enables LTO, so use
-`CARGO_PROFILE_RELEASE_LTO=true RUSTFLAGS='-C target-cpu=native'` for Hermes too.
+`CARGO_PROFILE_RELEASE_LTO=true RUSTFLAGS='-C target-cpu=native'` for Summa too.
 The adapter accepts `--indexing-threads`, `--indexing-memory-bytes`,
 `--posting-codec rounded|packed|pfor|simd4x`, `--term-dict-block-bytes`, and
 `--no-background-merges` when building an index. The opt-in
@@ -300,7 +300,7 @@ The adapter accepts `--indexing-threads`, `--indexing-memory-bytes`,
 score-independent block bounds on new segments. Serving accepts
 `--term-cache-blocks`, `--term-cache-bytes`, `--posting-validation-cache-bytes`,
 and `--exhaustive`; pass serving options with
-`HERMES_BENCH_ARGS`. Defaults and limits are documented in the
+`SUMMA_BENCH_ARGS`. Defaults and limits are documented in the
 [protocol](search-benchmark-game.md#runtime-controls).
 
 Preserve the upstream `results.json` after each run; the next run overwrites it.

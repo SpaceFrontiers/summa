@@ -1,4 +1,4 @@
-# Search Benchmark, the Game: Hermes comparison
+# Search Benchmark, the Game: Summa comparison
 
 ## Protocol and current scope
 
@@ -14,14 +14,14 @@ The initial adapter is an example executable using the normal `IndexWriter`,
 only the upstream line protocol. Malformed
 syntax must fail explicitly. It stores the corpus ID, indexes positioned text,
 and stores the numeric sort column as a fast field, matching the upstream schema.
-All three engines force merge to one segment; search uses one CPU. Hermes and
+All three engines force merge to one segment; search uses one CPU. Summa and
 Tantivy index with four workers and a 2,000,000,000-byte builder budget. Lucene
 retains its upstream eight workers (`availableProcessors`) and 1024 MiB writer
 RAM buffer. These are different resource controls, not process RSS caps, and
 initial index builds overlapped; no cross-engine indexing-speed claim is made.
 Index sizes and peak RSS include each engine's own format overhead.
 
-Hermes' existing `search_with_count` returns **scored documents**, not exact hit
+Summa' existing `search_with_count` returns **scored documents**, not exact hit
 counts. Never report that counter as an exact count. `COUNT` and `TOP_*_COUNT` use
 the existing `collect_segment` API with `CountCollector` and a `TopKCollector`
 tuple. That API preserves exact counts and ranked results. Eligible collectors
@@ -55,7 +55,7 @@ masked ranked-search or deletion-publication performance.
 
 ## Measurement plan
 
-Run Hermes and upstream Tantivy 0.26, then Lucene 10.4.0 where its build is
+Run Summa and upstream Tantivy 0.26, then Lucene 10.4.0 where its build is
 available, on the same dedicated Linux machine. Pin compiler and release flags
 (`-C target-cpu=native` for both Rust engines). Keep upstream query order,
 commands, warmup and repetitions, retaining all samples as well as its minimum
@@ -115,7 +115,7 @@ search_benchmark_game <index|serve|validate-queries> <path> [--exhaustive]
   [--posting-ratio-bounds] [--posting-impact-bounds] [--no-background-merges]
 ```
 
-The ratio-bound option `--posting-ratio-bounds` (also `hermes-tool index` and
+The ratio-bound option `--posting-ratio-bounds` (also `summa-tool index` and
 `IndexConfig.posting_ratio_bounds`) is off by default. New segments carry
 score-independent block metadata; queries detect it automatically. Existing
 segments keep their original bounds, and compatible merges preserve either
@@ -143,7 +143,7 @@ shared parser; the default remains rounded. Codec experiments use a separately
 rebuilt index and are labeled separately from same-index execution changes.
 `--term-dict-block-bytes N` sets the uncompressed term-dictionary block target
 for the build (512..=1048576, default 16384), the same
-`IndexConfig.term_dict_block_size` that `hermes-tool index` exposes.
+`IndexConfig.term_dict_block_size` that `summa-tool index` exposes.
 `--term-cache-blocks N` exposes the existing per-segment dictionary-block cache
 capacity (0 disables it, maximum 65,536 enforced by `IndexConfig` at open,
 unchanged default 256). This budgets
@@ -166,7 +166,7 @@ uses document frequency for a deletion-free term count, a buffered docset loop
 when scores are unnecessary, and single-scorer block WAND for ranked terms.
 Its [Boolean weight](https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/query/boolean_query/boolean_weight.rs)
 separates score-free unions from ranked block WAND. These are general query and
-collector distinctions, not special cases for this query list. Hermes should
+collector distinctions, not special cases for this query list. Summa should
 preserve the same distinction between exact membership and competitive scoring
 while reusing its own posting codecs and matching semantics.
 
@@ -250,13 +250,13 @@ Reference engines keep the analyzers in their upstream adapters. Tantivy's
 [default analyzer](https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/tokenizer/tokenizer_manager.rs)
 includes `RemoveLongFilter::limit(40)`. Lucene's adapter uses an empty stop list
 with [StandardAnalyzer](https://github.com/apache/lucene/blob/releases/lucene/10.4.0/lucene/core/src/java/org/apache/lucene/analysis/standard/StandardAnalyzer.java),
-whose default maximum token length is 255 (longer tokens are split). Hermes'
+whose default maximum token length is 255 (longer tokens are split). Summa'
 simple tokenizer retains the transformed ASCII tokens without those limits.
 These defaults can affect vocabulary, field lengths, index size, and scores.
-Do not claim identical BM25 rankings across engines or introduce a Hermes-only
+Do not claim identical BM25 rankings across engines or introduce a Summa-only
 corpus filter to improve timing. Exact hit counts are compared on every measured
-query, and Hermes ranking is checked against its own exhaustive scorer. Field
-length quantization also remains engine-specific. Hermes and Tantivy use
+query, and Summa ranking is checked against its own exhaustive scorer. Field
+length quantization also remains engine-specific. Summa and Tantivy use
 BM25 k1=1.2, b=0.75; the pinned Lucene adapter explicitly uses k1=0.9, b=0.4.
 Keep that upstream configuration and disclose it: the Lucene comparison follows
 the benchmark protocol, but is not a comparison of identical scoring functions.
@@ -323,7 +323,7 @@ follow from one host. Rebuilding may also affect document layout, so isolate
 individual codec CPU costs with production-block benchmarks before attributing
 all query timing changes to compression alone.
 
-A separate proposal worth measuring is tighter block score metadata. Hermes
+A separate proposal worth measuring is tighter block score metadata. Summa
 currently combines maximum TF and minimum length, which can come from different
 documents. That is conservative but can substantially overestimate a block's
 best BM25 score. Lucene's
@@ -331,7 +331,7 @@ best BM25 score. Lucene's
 retains competitive frequency/length pairs. Reusing that established model could
 provide tighter bounds while allowing scoring parameters and global collection
 statistics to change. This is an inference from the designs, not a measured
-Hermes speedup or an implemented format change. An experiment must first measure
+Summa speedup or an implemented format change. An experiment must first measure
 bounds versus actual block maxima and decoding avoided; then budget metadata,
 version the representation, preserve compatible block-copy merges, and verify
 exact scores under deletions, mixed segments, global statistics, and custom
@@ -340,7 +340,7 @@ benchmark's scoring function into stored maximum scores.
 
 The position stream is a separate compression opportunity: its existing 128-value
 blocks round widths to 0, 8, 16 or 32 bits. On this corpus `.pos` accounts for
-2,871,883,607 bytes (54% of the Hermes index), so posting-codec experiments cannot
+2,871,883,607 bytes (54% of the Summa index), so posting-codec experiments cannot
 resolve most of that cost. A future position-codec experiment should reuse the
 existing bounded exact-width and PFor kernels rather than add another bit packer.
 Use an explicitly versioned stream with a per-block codec tag and preserve the
@@ -430,14 +430,14 @@ unaligned slices, every short tail, protected-page input extents, endian behavio
 PFor exception reconstruction and sync/WASM parity, then rerun same-index query
 benchmarks. Multi-lane bit-pack layouts are not interchangeable with the current
 horizontal payload. The final measured engine retains its validated decoder;
-this probe adds no dependency or format change to Hermes.
+this probe adds no dependency or format change to Summa.
 
 ## Dictionary block-size and cache-byte experiment
 
 The current dictionary writer targets 16 KiB of uncompressed entries per STB5
 block. Existing full-corpus profiles spend substantial single-term COUNT time in
 Zstd. Lucene's smaller term blocks motivate measuring smaller units of decoding;
-we will first reuse Hermes's Zstd codec and restart/index format.
+we will first reuse Summa's Zstd codec and restart/index format.
 
 A validated `SSTableBlockSize` value permits targets from 512 bytes to 1 MiB,
 with the existing 16 KiB default. It is a flush target, not a maximum entry size;
@@ -589,7 +589,7 @@ with scalar advance/seek across dense and skewed terms, nested unions/conjunctio
 empty intersections, high document IDs, deletions and sync/async execution.
 Measure the same frozen index/compiler/flags before and after on ARM and x86,
 retaining all ranked commands as controls. No production storage/cache defaults
-change. This is subsequent work beyond frozen `hermes-zstd-capacity-v1`.
+change. This is subsequent work beyond frozen `summa-zstd-capacity-v1`.
 
 The verifier must independently request score-free `COUNT`, exhaustive `VERIFY`
 and Tantivy `COUNT` for each query before timing. A ranked top-k-plus-count
@@ -701,7 +701,7 @@ candidates still require all terms; failed candidates stop at their first witnes
 [Tantivy 0.26's intersection](https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/query/intersection.rs)
 orders drivers by cost and restarts on rejection; its
 [phrase scorer](https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/query/phrase_query/phrase_scorer.rs)
-uses that intersection. Hermes will retain its own documented phrase/slop rules.
+uses that intersection. Summa will retain its own documented phrase/slop rules.
 This is an unmeasured proposal. Acceptance requires complete-workload timings,
 exact counts and exhaustive top-k gates on x86 and ARM, including merged streams.
 
@@ -1040,12 +1040,12 @@ are in progress.
 ### Proposed block-WAND for short text unions
 
 The completed compact-conjunction comparison separates execution by query shape:
-198 regular two-term unions take 880.244 µs in Hermes versus 392.545 µs in
+198 regular two-term unions take 880.244 µs in Summa versus 392.545 µs in
 Tantivy; 83 three-term unions take 1550.570/1223.131 µs; 18 regular longer
 unions take 2646.073/2744.842 µs. These are geometric means of per-query medians
 on the same full-corpus run. The data motivates selecting different traversal
 algorithms by public query shape, without consulting query text or expected
-answers. It does not establish that WAND will be faster in Hermes.
+answers. It does not establish that WAND will be faster in Summa.
 
 Prototype two-term block-WAND inside the existing ranked executor. Keep semantic
 conjunctions, standalone terms and the compact low-density union path ahead of
@@ -1091,7 +1091,7 @@ position relationship. Long phrases therefore pay for payload reads that an
 empty intermediate intersection could make unnecessary. Tantivy 0.26's
 `PhraseScorer::compute_phrase_match` intersects positions incrementally and exits
 when the intermediate result is empty. The same general execution policy is
-applicable here, but Hermes must retain its own first-term occurrence and slop
+applicable here, but Summa must retain its own first-term occurrence and slop
 semantics; Tantivy's slop algorithm is not interchangeable.
 
 For zero-slop phrases with at least two terms, retain original first-term starts
@@ -1134,11 +1134,11 @@ intended effects. They do not change encoded bytes.
 ### Proposed phrase planning by selectivity (diagnostic prototype)
 
 The isolated ARM decoded-work trace finds identical requested-position totals
-for all 198 two-term phrases (195,149 values per engine), but Hermes requests
+for all 198 two-term phrases (195,149 values per engine), but Summa requests
 64,844 versus 31,908 for three-term phrases and 237,753 versus 46,151 for longer
 phrases. These are aggregate logical work counts, not latency, and the native
 100k indexes have their documented engine-specific build/order differences.
-Both adapters preserve all 1,676 exact counts; instrumented Hermes also preserves
+Both adapters preserve all 1,676 exact counts; instrumented Summa also preserves
 its exhaustive ordered ID/score-bit oracle on canonical and merged fixtures.
 
 The current phrase scorer chooses the rarest posting lead but probes the other
@@ -1160,7 +1160,7 @@ The public candidate remains frozen until evidence justifies a replacement.
 
 The first diagnostic prototype reduces phrase document-block decodes from
 15,984 to 12,320 and requested positions from 497,746 to 304,139, compared
-with the frozen incremental-position candidate on the same Hermes ARM index.
+with the frozen incremental-position candidate on the same Summa ARM index.
 All 1,676 counts and exhaustive ranking gates pass on both fixtures. However,
 three-term requests remain excessive because forcing original term zero to the
 end ignores its intermediate selectivity. The revised proposal permits it to
@@ -1173,7 +1173,7 @@ These observations are work counts, not latency or a full-corpus result.
 
 The revised diagnostic planner now requests exactly Tantivy's 273,208 positions
 across all 300 ARM phrases, including identical totals in each phrase-length
-group, versus the frozen Hermes candidate's 497,746. Posting-block decodes are
+group, versus the frozen Summa candidate's 497,746. Posting-block decodes are
 12,320 versus 15,984; position-block decodes are 10,884 versus 15,631.
 Independent cross-source oracles compare all ordered top-1000 document IDs,
 raw score bits and exact counts between the prior deferred-frequency build,

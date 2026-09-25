@@ -1,10 +1,10 @@
 [package]
-name = "hermes-copy-after"
+name = "summa-copy-after"
 version = "0.0.0"
 edition = "2024"
 [workspace]
 [dependencies]
-hermes-core = { path = "../../../../hermes-core" }
+summa-core = { path = "../../../../summa-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 memmap2 = "0.9"
 serde_json = "1"

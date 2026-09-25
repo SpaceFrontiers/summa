@@ -1,3 +1,34 @@
+# Summa 2 namespace release — 2026-09-25
+
+The [migration guide](summa-2-migration.md) records the breaking package, RPC,
+configuration, metrics, browser-storage and training-artifact namespaces. This
+change carries forward development main at `337db5d390572bf1653e17b9987850b28aecd481`.
+Search-index format versions and binary fixtures are unchanged. The TQ
+fingerprint regression initially detected a changed domain prefix; freezing its
+precomputed FNV seed restores the existing persisted fingerprint without a
+branding-dependent string. Both protocol schemas differ only in namespace text;
+field numbers and types are unchanged. Server and broker packages obtain their
+build inputs from the single `summa-proto` source crate.
+
+The search `check` harness passes all five stages, including strict Clippy,
+2,075 tests (25 ignored), native-without-sync and standalone broker compilation.
+The WASM release build and 41 JavaScript tests pass; TypeScript has 17 passing
+tests, Model Lab has seven, and the search UI has two. Both web applications
+build. Documentation links and package source builds pass. Full RPC validation
+is recorded below once complete. No performance improvement is claimed or
+benchmark defaults changed.
+
+Historical evidence labels were mechanically renamed. The retained split ZIP
+has regenerated member/archive checksums and records its original capture hash;
+its analysis still reproduces the reported numerical measurements. External
+capture hashes continue to identify original artifacts. The chart plot pixels
+are retained with replacement vector axis labels, avoiding regenerated curves.
+
+Remaining review item: broader GPU/backend CI is required for the renamed ML
+crates; local search checks do not establish accelerator support or measure
+runtime performance. Package publication and Pages deployment must be verified
+against their public destinations after the repository replacement.
+
 # Core/server review — 2026-09-05
 
 September 24 expanded-query follow-up: [the completed 826-query coverage and skipping campaign](benchmark-results/skipping-2026-09-24/README.md)
@@ -87,7 +118,7 @@ deprecations in `tokenizer/mod.rs`, because it treats warnings as errors.
 
 September 23 follow-up: the shared stop-word language mapping now uses
 `stop_words::Language`, imported as `StopWordLanguage` to distinguish it from
-Hermes's own `Language`. Comparing the old and new APIs for all 18 supported
+Summa's own `Language`. Comparing the old and new APIs for all 18 supported
 languages confirms byte-identical stop-word lists. Both APIs are generated from
 the same upstream enum definition; tokenizer behavior, serialized formats and
 allocation costs are unchanged. Strict search-stack and full-workspace Clippy
@@ -192,7 +223,7 @@ It is not a claim that every algorithm in the search stack has been audited.
 | Priority    | Finding and trigger                                                                                                                                                       | Change and evidence                                                                                                                                                                                                                      |
 | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | P1          | `GetTextStats` bypassed search shape validation and admission; deeply nested queries and concurrent statistics calls could reach expensive work outside the search limits | Reuse the query-shape walker and shared search permit before index open. Two RPC-level regressions first returned `NotFound` where `InvalidArgument`/`ResourceExhausted` were required; now they enforce the boundary and permit release |
-| P1          | `HERMES_PIN_METADATA_BUDGET_MB=u64::MAX` overflowed multiplication, panicking in debug or wrapping in release; malformed values silently disabled pinning                 | Checked conversion and actionable warnings; separate-process regression covers unset, zero, valid, malformed, negative, and overflowing values without mutating global test environment                                                  |
+| P1          | `SUMMA_PIN_METADATA_BUDGET_MB=u64::MAX` overflowed multiplication, panicking in debug or wrapping in release; malformed values silently disabled pinning                  | Checked conversion and actionable warnings; separate-process regression covers unset, zero, valid, malformed, negative, and overflowing values without mutating global test environment                                                  |
 | P2          | A merge synthesized absent fast columns with document-sized vectors, ran codec estimation, serialized, and copied the result back out                                     | Emit the existing constant/empty codecs directly; one bounded missing payload per column and no second block-directory/payload-placeholder arrays                                                                                        |
 | Maintenance | Search orchestration, shape policy, hydration accounting, and hundreds of tests lived in one 1,862-line file                                                              | Extract `search_service/validation.rs`, `response.rs`, and RPC/budget tests; preserve `SearchLimits` and `QueryShapeLimits` re-exports. The service retains the request orchestration                                                    |
 
@@ -235,7 +266,7 @@ existing segment-wide map still retains its allocations. Regression coverage
 checks growing vocabulary, repeated terms, empty/unpositioned fields, both
 tokenizer paths, all three position modes, and isolation between chunks/docs.
 
-The focused fixture is `hermes-core/examples/indexing_scratch_benchmark.rs`:
+The focused fixture is `summa-core/examples/indexing_scratch_benchmark.rs`:
 1,000 eight-chunk documents after preloading 1K/10K/100K terms, excluding flush,
 ANN and merge work. Exploratory before/after runs used Rust 1.98.0 and the same
 release flags, but other CPU-heavy work ran on the shared Mac; these are not
@@ -397,7 +428,7 @@ seeks. Reading preserves the original encoded position bytes.
 
 ### Same-fixture local measurements
 
-`hermes-core/examples/bm25_execution_benchmark.rs`: 20,000 RAM documents,
+`summa-core/examples/bm25_execution_benchmark.rs`: 20,000 RAM documents,
 80,000 positioned chunks, top 40 with ordinals, one indexing/search thread,
 current-thread async entry, default release flags on the same Apple Silicon
 Mac, Rust 1.98.1 (`48a229cea`). Each run has a warmup plus ten timed searches.
@@ -515,7 +546,7 @@ library tests, and peak process RSS stayed around 95–96 MiB on that fixture.
 
 ## Benchmark evidence
 
-Fixture: `hermes-core/benches/segment_merge.rs`; two RAM segments, each with
+Fixture: `summa-core/benches/segment_merge.rs`; two RAM segments, each with
 4,096 or 65,536 documents and one multi-value numeric fast field. The control
 copies both source columns. The missing case simulates one older source without
 the optional column. Source building/opening is outside timing. Each iteration
@@ -573,7 +604,7 @@ These items are not silently treated as compliant. Their changes need the
 additional behavior/format or production-workload validation listed here.
 
 1. **P1 — Fusion drops cross-shard statistics and the text deadline.** In
-   [search_service.rs](../hermes-server/src/search_service.rs), the fusion arm
+   [search_service.rs](../summa-server/src/search_service.rs), the fusion arm
    calls `search_fused_with_count`; only the ordinary-query arm constructs and
    passes `stats_override` and `deadline`. The broker deliberately extracts text
    leaves from fusion in `partition::text_stats_query` and sends merged stats.
@@ -597,7 +628,7 @@ additional behavior/format or production-workload validation listed here.
 
 3. **P2 — First text fast-field access builds an allocation-heavy global
    dictionary.** `FastFieldReader::build_text_state` in
-   [fast_field/mod.rs](../hermes-core/src/structures/fast_field/mod.rs) clones
+   [fast_field/mod.rs](../summa-core/src/structures/fast_field/mod.rs) clones
    source strings into a `BTreeMap`, builds ordinal maps with another lookup
    pass, then serializes the global dictionary. Its “k-way/O(total_entries)”
    comment overstated the implementation and is now corrected. Prototype a heap of borrowed
@@ -846,7 +877,7 @@ Raw measurement output is `.context/l1-performance.log` in this workspace.
 The follow-up [BMP forward-search research](bmp-forward-search.md) includes primary
 literature, reproducible phase-two and whole-block kernel experiments, and explicit
 safety conditions for selective completion, filters and threshold seeding. Current
-Hermes measurements favor very small survivor sets, not replacing whole-block
+Summa measurements favor very small survivor sets, not replacing whole-block
 inverted evaluation. Retrieval defaults remain unchanged.
 
 Follow-up measurements include production per-block term masks and already-parsed
@@ -1374,7 +1405,7 @@ A broader native-without-sync chunked suite passed 16 of 17 tests and exposed
 an existing discrepancy in `filters_and_phrases_push_into_chunked_text_maxscore`:
 the async fallback includes the required phrase's ordinal 0, returning `[0, 1]`
 where the sync bitset-filter path returns `[1]`. The saved 1.8.127 test binary
-(`hermes_core-14836e5caef7dcbc`, from the previous review) fails the same test
+(`summa_core-14836e5caef7dcbc`, from the previous review) fails the same test
 identically, confirming this is not introduced by the patch. Async phrase-filter
 materialization/scoring parity remains a separate correctness follow-up.
 Evidence: `.context/filtered-body-native-async.log` and
@@ -1447,9 +1478,9 @@ ranking and collection against ordinary distributed phrase scores.
 Reproduction commands using synthetic data:
 
 ```sh
-cargo test --locked -p hermes-core --lib long_phrase_features_keep_every_term_in_ranking_and_collection
-cargo build --locked -p hermes-server --bin hermes-server
-cargo test --locked -p hermes-broker --test e2e_real_server broker_ranks_and_exports_long_phrase_features_without_dropping_terms -- --ignored
+cargo test --locked -p summa-core --lib long_phrase_features_keep_every_term_in_ranking_and_collection
+cargo build --locked -p summa-server --bin summa-server
+cargo test --locked -p summa-broker --test e2e_real_server broker_ranks_and_exports_long_phrase_features_without_dropping_terms -- --ignored
 ```
 
 The algorithm is unchanged: candidate phrase scoring keeps one posting cursor
@@ -1541,7 +1572,7 @@ The WASM release build and all 12 runtime tests passed in the separate
 `.context/l1-phrase-cap-wasm-build` directory; logs are
 `.context/phrase-cap-wasm-{build,install,tests}.log`.
 All nine candidate-scoring tests also passed with native async execution
-(`cargo test --locked -p hermes-core --no-default-features --features native --lib
+(`cargo test --locked -p summa-core --no-default-features --features native --lib
 query::candidate_scoring::tests`), including the 300-term exact-score checks:
 `.context/phrase-cap-native-async.log`.
 
@@ -1580,7 +1611,7 @@ ANN codebooks, assignments, fingerprints, and surviving codes are retained.
   IVF-TQ, binary IVF, ScaNN AH, and ScaNN binary. Sparse block tests compare raw
   weights for Float32, Float16, UInt8, and UInt4. End-to-end BMP/MaxScore tests
   compare surviving scores and chunk/value ordinals.
-- `hermes-wasm/build.sh`, `npm ci`, and `npm test -- --run` passed; the final
+- `summa-wasm/build.sh`, `npm ci`, and `npm test -- --run` passed; the final
   rebuild and 13 tests also passed after portable warning cleanup. A persisted
   indexed-only text index reopens with tombstones, hides deleted hits/hydration,
   preserves an old reader, and rejects a corrupt mask. Logs are under
@@ -1957,7 +1988,7 @@ explicit commit and whole-document/chunk semantics. The server holds the existin
 exclusive writer guard during staged mutations; four shared admission permits
 bound conversion and staging. Started blocking workers own their permit/guard
 through cancellation. Envelope limits are shared by the server and broker from
-`hermes-proto/mutations.rs`: 100,000 deletion keys / 8 MiB key bytes and 1,000
+`summa-proto/mutations.rs`: 100,000 deletion keys / 8 MiB key bytes and 1,000
 replacement documents / 32 MiB encoded bytes. Broker partition error mapping
 validates total accounting, unique error positions, and bounds; it never invents
 successful operations from an incomplete backend response. Cross-shard publication
@@ -2015,7 +2046,7 @@ Validation for the mutation-surface extension:
   `mutations-native-async-tests.log`). These include complete deletion-mask byte
   comparisons, old snapshots, merge/compaction, and cancellation regressions.
 - The portable writer's two fault-injection integration tests passed with
-  `cargo test -p hermes-core --no-default-features --features wasm --test portable_mutations`.
+  `cargo test -p summa-core --no-default-features --features wasm --test portable_mutations`.
   They exercise failed/cancelled builds and failed/cancelled metadata rename.
 - WASM release build and all 19 Vitest tests passed. Python's 13 unit tests and
   TypeScript's 14 tests passed, including the real gRPC maximum-deletion-batch
@@ -2333,7 +2364,7 @@ patch to its detached checkout:
 CARGO_TARGET_DIR="$PWD/.context/segment-l1-measure-build" CARGO_BUILD_JOBS=4 \
   cargo test --locked --release \
   --manifest-path .context/segment-l1-measure-worktree/Cargo.toml \
-  -p hermes-core --lib segment_nomination_measurement::measure --no-run
+  -p summa-core --lib segment_nomination_measurement::measure --no-run
 SEGMENT_MEASURE_OUTPUT="$PWD/.context/segment-l1-measure-results" \
   SEGMENT_MEASURE_DOCS=16384 SEGMENT_MEASURE_QUERIES=32 \
   SEGMENT_MEASURE_REPEATS=4 SEGMENT_MEASURE_THREADS=4 \
@@ -2389,9 +2420,9 @@ scoring kernels, feature assembly and formula evaluation.
 ### Measured opportunity: amortize CPU scheduling
 
 The native server awaits `score_candidates_with_retrieved_and_rrf` directly in
-`hermes-server/src/search_service.rs`. Core groups candidates by segment and
+`summa-server/src/search_service.rs`. Core groups candidates by segment and
 processes those groups sequentially in
-`hermes-core/src/query/candidate_scoring/execution.rs`. Each BMP component and
+`summa-core/src/query/candidate_scoring/execution.rs`. Each BMP component and
 each dense/binary scoring batch independently enters `install_search_cpu`.
 Consequently, a small pool spread across 16 segments can incur approximately
 30 separate synchronous CPU-pool handoffs. The text probes, feature assembly
@@ -2940,7 +2971,7 @@ Validation: `RUST_TEST_THREADS=1 python3 scripts/check_search.py check` passed
 (1588 tests, 26 existing ignores, strict Clippy, ownership checks, native build
 without sync). An earlier parallel broker run hit loopback port collisions
 (`Address already in use`); the serial rerun passed. Native async compaction tests
-passed (24, one existing ignored benchmark). `hermes-wasm/build.sh`, `npm ci`
+passed (24, one existing ignored benchmark). `summa-wasm/build.sh`, `npm ci`
 and `npm test -- --run` passed (20 tests). `full` was not run: this change does
 not alter lifecycle/RPC protocols. The existing lifecycle/concurrency regressions
 are included in the passing harness.
@@ -3019,8 +3050,8 @@ had background macOS activity and are diagnostic only.
 Reproduce the fixture (each mode in a separate process for RSS measurement):
 
 ```sh
-HERMES_CONTENT_HASH_BENCH_ENABLED=false cargo test -p hermes-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
-HERMES_CONTENT_HASH_BENCH_ENABLED=true cargo test -p hermes-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
+SUMMA_CONTENT_HASH_BENCH_ENABLED=false cargo test -p summa-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
+SUMMA_CONTENT_HASH_BENCH_ENABLED=true cargo test -p summa-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
 ```
 
 ### Validation and remaining costs
@@ -3092,8 +3123,8 @@ to individual components. No cache or indexing defaults changed.
 Reproduce (run separately per mode to measure RSS):
 
 ```sh
-HERMES_CONTENT_HASH_BENCH_DUPLICATE_PERCENT=1 HERMES_CONTENT_HASH_BENCH_ENABLED=false cargo test -p hermes-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
-HERMES_CONTENT_HASH_BENCH_DUPLICATE_PERCENT=1 HERMES_CONTENT_HASH_BENCH_ENABLED=true cargo test -p hermes-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
+SUMMA_CONTENT_HASH_BENCH_DUPLICATE_PERCENT=1 SUMMA_CONTENT_HASH_BENCH_ENABLED=false cargo test -p summa-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
+SUMMA_CONTENT_HASH_BENCH_DUPLICATE_PERCENT=1 SUMMA_CONTENT_HASH_BENCH_ENABLED=true cargo test -p summa-core --release content_hash_performance_fixture --lib -- --ignored --nocapture
 ```
 
 Omitting the percentage retains the all-unchanged workload. The new fixture
@@ -3116,12 +3147,12 @@ references. Once their last owner drops, reopening an index recreates these
 resources and previously repeated all three process-wide INFO announcements.
 Each resource kind now announces its first successful creation at INFO;
 subsequent creations, including different settings, are available at DEBUG
-(`RUST_LOG=info,hermes_core::index=debug`). Reusing a live resource stays silent.
+(`RUST_LOG=info,summa_core::index=debug`). Reusing a live resource stays silent.
 The logging state is one `OnceLock<()>` per resource kind, with no retained
 resource ownership or growing configuration history. No storage formats,
 execution policy, or resource lifetime changed.
 
-`hermes-core/tests/resource_logging.rs` exercises three open/drop cycles with
+`summa-core/tests/resource_logging.rs` exercises three open/drop cycles with
 two overlapping index handles per cycle. Before the fix, each resource emitted
 three INFO records; afterward it emits one INFO and two DEBUG records. The
 regression passes with default features and native without sync. This is log
@@ -3202,8 +3233,8 @@ Raw paired runs, process snapshots, executable hashes, environment, and scripts
 are in `.context/staged-mutations/`. Initial non-paired measurements overlapped
 other workspace benchmarks and are excluded from conclusions. Reproduce each
 workload with the ignored `content_hash_performance_fixture`, setting
-`HERMES_CONTENT_HASH_BENCH_ENABLED=true` and
-`HERMES_CONTENT_HASH_BENCH_DUPLICATE_PERCENT=1` or `100`, with the same profile on
+`SUMMA_CONTENT_HASH_BENCH_ENABLED=true` and
+`SUMMA_CONTENT_HASH_BENCH_DUPLICATE_PERCENT=1` or `100`, with the same profile on
 both revisions.
 
 ### Validation
@@ -3230,22 +3261,22 @@ Documentation links and formatting passed.
 The full 5,032,104-document corpus and all 962 official queries were measured on
 a dedicated GCloud n2-highmem-8 (Intel Xeon, 64 GiB). Search was pinned to one CPU;
 both Rust engines used rustc 1.98.1, native CPU flags and release LTO. Main
-before/after samples reuse identical Hermes index bytes, with 60-second warmup
+before/after samples reuse identical Summa index bytes, with 60-second warmup
 and ten repetitions. Latencies below are geometric means of per-query medians,
 in microseconds, including parsing and pipe transport.
 
-| Command       | Hermes before µs | Hermes after µs | Tantivy µs | Lucene µs | Before/after speedup |
-| ------------- | ---------------: | --------------: | ---------: | --------: | -------------------: |
-| TOP_10        |            2,110 |           1,485 |        552 |       558 |                1.42× |
-| TOP_100       |            2,577 |           1,772 |        720 |       774 |                1.45× |
-| TOP_1000      |            3,033 |           2,092 |        933 |     1,151 |                1.45× |
-| TOP_100_COUNT |            5,196 |           3,097 |        862 |     1,382 |                1.68× |
-| COUNT         |            5,051 |             987 |        426 |       485 |                5.12× |
+| Command       | Summa before µs | Summa after µs | Tantivy µs | Lucene µs | Before/after speedup |
+| ------------- | --------------: | -------------: | ---------: | --------: | -------------------: |
+| TOP_10        |           2,110 |          1,485 |        552 |       558 |                1.42× |
+| TOP_100       |           2,577 |          1,772 |        720 |       774 |                1.45× |
+| TOP_1000      |           3,033 |          2,092 |        933 |     1,151 |                1.45× |
+| TOP_100_COUNT |           5,196 |          3,097 |        862 |     1,382 |                1.68× |
+| COUNT         |           5,051 |            987 |        426 |       485 |                5.12× |
 
-All 962 exact counts agree with Tantivy 0.26 and Lucene 10.4.0. Pruned Hermes
+All 962 exact counts agree with Tantivy 0.26 and Lucene 10.4.0. Pruned Summa
 rankings agree with exhaustive scoring in score bits and ordered IDs at top-10,
 top-100 and top-1000. `COUNT` is exact; `--exhaustive` also disables ranking
-pruning. Hermes remains slower than both references overall. Canonical score
+pruning. Summa remains slower than both references overall. Canonical score
 arithmetic, saturated TF bounds, keyword boundaries and phrase termination
 fixes are correctness requirements, not optional speed tradeoffs.
 
@@ -3299,9 +3330,9 @@ On the full 5,032,104-document corpus, all 714 supplemental terms improve by
 2.889× for TOP_10 and 1.648× for TOP_1000 on identical persisted index bytes.
 TOP_10 improves for 713/714 terms and TOP_1000 for 705/714. The official 962-query
 ranked commands improve by only 1.8–3.2%; exact-count commands remain flat, and
-Hermes still trails Tantivy by 2.12–3.37× across the five commands. Peak process
+Summa still trails Tantivy by 2.12–3.37× across the five commands. Peak process
 RSS increases by 0.38–1.27 MiB per official command. All 1,676 final x86 query
-gates pass, including exact counts against Tantivy and ordered Hermes IDs/score
+gates pass, including exact counts against Tantivy and ordered Summa IDs/score
 bits against exhaustive scoring. These measurements use a new machine/index and
 must not be multiplied into the original report's speedups.
 
@@ -3349,7 +3380,7 @@ per-hit `doc`/`seek`/`score` dispatch into the batched accumulator and collector
 **Measured prototype result.** On the full 5,032,104-document corpus and all 962
 official queries, frozen score-window v2 improves TOP100+COUNT
 3076.521→2103.758 µs (1.462×), including 14112.282→4380.319 µs (3.222×) over all
-301 unions. Its union COUNT control is flat. Hermes still takes 2.338× Tantivy's
+301 unions. Its union COUNT control is flat. Summa still takes 2.338× Tantivy's
 time overall for TOP100+COUNT. Small changes in unaffected ranked paths include
 control drift and are not credited to batching. Matched process RSS is roughly
 964 MiB versus Tantivy's 715 MiB; RSS includes resident mmap pages, not only heap.
@@ -3498,7 +3529,7 @@ The captured first window candidate does **not** pass its performance gate.
 Full-corpus conjunction COUNT changes 750.300 → 766.975 µs (2.2% slower), versus
 Tantivy 285.112 µs. All official COUNT is flat (800.014 → 800.584 µs); TOP10 is
 also flat (1,195.120 → 1,195.209 µs). TOP100+exact count is 1,682.446 → 1,661.517 µs
-versus Tantivy 820.219 µs. Hermes still has a systemic roughly twofold gap.
+versus Tantivy 820.219 µs. Summa still has a systemic roughly twofold gap.
 The 714-term control remains about 4.6× slower for TOP10. Full raw data and
 unchanged manifests are in the [conjunction bundle](benchmark-results/conjunction-2026-09-13/README.md).
 All 55 executable-archive members are verified (17,239,936 bytes, SHA-256
@@ -3511,7 +3542,7 @@ but below 500,000 improve about 2.1×; the two above 500,000 improve about 4.9×
 These bins describe the evidence, not execution thresholds. The next candidate
 uses the existing candidate-versus-bitmap-word cost model for admission before
 window setup; its performance remains unmeasured. The stronger verifier checks
-Hermes COUNT separately against exhaustive VERIFY and Tantivy for every query.
+Summa COUNT separately against exhaustive VERIFY and Tantivy for every query.
 
 The next performance priority is paired full-workload profiling of both engines,
 including pruned top-k, exhaustive scoring/counting, and score-free counting.
@@ -3543,7 +3574,7 @@ clean harness passed. Subsequent conjunction-density work is a separate change.
 
 ### Systemic gap: paired complete-workload profiles (September 14)
 
-The latest completed full-corpus comparison still leaves Hermes slower than
+The latest completed full-corpus comparison still leaves Summa slower than
 Tantivy by 2.36× for TOP_10, 1.96× for TOP_1000, 2.03× for TOP_100_COUNT, and
 1.94× for COUNT. The prior small improvements do not establish competitiveness.
 The next acceptance criterion is closing these workload gaps with shared search
@@ -3557,7 +3588,7 @@ counters; results use `cpu-clock:u` at 997 Hz and software task-clock. Instrumen
 throughput is diagnostic, not a replacement latency benchmark. Stack unwinding
 is incomplete, so the following attribution uses self samples only.
 
-| Hermes self CPU          | Official TOP_10 | Official COUNT | Official TOP_100_COUNT |
+| Summa self CPU           | Official TOP_10 | Official COUNT | Official TOP_100_COUNT |
 | ------------------------ | --------------: | -------------: | ---------------------: |
 | Posting iterator seek    |          24.84% |         21.02% |                 15.52% |
 | Position stream read     |          15.90% |         17.92% |                  9.58% |
@@ -3566,7 +3597,7 @@ is incomplete, so the following attribution uses self samples only.
 | Term score accumulation  |               — |              — |                 26.38% |
 | Top-k collect            |           0.43% |              — |                 11.50% |
 
-For the 714 standalone terms, 44.93% of Hermes CPU is deferred score computation
+For the 714 standalone terms, 44.93% of Summa CPU is deferred score computation
 and 29.63% is the single-term executor. This has a different cause from exact
 counting. Making the arithmetic cheaper cannot by itself close that much larger
 ranking gap: tighter competitive block bounds must reduce how many documents
@@ -3597,7 +3628,7 @@ Two completed full-corpus passes improve the baseline but leave a systemic gap.
 They use all 962 official queries, 714 supplemental terms, the same immutable
 5,032,104-document indexes, Rust 1.98.1/native CPU/LTO, and one Cascade Lake core.
 Each build passes independent COUNT versus exhaustive VERIFY versus Tantivy
-counts, plus pruned versus exhaustive Hermes top-k, on all 1,676 queries.
+counts, plus pruned versus exhaustive Summa top-k, on all 1,676 queries.
 Numbers below are geometric means of per-query medians, in microseconds. The
 rows are separate same-run comparisons; do not combine their absolute timings.
 
@@ -3629,7 +3660,7 @@ bytes are unchanged. The full-corpus phrase TOP_10 improves 1,061.700 → 926.96
 A 1.9-second formatting command overlapped the merged ARM supplemental
 TOP_1000 timing; that run's tiny differences are inconclusive.
 
-Latest official TOP_10 peak RSS is 972.0 MiB for Hermes versus 710.7 MiB for
+Latest official TOP_10 peak RSS is 972.0 MiB for Summa versus 710.7 MiB for
 Tantivy; the position change adds roughly 1 MiB to the measured process peak.
 The 714-term TOP_10 still measures 203.243 versus 43.694 µs: **4.65× slower**.
 These changes do not establish competitiveness. Software CPU samples now show
@@ -3652,8 +3683,8 @@ records their hashes and the omitted raw profiler/binary payloads.
 ### Batched lengths, phrase driver and corrected position admission (September 14)
 
 Three further same-host full-corpus comparisons retain exact counts and exhaustive
-Hermes ranking gates for all 962 official queries plus 714 standalone terms.
-Cross-engine counts agree; score bits and ordered IDs are checked between Hermes
+Summa ranking gates for all 962 official queries plus 714 standalone terms.
+Cross-engine counts agree; score bits and ordered IDs are checked between Summa
 pruned and exhaustive execution, not between differing engine scoring models.
 Each phase uses the same unchanged indexes, Rust 1.98.1/native CPU/LTO and one
 Cascade Lake core. These are separate runs; do not combine their absolute times.
@@ -3681,12 +3712,12 @@ bounded per-segment cache under the existing setting, default zero. Lazy callbac
 always validate actual returned bytes; short reads and cancellation never publish
 proofs. Encoded payloads and the BM25 formula are unchanged.
 
-| Corrected build / official command | Preceding build, µs | Corrected build, µs | Tantivy, µs | Hermes / Tantivy |
-| ---------------------------------- | ------------------: | ------------------: | ----------: | ---------------: |
-| TOP_10                             |             900.090 |             888.590 |     500.381 |           1.776× |
-| TOP_1000                           |           1,339.916 |           1,354.475 |     871.499 |           1.554× |
-| TOP_100_COUNT                      |           1,293.741 |           1,333.589 |     801.917 |           1.663× |
-| COUNT                              |             609.140 |             612.055 |     407.964 |           1.500× |
+| Corrected build / official command | Preceding build, µs | Corrected build, µs | Tantivy, µs | Summa / Tantivy |
+| ---------------------------------- | ------------------: | ------------------: | ----------: | --------------: |
+| TOP_10                             |             900.090 |             888.590 |     500.381 |          1.776× |
+| TOP_1000                           |           1,339.916 |           1,354.475 |     871.499 |          1.554× |
+| TOP_100_COUNT                      |           1,293.741 |           1,333.589 |     801.917 |          1.663× |
+| COUNT                              |             609.140 |             612.055 |     407.964 |          1.500× |
 
 For the 714 standalone terms the corrected times are 164.559 / 603.562 /
 705.030 / 10.404 µs for the same commands, versus Tantivy 44.364 / 408.937 /
@@ -3704,7 +3735,7 @@ is a separately frozen candidate, not included in this table.
 
 Corrected official TOP_10 peak RSS is 1,010.7 MiB versus 972.0 MiB for the preceding
 build and 710.7 MiB for Tantivy. Separate Linux smaps measurements identify the
-gap as mapped file residency: Hermes 1,027,030 KiB file PSS and 5,808 KiB anonymous
+gap as mapped file residency: Summa 1,027,030 KiB file PSS and 5,808 KiB anonymous
 PSS, versus Tantivy 724,758 and 776 KiB. These file pages remain evictable. The
 strict admission pass touches more position block headers; validation correctness
 is retained despite this cost. Neither RSS nor mmap residency is Rust `Pin`.
@@ -3725,7 +3756,7 @@ software profiles, memory records and the five-process audit. All five executabl
 archives were retrieved and each external SHA-256 and every internal manifest
 entry verified. The [manifest](benchmark-results/execution-admission-2026-09-14/manifest.json)
 records exact archive hashes; the compact bundle excludes executable binaries
-and raw perf samples. Hermes has not met the performance objective.
+and raw perf samples. Summa has not met the performance objective.
 
 The latency tables in this follow-up measure warm, single-client query execution.
 Cold-cache tails, concurrent ingest/merge, and production concurrency were not
@@ -3976,7 +4007,7 @@ budget is not a process RSS limit. Independent warm official top-10 profiles
 report 1,056,896 / 1,067,744 / 1,071,308 KiB RSS, predominantly mapped file
 pages, versus Tantivy's 727,788 KiB.
 
-Each of four Hermes reader/index controls per phase passes all 962 official
+Each of four Summa reader/index controls per phase passes all 962 official
 plus 714 supplementary COUNT comparisons with Tantivy and ordered ID/score-bit
 VERIFY against its own exhaustive top-10/100/1000 oracle. Cross-engine ranking
 identity is not claimed. Both ARM 100k fixtures pass the equivalent gates;
@@ -4028,7 +4059,7 @@ regresses: 930.306 to 977.419 µs overall and 1318.505 to 1615.754 µs for
 unions. The small improvement in exhaustive collection does not justify this
 ranked-query regression. The next candidate removes automatic classification.
 
-All four Hermes configurations pass 1,676 COUNT and exhaustive-ranked VERIFY
+All four Summa configurations pass 1,676 COUNT and exhaustive-ranked VERIFY
 gates on immutable indexes; no rebuild or similarity change is involved. Both
 ARM 100k fixtures pass their gates, with flat complete-workload latency.
 Diagnostics confirm activation on ARM (145 queries and 1,455 windows in the
@@ -4136,10 +4167,10 @@ original/windowed/candidate-run/Tantivy microseconds are
 1283.920/1682.766/1533.472/869.008 (TOP_1000),
 1181.460/1208.586/1206.035/825.762 (TOP_100_COUNT), and
 579.007/578.234/579.902/413.846 (COUNT). Union TOP_10 improves
-1069.920/1013.102/950.393 µs across the three Hermes binaries, versus
+1069.920/1013.102/950.393 µs across the three Summa binaries, versus
 628.282 µs for Tantivy. AND remains regressed: 569.604/1404.613/1209.879
 versus 334.471 µs. These selective-scoring gains do not rescue the dense AND
-executor. All six Hermes reader/index configurations pass the 1,676 COUNT and
+executor. All six Summa reader/index configurations pass the 1,676 COUNT and
 exhaustive ordered-ID/score-bit gates; all index manifests remain unchanged.
 
 Check `20260914T103231.933639Z-check`, portable core and 23 WASM tests pass.
@@ -4435,14 +4466,14 @@ continue copying encoded blocks as required by the system contract.
 
 The compact-conjunction full-corpus TOP_10 breakdown is:
 
-| Regular query shape | Queries | Hermes compact (µs) | Tantivy (µs) |
-| ------------------- | ------: | ------------------: | -----------: |
-| Two-term union      |     198 |             880.244 |      392.545 |
-| Three-term union    |      83 |            1550.570 |     1223.131 |
-| Longer union        |      18 |            2646.073 |     2744.842 |
-| Two-term phrase     |     198 |             534.399 |      379.884 |
-| Three-term phrase   |      83 |            1464.954 |      751.893 |
-| Longer phrase       |      19 |            3158.904 |     1355.093 |
+| Regular query shape | Queries | Summa compact (µs) | Tantivy (µs) |
+| ------------------- | ------: | -----------------: | -----------: |
+| Two-term union      |     198 |            880.244 |      392.545 |
+| Three-term union    |      83 |           1550.570 |     1223.131 |
+| Longer union        |      18 |           2646.073 |     2744.842 |
+| Two-term phrase     |     198 |            534.399 |      379.884 |
+| Three-term phrase   |      83 |           1464.954 |      751.893 |
+| Longer phrase       |      19 |           3158.904 |     1355.093 |
 
 The complete mix also includes mixed Boolean and negated queries, plus special
 stress queries; they remain in every official aggregate. Short unions suggest a
@@ -4565,7 +4596,7 @@ measurement is queued. This does not establish a net performance gain.
 ### Systemic cost isolation: latency strata and decoded work
 
 The verified deferred-frequency run is still slower across phrase-query sizes:
-Tantivy-latency quartiles give Hermes/Tantivy TOP_10 ratios of
+Tantivy-latency quartiles give Summa/Tantivy TOP_10 ratios of
 1.651/1.574/1.612/1.711. The AND quartiles are 1.608/1.520/1.443/1.443.
 Unions differ: 2.419/1.733/1.331/0.936. Each family retains all its official
 queries; quartiles only explain the aggregate, and do not define a query route.
@@ -4576,13 +4607,13 @@ It does not establish which representation or traversal accounts for the gap.
 A diagnostic-only experiment will count actual posting-ID, term-frequency and
 position block decodes, decoded values, and encoded payload bytes for both
 engines on the immutable full corpus. Instrumentation lives in isolated copies
-of frozen Hermes and the checksum-verified Tantivy 0.26.0 crate; it adds bounded
+of frozen Summa and the checksum-verified Tantivy 0.26.0 crate; it adds bounded
 atomic counters at owning decoders and emits one record per adapter request.
 No instrumentation enters production source or latency binaries. Recorded byte
 counts are decoder payload input, not physical I/O or RSS. Position requests
 and posting seek calls can additionally distinguish repeated work from decoding.
 The original and instrumented adapters must preserve protocol/count results,
-and Hermes must still pass the exhaustive ranking oracle. Full traces run only
+and Summa must still pass the exhaustive ranking oracle. Full traces run only
 after the queued latency comparisons finish. This is a proposed diagnostic,
 not a measured optimization or an explanation established by sample percentages.
 
@@ -4655,13 +4686,13 @@ isolated experiment, not a measured gain or a default format change.
 The verified decoded-work evidence (local archive `benchmark-results/decoded-work-2026-09-14/results.zip`)
 covers all 962 official queries and 714 supplemental terms, every command,
 two independent equal passes, and immutable full-corpus indexes. Instrumented
-copies are excluded from latency measurements. The three Hermes sources pass
+copies are excluded from latency measurements. The three Summa sources pass
 cross-source ordered top-1000 ID and raw-score-bit equality on rounded and group
 indexes, their pruned top-10/100/1000 agrees with exhaustive scoring, and exact
 counts agree with Tantivy. Payload bytes below are encoded decoder inputs;
 they exclude headers, skip metadata and inline postings and are not physical I/O.
 
-| Official TOP_10 work          |   Hermes V4 | New phrase planner | Tantivy 0.26 |
+| Official TOP_10 work          |    Summa V4 | New phrase planner | Tantivy 0.26 |
 | ----------------------------- | ----------: | -----------------: | -----------: |
 | AND decoded document IDs      |  96,438,925 |         96,438,925 |   93,314,862 |
 | AND document payload bytes    | 110,617,532 |        110,617,532 |   65,064,884 |
@@ -4760,7 +4791,7 @@ from ISA-specific kernels. The [SIMD intersection research by Lemire, Boytsov
 and Kurz](https://arxiv.org/abs/1401.6399) and its
 [reference implementation](https://github.com/fast-pack/SIMDCompressionAndIntersection)
 show why intersection, rather than decoding alone, deserves vectorization.
-Their reported gains do not predict Hermes performance. A later SIMD kernel
+Their reported gains do not predict Summa performance. A later SIMD kernel
 must beat this control, retain scalar behavior and validate x86 and ARM; none
 is implied by the scalar prototype. Independent all-codec result/score oracles,
 selective and dense lists, tails, high IDs, predicates and deadlines must pass
@@ -4981,7 +5012,7 @@ comparison is required, not a claim of a newly discovered technique.
 
 The isolated phrase experiment applies the principle described in
 [Lucene PR 15861](https://github.com/apache/lucene/pull/15861): prove that a
-candidate cannot compete before initializing its positions. Hermes's existing
+candidate cannot compete before initializing its positions. Summa's existing
 candidate/confirmation protocol already separates document alignment from
 phrase verification. The top-level ranked collector can use an optional final
 score bound from that same scorer; complete and custom collectors must continue
@@ -4992,7 +5023,7 @@ shared top-k driver.
 
 For a plain phrase with document lengths, its original-first term frequency
 bounds the number of matching starts. The minimum frequency across terms is
-not valid under Hermes's duplicate-start multiplicity semantics. Use the first
+not valid under Summa's duplicate-start multiplicity semantics. Use the first
 frequency and the current document's actual scoring length with the existing
 conservative BM25 envelope and floating-point guard. Unsupported numeric
 parameters or length representations decline the optimization. No score model,
@@ -5083,7 +5114,7 @@ This is an unmeasured proposal, separate from tiled seeking and direct impacts.
 ### Proposed bounded vector search within decoded posting blocks
 
 Phrase instruction profiles put substantial samples in serial binary searches
-of decoded posting suffixes. Hermes already has SSE2/NEON lower-bound kernels;
+of decoded posting suffixes. Summa already has SSE2/NEON lower-bound kernels;
 reintroducing a full linear vector scan would repeat an earlier discarded path.
 The next isolated experiment keeps current/next-document probes, binary-searches
 16-value tile maxima, and applies the existing SIMD kernel only to the selected
@@ -5491,7 +5522,7 @@ does not establish ranked-search superiority or recover the entire safety cost.
 Peak RSS over all four commands (KiB), pre-cleanup/corrected/byte-gap/Tantivy:
 official 1,271,384/1,270,888/1,270,960/855,596; supplemental
 491,400/491,356/490,952/348,528. Mapped pages dominate; no memory reduction is
-claimed from these essentially flat Hermes values. Byte-gap adds no scratch,
+claimed from these essentially flat Summa values. Byte-gap adds no scratch,
 and the new shared integrity record is constant-sized per segment.
 
 The verified archive (local archive `benchmark-results/cleanup-2026-09-15/results.zip`) and
@@ -5671,7 +5702,7 @@ combines frequency-ordered probes and block bounds. IResearch's
 [pruned conjunction](https://github.com/serenedb/serenedb/blob/6672dde0201981d4aa70447102d9029ccecce04f/iresearch/search/top/pruned_conjunction.hpp)
 bounds a lead block and filters bounded candidate batches; its
 [pruned phrase](https://github.com/serenedb/serenedb/blob/6672dde0201981d4aa70447102d9029ccecce04f/iresearch/search/top/pruned_phrase.hpp)
-checks a frequency-derived score bound before positional matching. Hermes already
+checks a frequency-derived score bound before positional matching. Summa already
 has related paths; these sources guide targeted experiments, not a second executor
 or permission to change canonical score arithmetic or equality pruning.
 
@@ -5696,14 +5727,14 @@ includes heap admission). These are sample shares, not predicted speedups.
 The next isolated experiments keep codecs, norms, scoring arithmetic and index
 bytes fixed. Inspired by IResearch's bounded posting-batch admission and PISA's
 threshold-first heap, screen eight scores before canonical heap admission;
-equal/unordered scores still reach Hermes's document/ordinal tie comparator.
+equal/unordered scores still reach Summa's document/ordinal tie comparator.
 Separately accumulate sorted document IDs into bitmap words in registers before
 writing each word. Scratch remains bounded, no cache or second executor is added,
 and a stale score threshold can only admit extra candidates. Both are proposals
 until paired x86/ARM timings and exact ranking/position oracles pass.
 
 IResearch's phrase path also prepares its scorer before candidate traversal.
-Hermes already rejects phrase candidates by frequency bounds before reading
+Summa already rejects phrase candidates by frequency bounds before reading
 positions, but recalculates numeric admissibility and invariant f64 factors for
 every candidate. A separate prototype prepares those factors at the existing
 BM25 owner and retains the identical per-frequency envelope and inflation. It
@@ -5712,7 +5743,7 @@ canonical BM25 scores and pruning-bound bits must remain identical.
 
 A third independent experiment reuses the posting iterator's existing one-step
 probe in `TermCursor::seek_prepare` before the SIMD search. The archived x86
-call site (`.context/selected-codegen/hermes-after-seek_prepare.asm`) sets up
+call site (`.context/selected-codegen/summa-after-seek_prepare.asm`) sets up
 vector comparisons even when the next decoded ID meets the target. The current
 block bounds prove a successor exists before the new probe; distant seeks keep
 the existing SIMD helper and no buffer or decoder is added. This targets the
@@ -5750,7 +5781,7 @@ and [ranked conjunction](https://github.com/pisa-engine/pisa/blob/4af477f227fcbf
 The benchmark's [engine list](https://github.com/quickwit-oss/search-benchmark-game/blob/master/Makefile)
 also includes Lucene; its already-adopted and rejected mechanisms are recorded in
 [the pinned Lucene review](lucene-11-performance-research.md). Engine rankings alone
-are not an explanation of Hermes's costs.
+are not an explanation of Summa's costs.
 
 The first score-batch x86 binary contains an eight-float vector comparison
 (`vcmpngtps`) followed by scalar canonical admission for survivors. Compiler
@@ -6187,7 +6218,7 @@ owners. Native and async construction share the same initialization.
 Measure independently against the preserved AVX2 baseline, including generic
 Boolean/phrase regressions, full exact oracles and the four-command matrix.
 
-The distinction is also explicit in [Lucene's Scorer API](<https://lucene.apache.org/core/10_3_1/core/org/apache/lucene/search/Scorer.html#twoPhaseIterator()>): two-phase iteration is optional and intended for scorers with expensive confirmation. Hermes keeps a conservative default so existing custom candidate methods still receive verification.
+The distinction is also explicit in [Lucene's Scorer API](<https://lucene.apache.org/core/10_3_1/core/org/apache/lucene/search/Scorer.html#twoPhaseIterator()>): two-phase iteration is optional and intended for scorers with expensive confirmation. Summa keeps a conservative default so existing custom candidate methods still receive verification.
 
 Pre-benchmark review found that term and fast-field `doc()` also observe timed
 query cancellation. The first prototype was withdrawn before application or
@@ -6538,7 +6569,7 @@ a passing regression covering exact count and ranked async/sync behavior.
 ### Bounded AVX2 length gathering — proposal
 
 A fresh isolated standalone TOP_10 profile of the original AVX2 baseline assigns
-31.62% of Hermes user CPU self samples to `DocLengths::gather_lengths`, 12.55%
+31.62% of Summa user CPU self samples to `DocLengths::gather_lengths`, 12.55%
 to executor dispatch, 9.69% to block bounds, 8.32% to checked ID decoding and
 8.27% to canonical scoring. The actual binary emits a four-way unrolled scalar
 loop with an ID bounds branch, 16-bit load and output store per lane. Both engine
@@ -6581,7 +6612,7 @@ exhaustive reference, since admission depends on k.
 ### Memory difference investigation — protocol (completed below)
 
 The user requested an explanation of the memory gap as well as further latency
-work. A preserved standalone TOP_10 snapshot shows Hermes RSS 350,416 KiB and
+work. A preserved standalone TOP_10 snapshot shows Summa RSS 350,416 KiB and
 Tantivy 222,728 KiB. Proportional file-backed residency is 343,098 versus
 219,895 KiB; anonymous residency is 5,032 versus 516 KiB. Neither process has
 locked pages or swap in this snapshot. Anonymous memory includes stacks/runtime
@@ -6589,10 +6620,10 @@ allocations as well as heap; do not label all RSS as allocated heap. Most of thi
 measured gap is resident file-backed data. This is a standalone-workload snapshot,
 not the peak of the four-command official workload.
 
-Immutable full-corpus files: Hermes postings 2,203,973,483 bytes versus Tantivy
+Immutable full-corpus files: Summa postings 2,203,973,483 bytes versus Tantivy
 1,054,571,755 bytes (2.09×); positions 2,752,821,603 versus 1,850,554,774 (1.49×).
-Hermes stores little-endian u16 lengths (10,064,248-byte chunks file), while
-Tantivy's quantized field norms occupy 5,032,209 bytes. The current Hermes Rounded
+Summa stores little-endian u16 lengths (10,064,248-byte chunks file), while
+Tantivy's quantized field norms occupy 5,032,209 bytes. The current Summa Rounded
 posting codec uses byte-rounded widths; Tantivy packs exact bit widths. These
 format differences explain a reason for the larger footprint, but the fraction
 of resident memory attributable to each must be measured rather than inferred
@@ -6623,7 +6654,7 @@ lengths and compact postings/positions is a separate format/scoring experiment.
 
 The user requested format investigation and permits evaluating quantized lengths.
 The [format comparison and design](text-format-comparison.md) records the pinned
-Tantivy implementation, Hermes ownership/compatibility constraints, and the
+Tantivy implementation, Summa ownership/compatibility constraints, and the
 proposed quantized-norm and compact-position experiments. The read-only audit
 streams all term ranges and accounts for actual payload versus metadata bytes
 in both immutable indexes. It also estimates narrower widths and reports the
@@ -6634,10 +6665,10 @@ separate process residency audit precedes these full-file scans.
 ### Completed memory attribution
 
 All 401 audit members and input index hashes verify. After the third official
-COUNT pass (following all ranked commands), selected Hermes RSS is 1007.29 MiB
+COUNT pass (following all ranked commands), selected Summa RSS is 1007.29 MiB
 versus Tantivy 574.24 MiB. Position RSS is 664.19/343.77 MiB and posting RSS is
 276.88/180.53 MiB: these account for 74.0% and 22.2% of the 433.05 MiB gap.
-Anonymous residency is only 6.16/0.78 MiB; lengths/norms 9.60/4.80 MiB. Hermes's
+Anonymous residency is only 6.16/0.78 MiB; lengths/norms 9.60/4.80 MiB. Summa's
 term dictionary is actually 6.70 MiB less resident. Original and selected builds
 have the same mapped index residency. All three count-pass snapshots are stable;
 all locked-byte observations are zero. Supplemental after/Tantivy RSS is
@@ -6684,7 +6715,7 @@ change. Main source hashes match every one of the 332 benchmark source files.
 ### Completed format and quantization accounting
 
 All 13 format-audit members verify, including every component-sum identity and
-immutable index hashes. Hermes/Tantivy posting metadata is 652.434/50.166 MiB
+immutable index hashes. Summa/Tantivy posting metadata is 652.434/50.166 MiB
 (13.01×), explaining 54.9% of the posting-file gap. Position metadata is
 339.989/13.429 MiB (25.32×), explaining 38.0% of the position-file gap. Posting
 gap/frequency payloads are 887.465/660.291 and 561.974/295.261 MiB; position
@@ -6695,7 +6726,7 @@ Exact/minus-one payload estimates save 577,974,979 posting bytes and exact-width
 position estimates save 568,889,062 bytes, preserving existing block boundaries.
 These are overlapping-format counterfactuals, not measured latency or a writer.
 The documented analyzer difference remains: 177 terms, 220 document occurrences
-and 247 position values more in Hermes; timed-query counts match. This is tiny
+and 247 position values more in Summa; timed-query counts match. This is tiny
 beside the billion-byte format gap. See [full accounting and priorities](text-format-comparison.md).
 
 Quantizing the existing norm column with the pinned 256-value table changes
@@ -6892,7 +6923,7 @@ against the original baseline. These tradeoffs prevent a blanket speedup claim.
 The old-index reader control changes **+0.7/+0.1/+3.2/+2.4%**; disabling the new
 write options does not remove all reader-code overhead.
 
-Compact/byte final Hermes/Tantivy ratios are **1.254/1.242/1.323/1.140×**.
+Compact/byte final Summa/Tantivy ratios are **1.254/1.242/1.323/1.140×**.
 Compact/exact remains faster than byte norms overall, but still trails Tantivy.
 ARM's 100,000-document check also gives mixed results: compact/byte official
 changes **-0.3/+2.0/-0.4/+1.3%**. Shared Mac load limits interpretation of small
@@ -7549,9 +7580,9 @@ sync; four focused diagnostics tests and portable compilation pass. The latter
 retains the existing unused-method warning. WASM was not rebuilt as instructed.
 
 The updated user requirement is RGB top-10 faster than Lucene BP/RGB. The matched
-60-second-warmup run is 444.841 µs for Hermes RGB versus 392.235 µs for Lucene
+60-second-warmup run is 444.841 µs for Summa RGB versus 392.235 µs for Lucene
 10.4.0 BP, a 13.4% deficit. The goal remains open. Unions account for the main
-family gap (499.622 versus 325.063 µs); phrases favor Hermes (486.759 versus
+family gap (499.622 versus 325.063 µs); phrases favor Summa (486.759 versus
 505.129 µs). An isolated required-window candidate regresses ARM AND and is not
 promoted. Block pruning and a proven two-term OR-to-AND transition are experiments
 to evaluate, not delivered wins.
@@ -7569,9 +7600,9 @@ ARM top-10 regresses). A guarded, once-per-query proof for any arity performs
 better: x86 TOP10 441.735 → 428.431 µs, with Lucene RGB at 396.400 µs. Union
 queries improve 495.87 → 458.39 µs; Lucene is 332.69 µs. TOP1000 is essentially
 flat (837.864 → 841.411). ARM TOP10 is 29.519 → 29.349 µs. All 1676 ordered
-ID/raw-score-bit/count references pass on both hosts and both fixed Hermes
+ID/raw-score-bit/count references pass on both hosts and both fixed Summa
 indexes. This remains a candidate pending selection and confirmation, not a
-claim that Hermes has surpassed Lucene.
+claim that Summa has surpassed Lucene.
 
 Adaptive window sizing, mapped batch admission and local score-required union
 driving are separately frozen experiments. Their source and measurements stay
@@ -7628,7 +7659,7 @@ ARM ranked results are flat. The graph default remains unchanged.
 
 Fresh top-10 RSS is 1019.39 MiB for the selected reader on the original RGB index,
 1055.73 MiB for compact RGB, 745.95 MiB for RGB off, 573.92 MiB for Tantivy and
-860.11 MiB for Lucene. Hermes anonymous memory stays near 5.6 MiB. Compact output
+860.11 MiB for Lucene. Summa anonymous memory stays near 5.6 MiB. Compact output
 saves 192.2 MiB on disk but reduces position residency by 95.88 MiB while increasing
 posting/dictionary residency by 114.69/17.68 MiB. This is not a resident-memory win.
 The larger mapped working set is established; its page-fault mechanism is not.
@@ -7645,7 +7676,7 @@ exact norms and existing ratio bounds. ARM official top-10 improves
 30.043 → 28.549 µs; x86 is flat (compact 474.245, SIMD 473.595, Lucene 440.889 µs).
 The target remains unmet. Full-corpus compact/SIMD index sizes are
 4,289.08/3,117.26 MiB; fresh top-10 RSS is 1055.71/855.82 MiB, versus original
-RGB 1018.90 and Lucene 859.91 MiB. Anonymous Hermes memory remains about 5.5 MiB.
+RGB 1018.90 and Lucene 859.91 MiB. Anonymous Summa memory remains about 5.5 MiB.
 This is a measured storage/residency benefit, not an x86 latency win. The codec
 remains opt-in. All exact references and permutation/unchanged-payload audits
 pass; both fixture and comparison exports are locally hash-verified.
@@ -7724,7 +7755,7 @@ versus predecessor 422.282 and Lucene RGB 390.625: a 1.3% reader improvement,
 but the target remains unmet by 6.7%. Top-1000 is 824.472 versus Lucene 848.283.
 Selected/SIMD top-10 is 425.249 µs, 2.0% slower than selected/original RGB; the
 codec remains an opt-in space/residency tradeoff. Fresh top-10 RSS is 1019.28 MiB
-for selected/original, 856.00 for selected/SIMD and 864.87 for Lucene. Hermes
+for selected/original, 856.00 for selected/SIMD and 864.87 for Lucene. Summa
 anonymous memory stays near 5.5 MiB.
 
 Supplemental selected top-10 wins 70.099 versus Lucene 88.379 µs, while
@@ -7804,20 +7835,20 @@ ARM and x86 for the candidate (exact IDs, score bits, ranked limits and counts).
 The candidate's edge/cache regression and 43 scoring unit tests also pass.
 Correctness alone does not justify selection:
 
-| Official workload, geometric mean of per-query medians | Current Hermes | Lookup candidate | Lucene RGB |
-| ------------------------------------------------------ | -------------- | ---------------- | ---------- |
-| ARM top-10, µs                                         | 29.386         | 29.039           | unmeasured |
-| ARM top-1000, µs                                       | 44.402         | 44.381           | unmeasured |
-| x86 top-10, µs                                         | 426.918        | 470.017          | 400.954    |
-| x86 top-1000, µs                                       | 867.289        | 931.035          | 882.210    |
+| Official workload, geometric mean of per-query medians | Current Summa | Lookup candidate | Lucene RGB |
+| ------------------------------------------------------ | ------------- | ---------------- | ---------- |
+| ARM top-10, µs                                         | 29.386        | 29.039           | unmeasured |
+| ARM top-1000, µs                                       | 44.402        | 44.381           | unmeasured |
+| x86 top-10, µs                                         | 426.918       | 470.017          | 400.954    |
+| x86 top-1000, µs                                       | 867.289       | 931.035          | 882.210    |
 
 The candidate regresses x86 top-10 by 10.1% and top-1000 by 7.4%, despite a
 small ARM improvement. It is rejected without changing defaults or query code.
-Current Hermes remains **6.5% slower than Lucene RGB on official top-10** and
+Current Summa remains **6.5% slower than Lucene RGB on official top-10** and
 1.7% faster on top-1000. The official x86 category split isolates the remaining
 deficit:
 
-| Top-10 category, µs | Hermes  | Lookup candidate | Lucene RGB |
+| Top-10 category, µs | Summa   | Lookup candidate | Lucene RGB |
 | ------------------- | ------- | ---------------- | ---------- |
 | AND                 | 308.930 | 333.310          | 315.764    |
 | Phrase              | 497.401 | 537.676          | 506.094    |
@@ -7845,12 +7876,12 @@ the same frozen index, Rust 1.98.1, native CPU flags and release LTO. It rotates
 engine order for seven passes over all 962 official queries; x86 engines are
 pinned to CPU 2. Builds, canonical verification and profiles are outside timing.
 Peak RSS over the official top-10 plus top-1000 process lifetime is
-1,012.19 MiB for Hermes, 1,011.87 for the candidate and 906.41 for Lucene.
+1,012.19 MiB for Summa, 1,011.87 for the candidate and 906.41 for Lucene.
 These are process maxima, not isolated heap sizes or a top-10-only comparison.
 
 The separate 714-query supplemental workload uses five passes: x86 top-10
 73.985/83.038/91.018 µs and top-1000 804.620/876.217/474.109 µs for
-Hermes/candidate/Lucene. It is not pooled with official queries to claim parity.
+Summa/candidate/Lucene. It is not pooled with official queries to claim parity.
 Source and binary hashes, complete query/pass matrices, canonical checks and
 raw measurements remain local under `.context/rgb-norm-lookup/`; the downloaded
 x86 archive's SHA256 and every query/pass matrix were verified. No benchmark
@@ -7918,9 +7949,9 @@ and 808.715/801.428/521.707 µs top-1000; they remain a separate workload.
 Memory is effectively unchanged by the combined change. After official top-10,
 baseline/candidate RSS is 1,012.11/1,012.27 MiB, of which only 5.79/5.79 MiB is
 anonymous. Lucene's corresponding RSS is 877.76 MiB with 334.42 MiB anonymous.
-Hermes' larger RSS here is file-backed residency, not a larger query heap.
+Summa' larger RSS here is file-backed residency, not a larger query heap.
 These full-workload snapshots touch phrase positions too. PSS must not be used
-as an engine comparison here: concurrent Hermes processes share the same mapped
+as an engine comparison here: concurrent Summa processes share the same mapped
 index pages. Peak RSS over both ranked limits is 1,012.24/1,012.33/901.91 MiB.
 The downloaded stability archive and all query/pass matrices were verified;
 SHA256 `9c2882482b08c8d4e9d753ff2bba055a0194c9c4311594e5e209dcd2385b56c1`.
@@ -8138,11 +8169,11 @@ pooled official/supplemental result is used to claim a win.
 After official RGB top-10, baseline/adopted RSS is **1,012.215/1,011.707 MiB**;
 anonymous residency is **5.789/5.793 MiB**. Lucene's RSS is 881.602 MiB, with
 338.281 MiB anonymous. The adopted reader does not materially change memory.
-Hermes' larger RSS is predominantly mapped index pages, not query heap growth;
+Summa' larger RSS is predominantly mapped index pages, not query heap growth;
 anonymous residency includes more than heap alone. Phrase queries also touch
 position pages. These are the unchanged frozen fixtures, not a claim that every
 RGB encoding has this residency. PSS is unsuitable for comparing these processes
-because the two Hermes executables share mapped index pages.
+because the two Summa executables share mapped index pages.
 
 RGB-off baseline/adopted RSS is 736.605/736.496 MiB, with
 5.773/5.770 MiB anonymous. Lifetime peak RSS across all four official commands is
@@ -8242,7 +8273,7 @@ under `.context/scoring-cleanup/`. No commits were made.
 
 ## Trusted text query reads and SIMD audit (2026-09-17)
 
-Normal segment queries now trust Hermes writers for posting directory, decoded
+Normal segment queries now trust Summa writers for posting directory, decoded
 document order/range, pruning bounds and position-stream invariants. Full metadata
 scans and decoded-document content checks are removed from that path, together
 with the proof cache, lock, budget, CLI option and cache statistics. Explicit
@@ -8276,7 +8307,7 @@ comparison uses its tuned 256 KiB validation cache; negative deltas are faster.
 Against the old zero-byte validation-cache setting (with the same dictionary
 budgets), x86 RGB latency falls 21.8–26.7%. The retained RGB top-10 time is
 433.79 µs versus 447.78 µs with the tuned cache, or 591.46 µs without it.
-These are warm Hermes comparisons; they do not establish cold-I/O, concurrent
+These are warm Summa comparisons; they do not establish cold-I/O, concurrent
 ingestion, tail-latency or cross-engine parity. No BMP speedup is claimed.
 
 The final owner-only cleanup was recompiled and compared against the selected
@@ -8332,12 +8363,12 @@ raw results are excluded from the PR.
 
 The [Faiss binary benchmark](https://github.com/facebookresearch/faiss/wiki/Binary-hashing-index-benchmark)
 uses 50 million 256-bit image descriptors for **range search**. It is relevant
-algorithmically, but its timings are not comparable to Hermes top-k search.
+algorithmically, but its timings are not comparable to Summa top-k search.
 [Faiss BinaryIVF](https://github.com/facebookresearch/faiss/wiki/Binary-indexes)
 is the measured reference here. Its
 [merge implementation](https://github.com/facebookresearch/faiss/blob/main/faiss/IndexBinaryIVF.cpp)
 copies inverted-list contents and rebases IDs; the caller must supply compatible
-centroids. Hermes also checks the persisted quantizer generation.
+centroids. Summa also checks the persisted quantizer generation.
 [Milvus BIN_IVF_FLAT](https://milvus.io/docs/bin-ivf-flat.md) exposes a related
 index, but this experiment does not measure Milvus service/storage overhead.
 
@@ -8346,7 +8377,7 @@ centering and seeded Gaussian sign projection: one million rows, 256 held-out
 queries, 256 clusters, probes 1/4/16/64, and top-k 10/100. This is a derived
 binary task, not the published SIFT Euclidean leaderboard. The main comparison
 imports identical Faiss-trained centroids, list membership, codes, and probe
-order into Hermes's existing writer. It isolates the scanner and routing;
+order into Summa's existing writer. It isolates the scanner and routing;
 it does not establish independently trained model quality or build-speed parity.
 
 Each engine uses one search thread, a warm-up pass, and five timed batch passes
@@ -8386,8 +8417,8 @@ threshold-only: 332.30 → 272.29 µs at 256 bits and 2,323.48 → 2,309.28 µs 
 −0.6% to +2.0%; ARM wide-code samples drift substantially on the shared desktop
 and are inconclusive. Do not infer a wide-code ARM gain from them.
 
-Hermes remains slower than Faiss for 256-bit codes: approximately 1.41× on x86
-and 1.94× on ARM at the tabulated point. Hermes is approximately 16% faster for
+Summa remains slower than Faiss for 256-bit codes: approximately 1.41× on x86
+and 1.94× on ARM at the tabulated point. Summa is approximately 16% faster for
 2,560-bit x86 scanning on this fixture. Neither is a general engine-parity claim.
 
 All main baseline/threshold results have identical document IDs, ordinals, and
@@ -8395,7 +8426,7 @@ score bits at every budget. Specialized scans match their controls too. With
 identical preassigned leaves, Faiss's sorted Hamming distances match exactly;
 recall is tie-aware against exhaustive BinaryFlat ground truth. At 64 probes,
 top-10 recall is 100% for both widths. A separate quality-only check trained
-Hermes on the same 65,536 sampled rows for ten iterations: top-10 recall at 16
+Summa on the same 65,536 sampled rows for ten iterations: top-10 recall at 16
 probes is 97.54% / 98.98% for 256 / 2,560 bits, versus the shared Faiss model's
 97.62% / 98.52%. Those separately trained runs have different list populations
 and are not substituted into the scanner timing comparison.
@@ -8404,12 +8435,12 @@ and are not substituted into the scanner timing comparison.
 
 For one million single-value vectors, 256 clusters:
 
-| Bits  | Hermes ANN bytes | Hermes flat bytes | Faiss serialized bytes |
-| ----- | ---------------: | ----------------: | ---------------------: |
-| 256   |       38,012,368 |        38,000,016 |             40,010,355 |
-| 2,560 |      326,012,368 |       326,000,016 |            328,084,083 |
+| Bits  | Summa ANN bytes | Summa flat bytes | Faiss serialized bytes |
+| ----- | --------------: | ---------------: | ---------------------: |
+| 256   |      38,012,368 |       38,000,016 |             40,010,355 |
+| 2,560 |     326,012,368 |      326,000,016 |            328,084,083 |
 
-Hermes keeps two exact binary code copies, each with six bytes per vector for
+Summa keeps two exact binary code copies, each with six bytes per vector for
 IDs and ordinals. Together they use about 1.9–2.0× the standalone Faiss index's
 disk space before outer container/shared model metadata. The measured Faiss index has no direct map (type 0), so its disk size does not
 include an arbitrary-ID vector lookup structure. Flat storage currently supports
@@ -8417,19 +8448,19 @@ retrieval, training, rebuild, and multi-value completion; removing its writer
 alone would break those operations. A single-value ANN query does not
 read that second code payload for reranking.
 
-Both Hermes corpus payloads are evictable; disk size is not heap residency.
+Both Summa corpus payloads are evictable; disk size is not heap residency.
 The isolated ANN reader's measured heap directory is 18,632 bytes at 256 runs,
-plus existing bounded query scratch. A Linux warm-query snapshot reports Hermes
+plus existing bounded query scratch. A Linux warm-query snapshot reports Summa
 process RSS of 39.36 / 313.94 MiB and anonymous RSS of 0.70 / 0.70 MiB at the two
 widths. Faiss's Python process reports 80.88 / 356.04 MiB RSS and 58.40 / 333.54
-MiB anonymous RSS. These include different language runtimes and exclude Hermes's
+MiB anonymous RSS. These include different language runtimes and exclude Summa's
 flat representation/document fields; they illustrate mmap versus heap ownership,
 not a fair whole-index memory ratio. The retained changes add no query or index
 allocation and change no persisted bytes.
 
-Two distinct one-million-row sources were merged. Hermes's copied payload
+Two distinct one-million-row sources were merged. Summa's copied payload
 columns remain byte-identical, with rebased IDs and 512 post-merge query checks
-per width. Faiss's codes and rebased IDs match its sources too. Hermes streams
+per width. Faiss's codes and rebased IDs match its sources too. Summa streams
 the persisted output, while Faiss first merges heap lists and then serializes;
 these are different timing/durability contracts, so no merge speedup is claimed.
 The first wide merge ran out of machine disk space; after removing build-cache
@@ -8664,7 +8695,7 @@ native-built binary ANN fixture with exact multi-value and missing-value reads
 ## Experimental Seismic sparse retrieval (2026-09-17)
 
 An isolated native prototype under `.context/seismic-experiment/` reuses upstream
-Seismic clustering/summaries and Hermes BMP forward storage, query preparation,
+Seismic clustering/summaries and Summa BMP forward storage, query preparation,
 candidate scoring and collection. No production dependency, format, dispatch or
 schema option was added. It supports one nonnegative vector per document only.
 The source snapshot, patches, source/data hashes, commands and full results are
@@ -8677,14 +8708,14 @@ results at >=99% recall against common quantized exhaustive truth. Times are
 warm mean milliseconds, with one warm-up and two measured passes. Search budgets
 were swept for BMP and Seismic; these are not held-out parameter selections.
 
-| Engine                                | Top-10 ms / recall | Top-100 ms / recall |
-| ------------------------------------- | -----------------: | ------------------: |
-| BMP                                   |    7.596 / 99.860% |    11.651 / 99.101% |
-| BMP + existing BP reorder             |    2.529 / 99.450% |     6.190 / 99.523% |
-| Reference Seismic, fresh              |    0.297 / 99.320% |     1.084 / 99.218% |
-| Hermes Seismic prototype, fresh       |    0.814 / 99.320% |     3.163 / 99.218% |
-| Hermes prototype, 4 copied fragments  |    2.464 / 99.470% |  target not reached |
-| Hermes prototype, 16 copied fragments |    1.954 / 99.440% |     5.705 / 99.402% |
+| Engine                               | Top-10 ms / recall | Top-100 ms / recall |
+| ------------------------------------ | -----------------: | ------------------: |
+| BMP                                  |    7.596 / 99.860% |    11.651 / 99.101% |
+| BMP + existing BP reorder            |    2.529 / 99.450% |     6.190 / 99.523% |
+| Reference Seismic, fresh             |    0.297 / 99.320% |     1.084 / 99.218% |
+| Summa Seismic prototype, fresh       |    0.814 / 99.320% |     3.163 / 99.218% |
+| Summa prototype, 4 copied fragments  |    2.464 / 99.470% |  target not reached |
+| Summa prototype, 16 copied fragments |    1.954 / 99.440% |     5.705 / 99.402% |
 
 Fresh high-recall Seismic uses up to 4,096 postings/term; copy-fragment tests use
 512 per term in each independent source. With 512, a fresh 1M index tops out near
@@ -8741,14 +8772,14 @@ reader admission. Production BMP dispatch and validation are unchanged.
 Three alternating independent process runs per engine on the same M4/compiler,
 fixture and release flags give these median warm mean latencies:
 
-| Top-k | Original Hermes ms | Final Hermes ms | Reference Seismic ms |  Recall |
-| ----: | -----------------: | --------------: | -------------------: | ------: |
-|    10 |              0.828 |           0.306 |                0.318 | 99.320% |
-|   100 |              3.162 |           1.098 |                1.107 | 99.218% |
+| Top-k | Original Summa ms | Final Summa ms | Reference Seismic ms |  Recall |
+| ----: | ----------------: | -------------: | -------------------: | ------: |
+|    10 |             0.828 |          0.306 |                0.318 | 99.320% |
+|   100 |             3.162 |          1.098 |                1.107 | 99.218% |
 
 The improvement is 2.7–2.9x; this supports parity on this fixture, not a general
 cross-platform lead. All 110,000 returned IDs, scores and positions are
-byte-identical between Hermes scorers in every paired run. Candidate counts and
+byte-identical between Summa scorers in every paired run. Candidate counts and
 recall against shared quantized truth are unchanged. A separate single-run
 16-fragment top-100 comparison improves 5.550 to 2.635 ms with byte-identical
 results and 99.402% recall. Formats, nomination budgets and merge logic did not
@@ -8812,7 +8843,7 @@ unimplemented findings, not measured maintenance savings.
 
 The isolated CLI now implements term-addressable nomination packs, explicit
 bounded term maintenance and copy-only pack merging. It reuses upstream
-Seismic's existing single-list clustering/summary builder, Hermes BMP forward
+Seismic's existing single-list clustering/summary builder, Summa BMP forward
 values and cold output writers. Ordinary merge and untouched-term maintenance
 share sequential range copying with row-directory remapping; adjacent payload
 extents are coalesced without decoding. Directory parsing buffers reads; term
@@ -8931,7 +8962,7 @@ builder and two compression workers. Runs are sequential, without overlapping
 compilation. Input pages are warmed before building. Query means exclude one
 warm-up pass and include two timed passes over the same first 1,000 eligible
 queries (at most 64 dimensions). These workloads are unfiltered and each
-document has one vector. Timers surround Hermes's public search call;
+document has one vector. Timers surround Summa's public search call;
 stored-ID hydration is outside the latency timer. Merge and maintenance timers
 start after writer opening; their process peaks include opening. The 1M merge
 input runs are hashed outside the timer, warming those input pages. Peak RSS includes
@@ -8940,19 +8971,19 @@ controlled cold-storage benchmark.
 
 Reference Seismic is upstream `3c267137e202748e69ada8cd093f4c0b7c04479c`
 with vectorium `39e016caed0ed030b56ab0532d4dcf0c71556b6e`, built with the same
-compiler/flags and four threads. Its standalone kernel has no Hermes document,
+compiler/flags and four threads. Its standalone kernel has no Summa document,
 filter, multi-value or lifecycle layer. It uses U16 dimensions and an owned
-serialized index; Hermes uses U32 forward dimensions and mmap plus stored IDs.
+serialized index; Summa uses U32 forward dimensions and mmap plus stored IDs.
 Both use 4,096 postings, strongest 15 coordinates for assignment, target cluster
 size 64, summary energy 0.4, and query cut/factor 10/0.85. Sampling and minimum
 cluster policies differ. Reference builds posting lists in parallel with Rayon;
-Hermes currently clusters terms serially within the single indexing builder.
+Summa currently clusters terms serially within the single indexing builder.
 The build comparison therefore measures complete implementations with different
 active clustering concurrency, not equal-core kernel throughput. Reference is
 a useful cost/quality comparison, not an identical implementation or
 merge-capable replacement.
 
-Previous Hermes MaxScore provides the unquantized exact-result oracle. Previous
+Previous Summa MaxScore provides the unquantized exact-result oracle. Previous
 BMP requires UInt8 quantization (fixed global maximum weight 5.0), so its recall
 also includes quantization effects. Recall below is strict document-ID recall;
 no relevance judgments or tie credit are applied. Removed engines exist only in
@@ -8979,7 +9010,7 @@ results. The cache's fixed allocation is 12 MB for this corpus; allocator and
 other working-set differences mean that is not the full observed RSS delta.
 
 The fresh optimized index gets 99.580% top-10 and 99.484% top-100 recall.
-Reference Seismic gets 99.770% / 99.744% at 0.920 / 1.552 ms: Hermes remains
+Reference Seismic gets 99.770% / 99.744% at 0.920 / 1.552 ms: Summa remains
 about 2.4× / 2.3× slower on this fixture. Old BMP takes 1.757 / 2.990 ms at
 99.080% / 99.271%; old exact MaxScore takes 4.269 / 6.085 ms. This is not a
 claim of parity or a uniform speedup over the removed backends.
@@ -8994,21 +9025,21 @@ query times are warm means over the common 1,000-query fixture.
 | Previous exact MaxScore |   1.575 |    0.763 |             3.235 |
 | Previous BMP (UInt8)    |  27.082 |    1.552 |             3.902 |
 | Reference Seismic       |  51.883 |    1.865 |             3.888 |
-| Hermes Seismic          | 122.856 |    3.702 |             5.437 |
+| Summa Seismic           | 122.856 |    3.702 |             5.437 |
 
 | Engine                  | Top-10 ms / recall | Top-100 ms / recall | Peak query RSS GB |
 | ----------------------- | -----------------: | ------------------: | ----------------: |
 | Previous exact MaxScore |  33.424 / 100.000% |   46.143 / 100.000% |             0.690 |
 | Previous BMP (UInt8)    |   10.544 / 98.760% |    16.559 / 99.175% |             0.852 |
 | Reference Seismic       |    1.156 / 99.610% |     2.137 / 99.086% |             2.206 |
-| Hermes Seismic          |    2.911 / 99.370% |     5.152 / 98.947% |             3.743 |
+| Summa Seismic           |    2.911 / 99.370% |     5.152 / 98.947% |             3.743 |
 
-Fresh Hermes reduces warm top-10/top-100 time by 3.62× / 3.21× versus previous
+Fresh Summa reduces warm top-10/top-100 time by 3.62× / 3.21× versus previous
 BMP, with +0.610 / −0.228 percentage points of recall respectively. This is not
 an equal-recall comparison. Reference remains 2.52× / 2.41× faster with slightly
-higher recall and about half the disk size. Hermes p95 is 5.269 / 7.826 ms;
+higher recall and about half the disk size. Summa p95 is 5.269 / 7.826 ms;
 reference p95 is 2.125 / 3.278 ms. The index-open and first-query measurements
-vary substantially with cache state: the first fresh Hermes run opened in
+vary substantially with cache state: the first fresh Summa run opened in
 2.719 s and its first query took 514 ms; the following top-100 process opened
 in 150 ms. These uncontrolled observations are not cold-start benchmarks.
 
@@ -9055,8 +9086,8 @@ A byte census of the fresh 100,000-vector sparse file finds 101.84 MB of exact
 forward values, 735.99 MB of cropped Float32 summaries, 45.47 MB of row
 nominations and 5.03 MB of directories/headers. Summaries account for **82.9%**
 of sparse bytes. Reference Seismic's serialized index is 413.52 MB versus
-Hermes's complete 888.44 MB index. Query peak RSS is approximately 905–909 MB
-for Hermes and 479–496 MB for reference. Hermes does not heap-copy the whole
+Summa's complete 888.44 MB index. Query peak RSS is approximately 905–909 MB
+for Summa and 479–496 MB for reference. Summa does not heap-copy the whole
 index; format opening touches dispersed cluster headers and query traversal
 faults mapped payload pages. Compacting summaries and separating compact
 admission metadata from payload pages remain distinct follow-up work.
@@ -9071,8 +9102,8 @@ fragments, not duplicate exact forward values.
 The reference's `QuantizedSummary::from` quantizes each summary to UInt8 with
 per-summary Float32 minimum/scale, transposes coordinates, uses Elias–Fano
 dimension offsets, and bit-packs summary IDs (at most six bits for these build
-settings). Its forward dimensions cost two bytes versus Hermes's four; its
-packed forward-offset nominations cost eight bytes versus Hermes's four-byte
+settings). Its forward dimensions cost two bytes versus Summa's four; its
+packed forward-offset nominations cost eight bytes versus Summa's four-byte
 row IDs. The [reference summary codec](https://github.com/TusKANNy/seismic/blob/3c267137e202748e69ada8cd093f4c0b7c04479c/src/quantized_summary.rs)
 therefore provides concrete compression work to evaluate. Summary counts also
 differ with clustering/sampling and energy accumulation; these structural
@@ -9219,7 +9250,7 @@ I/O reduction is not implemented in production. Insufficient scratch can leave
 nomination debt; partial passes preserve that debt and the finite follow-up
 count. These limits must be included in build/merge/maintenance comparisons.
 
-Required measurement: current Hermes BMP versus current Hermes Seismic on the
+Required measurement: current Summa BMP versus current Summa Seismic on the
 same corpus, compiler, host, threads and ingestion batching. Report total live
 index bytes and sparse payload bytes, initial build time, copy-merge time, peak
 RSS, search latency and recall before/after merge, and maintenance separately.
@@ -10602,7 +10633,7 @@ feature checks, featureless core, strict documentation, and the server build.
 The parallel real-server stage passed four tests and hit `Address already in
 use (os error 48)` during the fifth server's startup. Rerunning the entire
 five-test integration suite with `--test-threads=1` passed all five in 5.21s
-(`/tmp/hermes-bmp-gap-e2e-serial.log`); no test assertion or timeout was weakened.
+(`/tmp/summa-bmp-gap-e2e-serial.log`); no test assertion or timeout was weakened.
 The WASM release build and all 38 JavaScript tests passed, including the new
 wide-ID BMP packet/tail fixture. Moving the Seismic codec was additionally
 byte-compared with the archived pre-extraction encoder for 9,472 production
@@ -10707,7 +10738,7 @@ passed on macOS and Linux. The repository check passed on a serial rerun after
 three broker discovery timeouts in its first concurrent run; no broker code changed.
 
 The 100k corpus probe found 162/826 queries with exact count agreement across
-Hermes/Elasticsearch/OpenSearch. The references agreed on all 826. Hermes lexical
+Summa/Elasticsearch/OpenSearch. The references agreed on all 826. Summa lexical
 analysis differs from Lucene standard analysis, including punctuation and
 contractions; even `the` matched 90,785 versus 90,758 documents. This coverage
 limit must accompany any later QPS table. No full-corpus comparison numbers are
@@ -10717,9 +10748,9 @@ available yet. See [the campaign design and evidence](searchbench-comparison.md)
 
 All four engines completed 27 cells each without request errors, but only 15 of
 826 queries have equal full-corpus counts. All three references agree on every
-query. Hermes has 216 errors (including unsupported operators) and 595 count
+query. Summa has 216 errors (including unsupported operators) and 595 count
 mismatches. Analyzer compatibility remains a prerequisite for broad claims.
-At eight clients, Hermes top-10 conjunction throughput is 9,253 QPS versus Luxir
+At eight clients, Summa top-10 conjunction throughput is 9,253 QPS versus Luxir
 10,848, Elasticsearch 5,049 and OpenSearch 5,742. Its phrase ranking trails all
 references: 470 QPS for seven low-phrase queries and 189 for the single medium
 phrase. Investigate phrase candidate/position work separately; no runtime changes
@@ -10753,7 +10784,7 @@ Full production-RPC testing was not run; no RPC or publication protocol changed.
 The [final paired run](benchmark-results/searchbench-2026-09-23-phrases.md)
 measured low-phrase top-10 at 2,605 QPS versus 677 for first-term admission and
 1,510 for fresh Luxir. Medium-phrase top-10 reached 2,129 versus 1,099 and 3,524;
-the 39.6% gap remains. Hermes top-100 beat Luxir in both phrase families, while
+the 39.6% gap remains. Summa top-100 beat Luxir in both phrase families, while
 phrase counting remained about 20–21% behind. Exact IDs, score bits and counts
 matched between binaries on the same index. Query RSS remained about 1,137 MiB.
 The current-format RGB build passed its separate exhaustive top-100 smoke audit.
@@ -10779,7 +10810,7 @@ top-100 1,316 → 2,012, and count 99 → 138. Low-phrase top-10 rises
 2,538 → 3,081 and count 321 → 383; top-100 regresses 1.3%. Conjunction count
 regresses 3.2%. Fresh Luxir remains ahead for medium top-10 (3,540) and low
 count (413). Optional impacts reach 6,352 medium top-10 QPS but regress low
-phrase top-10/top-100 relative to ordinary Hermes. Impacts stay disabled by default.
+phrase top-10/top-100 relative to ordinary Summa. Impacts stay disabled by default.
 Only 15/826 queries qualify; no broad engine-parity conclusion is justified.
 
 All 36 timing cells have zero request errors. Same-index before/after IDs,
@@ -10799,11 +10830,11 @@ restored. The archive was downloaded and SHA-256 verified before stopping the
 
 The completed [32-client, 32-vCPU report](benchmark-results/searchbench-2026-09-23-32cpu.md)
 uses 30 server hardware threads on 15 physical cores with SMT and reserves the
-remaining physical core (two SMT threads) for replay. Prior/current Hermes, RGB,
+remaining physical core (two SMT threads) for replay. Prior/current Summa, RGB,
 Elasticsearch, OpenSearch and Luxir run sequentially, followed by an optional
 impacts variant. All 63 timing cells have zero errors. Ordinary medium-phrase
 top-10 improves 10,248 → 14,896 QPS, still below Luxir's 17,580. Optional impacts
-reach 27,085 but regress low-phrase top-100 relative to ordinary Hermes. Impacts
+reach 27,085 but regress low-phrase top-100 relative to ordinary Summa. Impacts
 remain off by default. RGB stays separate and has substantial regressions as well
 as gains. Only 15/826 corpus-count-compatible queries are measured.
 
@@ -10899,7 +10930,7 @@ top-10 is essentially unchanged. Single-client throughput regresses by
 All 24 cells and their repetitions are error-free. All 15 admitted queries have
 identical before/after exhaustive top-100 IDs/score bits/counts; all 45 response
 bodies are byte-identical. Only seven conjunctions are timed, with no claim of
-full 826-query compatibility. Remaining Hermes profile costs include posting
+full 826-query compatibility. Remaining Summa profile costs include posting
 decode/seek/intersection and ID-column random reads. Luxir's stripped executable
 prevents a comparable function-level attribution; do not infer its exact pruning
 or codec strategy from the throughput gap. The report retains memory, CPU usage,
@@ -10954,7 +10985,7 @@ to lower decoded-block counts. Luxir's stripped binary still prevents equivalent
 function-level attribution of its internal strategy.
 
 The saturation check at 64 clients reaches 47,107 conjunction top-100 QPS versus
-Luxir's 44,167. At 32 clients, Hermes uses 649 CPU µs/request versus Luxir's 703,
+Luxir's 44,167. At 32 clients, Summa uses 649 CPU µs/request versus Luxir's 703,
 but only 25.25 CPU equivalents versus 29.22; utilization is now a larger part of
 that gap than per-request CPU cost. These 64-client results remain separate from
 the requested 32-client comparison. Peak anonymous RSS is 111.3 MiB versus
@@ -11014,10 +11045,10 @@ outer dispatch is not automatically removal of all handoffs. Any experiment must
 preserve Searcher ownership, bounded capacity, reader/permit retention,
 panic-to-response behavior, cancellation and shutdown; no additional executor or
 benchmark-only public core API was introduced here. Peak anonymous RSS remains
-107.8–109.5 MiB for Hermes versus Luxir's 12.4 MiB in this run.
+107.8–109.5 MiB for Summa versus Luxir's 12.4 MiB in this run.
 
 All **64 cells / 192 repetitions** pass without request or memory-sampling errors.
-Seventeen Hermes instances preserve all 45 response bodies; worker widths preserve
+Seventeen Summa instances preserve all 45 response bodies; worker widths preserve
 the exhaustive IDs/score-bits/count audit. Coverage remains **15/826**. Harness
 `.context/search-harness/20260923T160104.343227Z-check` passes all five stages and
 2,029 native tests (25 normally ignored). Ruff/Python/report checks pass. WASM and
@@ -11066,12 +11097,12 @@ control and noisy scalar measurement retained in the report.
 In-place dispatch loses **2.5%** conjunction top-100 throughput and adds **7.8%**
 CPU cost relative to updated blocking execution. Some phrase workloads improve,
 but the evidence does not justify changing the default. Tokio still transfers
-its runtime core, and the shared Searcher handoff remains. Updated Hermes is
+its runtime core, and the shared Searcher handoff remains. Updated Summa is
 16.8% behind fresh Luxir on conjunction top-10 and 2.9% ahead on top-100 in the
 corrected campaign. Luxir top-100 varies between campaigns; this is not a general
 performance lead. Coverage remains **15/826**, with one medium-phrase query.
 
-Peak anonymous RSS remains 109.1 MiB for updated blocking Hermes versus 12.4 MiB
+Peak anonymous RSS remains 109.1 MiB for updated blocking Summa versus 12.4 MiB
 for Luxir; total RSS is 1,150.6 versus 159.0 MiB. Fast-field block metadata and
 checkpoints now contribute to estimated heap accounting. Existing lazy dictionary
 tables and ordinal maps remain outside that estimate. Remaining work includes
@@ -11080,7 +11111,7 @@ startup cost of the extra validated-header pass, and extending compatibility
 coverage before claiming parity across the full query set.
 
 All **114 cells / 342 repetitions** pass request and memory-sampling checks.
-Fifteen Hermes instances preserve all 45 response bodies and saved exhaustive
+Fifteen Summa instances preserve all 45 response bodies and saved exhaustive
 ranked-ID/score-bit/count audits agree. Full harness run
 `20260923T170615.743556Z-full` passes all nine stages, including real-server
 broker E2E. Final check `20260923T180425.771100Z-check` passes all five stages
@@ -11271,9 +11302,9 @@ Evidence: [projection](benchmark-results/closing-gap-2026-09-24/project-screen.j
 postings, selective frequency/position access, batch-oriented caching with CLOCK
 eviction, and separate index construction. Its bounded candidate selection does
 not guarantee exact top-k. These are workload-specific design choices, not
-controlled comparisons with Hermes.
+controlled comparisons with Summa.
 
-For Hermes, the actionable hypotheses are direct membership access for dense
+For Summa, the actionable hypotheses are direct membership access for dense
 postings and lower shared-cache contention. Existing exact score bounds,
 corruption checks and count semantics remain requirements. A separate docblob
 ranking representation or asynchronous disk reactor would need cold-I/O evidence;

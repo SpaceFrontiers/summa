@@ -5,7 +5,7 @@ use std::{
     io::{BufWriter, Write},
     path::Path,
 };
-#[path = "../../../../../../../hermes-core/src/structures/postings/sparse/dimensions.rs"]
+#[path = "../../../../../../../summa-core/src/structures/postings/sparse/dimensions.rs"]
 mod dimensions;
 mod structures {
     pub(crate) mod postings {
@@ -16,7 +16,7 @@ type Result<T> = std::result::Result<T, String>;
 fn corrupt(s: &str) -> String {
     s.into()
 }
-#[path = "../../../../../../../hermes-core/src/segment/bmp_forward/codec.rs"]
+#[path = "../../../../../../../summa-core/src/segment/bmp_forward/codec.rs"]
 mod codec;
 fn u32_at(b: &[u8], i: usize) -> u32 {
     u32::from_le_bytes(b[i..i + 4].try_into().unwrap())

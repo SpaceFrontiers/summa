@@ -3,7 +3,7 @@ failures:
 
 ---- index::tests::bmp::test_bmp_severe_backlog_defers_reorder_until_after_compaction stdout ----
 
-thread 'index::tests::bmp::test_bmp_severe_backlog_defers_reorder_until_after_compaction' (246112893) panicked at hermes-core/src/index/tests/bmp.rs:1658:6:
+thread 'index::tests::bmp::test_bmp_severe_backlog_defers_reorder_until_after_compaction' (246112893) panicked at summa-core/src/index/tests/bmp.rs:1658:6:
 severe-backlog compaction did not finish: Elapsed(())
 
 
@@ -12,4 +12,4 @@ failures:
 
 test result: FAILED. 1794 passed; 1 failed; 16 ignored; 0 measured; 0 filtered out; finished in 204.88s
 
-error: test failed, to rerun pass `-p hermes-core --lib`
+error: test failed, to rerun pass `-p summa-core --lib`

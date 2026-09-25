@@ -21,14 +21,14 @@ repos:
         stages: [pre-push]
       - id: clippy-metal
         name: clippy (Metal)
-        entry: env CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p hermes-llm -p hermes-train --all-targets --features metal -- -D warnings
+        entry: env CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p summa-llm -p summa-train --all-targets --features metal -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
         stages: [manual]
       - id: clippy-cuda
         name: clippy (CUDA)
-        entry: env CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p hermes-llm -p hermes-train --all-targets --features cuda -- -D warnings
+        entry: env CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 cargo clippy -p summa-llm -p summa-train --all-targets --features cuda -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false
@@ -47,12 +47,15 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: "\\.patch$"
       - id: end-of-file-fixer
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files
         args: ["--maxkb=1000"]
+        # Original blog artwork retained during the repository migration.
+        exclude: "^website/assets/gear-logo\\.png$"
 
   # YAML formatting
   - repo: https://github.com/pre-commit/mirrors-prettier

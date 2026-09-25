@@ -1,0 +1,194 @@
+[package]
+name = "summa-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Core async search engine library with WASM support"
+readme = "README.md"
+
+[dependencies]
+exmex = "0.21"
+tokio = { workspace = true, optional = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+byteorder = { workspace = true }
+bitpacking = { workspace = true }
+zstd = { workspace = true }
+rustc-hash = { workspace = true }
+parking_lot = { workspace = true }
+smallvec = "1.15"
+arc-swap = "1"
+async-channel = { workspace = true, optional = true }
+num_cpus = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
+thiserror = { workspace = true }
+log = "0.4"
+lru = "0.12"
+rust-stemmers = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-normalization = { workspace = true }
+icu_segmenter = { workspace = true }
+lindera = { workspace = true, optional = true }
+stop-words = { workspace = true }
+pest = { workspace = true }
+pest_derive = { workspace = true }
+base64 = { workspace = true }
+regex = { workspace = true }
+regex-syntax = { workspace = true }
+rand = { workspace = true }
+metrics = { version = "0.24", optional = true }
+reqwest = { version = "0.13", default-features = false, optional = true }
+instant = { version = "0.1", features = ["wasm-bindgen"], optional = true }
+lasso = { workspace = true, optional = true }
+hashbrown = { workspace = true }
+half = { version = "2.7", features = ["std"] }
+fst = { version = "0.4", optional = true }
+bincode = { version = "2.0", features = ["serde"] }
+memmap2 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
+uuid = { workspace = true, optional = true }
+hf-hub = { version = "1.0", default-features = false, features = ["blocking", "rustls-tls"], optional = true }
+
+# Native tokenizers with onig (C library) for full regex support
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.tokenizers]
+version = "0.23"
+default-features = false
+features = ["onig", "http"]
+optional = true
+
+# WASM tokenizers with fancy-regex (pure Rust, no C dependencies)
+[target.'cfg(target_arch = "wasm32")'.dependencies.tokenizers]
+version = "0.23"
+default-features = false
+features = ["fancy-regex"]
+optional = true
+
+# getrandom needs wasm_js backend for WASM (pulled transitively by tokenizers, rand, etc.)
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+version = "0.3"
+features = ["wasm_js"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }
+metrics-util = "0.20"
+tempfile = { workspace = true }
+rand = { workspace = true }
+criterion = { workspace = true }
+comfy-table = "7"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+
+[[example]]
+name = "search_benchmark_game"
+test = true
+required-features = ["sync"]
+
+[[bench]]
+name = "bmp_vs_maxscore"
+harness = false
+
+[[bench]]
+name = "bmp_hot_path"
+harness = false
+
+[[bench]]
+name = "bmp_reorder"
+harness = false
+
+[[bench]]
+name = "bmp_payload_layout"
+harness = false
+
+[[bench]]
+name = "compression"
+harness = false
+
+[[bench]]
+name = "indexing"
+harness = false
+
+[[bench]]
+name = "posting_compression"
+path = "benches/posting_compression/main.rs"
+harness = false
+
+[[bench]]
+name = "vector_indexing"
+harness = false
+
+[[bench]]
+name = "binary_vectors"
+harness = false
+
+[[bench]]
+name = "scann_vectors"
+harness = false
+
+[[bench]]
+name = "dense_ann"
+harness = false
+
+[[bench]]
+name = "core_structures"
+harness = false
+
+[[bench]]
+name = "collector_selection"
+path = "benches/collector_selection/main.rs"
+harness = false
+
+[[bench]]
+name = "search_pipeline"
+harness = false
+
+[[bench]]
+name = "segment_merge"
+harness = false
+required-features = ["native"]
+
+[[bench]]
+name = "rust_hot_paths"
+harness = false
+required-features = ["native"]
+
+[[bench]]
+name = "summa_benchmark"
+path = "benches/summa_benchmark/main.rs"
+harness = false
+
+[features]
+default = ["sync"]
+native = ["fst-index", "dep:tokio", "dep:async-channel", "dep:num_cpus", "dep:rayon", "dep:lasso", "dep:memmap2", "dep:tempfile", "dep:libc", "dep:uuid", "dep:tokenizers", "dep:hf-hub"]
+sync = ["native"]
+diagnostics = []
+# Per-query work accounting for dedicated diagnostic builds; absent by default.
+query-diagnostics = ["native"]
+metrics = ["dep:metrics"]
+fst-index = ["dep:fst"]
+# Japanese (unidic) and Korean (ko-dic) morphology for the `morph` tokenizer
+# option; embeds the dictionaries (about 200 MB in the binary).
+cjk-dict = ["dep:lindera"]
+wasm = ["fst-index", "dep:tokenizers"]
+http = ["dep:reqwest", "dep:instant"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.reqwest]
+version = "0.13"
+default-features = false
+features = ["rustls"]
+optional = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.reqwest]
+version = "0.13"
+default-features = false
+optional = true

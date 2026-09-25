@@ -1,7 +1,7 @@
 [
   {
     "label": "baseline-plain",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 684,
     "query_set_sha256": "8b6c42f54ac39eab4b3d6957268d7406def705300666dc2f1470735590dd184e",
     "cells": [
@@ -2016,7 +2016,7 @@
   },
   {
     "label": "patterns-impacts",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 684,
     "query_set_sha256": "8b6c42f54ac39eab4b3d6957268d7406def705300666dc2f1470735590dd184e",
     "cells": [
@@ -2944,7 +2944,7 @@
   },
   {
     "label": "patterns-plain",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 684,
     "query_set_sha256": "8b6c42f54ac39eab4b3d6957268d7406def705300666dc2f1470735590dd184e",
     "cells": [
@@ -3872,7 +3872,7 @@
   },
   {
     "label": "patterns-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 673,
     "query_set_sha256": "150eb666e8a67b7c9ddae9a5e29c591626a6ccca8d6f7deb25b93b055373af0b",
     "cells": [

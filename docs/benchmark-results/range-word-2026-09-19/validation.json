@@ -1,6 +1,6 @@
 {
   "wasm": {
-    "command": "cd hermes-wasm && bash build.sh && npm ci && npm test -- --run",
+    "command": "cd summa-wasm && bash build.sh && npm ci && npm test -- --run",
     "returncode": 0,
     "test_files": 7,
     "tests_passed": 38
@@ -14,7 +14,7 @@
     "benchmark_targets": 20
   },
   "native_async": {
-    "command": "cargo test --locked -p hermes-core --no-default-features --features native --test range_bitset",
+    "command": "cargo test --locked -p summa-core --no-default-features --features native --test range_bitset",
     "returncode": 0,
     "tests_passed": 2
   },
@@ -26,7 +26,7 @@
     "failure_output": "initial-failure.txt"
   },
   "isolated_retry": {
-    "command": "target/debug/deps/hermes_core-daed016561d0d789 --exact index::tests::bmp::test_bmp_severe_backlog_defers_reorder_until_after_compaction --test-threads=1",
+    "command": "target/debug/deps/summa_core-daed016561d0d789 --exact index::tests::bmp::test_bmp_severe_backlog_defers_reorder_until_after_compaction --test-threads=1",
     "returncode": 0,
     "seconds": 3.98
   },

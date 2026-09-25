@@ -8,8 +8,8 @@ import sys
 import time
 from pathlib import Path
 
-E = Path(os.environ.get("BMP_QUERY_EVIDENCE", "/mnt/hermes-copy-merge/bmp-query"))
-env = os.environ | {"HERMES_PIN_MODE": "copy", "HERMES_PIN_METADATA_BUDGET_MB": "64"}
+E = Path(os.environ.get("BMP_QUERY_EVIDENCE", "/mnt/summa-copy-merge/bmp-query"))
+env = os.environ | {"SUMMA_PIN_MODE": "copy", "SUMMA_PIN_METADATA_BUDGET_MB": "64"}
 
 
 def cgroup():

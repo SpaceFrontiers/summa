@@ -1,7 +1,7 @@
 # Yonik Searchbench comparison and phrase optimization
 
 September 24 expanded comparison: [all-query coverage and skipping experiments](benchmark-results/skipping-2026-09-24/README.md)
-retain all **826** original query attempts. Hermes executes **684** on the full
+retain all **826** original query attempts. Summa executes **684** on the full
 10M corpus; 142 hit explicit resource limits. The new [shared-input mode](#shared-input-comparison-mode)
 allows count differences and exposes them alongside the completed 684-query timings. The older results
 below use the stricter 15-query exact-count subset and remain historical results.
@@ -14,14 +14,14 @@ on September 22 at 21:06 UTC (September 23, 00:06 Moscow). All 108 measured cell
 completed without request errors. Only **15/826 queries** passed the full-corpus
 count gate: seven conjunctions, seven low-frequency phrases, and one medium-frequency
 phrase. Elasticsearch, OpenSearch, and Luxir agreed on all 826 count probes;
-Hermes returned errors for 216 rows and different counts for another 595.
+Summa returned errors for 216 rows and different counts for another 595.
 This is a severely restricted comparison, not a complete Searchbench result.
 
 The [result table](benchmark-results/searchbench-2026-09-22.md) and
 [CSV](benchmark-results/searchbench-2026-09-22.csv) retain every measured cell.
-At eight clients, top-10 conjunction QPS was Hermes 9,253, Elasticsearch 5,049,
+At eight clients, top-10 conjunction QPS was Summa 9,253, Elasticsearch 5,049,
 OpenSearch 5,742, and Luxir 10,848. Phrase ranking was substantially slower in
-Hermes: 470 QPS for the seven low-phrase queries versus 984–1,503 for the references;
+Summa: 470 QPS for the seven low-phrase queries versus 984–1,503 for the references;
 189 QPS for the single medium phrase versus 1,017–3,518. These results identify a
 phrase-ranking gap but cannot establish an overall engine ranking.
 
@@ -30,7 +30,7 @@ completed another 27 cells. It exposes a mapped-length phrase-pruning bug and
 helps RGB, but does not close the ordinary-index phrase gap. Further non-RGB
 work is described below. The [final non-RGB paired run](benchmark-results/searchbench-2026-09-23-phrases.md)
 now measures 2,605 QPS for low-phrase top-10 and 2,129 for medium-phrase top-10,
-versus fresh Luxir's 1,510 and 3,524. Hermes leads both phrase top-100 cells;
+versus fresh Luxir's 1,510 and 3,524. Summa leads both phrase top-100 cells;
 medium-phrase top-10 and exact counting remain behind.
 
 The monitoring process lost GCP authentication after 19:36 UTC. The remote job
@@ -68,12 +68,12 @@ and source presets define the workload; this is distinct from our existing
 
 The article's hardware is a Ryzen 9 9955HX with 64 GB RAM, 14 physical server
 cores and two driver cores. Measurements on another host must rerun all engines
-on that host; do not combine Hermes numbers with the article's absolute QPS.
+on that host; do not combine Summa numbers with the article's absolute QPS.
 The existing GCP instance `benchmark-host` in `us-east1-b` is running (`n2-highmem-8`: 8 vCPUs, 62 GiB usable RAM). Server affinity is
 `0-2,4-6` (three physical cores with SMT); driver affinity is `3,7` (one physical
 core with SMT). This differs substantially from the article's host. New artifacts
 live on the existing mounted 1 TB data disk under
-`/mnt/hermes-copy/searchbench-20260922`; the full boot disk is not used for new
+`/mnt/summa-copy/searchbench-20260922`; the full boot disk is not used for new
 build outputs or indexes.
 
 The user authorized restarting this machine. The September 22 run uses a benchmark
@@ -109,10 +109,10 @@ those operators. **100 of them are accepted by the native grammar without
 implementing the requested wildcard/regex operation** (98 wildcard rows and two
 regex rows). On a one-segment fixture containing `there`, `them`, `the`, and `e`:
 
-| Query  | Hermes count | Intended wildcard/prefix count |
-| ------ | -----------: | -----------------------------: |
-| `th*e` |            4 |                              2 |
-| `th*`  |            3 |                              3 |
+| Query  | Summa count | Intended wildcard/prefix count |
+| ------ | ----------: | -----------------------------: |
+| `th*e` |           4 |                              2 |
+| `th*`  |           3 |                              3 |
 
 The grammar interprets `th*e` as prefix `th*` OR term `e`. Therefore the benchmark
 adapter must gate by query family before parsing, even when strict parsing
@@ -124,7 +124,7 @@ Other boundaries:
 - The production server exposes gRPC, while Searchbench drives persistent HTTP.
   A benchmark HTTP frontend over core would need to be explicitly named as such;
   it would not measure the production gRPC server's overhead.
-- Hermes's default tokenizer strips punctuation within whitespace-delimited
+- Summa's default tokenizer strips punctuation within whitespace-delimited
   tokens. Its lexical tokenizer also has normalization differences from Lucene's
   standard analyzer. The Game adapter's text transformation cannot be reused to
   claim the original-text Searchbench posture.
@@ -160,7 +160,7 @@ Other boundaries:
    secondary query suite separate from full-text results.
 
 The partial-selection collector prototypes remain benchmark-only and are not
-enabled in this comparison. Comparing production Hermes on a new workload is
+enabled in this comparison. Comparing production Summa on a new workload is
 separate from a collector A/B experiment.
 
 ## Reproducing the completed preflight
@@ -168,7 +168,7 @@ separate from a collector A/B experiment.
 ```sh
 git clone --depth 1 --branch fulltext-munin-host-20260920 \
   https://github.com/yonik/searchbench.git .context/yonik-benchmark/searchbench
-cargo build --locked --release -p hermes-core --example search_benchmark_game
+cargo build --locked --release -p summa-core --example search_benchmark_game
 python3 scripts/searchbench/preflight.py \
   --binary target/release/examples/search_benchmark_game \
   --queries .context/yonik-benchmark/searchbench/queries/luceneutil/queries.txt \
@@ -191,7 +191,7 @@ been used to claim a verified 10M-document fixture.
 
 ## September 22 execution findings
 
-The [HTTP frontend](../hermes-server/examples/searchbench_http/main.rs) delegates
+The [HTTP frontend](../summa-server/examples/searchbench_http/main.rs) delegates
 index construction to `IndexWriter`, ranked search to the synchronous `Searcher`,
 exact counts to `collect_segment`/`CountCollector`, and ID hydration to fast text
 columns. The HTTP frontend is an example target with an Axum dev dependency; it
@@ -215,7 +215,7 @@ The 100,000-row smoke prefix found exact count agreement for 162/826 queries (un
 prefix query passed. Unsupported wildcard/regex families are explicitly excluded.
 This is a serious coverage limit, not a performance result. Examples:
 
-| Query | Hermes | Elasticsearch | OpenSearch |
+| Query |  Summa | Elasticsearch | OpenSearch |
 | ----- | -----: | ------------: | ---------: |
 | `the` | 90,785 |        90,758 |     90,758 |
 | `is`  | 47,700 |        46,746 |     46,746 |
@@ -252,10 +252,10 @@ the same resulting subset, corpus, CPU allocation, warmup, and repetitions.
 ## Run and evidence
 
 The completed run executed sequentially on `benchmark-host`: reference
-index construction, Hermes construction, all four count probes, and the common
+index construction, Summa construction, all four count probes, and the common
 subset timing matrix. Repository changes are uncommitted.
 
-Remote progress: `/mnt/hermes-copy/searchbench-20260922/status.txt` and
+Remote progress: `/mnt/summa-copy/searchbench-20260922/status.txt` and
 `campaign.log`. The local detached supervisor records progress in
 `.context/yonik-benchmark/supervisor.log`. On completion it downloads the raw
 results, count exclusions, memory samples, and logs to
@@ -309,14 +309,14 @@ A/B results are linked above.
 
 The [OpenSearch cancellation report](https://yonik.com/blog/opensearch-cancellation-wrapper/)
 points to bulk-operation forwarding, iterator reuse, and allocation-free checks.
-Hermes already calls the posting owner's SIMD block intersection and reuses
+Summa already calls the posting owner's SIMD block intersection and reuses
 position buffers; its phrase scorer drops deadline-free budget checks at setup.
 The measured phrase hotspot is candidate scoring bounds, not callback allocation.
 Cancellation remains enabled; no checks are removed for this experiment.
 
 ### Why the counts differ
 
-All three reference engines agreed for all 826 input queries. Hermes had 15 equal
+All three reference engines agreed for all 826 input queries. Summa had 15 equal
 counts, 595 different counts (583 higher, 12 lower), and 216 explicit errors.
 The errors split into 158 unsupported wildcard/regex queries, 46 prefixes that
 exceeded the existing 1,024-term expansion budget, and 12 query-syntax errors.
@@ -327,23 +327,23 @@ agreed on all 156 audited full-corpus queries: every one of the 141 term queries
 plus the 15 timed queries. This rules out an optimized-count discrepancy for
 those queries; it does not prove all phrase semantics equivalent to Lucene.
 
-Actual token streams from the benchmark Hermes tokenizer and Elasticsearch's
+Actual token streams from the benchmark Summa tokenizer and Elasticsearch's
 standard analyzer explain large differences on Wikipedia markup:
 
-| Input              | Hermes terms             | Reference terms     |
+| Input              | Summa terms              | Reference terms     |
 | ------------------ | ------------------------ | ------------------- |
 | `file:Example.jpg` | `file`, `example`, `jpg` | `file:example.jpg`  |
 | `people’s world`   | `people`, `world`        | `people’s`, `world` |
 | `the.com`          | `the`, `com`             | `the.com`           |
 | `ＦＩＬＥ ﬁle`     | `file`, `file`           | `ｆｉｌｅ`, `ﬁle`   |
 
-For example, `file` matches 536,622 Hermes documents versus 82,102 in every
+For example, `file` matches 536,622 Summa documents versus 82,102 in every
 reference; `people` matches 928,191 versus 790,960. Disabling stemming, folding
-and stop words does not make the two analyzers identical: Hermes still splits
+and stop words does not make the two analyzers identical: Summa still splits
 these boundaries and applies compatibility normalization.
 
 A separate 22-document fixture exposes a sloppy-phrase semantic difference:
-`"a a"~4` matches 13 Hermes documents versus 2 reference documents. Hermes's
+`"a a"~4` matches 13 Summa documents versus 2 reference documents. Summa's
 existing anchored-window matcher may reuse one occurrence for repeated terms;
 Lucene requires separate occurrences. Exact phrases agree on this fixture.
 Changing these established semantics needs a separate matching/analyzer change;
@@ -609,7 +609,7 @@ bounded multi-term execution capable of the benchmark's broader expansions.
 Do not obtain coverage by silently truncating expansions or changing the corpus.
 Reprobe all 826 exact counts after rebuilding, retaining explicit exclusions and
 errors until every cell's semantics are established. Equal counts alone are not
-a ranking oracle: preserve separate scorer/ID/score-bit checks within Hermes.
+a ranking oracle: preserve separate scorer/ID/score-bit checks within Summa.
 
 A post-change capability check submits all 826 published expressions to the real
 HTTP adapter over a four-document fixture: **801 accepted, 25 explicit errors**
@@ -626,7 +626,7 @@ rejections include 71 sloppy phrases handled by the HTTP adapter's existing
 
 The [32-vCPU host report](benchmark-results/searchbench-2026-09-23-32cpu.md)
 records all seven variants, 63 error-free cells, memory, correctness and operational
-recovery. Ordinary medium-phrase top-10 improves 45.4% over prior Hermes; optional
+recovery. Ordinary medium-phrase top-10 improves 45.4% over prior Summa; optional
 impacts exceed Luxir on that cell but regress low-phrase top-100. RGB has separate
 wins and regressions. Defaults remain unchanged, and coverage remains 15/826.
 
@@ -673,11 +673,11 @@ Run stage diagnostics without instrumentation for timings, and separately with
 work counters (the feature changes query overhead):
 
 ```sh
-cargo run --release -p hermes-server --example searchbench_http -- diagnose INDEX QUERIES.jsonl 30
-cargo run --release -p hermes-server --example searchbench_http --features query-diagnostics -- diagnose INDEX QUERIES.jsonl 30
+cargo run --release -p summa-server --example searchbench_http -- diagnose INDEX QUERIES.jsonl 30
+cargo run --release -p summa-server --example searchbench_http --features query-diagnostics -- diagnose INDEX QUERIES.jsonl 30
 # Automatic HTTP worker count, then explicit override:
-cargo run --release -p hermes-server --example searchbench_http -- serve INDEX 9401 30
-cargo run --release -p hermes-server --example searchbench_http -- serve INDEX 9401 30 2
+cargo run --release -p summa-server --example searchbench_http -- serve INDEX 9401 30
+cargo run --release -p summa-server --example searchbench_http -- serve INDEX 9401 30 2
 ```
 
 Each input line uses the existing HTTP envelope (`query`, `class`); diagnostics
@@ -715,7 +715,7 @@ async path has a different dispatch boundary. A future scheduling change must
 preserve bounded capacity, reader/permit ownership, cancellation, panic handling
 and shutdown before its performance is compared.
 
-With `hermes-server/query-diagnostics` enabled, the benchmark-only
+With `summa-server/query-diagnostics` enabled, the benchmark-only
 `GET /diagnostics` endpoint reports completed-handler/failed-worker counts and nine
 fixed-size timing sums/maxima. It retains no per-request records or query text.
 HTTP timings cover blocking entry/return, parse, search, projection and encoding
@@ -820,9 +820,9 @@ This expands coverage without rewriting the query corpus, but different counts
 mean different logical work. Report per-family query counts and count differences
 alongside throughput; do not present this as a scoring-equivalence test. On the
 September 24 full 10M probe, all three reference engines agree on all 826 counts.
-Both Hermes layouts execute 684 queries; 619 are within 5% of the reference count,
+Both Summa layouts execute 684 queries; 619 are within 5% of the reference count,
 and the median relative difference is 0.34%. Only 15 match exactly. The other 142
-Hermes requests fail explicit dictionary-scan or term-expansion limits; they
+Summa requests fail explicit dictionary-scan or term-expansion limits; they
 remain failures in the 826-query coverage table and have no successful-query QPS.
 
 A derived matched-workload suite could instead pair queries by operator shape,

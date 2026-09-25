@@ -157,7 +157,7 @@ receive a separate full native/WASM run because it was also rejected.
 Apple M4 alternating runs reduced the million-document piecewise scan from
 3.325/3.643 ms to 1.614/1.684 ms. Unaffected controls were noisy and sometimes
 slower, so a dedicated Cascade Lake machine repeated the comparison with matching
-Hermes 1.8.146 binaries, Rust 1.98.1, unchanged release flags and CPU affinity.
+Summa 1.8.146 binaries, Rust 1.98.1, unchanged release flags and CPU affinity.
 Both run orders confirmed the compressed-data improvement and the ordinary-filter
 regression. Compiler outlining shifted between the shared codec dispatcher and
 bitset packing; explicit inline hints did not remove the tradeoff. A final
@@ -240,7 +240,7 @@ small scan state machine removes an extra call from advance/seek. These hints
 are local to the measured scorer, not general reader/codec policy.
 
 The [measurement evidence](benchmark-results/lazy-range-2026-09-19/summary.json)
-records matching Hermes 1.8.147 / Rust 1.98.1 builds, unchanged release flags,
+records matching Summa 1.8.147 / Rust 1.98.1 builds, unchanged release flags,
 alternating before/after and after/before order, 20 Criterion samples, one-second
 warmups and two-second measurements. M4 has intermittent background-load noise;
 the isolated Cascade Lake runs pin execution to CPU 2. Full iteration includes

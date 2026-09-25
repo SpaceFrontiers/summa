@@ -1,22 +1,22 @@
 # Tokenizer backend compatibility
 
-Hermes treats `tokenizer.json` and its token IDs as part of the model artifact
+Summa treats `tokenizer.json` and its token IDs as part of the model artifact
 contract. Changing the tokenizer implementation is safe for an existing
 checkpoint only when encoding, decoding, added-token handling, and vocabulary
 lookups remain identical.
 
 ## Current backend
 
-`hermes-llm` and `hermes-train` use the first-party `hermes-tokenizer` crate;
+`summa-llm` and `summa-train` use the first-party `summa-tokenizer` crate;
 neither executable depends on Python Transformers or Hugging Face's Rust
 `tokenizers` package. The shared wrapper loads a local `tokenizer.json`,
 resolves EOS, encodes individual prompts and document batches, decodes
 generated IDs, and exposes exact and display-friendly vocabulary pieces.
 
-`hermes-core` has a wider contract. It supports native Hugging Face Hub and
+`summa-core` has a wider contract. It supports native Hugging Face Hub and
 local loading, byte loading for index-contained tokenizers, WordPiece models
 used by sparse retrieval, and a WASM build. A replacement for the LLM trainer
-therefore does not automatically qualify as a replacement for `hermes-core`.
+therefore does not automatically qualify as a replacement for `summa-core`.
 
 ## GigaToken evaluation — 2026-07-22
 
@@ -40,7 +40,7 @@ On the same small document sample, GigaToken processed 22.71 MiB/s and Hugging
 Face processed 16.33 MiB/s, a 1.39x tokenizer-only speedup. This is not an
 end-to-end trainer result. GigaToken's much larger published gains use its
 file-native API on multi-gigabyte inputs; its compatibility API has measurable
-overhead. Hermes currently parses JSONL itself, passes batches of strings to
+overhead. Summa currently parses JSONL itself, passes batches of strings to
 the tokenizer, and reuses a persistent causal-token cache after the first
 pass, so the published headline speedup does not transfer directly.
 
@@ -48,14 +48,14 @@ pass, so the published headline speedup does not transfer directly.
 
 The extraction has since been refreshed to GigaToken 0.10.0 at commit
 `34a1599f0c0ae7d7cd0d1c530e6522320158b360`. See the
-[provenance register](../hermes-tokenizer/UPSTREAM.md) for the current revision
+[provenance register](../summa-tokenizer/UPSTREAM.md) for the current revision
 and refresh policy. The July evaluation above measured 0.9.0; it is not a
 new measurement of the current extraction.
 
 ### Initial extraction — 2026-07-22
 
 The optimized byte-level BPE engine, persistent pretoken cache, merge kernels,
-and fast pretokenizers were extracted into `hermes-tokenizer` from GigaToken
+and fast pretokenizers were extracted into `summa-tokenizer` from GigaToken
 0.9.0 commit `542367a3efed134883fb4f1140b49c04e6fad3a3`. It is a narrow stable-Rust
 crate, not a copy of the full application: Python bindings, CLI, data loaders,
 Arrow/Parquet, networking, training code, reference implementations,
@@ -72,7 +72,7 @@ against the step-19,000 tokenizer.
 
 The extraction is intentionally limited to LLM training and inference:
 
-- `hermes-core` retains Hugging Face `tokenizers` for WordPiece sparse
+- `summa-core` retains Hugging Face `tokenizers` for WordPiece sparse
   retrieval, Hub loading, index-contained byte artifacts, and WASM.
 - SentencePiece/Unigram and BPE byte fallback are rejected rather than pulling
   their nightly SIMD path into the stable build.
@@ -86,5 +86,5 @@ The relevant upstream work is tracked in GigaToken issues
 
 An end-to-end first-pass curriculum benchmark should still measure accelerator
 utilization and training tokens per second; the 1.39x number above is a
-tokenizer-only result. Keep the Hugging Face backend in `hermes-core` until a
+tokenizer-only result. Keep the Hugging Face backend in `summa-core` until a
 replacement also meets its WordPiece and WASM contracts.

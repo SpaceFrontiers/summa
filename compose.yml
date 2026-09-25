@@ -11,11 +11,11 @@ services:
       - .:/app
       - rustuser-home:/home/rustuser
 
-  build-hermes-wasm:
+  build-summa-wasm:
     build:
       context: .
       dockerfile: Dockerfile
-    working_dir: /app/hermes-wasm
+    working_dir: /app/summa-wasm
     command: bash build.sh
     volumes:
       - .:/app

@@ -116,7 +116,7 @@ def check(root, paths):
 
     guide = root / "docs/benchmarks.md"
     listed = set(
-        re.findall(r"^\| `(hermes-[\w-]+)`\s*\| `([\w-]+)`", guide.read_text(), re.M)
+        re.findall(r"^\| `(summa-[\w-]+)`\s*\| `([\w-]+)`", guide.read_text(), re.M)
     )
     workspace = tomllib.loads((root / "Cargo.toml").read_text())
     actual = set()

@@ -90,7 +90,7 @@ def analyze(archive):
                     row = {
                         mode: measure(
                             [
-                                f"cloud/pruning/final/{run}-{mode}-{layout}/hermes/{key}-c32.json"
+                                f"cloud/pruning/final/{run}-{mode}-{layout}/summa/{key}-c32.json"
                                 for run in [1, 2]
                             ]
                         )

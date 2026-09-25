@@ -1,8 +1,8 @@
 # Expanded queries and skipping comparison — September 24, 2026
 
 **Completed:** all 826 original queries were probed on five deployments; 684
-successful shared inputs were timed across Hermes, Hermes RGB, Elasticsearch,
-OpenSearch and Luxir. Six Hermes configurations completed two skipping rounds.
+successful shared inputs were timed across Summa, Summa RGB, Elasticsearch,
+OpenSearch and Luxir. Six Summa configurations completed two skipping rounds.
 All 702 timing cells finished without request errors. No production algorithm,
 index format, schema or default changed.
 
@@ -10,13 +10,13 @@ index format, schema or default changed.
 
 | Deployment    | Successful count probes | Explicit failures |
 | ------------- | ----------------------: | ----------------: |
-| Hermes        |                 684/826 |               142 |
-| Hermes RGB    |                 684/826 |               142 |
+| Summa         |                 684/826 |               142 |
+| Summa RGB     |                 684/826 |               142 |
 | Elasticsearch |                 826/826 |                 0 |
 | OpenSearch    |                 826/826 |                 0 |
 | Luxir         |                 826/826 |                 0 |
 
-The three references agree on all 826 counts. The Hermes layouts have identical
+The three references agree on all 826 counts. The Summa layouts have identical
 counts/errors. Only 15 queries match the reference counts exactly; **619 of the
 684 successes are within 5%**, with a median relative difference of 0.34%.
 The new `campaign.py gate --comparison shared-input` mode retains different
@@ -29,8 +29,8 @@ ranges](engines.json), [per-query observed latencies](query-latencies.json),
 [65 substantial count outliers](count-outliers.json) retain the complete picture.
 These shared inputs do not establish equal logical work or ranking equivalence.
 
-For example, `+in +user\:robert` matches 571,821 documents in Hermes and 1,362 in
-all references. Its recorded Hermes plan requires `in` and an OR of `user` and
+For example, `+in +user\:robert` matches 571,821 documents in Summa and 1,362 in
+all references. Its recorded Summa plan requires `in` and an OR of `user` and
 `robert`: punctuation is split during analysis, and the unqualified analyzed
 term retains the parser's existing OR semantics. Conjunction timing gaps can
 therefore include substantially different work. This experiment preserves those
@@ -47,13 +47,13 @@ QPS, higher is better; 10M documents and 32 clients. These rows use the expanded
 original-text workload, not the older 15-query exact-count subset. The full
 report includes every family and operation.
 
-| Family                  | Queries | Hermes | Hermes RGB | Elasticsearch | OpenSearch |  Luxir |
-| ----------------------- | ------: | -----: | ---------: | ------------: | ---------: | -----: |
-| High/high conjunction   |      47 |  1,148 |      1,223 |         1,954 |      1,934 |  2,295 |
-| High/low conjunction    |      50 |  3,100 |      3,851 |        22,644 |     26,012 | 53,707 |
-| High-frequency phrase   |      30 |  1,607 |      1,204 |           283 |        296 |  1,162 |
-| Medium-frequency phrase |      46 |  1,965 |      1,871 |           256 |        270 |  1,003 |
-| Low-frequency phrase    |      50 |  2,645 |      2,724 |           279 |        280 |  1,426 |
+| Family                  | Queries | Summa | Summa RGB | Elasticsearch | OpenSearch |  Luxir |
+| ----------------------- | ------: | ----: | --------: | ------------: | ---------: | -----: |
+| High/high conjunction   |      47 | 1,148 |     1,223 |         1,954 |      1,934 |  2,295 |
+| High/low conjunction    |      50 | 3,100 |     3,851 |        22,644 |     26,012 | 53,707 |
+| High-frequency phrase   |      30 | 1,607 |     1,204 |           283 |        296 |  1,162 |
+| Medium-frequency phrase |      46 | 1,965 |     1,871 |           256 |        270 |  1,003 |
+| Low-frequency phrase    |      50 | 2,645 |     2,724 |           279 |        280 |  1,426 |
 
 Counts are within 5% for respectively 44/47, 32/50, 30/30, 44/46 and 48/50
 queries in these rows. Phrase ranking is competitive on this broader workload;
@@ -104,8 +104,8 @@ Peak process residency across the shared-input cells:
 
 | Deployment    | Total RSS (MiB) | Anonymous RSS (MiB) |
 | ------------- | --------------: | ------------------: |
-| Hermes        |           3,740 |               1,196 |
-| Hermes RGB    |           3,937 |               1,203 |
+| Summa         |           3,740 |               1,196 |
+| Summa RGB     |           3,937 |               1,203 |
 | Elasticsearch |           9,813 |               9,138 |
 | OpenSearch    |           9,978 |               9,305 |
 | Luxir         |           1,357 |                 152 |

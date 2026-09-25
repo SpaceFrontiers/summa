@@ -3441,266 +3441,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "hermes-broker"
-version = "1.9.1"
-dependencies = [
- "anyhow",
- "arc-swap",
- "clap",
- "env_logger",
- "futures",
- "hermes-core",
- "k8s-openapi",
- "kube",
- "log",
- "metrics",
- "metrics-exporter-prometheus",
- "num_cpus",
- "parking_lot",
- "prost",
- "rustls",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic",
- "tonic-build",
- "tonic-health",
- "tonic-prost",
- "tonic-prost-build",
- "tonic-reflection",
-]
-
-[[package]]
-name = "hermes-core"
-version = "1.9.1"
-dependencies = [
- "arc-swap",
- "async-channel",
- "async-trait",
- "base64 0.22.1",
- "bincode",
- "bitpacking",
- "byteorder",
- "comfy-table",
- "criterion",
- "exmex",
- "fst",
- "futures",
- "getrandom 0.3.4",
- "half",
- "hashbrown 0.17.1",
- "hf-hub 1.0.0",
- "icu_segmenter",
- "instant",
- "lasso",
- "libc",
- "lindera",
- "log",
- "lru",
- "memmap2",
- "metrics",
- "metrics-util",
- "num_cpus",
- "parking_lot",
- "pest",
- "pest_derive",
- "rand 0.9.5",
- "rayon",
- "regex",
- "regex-syntax",
- "reqwest 0.13.5",
- "rust-stemmers",
- "rustc-hash 2.1.3",
- "serde",
- "serde_json",
- "smallvec",
- "stop-words",
- "tempfile",
- "thiserror 2.0.21",
- "tokenizers",
- "tokio",
- "unicode-normalization",
- "unicode-segmentation",
- "uuid",
- "zstd 0.13.3",
-]
-
-[[package]]
-name = "hermes-llm"
-version = "1.9.1"
-dependencies = [
- "anyhow",
- "axum",
- "burn-autodiff",
- "burn-core",
- "burn-cubecl",
- "burn-fusion",
- "burn-ir",
- "burn-ndarray",
- "burn-nn",
- "burn-store",
- "burn-wgpu",
- "clap",
- "cubecl",
- "cubek",
- "dirs",
- "half",
- "hermes-mal",
- "hermes-tokenizer",
- "object_store",
- "rand 0.9.5",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "hermes-mal"
-version = "1.9.1"
-dependencies = [
- "anyhow",
- "pest",
- "pest_derive",
- "rust-embed",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "hermes-mal-python"
-version = "1.9.1"
-dependencies = [
- "hermes-mal",
- "pyo3",
- "serde_json",
-]
-
-[[package]]
-name = "hermes-server"
-version = "1.9.1"
-dependencies = [
- "anyhow",
- "axum",
- "clap",
- "env_logger",
- "hermes-core",
- "log",
- "metrics",
- "metrics-exporter-prometheus",
- "num_cpus",
- "parking_lot",
- "prost",
- "rayon",
- "rustc-hash 2.1.3",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tonic",
- "tonic-build",
- "tonic-prost",
- "tonic-prost-build",
-]
-
-[[package]]
-name = "hermes-tokenizer"
-version = "1.9.1"
-dependencies = [
- "ahash",
- "aho-corasick",
- "anyhow",
- "icu_normalizer",
- "icu_properties",
- "libc",
- "memchr",
- "parking_lot",
- "rayon",
- "rustc-hash 2.1.3",
- "serde",
- "serde_json",
- "tokenizers",
-]
-
-[[package]]
-name = "hermes-tool"
-version = "1.9.1"
-dependencies = [
- "anyhow",
- "bincode",
- "clap",
- "crossbeam-channel",
- "hermes-core",
- "libc",
- "murmur3",
- "rayon",
- "serde",
- "serde_json",
- "sonic-rs",
- "tempfile",
- "tikv-jemalloc-ctl",
- "tikv-jemallocator",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "hermes-train"
-version = "1.9.1"
-dependencies = [
- "anyhow",
- "burn-core",
- "burn-nn",
- "burn-optim",
- "burn-pack",
- "clap",
- "half",
- "hermes-llm",
- "libc",
- "native-tls",
- "postgres",
- "postgres-native-tls",
- "rand 0.9.5",
- "rusqlite",
- "safetensors 0.7.0",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "ureq 2.12.1",
- "zstd 0.13.3",
-]
-
-[[package]]
-name = "hermes-wasm"
-version = "1.9.1"
-dependencies = [
- "async-trait",
- "console_error_panic_hook",
- "console_log",
- "futures-channel",
- "getrandom 0.3.4",
- "hermes-core",
- "js-sys",
- "log",
- "parking_lot",
- "rustc-hash 2.1.3",
- "serde",
- "serde-wasm-bindgen",
- "serde_json",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "hermit-abi"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7488,6 +7228,272 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "summa-broker"
+version = "1.9.1"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "clap",
+ "env_logger",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "log",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "num_cpus",
+ "parking_lot",
+ "prost",
+ "rustls",
+ "summa-core",
+ "summa-proto",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tonic-health",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tonic-reflection",
+]
+
+[[package]]
+name = "summa-core"
+version = "1.9.1"
+dependencies = [
+ "arc-swap",
+ "async-channel",
+ "async-trait",
+ "base64 0.22.1",
+ "bincode",
+ "bitpacking",
+ "byteorder",
+ "comfy-table",
+ "criterion",
+ "exmex",
+ "fst",
+ "futures",
+ "getrandom 0.3.4",
+ "half",
+ "hashbrown 0.17.1",
+ "hf-hub 1.0.0",
+ "icu_segmenter",
+ "instant",
+ "lasso",
+ "libc",
+ "lindera",
+ "log",
+ "lru",
+ "memmap2",
+ "metrics",
+ "metrics-util",
+ "num_cpus",
+ "parking_lot",
+ "pest",
+ "pest_derive",
+ "rand 0.9.5",
+ "rayon",
+ "regex",
+ "regex-syntax",
+ "reqwest 0.13.5",
+ "rust-stemmers",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "stop-words",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokenizers",
+ "tokio",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "uuid",
+ "zstd 0.13.3",
+]
+
+[[package]]
+name = "summa-llm"
+version = "1.9.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "burn-autodiff",
+ "burn-core",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "burn-ndarray",
+ "burn-nn",
+ "burn-store",
+ "burn-wgpu",
+ "clap",
+ "cubecl",
+ "cubek",
+ "dirs",
+ "half",
+ "object_store",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "summa-mal",
+ "summa-tokenizer",
+ "tempfile",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "summa-mal"
+version = "1.9.1"
+dependencies = [
+ "anyhow",
+ "pest",
+ "pest_derive",
+ "rust-embed",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "summa-mal-python"
+version = "1.9.1"
+dependencies = [
+ "pyo3",
+ "serde_json",
+ "summa-mal",
+]
+
+[[package]]
+name = "summa-proto"
+version = "1.9.1"
+
+[[package]]
+name = "summa-server"
+version = "1.9.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "env_logger",
+ "log",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "num_cpus",
+ "parking_lot",
+ "prost",
+ "rayon",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "summa-core",
+ "summa-proto",
+ "tempfile",
+ "tokio",
+ "tonic",
+ "tonic-build",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "summa-tokenizer"
+version = "1.9.1"
+dependencies = [
+ "ahash",
+ "aho-corasick",
+ "anyhow",
+ "icu_normalizer",
+ "icu_properties",
+ "libc",
+ "memchr",
+ "parking_lot",
+ "rayon",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
+name = "summa-tool"
+version = "1.9.1"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "clap",
+ "crossbeam-channel",
+ "libc",
+ "murmur3",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sonic-rs",
+ "summa-core",
+ "tempfile",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "summa-train"
+version = "1.9.1"
+dependencies = [
+ "anyhow",
+ "burn-core",
+ "burn-nn",
+ "burn-optim",
+ "burn-pack",
+ "clap",
+ "half",
+ "libc",
+ "native-tls",
+ "postgres",
+ "postgres-native-tls",
+ "rand 0.9.5",
+ "rusqlite",
+ "safetensors 0.7.0",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "summa-llm",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "ureq 2.12.1",
+ "zstd 0.13.3",
+]
+
+[[package]]
+name = "summa-wasm"
+version = "1.9.1"
+dependencies = [
+ "async-trait",
+ "console_error_panic_hook",
+ "console_log",
+ "futures-channel",
+ "getrandom 0.3.4",
+ "js-sys",
+ "log",
+ "parking_lot",
+ "rustc-hash 2.1.3",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "summa-core",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
 
 [[package]]
 name = "symlink"

@@ -17,8 +17,8 @@ QUERIES = Path(os.environ["FORWARD_QUERIES"])
 ENV = os.environ | {
     "RAYON_NUM_THREADS": "4",
     "TOKIO_WORKER_THREADS": "4",
-    "HERMES_PIN_MODE": "copy",
-    "HERMES_PIN_METADATA_BUDGET_MB": "64",
+    "SUMMA_PIN_MODE": "copy",
+    "SUMMA_PIN_METADATA_BUDGET_MB": "64",
 }
 
 

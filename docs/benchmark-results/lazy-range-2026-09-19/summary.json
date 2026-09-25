@@ -6,7 +6,7 @@
   "package_version": "1.8.147",
   "local_environment": {
     "revision": "05150b9ba26eeb4d3f8e1bdba5572b816412f8b9",
-    "status": "M docs/range-block-scans.md\n M hermes-core/benches/rust_hot_paths.rs",
+    "status": "M docs/range-block-scans.md\n M summa-core/benches/rust_hot_paths.rs",
     "working_diff_sha256": "59e2fa1baee6a606e876a289217b274de740efa2173257f8dd0ea331e38611c0",
     "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
     "machine": "arm64",
@@ -23,8 +23,8 @@
       "CARGO_BUILD_JOBS": "",
       "CRITERION_HOME": "",
       "RAYON_NUM_THREADS": "",
-      "HERMES_PIN_MODE": "",
-      "HERMES_PIN_METADATA_BUDGET_MB": ""
+      "SUMMA_PIN_MODE": "",
+      "SUMMA_PIN_METADATA_BUDGET_MB": ""
     }
   },
   "local_runs": [
@@ -32,7 +32,7 @@
       "stage": "before",
       "repeat": 0,
       "command": [
-        "/Users/pasha/conductor/workspaces/hermes/jerusalem/.context/lazy-range/final/before-bench",
+        "/Users/pasha/conductor/workspaces/summa/jerusalem/.context/lazy-range/final/before-bench",
         "--bench",
         "--warm-up-time",
         "1",
@@ -48,7 +48,7 @@
       "stage": "after",
       "repeat": 0,
       "command": [
-        "/Users/pasha/conductor/workspaces/hermes/jerusalem/.context/lazy-range/final/after-bench",
+        "/Users/pasha/conductor/workspaces/summa/jerusalem/.context/lazy-range/final/after-bench",
         "--bench",
         "--warm-up-time",
         "1",
@@ -64,7 +64,7 @@
       "stage": "after",
       "repeat": 1,
       "command": [
-        "/Users/pasha/conductor/workspaces/hermes/jerusalem/.context/lazy-range/final/after-bench",
+        "/Users/pasha/conductor/workspaces/summa/jerusalem/.context/lazy-range/final/after-bench",
         "--bench",
         "--warm-up-time",
         "1",
@@ -80,7 +80,7 @@
       "stage": "before",
       "repeat": 1,
       "command": [
-        "/Users/pasha/conductor/workspaces/hermes/jerusalem/.context/lazy-range/final/before-bench",
+        "/Users/pasha/conductor/workspaces/summa/jerusalem/.context/lazy-range/final/before-bench",
         "--bench",
         "--warm-up-time",
         "1",

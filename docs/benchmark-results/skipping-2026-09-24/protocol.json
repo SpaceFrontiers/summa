@@ -20,7 +20,7 @@
   "query_cache": "off",
   "request_cache": "off",
   "engine_versions": {
-    "Hermes": "1.9.1",
+    "Summa": "1.9.1",
     "Elasticsearch": "9.5.4",
     "OpenSearch": "3.8.0",
     "Luxir": "0.1.0 x86-64-v4"

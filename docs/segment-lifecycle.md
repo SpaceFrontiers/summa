@@ -2,7 +2,7 @@
 
 Status: design and operational contract (2026-07-15), implemented.
 
-Hermes treats publication, replacement, cleanup, and deletion as one segment
+Summa treats publication, replacement, cleanup, and deletion as one segment
 ownership protocol. This document defines that protocol and the operator-facing
 failure behavior. The central rule is simple:
 
@@ -84,7 +84,7 @@ are fail-closed and cannot turn a durable commit into an apparent abort.
 
 Tokio cannot cancel a `spawn_blocking` closure after it has started. Dropping or
 aborting only its async wrapper while deleting an index would let filesystem
-writes continue into a removed directory. Hermes therefore drains blocking
+writes continue into a removed directory. Summa therefore drains blocking
 merge/reorder work instead of pretending to cancel it.
 
 Process shutdown first rejects new registry requests and stops optimizer scans.
@@ -176,7 +176,7 @@ same process-lifetime quarantine as a corrupt merge source.
 Reorder copies distinguish absent optional files from failures: only a genuine
 `NotFound` for a file the source reader did not observe is skipped. Required
 files, permission/storage errors, short copies, and invalid optional formats
-fail the output. Before replacement publication, Hermes opens the complete
+fail the output. Before replacement publication, Summa opens the complete
 output segment and verifies its document count; metadata is never switched to
 an output that only passed a shallow `.meta` check.
 
@@ -193,7 +193,7 @@ before repair if the documents are not reproducible. Then stop normal traffic
 and run the server once with:
 
 ```bash
-hermes-server --data-dir /data --doctor
+summa-server --data-dir /data --doctor
 ```
 
 Doctor opens every metadata-live segment, removes entries that cannot be

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hermes comparison orchestration using the pinned Searchbench native replay.
+"""Summa comparison orchestration using the pinned Searchbench native replay.
 
 No timing loop or REST request translation is reimplemented here. Count probes
 retain all exclusions. Exact-count comparisons require equal counts; explicitly
@@ -19,7 +19,7 @@ from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
-ENGINES = ("hermes", "elasticsearch", "opensearch", "luxir")
+ENGINES = ("summa", "elasticsearch", "opensearch", "luxir")
 
 
 def write(path, value):
@@ -33,7 +33,7 @@ def key(item):
 def install_adapter():
     from adapters import BaseAdapter
 
-    class HermesAdapter(BaseAdapter):
+    class SummaAdapter(BaseAdapter):
         _fail_rules = (("present", b'"error"'), ("absent", b'"docs":'))
 
         def build(self, params, item):
@@ -69,7 +69,7 @@ def install_adapter():
                 raise RuntimeError("ranked response unexpectedly counted")
             return None
 
-    return HermesAdapter("searchbench")
+    return SummaAdapter("searchbench")
 
 
 def parameters(item, operation):
@@ -153,7 +153,7 @@ def topology(args, adapter):
     from adapters import Request
     from topology_probe import assert_quiescent_topology, index_topology
 
-    if args.engine != "hermes":
+    if args.engine != "summa":
         result = index_topology(adapter, args.host, args.port, args.timeout)
         assert_quiescent_topology(result, 1)
         if result["live_docs"] != args.documents:
@@ -171,7 +171,7 @@ def topology(args, adapter):
 
     result = asyncio.run(fetch())
     if result["documents"] != args.documents or len(result["segments"]) != 1:
-        raise RuntimeError(f"wrong Hermes topology: {result}")
+        raise RuntimeError(f"wrong Summa topology: {result}")
     return result
 
 
@@ -402,7 +402,7 @@ def main():
     parser.add_argument("operation", choices=("probe", "gate", "measure"))
     parser.add_argument("--searchbench", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--engine", choices=ENGINES, default="hermes")
+    parser.add_argument("--engine", choices=ENGINES, default="summa")
     parser.add_argument(
         "--comparison",
         choices=("exact-count", "shared-input"),
@@ -436,7 +436,7 @@ def main():
         return
     adapter = (
         install_adapter()
-        if args.engine == "hermes"
+        if args.engine == "summa"
         else make_adapter(args.engine, "searchbench")
     )
     topology(args, adapter)

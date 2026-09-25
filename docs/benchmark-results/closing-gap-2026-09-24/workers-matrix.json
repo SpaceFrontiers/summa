@@ -1,7 +1,7 @@
 [
   {
     "label": "w16-patterns-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 142,
     "query_set_sha256": "11b31022ad355b1e86bf8df4a8d882b6a5ea61584e9b25487d272d42c07cbf4a",
     "cells": [
@@ -164,7 +164,7 @@
   },
   {
     "label": "w30-patterns-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 142,
     "query_set_sha256": "11b31022ad355b1e86bf8df4a8d882b6a5ea61584e9b25487d272d42c07cbf4a",
     "cells": [
@@ -327,7 +327,7 @@
   },
   {
     "label": "w8-patterns-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 142,
     "query_set_sha256": "11b31022ad355b1e86bf8df4a8d882b6a5ea61584e9b25487d272d42c07cbf4a",
     "cells": [

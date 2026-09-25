@@ -1,7 +1,7 @@
-diff --git a/hermes-core/src/query/scoring/conjunction.rs b/hermes-core/src/query/scoring/conjunction.rs
+diff --git a/summa-core/src/query/scoring/conjunction.rs b/summa-core/src/query/scoring/conjunction.rs
 index 619b57f7..5174d0f7 100644
---- a/hermes-core/src/query/scoring/conjunction.rs
-+++ b/hermes-core/src/query/scoring/conjunction.rs
+--- a/summa-core/src/query/scoring/conjunction.rs
++++ b/summa-core/src/query/scoring/conjunction.rs
 @@ -7,22 +7,26 @@ use super::{
  use log::debug;
  
@@ -36,10 +36,10 @@ index 619b57f7..5174d0f7 100644
      /// always uses the exhaustive instantiation below.
      pub(super) fn execute_conjunction(&mut self) -> crate::Result<Vec<ScoredDoc>> {
          with_window_scratch(|scratch| self.run_ranked_conjunction(scratch))
-diff --git a/hermes-core/src/query/term.rs b/hermes-core/src/query/term.rs
+diff --git a/summa-core/src/query/term.rs b/summa-core/src/query/term.rs
 index 960d193f..7a6a6db5 100644
---- a/hermes-core/src/query/term.rs
-+++ b/hermes-core/src/query/term.rs
+--- a/summa-core/src/query/term.rs
++++ b/summa-core/src/query/term.rs
 @@ -225,7 +225,7 @@ macro_rules! term_plan {
  
                  // Ranked term requests can use the same block bounds as a text

@@ -35,7 +35,7 @@ queries = {
     "alpha +gamma": lambda t: "gamma" in t,
     "absent": lambda t: "absent" in t,
 }
-with tempfile.TemporaryDirectory(prefix="hermes-bench-smoke-") as tmp:
+with tempfile.TemporaryDirectory(prefix="summa-bench-smoke-") as tmp:
     index = pathlib.Path(tmp) / "idx"
     corpus = "".join(
         json.dumps({"id": str(i), "text": t, "sort_field": i}) + "\n"

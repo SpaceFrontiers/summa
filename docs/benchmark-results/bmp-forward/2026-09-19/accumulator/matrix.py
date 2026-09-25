@@ -8,9 +8,9 @@ import sys
 import time
 from pathlib import Path
 
-FIXTURE = Path(os.environ.get("BMP_QUERY_EVIDENCE", "/mnt/hermes-copy-merge/bmp-query"))
+FIXTURE = Path(os.environ.get("BMP_QUERY_EVIDENCE", "/mnt/summa-copy-merge/bmp-query"))
 OUTPUT = FIXTURE / "optimization"
-env = os.environ | {"HERMES_PIN_MODE": "copy", "HERMES_PIN_METADATA_BUDGET_MB": "64"}
+env = os.environ | {"SUMMA_PIN_MODE": "copy", "SUMMA_PIN_METADATA_BUDGET_MB": "64"}
 
 
 def counters():

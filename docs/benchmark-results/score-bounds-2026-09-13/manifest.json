@@ -7,67 +7,67 @@
     "bytes": 265,
     "sha256": "00e7557a979cbed426b3f58fac3654c89465f5240304ff87b6aeb1c759312ae3"
   },
-  "cloud/bench-evidence/hermes-before-ratios-search.time": {
+  "cloud/bench-evidence/summa-before-ratios-search.time": {
     "bytes": 12934,
     "sha256": "831e1487caaa3ade9fa50d9198b67db2801ab4ad3ffd78e69ef1cfda644edf68"
   },
-  "cloud/bench-evidence/hermes-ratios-search.time": {
+  "cloud/bench-evidence/summa-ratios-search.time": {
     "bytes": 6411,
     "sha256": "ccc8a80c499f2c455c4f578d371c80763358ffd35902d31c6609c209606b94d1"
   },
-  "cloud/bench-evidence/hermes-ratios-v3-search.time": {
+  "cloud/bench-evidence/summa-ratios-v3-search.time": {
     "bytes": 12865,
     "sha256": "e246cd79694b15afa8ec679ec0c9a5d7440f97e72c20e4ce64686cf27468ef61"
   },
-  "cloud/bench-evidence/hermes-v3-cache1024-search.time": {
+  "cloud/bench-evidence/summa-v3-cache1024-search.time": {
     "bytes": 6449,
     "sha256": "99f800fbafc366ac6abe5804277ec0484909a04df2337809bf5822ba13244ef4"
   },
-  "cloud/bench-evidence/official-hermes-before-ratios-verification.engine-0.log": {
+  "cloud/bench-evidence/official-summa-before-ratios-verification.engine-0.log": {
     "bytes": 137,
     "sha256": "6f1fa1c64631d58460ffce5ccf8c9a82198a3222f416f014d2f10bb7dd6a27e3"
   },
-  "cloud/bench-evidence/official-hermes-before-ratios-verification.engine-1.log": {
+  "cloud/bench-evidence/official-summa-before-ratios-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/bench-evidence/official-hermes-before-ratios-verification.jsonl": {
+  "cloud/bench-evidence/official-summa-before-ratios-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/bench-evidence/official-hermes-before-ratios-verification.log": {
+  "cloud/bench-evidence/official-summa-before-ratios-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/bench-evidence/official-hermes-ratios-v3-verification.engine-0.log": {
+  "cloud/bench-evidence/official-summa-ratios-v3-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/bench-evidence/official-hermes-ratios-v3-verification.engine-1.log": {
+  "cloud/bench-evidence/official-summa-ratios-v3-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/bench-evidence/official-hermes-ratios-v3-verification.jsonl": {
+  "cloud/bench-evidence/official-summa-ratios-v3-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/bench-evidence/official-hermes-ratios-v3-verification.log": {
+  "cloud/bench-evidence/official-summa-ratios-v3-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/bench-evidence/official-hermes-ratios-verification.engine-0.log": {
+  "cloud/bench-evidence/official-summa-ratios-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/bench-evidence/official-hermes-ratios-verification.engine-1.log": {
+  "cloud/bench-evidence/official-summa-ratios-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/bench-evidence/official-hermes-ratios-verification.jsonl": {
+  "cloud/bench-evidence/official-summa-ratios-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/bench-evidence/official-hermes-ratios-verification.log": {
+  "cloud/bench-evidence/official-summa-ratios-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
@@ -227,51 +227,51 @@
     "bytes": 126807,
     "sha256": "736db40a4dad97646aabd43bf647108dddff2c31bf412cc4da4d93c465ed8d9c"
   },
-  "cloud/bench-evidence/supplemental-hermes-before-ratios-verification.engine-0.log": {
+  "cloud/bench-evidence/supplemental-summa-before-ratios-verification.engine-0.log": {
     "bytes": 137,
     "sha256": "6f1fa1c64631d58460ffce5ccf8c9a82198a3222f416f014d2f10bb7dd6a27e3"
   },
-  "cloud/bench-evidence/supplemental-hermes-before-ratios-verification.engine-1.log": {
+  "cloud/bench-evidence/supplemental-summa-before-ratios-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/bench-evidence/supplemental-hermes-before-ratios-verification.jsonl": {
+  "cloud/bench-evidence/supplemental-summa-before-ratios-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/bench-evidence/supplemental-hermes-before-ratios-verification.log": {
+  "cloud/bench-evidence/supplemental-summa-before-ratios-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-v3-verification.engine-0.log": {
+  "cloud/bench-evidence/supplemental-summa-ratios-v3-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-v3-verification.engine-1.log": {
+  "cloud/bench-evidence/supplemental-summa-ratios-v3-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-v3-verification.jsonl": {
+  "cloud/bench-evidence/supplemental-summa-ratios-v3-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-v3-verification.log": {
+  "cloud/bench-evidence/supplemental-summa-ratios-v3-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-verification.engine-0.log": {
+  "cloud/bench-evidence/supplemental-summa-ratios-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-verification.engine-1.log": {
+  "cloud/bench-evidence/supplemental-summa-ratios-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-verification.jsonl": {
+  "cloud/bench-evidence/supplemental-summa-ratios-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/bench-evidence/supplemental-hermes-ratios-verification.log": {
+  "cloud/bench-evidence/supplemental-summa-ratios-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
@@ -351,15 +351,15 @@
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/hermes-ratios-v1-manifest.json": {
+  "cloud/summa-ratios-v1-manifest.json": {
     "bytes": 5185,
     "sha256": "13376de34c01473062cdd815316ea507c26e8f9f502f993048d67cdcff1482dd"
   },
-  "cloud/hermes-ratios-v2-manifest.json": {
+  "cloud/summa-ratios-v2-manifest.json": {
     "bytes": 5304,
     "sha256": "0e6759d948cc084d59d08c9a58947c01049e5cab022d7d1f02ba5b2be6c05c19"
   },
-  "cloud/hermes-ratios-v3-manifest.json": {
+  "cloud/summa-ratios-v3-manifest.json": {
     "bytes": 5410,
     "sha256": "6f812af50b199af31e77efbd4c1ff7079f69b1a872da0bd0267d7394742621bc"
   },
@@ -419,15 +419,15 @@
     "bytes": 32757,
     "sha256": "04fde87a0429b38bcff22ac480a7e4acf80e73b8e932ab4a019577652acdaf22"
   },
-  "local/hermes-ratios-v1-manifest.json": {
+  "local/summa-ratios-v1-manifest.json": {
     "bytes": 5185,
     "sha256": "13376de34c01473062cdd815316ea507c26e8f9f502f993048d67cdcff1482dd"
   },
-  "local/hermes-ratios-v2-manifest.json": {
+  "local/summa-ratios-v2-manifest.json": {
     "bytes": 5304,
     "sha256": "0e6759d948cc084d59d08c9a58947c01049e5cab022d7d1f02ba5b2be6c05c19"
   },
-  "local/hermes-ratios-v3-manifest.json": {
+  "local/summa-ratios-v3-manifest.json": {
     "bytes": 5410,
     "sha256": "6f812af50b199af31e77efbd4c1ff7079f69b1a872da0bd0267d7394742621bc"
   },

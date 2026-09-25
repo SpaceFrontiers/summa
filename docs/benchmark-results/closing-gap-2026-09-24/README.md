@@ -50,64 +50,64 @@ The `baseline-plain` and `patterns-plain` binaries use the same original plain i
 
 ## Unicode-word checkpoint versus Luxir
 
-The following is the complete 673-query timing checkpoint before the four newly admitted regex expressions. Prefix/wildcard reference cells were rerun on exactly the same 55 selected expressions; the remaining cells retain the matching reference query sets. Exact count agreement does not establish equal candidate work or scoring semantics. Hermes here uses the opt-in impacts index. Later owner/inline gains must not be multiplied into these measurements.
+The following is the complete 673-query timing checkpoint before the four newly admitted regex expressions. Prefix/wildcard reference cells were rerun on exactly the same 55 selected expressions; the remaining cells retain the matching reference query sets. Exact count agreement does not establish equal candidate work or scoring semantics. Summa here uses the opt-in impacts index. Later owner/inline gains must not be multiplied into these measurements.
 
-| Family             | Operation | Queries | Hermes QPS | Luxir QPS | Hermes / Luxir |
-| ------------------ | --------- | ------: | ---------: | --------: | -------------: |
-| and_high_high      | COUNT     |      47 |      2,269 |     4,221 |          0.54× |
-| and_high_high      | TOP_10    |      47 |      2,225 |     2,279 |          0.98× |
-| and_high_high      | TOP_100   |      47 |      1,400 |     1,733 |          0.81× |
-| and_high_low       | COUNT     |      50 |     44,627 |    47,970 |          0.93× |
-| and_high_low       | TOP_10    |      50 |     26,090 |    43,628 |          0.60× |
-| and_high_low       | TOP_100   |      50 |     24,451 |    30,337 |          0.81× |
-| and_high_med       | COUNT     |      50 |      4,767 |     6,204 |          0.77× |
-| and_high_med       | TOP_10    |      50 |      4,060 |     8,794 |          0.46× |
-| and_high_med       | TOP_100   |      50 |      3,201 |     6,088 |          0.53× |
-| high_phrase        | COUNT     |      30 |         60 |        63 |          0.96× |
-| high_phrase        | TOP_10    |      30 |      2,036 |     1,144 |          1.78× |
-| high_phrase        | TOP_100   |      30 |        506 |       319 |          1.59× |
-| high_sloppy_phrase | COUNT     |       7 |        191 |       150 |          1.27× |
-| high_sloppy_phrase | TOP_10    |       7 |      7,088 |       374 |         18.94× |
-| high_sloppy_phrase | TOP_100   |       7 |      2,731 |       328 |          8.33× |
-| high_term          | COUNT     |      45 |     83,284 |   122,838 |          0.68× |
-| high_term          | TOP_10    |      45 |     60,500 |    58,989 |          1.03× |
-| high_term          | TOP_100   |      45 |     25,484 |    15,833 |          1.61× |
-| low_phrase         | COUNT     |      50 |        372 |       369 |          1.01× |
-| low_phrase         | TOP_10    |      50 |      2,338 |     1,407 |          1.66× |
-| low_phrase         | TOP_100   |      50 |        896 |       764 |          1.17× |
-| low_sloppy_phrase  | COUNT     |      37 |        362 |       304 |          1.19× |
-| low_sloppy_phrase  | TOP_10    |      37 |        930 |       360 |          2.58× |
-| low_sloppy_phrase  | TOP_100   |      37 |        522 |       310 |          1.68× |
-| low_term           | COUNT     |      47 |     82,830 |   123,633 |          0.67× |
-| low_term           | TOP_10    |      47 |     67,399 |   110,381 |          0.61× |
-| low_term           | TOP_100   |      47 |     39,112 |    33,502 |          1.17× |
-| med_phrase         | COUNT     |      46 |        167 |       154 |          1.08× |
-| med_phrase         | TOP_10    |      46 |      1,709 |     1,003 |          1.70× |
-| med_phrase         | TOP_100   |      46 |        573 |       510 |          1.12× |
-| med_sloppy_phrase  | COUNT     |      27 |        280 |       217 |          1.29× |
-| med_sloppy_phrase  | TOP_10    |      27 |      1,265 |       358 |          3.53× |
-| med_sloppy_phrase  | TOP_100   |      27 |        803 |       284 |          2.83× |
-| med_term           | COUNT     |      49 |     82,747 |   125,919 |          0.66× |
-| med_term           | TOP_10    |      49 |     66,582 |    88,022 |          0.76× |
-| med_term           | TOP_100   |      49 |     30,836 |    21,776 |          1.42× |
-| or_high_high       | COUNT     |      42 |      2,184 |     4,267 |          0.51× |
-| or_high_high       | TOP_10    |      42 |      2,004 |     2,340 |          0.86× |
-| or_high_high       | TOP_100   |      42 |      1,468 |     1,773 |          0.83× |
-| or_high_low        | COUNT     |      46 |     37,650 |     9,229 |          4.08× |
-| or_high_low        | TOP_10    |      46 |     17,878 |    33,938 |          0.53× |
-| or_high_low        | TOP_100   |      46 |     11,955 |    15,274 |          0.78× |
-| or_high_med        | COUNT     |      45 |      4,469 |     6,556 |          0.68× |
-| or_high_med        | TOP_10    |      45 |      5,061 |     7,771 |          0.65× |
-| or_high_med        | TOP_100   |      45 |      3,753 |     5,361 |          0.70× |
-| prefix3            | COUNT     |       2 |      2,905 |    10,013 |          0.29× |
-| prefix3            | TOP_10    |       2 |      5,804 |   117,904 |          0.05× |
-| prefix3            | TOP_100   |       2 |      5,797 |   107,381 |          0.05× |
-| wildcard           | COUNT     |      11 |      1,481 |     6,654 |          0.22× |
-| wildcard           | TOP_10    |      11 |      5,659 |    29,427 |          0.19× |
-| wildcard           | TOP_100   |      11 |      5,648 |    28,470 |          0.20× |
-| wildcard_scan      | COUNT     |      42 |        292 |     1,740 |          0.17× |
-| wildcard_scan      | TOP_10    |      42 |        303 |     1,815 |          0.17× |
-| wildcard_scan      | TOP_100   |      42 |        302 |     1,808 |          0.17× |
+| Family             | Operation | Queries | Summa QPS | Luxir QPS | Summa / Luxir |
+| ------------------ | --------- | ------: | --------: | --------: | ------------: |
+| and_high_high      | COUNT     |      47 |     2,269 |     4,221 |         0.54× |
+| and_high_high      | TOP_10    |      47 |     2,225 |     2,279 |         0.98× |
+| and_high_high      | TOP_100   |      47 |     1,400 |     1,733 |         0.81× |
+| and_high_low       | COUNT     |      50 |    44,627 |    47,970 |         0.93× |
+| and_high_low       | TOP_10    |      50 |    26,090 |    43,628 |         0.60× |
+| and_high_low       | TOP_100   |      50 |    24,451 |    30,337 |         0.81× |
+| and_high_med       | COUNT     |      50 |     4,767 |     6,204 |         0.77× |
+| and_high_med       | TOP_10    |      50 |     4,060 |     8,794 |         0.46× |
+| and_high_med       | TOP_100   |      50 |     3,201 |     6,088 |         0.53× |
+| high_phrase        | COUNT     |      30 |        60 |        63 |         0.96× |
+| high_phrase        | TOP_10    |      30 |     2,036 |     1,144 |         1.78× |
+| high_phrase        | TOP_100   |      30 |       506 |       319 |         1.59× |
+| high_sloppy_phrase | COUNT     |       7 |       191 |       150 |         1.27× |
+| high_sloppy_phrase | TOP_10    |       7 |     7,088 |       374 |        18.94× |
+| high_sloppy_phrase | TOP_100   |       7 |     2,731 |       328 |         8.33× |
+| high_term          | COUNT     |      45 |    83,284 |   122,838 |         0.68× |
+| high_term          | TOP_10    |      45 |    60,500 |    58,989 |         1.03× |
+| high_term          | TOP_100   |      45 |    25,484 |    15,833 |         1.61× |
+| low_phrase         | COUNT     |      50 |       372 |       369 |         1.01× |
+| low_phrase         | TOP_10    |      50 |     2,338 |     1,407 |         1.66× |
+| low_phrase         | TOP_100   |      50 |       896 |       764 |         1.17× |
+| low_sloppy_phrase  | COUNT     |      37 |       362 |       304 |         1.19× |
+| low_sloppy_phrase  | TOP_10    |      37 |       930 |       360 |         2.58× |
+| low_sloppy_phrase  | TOP_100   |      37 |       522 |       310 |         1.68× |
+| low_term           | COUNT     |      47 |    82,830 |   123,633 |         0.67× |
+| low_term           | TOP_10    |      47 |    67,399 |   110,381 |         0.61× |
+| low_term           | TOP_100   |      47 |    39,112 |    33,502 |         1.17× |
+| med_phrase         | COUNT     |      46 |       167 |       154 |         1.08× |
+| med_phrase         | TOP_10    |      46 |     1,709 |     1,003 |         1.70× |
+| med_phrase         | TOP_100   |      46 |       573 |       510 |         1.12× |
+| med_sloppy_phrase  | COUNT     |      27 |       280 |       217 |         1.29× |
+| med_sloppy_phrase  | TOP_10    |      27 |     1,265 |       358 |         3.53× |
+| med_sloppy_phrase  | TOP_100   |      27 |       803 |       284 |         2.83× |
+| med_term           | COUNT     |      49 |    82,747 |   125,919 |         0.66× |
+| med_term           | TOP_10    |      49 |    66,582 |    88,022 |         0.76× |
+| med_term           | TOP_100   |      49 |    30,836 |    21,776 |         1.42× |
+| or_high_high       | COUNT     |      42 |     2,184 |     4,267 |         0.51× |
+| or_high_high       | TOP_10    |      42 |     2,004 |     2,340 |         0.86× |
+| or_high_high       | TOP_100   |      42 |     1,468 |     1,773 |         0.83× |
+| or_high_low        | COUNT     |      46 |    37,650 |     9,229 |         4.08× |
+| or_high_low        | TOP_10    |      46 |    17,878 |    33,938 |         0.53× |
+| or_high_low        | TOP_100   |      46 |    11,955 |    15,274 |         0.78× |
+| or_high_med        | COUNT     |      45 |     4,469 |     6,556 |         0.68× |
+| or_high_med        | TOP_10    |      45 |     5,061 |     7,771 |         0.65× |
+| or_high_med        | TOP_100   |      45 |     3,753 |     5,361 |         0.70× |
+| prefix3            | COUNT     |       2 |     2,905 |    10,013 |         0.29× |
+| prefix3            | TOP_10    |       2 |     5,804 |   117,904 |         0.05× |
+| prefix3            | TOP_100   |       2 |     5,797 |   107,381 |         0.05× |
+| wildcard           | COUNT     |      11 |     1,481 |     6,654 |         0.22× |
+| wildcard           | TOP_10    |      11 |     5,659 |    29,427 |         0.19× |
+| wildcard           | TOP_100   |      11 |     5,648 |    28,470 |         0.20× |
+| wildcard_scan      | COUNT     |      42 |       292 |     1,740 |         0.17× |
+| wildcard_scan      | TOP_10    |      42 |       303 |     1,815 |         0.17× |
+| wildcard_scan      | TOP_100   |      42 |       302 |     1,808 |         0.17× |
 
 Four additional regex expressions now complete with exact reference counts: `(www|http|https)`, the weekday alternation, `colou?r`, and `[jkqxz][a-z]*ess`. Their separately timed four-query cells are in [regex-matrix.json](regex-matrix.json). Bounded literal-prefix extraction retains all scan, match and posting limits.
 

@@ -155,8 +155,8 @@ per segment, so four active source segments have four allowances; a merged
 segment has one. Old reader generations, concurrent query scratch, other fields
 and index-global ANN metadata also contribute to process memory.
 
-Configure residency with `HERMES_PIN_METADATA_BUDGET_MB` and
-`HERMES_PIN_MODE=copy|mlock` (or the server's matching CLI flags). The default
+Configure residency with `SUMMA_PIN_METADATA_BUDGET_MB` and
+`SUMMA_PIN_MODE=copy|mlock` (or the server's matching CLI flags). The default
 budget is zero. `copy` retains eligible metadata on the heap;
 `mlock` locks eligible pages subject to OS limits. Copy-mode memory can swap on a
 swap-enabled host. Opening visits row and term directories, not summary payloads. Include open time, faults,

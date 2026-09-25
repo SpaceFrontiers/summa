@@ -3,7 +3,7 @@
 Capability 4 adds opt-in [real passage seeding for document-only nominations](document-nominated-passages.md),
 with a response acknowledgment that fails closed through older adapters.
 
-Status: opt-in Hermes implementation, updated 2026-09-09. Search API training and
+Status: opt-in Summa implementation, updated 2026-09-09. Search API training and
 activation are separate. Existing retrieval defaults remain unchanged.
 
 ## Scoring execution efficiency (2026-09-09)
@@ -70,7 +70,7 @@ Logical identities are `(segment, document)` and `(segment, document, ordinal)`.
 Field-local physical IDs are not interchangeable: BMP and text BP reorder each
 field independently. Document-profile ordinal zero is not body chunk zero.
 Cross-field chunk alignment is an explicit caller contract, not inferred from
-field names. Hermes preserves existing missing/multi-value semantics.
+field names. Summa preserves existing missing/multi-value semantics.
 
 Filters and required quoted phrases define eligibility at L0 and remain hard
 constraints. Feature weights cannot relax them. Backfilled candidate scores use
@@ -267,11 +267,11 @@ scores are not relabeled as exhaustive scores or silently recomputed. Diagnostic
 `all_passages` requires backfill. Training must bind the backfill policy along
 with nomination settings because it changes the available feature population.
 
-Hermes fills missing raw feature scores when requested, applies an
+Summa fills missing raw feature scores when requested, applies an
 optional compiled formula to the full nominated union before truncation, and returns the raw features. Search API owns query intent,
 training and model selection, and may apply a richer linear/CatBoost model
 across separate query calls. The same versioned transforms and coefficients
-can execute in Hermes and Search API. Learned weights never replace raw exports.
+can execute in Summa and Search API. Learned weights never replace raw exports.
 
 Each fusion branch has a unique `name`, an explicit `document`/`chunk` scope,
 and the existing `Query` object. `l1.formula` references those branch names,
@@ -299,7 +299,7 @@ query branch is neither searched nor scored. Missing candidate field data stays
 explicitly unavailable in raw exports. No fallback to RRF is permitted for an
 invalid or unsupported formula request.
 
-The bounded L0 union survives until Hermes L1 evaluation. Export-only requests
+The bounded L0 union survives until Summa L1 evaluation. Export-only requests
 can return the whole union for external inference. Alternative reformulations
 and multiple phrase spans use separately named branches, preserving raw scores.
 Search API may share a logical coefficient across them by distributing it over
@@ -474,7 +474,7 @@ that could be in a global per-vertical top-K at the same depth; shard-local
 union may be a superset. Search API sees all retained candidates before normalization/model inference.
 Gather global text statistics for both nomination and scoring
 queries, including phrase terms. Do not reuse shard-local phrase IDF.
-Public pagination happens in Search API after model selection; Hermes feature
+Public pagination happens in Search API after model selection; Summa feature
 export addresses the complete requested candidate window.
 Feature exports, ordinal scores, truncation and timing survive broker merging.
 
@@ -487,13 +487,13 @@ explicitly. It must never silently change the source set on a retry.
 
 ## Search API and training ownership
 
-Hermes owns feature execution, validation, portable formula inference
+Summa owns feature execution, validation, portable formula inference
 instead of RRF, and raw exports. Search API owns query intent, original quoted
 constraints, document versus passage profiles, training, model selection,
 and any additional model inference across separate query calls. MCP, website and Cybrex inherit that policy. Ordinary Telegram keeps
 its explicit document-discovery policy. Multiple API retrieval calls must
 share a feature schema/model and deduplicate logical candidates before final
-selection; where possible represent nominations in one Hermes request.
+selection; where possible represent nominations in one Summa request.
 
 Training belongs beside Search API benchmarks. The existing cross-encoder is
 the teacher: retrieve a larger frozen L0 union, score candidate passages with
@@ -501,7 +501,7 @@ the teacher, and distill its scores/order into a regularized linear ranker.
 Use held-out query groups to measure teacher top-K recall at the actual online
 cross-encoder pool size, alongside existing human/Needle labels. Teacher
 agreement is not a claim of ground-truth relevance. Store a portable versioned JSON
-artifact consumed by Search API and sent to Hermes for engine-side L1. Inputs retain query IDs, target paper/group IDs,
+artifact consumed by Search API and sent to Summa for engine-side L1. Inputs retain query IDs, target paper/group IDs,
 index/feature/model versions, candidate origin, raw feature values and labels.
 Split by target paper before deriving transforms or optimizing coefficients;
 queries about the same paper cannot cross train/validation/test partitions.

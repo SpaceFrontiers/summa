@@ -1,5 +1,5 @@
---- a/hermes-core/src/query/prefix.rs
-+++ b/hermes-core/src/query/prefix.rs
+--- a/summa-core/src/query/prefix.rs
++++ b/summa-core/src/query/prefix.rs
 @@ -1,13 +1,15 @@
  //! Prefix query — matches all documents containing any term that starts with a
 -//! given prefix. Materializes the union of matching posting lists into a sorted
@@ -74,8 +74,8 @@
      }
  
      fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
---- a/hermes-core/src/query/scoring.rs
-+++ b/hermes-core/src/query/scoring.rs
+--- a/summa-core/src/query/scoring.rs
++++ b/summa-core/src/query/scoring.rs
 @@ -2419,7 +2419,7 @@
              self.execute_conjunction()
          } else if self.required_mask != 0 {
@@ -104,8 +104,8 @@
      }
  
      /// A single text cursor needs no dense ID-window scratch or score reduction.
---- a/hermes-core/src/query/scoring/tests.rs
-+++ b/hermes-core/src/query/scoring/tests.rs
+--- a/summa-core/src/query/scoring/tests.rs
++++ b/summa-core/src/query/scoring/tests.rs
 @@ -2684,7 +2684,7 @@
          |factor| MaxScoreExecutor::text(lists.clone(), avg, 50, Some(&lengths), params, factor);
  
@@ -115,8 +115,8 @@
      let exact_hits = exact.execute_single_text().unwrap();
      assert_eq!(
          exact_hits
---- a/hermes-core/src/query/term_pattern.rs
-+++ b/hermes-core/src/query/term_pattern.rs
+--- a/summa-core/src/query/term_pattern.rs
++++ b/summa-core/src/query/term_pattern.rs
 @@ -1,5 +1,5 @@
  //! Shared bounded dictionary matching for whole-term pattern filters.
 -use super::term_union::{TermUnionScorer, materialize_union, reject_chunked};
@@ -174,8 +174,8 @@
      }
  
      fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
---- a/hermes-core/src/query/term_union.rs
-+++ b/hermes-core/src/query/term_union.rs
+--- a/summa-core/src/query/term_union.rs
++++ b/summa-core/src/query/term_union.rs
 @@ -6,44 +6,144 @@
  use crate::{DocId, Score};
  use std::sync::Arc;
@@ -376,8 +376,8 @@
 +        }
 +    }
 +}
---- a/hermes-core/src/structures/postings/posting.rs
-+++ b/hermes-core/src/structures/postings/posting.rs
+--- a/summa-core/src/structures/postings/posting.rs
++++ b/summa-core/src/structures/postings/posting.rs
 @@ -11,9 +11,11 @@
  //! The codec is stored per block in the header, so a single list (for example
  //! the output of a merge) may mix codecs.
@@ -618,8 +618,8 @@
              let last_block_in_group = ((i + 1) * L1_INTERVAL - 1).min(merged.num_blocks() - 1);
              let expected = merged.block_last_doc(last_block_in_group).unwrap();
              assert_eq!(l1_doc, expected, "L1[{}] mismatch", i);
---- a/hermes-core/src/structures/postings/posting/compact.rs
-+++ b/hermes-core/src/structures/postings/posting/compact.rs
+--- a/summa-core/src/structures/postings/posting/compact.rs
++++ b/summa-core/src/structures/postings/posting/compact.rs
 @@ -222,8 +222,8 @@
              stream,
              l0_bytes: OwnedBytes::new(l0),
@@ -631,8 +631,8 @@
              ratios: self.footer.ratio_bounds.then(|| {
                  let ratio = read_ratio(
                      &self.index[self.footer.cursors_end() - self.footer.stream_len..],
---- a/hermes-core/src/tokenizer/mod.rs
-+++ b/hermes-core/src/tokenizer/mod.rs
+--- a/summa-core/src/tokenizer/mod.rs
++++ b/summa-core/src/tokenizer/mod.rs
 @@ -113,6 +113,29 @@
  impl Tokenizer for SimpleTokenizer {
      fn tokenize(&self, text: &str) -> Vec<Token> {
@@ -712,8 +712,8 @@
      fn test_empty_text() {
          let tokenizer = SimpleTokenizer;
          let tokens = Tokenizer::tokenize(&tokenizer, "");
---- a/hermes-core/tests/query_work_diagnostics.rs
-+++ b/hermes-core/tests/query_work_diagnostics.rs
+--- a/summa-core/tests/query_work_diagnostics.rs
++++ b/summa-core/tests/query_work_diagnostics.rs
 @@ -146,3 +146,90 @@
          }
      }
@@ -761,11 +761,11 @@
 +            .unwrap()
 +            .has_ratio_bounds()
 +    );
-+    let queries: Vec<Box<dyn hermes_core::query::Query>> = vec![
++    let queries: Vec<Box<dyn summa_core::query::Query>> = vec![
 +        Box::new(TermQuery::text(text, "alpha")),
-+        Box::new(hermes_core::query::PrefixQuery::text(text, "alp")),
-+        Box::new(hermes_core::query::WildcardQuery::text(text, "al*a").unwrap()),
-+        Box::new(hermes_core::query::RegexQuery::new(text, "al.*a").unwrap()),
++        Box::new(summa_core::query::PrefixQuery::text(text, "alp")),
++        Box::new(summa_core::query::WildcardQuery::text(text, "al*a").unwrap()),
++        Box::new(summa_core::query::RegexQuery::new(text, "al.*a").unwrap()),
 +        Box::new(
 +            BooleanQuery::new()
 +                .must(TermQuery::text(text, "alpha"))
@@ -805,8 +805,8 @@
 +        }
 +    }
 +}
---- a/hermes-core/tests/ranked_term_collection.rs
-+++ b/hermes-core/tests/ranked_term_collection.rs
+--- a/summa-core/tests/ranked_term_collection.rs
++++ b/summa-core/tests/ranked_term_collection.rs
 @@ -6,12 +6,13 @@
  
  #[tokio::test(flavor = "current_thread")]
@@ -832,8 +832,8 @@
          posting_impact_bounds,
          num_threads: 1,
          num_indexing_threads: 1,
---- a/hermes-server/examples/searchbench_http/audit.rs
-+++ b/hermes-server/examples/searchbench_http/audit.rs
+--- a/summa-server/examples/searchbench_http/audit.rs
++++ b/summa-server/examples/searchbench_http/audit.rs
 @@ -18,7 +18,13 @@
          .context("missing body")?;
      let id = searcher.schema().get_field("id").context("missing id")?;
@@ -854,7 +854,7 @@
              optimized += collector.count();
              let column = segment.fast_field(id.0).context("missing id column")?;
 -            let mut scorer = request.query.scorer_sync(segment, 0)?;
--            while scorer.doc() != hermes_core::structures::TERMINATED {
+-            while scorer.doc() != summa_core::structures::TERMINATED {
 -                if sample.len() < 10 {
 -                    sample.push(
 -                        column
@@ -873,7 +873,7 @@
 +                collect_segment(segment, request.query.as_ref(), &mut audit).await?;
 +            } else {
 +                let mut scorer = request.query.scorer_sync(segment, 0)?;
-+                while scorer.doc() != hermes_core::structures::TERMINATED {
++                while scorer.doc() != summa_core::structures::TERMINATED {
 +                    audit.collect(
 +                        scorer.doc(),
 +                        if check_ranked { scorer.score() } else { 0.0 },
@@ -919,7 +919,7 @@
 +        &mut self,
 +        doc: u32,
 +        score: f32,
-+        _: &[(u32, Vec<hermes_core::query::ScoredPosition>)],
++        _: &[(u32, Vec<summa_core::query::ScoredPosition>)],
 +    ) {
 +        self.count += 1;
 +        if self.sample.len() < 10 {
@@ -937,9 +937,9 @@
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    use hermes_core::query::{BooleanQuery, TermQuery};
-+    use hermes_core::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId, SegmentReader};
-+    use hermes_core::{Document, RamDirectory, SchemaBuilder};
++    use summa_core::query::{BooleanQuery, TermQuery};
++    use summa_core::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId, SegmentReader};
++    use summa_core::{Document, RamDirectory, SchemaBuilder};
 +    use std::sync::Arc;
 +
 +    #[tokio::test]
@@ -976,8 +976,8 @@
 +        assert_eq!(top.into_sorted_results()[0].doc_id, 2);
 +    }
 +}
---- a/hermes-server/examples/searchbench_http/corpus.rs
-+++ b/hermes-server/examples/searchbench_http/corpus.rs
+--- a/summa-server/examples/searchbench_http/corpus.rs
++++ b/summa-server/examples/searchbench_http/corpus.rs
 @@ -10,9 +10,9 @@
  
  pub const BODY_TOKENIZER: &str = "lex(segmenter: unicode, stem: none, stop_words: false, variants: false, fold: false, max_token_length: 255)";
@@ -1011,22 +1011,22 @@
      let mut writer = IndexWriter::create(MmapDirectory::new(path), schema.clone(), config).await?;
      let source = std::io::BufReader::new(std::fs::File::open(input)?);
      let mut count = 0u64;
---- a/hermes-server/examples/searchbench_http/main.rs
-+++ b/hermes-server/examples/searchbench_http/main.rs
+--- a/summa-server/examples/searchbench_http/main.rs
++++ b/summa-server/examples/searchbench_http/main.rs
 @@ -29,6 +29,7 @@
      searcher: Arc<Searcher<MmapDirectory>>,
-     parser: hermes_core::dsl::QueryLanguageParser,
-     tokenizer: hermes_core::tokenizer::BoxedTokenizer,
+     parser: summa_core::dsl::QueryLanguageParser,
+     tokenizer: summa_core::tokenizer::BoxedTokenizer,
 +    tokenizer_name: String,
-     body: hermes_core::Field,
-     id: hermes_core::Field,
+     body: summa_core::Field,
+     id: summa_core::Field,
      admission: Arc<tokio::sync::Semaphore>,
 @@ -167,7 +168,7 @@
  
  async fn stats(State(app): State<Arc<App>>) -> Json<Value> {
      Json(json!({
--        "engine": "hermes-benchmark-http", "body_tokenizer": corpus::BODY_TOKENIZER,
-+        "engine": "hermes-benchmark-http", "body_tokenizer": app.tokenizer_name,
+-        "engine": "summa-benchmark-http", "body_tokenizer": corpus::BODY_TOKENIZER,
++        "engine": "summa-benchmark-http", "body_tokenizer": app.tokenizer_name,
          "documents": app.searcher.num_docs(),
          "segments": app.searcher.segment_readers().iter().map(|reader| json!({
              "id": reader.meta().id.to_string(), "documents": reader.num_docs(),
@@ -1097,8 +1097,8 @@
          )),
          "serve" => runtime.block_on(serve(
              Path::new(&args[2]),
---- a/hermes-core/src/structures/postings/posting/groups.rs
-+++ b/hermes-core/src/structures/postings/posting/groups.rs
+--- a/summa-core/src/structures/postings/posting/groups.rs
++++ b/summa-core/src/structures/postings/posting/groups.rs
 @@ -0,0 +1,48 @@
 +//! Immutable little-endian L1 metadata, including unaligned mmap views.
 +
@@ -1148,15 +1148,15 @@
 +        Self(OwnedBytes::new(bytes))
 +    }
 +}
---- a/hermes-core/tests/unicode_word_queries.rs
-+++ b/hermes-core/tests/unicode_word_queries.rs
+--- a/summa-core/tests/unicode_word_queries.rs
++++ b/summa-core/tests/unicode_word_queries.rs
 @@ -0,0 +1,52 @@
 +#![cfg(feature = "native")]
 +
-+use hermes_core::dsl::{PositionMode, parse_single_index};
-+use hermes_core::index::{Index, IndexConfig, IndexWriter};
-+use hermes_core::query::{CountCollector, collect_segment};
-+use hermes_core::{Document, RamDirectory, SchemaBuilder};
++use summa_core::dsl::{PositionMode, parse_single_index};
++use summa_core::index::{Index, IndexConfig, IndexWriter};
++use summa_core::query::{CountCollector, collect_segment};
++use summa_core::{Document, RamDirectory, SchemaBuilder};
 +
 +#[tokio::test(flavor = "current_thread")]
 +async fn unicode_word_queries_keep_punctuated_terms_distinct_after_reopen() {

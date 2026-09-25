@@ -60,7 +60,7 @@ last_doc, offset, max_weight f32 = block max tf)`, L1 `last_doc` per 8
   check with `expected_pos += 1` per term (no gaps), score =
   `BM25(sum of term tfs) × 1.5` (not phrase frequency). One term collapses
   to `TermQuery`; no positions collapse to a MUST of terms.
-- Server conversion (`hermes-server/src/converters.rs::field_tokens`): phrase
+- Server conversion (`summa-server/src/converters.rs::field_tokens`): phrase
   text is tokenized with the field tokenizer and hint, `Token.position` is
   discarded, so the query side cannot express gaps.
 - Tokenizer (`tokenizer/mod.rs`): `tokenize_and_clean` splits on whitespace,
@@ -293,7 +293,7 @@ Status: implemented for the standalone reorder pass (2026-09-03,
 `segment/text_reorder.rs`, driven by `reorder_segment`, i.e. the optimizer
 and `IndexWriter::reorder`); merge-time BP for text fields is still open.
 
-There is no document-level permutation in Hermes and this design keeps it
+There is no document-level permutation in Summa and this design keeps it
 that way: doc ids, the store, the fast fields and the dense vector maps
 never move. A field that wants locality owns its permutation and a map back
 to `(doc_id, ordinal)`, exactly as a BMP sparse field does today
@@ -339,7 +339,7 @@ the map lookup per hit that chunked fields already pay.
 ## Tokenization, stemming, stop words
 
 Implemented 2026-09-04 as one dynamic tokenizer with three layers, identical
-at index and query time (`hermes-core/src/tokenizer/lex.rs`):
+at index and query time (`summa-core/src/tokenizer/lex.rs`):
 
 ```
 text<lex(by: <field>, default: <language|none>, stop_words: <bool>,
@@ -351,7 +351,7 @@ text<lex(by: <field>, default: <language|none>, stop_words: <bool>,
 Defaults are the recommended configuration (`icu`, `light`, variants on,
 folding on, 64-character tokens), so `lex()` is a complete language-agnostic
 tokenizer and only non-default options are rendered
-(`hermes-core/src/tokenizer/lex.rs`, one `LexOptions` struct shared by the
+(`summa-core/src/tokenizer/lex.rs`, one `LexOptions` struct shared by the
 spec, the tokenizer and the renderer).
 
 - **Segmentation and normalisation.** `icu` uses ICU4X's word segmenter
@@ -404,7 +404,7 @@ spec, the tokenizer and the renderer).
   the stemmers; dropped words keep their positions as gaps.
 - **Japanese and Korean morphology** (`cjk: dictionary`, `cjk-dict` feature,
   `tokenizer/cjk_morph.rs`): lindera with UniDic and ko-dic embedded in the
-  binary (about 200 MB; hermes-server builds with the feature, the broker and
+  binary (about 200 MB; summa-server builds with the feature, the broker and
   wasm do not, and a `cjk: dictionary` spec fails to parse in a binary without it so
   index and query tokenization can never diverge). Hangul runs always go
   through ko-dic, kana runs through UniDic, Han runs through UniDic only
@@ -516,7 +516,7 @@ What Lucene 10's `MaxScoreBulkScorer`/`Lucene104PostingsReader` and
 turbopuffer's FTS v2 (blog "fts-v2-maxscore", batched iterator advancement)
 do, and where the text vertical stands (2026-09-03):
 
-| Technique                                                                                                                                                                                          | Source      | Hermes                                                                                                                                                                                   |
+| Technique                                                                                                                                                                                          | Source      | Summa                                                                                                                                                                                    |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Block-Max MaxScore with a two-level skip (Lucene: 256-doc level 0, level 1 = `LEVEL1_NUM_DOCS`)                                                                                                    | Lucene      | done: 128-doc L0 blocks, 8-block L1 groups, both with bounds                                                                                                                             |
 | Window-at-a-time scoring: essential lists bulk-scored into a dense `windowScores[]` + `windowMatches` bitset, non-essential lists applied to the surviving candidates (`scoreNonEssentialClauses`) | Lucene      | done: `execute_windowed` for text cursors (see below)                                                                                                                                    |
@@ -543,7 +543,7 @@ do, and where the text vertical stands (2026-09-03):
   synthetic Zipfian corpora with real lengths, for every pruning change.
 - Phrase semantics tests: gaps, stop-word-only phrases, chunk boundaries,
   multi-valued ordinals, slop.
-- Size accounting per file (`hermes-tool diagnose`): `.post`, `.pos`,
+- Size accounting per file (`summa-tool diagnose`): `.post`, `.pos`,
   `.terms`, `.chunks` bytes per document before and after each step.
 - Latency by query length (1, 2, 4, 8, 16, 32 terms) and by phrase count,
   cold and warm cache.

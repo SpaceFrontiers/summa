@@ -190,22 +190,22 @@ VARIANT current
    Compiling reqwest v0.13.5
    Compiling instant v0.1.13
    Compiling console_log v1.1.0
-   Compiling hermes-core v1.9.1 ($SOURCE/hermes-core)
-   Compiling hermes-wasm v1.9.1 ($SOURCE/hermes-wasm)
+   Compiling summa-core v1.9.1 ($SOURCE/summa-core)
+   Compiling summa-wasm v1.9.1 ($SOURCE/summa-wasm)
     Finished `release` profile [optimized] target(s) in 48.23s
 [INFO]: ⬇️  Installing wasm-bindgen...
 [INFO]: Optimizing wasm binaries with `wasm-opt`...
 [INFO]: License key is set in Cargo.toml but no LICENSE file(s) were found; Please add the LICENSE file(s) to your project directory
 [INFO]: ✨   Done in 1m 00s
-[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/hermes-wasm/pkg.
+[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/summa-wasm/pkg.
 [WARN]: ⚠️   There's a newer version of wasm-pack available, the new version is: 0.15.0, you are using: 0.13.1. To update, navigate to: https://rustwasm.github.io/wasm-pack/installer/
-patching file 'pkg/hermes_wasm.js'
+patching file 'pkg/summa_wasm.js'
 
 > test
 > vitest
 
 
- RUN  v4.1.0 $SOURCE/hermes-wasm
+ RUN  v4.1.0 $SOURCE/summa-wasm
 
 
  Test Files  9 passed (9)
@@ -214,26 +214,26 @@ patching file 'pkg/hermes_wasm.js'
    Duration  511ms (transform 342ms, setup 0ms, import 571ms, tests 1.78s, environment 0ms)
 
 36d35af2763714c9927d5ad4187e59ab7f8e629e085aeeb7a846b52bf1bc9154  Cargo.lock
-6764c2eb7099f42bc03ef2f344ec26adb14f5b20166c5a55a399b60450b8f992  hermes-wasm/pkg/hermes_wasm_bg.wasm
+6764c2eb7099f42bc03ef2f344ec26adb14f5b20166c5a55a399b60450b8f992  summa-wasm/pkg/summa_wasm_bg.wasm
 VARIANT no-pilot
 [INFO]: 🎯  Checking for the Wasm target...
 [INFO]: 🌀  Compiling to Wasm...
-   Compiling hermes-core v1.9.1 ($SOURCE/hermes-core)
-   Compiling hermes-wasm v1.9.1 ($SOURCE/hermes-wasm)
+   Compiling summa-core v1.9.1 ($SOURCE/summa-core)
+   Compiling summa-wasm v1.9.1 ($SOURCE/summa-wasm)
     Finished `release` profile [optimized] target(s) in 21.35s
 [INFO]: ⬇️  Installing wasm-bindgen...
 [INFO]: Optimizing wasm binaries with `wasm-opt`...
 [INFO]: License key is set in Cargo.toml but no LICENSE file(s) were found; Please add the LICENSE file(s) to your project directory
 [INFO]: ✨   Done in 33.46s
-[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/hermes-wasm/pkg.
+[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/summa-wasm/pkg.
 [WARN]: ⚠️   There's a newer version of wasm-pack available, the new version is: 0.15.0, you are using: 0.13.1. To update, navigate to: https://rustwasm.github.io/wasm-pack/installer/
-patching file 'pkg/hermes_wasm.js'
+patching file 'pkg/summa_wasm.js'
 
 > test
 > vitest
 
 
- RUN  v4.1.0 $SOURCE/hermes-wasm
+ RUN  v4.1.0 $SOURCE/summa-wasm
 
 
  Test Files  9 passed (9)
@@ -242,26 +242,26 @@ patching file 'pkg/hermes_wasm.js'
    Duration  526ms (transform 375ms, setup 0ms, import 587ms, tests 1.89s, environment 0ms)
 
 36d35af2763714c9927d5ad4187e59ab7f8e629e085aeeb7a846b52bf1bc9154  Cargo.lock
-894ee744278edc26d365b3a9bd41247970e354599a3a805fcb6e7ebc7c86130a  hermes-wasm/pkg/hermes_wasm_bg.wasm
+894ee744278edc26d365b3a9bd41247970e354599a3a805fcb6e7ebc7c86130a  summa-wasm/pkg/summa_wasm_bg.wasm
 VARIANT short-pilot
 [INFO]: 🎯  Checking for the Wasm target...
 [INFO]: 🌀  Compiling to Wasm...
-   Compiling hermes-core v1.9.1 ($SOURCE/hermes-core)
-   Compiling hermes-wasm v1.9.1 ($SOURCE/hermes-wasm)
+   Compiling summa-core v1.9.1 ($SOURCE/summa-core)
+   Compiling summa-wasm v1.9.1 ($SOURCE/summa-wasm)
     Finished `release` profile [optimized] target(s) in 21.75s
 [INFO]: ⬇️  Installing wasm-bindgen...
 [INFO]: Optimizing wasm binaries with `wasm-opt`...
 [INFO]: License key is set in Cargo.toml but no LICENSE file(s) were found; Please add the LICENSE file(s) to your project directory
 [INFO]: ✨   Done in 34.09s
-[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/hermes-wasm/pkg.
+[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/summa-wasm/pkg.
 [WARN]: ⚠️   There's a newer version of wasm-pack available, the new version is: 0.15.0, you are using: 0.13.1. To update, navigate to: https://rustwasm.github.io/wasm-pack/installer/
-patching file 'pkg/hermes_wasm.js'
+patching file 'pkg/summa_wasm.js'
 
 > test
 > vitest
 
 
- RUN  v4.1.0 $SOURCE/hermes-wasm
+ RUN  v4.1.0 $SOURCE/summa-wasm
 
 
  Test Files  9 passed (9)
@@ -270,26 +270,26 @@ patching file 'pkg/hermes_wasm.js'
    Duration  513ms (transform 318ms, setup 0ms, import 542ms, tests 1.76s, environment 0ms)
 
 36d35af2763714c9927d5ad4187e59ab7f8e629e085aeeb7a846b52bf1bc9154  Cargo.lock
-d5be24baac57934e4339fc6d8b0e2b73492e80b50b92c280087e7d20aae3cb56  hermes-wasm/pkg/hermes_wasm_bg.wasm
+d5be24baac57934e4339fc6d8b0e2b73492e80b50b92c280087e7d20aae3cb56  summa-wasm/pkg/summa_wasm_bg.wasm
 VARIANT bound-priority
 [INFO]: 🎯  Checking for the Wasm target...
 [INFO]: 🌀  Compiling to Wasm...
-   Compiling hermes-core v1.9.1 ($SOURCE/hermes-core)
-   Compiling hermes-wasm v1.9.1 ($SOURCE/hermes-wasm)
+   Compiling summa-core v1.9.1 ($SOURCE/summa-core)
+   Compiling summa-wasm v1.9.1 ($SOURCE/summa-wasm)
     Finished `release` profile [optimized] target(s) in 21.65s
 [INFO]: ⬇️  Installing wasm-bindgen...
 [INFO]: Optimizing wasm binaries with `wasm-opt`...
 [INFO]: License key is set in Cargo.toml but no LICENSE file(s) were found; Please add the LICENSE file(s) to your project directory
 [INFO]: ✨   Done in 33.78s
-[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/hermes-wasm/pkg.
+[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/summa-wasm/pkg.
 [WARN]: ⚠️   There's a newer version of wasm-pack available, the new version is: 0.15.0, you are using: 0.13.1. To update, navigate to: https://rustwasm.github.io/wasm-pack/installer/
-patching file 'pkg/hermes_wasm.js'
+patching file 'pkg/summa_wasm.js'
 
 > test
 > vitest
 
 
- RUN  v4.1.0 $SOURCE/hermes-wasm
+ RUN  v4.1.0 $SOURCE/summa-wasm
 
 
  Test Files  9 passed (9)
@@ -298,26 +298,26 @@ patching file 'pkg/hermes_wasm.js'
    Duration  539ms (transform 411ms, setup 0ms, import 607ms, tests 1.79s, environment 1ms)
 
 36d35af2763714c9927d5ad4187e59ab7f8e629e085aeeb7a846b52bf1bc9154  Cargo.lock
-52bfda04d10475a34d25d7cf5d3671f76457bedcb8e825368ab6672113862b51  hermes-wasm/pkg/hermes_wasm_bg.wasm
+52bfda04d10475a34d25d7cf5d3671f76457bedcb8e825368ab6672113862b51  summa-wasm/pkg/summa_wasm_bg.wasm
 VARIANT single-block
 [INFO]: 🎯  Checking for the Wasm target...
 [INFO]: 🌀  Compiling to Wasm...
-   Compiling hermes-core v1.9.1 ($SOURCE/hermes-core)
-   Compiling hermes-wasm v1.9.1 ($SOURCE/hermes-wasm)
+   Compiling summa-core v1.9.1 ($SOURCE/summa-core)
+   Compiling summa-wasm v1.9.1 ($SOURCE/summa-wasm)
     Finished `release` profile [optimized] target(s) in 22.14s
 [INFO]: ⬇️  Installing wasm-bindgen...
 [INFO]: Optimizing wasm binaries with `wasm-opt`...
 [INFO]: License key is set in Cargo.toml but no LICENSE file(s) were found; Please add the LICENSE file(s) to your project directory
 [INFO]: ✨   Done in 34.44s
-[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/hermes-wasm/pkg.
+[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/summa-wasm/pkg.
 [WARN]: ⚠️   There's a newer version of wasm-pack available, the new version is: 0.15.0, you are using: 0.13.1. To update, navigate to: https://rustwasm.github.io/wasm-pack/installer/
-patching file 'pkg/hermes_wasm.js'
+patching file 'pkg/summa_wasm.js'
 
 > test
 > vitest
 
 
- RUN  v4.1.0 $SOURCE/hermes-wasm
+ RUN  v4.1.0 $SOURCE/summa-wasm
 
 
  Test Files  9 passed (9)
@@ -326,26 +326,26 @@ patching file 'pkg/hermes_wasm.js'
    Duration  533ms (transform 405ms, setup 0ms, import 624ms, tests 1.78s, environment 0ms)
 
 36d35af2763714c9927d5ad4187e59ab7f8e629e085aeeb7a846b52bf1bc9154  Cargo.lock
-ccaf473b00b5b9cef7c7c01f4f32db41ce2f6803d9c4f12c7ae85d0bbdecd812  hermes-wasm/pkg/hermes_wasm_bg.wasm
+ccaf473b00b5b9cef7c7c01f4f32db41ce2f6803d9c4f12c7ae85d0bbdecd812  summa-wasm/pkg/summa_wasm_bg.wasm
 VARIANT no-rare-seek
 [INFO]: 🎯  Checking for the Wasm target...
 [INFO]: 🌀  Compiling to Wasm...
-   Compiling hermes-core v1.9.1 ($SOURCE/hermes-core)
-   Compiling hermes-wasm v1.9.1 ($SOURCE/hermes-wasm)
+   Compiling summa-core v1.9.1 ($SOURCE/summa-core)
+   Compiling summa-wasm v1.9.1 ($SOURCE/summa-wasm)
     Finished `release` profile [optimized] target(s) in 23.00s
 [INFO]: ⬇️  Installing wasm-bindgen...
 [INFO]: Optimizing wasm binaries with `wasm-opt`...
 [INFO]: License key is set in Cargo.toml but no LICENSE file(s) were found; Please add the LICENSE file(s) to your project directory
 [INFO]: ✨   Done in 35.26s
-[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/hermes-wasm/pkg.
+[INFO]: 📦   Your wasm pkg is ready to publish at $SOURCE/summa-wasm/pkg.
 [WARN]: ⚠️   There's a newer version of wasm-pack available, the new version is: 0.15.0, you are using: 0.13.1. To update, navigate to: https://rustwasm.github.io/wasm-pack/installer/
-patching file 'pkg/hermes_wasm.js'
+patching file 'pkg/summa_wasm.js'
 
 > test
 > vitest
 
 
- RUN  v4.1.0 $SOURCE/hermes-wasm
+ RUN  v4.1.0 $SOURCE/summa-wasm
 
 
  Test Files  9 passed (9)
@@ -354,4 +354,4 @@ patching file 'pkg/hermes_wasm.js'
    Duration  531ms (transform 393ms, setup 0ms, import 639ms, tests 1.84s, environment 0ms)
 
 36d35af2763714c9927d5ad4187e59ab7f8e629e085aeeb7a846b52bf1bc9154  Cargo.lock
-af1f1553fbe2e14696b23ed0311bb7050ec8264c905542262397d24f24cf5db7  hermes-wasm/pkg/hermes_wasm_bg.wasm
+af1f1553fbe2e14696b23ed0311bb7050ec8264c905542262397d24f24cf5db7  summa-wasm/pkg/summa_wasm_bg.wasm

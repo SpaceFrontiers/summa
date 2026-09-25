@@ -2,7 +2,7 @@
 
 ## Status
 
-Implemented in `hermes-core/src/structures/vector/scann/fast_scan.rs`. The
+Implemented in `summa-core/src/structures/vector/scann/fast_scan.rs`. The
 segment payload format version (`SCANN_SEGMENT_PAYLOAD_VERSION`) is bumped
 from 1 to 2; version-1 payloads are refused with an actionable error.
 Migration is a rebuild of every float ScaNN generation (`alter_vector_index`
@@ -111,7 +111,7 @@ every float ScaNN generation before the field is searched.
 
 ## Measured
 
-`scann_fast_scan/score_block` in `hermes-core/benches/scann_vectors.rs`
+`scann_fast_scan/score_block` in `summa-core/benches/scann_vectors.rs`
 (4,096 rows = 128 groups per iteration), Apple M4 aarch64/NEON, rustc 1.98,
 `--warm-up-time 1 --measurement-time 2`; each cell is the best median of
 three interleaved baseline/final runs:

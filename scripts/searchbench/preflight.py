@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit a pinned Searchbench query file against Hermes's native parser.
+"""Audit a pinned Searchbench query file against Summa's native parser.
 
 This is capability discovery, not a performance benchmark or count-agreement
 check. Bare regex patterns need HTTP adapter translation into RegexQuery,

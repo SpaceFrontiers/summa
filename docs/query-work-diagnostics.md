@@ -64,7 +64,7 @@ cannot explain the norm regression.
 Build a dedicated binary (never use it for production latency):
 
 ```sh
-cargo build --release -p hermes-core --example search_benchmark_game --features query-diagnostics
+cargo build --release -p summa-core --example search_benchmark_game --features query-diagnostics
 python3 scripts/search_benchmark/diagnose.py collect --config config.json --output work
 python3 scripts/search_benchmark/diagnose.py compare --baseline work/compact.jsonl --candidate work/quantized.jsonl --output comparison.json
 ```
@@ -76,7 +76,7 @@ runs all four commands, checks each response, enforces a per-query timeout, and
 retains raw logs and structured per-query counters. The first pass is process
 cold, not a claim of cold OS page cache. Repeat 1 is used for comparison.
 
-A diagnostic Hermes binary emits `QUERY_WORK` JSON records on stderr; stdout
+A diagnostic Summa binary emits `QUERY_WORK` JSON records on stderr; stdout
 retains the benchmark protocol. `parse_ns` and `execute_ns` are instrumented
 phase timings, including execution-side response formatting, excluding the final
 flush. `VERIFY` aggregates its exhaustive and optimized sub-runs, so use it for
@@ -84,7 +84,7 @@ correctness only. Legacy 12-counter Tantivy diagnostic records are accepted;
 missing scoring/pruning/validation counters remain unavailable, never zero.
 
 Counter definitions are attached to every field of
-[`QueryWork`](../hermes-core/src/search_diagnostics.rs). Payload counters count
+[`QueryWork`](../summa-core/src/search_diagnostics.rs). Payload counters count
 successful current block decodes. Legacy position-list decoding is outside the
 position-block counters; current benchmark indexes use block position streams.
 The `segment_elapsed_ns` field is a duration, not a work count. Counter sums
@@ -107,7 +107,7 @@ and winner hydration. `seismic_filter_scans` counts selective or underfilled
 filtered executions that scan forward values; `seismic_budget_truncations`
 identifies finite nomination budgets reached before traversal completes.
 
-BMP reports its own phase and work metrics through `hermes_bmp_*`: preparation,
+BMP reports its own phase and work metrics through `summa_bmp_*`: preparation,
 grid scoring, prefetch, block scoring, document-map lookup, and LSP selection;
 visit/skip counts and prefetched bytes explain the work behind those phases.
 These are metrics captures, not fields in `QueryWork`. Sparse MaxScore has no

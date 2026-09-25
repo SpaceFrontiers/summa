@@ -36,7 +36,7 @@ An _approximate_ sparse index that abandons the document-space grid entirely:
   and Seismic needs exhaustive grid search over (λ, β, α, cut, heap_factor)
   to hit its numbers.
 
-## Why this matters for Hermes at 1B scale
+## Why this matters for Summa at 1B scale
 
 BMP's maximum grids are O(dims × vectors / `block_size`) before V19's local
 bit packing. At 1B vectors, `dims=105879`, `b=32`, and eight blocks per
@@ -51,11 +51,11 @@ mode), parameter-sensitive, and per-list clustering makes incremental
 merging awkward (blocks must be re-clustered per list — a rebuild-style
 operation like our reorder, not a byte-stack merge).
 
-## Fit with existing Hermes machinery
+## Fit with existing Summa machinery
 
 Most building blocks already exist:
 
-| Seismic component               | Hermes equivalent                                                                                                                                            |
+| Seismic component               | Summa equivalent                                                                                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | top-λ list pruning              | `pruning` (per-list fraction) — needs absolute-λ variant                                                                                                     |
 | α-mass summaries                | `doc_mass` logic (same cropping, applied to a max-vector)                                                                                                    |
@@ -82,4 +82,4 @@ strictly approximate retrieval with sub-ms budgets is acceptable
 product-wide.
 Suggested path: prototype behind `format: seismic` on one production-shaped
 segment, compare against BMP at equal recall using the new
-`hermes_bmp_*`/latency metrics before committing to the format.
+`summa_bmp_*`/latency metrics before committing to the format.

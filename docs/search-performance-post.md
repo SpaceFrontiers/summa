@@ -1,22 +1,22 @@
-# Hermes 1.9.1: latest search measurements
+# Summa 1.9.1: latest search measurements
 
 Warm throughput in queries/second (higher is better), 10 million Wikipedia
 chunks, 32 clients, 30 server hardware threads on Intel Cascade Lake. Query
-caches are disabled. Hermes uses the benchmark HTTP adapter over the core engine.
+caches are disabled. Summa uses the benchmark HTTP adapter over the core engine.
 
-| Workload                          | Hermes | Hermes RGB |  Luxir | Elasticsearch\* | OpenSearch\* |
-| --------------------------------- | -----: | ---------: | -----: | --------------: | -----------: |
-| Conjunction / top 10              | 47,939 |     75,533 | 53,361 |          22,199 |       25,041 |
-| Conjunction / top 100             | 42,995 |     62,932 | 42,653 |          18,309 |       19,499 |
-| Conjunction / count               | 75,576 |     93,064 | 66,758 |          29,210 |       23,131 |
-| Low-frequency phrase / top 10     | 16,982 |     22,205 |  7,615 |           2,900 |        3,020 |
-| Low-frequency phrase / top 100    |  5,147 |      6,012 |  3,869 |           1,174 |        1,125 |
-| Low-frequency phrase / count      |  1,985 |      2,898 |  2,072 |             344 |          349 |
-| Medium-frequency phrase / top 10  | 16,687 |     18,880 | 17,641 |           5,211 |        4,493 |
-| Medium-frequency phrase / top 100 | 10,988 |     11,685 |  5,977 |           1,531 |        1,197 |
-| Medium-frequency phrase / count   |    702 |        715 |    608 |             428 |          268 |
+| Workload                          |  Summa | Summa RGB |  Luxir | Elasticsearch\* | OpenSearch\* |
+| --------------------------------- | -----: | --------: | -----: | --------------: | -----------: |
+| Conjunction / top 10              | 47,939 |    75,533 | 53,361 |          22,199 |       25,041 |
+| Conjunction / top 100             | 42,995 |    62,932 | 42,653 |          18,309 |       19,499 |
+| Conjunction / count               | 75,576 |    93,064 | 66,758 |          29,210 |       23,131 |
+| Low-frequency phrase / top 10     | 16,982 |    22,205 |  7,615 |           2,900 |        3,020 |
+| Low-frequency phrase / top 100    |  5,147 |     6,012 |  3,869 |           1,174 |        1,125 |
+| Low-frequency phrase / count      |  1,985 |     2,898 |  2,072 |             344 |          349 |
+| Medium-frequency phrase / top 10  | 16,687 |    18,880 | 17,641 |           5,211 |        4,493 |
+| Medium-frequency phrase / top 100 | 10,988 |    11,685 |  5,977 |           1,531 |        1,197 |
+| Medium-frequency phrase / count   |    702 |       715 |    608 |             428 |          268 |
 
-Hermes, RGB and Luxir are from [September 24](ranked-pruning-followup.md).
+Summa, RGB and Luxir are from [September 24](ranked-pruning-followup.md).
 \*Elasticsearch 9.5.4 and OpenSearch 3.8.0 are the latest available
 [September 23 measurements](benchmark-results/searchbench-2026-09-23-32cpu.md)
 on the same hardware and workload configuration; they were not rerun with this

@@ -2,7 +2,7 @@
 
 The final candidate improves all 714 terms by **2.89× for TOP_10** and
 **1.65× for TOP_1000**, on the same full-corpus index and machine. The official
-962-query ranked commands improve by only **1.8–3.2%** overall; Hermes still
+962-query ranked commands improve by only **1.8–3.2%** overall; Summa still
 trails Tantivy by **2.12–3.37×** across the five commands. This is a targeted
 improvement, not a fastest-engine claim.
 
@@ -11,17 +11,17 @@ This follow-up targets the frequent-term ranking gap identified in the
 from a new dedicated machine and newly built index; absolute times must not be
 compared with the previous machine. The original report remains historical evidence.
 
-## Why Hermes still trails
+## Why Summa still trails
 
 A block's maximum term frequency and minimum document length can come from
 different documents. Combining them gives a safe but loose BM25 upper bound.
-Hermes consequently scores blocks whose actual documents cannot enter top-k.
+Summa consequently scores blocks whose actual documents cannot enter top-k.
 The previous diagnostic skipped only 3.28% of windows; the previous final
 standalone-term plan therefore retained scalar traversal.
 
 Lucene retains competitive frequency/norm pairs in its
 [impact accumulator](https://github.com/apache/lucene/blob/releases/lucene/10.4.0/lucene/core/src/java/org/apache/lucene/codecs/CompetitiveImpactAccumulator.java).
-The implemented Hermes extension instead adds one conservative minimum
+The implemented Summa extension instead adds one conservative minimum
 length/TF ratio per block and skip group. It is compact, independent of queries
 and BM25 parameters, and reuses the existing posting codecs, scorer and skip
 hierarchy. It is not a full competitive-impact frontier.
@@ -30,7 +30,7 @@ Tantivy 0.26's [posting serializer](https://github.com/quickwit-oss/tantivy/blob
 selects an actual fieldnorm/frequency pair maximizing its indexing BM25 factor
 for each full block. Its [skip reader](https://github.com/quickwit-oss/tantivy/blob/0.26.0/src/postings/skip.rs)
 uses that pair without decoding postings. This helps explain the remaining
-pruning advantage. Hermes's ratio still combines extrema and can remain loose;
+pruning advantage. Summa's ratio still combines extrema and can remain loose;
 a bounded competitive-impact frontier is the next format candidate to evaluate
 under changing global statistics and configurable BM25, with merge-copy costs
 included. No performance result is claimed for that unimplemented candidate.
@@ -56,12 +56,12 @@ implemented change or a measured speedup.
 
 `COUNT` enumerates complete membership or uses an exact guarded dictionary
 frequency. Ranked queries may skip only blocks that cannot beat the heap.
-`VERIFY` compares Hermes's ordered document IDs and score bits at k=10, 100 and
-1000 with exhaustive Hermes scoring, and compares exact counts with Tantivy.
+`VERIFY` compares Summa's ordered document IDs and score bits at k=10, 100 and
+1000 with exhaustive Summa scoring, and compares exact counts with Tantivy.
 It does not assert identical scores across engines with different BM25/norm
 representations. Every official query and every supplemental term must pass.
 
-`IndexConfig.posting_ratio_bounds` and `hermes-tool index
+`IndexConfig.posting_ratio_bounds` and `summa-tool index
 --posting-ratio-bounds` enable the new metadata for newly built segments. The
 option remains **off by default**. Readers detect it automatically; existing
 indexes retain their original bounds. The extension adds four bytes per L0
@@ -88,7 +88,7 @@ positioned text and no deletions. Deletion and chunk correctness are tested
 separately, not benchmarked as production workloads. Timed drivers and children are pinned to CPU 2. Builds, indexing,
 tests and diagnostics do not overlap timed search.
 
-Before and after binaries read **the same ratio-bearing Hermes index bytes**:
+Before and after binaries read **the same ratio-bearing Summa index bytes**:
 the previous reader safely ignores the additive metadata. Tantivy 0.26 uses its
 own index on the same transformed corpus. The main run uses 60-second warmups
 and ten repetitions per command; the supplement uses ten seconds and five
@@ -105,20 +105,20 @@ Raw results retain the rejected candidate and its larger-k tradeoffs.
 
 ## Final full-corpus results
 
-All 714 distinct terms, same persisted Hermes index:
+All 714 distinct terms, same persisted Summa index:
 
-| Command  | Previous Hermes µs | Final Hermes µs | Tantivy µs | Hermes speedup | Final Hermes/Tantivy |
-| -------- | -----------------: | --------------: | ---------: | -------------: | -------------------: |
-| TOP_10   |          1,359.936 |         470.661 |     80.717 |     **2.889×** |               5.831× |
-| TOP_1000 |          1,830.539 |       1,111.002 |    578.466 |     **1.648×** |               1.921× |
-| COUNT    |             69.102 |          67.293 |      9.642 |         1.027× |               6.979× |
+| Command  | Previous Summa µs | Final Summa µs | Tantivy µs | Summa speedup | Final Summa/Tantivy |
+| -------- | ----------------: | -------------: | ---------: | ------------: | ------------------: |
+| TOP_10   |         1,359.936 |        470.661 |     80.717 |    **2.889×** |              5.831× |
+| TOP_1000 |         1,830.539 |      1,111.002 |    578.466 |    **1.648×** |              1.921× |
+| COUNT    |            69.102 |         67.293 |      9.642 |        1.027× |              6.979× |
 
 TOP_10 is faster for 713/714 terms, with 708 at least 10% faster. TOP_1000
 is faster for 705/714 terms, with 685 at least 10% faster. Neither command has
 a term more than 10% slower in this run. These are comparisons of five-sample
 per-query medians, not confidence intervals.
 
-![Cumulative per-query speedups for all 714 terms](benchmark-results/score-bounds-2026-09-13/supplement-speedups.png)
+![Cumulative per-query speedups for all 714 terms](benchmark-results/score-bounds-2026-09-13/supplement-speedups.svg)
 
 The plot contains every term. The vertical line is equal latency; farther right
 means a larger speedup. The counting control stays close to that line.
@@ -131,16 +131,16 @@ the aggregate. Tantivy still wins those examples at 2.604 and 0.559 ms.
 
 All 962 official queries:
 
-| Command       | Previous Hermes µs | Final Hermes µs | Tantivy µs | Hermes speedup | Final Hermes/Tantivy |
-| ------------- | -----------------: | --------------: | ---------: | -------------: | -------------------: |
-| TOP_10        |          1,811.260 |       1,779.870 |    742.734 |         1.018× |               2.396× |
-| TOP_100       |          2,176.328 |       2,108.332 |    934.144 |         1.032× |               2.257× |
-| TOP_1000      |          2,596.013 |       2,529.973 |  1,195.918 |         1.026× |               2.116× |
-| TOP_100_COUNT |          3,710.147 |       3,731.351 |  1,106.011 |         0.994× |               3.374× |
-| COUNT         |          1,222.611 |       1,212.597 |    525.689 |         1.008× |               2.307× |
+| Command       | Previous Summa µs | Final Summa µs | Tantivy µs | Summa speedup | Final Summa/Tantivy |
+| ------------- | ----------------: | -------------: | ---------: | ------------: | ------------------: |
+| TOP_10        |         1,811.260 |      1,779.870 |    742.734 |        1.018× |              2.396× |
+| TOP_100       |         2,176.328 |      2,108.332 |    934.144 |        1.032× |              2.257× |
+| TOP_1000      |         2,596.013 |      2,529.973 |  1,195.918 |        1.026× |              2.116× |
+| TOP_100_COUNT |         3,710.147 |      3,731.351 |  1,106.011 |        0.994× |              3.374× |
+| COUNT         |         1,222.611 |      1,212.597 |    525.689 |        1.008× |              2.307× |
 
 The whole-suite gain is modest: 1.8–3.2% for the ranked commands. Exact-count
-commands are essentially flat. Hermes still trails Tantivy by 2.12–3.37× across
+commands are essentially flat. Summa still trails Tantivy by 2.12–3.37× across
 these commands. The 301 unions improve by 4.6%, 6.3% and 4.9% for TOP_10,
 TOP_100 and TOP_1000. This does not close the posting-alignment, phrase,
 dictionary or exhaustive-scoring gaps.
@@ -149,13 +149,13 @@ dictionary or exhaustive-scoring gaps.
 
 The main same-index comparison has essentially unchanged peak process RSS:
 
-| Command       | Previous Hermes MiB | Final Hermes MiB | Change MiB |
-| ------------- | ------------------: | ---------------: | ---------: |
-| TOP_10        |              962.12 |           962.81 |      +0.69 |
-| TOP_100       |              961.70 |           962.96 |      +1.27 |
-| TOP_1000      |              962.60 |           962.98 |      +0.38 |
-| TOP_100_COUNT |              961.50 |           962.06 |      +0.57 |
-| COUNT         |              933.66 |           934.12 |      +0.45 |
+| Command       | Previous Summa MiB | Final Summa MiB | Change MiB |
+| ------------- | -----------------: | --------------: | ---------: |
+| TOP_10        |             962.12 |          962.81 |      +0.69 |
+| TOP_100       |             961.70 |          962.96 |      +1.27 |
+| TOP_1000      |             962.60 |          962.98 |      +0.38 |
+| TOP_100_COUNT |             961.50 |          962.06 |      +0.57 |
+| COUNT         |             933.66 |          934.12 |      +0.45 |
 
 RSS includes resident mmap pages and heap; it is not a measurement of heap
 allocation alone. These are `/usr/bin/time -v` peaks for each fresh process
@@ -274,18 +274,18 @@ The [versioned evidence bundle](benchmark-results/score-bounds-2026-09-13/README
 contains complete timing samples, exactness gates, validation logs, memory
 records, hashes and scripts, with per-file SHA-256 verification. It retains
 intermediate candidates and separate ARM/cache runs without pooling them into
-the final result. The larger local `.context/hermes-ratio-benchmark-evidence.tar.gz`
+the final result. The larger local `.context/summa-ratio-benchmark-evidence.tar.gz`
 also preserves the cloud archive, Linux/ARM binaries, base Git bundle, frozen
 source overlays and ARM corpus prefix; its checksum is stored alongside it.
 The original benchmark bundle remains intact.
 
-The measured final code is the `hermes-ratios-v3` overlay over base revision
+The measured final code is the `summa-ratios-v3` overlay over base revision
 `ce2c96b945fccc4bac58ccc45bb4bc23b809773e`, with the earlier optimized overlay as
 the before control. Full manifests and binary hashes are included. Later edits
 only finish documentation and evidence packaging; production source still
 matches the measured v3 manifest.
 
-Enable the new format on newly indexed data with `hermes-tool index
+Enable the new format on newly indexed data with `summa-tool index
 --posting-ratio-bounds` or `IndexConfig.posting_ratio_bounds = true`; readers
 detect it automatically. The ranked-result handoff also benefits existing
 indexes without rebuilding. The benchmark adapter's `--term-cache-blocks 1024`

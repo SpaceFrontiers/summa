@@ -1,8 +1,8 @@
-    0.00 :   8774f1:        jae     0x878690 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x2090>
+    0.00 :   8774f1:        jae     0x878690 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x2090>
     0.06 :   8774f7:        movq    %rsi, %rdx
     0.64 :   8774fa:        movq    0x20(%rsp), %rax
     3.76 :   8774ff:        subq    %rax, %rdx
-    0.00 :   877502:        jb      0x87857d <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1f7d>
+    0.00 :   877502:        jb      0x87857d <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1f7d>
     0.52 :   877508:        movq    0x70(%rsp), %rcx
     0.29 :   87750d:        movzbl  (%rcx,%rdi), %esi
     0.64 :   877511:        movq    %rsi, 0x40(%rsp)
@@ -10,7 +10,7 @@
     0.52 :   87751a:        vpxor   %xmm0, %xmm0, %xmm0
     0.00 :   87751e:        vmovdqa %xmm0, 0x100(%rsp)
     0.06 :   877527:        cmpq    $0xf, %rdx
-    0.00 :   87752b:        ja      0x877563 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0xf63>
+    0.00 :   87752b:        ja      0x877563 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0xf63>
     0.17 :   87752d:        leaq    0x100(%rsp), %rbx
     0.40 :   877535:        movq    %rbx, %rdi
     0.00 :   877538:        movq    %r9, 0xe0(%rsp)
@@ -22,7 +22,7 @@
     0.00 :   87755b:        movq    0x10(%rsp), %r8
     0.00 :   877560:        movq    %rbx, %rsi
     0.06 :   877563:        cmpq    %r8, %r9
-    0.00 :   877566:        jae     0x878642 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x2042>
+    0.00 :   877566:        jae     0x878642 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x2042>
     0.58 :   87756c:        vmovdqu (%rsi), %xmm0
     4.91 :   877570:        movq    0x40(%rsp), %rax
     0.64 :   877575:        shll    $0x4, %eax
@@ -36,25 +36,25 @@
     0.00 :   87759e:        vpaddd  %xmm3, %xmm0, %xmm0
     0.00 :   8775a2:        vpaddd  %xmm2, %xmm0, %xmm0
     1.27 :   8775a6:        cmpl    $0x1, 0x48(%rsp)
-    0.00 :   8775ab:        jne     0x877630 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1030>
+    0.00 :   8775ab:        jne     0x877630 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1030>
     0.00 :   8775b1:        vmovd   %xmm0, %eax
     0.00 :   8775b5:        testq   %r14, %r14
-    0.00 :   8775b8:        je      0x8775ef <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0xfef>
+    0.00 :   8775b8:        je      0x8775ef <<summa_core::query::bmp::CandidateBmpPreparation>::score+0xfef>
     0.81 :   8775ba:        cmpl    %eax, (%r13)
-    0.00 :   8775be:        jae     0x8775f2 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0xff2>
+    0.00 :   8775be:        jae     0x8775f2 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0xff2>
     0.64 :   8775c0:        leaq    (,%r14,8), %rcx
     0.23 :   8775c8:        addq    %r13, %rcx
     0.17 :   8775cb:        movq    %r14, %r15
     0.00 :   8775ce:        nop
     0.12 :   8775d0:        cmpq    $0x1, %r15
-    0.00 :   8775d4:        je      0x877add <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x14dd>
+    0.00 :   8775d4:        je      0x877add <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x14dd>
     0.06 :   8775da:        leaq    0x8(%r13), %rdx
     0.06 :   8775de:        decq    %r15
     0.00 :   8775e1:        movq    %r15, %r14
     0.00 :   8775e4:        cmpl    %eax, 0x8(%r13)
     0.23 :   8775e8:        movq    %rdx, %r13
-    0.00 :   8775eb:        jb      0x8775d0 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0xfd0>
-    0.23 :   8775ed:        jmp     0x8775f6 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0xff6>
+    0.00 :   8775eb:        jb      0x8775d0 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0xfd0>
+    0.23 :   8775ed:        jmp     0x8775f6 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0xff6>
     0.12 :   8775ef:        xorl    %r14d, %r14d
     0.06 :   8775f2:        movq    (%rsp), %rdx
     0.06 :   8775f6:        movq    %rdx, (%rsp)
@@ -64,22 +64,22 @@
     0.06 :   87760a:        nopw    (%rax,%rax)
     0.06 :   877610:        movb    $0x1, %dl
     0.92 :   877612:        testq   %rsi, %rsi
-    0.00 :   877615:        je      0x877632 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1032>
+    0.00 :   877615:        je      0x877632 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1032>
     0.17 :   877617:        cmpl    %eax, (%rdi)
-    0.00 :   877619:        jne     0x877632 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1032>
+    0.00 :   877619:        jne     0x877632 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1032>
     0.00 :   87761b:        movzwl  0x4(%rdi), %edx
     0.06 :   87761f:        addq    $0x8, %rdi
     0.00 :   877623:        imull   %ecx, %edx
     0.00 :   877626:        addq    $-0x8, %rsi
     0.00 :   87762a:        addl    %edx, %r12d
-    0.00 :   87762d:        jae     0x877610 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x1010>
+    0.00 :   87762d:        jae     0x877610 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x1010>
     0.00 :   87762f:        nop
     0.00 :   877630:        xorl    %edx, %edx
     0.06 :   877632:        leaq    0x1(%r9), %rcx
     0.00 :   877636:        cmpq    %r8, %rcx
-    0.00 :   877639:        jae     0x87863f <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x203f>
+    0.00 :   877639:        jae     0x87863f <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x203f>
     1.16 :   87763f:        testb   %dl, %dl
-    0.00 :   877641:        je      0x8776d0 <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x10d0>
+    0.00 :   877641:        je      0x8776d0 <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x10d0>
     0.17 :   877647:        vpextrd $0x1, %xmm0, %eax
     0.17 :   87764d:        testq   %r14, %r14
-    0.00 :   877650:        je      0x87768f <<hermes_core::query::bmp::CandidateBmpPreparation>::score+0x108f>
+    0.00 :   877650:        je      0x87768f <<summa_core::query::bmp::CandidateBmpPreparation>::score+0x108f>

@@ -6,29 +6,29 @@ and [Lucene research](../../lucene-11-performance-research.md).
 `raw-results.zip` contains full official/supplementary raw timing samples,
 exactness gates, profiles, assembly excerpts, RSS reports, compiler/build logs,
 index/corpus manifests and pinned research sources. `manifest.json` records
-uncompressed member lengths and SHA-256 hashes. `official-speedups.png` includes
+uncompressed member lengths and SHA-256 hashes. `official-speedups.svg` includes
 all 962 queries and the complete 301-query union family, including regressions.
 
-Source reconstruction starts at Hermes commit
+Source reconstruction starts at Summa commit
 `ce2c96b945fccc4bac58ccc45bb4bc23b809773e`. Overlay the desired `sources/` snapshot;
 these contain every changed Rust/Cargo/grammar input, including the benchmark
 adapter. The public benchmark base is
 `a7c75473e91746280c5f01e69bf594ece5fca560`. Build commands and toolchain details are
 in the cloud scripts and logs. After extracting a historical overlay into a
-previously built tree, touch `hermes-core/src/lib.rs` and
-`hermes-core/examples/search_benchmark_game.rs` before building; this avoids
+previously built tree, touch `summa-core/src/lib.rs` and
+`summa-core/examples/search_benchmark_game.rs` before building; this avoids
 Cargo reusing a binary because archived source mtimes precede prior artifacts.
 Verify binary hashes and keep builds outside search timing.
 
 Snapshot meanings:
 
-- `hermes-ratios-v3`: prior ratio-bound implementation, this pass's baseline.
-- `hermes-score-window-v1`: Boolean score windows.
-- `hermes-score-window-v2`: contiguous term-run BM25 accumulation.
-- `hermes-phrase-bound-v1`: phrase competitive bound, subsequently rejected.
-- `hermes-score-window-v3`: phrase prototype plus standalone term windows.
-- `hermes-posting-validation-v1`: v3 plus structural posting validation.
-- `hermes-bulk-final-v1`: retained version; structural validation and standalone
+- `summa-ratios-v3`: prior ratio-bound implementation, this pass's baseline.
+- `summa-score-window-v1`: Boolean score windows.
+- `summa-score-window-v2`: contiguous term-run BM25 accumulation.
+- `summa-phrase-bound-v1`: phrase competitive bound, subsequently rejected.
+- `summa-score-window-v3`: phrase prototype plus standalone term windows.
+- `summa-posting-validation-v1`: v3 plus structural posting validation.
+- `summa-bulk-final-v1`: retained version; structural validation and standalone
   term windows, with the experimental phrase hint removed.
 
 `final-paired` compares v2 (`before`) with combined v3 (`phrase`), retaining the

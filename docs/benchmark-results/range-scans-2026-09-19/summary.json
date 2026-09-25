@@ -5,7 +5,7 @@
       "evidence_directory": "20260919T131223.752619Z-bench",
       "environment": {
         "revision": "94835959a7260085425fb531cf31541331f9675c",
-        "status": "M docs/README.md\n M hermes-core/benches/rust_hot_paths.rs\n?? docs/range-block-scans.md",
+        "status": "M docs/README.md\n M summa-core/benches/rust_hot_paths.rs\n?? docs/range-block-scans.md",
         "working_diff_sha256": "8c2d79cdd2c0fc2971e2ef94eb4ac14740fc31a0abab39ffd6f6b296f83d5ed6",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -22,8 +22,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -33,7 +33,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -52,7 +52,7 @@
       "evidence_directory": "20260919T131428.330956Z-bench",
       "environment": {
         "revision": "94835959a7260085425fb531cf31541331f9675c",
-        "status": "M docs/README.md\n M hermes-core/benches/rust_hot_paths.rs\n M hermes-core/src/query/range.rs\n M hermes-core/src/structures/fast_field/codec.rs\n M hermes-core/src/structures/fast_field/mod.rs\n?? docs/range-block-scans.md",
+        "status": "M docs/README.md\n M summa-core/benches/rust_hot_paths.rs\n M summa-core/src/query/range.rs\n M summa-core/src/structures/fast_field/codec.rs\n M summa-core/src/structures/fast_field/mod.rs\n?? docs/range-block-scans.md",
         "working_diff_sha256": "5a4936b14126fc2e0775efcff3e882691f94249c935576fd45afd35604efc2dc",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -69,8 +69,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -80,7 +80,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -99,7 +99,7 @@
       "evidence_directory": "20260919T131942.093712Z-bench",
       "environment": {
         "revision": "94835959a7260085425fb531cf31541331f9675c",
-        "status": "M docs/README.md\n M hermes-core/benches/rust_hot_paths.rs\n M hermes-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
+        "status": "M docs/README.md\n M summa-core/benches/rust_hot_paths.rs\n M summa-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
         "working_diff_sha256": "273b56042ec884cf31c2def326ff883b85e2713e56204327fb616f2d200882d1",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -116,8 +116,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -127,7 +127,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -146,7 +146,7 @@
       "evidence_directory": "20260919T132014.964703Z-bench",
       "environment": {
         "revision": "94835959a7260085425fb531cf31541331f9675c",
-        "status": "M docs/README.md\n M hermes-core/benches/rust_hot_paths.rs\n M hermes-core/src/query/range.rs\n M hermes-core/src/structures/fast_field/codec.rs\n M hermes-core/src/structures/fast_field/mod.rs\n M hermes-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
+        "status": "M docs/README.md\n M summa-core/benches/rust_hot_paths.rs\n M summa-core/src/query/range.rs\n M summa-core/src/structures/fast_field/codec.rs\n M summa-core/src/structures/fast_field/mod.rs\n M summa-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
         "working_diff_sha256": "4bdc437d2468197434ff94e217bd9815135365d604e672875cd61f7a96db6722",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -163,8 +163,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -174,7 +174,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -193,7 +193,7 @@
       "evidence_directory": "20260919T132301.589223Z-bench",
       "environment": {
         "revision": "94835959a7260085425fb531cf31541331f9675c",
-        "status": "M docs/README.md\n M hermes-core/benches/rust_hot_paths.rs\n M hermes-core/src/query/range.rs\n M hermes-core/src/structures/fast_field/codec.rs\n M hermes-core/src/structures/fast_field/mod.rs\n M hermes-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
+        "status": "M docs/README.md\n M summa-core/benches/rust_hot_paths.rs\n M summa-core/src/query/range.rs\n M summa-core/src/structures/fast_field/codec.rs\n M summa-core/src/structures/fast_field/mod.rs\n M summa-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
         "working_diff_sha256": "73f295711b23a2b6a9848696cdbe1ccbdeb45b235820a760e103a798961fc9da",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -210,8 +210,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -221,7 +221,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -239,7 +239,7 @@
     "shuffled-control": {
       "environment": {
         "revision": "94835959a7260085425fb531cf31541331f9675c",
-        "status": "M docs/README.md\n M hermes-core/benches/rust_hot_paths.rs\n M hermes-core/src/query/range.rs\n M hermes-core/src/structures/fast_field/codec.rs\n M hermes-core/src/structures/fast_field/mod.rs\n M hermes-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
+        "status": "M docs/README.md\n M summa-core/benches/rust_hot_paths.rs\n M summa-core/src/query/range.rs\n M summa-core/src/structures/fast_field/codec.rs\n M summa-core/src/structures/fast_field/mod.rs\n M summa-core/tests/range_bitset.rs\n?? docs/range-block-scans.md",
         "working_diff_sha256": "accbd4e2a13bb08151ad2ddef88a3a1b86c26a2a0780920f82e07f7fce56e400",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -256,8 +256,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -267,7 +267,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",

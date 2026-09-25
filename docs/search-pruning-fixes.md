@@ -111,7 +111,7 @@ at least five seconds of warmup per engine/command. Values are geometric means
 of per-query median microseconds, including the benchmark protocol. Builds,
 verification and residency audits do not overlap latency. RGB is disabled.
 
-Starting Hermes is the frozen compact/exact reader at the beginning of this
+Starting Summa is the frozen compact/exact reader at the beginning of this
 follow-up. Reader-only and byte-norm controls retain their original indexes.
 The combined index uses compact directories, Simd4x and impact bounds with
 exact norms. All changes below are direct same-run comparisons.

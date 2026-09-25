@@ -21,26 +21,27 @@ class SearchHarnessTests(unittest.TestCase):
         )
         (self.root / "docs/search-system-contract.md").write_text("System rules")
         (self.root / "Cargo.toml").write_text(
-            '[workspace.dependencies]\nmodel = { package = "hermes-llm", version = "1" }\n'
+            '[workspace.dependencies]\nmodel = { package = "summa-llm", version = "1" }\n'
         )
         for name in (
-            "hermes-core",
-            "hermes-server",
-            "hermes-broker",
-            "hermes-tool",
-            "hermes-wasm",
+            "summa-core",
+            "summa-proto",
+            "summa-server",
+            "summa-broker",
+            "summa-tool",
+            "summa-wasm",
         ):
             (self.root / name).mkdir()
             (self.root / name / "Cargo.toml").write_text("[dependencies]\n")
 
     def manifest(self, text):
-        (self.root / "hermes-core/Cargo.toml").write_text(text)
+        (self.root / "summa-core/Cargo.toml").write_text(text)
 
     def test_target_specific_aliased_runtime_dependency_is_rejected(self):
         self.manifest(
             "[target.'cfg(unix)'.dependencies]\nmodel = { workspace = true }\n"
         )
-        with self.assertRaisesRegex(ValueError, "hermes-llm"):
+        with self.assertRaisesRegex(ValueError, "summa-llm"):
             check_search.contracts(self.root)
 
     def test_transport_stays_in_adapters_but_dev_fixtures_can_cross_boundaries(self):

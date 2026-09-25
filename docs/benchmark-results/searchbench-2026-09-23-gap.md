@@ -4,9 +4,9 @@ Count agreement: **15/826 queries**. This is a restricted workload, not the comp
 
 10M Wikipedia chunks; one merged segment; six server hardware threads and two driver threads on a separate physical core. All variants share an isolated loopback network namespace. Query and request caches disabled. Thirty-second session warmup, full untimed validation, one-second connection warmup, three ten-second repetitions per cell.
 
-All four variants run sequentially. The prior and optimized Hermes binaries use the same immutable non-RGB index, without impact metadata. The optional impact variant uses a separate index rebuilt from the same corpus; impacts remain disabled by default. Luxir is rerun on the same host. Indexing and compilation finish before query timing.
+All four variants run sequentially. The prior and optimized Summa binaries use the same immutable non-RGB index, without impact metadata. The optional impact variant uses a separate index rebuilt from the same corpus; impacts remain disabled by default. Luxir is rerun on the same host. Indexing and compilation finish before query timing.
 
-Hermes uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
+Summa uses a benchmark HTTP frontend over core, not its production gRPC service. Text-analysis differences exclude many queries; equal corpus counts do not prove general analyzer or relevance equivalence. Luxir uses the official 0.1.0 x86-64-v4 release, not the article's local build. No p99 claim is made.
 
 | Family             | Included | Published queries |
 | ------------------ | -------: | ----------------: |
@@ -33,22 +33,22 @@ Hermes uses a benchmark HTTP frontend over core, not its production gRPC service
 
 **Throughput (queries/second; higher is better).** Values are the median of three repetitions. The CSV retains repetition min/max and peak process RSS. Raw replay JSON and memory samples accompany each cell.
 
-| Family       | Operation | Clients | Distinct queries | Hermes before (QPS) | Hermes optimized (QPS) | Hermes optimized + impacts (QPS) | Luxir (QPS) |
-| ------------ | --------- | ------: | ---------------: | ------------------: | ---------------------: | -------------------------------: | ----------: |
-| and_high_low | COUNT     |       8 |                7 |            16,823.4 |               16,277.6 |                         15,553.3 |    13,605.6 |
-| and_high_low | TOP_10    |       8 |                7 |             9,135.5 |                9,229.0 |                          9,248.0 |    10,642.1 |
-| and_high_low | TOP_100   |       8 |                7 |             7,056.7 |                7,170.1 |                          7,121.8 |     8,256.7 |
-| low_phrase   | COUNT     |       8 |                7 |               321.2 |                  383.3 |                            382.9 |       413.1 |
-| low_phrase   | TOP_10    |       8 |                7 |             2,537.8 |                3,080.6 |                          2,940.3 |     1,495.3 |
-| low_phrase   | TOP_100   |       8 |                7 |               952.6 |                  939.9 |                            803.0 |       758.8 |
-| med_phrase   | COUNT     |       8 |                1 |                98.5 |                  138.1 |                            137.9 |       121.1 |
-| med_phrase   | TOP_10    |       8 |                1 |             2,121.4 |                3,130.3 |                          6,351.6 |     3,539.8 |
-| med_phrase   | TOP_100   |       8 |                1 |             1,316.2 |                2,011.5 |                          2,433.8 |     1,180.4 |
+| Family       | Operation | Clients | Distinct queries | Summa before (QPS) | Summa optimized (QPS) | Summa optimized + impacts (QPS) | Luxir (QPS) |
+| ------------ | --------- | ------: | ---------------: | -----------------: | --------------------: | ------------------------------: | ----------: |
+| and_high_low | COUNT     |       8 |                7 |           16,823.4 |              16,277.6 |                        15,553.3 |    13,605.6 |
+| and_high_low | TOP_10    |       8 |                7 |            9,135.5 |               9,229.0 |                         9,248.0 |    10,642.1 |
+| and_high_low | TOP_100   |       8 |                7 |            7,056.7 |               7,170.1 |                         7,121.8 |     8,256.7 |
+| low_phrase   | COUNT     |       8 |                7 |              321.2 |                 383.3 |                           382.9 |       413.1 |
+| low_phrase   | TOP_10    |       8 |                7 |            2,537.8 |               3,080.6 |                         2,940.3 |     1,495.3 |
+| low_phrase   | TOP_100   |       8 |                7 |              952.6 |                 939.9 |                           803.0 |       758.8 |
+| med_phrase   | COUNT     |       8 |                1 |               98.5 |                 138.1 |                           137.9 |       121.1 |
+| med_phrase   | TOP_10    |       8 |                1 |            2,121.4 |               3,130.3 |                         6,351.6 |     3,539.8 |
+| med_phrase   | TOP_100   |       8 |                1 |            1,316.2 |               2,011.5 |                         2,433.8 |     1,180.4 |
 
 ## Retained changes and tradeoffs
 
 This comparison starts from the preceding certified rare-term phrase implementation,
-not the initial Hermes adapter. New work comprises exact singleton admission with
+not the initial Summa adapter. New work comprises exact singleton admission with
 stable-ID-aware ties, inverse-seeded exact length cutoffs, AVX2/AVX-512 candidate
 scans, existing L1 group bounds, cost-aware posting intersection, cached per-block
 position offsets and singleton/membership position reads. Native scalar and WASM
@@ -63,7 +63,7 @@ Ordinary medium-phrase top-10 remains 11.6% below Luxir; low-phrase counting is
 
 Optional impact metadata closes the medium-phrase top-10 gap on this workload:
 6,352 QPS versus Luxir's 3,540. It also reduces low-phrase top-10 by 4.6% and
-top-100 by 14.6% compared with optimized Hermes without impacts. Impacts therefore
+top-100 by 14.6% compared with optimized Summa without impacts. Impacts therefore
 remain disabled by default. They require a separate writer-built index; no live
 index is retrofitted.
 

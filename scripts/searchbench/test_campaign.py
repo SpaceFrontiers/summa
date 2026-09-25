@@ -31,7 +31,7 @@ class AgreementGateTests(unittest.TestCase):
                     {"key": campaign.key(items[1]), "count": 7},
                     {"key": campaign.key(items[2]), "count": 100},
                 ]
-                if engine == "hermes":
+                if engine == "summa":
                     rows[1] = {
                         "key": campaign.key(items[1]),
                         "error": "expansion budget exceeded",
@@ -42,7 +42,7 @@ class AgreementGateTests(unittest.TestCase):
             result = json.loads((out / "agreement.json").read_text())
             self.assertEqual([row["include"] for row in result], [True, False, False])
             self.assertEqual(
-                result[1]["observed"]["hermes"]["error"], "expansion budget exceeded"
+                result[1]["observed"]["summa"]["error"], "expansion budget exceeded"
             )
 
     def test_shared_input_gate_retains_count_differences_and_excludes_errors(self):
@@ -55,7 +55,7 @@ class AgreementGateTests(unittest.TestCase):
                         [
                             {
                                 "key": campaign.key(item),
-                                "count": 101 if engine == "hermes" else 100,
+                                "count": 101 if engine == "summa" else 100,
                             }
                         ]
                     )
@@ -67,13 +67,13 @@ class AgreementGateTests(unittest.TestCase):
             self.assertFalse(result[0]["counts_agree"])
             self.assertEqual(result[0]["comparison"], "shared-input")
             self.assertEqual(
-                campaign.eligible_counts(result, "hermes"), {campaign.key(item): 101}
+                campaign.eligible_counts(result, "summa"), {campaign.key(item): 101}
             )
             self.assertEqual(
                 campaign.eligible_counts(result, "elasticsearch"),
                 {campaign.key(item): 100},
             )
-            (out / "hermes-counts.json").write_text(
+            (out / "summa-counts.json").write_text(
                 json.dumps([{"key": campaign.key(item), "error": "budget exceeded"}])
             )
             campaign.gate(args, [item])

@@ -1,7 +1,7 @@
 [
   {
     "label": "local-owner-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 55,
     "query_set_sha256": "61ee62faecf61523482deba85d7a73593abc6d1f89f4b8137a465100d9d73839",
     "cells": [
@@ -164,7 +164,7 @@
   },
   {
     "label": "patterns-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 55,
     "query_set_sha256": "61ee62faecf61523482deba85d7a73593abc6d1f89f4b8137a465100d9d73839",
     "cells": [
@@ -327,7 +327,7 @@
   },
   {
     "label": "repeat-local-owner-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 55,
     "query_set_sha256": "61ee62faecf61523482deba85d7a73593abc6d1f89f4b8137a465100d9d73839",
     "cells": [
@@ -490,7 +490,7 @@
   },
   {
     "label": "repeat-patterns-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 55,
     "query_set_sha256": "61ee62faecf61523482deba85d7a73593abc6d1f89f4b8137a465100d9d73839",
     "cells": [

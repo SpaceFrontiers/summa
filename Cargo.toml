@@ -1,15 +1,16 @@
 [workspace]
 members = [
-    "hermes-broker",
-    "hermes-core",
-    "hermes-llm",
-    "hermes-mal",
-    "hermes-mal-python",
-    "hermes-tokenizer",
-    "hermes-train",
-    "hermes-server",
-    "hermes-tool",
-    "hermes-wasm",
+    "summa-broker",
+    "summa-core",
+    "summa-llm",
+    "summa-mal",
+    "summa-mal-python",
+    "summa-proto",
+    "summa-tokenizer",
+    "summa-train",
+    "summa-server",
+    "summa-tool",
+    "summa-wasm",
 ]
 resolver = "2"
 
@@ -18,9 +19,9 @@ version = "1.9.1"
 edition = "2024"
 rust-version = "1.98.1"
 license = "MIT"
-repository = "https://github.com/SpaceFrontiers/hermes"
-homepage = "https://github.com/SpaceFrontiers/hermes"
-documentation = "https://docs.rs/hermes-core"
+repository = "https://github.com/SpaceFrontiers/summa"
+homepage = "https://github.com/SpaceFrontiers/summa"
+documentation = "https://docs.rs/summa-core"
 authors = ["izihawa"]
 keywords = ["search", "full-text-search", "indexing", "ir"]
 categories = ["database", "text-processing"]
@@ -29,10 +30,11 @@ categories = ["database", "text-processing"]
 
 [workspace.dependencies]
 # Internal crates
-hermes-core = { version = "1.9.1", path = "hermes-core", default-features = false }
-hermes-mal = { version = "1.8.57", path = "hermes-mal" }
-hermes-llm = { version = "1.8.57", path = "hermes-llm", default-features = false }
-hermes-tokenizer = { version = "1.9.1", path = "hermes-tokenizer" }
+summa-core = { version = "1.9.1", path = "summa-core", default-features = false }
+summa-mal = { version = "1.9.1", path = "summa-mal" }
+summa-llm = { version = "1.9.1", path = "summa-llm", default-features = false }
+summa-tokenizer = { version = "1.9.1", path = "summa-tokenizer" }
+summa-proto = { version = "1.9.1", path = "summa-proto" }
 
 # Async runtime
 tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"] }

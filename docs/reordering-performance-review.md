@@ -124,11 +124,11 @@ bytes are in `.context/bp-bytes-{before,final}*`.
 Reproduction:
 
 ```sh
-cargo test --locked -p hermes-core --release --lib --no-run
+cargo test --locked -p summa-core --release --lib --no-run
 # Run the emitted test executable directly, after compilation stops:
-HERMES_BP_EVIDENCE_DIR=.context/reorder-evidence /usr/bin/time -l \
+SUMMA_BP_EVIDENCE_DIR=.context/reorder-evidence /usr/bin/time -l \
   <test-executable> bench_bp_gain_review --ignored --nocapture --test-threads=1
-HERMES_BP_EVIDENCE_DIR=.context/reorder-evidence \
+SUMMA_BP_EVIDENCE_DIR=.context/reorder-evidence \
   <test-executable> bench_reorder_review_bytes --ignored --nocapture --test-threads=1
 ```
 
@@ -181,7 +181,7 @@ cross-platform permutation guarantee.
 For Linux, replace the macOS timing wrapper above with:
 
 ```sh
-HERMES_BP_EVIDENCE_DIR=.context/reorder-evidence /usr/bin/time -v \
+SUMMA_BP_EVIDENCE_DIR=.context/reorder-evidence /usr/bin/time -v \
   taskset -c 0,1,2,3 <test-executable> \
   bench_bp_gain_review --ignored --nocapture --test-threads=1
 ```
@@ -204,7 +204,7 @@ above; this continuation adds review and validation records.
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `python3 scripts/check_search.py check` | Passed: contracts, format, Clippy, core/server/broker/tool tests with metrics, and native-without-sync compilation. Evidence: `.context/search-harness/20260905T144827.006019Z-check/`.                          |
 | Gain regressions                        | Three passed: exact gain bits including log-table overflow, half direction and empty rows; cache admission limits; complete permutations and reused cache storage. Evidence: `.context/bp-final-gain-tests.log`. |
-| Portable Rust library                   | `cargo check --locked -p hermes-core --no-default-features --lib` passed. Evidence: `.context/bp-resume-portable-check.log`.                                                                                     |
+| Portable Rust library                   | `cargo check --locked -p summa-core --no-default-features --lib` passed. Evidence: `.context/bp-resume-portable-check.log`.                                                                                      |
 | WASM                                    | `bash build.sh`, `npm ci` and `npm test -- --run` passed; four tests across two files. Evidence: `.context/bp-resume-wasm-{build,npm,tests}.log`.                                                                |
 | Documentation                           | `uv run scripts/check_docs.py` passed: 71 Markdown files, 247 local links and 20 benchmark targets. Evidence: `.context/bp-resume-docs-check.log`.                                                               |
 

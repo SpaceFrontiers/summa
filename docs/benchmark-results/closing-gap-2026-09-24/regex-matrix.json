@@ -60,7 +60,7 @@
   },
   {
     "label": "patterns-unicode",
-    "engine": "hermes",
+    "engine": "summa",
     "query_count": 4,
     "query_set_sha256": "9012c65613c5748e3c31d85cd623e03cf1f3fae837d662a59e81fb3dda1f5c47",
     "cells": [

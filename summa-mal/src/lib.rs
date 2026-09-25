@@ -1,0 +1,2207 @@
+//! Model Architecture Language (MAL) for Summa LLM
+//!
+//! A composable DSL for defining LLM model architectures using pest parser.
+//!
+//! # Example MAL - Minimal inline style
+//!
+//! ```text
+//! model tiny {
+//!     vocab_size: 32000
+//!     max_seq_len: 2048
+//!     hidden_size: 128
+//!     num_layers: 4
+//!     block: {
+//!         attention: { num_heads: 4 }
+//!         ffn: { hidden_dim: 512 }
+//!     }
+//! }
+//! ```
+//!
+//! # Optional continuum memory
+//!
+//! A block can replace its ordinary `ffn` with an ordered, fast-to-slow
+//! residual memory chain. Reserve experts are fixed-capacity architecture;
+//! their active masks live in checkpoints.
+//!
+//! ```text
+//! memory cms {
+//!     tier fast {
+//!         ffn: fast_ffn
+//!         reserve_experts { capacity: 2 rank: 32 top_k: 1 }
+//!     }
+//!     tier slow {
+//!         ffn: slow_ffn
+//!         reserve_experts { capacity: 8 rank: 32 top_k: 1 }
+//!         residual_init: zero
+//!     }
+//! }
+//!
+//! block remembered {
+//!     attention: gqa
+//!     memory: cms
+//! }
+//! ```
+//!
+//! # Example MAL - Composable style
+//!
+//! ```text
+//! # Define attention mechanism
+//! attention gqa {
+//!     num_heads: 32
+//!     num_kv_heads: 8
+//!     head_dim: 128
+//!     position_encoding: rope { theta: 10000.0 }
+//! }
+//!
+//! # Define FFN
+//! ffn swiglu_mlp {
+//!     hidden_dim: 14336
+//!     activation: swiglu
+//!     bias: false
+//! }
+//!
+//! # Define transformer block
+//! block llama_block {
+//!     attention: gqa
+//!     ffn: swiglu_mlp
+//!     norm: rmsnorm { eps: 1e-5 }
+//!     norm_position: pre
+//! }
+//!
+//! # Define model using the block
+//! model llama_7b {
+//!     vocab_size: 32000
+//!     max_seq_len: 4096
+//!     hidden_size: 4096
+//!     block: llama_block
+//!     num_layers: 32
+//! }
+//! ```
+
+use anyhow::{Result, anyhow};
+use pest::Parser;
+use pest_derive::Parser;
+use rust_embed::Embed;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Embedded well-known model definitions
+#[derive(Embed)]
+#[folder = "well-known/"]
+#[include = "*.mal"]
+struct WellKnown;
+
+#[derive(Parser)]
+#[grammar = "mal.pest"]
+pub struct MalParser;
+
+// ============================================================================
+// AST Types
+// ============================================================================
+
+/// Position encoding type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PositionEncoding {
+    Rope { theta: f64, scaling: Option<f64> },
+    Alibi { learned_slopes: bool },
+    Learned { max_positions: usize },
+    None,
+}
+
+impl Default for PositionEncoding {
+    fn default() -> Self {
+        Self::Rope {
+            theta: 10000.0,
+            scaling: None,
+        }
+    }
+}
+
+/// Attention mechanism definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionDef {
+    pub name: String,
+    pub num_heads: Option<usize>,
+    pub num_kv_heads: Option<usize>,
+    pub head_dim: Option<usize>,
+    pub dropout: f64,
+    pub bias: bool,
+    pub position_encoding: PositionEncoding,
+    pub window_size: Option<usize>,
+    pub causal: bool,
+    /// Per-head RMSNorm on Q and K before RoPE (OLMo2/Gemma-style stabilizer)
+    #[serde(default)]
+    pub qk_norm: bool,
+}
+
+impl Default for AttentionDef {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            num_heads: None,
+            num_kv_heads: None,
+            head_dim: None,
+            dropout: 0.0,
+            bias: false,
+            position_encoding: PositionEncoding::default(),
+            window_size: None,
+            causal: true,
+            qk_norm: false,
+        }
+    }
+}
+
+/// Normalization type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NormType {
+    #[default]
+    RmsNorm,
+    LayerNorm,
+    None,
+}
+
+/// Normalization configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NormConfig {
+    pub norm_type: NormType,
+    pub eps: f64,
+}
+
+/// Activation function
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Activation {
+    #[default]
+    SwiGLU,
+    GELU,
+    SiLU,
+    ReLU,
+    GELUNew,
+    GELUTanh,
+}
+
+/// Selective state-space (Mamba) mixer definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SsmDef {
+    pub name: String,
+    /// SSM state dimension N (default 16)
+    pub state_dim: usize,
+    /// Depthwise causal conv kernel width (default 4)
+    pub conv_kernel: usize,
+    /// Inner expansion factor: d_inner = expand * hidden_size (default 2)
+    pub expand: usize,
+    /// Δ projection rank (default ceil(hidden_size / 16))
+    pub dt_rank: Option<usize>,
+}
+
+impl Default for SsmDef {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            state_dim: 16,
+            conv_kernel: 4,
+            expand: 2,
+            dt_rank: None,
+        }
+    }
+}
+
+/// Feed-forward network definition
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FfnDef {
+    pub name: String,
+    pub hidden_dim: Option<usize>,
+    pub activation: Activation,
+    pub bias: bool,
+    pub dropout: f64,
+    pub gate: bool,
+    /// Sparse token-choice routing. Omitted for an ordinary dense FFN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<MoeDef>,
+}
+
+/// Configurable dropless token-choice mixture of experts.
+///
+/// `experts` are routed experts; `shared_experts` are always active. Router
+/// regularization belongs to the architecture config so every training entry
+/// point applies the same stable objective.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MoeDef {
+    pub experts: usize,
+    pub top_k: usize,
+    #[serde(default)]
+    pub shared_experts: usize,
+    #[serde(default)]
+    pub load_balance_loss_weight: f64,
+    #[serde(default)]
+    pub router_z_loss_weight: f64,
+}
+
+/// Fixed-capacity low-rank experts available for sleep-time consolidation.
+///
+/// Slots are allocated with the model but start dormant. Their activation mask
+/// and generation counters are checkpoint state rather than architecture
+/// fields, so activating a slot never changes tensor shapes. Summa executes a
+/// separate untrainable rank-matched zero fallback while all slots are dormant;
+/// it is not reserve capacity and keeps the configured top-1 route cost fixed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReserveExpertsDef {
+    pub capacity: usize,
+    pub rank: usize,
+    pub top_k: usize,
+}
+
+/// Initial behavior of a memory tier's ordinary FFN branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MemoryTierInit {
+    #[default]
+    Default,
+    /// Zero the FFN output projection so the residual tier is initially a
+    /// strict no-op. This is used by checkpoint-compatible memory upgrades.
+    ResidualZero,
+}
+
+/// One level in a fast-to-slow continuum memory chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTierDef {
+    pub name: String,
+    pub ffn: FfnDef,
+    pub reserve_experts: ReserveExpertsDef,
+    #[serde(default)]
+    pub residual_init: MemoryTierInit,
+}
+
+/// Ordered fast-to-slow FFN/MoE memory levels following a sequence mixer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryDef {
+    pub name: String,
+    pub tiers: Vec<MemoryTierDef>,
+}
+
+impl Default for FfnDef {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            hidden_dim: None,
+            activation: Activation::default(),
+            bias: false,
+            dropout: 0.0,
+            gate: true,
+            moe: None,
+        }
+    }
+}
+
+/// Transformer block definition
+///
+/// The mixer is attention by default; when `ssm` is set the block is a
+/// Mamba block (attention settings are ignored).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockDef {
+    pub name: String,
+    pub attention: AttentionDef,
+    #[serde(default)]
+    pub ssm: Option<SsmDef>,
+    pub ffn: FfnDef,
+    /// Optional fast-to-slow memory chain replacing the ordinary FFN branch.
+    /// Omission preserves the historical model and checkpoint topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<MemoryDef>,
+    pub norm: NormConfig,
+    pub norm_position: NormPosition,
+    pub residual: bool,
+    pub dropout: f64,
+}
+
+impl BlockDef {
+    /// Whether this block uses its state-space mixer instead of attention.
+    pub fn is_ssm(&self) -> bool {
+        self.ssm.is_some()
+    }
+
+    // Per-block computed properties (pattern-aware model construction)
+
+    /// Configured query-head count, or the MAL default when omitted.
+    pub fn num_heads(&self) -> usize {
+        self.attention.num_heads.unwrap_or(12)
+    }
+
+    /// Configured key/value-head count, defaulting to the query-head count.
+    pub fn num_kv_heads(&self) -> usize {
+        self.attention.num_kv_heads.unwrap_or(self.num_heads())
+    }
+
+    /// Configured head width, or an even split of `hidden_size` when omitted.
+    pub fn head_dim(&self, hidden_size: usize) -> usize {
+        self.attention
+            .head_dim
+            .unwrap_or(hidden_size / self.num_heads())
+    }
+
+    /// Configured FFN width, or four times `hidden_size` when omitted.
+    pub fn intermediate_size(&self, hidden_size: usize) -> usize {
+        self.ffn.hidden_dim.unwrap_or(hidden_size * 4)
+    }
+
+    /// Effective normalization epsilon, including the MAL default.
+    pub fn norm_eps(&self) -> f64 {
+        if self.norm.eps > 0.0 {
+            self.norm.eps
+        } else {
+            1e-5
+        }
+    }
+
+    /// Effective RoPE theta, including the MAL default for non-RoPE blocks.
+    pub fn rope_theta(&self) -> f64 {
+        match &self.attention.position_encoding {
+            PositionEncoding::Rope { theta, .. } => *theta,
+            _ => 10000.0,
+        }
+    }
+
+    /// Optional RoPE scaling for this block.
+    pub fn rope_scaling(&self) -> Option<f64> {
+        match &self.attention.position_encoding {
+            PositionEncoding::Rope { scaling, .. } => *scaling,
+            _ => None,
+        }
+    }
+}
+
+/// Normalization position in block
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum NormPosition {
+    #[default]
+    Pre,
+    Post,
+}
+
+impl Default for BlockDef {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            attention: AttentionDef::default(),
+            ssm: None,
+            ffn: FfnDef::default(),
+            memory: None,
+            norm: NormConfig {
+                norm_type: NormType::RmsNorm,
+                eps: 1e-5,
+            },
+            norm_position: NormPosition::Pre,
+            residual: true,
+            dropout: 0.0,
+        }
+    }
+}
+
+/// Embeddings configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EmbeddingsConfig {
+    pub tie_weights: bool,
+    pub dropout: f64,
+    pub scale: Option<f64>,
+}
+
+/// Output head configuration
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OutputConfig {
+    pub bias: bool,
+    pub norm: Option<NormConfig>,
+}
+
+/// Parsed model definition from MAL
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDef {
+    pub name: String,
+    pub description: Option<String>,
+    /// Number of token IDs exposed by the tokenizer and model API. Parameter
+    /// storage is padded internally for efficient accelerator kernels.
+    pub vocab_size: usize,
+    pub max_seq_len: usize,
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub block: BlockDef,
+    /// Optional heterogeneous layer pattern, repeated cyclically across
+    /// num_layers (e.g. [mamba, mamba, attn]). Overrides `block` when set.
+    #[serde(default)]
+    pub pattern: Option<Vec<BlockDef>>,
+    pub embeddings: EmbeddingsConfig,
+    pub output: OutputConfig,
+}
+
+impl Default for ModelDef {
+    fn default() -> Self {
+        Self {
+            name: "default".to_string(),
+            description: None,
+            vocab_size: 32000,
+            max_seq_len: 2048,
+            hidden_size: 768,
+            num_layers: 12,
+            block: BlockDef::default(),
+            pattern: None,
+            embeddings: EmbeddingsConfig::default(),
+            output: OutputConfig::default(),
+        }
+    }
+}
+
+impl std::fmt::Display for ModelDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "model {} {{", self.name)?;
+        if let Some(desc) = &self.description {
+            writeln!(f, "    description: \"{}\"", desc)?;
+        }
+        writeln!(f, "    vocab_size: {}", self.vocab_size)?;
+        writeln!(f, "    max_seq_len: {}", self.max_seq_len)?;
+        writeln!(f, "    hidden_size: {}", self.hidden_size)?;
+        writeln!(f, "    num_layers: {}", self.num_layers)?;
+        writeln!(f, "}}")?;
+        writeln!(f)?;
+
+        // Attention
+        writeln!(f, "attention {{")?;
+        if let Some(h) = self.block.attention.num_heads {
+            writeln!(f, "    num_heads: {}", h)?;
+        }
+        if let Some(kv) = self.block.attention.num_kv_heads {
+            writeln!(f, "    num_kv_heads: {}", kv)?;
+        }
+        if let Some(hd) = self.block.attention.head_dim {
+            writeln!(f, "    head_dim: {}", hd)?;
+        }
+        writeln!(f, "    bias: {}", self.block.attention.bias)?;
+        writeln!(f, "}}")?;
+        writeln!(f)?;
+
+        // FFN
+        writeln!(f, "ffn {{")?;
+        if let Some(dim) = self.block.ffn.hidden_dim {
+            writeln!(f, "    hidden_dim: {}", dim)?;
+        }
+        writeln!(f, "    activation: {:?}", self.block.ffn.activation)?;
+        writeln!(f, "    bias: {}", self.block.ffn.bias)?;
+        writeln!(f, "}}")?;
+        writeln!(f)?;
+
+        // Block
+        writeln!(f, "block {{")?;
+        writeln!(f, "    norm: {:?}", self.block.norm.norm_type)?;
+        writeln!(f, "    norm_position: {:?}", self.block.norm_position)?;
+        writeln!(f, "    residual: {}", self.block.residual)?;
+        writeln!(f, "}}")?;
+        writeln!(f)?;
+
+        // Estimated parameters
+        let params = self.estimated_params();
+        writeln!(
+            f,
+            "Estimated parameters: {:.2}B",
+            params as f64 / 1_000_000_000.0
+        )
+    }
+}
+
+impl ModelDef {
+    // ========================================================================
+    // Computed properties for model construction
+    // ========================================================================
+
+    /// Block definition for layer `i`: cycles through `pattern` when set,
+    /// otherwise the homogeneous `block`.
+    pub fn block_for_layer(&self, i: usize) -> &BlockDef {
+        match &self.pattern {
+            Some(p) if !p.is_empty() => &p[i % p.len()],
+            _ => &self.block,
+        }
+    }
+
+    /// Effective Δ rank for an SSM mixer (paper default: ceil(hidden/16))
+    pub fn dt_rank(&self, ssm: &SsmDef) -> usize {
+        ssm.dt_rank.unwrap_or(self.hidden_size.div_ceil(16))
+    }
+
+    /// Query-head count of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::num_heads`] instead.
+    pub fn num_heads(&self) -> usize {
+        self.block.num_heads()
+    }
+
+    /// Key/value-head count of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::num_kv_heads`] instead.
+    pub fn num_kv_heads(&self) -> usize {
+        self.block.num_kv_heads()
+    }
+
+    /// Attention-head width of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::head_dim`] instead.
+    pub fn head_dim(&self) -> usize {
+        self.block.head_dim(self.hidden_size)
+    }
+
+    /// FFN width of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::intermediate_size`] instead.
+    pub fn intermediate_size(&self) -> usize {
+        self.block.intermediate_size(self.hidden_size)
+    }
+
+    /// Normalization epsilon of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::norm_eps`] instead.
+    pub fn norm_eps(&self) -> f64 {
+        self.block.norm_eps()
+    }
+
+    /// RoPE theta of the homogeneous/default block.
+    ///
+    /// Pattern-aware callers should use [`Self::block_for_layer`] and
+    /// [`BlockDef::rope_theta`] instead.
+    pub fn rope_theta(&self) -> f64 {
+        self.block.rope_theta()
+    }
+
+    /// Vocabulary rows stored by embeddings and the output projection.
+    ///
+    /// Keeping this derived preserves a single logical vocabulary in MAL and
+    /// checkpoint configs while giving GPU kernels an aligned output dimension.
+    pub fn padded_vocab_size(&self) -> usize {
+        self.vocab_size.next_multiple_of(64)
+    }
+
+    /// Count trainable parameters implied by the model definition.
+    pub fn estimated_params(&self) -> usize {
+        let h = self.hidden_size;
+        let stored_vocab_size = self.padded_vocab_size();
+        let embed_params = stored_vocab_size * h;
+        let norm_params = |norm: &NormConfig| match norm.norm_type {
+            NormType::RmsNorm => h,
+            NormType::LayerNorm => 2 * h,
+            NormType::None => 0,
+        };
+
+        let mut layer_params = 0usize;
+        for i in 0..self.num_layers {
+            let block = self.block_for_layer(i);
+            let mixer = match &block.ssm {
+                // Mamba: in_proj + out_proj + conv + x_proj + dt_proj + A + D.
+                Some(ssm) => {
+                    let d_inner = ssm.expand * h;
+                    let dt_rank = self.dt_rank(ssm);
+                    2 * h * d_inner            // in_proj (x, z)
+                        + d_inner * h          // out_proj
+                        + d_inner * ssm.conv_kernel
+                        + d_inner * (dt_rank + 2 * ssm.state_dim) // x_proj
+                        + dt_rank * d_inner + d_inner // dt_proj weight + bias
+                        + d_inner * ssm.state_dim // A_log
+                        + d_inner // D
+                        + d_inner // depthwise conv bias
+                }
+                // Attention: q/k/v/o. Uses GQA kv width when configured.
+                None => {
+                    let q = block.num_heads() * block.head_dim(h);
+                    let kv = block.num_kv_heads() * block.head_dim(h);
+                    let weights = h * q + 2 * h * kv + q * h;
+                    let bias = if block.attention.bias {
+                        2 * q + 2 * kv
+                    } else {
+                        0
+                    };
+                    let qk_norm = if block.attention.qk_norm {
+                        2 * block.head_dim(h)
+                    } else {
+                        0
+                    };
+                    weights + bias + qk_norm
+                }
+            };
+            let ffn_params = |ffn: &FfnDef| {
+                let intermediate = ffn.hidden_dim.unwrap_or(h * 4);
+                let projections = if ffn.gate { 3 } else { 2 };
+                let expert_count = ffn
+                    .moe
+                    .as_ref()
+                    .map_or(1, |moe| moe.experts + moe.shared_experts);
+                let weights = expert_count * projections * h * intermediate;
+                let bias = if ffn.bias {
+                    expert_count * ((if ffn.gate { 2 } else { 1 }) * intermediate + h)
+                } else {
+                    0
+                };
+                let router = ffn.moe.as_ref().map_or(0, |moe| h * moe.experts);
+                weights + bias + router
+            };
+            let feed_forward = match &block.memory {
+                Some(memory) => memory
+                    .tiers
+                    .iter()
+                    .map(|tier| {
+                        let reserve =
+                            tier.reserve_experts.capacity * (2 * h * tier.reserve_experts.rank + h);
+                        ffn_params(&tier.ffn) + reserve
+                    })
+                    .sum(),
+                None => ffn_params(&block.ffn),
+            };
+            layer_params += mixer + feed_forward + 2 * norm_params(&block.norm);
+        }
+
+        let final_norm = self
+            .output
+            .norm
+            .as_ref()
+            .unwrap_or(&self.block_for_layer(0).norm);
+        let head_weights = (!self.embeddings.tie_weights) as usize * h * stored_vocab_size;
+        let head_bias = self.output.bias as usize * stored_vocab_size;
+        embed_params + layer_params + norm_params(final_norm) + head_weights + head_bias
+    }
+
+    /// Load from JSON file
+    pub fn from_json<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&content)?)
+    }
+
+    /// Save to JSON file
+    pub fn save_json(&self, path: &str) -> Result<()> {
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, content)?;
+        Ok(())
+    }
+}
+
+/// Complete parsed MAL file with all definitions
+#[derive(Debug, Clone, Default)]
+pub struct MalFile {
+    pub attentions: HashMap<String, AttentionDef>,
+    pub ssms: HashMap<String, SsmDef>,
+    pub ffns: HashMap<String, FfnDef>,
+    pub memories: HashMap<String, MemoryDef>,
+    pub blocks: HashMap<String, BlockDef>,
+    pub models: HashMap<String, ModelDef>,
+}
+
+// ============================================================================
+// Parsing Functions
+// ============================================================================
+
+/// Parse activation type from string
+fn parse_activation(s: &str) -> Activation {
+    match s {
+        "swiglu" => Activation::SwiGLU,
+        "gelu" => Activation::GELU,
+        "silu" => Activation::SiLU,
+        "relu" => Activation::ReLU,
+        "gelu_new" => Activation::GELUNew,
+        "gelu_tanh" => Activation::GELUTanh,
+        _ => Activation::SwiGLU,
+    }
+}
+
+/// Parse a model property (block-based only)
+fn parse_model_prop(
+    pair: pest::iterators::Pair<Rule>,
+    def: &mut ModelDef,
+    file: &MalFile,
+) -> Result<()> {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::vocab_size_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.vocab_size = val.as_str().parse()?;
+                }
+            }
+            Rule::max_seq_len_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.max_seq_len = val.as_str().parse()?;
+                }
+            }
+            Rule::hidden_size_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.hidden_size = val.as_str().parse()?;
+                }
+            }
+            Rule::num_layers_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.num_layers = val.as_str().parse()?;
+                }
+            }
+            Rule::block_ref_prop => {
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let name = child.as_str();
+                            def.block = file
+                                .blocks
+                                .get(name)
+                                .ok_or_else(|| anyhow!("undefined block '{name}'"))?
+                                .clone();
+                        }
+                        Rule::inline_block => {
+                            let mut block = BlockDef::default();
+                            for prop in child.into_inner() {
+                                if prop.as_rule() == Rule::block_prop {
+                                    parse_block_prop(prop, &mut block, file)?;
+                                }
+                            }
+                            def.block = block;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::pattern_prop => {
+                let mut blocks = Vec::new();
+                for child in inner.into_inner() {
+                    if child.as_rule() == Rule::identifier {
+                        let name = child.as_str();
+                        let block = file.blocks.get(name).ok_or_else(|| {
+                            anyhow!("pattern references undefined block '{}'", name)
+                        })?;
+                        blocks.push(block.clone());
+                    }
+                }
+                if !blocks.is_empty() {
+                    def.pattern = Some(blocks);
+                }
+            }
+            Rule::embeddings_prop => {
+                for param in inner.into_inner() {
+                    for child in param.into_inner() {
+                        match child.as_rule() {
+                            Rule::tie_weights_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.embeddings.tie_weights = val.as_str() == "true";
+                                }
+                            }
+                            Rule::dropout_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.embeddings.dropout = val.as_str().parse()?;
+                                }
+                            }
+                            Rule::scale_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.embeddings.scale = Some(val.as_str().parse()?);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Rule::output_prop => {
+                for param in inner.into_inner() {
+                    for child in param.into_inner() {
+                        match child.as_rule() {
+                            Rule::bias_prop => {
+                                if let Some(val) = child.into_inner().next() {
+                                    def.output.bias = val.as_str() == "true";
+                                }
+                            }
+                            Rule::norm_prop => {
+                                if let Some(cfg) = child.into_inner().next() {
+                                    def.output.norm = Some(parse_norm_config(cfg)?);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Rule::description_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    let s = val.as_str();
+                    def.description = Some(s[1..s.len() - 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse a model definition from pest pair
+fn parse_model_def(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<ModelDef> {
+    let mut def = ModelDef::default();
+    let mut inner = pair.into_inner();
+
+    // Get model name
+    if let Some(name) = inner.next() {
+        def.name = name.as_str().to_string();
+    }
+
+    // Parse properties
+    for prop in inner {
+        if prop.as_rule() == Rule::model_prop {
+            parse_model_prop(prop, &mut def, file)?;
+        }
+    }
+
+    Ok(def)
+}
+
+/// Parse a MAL string containing exactly one model definition.
+///
+/// Use [`parse_mal_full`] when a source intentionally defines multiple models.
+pub fn parse_mal(input: &str) -> Result<ModelDef> {
+    let file = parse_mal_full(input)?;
+    match file.models.len() {
+        0 => Err(anyhow!("no model definition found")),
+        1 => Ok(file.models.into_values().next().expect("length checked")),
+        _ => {
+            let mut names = file.models.keys().cloned().collect::<Vec<_>>();
+            names.sort();
+            Err(anyhow!(
+                "multiple model definitions found ({}); use parse_mal_full to select one",
+                names.join(", ")
+            ))
+        }
+    }
+}
+
+fn insert_unique<T>(
+    definitions: &mut HashMap<String, T>,
+    kind: &str,
+    name: String,
+    value: T,
+) -> Result<()> {
+    match definitions.entry(name) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(value);
+            Ok(())
+        }
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            Err(anyhow!("duplicate {kind} '{}'", entry.key()))
+        }
+    }
+}
+
+/// Parse complete MAL file with all definitions
+pub fn parse_mal_full(input: &str) -> Result<MalFile> {
+    let pairs = MalParser::parse(Rule::file, input).map_err(|e| anyhow!("Parse error: {}", e))?;
+
+    let mut file = MalFile::default();
+
+    for pair in pairs {
+        if pair.as_rule() == Rule::file {
+            for inner in pair.into_inner() {
+                if inner.as_rule() == Rule::definition {
+                    for def in inner.into_inner() {
+                        match def.as_rule() {
+                            Rule::model_def => {
+                                let model = parse_model_def(def, &file)?;
+                                insert_unique(
+                                    &mut file.models,
+                                    "model",
+                                    model.name.clone(),
+                                    model,
+                                )?;
+                            }
+                            Rule::attention_def => {
+                                let attn = parse_attention_def(def)?;
+                                insert_unique(
+                                    &mut file.attentions,
+                                    "attention",
+                                    attn.name.clone(),
+                                    attn,
+                                )?;
+                            }
+                            Rule::ssm_def => {
+                                let ssm = parse_ssm_def(def)?;
+                                insert_unique(&mut file.ssms, "ssm", ssm.name.clone(), ssm)?;
+                            }
+                            Rule::ffn_def => {
+                                let ffn = parse_ffn_def(def)?;
+                                insert_unique(&mut file.ffns, "ffn", ffn.name.clone(), ffn)?;
+                            }
+                            Rule::memory_def => {
+                                let memory = parse_memory_def(def, &file)?;
+                                insert_unique(
+                                    &mut file.memories,
+                                    "memory",
+                                    memory.name.clone(),
+                                    memory,
+                                )?;
+                            }
+                            Rule::block_def => {
+                                let block = parse_block_def(def, &file)?;
+                                insert_unique(
+                                    &mut file.blocks,
+                                    "block",
+                                    block.name.clone(),
+                                    block,
+                                )?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(file)
+}
+
+/// Parse an attention definition
+fn parse_attention_def(pair: pest::iterators::Pair<Rule>) -> Result<AttentionDef> {
+    let mut def = AttentionDef::default();
+    let mut inner = pair.into_inner();
+
+    if let Some(name) = inner.next() {
+        def.name = name.as_str().to_string();
+    }
+
+    for prop in inner {
+        if prop.as_rule() == Rule::attention_prop {
+            parse_attention_prop(prop, &mut def)?;
+        }
+    }
+
+    Ok(def)
+}
+
+/// Parse a position-encoding config (rope { theta, scaling } | alibi | learned | none)
+fn parse_position_encoding(pair: pest::iterators::Pair<Rule>) -> Result<PositionEncoding> {
+    // position_encoding_config contains one of the variant configs; the bare
+    // "none" literal produces no inner pair.
+    let Some(config) = pair.into_inner().next() else {
+        return Ok(PositionEncoding::None);
+    };
+    match config.as_rule() {
+        Rule::rope_config => {
+            let mut theta = 10000.0;
+            let mut scaling = None;
+            for param in config.into_inner() {
+                for inner in param.into_inner() {
+                    match inner.as_rule() {
+                        Rule::rope_theta_prop | Rule::rope_base_prop => {
+                            if let Some(val) = inner.into_inner().next() {
+                                theta = val.as_str().parse()?;
+                            }
+                        }
+                        Rule::rope_scaling_prop => {
+                            if let Some(val) = inner.into_inner().next() {
+                                scaling = Some(val.as_str().parse()?);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(PositionEncoding::Rope { theta, scaling })
+        }
+        Rule::alibi_config => {
+            let learned_slopes = config.as_str().contains("learned");
+            Ok(PositionEncoding::Alibi { learned_slopes })
+        }
+        Rule::learned_config => {
+            let mut max_positions = 0;
+            for param in config.into_inner() {
+                for inner in param.into_inner() {
+                    if inner.as_rule() == Rule::max_positions_prop
+                        && let Some(val) = inner.into_inner().next()
+                    {
+                        max_positions = val.as_str().parse()?;
+                    }
+                }
+            }
+            Ok(PositionEncoding::Learned { max_positions })
+        }
+        _ => Ok(PositionEncoding::None),
+    }
+}
+
+/// Parse attention properties
+fn parse_attention_prop(pair: pest::iterators::Pair<Rule>, def: &mut AttentionDef) -> Result<()> {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::num_heads_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.num_heads = Some(val.as_str().parse()?);
+                }
+            }
+            Rule::num_kv_heads_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.num_kv_heads = Some(val.as_str().parse()?);
+                }
+            }
+            Rule::head_dim_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.head_dim = Some(val.as_str().parse()?);
+                }
+            }
+            Rule::dropout_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.dropout = val.as_str().parse()?;
+                }
+            }
+            Rule::bias_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.bias = val.as_str() == "true";
+                }
+            }
+            Rule::causal_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.causal = val.as_str() == "true";
+                }
+            }
+            Rule::window_size_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.window_size = Some(val.as_str().parse()?);
+                }
+            }
+            Rule::position_encoding_prop => {
+                if let Some(config) = inner.into_inner().next() {
+                    def.position_encoding = parse_position_encoding(config)?;
+                }
+            }
+            Rule::qk_norm_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.qk_norm = val.as_str() == "true";
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse an SSM (Mamba) definition
+fn parse_ssm_def(pair: pest::iterators::Pair<Rule>) -> Result<SsmDef> {
+    let mut def = SsmDef::default();
+    let mut inner = pair.into_inner();
+
+    if let Some(name) = inner.next() {
+        def.name = name.as_str().to_string();
+    }
+
+    for prop in inner {
+        if prop.as_rule() == Rule::ssm_prop {
+            parse_ssm_prop(prop, &mut def)?;
+        }
+    }
+
+    Ok(def)
+}
+
+/// Parse SSM properties
+fn parse_ssm_prop(pair: pest::iterators::Pair<Rule>, def: &mut SsmDef) -> Result<()> {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::state_dim_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.state_dim = val.as_str().parse()?;
+                }
+            }
+            Rule::conv_kernel_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.conv_kernel = val.as_str().parse()?;
+                }
+            }
+            Rule::expand_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.expand = val.as_str().parse()?;
+                }
+            }
+            Rule::dt_rank_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.dt_rank = Some(val.as_str().parse()?);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse an FFN definition
+/// Parse a `norm_config` (`rmsnorm { eps: … }` | `layernorm { … }` | `none`)
+/// into a `NormConfig`. An omitted epsilon is represented as zero and resolved
+/// by model construction.
+fn parse_norm_config(pair: pest::iterators::Pair<Rule>) -> Result<NormConfig> {
+    let mut norm = NormConfig::default();
+    match pair.into_inner().next() {
+        // Bare `none` literal produces no inner rule.
+        None => norm.norm_type = NormType::None,
+        Some(cfg) => {
+            norm.norm_type = match cfg.as_rule() {
+                Rule::rmsnorm_config => NormType::RmsNorm,
+                Rule::layernorm_config => NormType::LayerNorm,
+                other => anyhow::bail!("unexpected norm config rule: {other:?}"),
+            };
+            for param in cfg.into_inner() {
+                // norm_param -> norm_eps_prop -> number
+                if let Some(prop) = param.into_inner().next()
+                    && let Some(number) = prop.into_inner().next()
+                {
+                    norm.eps = number.as_str().parse()?;
+                }
+            }
+        }
+    }
+    Ok(norm)
+}
+
+fn parse_ffn_def(pair: pest::iterators::Pair<Rule>) -> Result<FfnDef> {
+    let mut def = FfnDef::default();
+    let mut inner = pair.into_inner();
+
+    if let Some(name) = inner.next() {
+        def.name = name.as_str().to_string();
+    }
+
+    for prop in inner {
+        if prop.as_rule() == Rule::ffn_prop {
+            parse_ffn_prop(prop, &mut def)?;
+        }
+    }
+
+    Ok(def)
+}
+
+/// Parse FFN properties
+fn parse_ffn_prop(pair: pest::iterators::Pair<Rule>, def: &mut FfnDef) -> Result<()> {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::hidden_dim_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.hidden_dim = Some(val.as_str().parse()?);
+                }
+            }
+            Rule::activation_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.activation = parse_activation(val.as_str());
+                }
+            }
+            Rule::bias_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.bias = val.as_str() == "true";
+                }
+            }
+            Rule::dropout_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.dropout = val.as_str().parse()?;
+                }
+            }
+            Rule::gate_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.gate = val.as_str() == "true";
+                }
+            }
+            Rule::moe_prop => {
+                let mut moe = MoeDef {
+                    experts: 0,
+                    top_k: 0,
+                    shared_experts: 0,
+                    load_balance_loss_weight: 0.0,
+                    router_z_loss_weight: 0.0,
+                };
+                for param in inner.into_inner() {
+                    let Some(prop) = param.into_inner().next() else {
+                        continue;
+                    };
+                    let value = prop
+                        .clone()
+                        .into_inner()
+                        .next()
+                        .map(|value| value.as_str())
+                        .unwrap_or_default();
+                    match prop.as_rule() {
+                        Rule::experts_prop => moe.experts = value.parse()?,
+                        Rule::top_k_prop => moe.top_k = value.parse()?,
+                        Rule::shared_experts_prop => moe.shared_experts = value.parse()?,
+                        Rule::load_balance_loss_weight_prop => {
+                            moe.load_balance_loss_weight = value.parse()?
+                        }
+                        Rule::router_z_loss_weight_prop => {
+                            moe.router_z_loss_weight = value.parse()?
+                        }
+                        _ => {}
+                    }
+                }
+                def.moe = Some(moe);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn parse_memory_tier(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<MemoryTierDef> {
+    let mut inner = pair.into_inner();
+    let name = inner
+        .next()
+        .ok_or_else(|| anyhow!("memory tier is missing a name"))?
+        .as_str()
+        .to_string();
+    let mut ffn = None;
+    let mut reserve_experts = None;
+    let mut residual_init = MemoryTierInit::Default;
+
+    for property in inner {
+        if property.as_rule() != Rule::memory_tier_prop {
+            continue;
+        }
+        let Some(property) = property.into_inner().next() else {
+            continue;
+        };
+        match property.as_rule() {
+            Rule::memory_ffn_prop => {
+                for child in property.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let ffn_name = child.as_str();
+                            ffn = Some(
+                                file.ffns
+                                    .get(ffn_name)
+                                    .ok_or_else(|| anyhow!("undefined ffn '{ffn_name}'"))?
+                                    .clone(),
+                            );
+                        }
+                        Rule::inline_ffn => {
+                            let mut inline = FfnDef::default();
+                            for prop in child.into_inner() {
+                                if prop.as_rule() == Rule::ffn_prop {
+                                    parse_ffn_prop(prop, &mut inline)?;
+                                }
+                            }
+                            ffn = Some(inline);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::reserve_experts_prop => {
+                let mut capacity = None;
+                let mut rank = None;
+                let mut top_k = None;
+                for parameter in property.into_inner() {
+                    let Some(parameter) = parameter.into_inner().next() else {
+                        continue;
+                    };
+                    let value: usize = parameter
+                        .clone()
+                        .into_inner()
+                        .next()
+                        .ok_or_else(|| anyhow!("reserve expert parameter is missing a value"))?
+                        .as_str()
+                        .parse()?;
+                    match parameter.as_rule() {
+                        Rule::capacity_prop => capacity = Some(value),
+                        Rule::rank_prop => rank = Some(value),
+                        Rule::top_k_prop => top_k = Some(value),
+                        _ => {}
+                    }
+                }
+                reserve_experts = Some(ReserveExpertsDef {
+                    capacity: capacity.unwrap_or(0),
+                    rank: rank.unwrap_or(0),
+                    top_k: top_k.unwrap_or(0),
+                });
+            }
+            Rule::residual_init_prop => {
+                residual_init = match property.into_inner().next().map(|v| v.as_str()) {
+                    Some("zero") => MemoryTierInit::ResidualZero,
+                    _ => MemoryTierInit::Default,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    Ok(MemoryTierDef {
+        name,
+        ffn: ffn.ok_or_else(|| anyhow!("memory tier requires an ffn"))?,
+        reserve_experts: reserve_experts
+            .ok_or_else(|| anyhow!("memory tier requires reserve_experts"))?,
+        residual_init,
+    })
+}
+
+fn parse_memory_def(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<MemoryDef> {
+    let mut inner = pair.into_inner();
+    let name = inner
+        .next()
+        .ok_or_else(|| anyhow!("memory definition is missing a name"))?
+        .as_str()
+        .to_string();
+    let tiers = inner
+        .filter(|pair| pair.as_rule() == Rule::memory_tier)
+        .map(|tier| parse_memory_tier(tier, file))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MemoryDef { name, tiers })
+}
+
+/// Parse a block definition
+fn parse_block_def(pair: pest::iterators::Pair<Rule>, file: &MalFile) -> Result<BlockDef> {
+    let mut def = BlockDef::default();
+    let mut inner = pair.into_inner();
+
+    if let Some(name) = inner.next() {
+        def.name = name.as_str().to_string();
+    }
+
+    for prop in inner {
+        if prop.as_rule() == Rule::block_prop {
+            parse_block_prop(prop, &mut def, file)?;
+        }
+    }
+
+    Ok(def)
+}
+
+/// Parse block properties
+fn parse_block_prop(
+    pair: pest::iterators::Pair<Rule>,
+    def: &mut BlockDef,
+    file: &MalFile,
+) -> Result<()> {
+    for inner in pair.into_inner() {
+        match inner.as_rule() {
+            Rule::attention_ref_prop => {
+                // Can be identifier or inline definition
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let name = child.as_str();
+                            def.attention = file
+                                .attentions
+                                .get(name)
+                                .ok_or_else(|| anyhow!("undefined attention '{name}'"))?
+                                .clone();
+                        }
+                        Rule::inline_attention => {
+                            let mut attn = AttentionDef::default();
+                            for prop in child.into_inner() {
+                                if prop.as_rule() == Rule::attention_prop {
+                                    parse_attention_prop(prop, &mut attn)?;
+                                }
+                            }
+                            def.attention = attn;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::ssm_ref_prop => {
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let name = child.as_str();
+                            def.ssm = Some(
+                                file.ssms
+                                    .get(name)
+                                    .ok_or_else(|| anyhow!("undefined ssm '{name}'"))?
+                                    .clone(),
+                            );
+                        }
+                        Rule::inline_ssm => {
+                            let mut ssm = SsmDef::default();
+                            for prop in child.into_inner() {
+                                if prop.as_rule() == Rule::ssm_prop {
+                                    parse_ssm_prop(prop, &mut ssm)?;
+                                }
+                            }
+                            def.ssm = Some(ssm);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::ffn_ref_prop => {
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let name = child.as_str();
+                            def.ffn = file
+                                .ffns
+                                .get(name)
+                                .ok_or_else(|| anyhow!("undefined ffn '{name}'"))?
+                                .clone();
+                        }
+                        Rule::inline_ffn => {
+                            let mut ffn = FfnDef::default();
+                            for prop in child.into_inner() {
+                                if prop.as_rule() == Rule::ffn_prop {
+                                    parse_ffn_prop(prop, &mut ffn)?;
+                                }
+                            }
+                            def.ffn = ffn;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::memory_ref_prop => {
+                for child in inner.into_inner() {
+                    match child.as_rule() {
+                        Rule::identifier => {
+                            let name = child.as_str();
+                            def.memory = Some(
+                                file.memories
+                                    .get(name)
+                                    .ok_or_else(|| anyhow!("undefined memory '{name}'"))?
+                                    .clone(),
+                            );
+                        }
+                        Rule::inline_memory => {
+                            let tiers = child
+                                .into_inner()
+                                .filter(|pair| pair.as_rule() == Rule::memory_tier)
+                                .map(|tier| parse_memory_tier(tier, file))
+                                .collect::<Result<Vec<_>>>()?;
+                            def.memory = Some(MemoryDef {
+                                name: "inline".to_string(),
+                                tiers,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Rule::norm_prop => {
+                // norm_prop -> norm_config -> (rmsnorm_config | layernorm_config | "none")
+                if let Some(cfg) = inner.into_inner().next() {
+                    def.norm = parse_norm_config(cfg)?;
+                }
+            }
+            Rule::norm_position_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.norm_position = match val.as_str() {
+                        "pre" => NormPosition::Pre,
+                        "post" => NormPosition::Post,
+                        _ => NormPosition::Pre,
+                    };
+                }
+            }
+            Rule::residual_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.residual = val.as_str() == "true";
+                }
+            }
+            Rule::dropout_prop => {
+                if let Some(val) = inner.into_inner().next() {
+                    def.dropout = val.as_str().parse()?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Parse MAL from a file
+pub fn parse_mal_file<P: AsRef<std::path::Path>>(path: P) -> Result<ModelDef> {
+    let content = std::fs::read_to_string(path)?;
+    parse_mal(&content)
+}
+
+// ============================================================================
+// Built-in model definitions
+// ============================================================================
+
+/// Get a well-known model definition by name
+///
+/// Accepts:
+/// - Short names: "nano", "tiny", "gpt2-small", etc.
+/// - Well-known paths: "well-known/nano.mal", "well-known/gpt2_small.mal"
+/// - Filenames: "nano.mal", "gpt2_small.mal"
+pub fn get_builtin_model(name: &str) -> Option<ModelDef> {
+    let mal = get_wellknown_mal(name)?;
+    parse_mal(&mal).ok()
+}
+
+/// Get the raw MAL content for a well-known model
+///
+/// Dynamically loads from embedded well-known/ directory.
+pub fn get_wellknown_mal(name: &str) -> Option<String> {
+    // Normalize: strip well-known/ prefix, ensure .mal suffix
+    let name = name.strip_prefix("well-known/").unwrap_or(name);
+    let filename = if name.ends_with(".mal") {
+        name.to_string()
+    } else {
+        // Convert kebab-case to snake_case for filename
+        format!("{}.mal", name.replace('-', "_"))
+    };
+
+    WellKnown::get(&filename).map(|f| String::from_utf8_lossy(&f.data).into_owned())
+}
+
+/// List all well-known model names (auto-discovered from embedded files)
+pub fn list_wellknown_models() -> Vec<String> {
+    WellKnown::iter()
+        .filter_map(|path| {
+            let path: &str = path.as_ref();
+            if path.ends_with(".mal") {
+                Some(path.strip_suffix(".mal").unwrap().replace('_', "-"))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_simple_model() {
+        let mal = r#"
+            attention test_attn {
+                num_heads: 8
+                bias: false
+            }
+
+            ffn test_ffn {
+                hidden_dim: 2048
+                activation: gelu
+            }
+
+            block test_block {
+                attention: test_attn
+                ffn: test_ffn
+                norm_position: pre
+            }
+
+            model test {
+                vocab_size: 32000
+                hidden_size: 512
+                num_layers: 8
+                block: test_block
+            }
+        "#;
+
+        let def = parse_mal(mal).unwrap();
+        assert_eq!(def.name, "test");
+        assert_eq!(def.vocab_size, 32000);
+        assert_eq!(def.hidden_size, 512);
+        assert_eq!(def.num_layers, 8);
+    }
+
+    #[test]
+    fn test_parse_with_block_props() {
+        let mal = r#"
+            attention full_attn {
+                num_heads: 16
+                num_kv_heads: 4
+                bias: true
+                dropout: 0.1
+            }
+
+            ffn full_ffn {
+                hidden_dim: 4096
+                activation: gelu
+                bias: true
+                dropout: 0.1
+            }
+
+            block full_block {
+                attention: full_attn
+                ffn: full_ffn
+                norm: layernorm { eps: 1e-6 }
+                norm_position: pre
+                residual: true
+            }
+
+            model full_test {
+                description: "A test model"
+                vocab_size: 50000
+                max_seq_len: 4096
+                hidden_size: 1024
+                num_layers: 12
+                block: full_block
+            }
+        "#;
+
+        let def = parse_mal(mal).unwrap();
+        assert_eq!(def.description, Some("A test model".to_string()));
+        assert_eq!(def.vocab_size, 50000);
+        assert_eq!(def.max_seq_len, 4096);
+        assert_eq!(def.block.attention.num_heads, Some(16));
+        assert_eq!(def.block.attention.num_kv_heads, Some(4));
+        assert_eq!(def.block.ffn.hidden_dim, Some(4096));
+        assert!(matches!(def.block.ffn.activation, Activation::GELU));
+        // Regression: `norm:` was silently dropped (no Rule::norm_prop arm),
+        // building every block as the default RMSNorm regardless of config.
+        assert!(matches!(def.block.norm.norm_type, NormType::LayerNorm));
+        assert_eq!(def.block.norm.eps, 1e-6);
+    }
+
+    #[test]
+    fn moe_is_optional_and_fully_configurable() {
+        let dense = parse_mal(
+            "model d { vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1 \
+             block: { attention: { num_heads: 1 } ffn: { hidden_dim: 12 } } }",
+        )
+        .unwrap();
+        assert!(dense.block.ffn.moe.is_none());
+
+        let moe = parse_mal(
+            r#"
+            ffn experts {
+                hidden_dim: 12
+                activation: swiglu
+                moe {
+                    experts: 8
+                    top_k: 2
+                    shared_experts: 1
+                    load_balance_loss_weight: 0.01
+                    router_z_loss_weight: 0.001
+                }
+            }
+            model m {
+                vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1
+                block: { attention: { num_heads: 1 } ffn: experts }
+            }
+            "#,
+        )
+        .unwrap();
+        let config = moe.block.ffn.moe.as_ref().unwrap();
+        assert_eq!(config.experts, 8);
+        assert_eq!(config.top_k, 2);
+        assert_eq!(config.shared_experts, 1);
+        assert_eq!(config.load_balance_loss_weight, 0.01);
+        assert_eq!(config.router_z_loss_weight, 0.001);
+        assert!(moe.estimated_params() > dense.estimated_params());
+    }
+
+    #[test]
+    fn memory_preserves_tier_order_and_reserve_shape() {
+        let model = parse_mal(
+            r#"
+            ffn fast_ffn { hidden_dim: 32 activation: swiglu }
+            memory sleep_chain {
+                tier fast {
+                    ffn: fast_ffn
+                    reserve_experts { capacity: 2 rank: 4 top_k: 1 }
+                }
+                tier medium {
+                    ffn: { hidden_dim: 16 activation: silu }
+                    reserve_experts { capacity: 4 rank: 2 top_k: 1 }
+                    residual_init: zero
+                }
+            }
+            block remembered {
+                attention: { num_heads: 2 }
+                memory: sleep_chain
+            }
+            model sleeper {
+                vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1
+                block: remembered
+            }
+            "#,
+        )
+        .unwrap();
+
+        let memory = model.block.memory.as_ref().unwrap();
+        assert_eq!(memory.tiers.len(), 2);
+        assert_eq!(memory.tiers[0].name, "fast");
+        assert_eq!(memory.tiers[1].name, "medium");
+        assert_eq!(memory.tiers[0].reserve_experts.capacity, 2);
+        assert_eq!(memory.tiers[1].reserve_experts.rank, 2);
+        assert!(matches!(
+            memory.tiers[1].residual_init,
+            MemoryTierInit::ResidualZero
+        ));
+    }
+
+    #[test]
+    fn inline_memory_and_undefined_memory_are_explicit() {
+        let inline = parse_mal(
+            r#"
+            model sleeper {
+                vocab_size: 64 max_seq_len: 16 hidden_size: 8 num_layers: 1
+                block: {
+                    attention: { num_heads: 2 }
+                    memory: {
+                        tier fast {
+                            ffn: { hidden_dim: 16 }
+                            reserve_experts { capacity: 1 rank: 2 top_k: 1 }
+                        }
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(inline.block.memory.unwrap().tiers[0].name, "fast");
+
+        let error = parse_mal(
+            "model sleeper { vocab_size: 64 hidden_size: 8 num_layers: 1 \
+             block: { attention: { num_heads: 2 } memory: absent } }",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("undefined memory 'absent'"), "{error}");
+    }
+
+    #[test]
+    fn retriever_200m_moe_has_the_intended_sparse_budget() {
+        let model = get_builtin_model("retriever-200m-moe").unwrap();
+        assert_eq!(model.estimated_params(), 200_795_648);
+        assert_eq!(model.num_layers, 24);
+        assert_eq!(model.pattern.as_ref().unwrap().len(), 6);
+
+        let moe_layers: Vec<_> = (0..model.num_layers)
+            .filter_map(|layer| model.block_for_layer(layer).ffn.moe.as_ref())
+            .collect();
+        assert_eq!(moe_layers.len(), 12);
+        assert!(moe_layers.iter().all(|moe| moe.experts == 8));
+        assert!(moe_layers.iter().all(|moe| moe.top_k == 2));
+        assert!(moe_layers.iter().all(|moe| moe.shared_experts == 0));
+        assert_eq!(model.block_for_layer(23).name, "attn_moe_block");
+    }
+
+    #[test]
+    fn retriever_300m_moe_has_the_intended_sparse_budget() {
+        let model = get_builtin_model("retriever-300m-moe").unwrap();
+        assert_eq!(model.estimated_params(), 299_929_088);
+        assert_eq!(model.num_layers, 24);
+        assert_eq!(model.pattern.as_ref().unwrap().len(), 6);
+
+        let moe_layers: Vec<_> = (0..model.num_layers)
+            .filter_map(|layer| model.block_for_layer(layer).ffn.moe.as_ref())
+            .collect();
+        assert_eq!(moe_layers.len(), 12);
+        assert!(moe_layers.iter().all(|moe| moe.experts == 15));
+        assert!(moe_layers.iter().all(|moe| moe.top_k == 2));
+        assert!(moe_layers.iter().all(|moe| moe.shared_experts == 0));
+        assert_eq!(model.block_for_layer(23).name, "attn_moe_block");
+    }
+
+    #[test]
+    fn retriever_300m_sleep_is_additive_and_upgrade_shaped() {
+        let original = get_builtin_model("retriever-300m-moe").unwrap();
+        let sleep = get_builtin_model("retriever-300m-moe-sleep").unwrap();
+        assert_eq!(sleep.num_layers, original.num_layers);
+        assert_eq!(sleep.estimated_params(), 312_290_816);
+        for layer in 0..sleep.num_layers {
+            let source = original.block_for_layer(layer);
+            let memory = sleep.block_for_layer(layer).memory.as_ref().unwrap();
+            assert_eq!(memory.tiers.len(), 3);
+            assert_eq!(memory.tiers[0].name, "fast");
+            assert_eq!(memory.tiers[0].ffn.hidden_dim, source.ffn.hidden_dim);
+            assert_eq!(
+                memory.tiers[0].ffn.moe.as_ref().map(|moe| moe.experts),
+                source.ffn.moe.as_ref().map(|moe| moe.experts)
+            );
+            assert!(
+                memory.tiers[1..]
+                    .iter()
+                    .all(|tier| tier.residual_init == MemoryTierInit::ResidualZero)
+            );
+            assert!(
+                memory
+                    .tiers
+                    .iter()
+                    .all(|tier| tier.reserve_experts.top_k == 1)
+            );
+        }
+    }
+
+    #[test]
+    fn test_norm_none_and_rmsnorm() {
+        let base = |norm: &str| {
+            format!(
+                r#"
+                block b {{ attention: {{ num_heads: 4 }} ffn: {{ hidden_dim: 64 }} norm: {norm} }}
+                model m {{ vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }}
+                "#
+            )
+        };
+        let d = parse_mal(&base("rmsnorm { eps: 1e-5 }")).unwrap();
+        assert!(matches!(d.block.norm.norm_type, NormType::RmsNorm));
+        let d = parse_mal(&base("none")).unwrap();
+        assert!(matches!(d.block.norm.norm_type, NormType::None));
+    }
+
+    #[test]
+    fn test_embedding_and_output_configuration() {
+        let def = parse_mal(
+            r#"
+            block b { attention: { num_heads: 4 } ffn: { hidden_dim: 64 } }
+            model m {
+                vocab_size: 100
+                max_seq_len: 64
+                hidden_size: 32
+                num_layers: 2
+                block: b
+                embeddings { tie_weights: true dropout: 0.2 scale: 5.5 }
+                output { bias: true norm: none }
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert!(def.embeddings.tie_weights);
+        assert_eq!(def.embeddings.dropout, 0.2);
+        assert_eq!(def.embeddings.scale, Some(5.5));
+        assert!(def.output.bias);
+        assert!(matches!(def.output.norm.unwrap().norm_type, NormType::None));
+    }
+
+    #[test]
+    fn test_undefined_refs_error() {
+        // Undefined block/attention/ffn/ssm references must fail loud, not
+        // silently fall back to defaults.
+        let cases = [
+            "model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: nope }",
+            "block b { attention: nope ffn: { hidden_dim: 64 } }\n\
+             model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }",
+            "block b { attention: { num_heads: 4 } ffn: nope }\n\
+             model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }",
+            "block b { ssm: nope ffn: { hidden_dim: 64 } }\n\
+             model m { vocab_size: 100 max_seq_len: 64 hidden_size: 32 num_layers: 2 block: b }",
+        ];
+        for mal in cases {
+            let err = parse_mal(mal).unwrap_err().to_string();
+            assert!(
+                err.contains("undefined"),
+                "expected undefined-ref error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_mal_rejects_multiple_models() {
+        let err = parse_mal(
+            r#"
+            model alpha { vocab_size: 10 hidden_size: 8 num_layers: 1 block: { attention: { num_heads: 1 } ffn: { hidden_dim: 16 } } }
+            model beta { vocab_size: 10 hidden_size: 8 num_layers: 1 block: { attention: { num_heads: 1 } ffn: { hidden_dim: 16 } } }
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("multiple model definitions"), "{err}");
+        assert!(err.contains("alpha") && err.contains("beta"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_mal_full_rejects_duplicate_definitions() {
+        let err = parse_mal_full("attention repeated {} attention repeated {}")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate attention 'repeated'"), "{err}");
+    }
+
+    #[test]
+    fn test_wellknown_models() {
+        for name in list_wellknown_models() {
+            let def = get_builtin_model(&name).unwrap_or_else(|| panic!("Failed to get {}", name));
+            // Verify computed properties work
+            assert!(def.num_heads() > 0);
+            assert!(def.intermediate_size() > 0);
+        }
+    }
+
+    #[test]
+    fn test_model_properties() {
+        let def = get_builtin_model("tiny").unwrap();
+
+        assert_eq!(def.vocab_size, 32000);
+        assert_eq!(def.hidden_size, 128);
+        assert_eq!(def.num_layers, 4);
+        assert_eq!(def.num_heads(), 4);
+    }
+
+    #[test]
+    fn homogeneous_model_helpers_match_the_default_block() {
+        let mut def = ModelDef {
+            hidden_size: 96,
+            ..ModelDef::default()
+        };
+        def.block.attention.num_heads = Some(6);
+        def.block.attention.num_kv_heads = Some(2);
+        def.block.attention.head_dim = Some(16);
+        def.block.attention.position_encoding = PositionEncoding::Rope {
+            theta: 500_000.0,
+            scaling: Some(2.0),
+        };
+        def.block.ffn.hidden_dim = Some(320);
+        def.block.norm.eps = 1e-6;
+
+        assert_eq!(def.num_heads(), def.block.num_heads());
+        assert_eq!(def.num_kv_heads(), def.block.num_kv_heads());
+        assert_eq!(def.head_dim(), def.block.head_dim(def.hidden_size));
+        assert_eq!(
+            def.intermediate_size(),
+            def.block.intermediate_size(def.hidden_size)
+        );
+        assert_eq!(def.norm_eps(), def.block.norm_eps());
+        assert_eq!(def.rope_theta(), def.block.rope_theta());
+    }
+
+    #[test]
+    fn test_comments() {
+        let mal = r#"
+            # This is a comment
+            attention test_attn {
+                # Comment in attention
+                num_heads: 2
+            }
+
+            ffn test_ffn {
+                hidden_dim: 256
+            }
+
+            block test_block {
+                attention: test_attn
+                ffn: test_ffn
+            }
+
+            # Comment before model
+            model test {
+                vocab_size: 1000
+                hidden_size: 64
+                num_layers: 2
+                block: test_block
+            }
+        "#;
+
+        let def = parse_mal(mal).unwrap();
+        assert_eq!(def.vocab_size, 1000);
+    }
+
+    #[test]
+    fn test_parse_position_encoding_and_tie_weights() {
+        let mal = r#"
+            attention pe_attn {
+                num_heads: 8
+                position_encoding: rope { theta: 100000.0 }
+            }
+
+            ffn pe_ffn {
+                hidden_dim: 1024
+            }
+
+            block pe_block {
+                attention: pe_attn
+                ffn: pe_ffn
+            }
+
+            model pe_test {
+                vocab_size: 1000
+                hidden_size: 256
+                num_layers: 2
+                block: pe_block
+                embeddings {
+                    tie_weights: true
+                }
+            }
+        "#;
+
+        let def = parse_mal(mal).unwrap();
+        assert_eq!(def.rope_theta(), 100000.0, "theta must not be dropped");
+
+        // qk_norm parses and lands
+        let with_qk = parse_mal(
+            r#"
+            attention qk { num_heads: 4
+                           qk_norm: true }
+            ffn f { hidden_dim: 64 }
+            block b { attention: qk
+                      ffn: f }
+            model m { vocab_size: 100
+                      hidden_size: 64
+                      num_layers: 1
+                      block: b }
+        "#,
+        )
+        .unwrap();
+        assert!(with_qk.block.attention.qk_norm);
+
+        assert!(
+            def.embeddings.tie_weights,
+            "tie_weights must not be dropped"
+        );
+
+        // Alternate spellings and variants
+        let mal2 = r#"
+            attention a { rope_theta: 500000.0 }
+        "#;
+        // rope_theta at attention level requires position_encoding wrapper;
+        // bare form is not part of the grammar — this should fail to parse
+        assert!(
+            parse_mal_full(mal2).is_err() || {
+                let f = parse_mal_full(mal2).unwrap();
+                f.attentions.is_empty()
+            }
+        );
+
+        let mal3 = r#"
+            attention nopos { position_encoding: none }
+            ffn f { hidden_dim: 64 }
+            block b { attention: nopos
+                      ffn: f }
+            model m { vocab_size: 100
+                      hidden_size: 64
+                      num_layers: 1
+                      block: b }
+        "#;
+        let def3 = parse_mal(mal3).unwrap();
+        assert!(matches!(
+            def3.block.attention.position_encoding,
+            PositionEncoding::None
+        ));
+    }
+
+    #[test]
+    fn test_parse_hybrid_ssm_pattern() {
+        let mal = r#"
+            attention h_attn {
+                num_heads: 4
+                bias: false
+            }
+
+            ssm h_ssm {
+                state_dim: 16
+                conv_kernel: 4
+                expand: 2
+            }
+
+            ffn h_ffn {
+                hidden_dim: 512
+                activation: swiglu
+                bias: false
+            }
+
+            block attn_block {
+                attention: h_attn
+                ffn: h_ffn
+                norm: rmsnorm { eps: 1e-5 }
+                norm_position: pre
+            }
+
+            block mamba_block {
+                ssm: h_ssm
+                ffn: h_ffn
+                norm: rmsnorm { eps: 1e-5 }
+                norm_position: pre
+            }
+
+            model hybrid {
+                vocab_size: 1000
+                max_seq_len: 128
+                hidden_size: 64
+                num_layers: 6
+                block: attn_block
+                pattern: [mamba_block, mamba_block, attn_block]
+            }
+        "#;
+
+        let def = parse_mal(mal).unwrap();
+        assert_eq!(def.num_layers, 6);
+
+        let pattern = def.pattern.as_ref().unwrap();
+        assert_eq!(pattern.len(), 3);
+        assert!(pattern[0].is_ssm());
+        assert!(pattern[1].is_ssm());
+        assert!(!pattern[2].is_ssm());
+
+        // Cyclic layer assignment
+        assert!(def.block_for_layer(0).is_ssm());
+        assert!(!def.block_for_layer(2).is_ssm());
+        assert!(def.block_for_layer(3).is_ssm());
+        assert!(!def.block_for_layer(5).is_ssm());
+
+        let ssm = pattern[0].ssm.as_ref().unwrap();
+        assert_eq!(ssm.state_dim, 16);
+        assert_eq!(ssm.conv_kernel, 4);
+        assert_eq!(ssm.expand, 2);
+        assert_eq!(def.dt_rank(ssm), 4); // ceil(64/16)
+
+        // JSON roundtrip keeps the hybrid structure
+        let json = serde_json::to_string(&def).unwrap();
+        let back: ModelDef = serde_json::from_str(&json).unwrap();
+        assert!(back.pattern.as_ref().unwrap()[0].is_ssm());
+
+        // Attention-only JSON leaves the optional hybrid fields empty.
+        let attention_only: ModelDef = serde_json::from_str(
+            &serde_json::to_string(&get_builtin_model("tiny").unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(attention_only.pattern.is_none());
+        assert!(!attention_only.block.is_ssm());
+    }
+
+    #[test]
+    fn test_composable_architecture() {
+        let mal = r#"
+            attention my_attn {
+                num_heads: 16
+                num_kv_heads: 4
+                head_dim: 128
+                bias: false
+            }
+
+            ffn my_ffn {
+                hidden_dim: 11008
+                activation: swiglu
+                bias: false
+            }
+
+            block my_block {
+                attention: my_attn
+                ffn: my_ffn
+                norm: rmsnorm { eps: 1e-5 }
+                norm_position: pre
+                residual: true
+            }
+
+            model my_model {
+                description: "LLaMA 7B architecture"
+                vocab_size: 32000
+                max_seq_len: 4096
+                hidden_size: 4096
+                num_layers: 32
+                block: my_block
+            }
+        "#;
+
+        let file = parse_mal_full(mal).unwrap();
+
+        assert!(file.attentions.contains_key("my_attn"));
+        assert!(file.ffns.contains_key("my_ffn"));
+        assert!(file.blocks.contains_key("my_block"));
+        assert!(file.models.contains_key("my_model"));
+
+        let attn = file.attentions.get("my_attn").unwrap();
+        assert_eq!(attn.num_heads, Some(16));
+        assert_eq!(attn.num_kv_heads, Some(4));
+
+        let ffn = file.ffns.get("my_ffn").unwrap();
+        assert_eq!(ffn.hidden_dim, Some(11008));
+        assert!(matches!(ffn.activation, Activation::SwiGLU));
+
+        let block = file.blocks.get("my_block").unwrap();
+        assert!(matches!(block.norm_position, NormPosition::Pre));
+        assert!(block.residual);
+    }
+
+    #[test]
+    fn vocabulary_storage_alignment_is_derived() {
+        let mut model = ModelDef {
+            vocab_size: 50_277,
+            ..ModelDef::default()
+        };
+        assert_eq!(model.padded_vocab_size(), 50_304);
+
+        model.vocab_size = 32_000;
+        assert_eq!(model.padded_vocab_size(), 32_000);
+
+        let serialized = serde_json::to_value(&model).unwrap();
+        assert_eq!(serialized["vocab_size"], 32_000);
+        assert!(serialized.get("padded_vocab_size").is_none());
+    }
+}

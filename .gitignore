@@ -23,9 +23,9 @@ Thumbs.db
 
 # Node.js
 node_modules/
-hermes-web/dist/
-hermes-web/dist-model-lab/
-hermes-model-lab/dist/
+summa-web/dist/
+summa-web/dist-model-lab/
+summa-model-lab/dist/
 
 # Python
 __pycache__/
@@ -35,17 +35,17 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
-hermes-python/target/
+summa-python/target/
 
 # Rust
 *.rs.bk
 Cargo.lock.bak
 
 # WASM build output (regenerated on build)
-hermes-wasm/pkg/
+summa-wasm/pkg/
 
 # Maturin
-hermes-python/target/
+summa-python/target/
 
 # Environment
 .env

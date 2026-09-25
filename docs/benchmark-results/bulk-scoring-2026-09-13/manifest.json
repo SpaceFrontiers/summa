@@ -95,11 +95,11 @@
     "bytes": 127998,
     "sha256": "ce60d45668a3b4c0a5a705db98f47e2c04c69676d93d5d707d565e73ee3ec393"
   },
-  "cloud/bulk-hermes-index.log": {
+  "cloud/bulk-summa-index.log": {
     "bytes": 968,
     "sha256": "f21c127038be3a6b4d26cf6fca22b0d979c68af02a95bcd99a491cf171735a50"
   },
-  "cloud/bulk-hermes-index.time": {
+  "cloud/bulk-summa-index.time": {
     "bytes": 855,
     "sha256": "9559ae51b233124760d12da72684e6f350d74010fb1e7bce71539799888d5f35"
   },
@@ -231,39 +231,39 @@
     "bytes": 3159,
     "sha256": "e325713193954207c7306216ab6cf33d5a80f2a737bc25e22c9a6820dd62cace"
   },
-  "cloud/final-phase-hermes-bulk-final-search.time": {
+  "cloud/final-phase-summa-bulk-final-search.time": {
     "bytes": 6434,
     "sha256": "bae5e9ac572b96261675d96e2152042c1ceb1da3818da5ba3bbc8b5e85f994ba"
   },
-  "cloud/final-phase-hermes-bulk-v2-search.time": {
+  "cloud/final-phase-summa-bulk-v2-search.time": {
     "bytes": 6411,
     "sha256": "c4a64f3ada7998b28283a2875b4e28b8f73dc6536d2489a2a306f28f3f626d8b"
   },
-  "cloud/final-phase-hermes-posting-validation-search.time": {
+  "cloud/final-phase-summa-posting-validation-search.time": {
     "bytes": 6498,
     "sha256": "ae725d89d0035db320427da8dacda50f835fed35941997d034e329b0bff559ac"
   },
-  "cloud/hermes-Cargo.lock": {
+  "cloud/summa-Cargo.lock": {
     "bytes": 231783,
     "sha256": "5ba1b6e7223f4bc72e6a8abf7efcc4ec7c9f2088d75ce15318dbfc054119ca03"
   },
-  "cloud/hermes-before-bulk-search.time": {
+  "cloud/summa-before-bulk-search.time": {
     "bytes": 7254,
     "sha256": "09b0c354adcf50ede0747b4799b623d1076850e0cc24799b469f3eb9dc99527f"
   },
-  "cloud/hermes-bulk-v1-search.time": {
+  "cloud/summa-bulk-v1-search.time": {
     "bytes": 4013,
     "sha256": "5a6b35787329602f5bea5108c12bb98a37226bada0c2491268b97577cc3b0afe"
   },
-  "cloud/hermes-bulk-v2-search.time": {
+  "cloud/summa-bulk-v2-search.time": {
     "bytes": 7218,
     "sha256": "f9eb5b9167dd51ea40b58b944428a62af982ac644db46cf22fde7f3d83ba486e"
   },
-  "cloud/hermes-index-manifest.json": {
+  "cloud/summa-index-manifest.json": {
     "bytes": 1525,
     "sha256": "d96709f1acb0356650ee560d7f4e848b9d32420869c4ce0a823bbcb4fb29fa12"
   },
-  "cloud/hermes-phrase-bound-search.time": {
+  "cloud/summa-phrase-bound-search.time": {
     "bytes": 3228,
     "sha256": "b70bc004fe4d554b39faf3ee887daf95fe1277deff04c18a27f5cd3440ec40a1"
   },
@@ -307,115 +307,115 @@
     "bytes": 1615,
     "sha256": "95df4e747cddee56dd1b62e5c981bb27b334846b40c0d594a9e86461d1f0930f"
   },
-  "cloud/official-hermes-before-bulk-verification.engine-0.log": {
+  "cloud/official-summa-before-bulk-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/official-hermes-before-bulk-verification.engine-1.log": {
+  "cloud/official-summa-before-bulk-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/official-hermes-before-bulk-verification.jsonl": {
+  "cloud/official-summa-before-bulk-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/official-hermes-before-bulk-verification.log": {
+  "cloud/official-summa-before-bulk-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/official-hermes-bulk-final-verification.engine-0.log": {
+  "cloud/official-summa-bulk-final-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/official-hermes-bulk-final-verification.engine-1.log": {
+  "cloud/official-summa-bulk-final-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/official-hermes-bulk-final-verification.jsonl": {
+  "cloud/official-summa-bulk-final-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/official-hermes-bulk-final-verification.log": {
+  "cloud/official-summa-bulk-final-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/official-hermes-bulk-v1-verification.engine-0.log": {
+  "cloud/official-summa-bulk-v1-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/official-hermes-bulk-v1-verification.engine-1.log": {
+  "cloud/official-summa-bulk-v1-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/official-hermes-bulk-v1-verification.jsonl": {
+  "cloud/official-summa-bulk-v1-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/official-hermes-bulk-v1-verification.log": {
+  "cloud/official-summa-bulk-v1-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/official-hermes-bulk-v2-verification.engine-0.log": {
+  "cloud/official-summa-bulk-v2-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/official-hermes-bulk-v2-verification.engine-1.log": {
+  "cloud/official-summa-bulk-v2-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/official-hermes-bulk-v2-verification.jsonl": {
+  "cloud/official-summa-bulk-v2-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/official-hermes-bulk-v2-verification.log": {
+  "cloud/official-summa-bulk-v2-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/official-hermes-bulk-v3-verification.engine-0.log": {
+  "cloud/official-summa-bulk-v3-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/official-hermes-bulk-v3-verification.engine-1.log": {
+  "cloud/official-summa-bulk-v3-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/official-hermes-bulk-v3-verification.jsonl": {
+  "cloud/official-summa-bulk-v3-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/official-hermes-bulk-v3-verification.log": {
+  "cloud/official-summa-bulk-v3-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/official-hermes-phrase-bound-verification.engine-0.log": {
+  "cloud/official-summa-phrase-bound-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/official-hermes-phrase-bound-verification.engine-1.log": {
+  "cloud/official-summa-phrase-bound-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/official-hermes-phrase-bound-verification.jsonl": {
+  "cloud/official-summa-phrase-bound-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/official-hermes-phrase-bound-verification.log": {
+  "cloud/official-summa-phrase-bound-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
-  "cloud/official-hermes-posting-validation-verification.engine-0.log": {
+  "cloud/official-summa-posting-validation-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/official-hermes-posting-validation-verification.engine-1.log": {
+  "cloud/official-summa-posting-validation-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/official-hermes-posting-validation-verification.jsonl": {
+  "cloud/official-summa-posting-validation-verification.jsonl": {
     "bytes": 62660,
     "sha256": "ef17174d65e95988a69982d9662b51c1939f03ad7925b23a43f89bac0f105834"
   },
-  "cloud/official-hermes-posting-validation-verification.log": {
+  "cloud/official-summa-posting-validation-verification.log": {
     "bytes": 359,
     "sha256": "2986d0e83aee0893480998c18b8508bd70ca7701242161d299c015ead8433c63"
   },
@@ -491,75 +491,75 @@
     "bytes": 128212,
     "sha256": "488280cbda847bacfd44d83f5e1355efd4e604cd574924aa6cd4fb43a29a8561"
   },
-  "cloud/profile-union-hermes-before-bulk.log": {
+  "cloud/profile-union-summa-before-bulk.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/profile-union-hermes-before-bulk.output": {
+  "cloud/profile-union-summa-before-bulk.output": {
     "bytes": 6075,
     "sha256": "6684bd5942133c50276dbed5820e5d4352770512f1e0e74d63cb868aa8ae69f7"
   },
-  "cloud/profile-union-hermes-before-bulk.report": {
+  "cloud/profile-union-summa-before-bulk.report": {
     "bytes": 2448,
     "sha256": "9a0bdfaa7fcd8a7f0f8f0e44be6df8c83b0808be2b579fb5b3bbd0d9e8a29c61"
   },
-  "cloud/profile-union-hermes-bulk-v2.log": {
+  "cloud/profile-union-summa-bulk-v2.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/profile-union-hermes-bulk-v2.output": {
+  "cloud/profile-union-summa-bulk-v2.output": {
     "bytes": 6075,
     "sha256": "6684bd5942133c50276dbed5820e5d4352770512f1e0e74d63cb868aa8ae69f7"
   },
-  "cloud/profile-union-hermes-bulk-v2.report": {
+  "cloud/profile-union-summa-bulk-v2.report": {
     "bytes": 2990,
     "sha256": "f329c3b98e07d697d617874ba9d0be5a488b1687e90c3209bc86728c4df7d6e3"
   },
-  "cloud/rss-hermes-bulk-v2-COUNT.log": {
+  "cloud/rss-summa-bulk-v2-COUNT.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/rss-hermes-bulk-v2-COUNT.output": {
+  "cloud/rss-summa-bulk-v2-COUNT.output": {
     "bytes": 14313,
     "sha256": "6472938ff90702303afbc1a2f31611a711d0457f2909e89ee267b39a89154d6c"
   },
-  "cloud/rss-hermes-bulk-v2-COUNT.time": {
+  "cloud/rss-summa-bulk-v2-COUNT.time": {
     "bytes": 796,
     "sha256": "f01e7332de23f97d2eb03b78fab16f1280acc50cb9e7172825573cdb088ae696"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_10.log": {
+  "cloud/rss-summa-bulk-v2-TOP_10.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_10.output": {
+  "cloud/rss-summa-bulk-v2-TOP_10.output": {
     "bytes": 5772,
     "sha256": "1de168ed7114d1f9720052034ffd4ba2ef8d1a801154c815fe04fc65a52d47f0"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_10.time": {
+  "cloud/rss-summa-bulk-v2-TOP_10.time": {
     "bytes": 801,
     "sha256": "0f4e5f4e6353ac8094115484de1207b1d1ac638b9f143f4dd02b53c4c4434cbd"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_1000.log": {
+  "cloud/rss-summa-bulk-v2-TOP_1000.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_1000.output": {
+  "cloud/rss-summa-bulk-v2-TOP_1000.output": {
     "bytes": 5772,
     "sha256": "1de168ed7114d1f9720052034ffd4ba2ef8d1a801154c815fe04fc65a52d47f0"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_1000.time": {
+  "cloud/rss-summa-bulk-v2-TOP_1000.time": {
     "bytes": 801,
     "sha256": "2e7b02cbc6c6b4f852cc82fdb9196dd38ea83afa42c0a0f2b671292985bb5351"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_100_COUNT.log": {
+  "cloud/rss-summa-bulk-v2-TOP_100_COUNT.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_100_COUNT.output": {
+  "cloud/rss-summa-bulk-v2-TOP_100_COUNT.output": {
     "bytes": 14313,
     "sha256": "6472938ff90702303afbc1a2f31611a711d0457f2909e89ee267b39a89154d6c"
   },
-  "cloud/rss-hermes-bulk-v2-TOP_100_COUNT.time": {
+  "cloud/rss-summa-bulk-v2-TOP_100_COUNT.time": {
     "bytes": 797,
     "sha256": "b86494e02216775573dd186dc4ca445bb0e6663a170e4aef98a21ea6afea304a"
   },
@@ -623,115 +623,115 @@
     "bytes": 41,
     "sha256": "b9ea4c0243533d7859e0f2943df6c2daff03a26bbc0ba5de428705b1f3db6781"
   },
-  "cloud/supplemental-hermes-before-bulk-verification.engine-0.log": {
+  "cloud/supplemental-summa-before-bulk-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/supplemental-hermes-before-bulk-verification.engine-1.log": {
+  "cloud/supplemental-summa-before-bulk-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/supplemental-hermes-before-bulk-verification.jsonl": {
+  "cloud/supplemental-summa-before-bulk-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/supplemental-hermes-before-bulk-verification.log": {
+  "cloud/supplemental-summa-before-bulk-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/supplemental-hermes-bulk-final-verification.engine-0.log": {
+  "cloud/supplemental-summa-bulk-final-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/supplemental-hermes-bulk-final-verification.engine-1.log": {
+  "cloud/supplemental-summa-bulk-final-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/supplemental-hermes-bulk-final-verification.jsonl": {
+  "cloud/supplemental-summa-bulk-final-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/supplemental-hermes-bulk-final-verification.log": {
+  "cloud/supplemental-summa-bulk-final-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/supplemental-hermes-bulk-v1-verification.engine-0.log": {
+  "cloud/supplemental-summa-bulk-v1-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/supplemental-hermes-bulk-v1-verification.engine-1.log": {
+  "cloud/supplemental-summa-bulk-v1-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/supplemental-hermes-bulk-v1-verification.jsonl": {
+  "cloud/supplemental-summa-bulk-v1-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/supplemental-hermes-bulk-v1-verification.log": {
+  "cloud/supplemental-summa-bulk-v1-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/supplemental-hermes-bulk-v2-verification.engine-0.log": {
+  "cloud/supplemental-summa-bulk-v2-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/supplemental-hermes-bulk-v2-verification.engine-1.log": {
+  "cloud/supplemental-summa-bulk-v2-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/supplemental-hermes-bulk-v2-verification.jsonl": {
+  "cloud/supplemental-summa-bulk-v2-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/supplemental-hermes-bulk-v2-verification.log": {
+  "cloud/supplemental-summa-bulk-v2-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/supplemental-hermes-bulk-v3-verification.engine-0.log": {
+  "cloud/supplemental-summa-bulk-v3-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/supplemental-hermes-bulk-v3-verification.engine-1.log": {
+  "cloud/supplemental-summa-bulk-v3-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/supplemental-hermes-bulk-v3-verification.jsonl": {
+  "cloud/supplemental-summa-bulk-v3-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/supplemental-hermes-bulk-v3-verification.log": {
+  "cloud/supplemental-summa-bulk-v3-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/supplemental-hermes-phrase-bound-verification.engine-0.log": {
+  "cloud/supplemental-summa-phrase-bound-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/supplemental-hermes-phrase-bound-verification.engine-1.log": {
+  "cloud/supplemental-summa-phrase-bound-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/supplemental-hermes-phrase-bound-verification.jsonl": {
+  "cloud/supplemental-summa-phrase-bound-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/supplemental-hermes-phrase-bound-verification.log": {
+  "cloud/supplemental-summa-phrase-bound-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
-  "cloud/supplemental-hermes-posting-validation-verification.engine-0.log": {
+  "cloud/supplemental-summa-posting-validation-verification.engine-0.log": {
     "bytes": 164,
     "sha256": "cbb9163ea1c1d68ee0d8038ef28555c9deff1f0960f4dc4b47e4f137a367026c"
   },
-  "cloud/supplemental-hermes-posting-validation-verification.engine-1.log": {
+  "cloud/supplemental-summa-posting-validation-verification.engine-1.log": {
     "bytes": 0,
     "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
-  "cloud/supplemental-hermes-posting-validation-verification.jsonl": {
+  "cloud/supplemental-summa-posting-validation-verification.jsonl": {
     "bytes": 39256,
     "sha256": "958a707bc9c824af364156ebc6685458e935107b14b42f98b4f6141db5accc78"
   },
-  "cloud/supplemental-hermes-posting-validation-verification.log": {
+  "cloud/supplemental-summa-posting-validation-verification.log": {
     "bytes": 293,
     "sha256": "76084b9fba71fef098756f431f0ad599af7214284ba5457a717b6620f6aec529"
   },
@@ -771,19 +771,19 @@
     "bytes": 5649,
     "sha256": "811062d60b3a0ac73fb3ce0553e25a70302280d4fac4c5d3b951629ebb575ad9"
   },
-  "cloud/v3-phase-hermes-bulk-v3-search.time": {
+  "cloud/v3-phase-summa-bulk-v3-search.time": {
     "bytes": 6412,
     "sha256": "962ab7727163bc4cdc67b9c23e422fdbb8196b0420a3f4cdffc832dfd4b1c191"
   },
-  "cloud/v3-phase-hermes-phrase-bound-search.time": {
+  "cloud/v3-phase-summa-phrase-bound-search.time": {
     "bytes": 6451,
     "sha256": "7c2676b7d18271405f231095a8c2815fc100e80d30ca0af0715daee43f060437"
   },
-  "cloud/validation-phase-hermes-bulk-v3-search.time": {
+  "cloud/validation-phase-summa-bulk-v3-search.time": {
     "bytes": 6412,
     "sha256": "84c9ab624f571028f95d3dffea00e396f9225679ce0498bac3ac63f34afcd082"
   },
-  "cloud/validation-phase-hermes-posting-validation-search.time": {
+  "cloud/validation-phase-summa-posting-validation-search.time": {
     "bytes": 6498,
     "sha256": "f376606c1abbf3659729db5f89a7743bfe5f054230ccd841ad4052bd6afc673c"
   },
@@ -975,19 +975,19 @@
     "bytes": 681,
     "sha256": "18695827ffb1611d1be7b2a040fe703f6b9ca9c8a9b8fad08e56b0b7ebeb5d93"
   },
-  "local/hermes-phrase-bound-v1-manifest.json": {
+  "local/summa-phrase-bound-v1-manifest.json": {
     "bytes": 6178,
     "sha256": "78e11e67899568d63e63f2e1fe990685b09502e3d970196071c3d3d8cb80a4b4"
   },
-  "local/hermes-score-window-v1-manifest.json": {
+  "local/summa-score-window-v1-manifest.json": {
     "bytes": 6066,
     "sha256": "941e006765522af95fad0d54fb136706837a94138e9c4240c28d9ae0d2a99510"
   },
-  "local/hermes-score-window-v2-manifest.json": {
+  "local/summa-score-window-v2-manifest.json": {
     "bytes": 6178,
     "sha256": "cc40a5b9385516d6694c8f58ae123287299cbcbf15f16287d2cf570d7858210c"
   },
-  "local/hermes-score-window-v3-manifest.json": {
+  "local/summa-score-window-v3-manifest.json": {
     "bytes": 6177,
     "sha256": "9ccc700580dde7263723e7e213dce6d0d923d2bbfc00c55df57689489d821d71"
   },
@@ -1519,1111 +1519,1111 @@
     "bytes": 20143,
     "sha256": "46c386940a042c038767ba5c0f5c52bf8c9dc198c898f834dbae523de67417d1"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/Cargo.toml": {
+  "sources/summa-bulk-final-v1/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-bulk-final-v1/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-bulk-final-v1/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 11127,
     "sha256": "cbcb7837be3e588274ca093df475fafec2e531b379fda31b9a30595fec9a7139"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-bulk-final-v1/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/index/mod.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/index/mod.rs": {
     "bytes": 37861,
     "sha256": "805df0f789c626d15cb5dc36a6935d05157311b1d8d7c2168fa86748f78aca4a"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/index/wasm_writer.rs": {
     "bytes": 15929,
     "sha256": "0265ebc3264aaac66962a1e609c3dfad6610c8994be6687190aa08c9a433f331"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/index/writer.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/index/writer.rs": {
     "bytes": 101238,
     "sha256": "37f81dd1e56f19f7db7c5b0e7f4c7de6a8b6ce1d64f52007d6a2d149dcd3853d"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/bm25.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/boolean.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/boolean.rs": {
     "bytes": 90060,
     "sha256": "2faa8140148937e4fe96c99bd92733ad572b8261a7fd201c9eedc023edf23908"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/collector.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/collector.rs": {
     "bytes": 53948,
     "sha256": "0373be07eeb0030ff4fb272b9d70b881445093c1e3181a0aa00a73b9dbcad4e7"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/docset.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/phrase.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/phrase.rs": {
     "bytes": 45544,
     "sha256": "4f248bf9307e2a788b13c5eb9b96f900a18b0ed426401e387f5bdb3a0099e2a4"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/planner.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/scoring.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/term.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/term.rs": {
     "bytes": 36395,
     "sha256": "0d20f72c81a5c425e25ef49cd380a244bafdefebe2a153edfcf48204c8d3e88c"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/query/traits.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/query/traits.rs": {
     "bytes": 26813,
     "sha256": "4eabcbef16697b2a3ac28fab97fb29c1558de60c587ccd4e4fe73896796e25c9"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/segment/builder/config.rs": {
     "bytes": 3416,
     "sha256": "252ea1b3952060ea8cb9186efc63b37ad894edaeb431223554766d1b86c2a303"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/segment/builder/mod.rs": {
     "bytes": 89920,
     "sha256": "787703cf11faf0e1a122e6d2b3e19c6b7c9829872279bcf1e88848f925061587"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16374,
     "sha256": "ca6d9da904f4037d432556e2e52db591331e88c7c7ae87bb94e3f34c0025b99f"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33373,
     "sha256": "1836c0b570260b4bd8ef2c0494b3540130ea855f80bb30a9f5804a3fa2538b3a"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19350,
     "sha256": "f30b187871e9c8c846b2c62bb55631dc74da444716474efe883ffeafad4984cd"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21549,
     "sha256": "6d28a18282132e3c30c7bdc927535aa6e2b936a936b0ffb98b6ccb2a7eef37fc"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/structures/postings/posting.rs": {
     "bytes": 127347,
     "sha256": "93d3fcb932e24cc4d6ff8e29280cabadd22d3c0c878af67a26d42f05f5b5b19d"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 20334,
     "sha256": "ff8a12f146f173e26b6916be33af3301d97a6db573f986ff7d3e4084cc5dd1c2"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/structures/postings/posting/validation.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/structures/postings/posting/validation.rs": {
     "bytes": 7619,
     "sha256": "64dd2a27626686d664921d2f7794885930d3f472f45b31f645a0502b49e26cbf"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/src/structures/simd.rs": {
+  "sources/summa-bulk-final-v1/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/tests/corrupt_text_postings.rs": {
+  "sources/summa-bulk-final-v1/summa-core/tests/corrupt_text_postings.rs": {
     "bytes": 2190,
     "sha256": "0d6d74cb8ed37957857e53a73afe14202975e4bfa39cc21c33abcf43723fe91c"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-bulk-final-v1/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 7349,
     "sha256": "efcd077d6814d6bf84041752b776e3aaec9ca756eb02feaec8a15e390a83da9f"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-bulk-final-v1/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-bulk-final-v1/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-bulk-final-v1/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-bulk-final-v1/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-bulk-final-v1/hermes-tool/src/index_ops.rs": {
+  "sources/summa-bulk-final-v1/summa-tool/src/index_ops.rs": {
     "bytes": 30861,
     "sha256": "2e7936f3c9b447da492c9bdca56790b95a5a10b427599119293cee53201f5a14"
   },
-  "sources/hermes-bulk-final-v1/hermes-tool/src/main.rs": {
+  "sources/summa-bulk-final-v1/summa-tool/src/main.rs": {
     "bytes": 22228,
     "sha256": "b46c2aeddc0a22c6289d8a1a4f3ae5e57c91089ba46c96f1059c29c705c881b7"
   },
-  "sources/hermes-bulk-final-v1/scripts/search_benchmark/Makefile": {
+  "sources/summa-bulk-final-v1/scripts/search_benchmark/Makefile": {
     "bytes": 173,
     "sha256": "209b6ddc0e89bebcaea79fafbe68336f070ac7b12417ef078a9abc9f8d6bff72"
   },
-  "sources/hermes-bulk-final-v1/scripts/search_benchmark/analyze.py": {
+  "sources/summa-bulk-final-v1/scripts/search_benchmark/analyze.py": {
     "bytes": 3984,
     "sha256": "99216a2458b682667c4d6b86affb5da13c2fea3f298ccd9e3dd41bd075fb1c6d"
   },
-  "sources/hermes-bulk-final-v1/scripts/search_benchmark/smoke.py": {
+  "sources/summa-bulk-final-v1/scripts/search_benchmark/smoke.py": {
     "bytes": 2797,
     "sha256": "ccfa0298db6309046714bb0254367189fbebf803742f08ca20dccdb5dc08ed09"
   },
-  "sources/hermes-bulk-final-v1/scripts/search_benchmark/supplemental_terms.py": {
+  "sources/summa-bulk-final-v1/scripts/search_benchmark/supplemental_terms.py": {
     "bytes": 747,
     "sha256": "11c8ef1c20ae8226376e0c202eebebd31a5c5dff8ecfde395bbd14dd3b7d4a23"
   },
-  "sources/hermes-bulk-final-v1/scripts/search_benchmark/verify.py": {
+  "sources/summa-bulk-final-v1/scripts/search_benchmark/verify.py": {
     "bytes": 3062,
     "sha256": "e6731b06688b6996f6c15e46268363faad2baa207ce0276b6e90909b9fb864bd"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/Cargo.toml": {
+  "sources/summa-phrase-bound-v1/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 11127,
     "sha256": "cbcb7837be3e588274ca093df475fafec2e531b379fda31b9a30595fec9a7139"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-phrase-bound-v1/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/index/mod.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/index/mod.rs": {
     "bytes": 37861,
     "sha256": "805df0f789c626d15cb5dc36a6935d05157311b1d8d7c2168fa86748f78aca4a"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/index/wasm_writer.rs": {
     "bytes": 15929,
     "sha256": "0265ebc3264aaac66962a1e609c3dfad6610c8994be6687190aa08c9a433f331"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/index/writer.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/index/writer.rs": {
     "bytes": 101238,
     "sha256": "37f81dd1e56f19f7db7c5b0e7f4c7de6a8b6ce1d64f52007d6a2d149dcd3853d"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/bm25.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/boolean.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/boolean.rs": {
     "bytes": 90060,
     "sha256": "2faa8140148937e4fe96c99bd92733ad572b8261a7fd201c9eedc023edf23908"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/collector.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/collector.rs": {
     "bytes": 57304,
     "sha256": "790804dd996b454186e55b0f0575be52a8d45a9adbd59371f49eae2f3acb9b44"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/docset.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/phrase.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/phrase.rs": {
     "bytes": 49961,
     "sha256": "935f8897e47a80733f351e5d6aa4ed181a82d93c668fa8b685a938fa8cc4eb9d"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/planner.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/scoring.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/term.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/term.rs": {
     "bytes": 32564,
     "sha256": "ff558c304a0d40d8e1be894b463856bdc9f5eb45a211d2186ee9b2f9f82aec2d"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/query/traits.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/query/traits.rs": {
     "bytes": 27296,
     "sha256": "96a45b9d94e64b29af4000b199bd3c59cfbe42c19237fa526d458ed7e82a4af7"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/segment/builder/config.rs": {
     "bytes": 3416,
     "sha256": "252ea1b3952060ea8cb9186efc63b37ad894edaeb431223554766d1b86c2a303"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/segment/builder/mod.rs": {
     "bytes": 89920,
     "sha256": "787703cf11faf0e1a122e6d2b3e19c6b7c9829872279bcf1e88848f925061587"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16374,
     "sha256": "ca6d9da904f4037d432556e2e52db591331e88c7c7ae87bb94e3f34c0025b99f"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33373,
     "sha256": "1836c0b570260b4bd8ef2c0494b3540130ea855f80bb30a9f5804a3fa2538b3a"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19350,
     "sha256": "f30b187871e9c8c846b2c62bb55631dc74da444716474efe883ffeafad4984cd"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21549,
     "sha256": "6d28a18282132e3c30c7bdc927535aa6e2b936a936b0ffb98b6ccb2a7eef37fc"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/structures/postings/posting.rs": {
     "bytes": 126825,
     "sha256": "5e6f287239426ae8494e8a3ecef7d7737a4f0d50159b0908e05fbff9f54a26d8"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 22006,
     "sha256": "773e6e06ca41b913a849af4ed9f1f32dfec2198d6081401e4e68ca3073d967e8"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/src/structures/simd.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 7349,
     "sha256": "efcd077d6814d6bf84041752b776e3aaec9ca756eb02feaec8a15e390a83da9f"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-phrase-bound-v1/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-phrase-bound-v1/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-phrase-bound-v1/hermes-tool/src/index_ops.rs": {
+  "sources/summa-phrase-bound-v1/summa-tool/src/index_ops.rs": {
     "bytes": 30861,
     "sha256": "2e7936f3c9b447da492c9bdca56790b95a5a10b427599119293cee53201f5a14"
   },
-  "sources/hermes-phrase-bound-v1/hermes-tool/src/main.rs": {
+  "sources/summa-phrase-bound-v1/summa-tool/src/main.rs": {
     "bytes": 22228,
     "sha256": "b46c2aeddc0a22c6289d8a1a4f3ae5e57c91089ba46c96f1059c29c705c881b7"
   },
-  "sources/hermes-phrase-bound-v1/scripts/search_benchmark/Makefile": {
+  "sources/summa-phrase-bound-v1/scripts/search_benchmark/Makefile": {
     "bytes": 173,
     "sha256": "209b6ddc0e89bebcaea79fafbe68336f070ac7b12417ef078a9abc9f8d6bff72"
   },
-  "sources/hermes-phrase-bound-v1/scripts/search_benchmark/analyze.py": {
+  "sources/summa-phrase-bound-v1/scripts/search_benchmark/analyze.py": {
     "bytes": 3984,
     "sha256": "99216a2458b682667c4d6b86affb5da13c2fea3f298ccd9e3dd41bd075fb1c6d"
   },
-  "sources/hermes-phrase-bound-v1/scripts/search_benchmark/smoke.py": {
+  "sources/summa-phrase-bound-v1/scripts/search_benchmark/smoke.py": {
     "bytes": 2797,
     "sha256": "ccfa0298db6309046714bb0254367189fbebf803742f08ca20dccdb5dc08ed09"
   },
-  "sources/hermes-phrase-bound-v1/scripts/search_benchmark/supplemental_terms.py": {
+  "sources/summa-phrase-bound-v1/scripts/search_benchmark/supplemental_terms.py": {
     "bytes": 747,
     "sha256": "11c8ef1c20ae8226376e0c202eebebd31a5c5dff8ecfde395bbd14dd3b7d4a23"
   },
-  "sources/hermes-phrase-bound-v1/scripts/search_benchmark/verify.py": {
+  "sources/summa-phrase-bound-v1/scripts/search_benchmark/verify.py": {
     "bytes": 3062,
     "sha256": "e6731b06688b6996f6c15e46268363faad2baa207ce0276b6e90909b9fb864bd"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/Cargo.toml": {
+  "sources/summa-posting-validation-v1/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-posting-validation-v1/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-posting-validation-v1/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 11127,
     "sha256": "cbcb7837be3e588274ca093df475fafec2e531b379fda31b9a30595fec9a7139"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-posting-validation-v1/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/index/mod.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/index/mod.rs": {
     "bytes": 37861,
     "sha256": "805df0f789c626d15cb5dc36a6935d05157311b1d8d7c2168fa86748f78aca4a"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/index/wasm_writer.rs": {
     "bytes": 15929,
     "sha256": "0265ebc3264aaac66962a1e609c3dfad6610c8994be6687190aa08c9a433f331"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/index/writer.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/index/writer.rs": {
     "bytes": 101238,
     "sha256": "37f81dd1e56f19f7db7c5b0e7f4c7de6a8b6ce1d64f52007d6a2d149dcd3853d"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/bm25.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/boolean.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/boolean.rs": {
     "bytes": 90060,
     "sha256": "2faa8140148937e4fe96c99bd92733ad572b8261a7fd201c9eedc023edf23908"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/collector.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/collector.rs": {
     "bytes": 57304,
     "sha256": "790804dd996b454186e55b0f0575be52a8d45a9adbd59371f49eae2f3acb9b44"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/docset.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/phrase.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/phrase.rs": {
     "bytes": 49961,
     "sha256": "935f8897e47a80733f351e5d6aa4ed181a82d93c668fa8b685a938fa8cc4eb9d"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/planner.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/scoring.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/term.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/term.rs": {
     "bytes": 36395,
     "sha256": "0d20f72c81a5c425e25ef49cd380a244bafdefebe2a153edfcf48204c8d3e88c"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/query/traits.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/query/traits.rs": {
     "bytes": 27296,
     "sha256": "96a45b9d94e64b29af4000b199bd3c59cfbe42c19237fa526d458ed7e82a4af7"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/segment/builder/config.rs": {
     "bytes": 3416,
     "sha256": "252ea1b3952060ea8cb9186efc63b37ad894edaeb431223554766d1b86c2a303"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/segment/builder/mod.rs": {
     "bytes": 89920,
     "sha256": "787703cf11faf0e1a122e6d2b3e19c6b7c9829872279bcf1e88848f925061587"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16374,
     "sha256": "ca6d9da904f4037d432556e2e52db591331e88c7c7ae87bb94e3f34c0025b99f"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33373,
     "sha256": "1836c0b570260b4bd8ef2c0494b3540130ea855f80bb30a9f5804a3fa2538b3a"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19350,
     "sha256": "f30b187871e9c8c846b2c62bb55631dc74da444716474efe883ffeafad4984cd"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21549,
     "sha256": "6d28a18282132e3c30c7bdc927535aa6e2b936a936b0ffb98b6ccb2a7eef37fc"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/structures/postings/posting.rs": {
     "bytes": 127347,
     "sha256": "93d3fcb932e24cc4d6ff8e29280cabadd22d3c0c878af67a26d42f05f5b5b19d"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 20334,
     "sha256": "ff8a12f146f173e26b6916be33af3301d97a6db573f986ff7d3e4084cc5dd1c2"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/structures/postings/posting/validation.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/structures/postings/posting/validation.rs": {
     "bytes": 7619,
     "sha256": "64dd2a27626686d664921d2f7794885930d3f472f45b31f645a0502b49e26cbf"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/src/structures/simd.rs": {
+  "sources/summa-posting-validation-v1/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/tests/corrupt_text_postings.rs": {
+  "sources/summa-posting-validation-v1/summa-core/tests/corrupt_text_postings.rs": {
     "bytes": 2190,
     "sha256": "0d6d74cb8ed37957857e53a73afe14202975e4bfa39cc21c33abcf43723fe91c"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-posting-validation-v1/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 7349,
     "sha256": "efcd077d6814d6bf84041752b776e3aaec9ca756eb02feaec8a15e390a83da9f"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-posting-validation-v1/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-posting-validation-v1/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-posting-validation-v1/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-posting-validation-v1/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-posting-validation-v1/hermes-tool/src/index_ops.rs": {
+  "sources/summa-posting-validation-v1/summa-tool/src/index_ops.rs": {
     "bytes": 30861,
     "sha256": "2e7936f3c9b447da492c9bdca56790b95a5a10b427599119293cee53201f5a14"
   },
-  "sources/hermes-posting-validation-v1/hermes-tool/src/main.rs": {
+  "sources/summa-posting-validation-v1/summa-tool/src/main.rs": {
     "bytes": 22228,
     "sha256": "b46c2aeddc0a22c6289d8a1a4f3ae5e57c91089ba46c96f1059c29c705c881b7"
   },
-  "sources/hermes-posting-validation-v1/scripts/search_benchmark/Makefile": {
+  "sources/summa-posting-validation-v1/scripts/search_benchmark/Makefile": {
     "bytes": 173,
     "sha256": "209b6ddc0e89bebcaea79fafbe68336f070ac7b12417ef078a9abc9f8d6bff72"
   },
-  "sources/hermes-posting-validation-v1/scripts/search_benchmark/analyze.py": {
+  "sources/summa-posting-validation-v1/scripts/search_benchmark/analyze.py": {
     "bytes": 3984,
     "sha256": "99216a2458b682667c4d6b86affb5da13c2fea3f298ccd9e3dd41bd075fb1c6d"
   },
-  "sources/hermes-posting-validation-v1/scripts/search_benchmark/smoke.py": {
+  "sources/summa-posting-validation-v1/scripts/search_benchmark/smoke.py": {
     "bytes": 2797,
     "sha256": "ccfa0298db6309046714bb0254367189fbebf803742f08ca20dccdb5dc08ed09"
   },
-  "sources/hermes-posting-validation-v1/scripts/search_benchmark/supplemental_terms.py": {
+  "sources/summa-posting-validation-v1/scripts/search_benchmark/supplemental_terms.py": {
     "bytes": 747,
     "sha256": "11c8ef1c20ae8226376e0c202eebebd31a5c5dff8ecfde395bbd14dd3b7d4a23"
   },
-  "sources/hermes-posting-validation-v1/scripts/search_benchmark/verify.py": {
+  "sources/summa-posting-validation-v1/scripts/search_benchmark/verify.py": {
     "bytes": 3062,
     "sha256": "e6731b06688b6996f6c15e46268363faad2baa207ce0276b6e90909b9fb864bd"
   },
-  "sources/hermes-ratios-v3/hermes-core/Cargo.toml": {
+  "sources/summa-ratios-v3/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-ratios-v3/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-ratios-v3/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-ratios-v3/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-ratios-v3/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 11127,
     "sha256": "cbcb7837be3e588274ca093df475fafec2e531b379fda31b9a30595fec9a7139"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-ratios-v3/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-ratios-v3/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/index/mod.rs": {
+  "sources/summa-ratios-v3/summa-core/src/index/mod.rs": {
     "bytes": 37861,
     "sha256": "805df0f789c626d15cb5dc36a6935d05157311b1d8d7c2168fa86748f78aca4a"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-ratios-v3/summa-core/src/index/wasm_writer.rs": {
     "bytes": 15929,
     "sha256": "0265ebc3264aaac66962a1e609c3dfad6610c8994be6687190aa08c9a433f331"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/index/writer.rs": {
+  "sources/summa-ratios-v3/summa-core/src/index/writer.rs": {
     "bytes": 101238,
     "sha256": "37f81dd1e56f19f7db7c5b0e7f4c7de6a8b6ce1d64f52007d6a2d149dcd3853d"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/bm25.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/boolean.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/boolean.rs": {
     "bytes": 85101,
     "sha256": "1091cb1e0c7604ebb4978982ec608cb0a4c36d41620db88d895138fa69db2712"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/collector.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/collector.rs": {
     "bytes": 50742,
     "sha256": "187cd1b0cf90d9e4566e8965cf91ed32fe3868f58435b67822a5c80caa4e6732"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/docset.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/phrase.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/phrase.rs": {
     "bytes": 45544,
     "sha256": "4f248bf9307e2a788b13c5eb9b96f900a18b0ed426401e387f5bdb3a0099e2a4"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/planner.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/scoring.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/term.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/term.rs": {
     "bytes": 26890,
     "sha256": "0ac8a1c6f932b8d45fc4787ae693a3011e68d07de8d44f0529bec600be182b71"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/query/traits.rs": {
+  "sources/summa-ratios-v3/summa-core/src/query/traits.rs": {
     "bytes": 24657,
     "sha256": "144ae2ad602c42a9af57904f33c8d0791530cd7d45839e8998e8c1daf71ab7d8"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-ratios-v3/summa-core/src/segment/builder/config.rs": {
     "bytes": 3416,
     "sha256": "252ea1b3952060ea8cb9186efc63b37ad894edaeb431223554766d1b86c2a303"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-ratios-v3/summa-core/src/segment/builder/mod.rs": {
     "bytes": 89920,
     "sha256": "787703cf11faf0e1a122e6d2b3e19c6b7c9829872279bcf1e88848f925061587"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-ratios-v3/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16374,
     "sha256": "ca6d9da904f4037d432556e2e52db591331e88c7c7ae87bb94e3f34c0025b99f"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-ratios-v3/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33373,
     "sha256": "1836c0b570260b4bd8ef2c0494b3540130ea855f80bb30a9f5804a3fa2538b3a"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-ratios-v3/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19350,
     "sha256": "f30b187871e9c8c846b2c62bb55631dc74da444716474efe883ffeafad4984cd"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-ratios-v3/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21549,
     "sha256": "6d28a18282132e3c30c7bdc927535aa6e2b936a936b0ffb98b6ccb2a7eef37fc"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-ratios-v3/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-ratios-v3/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-ratios-v3/summa-core/src/structures/postings/posting.rs": {
     "bytes": 124067,
     "sha256": "2883381599fcd53d1172f5e8e7c2ac7ff0d926627b13a0833f2f2328f12bf4a3"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-ratios-v3/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 22006,
     "sha256": "773e6e06ca41b913a849af4ed9f1f32dfec2198d6081401e4e68ca3073d967e8"
   },
-  "sources/hermes-ratios-v3/hermes-core/src/structures/simd.rs": {
+  "sources/summa-ratios-v3/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-ratios-v3/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-ratios-v3/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 6989,
     "sha256": "51687c8d1f8b988548076ad7b653eaa0a8ab74fc9293ae39092357021c5fbe8b"
   },
-  "sources/hermes-ratios-v3/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-ratios-v3/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-ratios-v3/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-ratios-v3/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-ratios-v3/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-ratios-v3/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-ratios-v3/hermes-tool/src/index_ops.rs": {
+  "sources/summa-ratios-v3/summa-tool/src/index_ops.rs": {
     "bytes": 30861,
     "sha256": "2e7936f3c9b447da492c9bdca56790b95a5a10b427599119293cee53201f5a14"
   },
-  "sources/hermes-ratios-v3/hermes-tool/src/main.rs": {
+  "sources/summa-ratios-v3/summa-tool/src/main.rs": {
     "bytes": 22228,
     "sha256": "b46c2aeddc0a22c6289d8a1a4f3ae5e57c91089ba46c96f1059c29c705c881b7"
   },
-  "sources/hermes-ratios-v3/scripts/search_benchmark/Makefile": {
+  "sources/summa-ratios-v3/scripts/search_benchmark/Makefile": {
     "bytes": 173,
     "sha256": "209b6ddc0e89bebcaea79fafbe68336f070ac7b12417ef078a9abc9f8d6bff72"
   },
-  "sources/hermes-ratios-v3/scripts/search_benchmark/analyze.py": {
+  "sources/summa-ratios-v3/scripts/search_benchmark/analyze.py": {
     "bytes": 3984,
     "sha256": "99216a2458b682667c4d6b86affb5da13c2fea3f298ccd9e3dd41bd075fb1c6d"
   },
-  "sources/hermes-ratios-v3/scripts/search_benchmark/smoke.py": {
+  "sources/summa-ratios-v3/scripts/search_benchmark/smoke.py": {
     "bytes": 2797,
     "sha256": "ccfa0298db6309046714bb0254367189fbebf803742f08ca20dccdb5dc08ed09"
   },
-  "sources/hermes-ratios-v3/scripts/search_benchmark/supplemental_terms.py": {
+  "sources/summa-ratios-v3/scripts/search_benchmark/supplemental_terms.py": {
     "bytes": 747,
     "sha256": "11c8ef1c20ae8226376e0c202eebebd31a5c5dff8ecfde395bbd14dd3b7d4a23"
   },
-  "sources/hermes-ratios-v3/scripts/search_benchmark/verify.py": {
+  "sources/summa-ratios-v3/scripts/search_benchmark/verify.py": {
     "bytes": 3062,
     "sha256": "e6731b06688b6996f6c15e46268363faad2baa207ce0276b6e90909b9fb864bd"
   },
-  "sources/hermes-score-window-v1/hermes-core/Cargo.toml": {
+  "sources/summa-score-window-v1/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-score-window-v1/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-score-window-v1/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-score-window-v1/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-score-window-v1/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 11127,
     "sha256": "cbcb7837be3e588274ca093df475fafec2e531b379fda31b9a30595fec9a7139"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-score-window-v1/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-score-window-v1/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/index/mod.rs": {
+  "sources/summa-score-window-v1/summa-core/src/index/mod.rs": {
     "bytes": 37861,
     "sha256": "805df0f789c626d15cb5dc36a6935d05157311b1d8d7c2168fa86748f78aca4a"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-score-window-v1/summa-core/src/index/wasm_writer.rs": {
     "bytes": 15929,
     "sha256": "0265ebc3264aaac66962a1e609c3dfad6610c8994be6687190aa08c9a433f331"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/index/writer.rs": {
+  "sources/summa-score-window-v1/summa-core/src/index/writer.rs": {
     "bytes": 101238,
     "sha256": "37f81dd1e56f19f7db7c5b0e7f4c7de6a8b6ce1d64f52007d6a2d149dcd3853d"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/bm25.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/boolean.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/boolean.rs": {
     "bytes": 90060,
     "sha256": "2faa8140148937e4fe96c99bd92733ad572b8261a7fd201c9eedc023edf23908"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/collector.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/collector.rs": {
     "bytes": 53948,
     "sha256": "0373be07eeb0030ff4fb272b9d70b881445093c1e3181a0aa00a73b9dbcad4e7"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/docset.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/phrase.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/phrase.rs": {
     "bytes": 45544,
     "sha256": "4f248bf9307e2a788b13c5eb9b96f900a18b0ed426401e387f5bdb3a0099e2a4"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/planner.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/scoring.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/term.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/term.rs": {
     "bytes": 26890,
     "sha256": "0ac8a1c6f932b8d45fc4787ae693a3011e68d07de8d44f0529bec600be182b71"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/query/traits.rs": {
+  "sources/summa-score-window-v1/summa-core/src/query/traits.rs": {
     "bytes": 26813,
     "sha256": "4eabcbef16697b2a3ac28fab97fb29c1558de60c587ccd4e4fe73896796e25c9"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-score-window-v1/summa-core/src/segment/builder/config.rs": {
     "bytes": 3416,
     "sha256": "252ea1b3952060ea8cb9186efc63b37ad894edaeb431223554766d1b86c2a303"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-score-window-v1/summa-core/src/segment/builder/mod.rs": {
     "bytes": 89920,
     "sha256": "787703cf11faf0e1a122e6d2b3e19c6b7c9829872279bcf1e88848f925061587"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-score-window-v1/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16374,
     "sha256": "ca6d9da904f4037d432556e2e52db591331e88c7c7ae87bb94e3f34c0025b99f"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-score-window-v1/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33373,
     "sha256": "1836c0b570260b4bd8ef2c0494b3540130ea855f80bb30a9f5804a3fa2538b3a"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-score-window-v1/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19350,
     "sha256": "f30b187871e9c8c846b2c62bb55631dc74da444716474efe883ffeafad4984cd"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-score-window-v1/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21549,
     "sha256": "6d28a18282132e3c30c7bdc927535aa6e2b936a936b0ffb98b6ccb2a7eef37fc"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-score-window-v1/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-score-window-v1/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-score-window-v1/summa-core/src/structures/postings/posting.rs": {
     "bytes": 124067,
     "sha256": "2883381599fcd53d1172f5e8e7c2ac7ff0d926627b13a0833f2f2328f12bf4a3"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-score-window-v1/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 22006,
     "sha256": "773e6e06ca41b913a849af4ed9f1f32dfec2198d6081401e4e68ca3073d967e8"
   },
-  "sources/hermes-score-window-v1/hermes-core/src/structures/simd.rs": {
+  "sources/summa-score-window-v1/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-score-window-v1/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-score-window-v1/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 6989,
     "sha256": "51687c8d1f8b988548076ad7b653eaa0a8ab74fc9293ae39092357021c5fbe8b"
   },
-  "sources/hermes-score-window-v1/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-score-window-v1/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-score-window-v1/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-score-window-v1/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-score-window-v1/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-score-window-v1/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-score-window-v1/hermes-tool/src/index_ops.rs": {
+  "sources/summa-score-window-v1/summa-tool/src/index_ops.rs": {
     "bytes": 30861,
     "sha256": "2e7936f3c9b447da492c9bdca56790b95a5a10b427599119293cee53201f5a14"
   },
-  "sources/hermes-score-window-v1/hermes-tool/src/main.rs": {
+  "sources/summa-score-window-v1/summa-tool/src/main.rs": {
     "bytes": 22228,
     "sha256": "b46c2aeddc0a22c6289d8a1a4f3ae5e57c91089ba46c96f1059c29c705c881b7"
   },
-  "sources/hermes-score-window-v1/scripts/search_benchmark/Makefile": {
+  "sources/summa-score-window-v1/scripts/search_benchmark/Makefile": {
     "bytes": 173,
     "sha256": "209b6ddc0e89bebcaea79fafbe68336f070ac7b12417ef078a9abc9f8d6bff72"
   },
-  "sources/hermes-score-window-v1/scripts/search_benchmark/analyze.py": {
+  "sources/summa-score-window-v1/scripts/search_benchmark/analyze.py": {
     "bytes": 3984,
     "sha256": "99216a2458b682667c4d6b86affb5da13c2fea3f298ccd9e3dd41bd075fb1c6d"
   },
-  "sources/hermes-score-window-v1/scripts/search_benchmark/smoke.py": {
+  "sources/summa-score-window-v1/scripts/search_benchmark/smoke.py": {
     "bytes": 2797,
     "sha256": "ccfa0298db6309046714bb0254367189fbebf803742f08ca20dccdb5dc08ed09"
   },
-  "sources/hermes-score-window-v1/scripts/search_benchmark/supplemental_terms.py": {
+  "sources/summa-score-window-v1/scripts/search_benchmark/supplemental_terms.py": {
     "bytes": 747,
     "sha256": "11c8ef1c20ae8226376e0c202eebebd31a5c5dff8ecfde395bbd14dd3b7d4a23"
   },
-  "sources/hermes-score-window-v1/scripts/search_benchmark/verify.py": {
+  "sources/summa-score-window-v1/scripts/search_benchmark/verify.py": {
     "bytes": 3062,
     "sha256": "e6731b06688b6996f6c15e46268363faad2baa207ce0276b6e90909b9fb864bd"
   },
-  "sources/hermes-score-window-v2/hermes-core/Cargo.toml": {
+  "sources/summa-score-window-v2/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-score-window-v2/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-score-window-v2/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-score-window-v2/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-score-window-v2/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 11127,
     "sha256": "cbcb7837be3e588274ca093df475fafec2e531b379fda31b9a30595fec9a7139"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-score-window-v2/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-score-window-v2/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/index/mod.rs": {
+  "sources/summa-score-window-v2/summa-core/src/index/mod.rs": {
     "bytes": 37861,
     "sha256": "805df0f789c626d15cb5dc36a6935d05157311b1d8d7c2168fa86748f78aca4a"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-score-window-v2/summa-core/src/index/wasm_writer.rs": {
     "bytes": 15929,
     "sha256": "0265ebc3264aaac66962a1e609c3dfad6610c8994be6687190aa08c9a433f331"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/index/writer.rs": {
+  "sources/summa-score-window-v2/summa-core/src/index/writer.rs": {
     "bytes": 101238,
     "sha256": "37f81dd1e56f19f7db7c5b0e7f4c7de6a8b6ce1d64f52007d6a2d149dcd3853d"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/bm25.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/boolean.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/boolean.rs": {
     "bytes": 90060,
     "sha256": "2faa8140148937e4fe96c99bd92733ad572b8261a7fd201c9eedc023edf23908"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/collector.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/collector.rs": {
     "bytes": 53948,
     "sha256": "0373be07eeb0030ff4fb272b9d70b881445093c1e3181a0aa00a73b9dbcad4e7"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/docset.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/phrase.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/phrase.rs": {
     "bytes": 45544,
     "sha256": "4f248bf9307e2a788b13c5eb9b96f900a18b0ed426401e387f5bdb3a0099e2a4"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/planner.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/scoring.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/term.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/term.rs": {
     "bytes": 32564,
     "sha256": "ff558c304a0d40d8e1be894b463856bdc9f5eb45a211d2186ee9b2f9f82aec2d"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/query/traits.rs": {
+  "sources/summa-score-window-v2/summa-core/src/query/traits.rs": {
     "bytes": 26813,
     "sha256": "4eabcbef16697b2a3ac28fab97fb29c1558de60c587ccd4e4fe73896796e25c9"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-score-window-v2/summa-core/src/segment/builder/config.rs": {
     "bytes": 3416,
     "sha256": "252ea1b3952060ea8cb9186efc63b37ad894edaeb431223554766d1b86c2a303"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-score-window-v2/summa-core/src/segment/builder/mod.rs": {
     "bytes": 89920,
     "sha256": "787703cf11faf0e1a122e6d2b3e19c6b7c9829872279bcf1e88848f925061587"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-score-window-v2/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16374,
     "sha256": "ca6d9da904f4037d432556e2e52db591331e88c7c7ae87bb94e3f34c0025b99f"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-score-window-v2/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33373,
     "sha256": "1836c0b570260b4bd8ef2c0494b3540130ea855f80bb30a9f5804a3fa2538b3a"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-score-window-v2/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19350,
     "sha256": "f30b187871e9c8c846b2c62bb55631dc74da444716474efe883ffeafad4984cd"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-score-window-v2/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21549,
     "sha256": "6d28a18282132e3c30c7bdc927535aa6e2b936a936b0ffb98b6ccb2a7eef37fc"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-score-window-v2/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-score-window-v2/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-score-window-v2/summa-core/src/structures/postings/posting.rs": {
     "bytes": 126825,
     "sha256": "5e6f287239426ae8494e8a3ecef7d7737a4f0d50159b0908e05fbff9f54a26d8"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-score-window-v2/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 22006,
     "sha256": "773e6e06ca41b913a849af4ed9f1f32dfec2198d6081401e4e68ca3073d967e8"
   },
-  "sources/hermes-score-window-v2/hermes-core/src/structures/simd.rs": {
+  "sources/summa-score-window-v2/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-score-window-v2/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-score-window-v2/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 7349,
     "sha256": "efcd077d6814d6bf84041752b776e3aaec9ca756eb02feaec8a15e390a83da9f"
   },
-  "sources/hermes-score-window-v2/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-score-window-v2/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-score-window-v2/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-score-window-v2/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-score-window-v2/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-score-window-v2/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-score-window-v2/hermes-tool/src/index_ops.rs": {
+  "sources/summa-score-window-v2/summa-tool/src/index_ops.rs": {
     "bytes": 30861,
     "sha256": "2e7936f3c9b447da492c9bdca56790b95a5a10b427599119293cee53201f5a14"
   },
-  "sources/hermes-score-window-v2/hermes-tool/src/main.rs": {
+  "sources/summa-score-window-v2/summa-tool/src/main.rs": {
     "bytes": 22228,
     "sha256": "b46c2aeddc0a22c6289d8a1a4f3ae5e57c91089ba46c96f1059c29c705c881b7"
   },
-  "sources/hermes-score-window-v2/scripts/search_benchmark/Makefile": {
+  "sources/summa-score-window-v2/scripts/search_benchmark/Makefile": {
     "bytes": 173,
     "sha256": "209b6ddc0e89bebcaea79fafbe68336f070ac7b12417ef078a9abc9f8d6bff72"
   },
-  "sources/hermes-score-window-v2/scripts/search_benchmark/analyze.py": {
+  "sources/summa-score-window-v2/scripts/search_benchmark/analyze.py": {
     "bytes": 3984,
     "sha256": "99216a2458b682667c4d6b86affb5da13c2fea3f298ccd9e3dd41bd075fb1c6d"
   },
-  "sources/hermes-score-window-v2/scripts/search_benchmark/smoke.py": {
+  "sources/summa-score-window-v2/scripts/search_benchmark/smoke.py": {
     "bytes": 2797,
     "sha256": "ccfa0298db6309046714bb0254367189fbebf803742f08ca20dccdb5dc08ed09"
   },
-  "sources/hermes-score-window-v2/scripts/search_benchmark/supplemental_terms.py": {
+  "sources/summa-score-window-v2/scripts/search_benchmark/supplemental_terms.py": {
     "bytes": 747,
     "sha256": "11c8ef1c20ae8226376e0c202eebebd31a5c5dff8ecfde395bbd14dd3b7d4a23"
   },
-  "sources/hermes-score-window-v2/scripts/search_benchmark/verify.py": {
+  "sources/summa-score-window-v2/scripts/search_benchmark/verify.py": {
     "bytes": 3062,
     "sha256": "e6731b06688b6996f6c15e46268363faad2baa207ce0276b6e90909b9fb864bd"
   },
-  "sources/hermes-score-window-v3/hermes-core/Cargo.toml": {
+  "sources/summa-score-window-v3/summa-core/Cargo.toml": {
     "bytes": 4788,
     "sha256": "07db84190246dbf264c072ff9f23b12de1e1a8761bc47af77ebc6efe3a2be45f"
   },
-  "sources/hermes-score-window-v3/hermes-core/benches/rust_hot_paths.rs": {
+  "sources/summa-score-window-v3/summa-core/benches/rust_hot_paths.rs": {
     "bytes": 9927,
     "sha256": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f"
   },
-  "sources/hermes-score-window-v3/hermes-core/examples/search_benchmark_game.rs": {
+  "sources/summa-score-window-v3/summa-core/examples/search_benchmark_game.rs": {
     "bytes": 11127,
     "sha256": "cbcb7837be3e588274ca093df475fafec2e531b379fda31b9a30595fec9a7139"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/dsl/ql/mod.rs": {
+  "sources/summa-score-window-v3/summa-core/src/dsl/ql/mod.rs": {
     "bytes": 44539,
     "sha256": "d68d0c1a68e49b97f0af6829b9fd565e469ca7dd4c99f38351106c8acb665da0"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/dsl/ql/ql.pest": {
+  "sources/summa-score-window-v3/summa-core/src/dsl/ql/ql.pest": {
     "bytes": 2401,
     "sha256": "84d1845e64f5b25739339181fe2c370bfe65cde2105019ee39df04940f1e5b4d"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/index/mod.rs": {
+  "sources/summa-score-window-v3/summa-core/src/index/mod.rs": {
     "bytes": 37861,
     "sha256": "805df0f789c626d15cb5dc36a6935d05157311b1d8d7c2168fa86748f78aca4a"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/index/wasm_writer.rs": {
+  "sources/summa-score-window-v3/summa-core/src/index/wasm_writer.rs": {
     "bytes": 15929,
     "sha256": "0265ebc3264aaac66962a1e609c3dfad6610c8994be6687190aa08c9a433f331"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/index/writer.rs": {
+  "sources/summa-score-window-v3/summa-core/src/index/writer.rs": {
     "bytes": 101238,
     "sha256": "37f81dd1e56f19f7db7c5b0e7f4c7de6a8b6ce1d64f52007d6a2d149dcd3853d"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/bm25.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/bm25.rs": {
     "bytes": 9205,
     "sha256": "d89ecc61917bce55bc919d25deb7ffd29087d6c53d809979798309ac5d527dc9"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/boolean.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/boolean.rs": {
     "bytes": 90060,
     "sha256": "2faa8140148937e4fe96c99bd92733ad572b8261a7fd201c9eedc023edf23908"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/collector.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/collector.rs": {
     "bytes": 57304,
     "sha256": "790804dd996b454186e55b0f0575be52a8d45a9adbd59371f49eae2f3acb9b44"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/docset.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/docset.rs": {
     "bytes": 15532,
     "sha256": "57967ce8bc20675a22450af63b09aa6640544564689419b19b6c3ab1daf08d21"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/phrase.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/phrase.rs": {
     "bytes": 49961,
     "sha256": "935f8897e47a80733f351e5d6aa4ed181a82d93c668fa8b685a938fa8cc4eb9d"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/planner.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/planner.rs": {
     "bytes": 43344,
     "sha256": "4246a53ce9a1ce67e8a1a31ae33f1e6f992143333c622850018bea29334f0f8b"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/scoring.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/scoring.rs": {
     "bytes": 116069,
     "sha256": "9c44bc71e16d2aacfc80721720d643675ad4ded8c09619bbec2820e6fcbefa71"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/term.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/term.rs": {
     "bytes": 36395,
     "sha256": "0d20f72c81a5c425e25ef49cd380a244bafdefebe2a153edfcf48204c8d3e88c"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/query/traits.rs": {
+  "sources/summa-score-window-v3/summa-core/src/query/traits.rs": {
     "bytes": 27296,
     "sha256": "96a45b9d94e64b29af4000b199bd3c59cfbe42c19237fa526d458ed7e82a4af7"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/segment/builder/config.rs": {
+  "sources/summa-score-window-v3/summa-core/src/segment/builder/config.rs": {
     "bytes": 3416,
     "sha256": "252ea1b3952060ea8cb9186efc63b37ad894edaeb431223554766d1b86c2a303"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/segment/builder/mod.rs": {
+  "sources/summa-score-window-v3/summa-core/src/segment/builder/mod.rs": {
     "bytes": 89920,
     "sha256": "787703cf11faf0e1a122e6d2b3e19c6b7c9829872279bcf1e88848f925061587"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/segment/builder/postings.rs": {
+  "sources/summa-score-window-v3/summa-core/src/segment/builder/postings.rs": {
     "bytes": 16374,
     "sha256": "ca6d9da904f4037d432556e2e52db591331e88c7c7ae87bb94e3f34c0025b99f"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/segment/merger/compact.rs": {
+  "sources/summa-score-window-v3/summa-core/src/segment/merger/compact.rs": {
     "bytes": 33373,
     "sha256": "1836c0b570260b4bd8ef2c0494b3540130ea855f80bb30a9f5804a3fa2538b3a"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/segment/reader/candidate_lookup.rs": {
+  "sources/summa-score-window-v3/summa-core/src/segment/reader/candidate_lookup.rs": {
     "bytes": 19350,
     "sha256": "f30b187871e9c8c846b2c62bb55631dc74da444716474efe883ffeafad4984cd"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/segment/text_reorder.rs": {
+  "sources/summa-score-window-v3/summa-core/src/segment/text_reorder.rs": {
     "bytes": 21549,
     "sha256": "6d28a18282132e3c30c7bdc927535aa6e2b936a936b0ffb98b6ccb2a7eef37fc"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/structures/postings/horizontal_bp128.rs": {
+  "sources/summa-score-window-v3/summa-core/src/structures/postings/horizontal_bp128.rs": {
     "bytes": 28372,
     "sha256": "40db2fc9f10511d72f9900ece6e7a8671ee219ce6456cc09e00483f8e06140e3"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/structures/postings/opt_p4d.rs": {
+  "sources/summa-score-window-v3/summa-core/src/structures/postings/opt_p4d.rs": {
     "bytes": 32125,
     "sha256": "4d771a96b2b8a59044c864a51d34720b99fbea854577b7e431d79754b29320a6"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/structures/postings/posting.rs": {
+  "sources/summa-score-window-v3/summa-core/src/structures/postings/posting.rs": {
     "bytes": 126825,
     "sha256": "5e6f287239426ae8494e8a3ecef7d7737a4f0d50159b0908e05fbff9f54a26d8"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/structures/postings/posting/compact.rs": {
+  "sources/summa-score-window-v3/summa-core/src/structures/postings/posting/compact.rs": {
     "bytes": 22006,
     "sha256": "773e6e06ca41b913a849af4ed9f1f32dfec2198d6081401e4e68ca3073d967e8"
   },
-  "sources/hermes-score-window-v3/hermes-core/src/structures/simd.rs": {
+  "sources/summa-score-window-v3/summa-core/src/structures/simd.rs": {
     "bytes": 198063,
     "sha256": "8e6a2f40e854a23ab3485ad145688c45d0b892ee3ca14ff81d1a610c13a6ccaf"
   },
-  "sources/hermes-score-window-v3/hermes-core/tests/exhaustive_text_collection.rs": {
+  "sources/summa-score-window-v3/summa-core/tests/exhaustive_text_collection.rs": {
     "bytes": 7349,
     "sha256": "efcd077d6814d6bf84041752b776e3aaec9ca756eb02feaec8a15e390a83da9f"
   },
-  "sources/hermes-score-window-v3/hermes-core/tests/query_required_clauses.rs": {
+  "sources/summa-score-window-v3/summa-core/tests/query_required_clauses.rs": {
     "bytes": 9622,
     "sha256": "b32eff09e3619e2a2898f1389feec437db32172be6f67aa699bd30d17da1020e"
   },
-  "sources/hermes-score-window-v3/hermes-core/tests/ranked_term_collection.rs": {
+  "sources/summa-score-window-v3/summa-core/tests/ranked_term_collection.rs": {
     "bytes": 8512,
     "sha256": "843c68a77506eaeb497c8c3e58a5a71654afa8c1fad9a8d09b54294641c52551"
   },
-  "sources/hermes-score-window-v3/hermes-core/tests/ratio_chunked_collection.rs": {
+  "sources/summa-score-window-v3/summa-core/tests/ratio_chunked_collection.rs": {
     "bytes": 5606,
     "sha256": "d90379f01522e01691283f23bcd95e8f77e1b2533219435cb793dc84301a8e01"
   },
-  "sources/hermes-score-window-v3/hermes-tool/src/index_ops.rs": {
+  "sources/summa-score-window-v3/summa-tool/src/index_ops.rs": {
     "bytes": 30861,
     "sha256": "2e7936f3c9b447da492c9bdca56790b95a5a10b427599119293cee53201f5a14"
   },
-  "sources/hermes-score-window-v3/hermes-tool/src/main.rs": {
+  "sources/summa-score-window-v3/summa-tool/src/main.rs": {
     "bytes": 22228,
     "sha256": "b46c2aeddc0a22c6289d8a1a4f3ae5e57c91089ba46c96f1059c29c705c881b7"
   },
-  "sources/hermes-score-window-v3/scripts/search_benchmark/Makefile": {
+  "sources/summa-score-window-v3/scripts/search_benchmark/Makefile": {
     "bytes": 173,
     "sha256": "209b6ddc0e89bebcaea79fafbe68336f070ac7b12417ef078a9abc9f8d6bff72"
   },
-  "sources/hermes-score-window-v3/scripts/search_benchmark/analyze.py": {
+  "sources/summa-score-window-v3/scripts/search_benchmark/analyze.py": {
     "bytes": 3984,
     "sha256": "99216a2458b682667c4d6b86affb5da13c2fea3f298ccd9e3dd41bd075fb1c6d"
   },
-  "sources/hermes-score-window-v3/scripts/search_benchmark/smoke.py": {
+  "sources/summa-score-window-v3/scripts/search_benchmark/smoke.py": {
     "bytes": 2797,
     "sha256": "ccfa0298db6309046714bb0254367189fbebf803742f08ca20dccdb5dc08ed09"
   },
-  "sources/hermes-score-window-v3/scripts/search_benchmark/supplemental_terms.py": {
+  "sources/summa-score-window-v3/scripts/search_benchmark/supplemental_terms.py": {
     "bytes": 747,
     "sha256": "11c8ef1c20ae8226376e0c202eebebd31a5c5dff8ecfde395bbd14dd3b7d4a23"
   },
-  "sources/hermes-score-window-v3/scripts/search_benchmark/verify.py": {
+  "sources/summa-score-window-v3/scripts/search_benchmark/verify.py": {
     "bytes": 3062,
     "sha256": "e6731b06688b6996f6c15e46268363faad2baa207ce0276b6e90909b9fb864bd"
   },

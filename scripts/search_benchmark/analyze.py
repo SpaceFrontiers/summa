@@ -91,7 +91,7 @@ if __name__ == "__main__":
     parser.add_argument("results")
     parser.add_argument("--candidate-results", help="separate candidate results file")
     parser.add_argument("--baseline", default="tantivy-0.26")
-    parser.add_argument("--candidate", default="hermes")
+    parser.add_argument("--candidate", default="summa")
     args = parser.parse_args()
     candidate_data = None
     if args.candidate_results:

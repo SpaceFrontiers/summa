@@ -1,4 +1,4 @@
-   Compiling hermes-core v1.8.146 (/Users/pasha/conductor/workspaces/hermes/jerusalem/hermes-core)
+   Compiling summa-core v1.8.146 (/Users/pasha/conductor/workspaces/summa/jerusalem/summa-core)
     Finished `bench` profile [optimized] target(s) in 49.81s
      Running benches/rust_hot_paths.rs (target/release/deps/rust_hot_paths-4420a8aeca31a8b8)
 Gnuplot not found, using plotters backend

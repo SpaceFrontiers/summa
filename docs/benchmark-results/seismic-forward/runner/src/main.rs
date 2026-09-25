@@ -1,4 +1,4 @@
-use hermes_core::{
+use summa_core::{
     directories::MmapDirectory,
     dsl::{Document, SchemaBuilder},
     index::{Index, IndexConfig, IndexWriter},
@@ -48,7 +48,7 @@ fn config() -> IndexConfig {
         num_indexing_threads: 1,
         num_compression_threads: 2,
         max_indexing_memory_bytes: 16 * 1024 * 1024 * 1024,
-        merge_policy: Box::new(hermes_core::merge::NoMergePolicy),
+        merge_policy: Box::new(summa_core::merge::NoMergePolicy),
         ..IndexConfig::default()
     }
 }
@@ -98,7 +98,7 @@ fn backend(path: &Path) -> String {
 }
 #[tokio::main]
 async fn main() {
-    if std::env::var_os("HERMES_BENCH_LOG").is_some() {
+    if std::env::var_os("SUMMA_BENCH_LOG").is_some() {
         log::set_logger(&LOGGER).unwrap();
         log::set_max_level(log::LevelFilter::Debug);
     }
@@ -145,7 +145,7 @@ async fn main() {
                     doc.add_sparse_vector(field, corpus.row(row));
                     match writer.add_document(doc) {
                         Ok(()) => break,
-                        Err(hermes_core::Error::QueueFull) => {
+                        Err(summa_core::Error::QueueFull) => {
                             backpressure_retries += 1;
                             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                         }

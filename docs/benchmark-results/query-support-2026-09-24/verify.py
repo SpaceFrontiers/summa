@@ -22,7 +22,7 @@ def verify(binary, output):
     assert len(rows) == 826
     before = json.loads((HERE / "before.json").read_text())
     assert hashlib.sha256(queries.read_bytes()).hexdigest() == before["queries_sha256"]
-    with tempfile.TemporaryDirectory(prefix="hermes-query-support-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="summa-query-support-") as temporary:
         directory = Path(temporary)
         corpus = directory / "corpus.jsonl"
         corpus.write_text(

@@ -4,7 +4,7 @@
 
 The adopted reader improves official RGB top-10 **2.0%**, from 441.487 to
 432.761 µs in the independent paired run. Lucene RGB takes 420.303 µs:
-**Hermes remains 3.0% slower; the parity target is not met.** These are geometric
+**Summa remains 3.0% slower; the parity target is not met.** These are geometric
 means of per-query medians over seven passes and 962 official queries on the
 frozen 5,032,104-document x86 fixture.
 
@@ -28,7 +28,7 @@ Nothing has been committed. The validation machine is confirmed **TERMINATED**.
 
 ## Earlier: RGB versus Lucene — September 16, 2026
 
-The target is RGB top-10 faster than **Lucene BP/RGB**. The selected Hermes
+The target is RGB top-10 faster than **Lucene BP/RGB**. The selected Summa
 reader is **6.7% slower** in the final confirmation: 416.881 µs versus
 390.625 µs. It improves 1.3% from the same-run predecessor (422.282 µs).
 Top-1000 is 824.472 µs versus Lucene's 848.283 µs. The selected fix removes
@@ -39,12 +39,12 @@ The earlier all-command comparison below predates that two-term optimization.
 It uses the same host, corpus and seven-pass warm serial protocol, geometric
 means of per-query median microseconds; do not pool timings across runs:
 
-| Operation             | Hermes RGB | Lucene BP/RGB | Tantivy |
-| --------------------- | ---------: | ------------: | ------: |
-| Top 10                |    424.943 |       393.534 | 532.048 |
-| Top 1000              |    839.102 |       854.396 | 927.447 |
-| Top 100 + exact count |    724.421 |      1078.629 | 875.129 |
-| Exact count           |    349.461 |       378.291 | 428.260 |
+| Operation             | Summa RGB | Lucene BP/RGB | Tantivy |
+| --------------------- | --------: | ------------: | ------: |
+| Top 10                |   424.943 |       393.534 | 532.048 |
+| Top 1000              |   839.102 |       854.396 | 927.447 |
+| Top 100 + exact count |   724.421 |      1078.629 | 875.129 |
+| Exact count           |   349.461 |       378.291 | 428.260 |
 
 The reader retains physical traversal through same-field composition, maps IDs
 at collection, reuses typed conjunctions, switches proven OR tails to that
@@ -60,17 +60,17 @@ top-10. It remains opt-in for storage and residency: final top-10 RSS is
 
 ## Earlier: block execution — September 16, 2026
 
-**Hermes is faster on all four official benchmark commands with RGB disabled.**
+**Summa is faster on all four official benchmark commands with RGB disabled.**
 The selected `packed` reader uses unchanged compact postings with exact norms.
 Same-run seven-pass comparison: 5,032,104 documents, 962 official queries;
 geometric means of per-query median microseconds.
 
-| Operation             | Starting Hermes | Selected Hermes | Tantivy | Hermes / Tantivy |
-| --------------------- | --------------: | --------------: | ------: | ---------------: |
-| Top 10                |         613.554 |         507.672 | 528.746 |           0.960× |
-| Top 1000              |        1097.240 |         916.958 | 934.137 |           0.982× |
-| Top 100 + exact count |        1166.682 |         800.381 | 875.478 |           0.914× |
-| Exact count           |         477.260 |         406.881 | 431.714 |           0.942× |
+| Operation             | Starting Summa | Selected Summa | Tantivy | Summa / Tantivy |
+| --------------------- | -------------: | -------------: | ------: | --------------: |
+| Top 10                |        613.554 |        507.672 | 528.746 |          0.960× |
+| Top 1000              |       1097.240 |        916.958 | 934.137 |          0.982× |
+| Top 100 + exact count |       1166.682 |        800.381 | 875.478 |          0.914× |
+| Exact count           |        477.260 |        406.881 | 431.714 |          0.942× |
 
 Official-workload parity is reached in this warm serial benchmark. Supplemental
 standalone queries, some individual query families and memory usage still lag;
@@ -143,21 +143,21 @@ Rust 1.98.1 / LLVM 22.1.8, release LTO and native CPU flags, same Cascade Lake m
 CPU 2. A sixth same-run engine retains the first byte-norm reader to isolate the final
 header/payload cleanup. Seven rotated complete query passes follow at least ten seconds of warmup
 per engine/command. Values below are geometric means of per-query median
-microseconds. Starting Hermes is the preserved September 16 admission/position
+microseconds. Starting Summa is the preserved September 16 admission/position
 build. The reader-only control isolates code overhead on the unchanged index.
-All Hermes indexes use Rounded payloads, ratio/L1 bounds and no impact envelopes.
+All Summa indexes use Rounded payloads, ratio/L1 bounds and no impact envelopes.
 No build, full-file audit or memory run overlaps latency on the same host.
 
 ### Official workload
 
-| Operation             | Starting Hermes | New reader / old index | Compact / exact norms | Compact / byte norms | Tantivy |
-| --------------------- | --------------: | ---------------------: | --------------------: | -------------------: | ------: |
-| Top 10                |         599.138 |                603.573 |               596.942 |              629.555 | 501.876 |
-| Top 1000              |        1067.240 |               1068.751 |              1061.968 |             1109.537 | 893.010 |
-| Top 100 + exact count |        1102.459 |               1138.192 |              1122.861 |             1127.345 | 852.191 |
-| Exact count           |         446.752 |                457.626 |               449.035 |              461.769 | 405.000 |
+| Operation             | Starting Summa | New reader / old index | Compact / exact norms | Compact / byte norms | Tantivy |
+| --------------------- | -------------: | ---------------------: | --------------------: | -------------------: | ------: |
+| Top 10                |        599.138 |                603.573 |               596.942 |              629.555 | 501.876 |
+| Top 1000              |       1067.240 |               1068.751 |              1061.968 |             1109.537 | 893.010 |
+| Top 100 + exact count |       1102.459 |               1138.192 |              1122.861 |             1127.345 | 852.191 |
+| Exact count           |        446.752 |                457.626 |               449.035 |              461.769 | 405.000 |
 
-Against starting Hermes, compact/exact changes: Top 10 -0.4%, Top 1000 -0.5%, Top 100 + exact count +1.9%, Exact count +0.5%.
+Against starting Summa, compact/exact changes: Top 10 -0.4%, Top 1000 -0.5%, Top 100 + exact count +1.9%, Exact count +0.5%.
 Compact/byte changes: Top 10 +5.1%, Top 1000 +4.0%, Top 100 + exact count +2.3%, Exact count +3.4%.
 The final reader also shares the descriptor and L0 borrow and reuses decoded
 block header/payload lookups. Against the first byte-norm reader in this same
@@ -168,12 +168,12 @@ order; these remaining reader costs also affect indexes using the old formats.
 
 ### Supplemental standalone terms
 
-| Operation             | Starting Hermes | New reader / old index | Compact / exact norms | Compact / byte norms | Tantivy |
-| --------------------- | --------------: | ---------------------: | --------------------: | -------------------: | ------: |
-| Top 10                |         136.871 |                135.887 |               136.139 |              141.341 |  50.331 |
-| Top 1000              |         566.836 |                569.913 |               569.903 |              650.732 | 424.354 |
-| Top 100 + exact count |         259.474 |                260.671 |               261.881 |              260.305 | 255.833 |
-| Exact count           |          13.141 |                 13.005 |                12.941 |               12.871 |   9.109 |
+| Operation             | Starting Summa | New reader / old index | Compact / exact norms | Compact / byte norms | Tantivy |
+| --------------------- | -------------: | ---------------------: | --------------------: | -------------------: | ------: |
+| Top 10                |        136.871 |                135.887 |               136.139 |              141.341 |  50.331 |
+| Top 1000              |        566.836 |                569.913 |               569.903 |              650.732 | 424.354 |
+| Top 100 + exact count |        259.474 |                260.671 |               261.881 |              260.305 | 255.833 |
+| Exact count           |         13.141 |                 13.005 |                12.941 |               12.871 |   9.109 |
 
 Compact/byte changes: Top 10 +3.3%, Top 1000 +14.8%, Top 100 + exact count +0.3%, Exact count -2.1%.
 The final reader cleanup regresses standalone byte-norm top-1000 5.5% versus
@@ -188,12 +188,12 @@ These are warm single-CPU measurements, not concurrent-service tail latency.
 passes. Shared Mac load limits small-difference claims. There is no ARM Tantivy
 comparison in this run.
 
-| Operation             | Starting Hermes | New reader / old index | Compact / exact norms | Compact / byte norms |
-| --------------------- | --------------: | ---------------------: | --------------------: | -------------------: |
-| Top 10                |          32.769 |                 32.739 |                33.151 |               32.674 |
-| Top 1000              |          48.015 |                 48.339 |                48.268 |               48.997 |
-| Top 100 + exact count |          37.498 |                 37.448 |                37.954 |               37.336 |
-| Exact count           |          25.587 |                 25.757 |                26.179 |               25.925 |
+| Operation             | Starting Summa | New reader / old index | Compact / exact norms | Compact / byte norms |
+| --------------------- | -------------: | ---------------------: | --------------------: | -------------------: |
+| Top 10                |         32.769 |                 32.739 |                33.151 |               32.674 |
+| Top 1000              |         48.015 |                 48.339 |                48.268 |               48.997 |
+| Top 100 + exact count |         37.498 |                 37.448 |                37.954 |               37.336 |
+| Exact count           |         25.587 |                 25.757 |                26.179 |               25.925 |
 
 Compact/byte official changes: Top 10 -0.3%, Top 1000 +2.0%, Top 100 + exact count -0.4%, Exact count +1.3%.
 The mixed ARM results do not support a default change.

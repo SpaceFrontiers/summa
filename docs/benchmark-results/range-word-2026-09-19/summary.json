@@ -14,7 +14,7 @@
     "before": {
       "environment": {
         "revision": "c11169b41aa04fff00fd9c4204cacdedd76d0943",
-        "status": "M hermes-core/tests/range_bitset.rs\n?? docs/range-word-materialization.md",
+        "status": "M summa-core/tests/range_bitset.rs\n?? docs/range-word-materialization.md",
         "working_diff_sha256": "31194def0d1cc148a49eda272138fd109be08b2e988d1445180ba08e66681adb",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -31,8 +31,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "command": [
@@ -40,7 +40,7 @@
         "bench",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--bench",
         "rust_hot_paths",
         "--",
@@ -53,7 +53,7 @@
     "after": {
       "environment": {
         "revision": "c11169b41aa04fff00fd9c4204cacdedd76d0943",
-        "status": "M hermes-core/src/query/range.rs\n M hermes-core/src/query/traits.rs\n M hermes-core/src/structures/fast_field/mod.rs\n M hermes-core/tests/range_bitset.rs\n?? docs/range-word-materialization.md",
+        "status": "M summa-core/src/query/range.rs\n M summa-core/src/query/traits.rs\n M summa-core/src/structures/fast_field/mod.rs\n M summa-core/tests/range_bitset.rs\n?? docs/range-word-materialization.md",
         "working_diff_sha256": "dba240097a466af6d74ae3d29dc6748cbea73889bb73a8b61e4ce96240fd0928",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -70,8 +70,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "command": [
@@ -79,7 +79,7 @@
         "bench",
         "--locked",
         "-p",
-        "hermes-core",
+        "summa-core",
         "--bench",
         "rust_hot_paths",
         "--",
@@ -354,10 +354,10 @@
     "after_materializer": 668
   },
   "after_source_sha256": {
-    "hermes-core/benches/rust_hot_paths.rs": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f",
-    "hermes-core/src/query/range.rs": "3207928002687ec1ab591ed24ed4931340323122a13dde805a76ad975b46c9c8",
-    "hermes-core/src/query/traits.rs": "d558d30ef904381005265416cf3c98103b6415df260264a831ea64cbbb64adf3",
-    "hermes-core/src/structures/fast_field/mod.rs": "c2d779160e3f602cc933f8995928d3cdc3d78a814b6373706a0f216e97add5b0"
+    "summa-core/benches/rust_hot_paths.rs": "a8cb32bbde28fe993cc66f831fbeb037ae03da3118d7a6adc83d7b605ea6305f",
+    "summa-core/src/query/range.rs": "3207928002687ec1ab591ed24ed4931340323122a13dde805a76ad975b46c9c8",
+    "summa-core/src/query/traits.rs": "d558d30ef904381005265416cf3c98103b6415df260264a831ea64cbbb64adf3",
+    "summa-core/src/structures/fast_field/mod.rs": "c2d779160e3f602cc933f8995928d3cdc3d78a814b6373706a0f216e97add5b0"
   },
   "limitations": [
     "Single Apple M4 host with unrelated desktop/VPN activity; no task-owned compilation during timing.",

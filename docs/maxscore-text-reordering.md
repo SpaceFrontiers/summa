@@ -7,7 +7,7 @@ use bounded scratch; ordinary merges preserve existing physical maps.
 
 The original Tantivy parity target is measured with **RGB disabled**. Reordering
 results are reported separately. The additional September 16 requirement is for
-Hermes RGB top-10 to beat Lucene with BP/RGB on the same corpus and machine;
+Summa RGB top-10 to beat Lucene with BP/RGB on the same corpus and machine;
 beating Tantivy alone does not satisfy this requirement.
 
 ## Required behavior
@@ -264,7 +264,7 @@ fixture before attributing timing or residency differences to encoding.
 
 The current BP graph admits every term with document frequency at least two.
 Lucene's BP defaults to a much higher minimum frequency on large corpora. An
-isolated Hermes experiment keeps the 128-document terminal partition and tests
+isolated Summa experiment keeps the 128-document terminal partition and tests
 `max(2, min(4096, document_count / 1024))` as the graph's eligibility threshold.
 This focuses graph work on common posting lists while retaining small-index
 behavior. All terms are still encoded and searchable; the threshold changes only
@@ -304,7 +304,7 @@ is added. Correctness and cross-architecture timings decide whether it is kept.
 
 [Lucene 10.4 MaxScoreBulkScorer](https://github.com/apache/lucene/blob/releases/lucene/10.4.0/lucene/core/src/java/org/apache/lucene/search/MaxScoreBulkScorer.java)
 computes the next outer window from the previous local essential set.
-Hermes currently uses the global partition for every boundary, even when a
+Summa currently uses the global partition for every boundary, even when a
 frequent clause was non-essential in the preceding local window. An isolated
 mapped-union experiment retains the previous local essential set for choosing
 only the next end boundary. The start still includes every globally essential
@@ -318,11 +318,11 @@ may amortize bound work without adaptive counters or another executor.
 PISA's [Block-Max MaxScore implementation](https://github.com/pisa-engine/pisa/blob/master/include/pisa/query/algorithm/block_max_maxscore_query.hpp)
 visits essential cursors per document, refines non-essential bounds, and then
 probes survivors. This supports separating bound refinement from scoring, but
-is not evidence that returning Hermes to document-at-a-time execution would
-improve this workload. Its arithmetic also differs from Hermes's canonical
+is not evidence that returning Summa to document-at-a-time execution would
+improve this workload. Its arithmetic also differs from Summa's canonical
 query-order score reduction. PISA's [vectorized BMM discussion](https://github.com/pisa-engine/pisa/issues/629)
 specifically identifies Lucene's vectorized implementation as a comparison
-worth adding. The measured Hermes probes retain the existing bounded window
+worth adding. The measured Summa probes retain the existing bounded window
 executor and its exact score contract.
 
 ### Canonical reduction loop order experiment

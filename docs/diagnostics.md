@@ -1,6 +1,6 @@
 # Index diagnostics
 
-Hermes had no way to answer "is this index healthy?" short of reading payload
+Summa had no way to answer "is this index healthy?" short of reading payload
 bytes off disk by hand. Two production incidents motivated this feature, both
 of which were invisible until latency regressed:
 
@@ -27,7 +27,7 @@ of which were invisible until latency regressed:
   unchanged as the canonical skew metric.
 - **Elasticsearch's disk-usage API** breaks index footprint down per field,
   behind `run_expensive_tasks=true`. Our TOCs already carry per-field extents,
-  so Hermes reports this for free.
+  so Summa reports this for free.
 
 ## Coverage
 
@@ -127,18 +127,18 @@ Emitted at every segment open:
   largest_leaf=30.7% payload=19.5 GiB
 ```
 
-plus gauges (`hermes_ann_imbalance`, `hermes_ann_fragmentation`,
-`hermes_ann_largest_leaf_share`, labelled `index`/`field`) so dashboards see
+plus gauges (`summa_ann_imbalance`, `summa_ann_fragmentation`,
+`summa_ann_largest_leaf_share`, labelled `index`/`field`) so dashboards see
 drift without log scraping. Threshold breaches log at `warn`.
 
 After all segments load, the searcher logs one per-field aggregate line, so
 an operator reads index health from N_fields lines instead of
 N_segments × N_fields.
 
-### Active: `hermes-tool diagnose` (on demand)
+### Active: `summa-tool diagnose` (on demand)
 
 ```
-hermes-tool diagnose -i ./my_index [--json] \
+summa-tool diagnose -i ./my_index [--json] \
     [--sample N] [--probe-cost NPROBE] [--residency]
 ```
 
@@ -170,27 +170,27 @@ cron.
 
 ## What is deliberately not here
 
-- No corruption checking — Hermes validates checksums and structure at open;
+- No corruption checking — Summa validates checksums and structure at open;
   duplicating Lucene's exhaustive `-slow` verify adds cost without new
   information.
 - No automatic remediation. The tool reports; retraining or re-embedding are
   operator decisions.
 - No background scan thread in the server. Segment-open reporting plus a
   cron'd `diagnose --json` covers the periodic case without a new scheduler
-  in hermes-core.
+  in summa-core.
 
 ## Usage
 
 ```bash
 # Cheap report, safe against a live index
-hermes-tool diagnose -i ./my_index
+summa-tool diagnose -i ./my_index
 
 # Everything, machine-readable, for cron/CI trending
-hermes-tool diagnose -i ./my_index --json \
+summa-tool diagnose -i ./my_index --json \
     --sample 1000 --probe-cost 64 --residency > health.json
 
 # Stopword/tokenization bloat, BMP vocabulary shape, and Seismic maintenance debt
-hermes-tool diagnose -i ./my_index --terms 20 --sparse-stats
+summa-tool diagnose -i ./my_index --terms 20 --sparse-stats
 ```
 
 The `--sample` positions come from a deterministic splitmix64 sequence, not an
@@ -200,7 +200,7 @@ vectors in testing exactly this way).
 
 ## Files
 
-- `hermes-core/src/segment/ann_disk.rs` — `AnnHealth`, `health()`
-- `hermes-core/src/index/searcher.rs` — per-field aggregate at load
-- `hermes-core/src/observe.rs` — gauges
-- `hermes-tool/src/diagnose.rs` — the subcommand
+- `summa-core/src/segment/ann_disk.rs` — `AnnHealth`, `health()`
+- `summa-core/src/index/searcher.rs` — per-field aggregate at load
+- `summa-core/src/observe.rs` — gauges
+- `summa-tool/src/diagnose.rs` — the subcommand

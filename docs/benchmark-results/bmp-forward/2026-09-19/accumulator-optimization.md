@@ -96,7 +96,7 @@ that a sampled program counter identifies a particular hardware stall.
 ## Reproduction and evidence
 
 The [matrix driver](accumulator/matrix.py) expects the isolated fixture directory
-(`BMP_QUERY_EVIDENCE`, default `/mnt/hermes-copy-merge/bmp-query`) to contain
+(`BMP_QUERY_EVIDENCE`, default `/mnt/summa-copy-merge/bmp-query`) to contain
 `gap-index/`, `queries.json`, and `optimization/{before,after}-bin`. Run it only
 against a disposable benchmark fixture. The checked-in driver adds a path
 override and formatting to the measured script; the executed copy is archived.
@@ -104,8 +104,8 @@ override and formatting to the measured script; the executed copy is archived.
 ```sh
 python3 docs/benchmark-results/bmp-forward/2026-09-19/accumulator/matrix.py
 python3 docs/benchmark-results/bmp-forward/2026-09-19/accumulator/analyze.py \
-  /mnt/hermes-copy-merge/bmp-query/optimization/results.json \
-  /mnt/hermes-copy-merge/bmp-query/optimization/summary.json
+  /mnt/summa-copy-merge/bmp-query/optimization/results.json \
+  /mnt/summa-copy-merge/bmp-query/optimization/summary.json
 ```
 
 Binary/scorer/runner hashes are in [build-manifest.json](accumulator/build-manifest.json),

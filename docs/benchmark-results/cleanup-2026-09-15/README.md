@@ -63,7 +63,7 @@ restored separately from the preserved benchmark workspace.
   strengthening. Build logs record compiler and flags.
 
 RSS measurements are separate process high-water marks over all four commands,
-including mapped pages and heap; they do not isolate heap residency. Hermes RSS
+including mapped pages and heap; they do not isolate heap residency. Summa RSS
 is essentially flat across controls and candidate. Checked decoder code grows
 from 2,996 to 3,752 bytes on ARM and 3,304 to 4,006 bytes on x86.
 

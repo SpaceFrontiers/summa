@@ -1,3 +1,3 @@
-# Copy to upstream engines/hermes/Makefile; set HERMES_BENCH_BINARY and HERMES_BENCH_INDEX.
+# Copy to upstream engines/summa/Makefile; set SUMMA_BENCH_BINARY and SUMMA_BENCH_INDEX.
 serve:
-	@$(HERMES_BENCH_BINARY) serve $(HERMES_BENCH_INDEX) $(HERMES_BENCH_ARGS)
+	@$(SUMMA_BENCH_BINARY) serve $(SUMMA_BENCH_INDEX) $(SUMMA_BENCH_ARGS)

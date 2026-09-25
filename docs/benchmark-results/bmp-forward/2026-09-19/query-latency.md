@@ -209,7 +209,7 @@ Save the BMPB executable and converter before making a second source copy for
 the baseline. The raw baseline restores these six BMP files from commit
 `782227808a54c560b231d19e0a4d46662ecca334`: `segment/bmp_forward.rs`,
 `segment/bmp_forward/rewrite.rs`, `segment/builder/bmp.rs`, `segment/format.rs`,
-`segment/reader/bmp.rs`, and `query/bmp.rs` (all under `hermes-core/src`). Its
+`segment/reader/bmp.rs`, and `query/bmp.rs` (all under `summa-core/src`). Its
 candidate scorer calls `vector_for_scoring` rather than `vector` so both formats
 use the same writer-trusted policy. Rebuild after restoring files; old archive
 mtimes can otherwise make Cargo reuse the wrong artifact. Opening the raw

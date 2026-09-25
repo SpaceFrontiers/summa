@@ -7,12 +7,12 @@
       "tests_ignored": 25
     },
     {
-      "command": "cargo test -p hermes-core --no-default-features --features native --test regex_query --test wildcard_query",
+      "command": "cargo test -p summa-core --no-default-features --features native --test regex_query --test wildcard_query",
       "passed": true,
       "tests_passed": 8
     },
     {
-      "command": "cd hermes-wasm && bash build.sh && npm ci && npm test",
+      "command": "cd summa-wasm && bash build.sh && npm ci && npm test",
       "passed": true,
       "tests_passed": 41
     },
@@ -24,17 +24,17 @@
     }
   ],
   "source_sha256": {
-    "hermes-core/src/dsl/ql/mod.rs": "5d972ea51ef6cd73f965ecbea4b7d55ce37713b7b74cf2d51a6b74396ff8f18a",
-    "hermes-core/src/dsl/ql/ql.pest": "d8d4a5af335fa2d88a6b372038d99aafe1009a29b8b0471f4ae8fb7a8620d981",
-    "hermes-core/src/lib.rs": "3dcbd41c7c6181750288cf2fdfb49de2a654249d098ce6a2f51c3be6dbcee1ad",
-    "hermes-core/src/query/mod.rs": "9cd1e606ff473b19dd3ab2cd22dcb9b28d9dfc35ede254492cfe770efc2cf1d1",
-    "hermes-core/src/query/regex.rs": "e2a5182aa45ff56534e64bbc12346e3881d191af26be551cfe2e49f34e97137d",
-    "hermes-core/src/query/term_pattern.rs": "294cf7da913079b1c4f24f36672450d01a07cab74efb1babf8025eaba7743921",
-    "hermes-core/src/query/wildcard.rs": "b9a02dc69928383ce05aae2aba62e71a767bea0c17cf2f5cbad2f87ba6a499e9",
-    "hermes-core/tests/regex_query.rs": "2cd7c0fe38ccb925c8796f6b2be5d15fbb65b24c8ee738ffe0b75ef2230817bf",
-    "hermes-core/tests/wildcard_query.rs": "932e1ea47f3e7f807f73de18a1af0da958535c2fbc8601c0270efb11f6fbfe43",
-    "hermes-server/examples/searchbench_http/query.rs": "7a9cdab5cf1eba765ddc4e9f0073ddee92b3b3ccd3f3301efaf4a7108fa75856",
-    "hermes-wasm/tests/wildcard.test.ts": "1e9d0224c9014a3855ebf85a42120f7d3b3775de5e6db288bbd69098b695e9b1"
+    "summa-core/src/dsl/ql/mod.rs": "5d972ea51ef6cd73f965ecbea4b7d55ce37713b7b74cf2d51a6b74396ff8f18a",
+    "summa-core/src/dsl/ql/ql.pest": "d8d4a5af335fa2d88a6b372038d99aafe1009a29b8b0471f4ae8fb7a8620d981",
+    "summa-core/src/lib.rs": "3dcbd41c7c6181750288cf2fdfb49de2a654249d098ce6a2f51c3be6dbcee1ad",
+    "summa-core/src/query/mod.rs": "9cd1e606ff473b19dd3ab2cd22dcb9b28d9dfc35ede254492cfe770efc2cf1d1",
+    "summa-core/src/query/regex.rs": "e2a5182aa45ff56534e64bbc12346e3881d191af26be551cfe2e49f34e97137d",
+    "summa-core/src/query/term_pattern.rs": "294cf7da913079b1c4f24f36672450d01a07cab74efb1babf8025eaba7743921",
+    "summa-core/src/query/wildcard.rs": "b9a02dc69928383ce05aae2aba62e71a767bea0c17cf2f5cbad2f87ba6a499e9",
+    "summa-core/tests/regex_query.rs": "2cd7c0fe38ccb925c8796f6b2be5d15fbb65b24c8ee738ffe0b75ef2230817bf",
+    "summa-core/tests/wildcard_query.rs": "932e1ea47f3e7f807f73de18a1af0da958535c2fbc8601c0270efb11f6fbfe43",
+    "summa-server/examples/searchbench_http/query.rs": "7a9cdab5cf1eba765ddc4e9f0073ddee92b3b3ccd3f3301efaf4a7108fa75856",
+    "summa-wasm/tests/wildcard.test.ts": "1e9d0224c9014a3855ebf85a42120f7d3b3775de5e6db288bbd69098b695e9b1"
   },
   "limits": [
     "Four-document acceptance fixture, not full-corpus count or ranking parity.",

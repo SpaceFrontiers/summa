@@ -3,63 +3,63 @@
   "documents": 42596,
   "windows": [
     {
-      "root": "/data/hermes-server/documents_20260912",
+      "root": "/data/summa-server/documents_20260912",
       "segment": "01a09b34a52cbac71c7f298b9c12a88a",
       "start_row": 30838829,
       "rows": 100000,
       "documents": 4522
     },
     {
-      "root": "/data/hermes-server/documents_20260912",
+      "root": "/data/summa-server/documents_20260912",
       "segment": "01a0abb18d7331a5694cd1f0ee84976a",
       "start_row": 44219965,
       "rows": 100000,
       "documents": 4942
     },
     {
-      "root": "/data/hermes-server/documents_20260912",
+      "root": "/data/summa-server/documents_20260912",
       "segment": "01a0ad0356926afbdbb34be2f1e3f7ea",
       "start_row": 62353601,
       "rows": 100000,
       "documents": 5201
     },
     {
-      "root": "/data2/hermes-server-4/documents_20260912",
+      "root": "/data2/summa-server-4/documents_20260912",
       "segment": "01a09b0a0dc330709be60b14e9418578",
       "start_row": 30980831,
       "rows": 100000,
       "documents": 4966
     },
     {
-      "root": "/data2/hermes-server-4/documents_20260912",
+      "root": "/data2/summa-server-4/documents_20260912",
       "segment": "01a0abe82e7f5263f65ac32ea3854914",
       "start_row": 37102432,
       "rows": 100000,
       "documents": 5420
     },
     {
-      "root": "/data2/hermes-server-4/documents_20260912",
+      "root": "/data2/summa-server-4/documents_20260912",
       "segment": "01a0b28eb537dbae4eac41dd563a2c82",
       "start_row": 60915805,
       "rows": 100000,
       "documents": 4384
     },
     {
-      "root": "/data3/hermes-server/documents_20260912",
+      "root": "/data3/summa-server/documents_20260912",
       "segment": "01a09b273243125a6bbb4894a3237713",
       "start_row": 30960696,
       "rows": 100000,
       "documents": 4899
     },
     {
-      "root": "/data3/hermes-server/documents_20260912",
+      "root": "/data3/summa-server/documents_20260912",
       "segment": "01a0b25433fef4174d99ef9dc39a0a25",
       "start_row": 55298678,
       "rows": 100000,
       "documents": 3753
     },
     {
-      "root": "/data3/hermes-server/documents_20260912",
+      "root": "/data3/summa-server/documents_20260912",
       "segment": "01a0b0067518e00046cd7b0324c69ccc",
       "start_row": 58274905,
       "rows": 100000,
@@ -127,7 +127,7 @@
       "seg_01a0b8cf0c21b23c61522d759a78396c.sparse": 1647067806,
       "seg_01a0b8cf0c21b23c61522d759a78396c.store": 981,
       "seg_01a0b8cf0c21b23c61522d759a78396c.meta": 24,
-      ".hermes_writer.lock": 0,
+      ".summa_writer.lock": 0,
       "seg_01a0b8cf0c21b23c61522d759a78396c.post": 0
     },
     "gap": {
@@ -137,7 +137,7 @@
       "seg_01a0b8cf0c21b23c61522d759a78396c.sparse": 1317163549,
       "seg_01a0b8cf0c21b23c61522d759a78396c.store": 981,
       "seg_01a0b8cf0c21b23c61522d759a78396c.meta": 24,
-      ".hermes_writer.lock": 0,
+      ".summa_writer.lock": 0,
       "seg_01a0b8cf0c21b23c61522d759a78396c.post": 0
     }
   },

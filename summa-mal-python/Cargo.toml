@@ -1,0 +1,22 @@
+[package]
+name = "summa-mal-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Python (PyO3) bindings for the Summa MAL parser — thin wrapper over summa-mal"
+publish = false
+
+[lib]
+name = "summa_mal"
+crate-type = ["cdylib"]
+doc = false
+
+[dependencies]
+# Renamed to `mal` to avoid colliding with this crate's own `summa_mal` lib
+# name (the Python extension module must itself be named `summa_mal`).
+mal = { path = "../summa-mal", package = "summa-mal" }
+serde_json = { workspace = true }
+pyo3.workspace = true

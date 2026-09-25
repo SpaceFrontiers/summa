@@ -37,7 +37,7 @@ blob (the 4-bit grid is row-major — any permutation rewrites every row), so
 partial reorder bounds CPU/memory, not per-pass IO. Passes go through the
 cold-IO writer, so at least they no longer evict the cache.
 
-## Optimizer tiering (hermes-server)
+## Optimizer tiering (summa-server)
 
 - Segments `< --optimizer-large-segment-docs` (default 5M): full-depth BP.
 - Larger: budgeted pass — depth capped at
@@ -118,7 +118,7 @@ background via warm-started passes; `bp_converged` now means
 ## Single-pass parallelism (2026-07-14)
 
 A single reorder pass has three phases; all three are now parallel and all
-three run on one process-wide, bounded background pool. In `hermes-server`,
+three run on one process-wide, bounded background pool. In `summa-server`,
 `--optimizer-threads` sets its width when the periodic optimizer is enabled;
 otherwise merge-time and manual BP share the `cores/2` fallback pool. There is
 never a pool per index or per pass, and background CPU stays off the global
@@ -142,7 +142,7 @@ forward index 135 ms → 50 ms (2.7×); blob-encode phase ~3.3 s → ~1.0 s;
 `writer.reorder()` end-to-end 4.7 s → 2.36 s (2.0×). BP itself (1.3 s
 full-depth here) is now the dominant phase, and it is budgeted/warm-started.
 Evidence: `bench_forward_index_build` (`#[ignore]`) in
-`hermes-core/src/index/tests/bmp.rs`.
+`summa-core/src/index/tests/bmp.rs`.
 
 ## Default changes (2026-07-14, follow-up)
 

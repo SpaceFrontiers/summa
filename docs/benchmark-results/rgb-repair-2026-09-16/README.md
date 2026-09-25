@@ -43,7 +43,7 @@ construction are documented in the
    checkout. Touch extracted source files before Cargo to prevent stale-mtime
    artifact reuse. Build with Rust 1.98.1, release LTO and native CPU flags.
 2. Copy the included `verify_reference.rs` to
-   `hermes-core/examples/verify_reference.rs` and build that example with the same
+   `summa-core/examples/verify_reference.rs` and build that example with the same
    flags. Run it against the preserved oracle. All 1,676
    queries must preserve ordered IDs, raw score bits and exact counts. Do not
    compare raw scores across engines with different scoring configurations.

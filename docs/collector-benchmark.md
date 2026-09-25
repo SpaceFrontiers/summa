@@ -8,7 +8,7 @@ are in the [IResearch audit](iresearch-optimization-audit.md#top-k-selection).
 ## Invariant and scope
 
 All three return identical ordered document IDs, score bits, and ordinals under
-Hermes's total float and tie ordering. Full-sort oracle checks precede timing,
+Summa's total float and tie ordering. Full-sort oracle checks precede timing,
 including empty/short streams, k=0/1, non-power-of-two trees, negative scores,
 ties, signed zero, infinities, and NaNs. Timed fixtures contain finite positive
 scores; the shared eight-score screen follows the existing text admission shape.
@@ -34,7 +34,7 @@ k entries and k cached competitor nodes. Printed backing-byte figures describe
 allocation capacity from the concrete types, not process RSS or allocator
 overhead. A full sort of the input is used only by the untimed oracle. The input
 fixture is shared across algorithms and excluded from collector memory figures.
-The loser-tree prototype caches complete Hermes ordering keys in 16-byte nodes.
+The loser-tree prototype caches complete Summa ordering keys in 16-byte nodes.
 Upstream IResearch caches score/leaf pairs and uses different tie admission;
 these results measure this tie-preserving Rust implementation, not its C++ binary
 or every possible loser-tree representation.
@@ -43,7 +43,7 @@ or every possible loser-tree representation.
 
 ```sh
 # Release-mode correctness preflight, without timing.
-cargo bench --locked -p hermes-core --bench collector_selection -- --test
+cargo bench --locked -p summa-core --bench collector_selection -- --test
 
 # Run adjacent algorithm comparisons with recorded environment/source identity.
 python3 scripts/check_search.py bench --bench collector_selection --save-baseline collectors-forward

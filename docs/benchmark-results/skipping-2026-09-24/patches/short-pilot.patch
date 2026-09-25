@@ -1,5 +1,5 @@
---- a/hermes-core/src/query/phrase/seed.rs
-+++ b/hermes-core/src/query/phrase/seed.rs
+--- a/summa-core/src/query/phrase/seed.rs
++++ b/summa-core/src/query/phrase/seed.rs
 @@ -12,7 +12,7 @@
          }
          // Small heaps benefit from wider coverage with few position checks;

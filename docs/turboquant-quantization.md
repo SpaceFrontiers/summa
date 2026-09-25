@@ -118,7 +118,7 @@ Since codec v2 non-power-of-two dims pay no padding: a 768-dim vector costs
 
 ## Benchmark
 
-`hermes-core/src/index/tests/tq_bench.rs` (ignored test; run in release):
+`summa-core/src/index/tests/tq_bench.rs` (ignored test; run in release):
 clustered synthetic unit-norm corpus, queries perturbed from corpus points,
 ground truth = the flat index's exact cosine top-10.
 
@@ -235,7 +235,7 @@ fingerprint. Only centroids are stored as trained artifacts
 
 Unmarked, pre-cosine IVF-TQ artifacts are unsupported and rejected while the
 trained generation or ANN payload is opened. Rebuild the index with a current
-Hermes version; the current reader and writer do not load or migrate the legacy
+Summa version; the current reader and writer do not load or migrate the legacy
 format.
 
 Coarse training draws a deterministic uniform point sample directly at the
@@ -276,4 +276,4 @@ Rayon pool above 65k vectors (per-task collectors, merged top-k).
 - No configurable bit width (4 = 3+1 fixed; header carries it for evolution).
 - No WASM in-browser TQ _encoding_ (WASM reads native-built payloads;
   `LocalIndex` encode support is a follow-up).
-- No L2 metric (dense scoring in Hermes is cosine/dot; unchanged).
+- No L2 metric (dense scoring in Summa is cosine/dot; unchanged).

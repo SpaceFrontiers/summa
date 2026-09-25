@@ -1,14 +1,14 @@
-# RL Training Pipeline for Agentic Search over Hermes
+# RL Training Pipeline for Agentic Search over Summa
 
-> Design doc. Goal: train an LLM, with reinforcement learning, to drive Hermes as an
+> Design doc. Goal: train an LLM, with reinforcement learning, to drive Summa as an
 > agentic retriever — searching, reading, navigating references, and refining queries
 > until it can return a ranked list of the documents that answer a question. The
 > approach is modeled on **SID-1** (SID AI, _"SID-1 Technical Report: Test-Time
-> Compute for Retrieval"_, Dec 2025) and adapted to Hermes' concrete API surface.
+> Compute for Retrieval"_, Dec 2025) and adapted to Summa' concrete API surface.
 
 The current executable workflow and supported training task contracts are
 documented in [training workflows](training-objectives-and-curricula.md) and
-the [trainer guide](../hermes-train/README.md). This document retains the
+the [trainer guide](../summa-train/README.md). This document retains the
 agentic-search research proposal and does not imply that every proposed tool
 or rollout service is implemented.
 
@@ -26,7 +26,7 @@ Distilled from the SID-1 technical report and the turbopuffer infrastructure wri
 | **Reward**             | **NDCG** primary, plus recall, plus _timeliness/speed_, plus a format reward added later                                                                                      | Found-the-docs + ranked-them-right + did-it-fast. Speed reward is what makes parallel tool calls emerge.                                                              |
 | **Agentic loop**       | Multi-turn: search → read excerpts → optionally `read` full doc → refine query → repeat → submit ranked list. As many steps as needed.                                        | Hierarchical retrieval (excerpts first, full doc on demand) controls context length.                                                                                  |
 | **Emergent behaviors** | Prefers ANN over BM25 over time; learns **HyDE** late in training; issues **4–8 parallel searches/turn** (up to ~20 tool calls total)                                         | We don't hand-design these — the reward shapes them. But the tool interface must _allow_ them.                                                                        |
-| **Synthetic data**     | Multi-hop questions built from **document-to-document similarity** (no hyperlinks needed); a seed doc must be in the targets; LLM-judge verification; explicit error taxonomy | Hermes already computes doc-doc similarity (ANN over its own dense vectors) — we can generate multi-hop data on _any_ corpus.                                         |
+| **Synthetic data**     | Multi-hop questions built from **document-to-document similarity** (no hyperlinks needed); a seed doc must be in the targets; LLM-judge verification; explicit error taxonomy | Summa already computes doc-doc similarity (ANN over its own dense vectors) — we can generate multi-hop data on _any_ corpus.                                          |
 | **Stability traps**    | (a) Tokens-In/Tokens-Out retokenization → collapse; (b) length-normalization debiasing → OOV-token blowup                                                                     | These are the two things that silently kill agentic-RL runs. Documented fixes below.                                                                                  |
 | **Eval**               | 191 questions across general / finance / science / legal / email; report recall + NDCG + latency + cost; fuse k rollouts with **RRF**                                         | Public benchmarks (HotpotQA, SciFact) saturate — build a custom multi-hop eval.                                                                                       |
 
@@ -40,25 +40,25 @@ diversity, evidence-quality, retrieval-gain; rule-based vs ORM vs PRM).
 
 ---
 
-## 2. Mapping SID-1 onto Hermes
+## 2. Mapping SID-1 onto Summa
 
-Hermes exposes the retrieval primitives SID-1 assumes. The grounding (verified against the
+Summa exposes the retrieval primitives SID-1 assumes. The grounding (verified against the
 codebase) and the gaps:
 
-| SID-1 capability                 | Hermes equivalent                                                                                                                                       | Source / note                                                                                                                                           |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ANN / dense search               | `DenseVectorQuery` (`nprobe`, `rerank_factor`)                                                                                                          | `hermes-core/src/query/vector/dense.rs`. **Client must pass the f32 vector** — server does _not_ embed text → we need an embedding service in the loop. |
-| BM25 / lexical                   | `TermQuery`, `MatchQuery`, `BooleanQuery` (MUST/SHOULD/MUST_NOT, MaxScore/WAND)                                                                         | `query/term.rs`, `query/boolean.rs`. `MatchQuery` tokenizes server-side.                                                                                |
-| Sparse / SPLADE                  | `SparseVectorQuery` — **server tokenizes `text`** and IDF-weights, or accepts precomputed `(indices, values)`; BMP + MaxScore pruning                   | `query/vector/sparse.rs`, `hermes-server/src/converters.rs:156`. This one _can_ take raw text.                                                          |
-| Metadata / numeric filter        | `RangeQuery` (u64/i64/f64) composed via `BooleanQuery` MUST                                                                                             | `query/range.rs`. Filter-style (score 1.0).                                                                                                             |
-| Reranking (L2)                   | `Reranker` field on `SearchRequest` (dense or binary), RRF (`rrf_k`), Matryoshka prefilter                                                              | `hermes.proto:157`.                                                                                                                                     |
-| Fetch full document              | `GetDocument(DocAddress{segment_id, doc_id})`                                                                                                           | `SearchService.GetDocument`. This is our **`fetch` tool**.                                                                                              |
-| Excerpts vs full text            | **Gap**: no snippet/highlight. Stored fields come back whole.                                                                                           | We truncate stored text at the _environment_ layer to make excerpts; `fetch` returns full.                                                              |
-| Document references / navigation | **No native graph.** Convention: store reference IDs/URIs in a (multi-valued) stored field; resolve via `GetDocument` / a term lookup on an `id` field. | `FieldValueList` supports multi-value. We build a **`navigate` tool** on top.                                                                           |
-| regex search                     | **Not supported.**                                                                                                                                      | Drop it from the toolset (SID-1 had it; non-essential).                                                                                                 |
-| Hybrid / parallel tools          | Multiple queries per turn = multiple gRPC `Search` calls; fuse with RRF                                                                                 | Parallelism is a serving concern (§6), not a query-type concern.                                                                                        |
+| SID-1 capability                 | Summa equivalent                                                                                                                                        | Source / note                                                                                                                                          |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ANN / dense search               | `DenseVectorQuery` (`nprobe`, `rerank_factor`)                                                                                                          | `summa-core/src/query/vector/dense.rs`. **Client must pass the f32 vector** — server does _not_ embed text → we need an embedding service in the loop. |
+| BM25 / lexical                   | `TermQuery`, `MatchQuery`, `BooleanQuery` (MUST/SHOULD/MUST_NOT, MaxScore/WAND)                                                                         | `query/term.rs`, `query/boolean.rs`. `MatchQuery` tokenizes server-side.                                                                               |
+| Sparse / SPLADE                  | `SparseVectorQuery` — **server tokenizes `text`** and IDF-weights, or accepts precomputed `(indices, values)`; BMP + MaxScore pruning                   | `query/vector/sparse.rs`, `summa-server/src/converters.rs:156`. This one _can_ take raw text.                                                          |
+| Metadata / numeric filter        | `RangeQuery` (u64/i64/f64) composed via `BooleanQuery` MUST                                                                                             | `query/range.rs`. Filter-style (score 1.0).                                                                                                            |
+| Reranking (L2)                   | `Reranker` field on `SearchRequest` (dense or binary), RRF (`rrf_k`), Matryoshka prefilter                                                              | `summa.proto:157`.                                                                                                                                     |
+| Fetch full document              | `GetDocument(DocAddress{segment_id, doc_id})`                                                                                                           | `SearchService.GetDocument`. This is our **`fetch` tool**.                                                                                             |
+| Excerpts vs full text            | **Gap**: no snippet/highlight. Stored fields come back whole.                                                                                           | We truncate stored text at the _environment_ layer to make excerpts; `fetch` returns full.                                                             |
+| Document references / navigation | **No native graph.** Convention: store reference IDs/URIs in a (multi-valued) stored field; resolve via `GetDocument` / a term lookup on an `id` field. | `FieldValueList` supports multi-value. We build a **`navigate` tool** on top.                                                                          |
+| regex search                     | **Not supported.**                                                                                                                                      | Drop it from the toolset (SID-1 had it; non-essential).                                                                                                |
+| Hybrid / parallel tools          | Multiple queries per turn = multiple gRPC `Search` calls; fuse with RRF                                                                                 | Parallelism is a serving concern (§6), not a query-type concern.                                                                                       |
 
-**Two things Hermes forces that SID-1's stack hid:**
+**Two things Summa forces that SID-1's stack hid:**
 
 1. **Dense queries need vectors, not text.** The policy model emits _text_; the environment
    must embed it (query text, and HyDE pseudo-docs) with the _same_ embedding model used to
@@ -72,7 +72,7 @@ codebase) and the gaps:
 
 ## 3. Environment design
 
-A Gym-style environment wrapping a Hermes deployment + an embedding service. One **episode**
+A Gym-style environment wrapping a Summa deployment + an embedding service. One **episode**
 = one question against one corpus.
 
 ### 3.1 Episode lifecycle
@@ -81,7 +81,7 @@ A Gym-style environment wrapping a Hermes deployment + an embedding service. One
 reset(question, corpus_id) → observation_0 (system prompt + question + tool schema)
 loop:
     action = policy(observation_t)          # model emits tool call(s) or <submit>
-    obs_{t+1}, done = env.step(action)       # execute against Hermes, append results
+    obs_{t+1}, done = env.step(action)       # execute against Summa, append results
 until done (submit OR step/token budget hit)
 reward = score(submitted_ranking, gold_targets, trajectory_stats)
 ```
@@ -94,7 +94,7 @@ speed reward makes parallelism pay off — as in SID-1).
 ```jsonc
 // 1. Lexical / structured search
 search_bm25(query: string, fields?: [string], filters?: Filter[], k?: int=10)
-// 2. Sparse search — Hermes tokenizes & IDF-weights server-side
+// 2. Sparse search — Summa tokenizes & IDF-weights server-side
 search_sparse(query: string, field: string, filters?: Filter[], k?: int=10)
 // 3. Dense ANN — environment embeds `query` (and `hyde_doc` if given) with the index's model
 search_dense(query: string, field: string, hyde_doc?: string,
@@ -113,7 +113,7 @@ submit(doc_ids: [string])                    // ranked, best-first
 (e.g. `date >= ...`, `source == "email"`). Each `search_*` is one `SearchService.Search`
 RPC; `search_hybrid`/`navigate` may fan out to several.
 
-**Doc IDs:** Hermes' `DocAddress{segment_id, doc_id}` is unstable across merges. The
+**Doc IDs:** Summa' `DocAddress{segment_id, doc_id}` is unstable across merges. The
 environment maps each result to a **stable external id** (a `stored` `id`/`uri` field in the
 schema) and translates back. Gold targets are expressed in those stable ids.
 
@@ -158,7 +158,7 @@ r_i = w_ndcg · NDCG@K(R_i, T)
   exist, no duplicate ids.
 - **cost / time**: normalized so that the _median_ trajectory gets ~0; faster-than-median is
   positive. This is the term that makes parallel tool use and early stopping emerge. Measure
-  cost as wall-clock from the Hermes `SearchTimings` plus a per-turn and per-token penalty —
+  cost as wall-clock from the Summa `SearchTimings` plus a per-turn and per-token penalty —
   not just step count — so the model is paid for _issuing searches in parallel_ rather than
   serially.
 - **redundancy** penalty discourages spamming the same query (a known GRPO failure mode).
@@ -173,10 +173,10 @@ only LLM-judge usage is **offline**, during data generation (§5).
 
 ---
 
-## 5. Synthetic data pipeline (Hermes-native)
+## 5. Synthetic data pipeline (Summa-native)
 
-SID-1's headline data trick maps directly onto Hermes: build multi-hop questions from
-**document-to-document similarity**, which Hermes already gives us via ANN over its own dense
+SID-1's headline data trick maps directly onto Summa: build multi-hop questions from
+**document-to-document similarity**, which Summa already gives us via ANN over its own dense
 vectors. No hyperlinks/Wikipedia structure required → works on _their_ corpus.
 
 ### 5.1 Generation
@@ -186,7 +186,7 @@ vectors. No hyperlinks/Wikipedia structure required → works on _their_ corpus.
 2. Chain:   for each hop, search_dense(embed(d0)) over the dense field to get
             top-N similar docs; pick d1 (semantically linked but distinct).
             Repeat to build a chain d0 → d1 → … → dH (H = 1..3).
-            (Hermes ANN *is* the dynamic link graph.)
+            (Summa ANN *is* the dynamic link graph.)
 3. Question: prompt a strong LLM to write a question whose answer requires *all*
             docs in the chain, with d0 (the seed) guaranteed to be a target —
             SID-1 found a forced seed is required for question diversity.
@@ -200,7 +200,7 @@ Run an LLM judge over `(question, T)` to filter:
 - **Type 1** — targets contain unnecessary docs (hurts precision → over-reporting). Most
   common; trim.
 - **Type 2** — a relevant doc is missing from `T` (adds label noise → model penalized for
-  good retrieval). Use Hermes search to find likely-missing relevant docs and add them, or
+  good retrieval). Use Summa search to find likely-missing relevant docs and add them, or
   drop the question.
 - **Type 3** — unanswerable despite non-empty `T`. Drop.
 
@@ -231,14 +231,14 @@ This is where SID-1/turbopuffer spent real effort, and the part most likely to b
 - **QPS bursts**: 256 questions × 16 rollouts × ~20 tool calls ≈ **80k searches/step**, and
   all groups fire their _first_ search in a ~10 s window → **1k+ QPS spikes**. Plan for the
   burst, not the average.
-- **Hermes serving**: run a **read-only replica pool** over a shared, immutable index
-  snapshot (Hermes' segment files are write-once; mmap + the caching directory layer make
+- **Summa serving**: run a **read-only replica pool** over a shared, immutable index
+  snapshot (Summa' segment files are write-once; mmap + the caching directory layer make
   replicas cheap). Pin the corpus snapshot for the whole RL run so doc ids/gold stay valid.
   Scale replicas horizontally; the gRPC `SearchService` is stateless per request.
 - **Embedding service**: a batched GPU embedder (query text + HyDE docs) co-located with the
   rollout workers. Cache embeddings of repeated query strings within a step.
 - **Async rollouts**: decouple generation from search. Each rollout worker issues `search_*`
-  RPCs asynchronously so the 4–8 parallel calls/turn actually hit Hermes concurrently (this
+  RPCs asynchronously so the 4–8 parallel calls/turn actually hit Summa concurrently (this
   is what the _time_ reward is supposed to reward — don't serialize them in the harness).
 - **Determinism for reward**: fix `nprobe`, segment layout, and snapshot so NDCG is
   reproducible across the 16 group members (variance should come from the _policy_, not from
@@ -275,7 +275,7 @@ straight from base).
 
 **Masking:** mask tool-result / retrieved tokens out of the policy loss (Search-R1's
 retrieved-token masking) — the model is graded on _its_ tokens (queries, reasoning, submit),
-not on text Hermes handed back.
+not on text Summa handed back.
 
 **Warm-up:** first run with sparse search only (raw text → server tokenizes, no embedder
 needed) and short budgets to get format + basic search working; then enable dense/HyDE and
@@ -290,7 +290,7 @@ grow the length budget.
   cost/question** — the SID-1 table format.
 - **Test-time compute**: evaluate `1×` (single rollout) and `k×` (k rollouts **RRF-fused**,
   `rrf_k≈60`). The k× curve is the "test-time compute for retrieval" story.
-- **Baselines** to beat, all on the _same Hermes index_: (a) dense-only top-K; (b)
+- **Baselines** to beat, all on the _same Summa index_: (a) dense-only top-K; (b)
   dense+rerank; (c) BM25; (d) a frontier LLM (GPT-5.x / Sonnet / Gemini) given the same tool
   schema via the API. SID-1's bar: nearly 2× the embedding+rerank recall.
 - **Retire saturated tasks**: if HotpotQA/SciFact-style sets hit ~perfect NDCG, drop them
@@ -303,21 +303,21 @@ grow the length budget.
 
 ## 9. Phased implementation plan
 
-| Phase                      | Deliverable                                                                                                                                             | Depends on |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| **0. Snapshot & replicas** | Pin a corpus snapshot; stand up a read-only Hermes replica pool + batched embedding service; load test to 1k QPS.                                       | §6         |
-| **1. Environment**         | `HermesSearchEnv` (reset/step), the 7 tools → Hermes RPCs, stable-id mapping, excerpt truncation, transcript builder. Unit-tested against a tiny index. | §3         |
-| **2. Reward**              | NDCG/recall/format/time/redundancy scorer over stable ids; deterministic, no neural RM. Golden tests.                                                   | §4         |
-| **3. Data**                | Synthetic multi-hop generator (Hermes-ANN doc-doc chains) + LLM-judge verifier + curriculum buckets; obfuscated ids. Produce v0 train + held-out eval.  | §5         |
-| **4. RL loop**             | GRPO trainer with exact TI/TO token handling, length-biased advantage, retrieved-token masking, length scheduling. Warm-up = sparse-only.               | §7         |
-| **5. Scale & eval**        | Full multi-domain training; eval harness (1×/k×/RRF) + baselines table; ablations.                                                                      | 1–4        |
-| **6. Serve**               | Export policy; inference path = same env tools against production Hermes; expose as a retrieval sub-agent.                                              | 5          |
+| Phase                      | Deliverable                                                                                                                                           | Depends on |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| **0. Snapshot & replicas** | Pin a corpus snapshot; stand up a read-only Summa replica pool + batched embedding service; load test to 1k QPS.                                      | §6         |
+| **1. Environment**         | `SummaSearchEnv` (reset/step), the 7 tools → Summa RPCs, stable-id mapping, excerpt truncation, transcript builder. Unit-tested against a tiny index. | §3         |
+| **2. Reward**              | NDCG/recall/format/time/redundancy scorer over stable ids; deterministic, no neural RM. Golden tests.                                                 | §4         |
+| **3. Data**                | Synthetic multi-hop generator (Summa-ANN doc-doc chains) + LLM-judge verifier + curriculum buckets; obfuscated ids. Produce v0 train + held-out eval. | §5         |
+| **4. RL loop**             | GRPO trainer with exact TI/TO token handling, length-biased advantage, retrieved-token masking, length scheduling. Warm-up = sparse-only.             | §7         |
+| **5. Scale & eval**        | Full multi-domain training; eval harness (1×/k×/RRF) + baselines table; ablations.                                                                    | 1–4        |
+| **6. Serve**               | Export policy; inference path = same env tools against production Summa; expose as a retrieval sub-agent.                                             | 5          |
 
 ### Suggested repo layout
 
 ```
-hermes-rl/                      # new sibling crate/package
-  env/         hermes_search_env.py   # tools → hermes-client-python RPCs
+summa-rl/                      # new sibling crate/package
+  env/         summa_search_env.py   # tools → summa-client-python RPCs
   reward/      ndcg.py, scorer.py
   data/        gen_multihop.py, verify_judge.py, curriculum.py
   train/       grpo.py (TI/TO-safe), length_schedule.py, masking.py
@@ -325,7 +325,7 @@ hermes-rl/                      # new sibling crate/package
   serve/       replica_pool/, embedder/
 ```
 
-Reuses `hermes-client-python` for all retrieval; no changes required to the Hermes search
+Reuses `summa-client-python` for all retrieval; no changes required to the Summa search
 algorithm itself (SID-1 explicitly works with existing search tools — and so does this).
 
 ---
@@ -333,7 +333,7 @@ algorithm itself (SID-1 explicitly works with existing search tools — and so d
 ## 10. Open parameters (decide before Phase 4)
 
 - **Base model**: Qwen3-14B (SID-1's choice) vs smaller (3B/7B) for cheaper iteration.
-- **Embedding model**: must match whatever built the dense field in your Hermes index — the
+- **Embedding model**: must match whatever built the dense field in your Summa index — the
   environment embeds query text with _that_ model, or HyDE/ANN silently degrades.
 - **Group size / batch**: 16 / 256 is SID-1's; scale to GPU budget (group size ≥8 keeps the
   group-relative signal meaningful).
@@ -394,7 +394,7 @@ the same score → zero gradient). Two cheap, intrinsic fixes:
 ### 11.4 The "do-nothing" local optimum (query-rewriting trap)
 
 **SAGE** (2506.19783) reports that with a strong retriever, the agent's best safe move is to
-**not reformulate** — a deceptive high-reward local optimum that stalls exploration. Hermes'
+**not reformulate** — a deceptive high-reward local optimum that stalls exploration. Summa'
 dense retriever is strong, so expect this. Mitigations we should bake in: an explicit
 exploration incentive early, the **identical-query penalty** already in our `redundancy` term,
 and reward shaping that pays for _information gain_ (11.3) rather than mere query emission.

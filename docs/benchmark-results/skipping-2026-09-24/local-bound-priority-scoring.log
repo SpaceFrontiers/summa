@@ -2,9 +2,9 @@ warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dw
   |
   = note: `#[warn(linker_messages)]` on by default
 
-warning: `hermes-core` (lib test) generated 1 warning
+warning: `summa-core` (lib test) generated 1 warning
     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s
-     Running unittests src/lib.rs (/Users/pasha/conductor/workspaces/hermes/moroni/target/debug/deps/hermes_core-f33894cde6671c76)
+     Running unittests src/lib.rs (/Users/pasha/conductor/workspaces/summa/moroni/target/debug/deps/summa_core-f33894cde6671c76)
 
 running 1 test
 test query::scoring::tests::skewed_conjunction_preserves_frequency_rows_across_seeks_and_partial_batches ... ok

@@ -58,7 +58,7 @@ def matrix(folder):
         if not run.is_dir() or not (run / "completed.json").exists():
             continue
         assert read(run / "completed.json") == {"complete": True}
-        engine = "luxir" if run.name.startswith("luxir") else "hermes"
+        engine = "luxir" if run.name.startswith("luxir") else "summa"
         selected = [row for row in read(run / "agreement.json") if row["include"]]
         query_keys = sorted(row["key"] for row in selected)
         entry = {
@@ -72,7 +72,7 @@ def matrix(folder):
                 metrics(path) for path in sorted((run / engine).glob("*-c32.json"))
             ],
         }
-        if engine == "hermes":
+        if engine == "summa":
             entry["binary_sha256"] = read(run / "provenance.json")["binary_sha256"]
             audits = [
                 json.loads(line)

@@ -2,7 +2,7 @@
 //! rustc --edition=2024 -O --cfg 'feature="native"' measure.rs -o measure
 #![allow(dead_code)]
 use std::{hint::black_box, time::Instant};
-#[path = "../../../../hermes-core/src/structures/postings/sparse/dimensions.rs"]
+#[path = "../../../../summa-core/src/structures/postings/sparse/dimensions.rs"]
 mod dimensions;
 mod structures {
     pub(crate) mod postings {
@@ -13,7 +13,7 @@ type Result<T> = std::result::Result<T, String>;
 fn corrupt(message: &str) -> String {
     message.into()
 }
-#[path = "../../../../hermes-core/src/segment/bmp_forward/codec.rs"]
+#[path = "../../../../summa-core/src/segment/bmp_forward/codec.rs"]
 mod codec;
 fn raw(bytes: &[u8]) -> impl Iterator<Item = (u32, u8)> + '_ {
     bytes

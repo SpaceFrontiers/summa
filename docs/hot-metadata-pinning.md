@@ -5,7 +5,7 @@ Status: implemented (2026-07-22).
 ## Problem
 
 Every query must touch certain small metadata sections — BMP block-offset
-tables, sparse skip sections, doc-id maps, and the coarse query hierarchy. Hermes maps whole
+tables, sparse skip sections, doc-id maps, and the coarse query hierarchy. Summa maps whole
 segment files and slices them zero-copy, so residency of those sections is
 decided by the kernel's page-cache LRU, not by us. Under memory pressure the
 kernel evicts them exactly like bulk data, and every subsequent query pays
@@ -15,7 +15,7 @@ grid/starts/doc-map faults were still unpinned).
 
 The classic production pattern for this is a **meta/data split**: each store
 keeps a small offset/index part every lookup touches (pin it in RAM) separate
-from the bulk payload (page-cache or direct I/O). Hermes already has the
+from the bulk payload (page-cache or direct I/O). Summa already has the
 _layout_ half of this — every file is section-structured with lazy range
 reads, and some metadata is resident because it is decoded to the heap (for
 example, sparse dimension tables and global ANN routing artifacts). What was
@@ -113,11 +113,11 @@ Other platforms retain their existing copy behavior.
 
 `segment/pin.rs` defines a process-wide `PinPolicy`:
 
-- `--pin-metadata-budget-mb` (or `HERMES_PIN_METADATA_BUDGET_MB`) — metadata
+- `--pin-metadata-budget-mb` (or `SUMMA_PIN_METADATA_BUDGET_MB`) — metadata
   budget per segment. The same bound is separately applied once to each
   index-global ANN generation, in routing-first priority order. Default 0
   disables pinning.
-- `--pin-mode` (or `HERMES_PIN_MODE`) — `mlock` (default; locks existing metadata
+- `--pin-mode` (or `SUMMA_PIN_MODE`) — `mlock` (default; locks existing metadata
   pages and needs RLIMIT_MEMLOCK headroom) or `copy` (copies mapped metadata to
   the heap without special permissions). Heap allocations are outside the page
   cache but can still swap unless the host is swapless.

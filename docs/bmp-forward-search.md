@@ -21,14 +21,14 @@ The original [BMP paper (SIGIR 2024)](https://arxiv.org/abs/2405.01117)
 compared inverted, per-document forward, and block-local hybrid organizations.
 The hybrid won: each selected block stores local inverted lists, enabling
 shared query-term probes and accumulator updates. Per-document forward reads
-have additional vector lookups. This is a reason to keep Hermes's block path
+have additional vector lookups. This is a reason to keep Summa's block path
 for broadly populated candidate blocks.
 
 [Seismic (SIGIR 2024)](https://arxiv.org/html/2404.18812v1) demonstrates a
 complementary use: an aggressively pruned inverted structure nominates IDs,
 then a forward index supplies complete vectors for inner products. That is an
 approximate retrieval design, not a proof that smaller nomination pools retain
-exact top-k. Hermes V20 forward values contain the _retained quantized BMP_
+exact top-k. Summa V20 forward values contain the _retained quantized BMP_
 postings, not pre-pruning original vectors; they cannot restore terms removed
 at ingestion.
 
@@ -39,17 +39,17 @@ tradeoff. It does not provide a safe BMP pruning bound by itself.
 
 [LSP (2026 preprint)](https://arxiv.org/html/2602.02883v1) separates cheap
 superblock selection from block evaluation and distinguishes rank-safe pruning
-from approximate exclusion. Hermes already follows this architecture with
+from approximate exclusion. Summa already follows this architecture with
 H/E/D grids, integer bounds and a gamma-limited superblock policy. Its Table 9
 also directly compares forward and flat-inverted document scoring: on that
 SPLADE/MS MARCO setup, forward wins at small blocks (up to 64 slots), with the
 advantage disappearing around 96–128. At 32 slots, reported times are 11.4 vs
-17.0 ms (99% recall budget) and 22.1 vs 31.3 ms (safe retrieval). Hermes defaults
+17.0 ms (99% recall budget) and 22.1 vs 31.3 ms (safe retrieval). Summa defaults
 to 32 slots, so this is directly relevant, though our adaptive encodings and
 logical-order forward layout differ. Replacing
 grid aggregation with document-forward scans would discard its main advantage.
 
-## Where to integrate in Hermes
+## Where to integrate in Summa
 
 The following are engineering inferences from those designs and the current
 `query/bmp.rs` executor, not reported results from those papers.
@@ -101,12 +101,12 @@ unbudgeted physical-to-forward map would defeat the storage design. Small
 batched prefetch or a budgeted existing-map extension can be evaluated only if
 lookup/fault measurements justify it.
 
-## Hermes kernel measurements
+## Summa kernel measurements
 
 The ignored `query::bmp::forward_experiment::measure_forward_completion_against_block_scoring`
 test compares the existing adaptive inverted block kernel with the shared forward
 integer scorer. Run in release mode with `--ignored --nocapture --test-threads=1`;
-set `HERMES_FORWARD_EXPERIMENT_FULL=1` for whole-query evaluation instead of the
+set `SUMMA_FORWARD_EXPERIMENT_FULL=1` for whole-query evaluation instead of the
 production phase-two mask. The fixture has 64 blocks, 4,096 dimensions, 64 retained
 entries/vector, block sizes 8/32/128, queries of 8/32/64 dimensions, and spread or
 partly shared document dimensions. It applies the production per-block term mask,
@@ -127,7 +127,7 @@ CPU-heavy workload. Representative medians for 32-slot blocks and 64 query terms
 
 Here selective completion wins at one or two survivors, but a whole-block
 forward replacement loses by 11.3–11.6 times. Small blocks alone do not reproduce
-the LSP paper's result in Hermes. Its term/weight arrays and block-local access
+the LSP paper's result in Summa. Its term/weight arrays and block-local access
 patterns differ from our logical directory, per-vector validation, and adaptive
 inverted representation. This experiment includes physical-to-logical mapping,
 binary lookup, payload validation and dot product; it excludes survivor discovery,
@@ -195,7 +195,7 @@ production still validates selected values through the owning reader. Peak proce
 RSS / footprint were 92,258,304 / 26,296,704 bytes, including fixture construction,
 BP and both mappings. This is warm mmap, not a cold-cache or per-query residency
 measurement. Evidence: `.context/l1-forward-lookup.log`. All three experiments
-were rerun after rebasing onto `origin/main` at `1844d9af` (Hermes 1.8.124).
+were rerun after rebasing onto `origin/main` at `1844d9af` (Summa 1.8.124).
 
 ## Decision and limits
 
@@ -212,7 +212,7 @@ The retired `measure_forward_completion_in_whole_bmp_traversal` prototype
 exercised the actual segment executor, including quantization, H/E/D traversal,
 survivor discovery, logical lookup, selected-vector validation, scoring and top-k
 collection. These are historical measurements of that prototype; its traversal
-hook is no longer compiled or exposed by Hermes.
+hook is no longer compiled or exposed by Summa.
 
 The mmap fixture has 8,192 vectors with 64 entries each, 32-slot blocks, 4,096 or
 105,879 dimensions, and interleaved term clusters. Record BP changes 8,190 slots.

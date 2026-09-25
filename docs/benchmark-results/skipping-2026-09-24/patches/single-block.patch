@@ -1,5 +1,5 @@
---- a/hermes-core/src/query/phrase.rs
-+++ b/hermes-core/src/query/phrase.rs
+--- a/summa-core/src/query/phrase.rs
++++ b/summa-core/src/query/phrase.rs
 @@ -1595,7 +1595,7 @@
              {
                  checked_block = block;

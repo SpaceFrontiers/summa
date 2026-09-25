@@ -22,8 +22,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -33,7 +33,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -51,7 +51,7 @@
     "unhinted": {
       "environment": {
         "revision": "5b5f843657f85929790339be8cf350a92fbbb37a",
-        "status": "M docs/range-block-scans.md\n M hermes-core/src/structures/fast_field/codec.rs",
+        "status": "M docs/range-block-scans.md\n M summa-core/src/structures/fast_field/codec.rs",
         "working_diff_sha256": "59b7cdb1527708982dd02d9359a561aed0043993ba92a73d68c5025d4539da6e",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -68,8 +68,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -79,7 +79,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -114,8 +114,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -125,7 +125,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -143,7 +143,7 @@
     "dispatch-inline": {
       "environment": {
         "revision": "5b5f843657f85929790339be8cf350a92fbbb37a",
-        "status": "M docs/range-block-scans.md\n M hermes-core/src/structures/fast_field/codec.rs",
+        "status": "M docs/range-block-scans.md\n M summa-core/src/structures/fast_field/codec.rs",
         "working_diff_sha256": "a11ba65258650d8a746f398953b76507603bf1dfe798c06da1e39a028ccedbad",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -160,8 +160,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -171,7 +171,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",
@@ -189,7 +189,7 @@
     "kernel-boundary": {
       "environment": {
         "revision": "5b5f843657f85929790339be8cf350a92fbbb37a",
-        "status": "M docs/range-block-scans.md\n M hermes-core/src/structures/fast_field/codec.rs",
+        "status": "M docs/range-block-scans.md\n M summa-core/src/structures/fast_field/codec.rs",
         "working_diff_sha256": "6cbce0ac076af69c54b10c104839c4b214e30eb287b42fc9d1b59d97c644a054",
         "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
         "machine": "arm64",
@@ -206,8 +206,8 @@
           "CARGO_BUILD_JOBS": "",
           "CRITERION_HOME": "",
           "RAYON_NUM_THREADS": "",
-          "HERMES_PIN_MODE": "",
-          "HERMES_PIN_METADATA_BUDGET_MB": ""
+          "SUMMA_PIN_MODE": "",
+          "SUMMA_PIN_METADATA_BUDGET_MB": ""
         }
       },
       "steps": [
@@ -217,7 +217,7 @@
             "bench",
             "--locked",
             "-p",
-            "hermes-core",
+            "summa-core",
             "--bench",
             "rust_hot_paths",
             "--",

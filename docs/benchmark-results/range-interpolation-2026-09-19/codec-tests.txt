@@ -1,11 +1,11 @@
-   Compiling hermes-core v1.8.146 (/Users/pasha/conductor/workspaces/hermes/jerusalem/hermes-core)
+   Compiling summa-core v1.8.146 (/Users/pasha/conductor/workspaces/summa/jerusalem/summa-core)
 warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
   |
   = note: `#[warn(linker_messages)]` on by default
 
-warning: `hermes-core` (lib test) generated 1 warning
+warning: `summa-core` (lib test) generated 1 warning
     Finished `test` profile [unoptimized + debuginfo] target(s) in 52.00s
-     Running unittests src/lib.rs (target/debug/deps/hermes_core-46a82152915afa24)
+     Running unittests src/lib.rs (target/debug/deps/summa_core-46a82152915afa24)
 
 running 31 tests
 test structures::fast_field::codec::tests::byte_aligned_batches_preserve_offsets_tails_and_wrapping_values ... ok

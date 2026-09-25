@@ -71,31 +71,31 @@ Warm throughput, queries/second; higher is better. Percentages compare each
 layout with its own baseline. Luxir is a fresh same-host reference, not a
 before/after code comparison.
 
-| Workload                          | Hermes before → after | Change | RGB before → after |  Change |  Luxir |
-| --------------------------------- | --------------------: | -----: | -----------------: | ------: | -----: |
-| Conjunction / top 10              |       46,512 → 47,939 |  +3.1% |    74,980 → 75,533 |   +0.7% | 53,361 |
-| Conjunction / top 100             |       41,476 → 42,995 |  +3.7% |    62,783 → 62,932 |   +0.2% | 42,653 |
-| Conjunction / count               |       77,668 → 75,576 |  -2.7% |    93,540 → 93,064 |   -0.5% | 66,758 |
-| Low-frequency phrase / top 10     |       16,213 → 16,982 |  +4.7% |     8,706 → 22,205 | +155.0% |  7,615 |
-| Low-frequency phrase / top 100    |         5,101 → 5,147 |  +0.9% |      5,784 → 6,012 |   +3.9% |  3,869 |
-| Low-frequency phrase / count      |         1,972 → 1,985 |  +0.6% |      2,915 → 2,898 |   -0.6% |  2,072 |
-| Medium-frequency phrase / top 10  |       15,704 → 16,687 |  +6.3% |    17,244 → 18,880 |   +9.5% | 17,641 |
-| Medium-frequency phrase / top 100 |       10,540 → 10,988 |  +4.3% |     8,112 → 11,685 |  +44.0% |  5,977 |
-| Medium-frequency phrase / count   |             718 → 702 |  -2.2% |          733 → 715 |   -2.4% |    608 |
+| Workload                          | Summa before → after | Change | RGB before → after |  Change |  Luxir |
+| --------------------------------- | -------------------: | -----: | -----------------: | ------: | -----: |
+| Conjunction / top 10              |      46,512 → 47,939 |  +3.1% |    74,980 → 75,533 |   +0.7% | 53,361 |
+| Conjunction / top 100             |      41,476 → 42,995 |  +3.7% |    62,783 → 62,932 |   +0.2% | 42,653 |
+| Conjunction / count               |      77,668 → 75,576 |  -2.7% |    93,540 → 93,064 |   -0.5% | 66,758 |
+| Low-frequency phrase / top 10     |      16,213 → 16,982 |  +4.7% |     8,706 → 22,205 | +155.0% |  7,615 |
+| Low-frequency phrase / top 100    |        5,101 → 5,147 |  +0.9% |      5,784 → 6,012 |   +3.9% |  3,869 |
+| Low-frequency phrase / count      |        1,972 → 1,985 |  +0.6% |      2,915 → 2,898 |   -0.6% |  2,072 |
+| Medium-frequency phrase / top 10  |      15,704 → 16,687 |  +6.3% |    17,244 → 18,880 |   +9.5% | 17,641 |
+| Medium-frequency phrase / top 100 |      10,540 → 10,988 |  +4.3% |     8,112 → 11,685 |  +44.0% |  5,977 |
+| Medium-frequency phrase / count   |            718 → 702 |  -2.2% |          733 → 715 |   -2.4% |    608 |
 
 CPU microseconds/request, including server overhead; lower is better.
 
-| Workload                          | Hermes before → after | RGB before → after |
-| --------------------------------- | --------------------: | -----------------: |
-| Conjunction / top 10              |         542.7 → 529.6 |      346.0 → 343.9 |
-| Conjunction / top 100             |         606.1 → 590.4 |      405.3 → 403.9 |
-| Conjunction / count               |         316.9 → 318.1 |      183.9 → 184.7 |
-| Low-frequency phrase / top 10     |       1630.7 → 1574.5 |    3164.7 → 1190.7 |
-| Low-frequency phrase / top 100    |       5346.2 → 5388.1 |    4731.9 → 4650.3 |
-| Low-frequency phrase / count      |     14821.1 → 14703.6 |    9918.4 → 9981.5 |
-| Medium-frequency phrase / top 10  |       1638.1 → 1559.6 |    1495.2 → 1363.7 |
-| Medium-frequency phrase / top 100 |       2467.0 → 2396.4 |    3222.7 → 2236.6 |
-| Medium-frequency phrase / count   |     41201.6 → 42325.1 |  40427.3 → 41367.1 |
+| Workload                          | Summa before → after | RGB before → after |
+| --------------------------------- | -------------------: | -----------------: |
+| Conjunction / top 10              |        542.7 → 529.6 |      346.0 → 343.9 |
+| Conjunction / top 100             |        606.1 → 590.4 |      405.3 → 403.9 |
+| Conjunction / count               |        316.9 → 318.1 |      183.9 → 184.7 |
+| Low-frequency phrase / top 10     |      1630.7 → 1574.5 |    3164.7 → 1190.7 |
+| Low-frequency phrase / top 100    |      5346.2 → 5388.1 |    4731.9 → 4650.3 |
+| Low-frequency phrase / count      |    14821.1 → 14703.6 |    9918.4 → 9981.5 |
+| Medium-frequency phrase / top 10  |      1638.1 → 1559.6 |    1495.2 → 1363.7 |
+| Medium-frequency phrase / top 100 |      2467.0 → 2396.4 |    3222.7 → 2236.6 |
+| Medium-frequency phrase / count   |    41201.6 → 42325.1 |  40427.3 → 41367.1 |
 
 Peak resident memory across the sessions below includes warm mmap payloads.
 Anonymous RSS is reported separately; neither measure is Rust `Pin`. The
@@ -140,7 +140,7 @@ indexing workers respectively. Their cross-layout difference is **not** a pure
 reordering ablation.
 
 The benchmark host is an n2-highmem-32: 32 logical CPUs / 16 physical Cascade Lake
-cores. Server affinity is CPUs 0–14,16–30; the replay driver uses 15,31. Hermes
+cores. Server affinity is CPUs 0–14,16–30; the replay driver uses 15,31. Summa
 uses 30 search workers, four HTTP workers and 32 clients, with query caching off
 and warm filesystem pages. Both versions use the same compiler and locked
 release build with `RUSTFLAGS="-C target-cpu=native"`.
