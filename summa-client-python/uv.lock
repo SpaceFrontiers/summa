@@ -157,41 +157,6 @@ wheels = [
 ]
 
 [[package]]
-name = "summa-client-python"
-version = "1.9.1"
-source = { editable = "." }
-dependencies = [
-    { name = "grpcio" },
-    { name = "protobuf" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "grpcio-tools" },
-    { name = "ruff" },
-]
-test = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "grpcio", specifier = ">=1.76.0" },
-    { name = "protobuf", specifier = ">=6.33.4" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "grpcio-tools", specifier = ">=1.76.0" },
-    { name = "ruff", specifier = "==0.16.0" },
-]
-test = [
-    { name = "pytest", specifier = ">=8.0.0" },
-    { name = "pytest-asyncio", specifier = ">=0.24.0" },
-]
-
-[[package]]
 name = "iniconfig"
 version = "2.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -306,6 +271,41 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/86/ff/f75651350db3cf2ef767371307eb163f3cc1ac03e16fdf3ac347607f7edb/setuptools-80.10.1.tar.gz", hash = "sha256:bf2e513eb8144c3298a3bd28ab1a5edb739131ec5c22e045ff93cd7f5319703a", size = 1229650, upload-time = "2026-01-21T09:42:03.061Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e0/76/f963c61683a39084aa575f98089253e1e852a4417cb8a3a8a422923a5246/setuptools-80.10.1-py3-none-any.whl", hash = "sha256:fc30c51cbcb8199a219c12cc9c281b5925a4978d212f84229c909636d9f6984e", size = 1099859, upload-time = "2026-01-21T09:42:00.688Z" },
+]
+
+[[package]]
+name = "summa-client-python"
+version = "2.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "grpcio" },
+    { name = "protobuf" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "grpcio-tools" },
+    { name = "ruff" },
+]
+test = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "grpcio", specifier = ">=1.76.0" },
+    { name = "protobuf", specifier = ">=6.33.4" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "grpcio-tools", specifier = ">=1.76.0" },
+    { name = "ruff", specifier = "==0.16.0" },
+]
+test = [
+    { name = "pytest", specifier = ">=8.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.24.0" },
 ]
 
 [[package]]

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "summa-client-python"
-version = "1.9.1"
+version = "2.0.0"
 description = "Async Python client for Summa search server"
 readme = "README.md"
 license = "MIT"

@@ -1,6 +1,6 @@
 {
   "name": "summa-client-typescript",
-  "version": "1.9.1",
+  "version": "2.0.0",
   "description": "TypeScript client for Summa search server",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
