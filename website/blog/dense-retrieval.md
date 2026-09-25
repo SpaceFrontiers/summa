@@ -10,8 +10,6 @@ nav_order: 3
 
 _September 25, 2026_
 
-<script async src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js"></script>
-
 Imagine that we have a collection of help pages and a user types “how to recover an account.” The useful page is called “Resetting your password.” We would like to find it without first writing a dictionary of every possible paraphrase.
 
 Let's make the computer learn this correspondence. In dense retrieval, an encoder maps each query and document into vectors,

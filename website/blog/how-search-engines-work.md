@@ -4,10 +4,6 @@ parent: Blog
 nav_order: 1
 ---
 
-<script type="text/javascript" async
-  src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-mml-chtml.js">
-</script>
-
 <style rel="stylesheet">
 figure > img {
     display:block;
