@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - uses: bazelbuild/setup-bazelisk@v2
       - name: Install Protobuf Headers
         run: sudo apt-get install -y protobuf-compiler libprotobuf-dev
@@ -24,7 +24,7 @@ jobs:
     needs: test
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - name: Install Protoc
         uses: arduino/setup-protoc@v1
       - uses: actions/cache@v2.1.6
@@ -47,7 +47,7 @@ jobs:
     needs: test
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - uses: bazelbuild/setup-bazelisk@v2
       - name: Mount bazel cache
         uses: actions/cache@v3
@@ -66,7 +66,7 @@ jobs:
     needs: test
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v7
       - uses: bazelbuild/setup-bazelisk@v2
       - name: Mount bazel cache
         uses: actions/cache@v3
