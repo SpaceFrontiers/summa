@@ -370,6 +370,13 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 )
                 .await?;
             cleanup.disarm();
+            // Publication already refreshed the writer-owned PK snapshot. Drop
+            // our source/mask owner and drain eligible deletes inside this owned
+            // transaction, before the caller can start another segment. Keeping
+            // the claim and capacity here also makes cancellation/shutdown drain
+            // cleanup along with the completed replacement.
+            drop(_snapshot);
+            manager.wait_for_scheduled_deletions().await;
             log::info!("[compaction] index={} source={} physical_rows={} removed_rows={} removed_ratio={:.6} live_rows={} elapsed_secs={:.3}",
                 manager.schema.index_label(), source_id, physical, removed,
                 f64::from(removed) / f64::from(physical), meta.num_docs, start.elapsed().as_secs_f64());

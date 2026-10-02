@@ -1860,8 +1860,10 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         Ok(changed)
     }
 
-    /// Compact every tombstoned segment in the current snapshot. Works even
-    /// when the index contains only one segment.
+    /// Compact every tombstoned segment in the current snapshot. Publish each
+    /// replacement and drain eligible source deletions before starting the next
+    /// segment. Reader-held snapshots retain their files. Works even when the
+    /// index contains only one segment.
     pub async fn compact(&mut self, memory_budget: usize) -> Result<usize> {
         if memory_budget < 1024 * 1024 {
             return Err(Error::Schema(
