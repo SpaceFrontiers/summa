@@ -1,0 +1,639 @@
+#![allow(dead_code)]
+mod original {use std::cmp::Ordering; use std::collections::BinaryHeap; type DocId=u32; const MAX_INITIAL_SCORE_COLLECTOR_CAPACITY:usize=8192;
+/// Entry for top-k min-heap
+#[derive(Clone, Copy)]
+pub struct HeapEntry {
+    pub doc_id: DocId,
+    pub score: f32,
+    pub ordinal: u16,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits()
+            && self.doc_id == other.doc_id
+            && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap: lower scores come first (to be evicted).
+        // Keep a total float order and deterministic doc/ordinal tie breaks.
+        // The generic then_with closures inline; no callback allocation is needed.
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.doc_id.cmp(&other.doc_id))
+            .then_with(|| self.ordinal.cmp(&other.ordinal))
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Efficient top-k collector using min-heap (internal, scoring-layer)
+///
+/// Maintains the k highest-scoring documents using a min-heap where the
+/// lowest score is at the top for O(1) threshold lookup and O(log k) eviction.
+/// No deduplication — caller must ensure each doc_id is inserted only once.
+///
+/// This is intentionally separate from `TopKCollector` in `collector.rs`:
+/// `ScoreCollector` is used inside `MaxScoreExecutor` where only `(doc_id,
+/// score, ordinal)` tuples exist — no `Scorer` trait, no position tracking,
+/// and the threshold must be inlined for tight block-max loops.
+/// `TopKCollector` wraps a `Scorer` and drives the full `DocSet`/`Scorer`
+/// protocol, collecting positions on demand.
+pub struct ScoreCollector {
+    /// Min-heap of top-k entries (lowest score at top for eviction)
+    heap: BinaryHeap<HeapEntry>,
+    pub k: usize,
+    /// Cached threshold: avoids repeated heap.peek() in hot loops.
+    /// Updated only when the heap changes (insert/pop).
+    cached_threshold: f32,
+    /// Score of the logical sentinel filling every unused top-k slot after
+    /// threshold seeding. Keeping one score here instead of `k - heap.len()`
+    /// entries makes filling those unused slots O(1) time and memory.
+    virtual_threshold: Option<f32>,
+}
+
+impl ScoreCollector {
+    /// Create a new collector for top-k results
+    pub fn new(k: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(k.min(MAX_INITIAL_SCORE_COLLECTOR_CAPACITY)),
+            k,
+            cached_threshold: 0.0,
+            virtual_threshold: None,
+        }
+    }
+
+    /// Current score threshold (minimum score to enter top-k)
+    #[inline]
+    pub fn threshold(&self) -> f32 {
+        self.cached_threshold
+    }
+
+    /// Recompute cached threshold from heap state
+    #[inline]
+    fn update_threshold(&mut self) {
+        self.cached_threshold = if let Some(threshold) = self.virtual_threshold {
+            threshold
+        } else if self.heap.len() >= self.k {
+            self.heap.peek().map(|e| e.score).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Insert a document score. Returns true if inserted in top-k.
+    /// Caller must ensure each doc_id is inserted only once.
+    #[inline]
+    pub fn insert(&mut self, doc_id: DocId, score: f32) -> bool {
+        self.insert_with_ordinal(doc_id, score, 0)
+    }
+
+    /// Insert a document score with ordinal. Returns true if inserted in top-k.
+    /// Caller must ensure each doc_id is inserted only once.
+    #[inline]
+    pub fn insert_with_ordinal(&mut self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        let entry = HeapEntry {
+            doc_id,
+            score,
+            ordinal,
+        };
+        if self.heap.len() < self.k {
+            if let Some(threshold) = self.virtual_threshold {
+                let sentinel = HeapEntry {
+                    doc_id: u32::MAX,
+                    score: threshold,
+                    ordinal: 0,
+                };
+                if entry >= sentinel {
+                    return false;
+                }
+            }
+
+            self.heap.push(entry);
+            // The final real entry displaces the last virtual sentinel.
+            if self.heap.len() == self.k {
+                self.virtual_threshold = None;
+                self.update_threshold();
+            }
+            true
+        } else if score < self.cached_threshold {
+            false
+        } else if self.heap.peek().is_some_and(|worst| entry < *worst) {
+            {
+                let mut worst = self.heap.peek_mut().expect("full heap has a root");
+                *worst = entry;
+            }
+            self.update_threshold();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Screen eight scores together, then use the canonical heap admission.
+    /// A stale threshold only admits extra candidates. Equal and unordered
+    /// scores still reach the total-order comparison, including seeded heaps.
+    fn insert_text_run(&mut self, docs: &[DocId], scores: &[f32]) {
+        self.insert_text_run_with_mapping(docs, scores, |doc| doc);
+    }
+
+    /// Resolve stable IDs only after the score screen, before heap tie-breaking.
+    fn insert_text_run_with_mapping(
+        &mut self,
+        docs: &[DocId],
+        scores: &[f32],
+        resolve: impl Fn(DocId) -> DocId,
+    ) {
+        debug_assert_eq!(docs.len(), scores.len());
+        let (blocks, tail) = scores.as_chunks::<8>();
+        for (docs, scores) in docs.chunks_exact(8).zip(blocks) {
+            let threshold = if self.heap.len() >= self.k {
+                self.cached_threshold
+            } else {
+                f32::NEG_INFINITY
+            };
+            let mut candidates = 0u8;
+            for (i, &score) in scores.iter().enumerate() {
+                let eligible = if score < threshold { 0 } else { 1 };
+                candidates |= eligible << i;
+            }
+            while candidates != 0 {
+                let i = candidates.trailing_zeros() as usize;
+                self.insert(resolve(docs[i]), 0.0 + scores[i]);
+                candidates &= candidates - 1;
+            }
+        }
+        for (&doc, &score) in docs[blocks.len() * 8..].iter().zip(tail) {
+            if self.heap.len() >= self.k && score < self.cached_threshold {
+                continue;
+            }
+            self.insert(resolve(doc), 0.0 + score);
+        }
+    }
+
+    /// Check if a score could potentially enter top-k
+    #[cfg(test)]
+    pub fn would_enter(&self, score: f32) -> bool {
+        self.len() < self.k || score > self.cached_threshold
+    }
+
+    /// Check whether this fully identified candidate ranks ahead of the current
+    /// worst retained entry, including deterministic tie breaks.
+    #[cfg(test)]
+    pub fn would_enter_candidate(&self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        let entry = HeapEntry {
+            doc_id,
+            score,
+            ordinal,
+        };
+        if let Some(threshold) = self.virtual_threshold {
+            let sentinel = HeapEntry {
+                doc_id: u32::MAX,
+                score: threshold,
+                ordinal: 0,
+            };
+            entry < sentinel
+        } else {
+            self.heap.len() < self.k || self.heap.peek().is_some_and(|worst| entry < *worst)
+        }
+    }
+
+    /// Get the conceptual heap length, including virtual threshold sentinels.
+    #[inline]
+    pub fn len(&self) -> usize {
+        if self.virtual_threshold.is_some() {
+            self.k
+        } else {
+            self.heap.len()
+        }
+    }
+
+    /// Number of real results retained, excluding threshold sentinels.
+    #[inline]
+    pub fn real_len(&self) -> usize {
+        self.heap.len()
+    }
+
+    /// Check if collector is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Seed the threshold from a cross-segment shared value.
+    ///
+    /// Logically fills unused slots and replaces retained entries below the new
+    /// floor with virtual dummy entries. This can be called repeatedly while
+    /// another segment raises the shared threshold; equal-scoring real
+    /// candidates win the deterministic doc-id tie break over sentinels.
+    pub fn seed_threshold(&mut self, initial_threshold: f32) {
+        if initial_threshold <= 0.0
+            || self.k == 0
+            || (self.len() >= self.k && initial_threshold <= self.cached_threshold)
+        {
+            return;
+        }
+
+        let sentinel = HeapEntry {
+            doc_id: u32::MAX,
+            score: initial_threshold,
+            ordinal: 0,
+        };
+
+        // When unused slots are already represented by a virtual sentinel, a
+        // new seed only changes the heap if it outranks the old floor. With an
+        // all-real full heap, it must similarly outrank the current root.
+        if let Some(current_threshold) = self.virtual_threshold {
+            let current = HeapEntry {
+                doc_id: u32::MAX,
+                score: current_threshold,
+                ordinal: 0,
+            };
+            if sentinel >= current {
+                return;
+            }
+        } else if self.heap.len() >= self.k
+            && !self.heap.peek().is_some_and(|worst| sentinel < *worst)
+        {
+            return;
+        }
+
+        self.virtual_threshold = Some(initial_threshold);
+        while self.heap.peek().is_some_and(|worst| sentinel < *worst) {
+            self.heap.pop();
+        }
+        self.update_threshold();
+    }
+
+    /// Convert to sorted top-k results (descending by score).
+    /// Filters out sentinel entries (doc_id == u32::MAX) from threshold seeding.
+    pub fn into_sorted_results(self) -> Vec<(DocId, f32, u16)> {
+        let mut results: Vec<(DocId, f32, u16)> = self
+            .heap
+            .into_vec()
+            .into_iter()
+            .filter(|e| e.doc_id != u32::MAX)
+            .map(|e| (e.doc_id, e.score, e.ordinal))
+            .collect();
+
+        // Sort by score descending, then doc_id ascending
+        results.sort_unstable_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        results
+    }
+}
+
+}
+mod packed {use std::cmp::Ordering; use std::collections::BinaryHeap; type DocId=u32; const MAX_INITIAL_SCORE_COLLECTOR_CAPACITY:usize=8192;
+/// Entry for top-k min-heap
+#[derive(Clone, Copy)]
+pub struct HeapEntry {
+    pub doc_id: DocId,
+    pub score: f32,
+    pub ordinal: u16,
+}
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.score.to_bits() == other.score.to_bits()
+            && self.doc_id == other.doc_id
+            && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap: lower scores come first (to be evicted).
+        // Keep a total float order and deterministic doc/ordinal tie breaks.
+        // The generic then_with closures inline; no callback allocation is needed.
+        match self.score.partial_cmp(&other.score) {
+            Some(Ordering::Less) => Ordering::Greater,
+            Some(Ordering::Greater) => Ordering::Less,
+            _ => other.score.total_cmp(&self.score)
+                .then_with(|| self.doc_id.cmp(&other.doc_id))
+                .then_with(|| self.ordinal.cmp(&other.ordinal)),
+        }
+    }
+}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Efficient top-k collector using min-heap (internal, scoring-layer)
+///
+/// Maintains the k highest-scoring documents using a min-heap where the
+/// lowest score is at the top for O(1) threshold lookup and O(log k) eviction.
+/// No deduplication — caller must ensure each doc_id is inserted only once.
+///
+/// This is intentionally separate from `TopKCollector` in `collector.rs`:
+/// `ScoreCollector` is used inside `MaxScoreExecutor` where only `(doc_id,
+/// score, ordinal)` tuples exist — no `Scorer` trait, no position tracking,
+/// and the threshold must be inlined for tight block-max loops.
+/// `TopKCollector` wraps a `Scorer` and drives the full `DocSet`/`Scorer`
+/// protocol, collecting positions on demand.
+pub struct ScoreCollector {
+    /// Min-heap of top-k entries (lowest score at top for eviction)
+    heap: BinaryHeap<HeapEntry>,
+    pub k: usize,
+    /// Cached threshold: avoids repeated heap.peek() in hot loops.
+    /// Updated only when the heap changes (insert/pop).
+    cached_threshold: f32,
+    /// Score of the logical sentinel filling every unused top-k slot after
+    /// threshold seeding. Keeping one score here instead of `k - heap.len()`
+    /// entries makes filling those unused slots O(1) time and memory.
+    virtual_threshold: Option<f32>,
+}
+
+impl ScoreCollector {
+    /// Create a new collector for top-k results
+    pub fn new(k: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(k.min(MAX_INITIAL_SCORE_COLLECTOR_CAPACITY)),
+            k,
+            cached_threshold: 0.0,
+            virtual_threshold: None,
+        }
+    }
+
+    /// Current score threshold (minimum score to enter top-k)
+    #[inline]
+    pub fn threshold(&self) -> f32 {
+        self.cached_threshold
+    }
+
+    /// Recompute cached threshold from heap state
+    #[inline]
+    fn update_threshold(&mut self) {
+        self.cached_threshold = if let Some(threshold) = self.virtual_threshold {
+            threshold
+        } else if self.heap.len() >= self.k {
+            self.heap.peek().map(|e| e.score).unwrap_or(0.0)
+        } else {
+            0.0
+        };
+    }
+
+    /// Insert a document score. Returns true if inserted in top-k.
+    /// Caller must ensure each doc_id is inserted only once.
+    #[inline]
+    pub fn insert(&mut self, doc_id: DocId, score: f32) -> bool {
+        self.insert_with_ordinal(doc_id, score, 0)
+    }
+
+    /// Insert a document score with ordinal. Returns true if inserted in top-k.
+    /// Caller must ensure each doc_id is inserted only once.
+    #[inline]
+    pub fn insert_with_ordinal(&mut self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        let entry = HeapEntry {
+            doc_id,
+            score,
+            ordinal,
+        };
+        if self.heap.len() < self.k {
+            if let Some(threshold) = self.virtual_threshold {
+                let sentinel = HeapEntry {
+                    doc_id: u32::MAX,
+                    score: threshold,
+                    ordinal: 0,
+                };
+                if entry >= sentinel {
+                    return false;
+                }
+            }
+
+            self.heap.push(entry);
+            // The final real entry displaces the last virtual sentinel.
+            if self.heap.len() == self.k {
+                self.virtual_threshold = None;
+                self.update_threshold();
+            }
+            true
+        } else if score < self.cached_threshold {
+            false
+        } else if self.heap.peek().is_some_and(|worst| entry < *worst) {
+            {
+                let mut worst = self.heap.peek_mut().expect("full heap has a root");
+                *worst = entry;
+            }
+            self.update_threshold();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Screen eight scores together, then use the canonical heap admission.
+    /// A stale threshold only admits extra candidates. Equal and unordered
+    /// scores still reach the total-order comparison, including seeded heaps.
+    fn insert_text_run(&mut self, docs: &[DocId], scores: &[f32]) {
+        self.insert_text_run_with_mapping(docs, scores, |doc| doc);
+    }
+
+    /// Resolve stable IDs only after the score screen, before heap tie-breaking.
+    fn insert_text_run_with_mapping(
+        &mut self,
+        docs: &[DocId],
+        scores: &[f32],
+        resolve: impl Fn(DocId) -> DocId,
+    ) {
+        debug_assert_eq!(docs.len(), scores.len());
+        let (blocks, tail) = scores.as_chunks::<8>();
+        for (docs, scores) in docs.chunks_exact(8).zip(blocks) {
+            let threshold = if self.heap.len() >= self.k {
+                self.cached_threshold
+            } else {
+                f32::NEG_INFINITY
+            };
+            let mut candidates = 0u8;
+            for (i, &score) in scores.iter().enumerate() {
+                let eligible = if score < threshold { 0 } else { 1 };
+                candidates |= eligible << i;
+            }
+            while candidates != 0 {
+                let i = candidates.trailing_zeros() as usize;
+                self.insert(resolve(docs[i]), 0.0 + scores[i]);
+                candidates &= candidates - 1;
+            }
+        }
+        for (&doc, &score) in docs[blocks.len() * 8..].iter().zip(tail) {
+            if self.heap.len() >= self.k && score < self.cached_threshold {
+                continue;
+            }
+            self.insert(resolve(doc), 0.0 + score);
+        }
+    }
+
+    /// Check if a score could potentially enter top-k
+    #[cfg(test)]
+    pub fn would_enter(&self, score: f32) -> bool {
+        self.len() < self.k || score > self.cached_threshold
+    }
+
+    /// Check whether this fully identified candidate ranks ahead of the current
+    /// worst retained entry, including deterministic tie breaks.
+    #[cfg(test)]
+    pub fn would_enter_candidate(&self, doc_id: DocId, score: f32, ordinal: u16) -> bool {
+        if self.k == 0 {
+            return false;
+        }
+        let entry = HeapEntry {
+            doc_id,
+            score,
+            ordinal,
+        };
+        if let Some(threshold) = self.virtual_threshold {
+            let sentinel = HeapEntry {
+                doc_id: u32::MAX,
+                score: threshold,
+                ordinal: 0,
+            };
+            entry < sentinel
+        } else {
+            self.heap.len() < self.k || self.heap.peek().is_some_and(|worst| entry < *worst)
+        }
+    }
+
+    /// Get the conceptual heap length, including virtual threshold sentinels.
+    #[inline]
+    pub fn len(&self) -> usize {
+        if self.virtual_threshold.is_some() {
+            self.k
+        } else {
+            self.heap.len()
+        }
+    }
+
+    /// Number of real results retained, excluding threshold sentinels.
+    #[inline]
+    pub fn real_len(&self) -> usize {
+        self.heap.len()
+    }
+
+    /// Check if collector is empty
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Seed the threshold from a cross-segment shared value.
+    ///
+    /// Logically fills unused slots and replaces retained entries below the new
+    /// floor with virtual dummy entries. This can be called repeatedly while
+    /// another segment raises the shared threshold; equal-scoring real
+    /// candidates win the deterministic doc-id tie break over sentinels.
+    pub fn seed_threshold(&mut self, initial_threshold: f32) {
+        if initial_threshold <= 0.0
+            || self.k == 0
+            || (self.len() >= self.k && initial_threshold <= self.cached_threshold)
+        {
+            return;
+        }
+
+        let sentinel = HeapEntry {
+            doc_id: u32::MAX,
+            score: initial_threshold,
+            ordinal: 0,
+        };
+
+        // When unused slots are already represented by a virtual sentinel, a
+        // new seed only changes the heap if it outranks the old floor. With an
+        // all-real full heap, it must similarly outrank the current root.
+        if let Some(current_threshold) = self.virtual_threshold {
+            let current = HeapEntry {
+                doc_id: u32::MAX,
+                score: current_threshold,
+                ordinal: 0,
+            };
+            if sentinel >= current {
+                return;
+            }
+        } else if self.heap.len() >= self.k
+            && !self.heap.peek().is_some_and(|worst| sentinel < *worst)
+        {
+            return;
+        }
+
+        self.virtual_threshold = Some(initial_threshold);
+        while self.heap.peek().is_some_and(|worst| sentinel < *worst) {
+            self.heap.pop();
+        }
+        self.update_threshold();
+    }
+
+    /// Convert to sorted top-k results (descending by score).
+    /// Filters out sentinel entries (doc_id == u32::MAX) from threshold seeding.
+    pub fn into_sorted_results(self) -> Vec<(DocId, f32, u16)> {
+        let mut results: Vec<(DocId, f32, u16)> = self
+            .heap
+            .into_vec()
+            .into_iter()
+            .filter(|e| e.doc_id != u32::MAX)
+            .map(|e| (e.doc_id, e.score, e.ordinal))
+            .collect();
+
+        // Sort by score descending, then doc_id ascending
+        results.sort_unstable_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        results
+    }
+}
+
+}
+
+use std::{hint::black_box,time::Instant};
+fn data(n:usize,kind:usize)->Vec<(u32,f32,u16)> {
+ let mut seed=42u64; let mut rows=Vec::with_capacity(n);
+ for i in 0..n {seed=seed.wrapping_mul(6364136223846793005).wrapping_add(1); let score=match kind {0=>(seed>>32) as u32 as f32/100000000.0,1=>((seed>>32)%32) as f32,2=>i as f32,_=>f32::from_bits((seed>>32) as u32)};rows.push(((i as u32).wrapping_mul(2654435761),score,(i%7) as u16));} rows
+}
+macro_rules! runner {($name:ident,$m:ident)=>{
+ #[inline(never)] fn $name(rows:&[(u32,f32,u16)], k:usize, seed:bool)->Vec<(u32,u32,u16)> {
+ let mut collector=$m::ScoreCollector::new(k); if seed {collector.seed_threshold(20.0);}
+ for &(d,s,o) in rows {collector.insert_with_ordinal(d,s,o);}
+ collector.into_sorted_results().into_iter().map(|(d,s,o)|(d,s.to_bits(),o)).collect()
+ }
+}}
+runner!(baseline,original);runner!(candidate,packed);
+fn main(){
+ // Check the transformed ordering independently on random bit patterns,
+ // including identical scores with different stable IDs and ordinals.
+ let special=data(100000,3);
+ for pair in special.windows(2) {for tie in [false,true] {let a=pair[0];let mut b=pair[1];if tie {b.1=a.1;}
+ let old=original::HeapEntry{doc_id:a.0,score:a.1,ordinal:a.2}.cmp(&original::HeapEntry{doc_id:b.0,score:b.1,ordinal:b.2});
+ let new=packed::HeapEntry{doc_id:a.0,score:a.1,ordinal:a.2}.cmp(&packed::HeapEntry{doc_id:b.0,score:b.1,ordinal:b.2});assert_eq!(old,new);}}
+ for kind in 0..4 {let rows=data(100000,kind);for k in [0,1,10,100,1000] {for seeded in [false,true] {assert_eq!(baseline(&rows,k,seeded),candidate(&rows,k,seeded));}}}
+ for kind in 0..3 {let rows=data(100000,kind);for k in [10,100,1000] {let expected=baseline(&rows,k,false);for label in ["baseline1","candidate1","candidate2","baseline2"] {let mut samples=vec![];for i in 0..25 {let start=Instant::now();let got=if label.starts_with("baseline"){baseline(black_box(&rows),k,false)}else{candidate(black_box(&rows),k,false)};let elapsed=start.elapsed().as_nanos();assert_eq!(got,expected);if i>=5 {samples.push(elapsed);}}
+ println!("{{\"kind\":{kind},\"k\":{k},\"label\":\"{label}\",\"samples_ns\":{samples:?}}}");}}}
+ println!("{{\"complete\":true,\"entry_bytes\":{},\"collector_bytes\":{}}}",size_of::<original::HeapEntry>(),size_of::<original::ScoreCollector>());
+}

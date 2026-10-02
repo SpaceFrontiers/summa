@@ -110,8 +110,8 @@ The adapter's full usage string is:
 ```text
 search_benchmark_game <index|serve|validate-queries> <path> [--exhaustive]
   [--indexing-threads N] [--indexing-memory-bytes N]
-  [--posting-codec rounded|packed|pfor|simd4x]
-  [--term-cache-blocks N] [--term-cache-bytes N] [--term-dict-block-bytes N]
+  [--posting-codec rounded|rounded_bitmap|packed|pfor|simd4x]
+  [--term-cache-blocks N] [--term-cache-bytes N] [--term-cache-process-bytes N] [--term-dict-block-bytes N]
   [--posting-ratio-bounds] [--posting-impact-bounds] [--no-background-merges]
 ```
 
@@ -137,9 +137,9 @@ validated before index creation, using existing `IndexConfig` settings. Defaults
 are four workers and 2,000,000,000 bytes. This is the existing builder flush
 budget divided among workers, not a whole-process RSS cap; ingestion queues,
 serialization, merge work and mmap residency also contribute to peak memory.
-`--posting-codec rounded|packed|pfor|simd4x`
+`--posting-codec rounded|rounded_bitmap|packed|pfor|simd4x`
 selects the existing posting codec through `IndexConfig::posting_codec` and its
-shared parser; the default remains rounded. Codec experiments use a separately
+shared parser; the default is rounded_bitmap (the optimization mode's codec). Codec experiments use a separately
 rebuilt index and are labeled separately from same-index execution changes.
 `--term-dict-block-bytes N` sets the uncompressed term-dictionary block target
 for the build (512..=1048576, default 16384), the same
@@ -154,6 +154,12 @@ default. Do not infer a universal cache setting from this repeated workload.
 `--term-cache-bytes N` adds the optional per-segment byte cap on retained
 decompressed dictionary blocks (`IndexConfig.term_cache_budget_bytes`; 0
 disables retention entirely). It is applied together with the block cap.
+Either per-segment flag selects per-segment caches, matching every run recorded
+before September 27, 2026. Without them the adapter uses the process-wide
+dictionary cache default (`IndexConfig.term_cache_process_bytes`, 256 MiB on
+64-bit native builds; [design](term-dictionary-cache.md)).
+`--term-cache-process-bytes N` sets that shared budget explicitly (0 selects
+per-segment caches); the startup line prints the effective policy.
 Posting/position validation caches were removed when normal query reads began
 trusting immutable writer output. The former `--posting-validation-cache-bytes`
 option is no longer accepted; older measurements that mention it describe their

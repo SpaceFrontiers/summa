@@ -333,6 +333,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             for compact in [false, true] {
                 let encode = |values: &[u32]| {

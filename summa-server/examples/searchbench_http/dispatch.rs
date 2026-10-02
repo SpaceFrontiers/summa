@@ -1,11 +1,16 @@
 //! Benchmark dispatch policy. The closure owns admission and reader lifetimes.
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use summa_core::Searcher;
+use summa_core::directories::MmapDirectory;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub enum Dispatch {
-    #[default]
     Blocking,
     InPlace,
+    /// One job on the index's search pool (`Searcher::run_on_search_pool`),
+    /// the path `summa-server` uses; the blocking modes add a thread handoff.
+    #[default]
+    Pool,
 }
 
 impl std::str::FromStr for Dispatch {
@@ -15,7 +20,8 @@ impl std::str::FromStr for Dispatch {
         match value {
             "blocking" => Ok(Self::Blocking),
             "in-place" => Ok(Self::InPlace),
-            _ => anyhow::bail!("DISPATCH must be blocking or in-place"),
+            "pool" => Ok(Self::Pool),
+            _ => anyhow::bail!("DISPATCH must be blocking, in-place or pool"),
         }
     }
 }
@@ -23,9 +29,17 @@ impl std::str::FromStr for Dispatch {
 impl Dispatch {
     pub async fn run<T: Send + 'static>(
         self,
+        searcher: Option<&Searcher<MmapDirectory>>,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, String> {
         match self {
+            Self::Pool => match searcher {
+                Some(searcher) => searcher
+                    .run_on_search_pool(work)
+                    .await
+                    .map_err(|e| e.to_string()),
+                None => Err("pool dispatch requires a searcher".to_owned()),
+            },
             Self::Blocking => tokio::task::spawn_blocking(work)
                 .await
                 .map_err(|e| e.to_string()),
@@ -60,7 +74,7 @@ mod tests {
                 for _ in 0..64 {
                     let permit = admission.clone().try_acquire_owned().unwrap();
                     tasks.push(tokio::spawn(async move {
-                        mode.run(move || {
+                        mode.run(None, move || {
                             let _permit = permit;
                             std::thread::sleep(Duration::from_millis(1));
                             42
@@ -81,7 +95,7 @@ mod tests {
                 assert_eq!(admission.available_permits(), 64);
                 let permit = admission.clone().try_acquire_owned().unwrap();
                 assert!(
-                    mode.run(move || {
+                    mode.run(None, move || {
                         let _permit = permit;
                         panic!("injected worker panic")
                     })
@@ -104,7 +118,7 @@ mod tests {
             let (started_tx, started_rx) = mpsc::channel();
             let (release_tx, release_rx) = mpsc::channel();
             let task = runtime.spawn(async move {
-                mode.run(move || {
+                mode.run(None, move || {
                     let _permit = permit;
                     let _owner = held_owner;
                     started_tx.send(()).unwrap();

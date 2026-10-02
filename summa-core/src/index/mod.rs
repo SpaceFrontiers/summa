@@ -11,6 +11,8 @@
 use crate::dsl::Schema;
 #[cfg(feature = "native")]
 use crate::error::Result;
+#[cfg(feature = "native")]
+use crate::structures::{RetainedBytes, SharedBlockCache};
 #[cfg(feature = "sync")]
 use std::collections::HashMap;
 #[cfg(feature = "native")]
@@ -19,7 +21,7 @@ use std::sync::Arc;
 use std::sync::{OnceLock, Weak};
 
 mod searcher;
-pub use searcher::Searcher;
+pub use searcher::{DOCUMENT_READ_BATCH_SIZE, DocumentReadBatch, Searcher};
 
 #[cfg(any(feature = "native", feature = "wasm"))]
 mod content_hash;
@@ -360,11 +362,19 @@ pub struct IndexConfig {
     /// builders requesting the same width share one process-wide pool, so
     /// indexing-worker fan-out does not multiply this thread count.
     pub num_compression_threads: usize,
-    /// Block cache size for term dictionary per segment
+    /// Block cache size for term dictionary per segment. Applies to search
+    /// only when `term_cache_process_bytes` is 0; merges always use it.
     pub term_cache_blocks: usize,
     /// Optional per-segment cap on retained decompressed dictionary-block bytes.
-    /// None preserves the block-count policy; zero disables retention.
+    /// None preserves the block-count policy; zero disables retention. Same
+    /// scope as `term_cache_blocks`.
     pub term_cache_budget_bytes: Option<usize>,
+    /// Process-wide byte budget for decompressed term-dictionary blocks read
+    /// by searches. Indexes opened with the same budget share one cache, so
+    /// segment fan-out and overlapping reader generations do not multiply it.
+    /// Zero selects the per-segment `term_cache_blocks` policy instead.
+    /// See `docs/term-dictionary-cache.md`.
+    pub term_cache_process_bytes: usize,
     /// Flush target for newly written term dictionaries; default 16 KiB.
     pub term_dict_block_size: crate::structures::SSTableBlockSize,
     /// Process-wide byte budget for decompressed document-store blocks.
@@ -454,14 +464,17 @@ pub struct IndexConfig {
 static SEARCH_CPU_POOLS: OnceLock<parking_lot::Mutex<HashMap<usize, Weak<rayon::ThreadPool>>>> =
     OnceLock::new();
 
-/// Store caches are shared process-wide by configured byte budget, just like
-/// search CPU pools are shared by width. `IndexRegistry` clones one config for
-/// every index, but standalone callers with the same policy also converge on
-/// the same bounded cache.
+/// Decoded-block caches are shared process-wide by configured byte budget,
+/// just like search CPU pools are shared by width. `IndexRegistry` clones one
+/// config for every index, but standalone callers with the same policy also
+/// converge on the same bounded cache.
 #[cfg(feature = "native")]
-static STORE_CACHE_POOLS: OnceLock<
-    parking_lot::Mutex<std::collections::HashMap<usize, Weak<crate::segment::SharedStoreCache>>>,
-> = OnceLock::new();
+type BlockCachePools<V> =
+    OnceLock<parking_lot::Mutex<std::collections::HashMap<usize, Weak<SharedBlockCache<V>>>>>;
+#[cfg(feature = "native")]
+static STORE_CACHE_POOLS: BlockCachePools<crate::segment::CachedBlock> = OnceLock::new();
+#[cfg(feature = "native")]
+static TERM_CACHE_POOLS: BlockCachePools<crate::structures::DecodedBlock> = OnceLock::new();
 
 #[cfg(feature = "native")]
 static SPARSE_IO_GATES: OnceLock<
@@ -501,23 +514,68 @@ pub(crate) fn shared_sparse_io_gate(limit: usize) -> Arc<SparseIoGate> {
 }
 
 #[cfg(feature = "native")]
-pub(crate) fn shared_store_cache(budget_bytes: usize) -> Arc<crate::segment::SharedStoreCache> {
-    let mut caches = STORE_CACHE_POOLS
+fn shared_block_cache<V: RetainedBytes + ?Sized>(
+    pools: &'static BlockCachePools<V>,
+    budget_bytes: usize,
+    announced: &'static OnceLock<()>,
+    label: &str,
+) -> Arc<SharedBlockCache<V>> {
+    let mut caches = pools
         .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
         .lock();
     if let Some(cache) = caches.get(&budget_bytes).and_then(Weak::upgrade) {
         return cache;
     }
-    let cache = Arc::new(crate::segment::SharedStoreCache::new(budget_bytes));
+    let cache = Arc::new(SharedBlockCache::new(budget_bytes));
     caches.retain(|_, cache| cache.strong_count() > 0);
     caches.insert(budget_bytes, Arc::downgrade(&cache));
-    static ANNOUNCED: OnceLock<()> = OnceLock::new();
     log::log!(
-        shared_resource_log_level(&ANNOUNCED),
-        "[store_cache] process-wide budget={}",
+        shared_resource_log_level(announced),
+        "[{label}] process-wide budget={}",
         crate::format_bytes(budget_bytes as u64)
     );
     cache
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn shared_store_cache(budget_bytes: usize) -> Arc<crate::segment::SharedStoreCache> {
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    shared_block_cache(&STORE_CACHE_POOLS, budget_bytes, &ANNOUNCED, "store_cache")
+}
+
+#[cfg(feature = "native")]
+pub(crate) fn shared_term_cache(
+    budget_bytes: usize,
+) -> Arc<SharedBlockCache<crate::structures::DecodedBlock>> {
+    static ANNOUNCED: OnceLock<()> = OnceLock::new();
+    shared_block_cache(&TERM_CACHE_POOLS, budget_bytes, &ANNOUNCED, "term_cache")
+}
+
+/// Search-time dictionary cache policy of `config`. The per-segment caps are
+/// validated either way; setting them while the process-wide cache is active
+/// has no search effect and is reported.
+#[cfg(feature = "native")]
+pub(crate) fn term_cache_policy(config: &IndexConfig) -> Result<crate::segment::TermCachePolicy> {
+    validate_term_cache_blocks(config.term_cache_blocks)?;
+    if config.term_cache_process_bytes == 0 {
+        return Ok(crate::segment::TermCachePolicy::PerSegment {
+            blocks: config.term_cache_blocks,
+            budget_bytes: config.term_cache_budget_bytes,
+        });
+    }
+    if config.term_cache_blocks != DEFAULT_TERM_CACHE_BLOCKS
+        || config.term_cache_budget_bytes.is_some()
+    {
+        log::warn!(
+            "IndexConfig.term_cache_blocks/term_cache_budget_bytes are ignored by searches while \
+             term_cache_process_bytes={} (they still bound merges); set \
+             term_cache_process_bytes=0 to use per-segment dictionary caches",
+            config.term_cache_process_bytes
+        );
+    }
+    Ok(crate::segment::TermCachePolicy::Shared(shared_term_cache(
+        config.term_cache_process_bytes,
+    )))
 }
 
 #[cfg(feature = "sync")]
@@ -577,8 +635,9 @@ impl Default for IndexConfig {
             sparse_io_concurrency: 4,
             num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
-            term_cache_blocks: 256,
+            term_cache_blocks: DEFAULT_TERM_CACHE_BLOCKS,
             term_cache_budget_bytes: None,
+            term_cache_process_bytes: DEFAULT_TERM_CACHE_PROCESS_BYTES,
             term_dict_block_size: crate::structures::SSTableBlockSize::default(),
             // Stored bodies can be much larger than the writer's nominal
             // 16-KiB block target. Keep this process-wide and byte bounded so
@@ -629,6 +688,18 @@ impl Default for IndexConfig {
         }
     }
 }
+
+/// Default per-segment dictionary block cap (`IndexConfig::term_cache_blocks`).
+pub const DEFAULT_TERM_CACHE_BLOCKS: usize = 256;
+
+/// Default process-wide dictionary cache budget. Sized for broad dictionary
+/// scans of a large text field (the 10M-document benchmark's 42 broad
+/// wildcards retain 207 MB); WASM and 32-bit targets keep per-segment caches.
+#[cfg(all(feature = "native", target_pointer_width = "64"))]
+pub const DEFAULT_TERM_CACHE_PROCESS_BYTES: usize = 256 * 1024 * 1024;
+/// Default process-wide dictionary cache budget (disabled on this target).
+#[cfg(not(all(feature = "native", target_pointer_width = "64")))]
+pub const DEFAULT_TERM_CACHE_PROCESS_BYTES: usize = 0;
 
 /// Largest `IndexConfig::term_cache_blocks`; the per-segment dictionary block
 /// cache is sized by count and this keeps a typo from pinning a whole

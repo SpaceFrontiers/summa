@@ -1,0 +1,1566 @@
+{
+  "provenance": {
+    "binary_sha256": "9a6eb2b8e6da26961280b51b25977ff457cd984f9df3c62746f87ff5728b264c",
+    "patch_sha256": "ee6dd062b254ef05da6e99b2f5659d705c04742fbf03b4a810375570e144bf2e",
+    "flags": "-C target-cpu=native"
+  },
+  "audits": 677,
+  "native_phases": {
+    "p1": [
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 14.226,
+          "project": 5.6435,
+          "response_drop": 0.036,
+          "search": 3617.5315,
+          "serialize": 0.8155
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 14.9535,
+          "project": 31.2425,
+          "response_drop": 0.075,
+          "search": 4590.348,
+          "serialize": 3.013
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 14.5265,
+          "project": 4.608,
+          "response_drop": 0.044,
+          "search": 4562.859,
+          "serialize": 0.729
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 14.6675,
+          "project": 30.5665,
+          "response_drop": 0.081,
+          "search": 5331.7715,
+          "serialize": 3.02
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 16.251,
+          "project": 5.55,
+          "response_drop": 0.038,
+          "search": 7011.2075,
+          "serialize": 0.852
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 16.67,
+          "project": 35.7225,
+          "response_drop": 0.0865,
+          "search": 7699.6315,
+          "serialize": 3.537
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 12.141,
+          "project": 3.886,
+          "response_drop": 0.03,
+          "search": 608.784,
+          "serialize": 0.6355
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.5445,
+          "project": 28.859,
+          "response_drop": 0.057,
+          "search": 1002.3165,
+          "serialize": 3.0265
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.9525,
+          "project": 1.818,
+          "response_drop": 0.034,
+          "search": 262.028,
+          "serialize": 0.413
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 11.117,
+          "project": 18.6625,
+          "response_drop": 0.056,
+          "search": 406.608,
+          "serialize": 2.603
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.7155,
+          "project": 2.0155,
+          "response_drop": 0.033,
+          "search": 461.67,
+          "serialize": 0.451
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.283,
+          "project": 29.9395,
+          "response_drop": 0.07,
+          "search": 873.348,
+          "serialize": 2.9895
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ],
+    "q1": [
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 14.596,
+          "project": 5.479,
+          "response_drop": 0.044,
+          "search": 3694.3705,
+          "serialize": 0.886
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 15.0445,
+          "project": 33.0485,
+          "response_drop": 0.0755,
+          "search": 4702.17,
+          "serialize": 3.0695
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 14.4095,
+          "project": 4.3205,
+          "response_drop": 0.046,
+          "search": 4684.6395,
+          "serialize": 0.9195
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 15.207,
+          "project": 31.069,
+          "response_drop": 0.086,
+          "search": 5472.013,
+          "serialize": 3.1905
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 15.442,
+          "project": 5.2465,
+          "response_drop": 0.046,
+          "search": 7133.871,
+          "serialize": 0.9575
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 16.187,
+          "project": 35.9305,
+          "response_drop": 0.082,
+          "search": 7849.265,
+          "serialize": 3.4985
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 11.6105,
+          "project": 3.5985,
+          "response_drop": 0.035,
+          "search": 610.0695,
+          "serialize": 0.629
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 12.8105,
+          "project": 28.013,
+          "response_drop": 0.053,
+          "search": 995.615,
+          "serialize": 2.896
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.594,
+          "project": 1.724,
+          "response_drop": 0.037,
+          "search": 259.675,
+          "serialize": 0.383
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.5985,
+          "project": 18.164,
+          "response_drop": 0.051,
+          "search": 404.608,
+          "serialize": 2.4935
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.7335,
+          "project": 1.9255,
+          "response_drop": 0.041,
+          "search": 457.13,
+          "serialize": 0.429
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 12.1385,
+          "project": 27.817,
+          "response_drop": 0.053,
+          "search": 862.3065,
+          "serialize": 2.8665
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ],
+    "q2": [
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 13.9995,
+          "project": 5.336,
+          "response_drop": 0.045,
+          "search": 3694.6585,
+          "serialize": 0.814
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 14.5415,
+          "project": 31.57,
+          "response_drop": 0.075,
+          "search": 4699.345,
+          "serialize": 2.987
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 14.2105,
+          "project": 4.5545,
+          "response_drop": 0.045,
+          "search": 4689.3635,
+          "serialize": 0.8645
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 15.6345,
+          "project": 31.9935,
+          "response_drop": 0.075,
+          "search": 5496.826,
+          "serialize": 3.1115
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 15.675,
+          "project": 5.4335,
+          "response_drop": 0.047,
+          "search": 7128.071,
+          "serialize": 0.919
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 16.8385,
+          "project": 37.5065,
+          "response_drop": 0.086,
+          "search": 7863.5105,
+          "serialize": 3.6005
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 12.2995,
+          "project": 3.697,
+          "response_drop": 0.035,
+          "search": 614.0485,
+          "serialize": 0.5785
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.0695,
+          "project": 28.0295,
+          "response_drop": 0.071,
+          "search": 994.225,
+          "serialize": 2.783
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.676,
+          "project": 1.7125,
+          "response_drop": 0.03,
+          "search": 259.29,
+          "serialize": 0.377
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.932,
+          "project": 17.68,
+          "response_drop": 0.056,
+          "search": 403.6995,
+          "serialize": 2.434
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.9885,
+          "project": 1.981,
+          "response_drop": 0.032,
+          "search": 458.1005,
+          "serialize": 0.4465
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 12.3625,
+          "project": 27.858,
+          "response_drop": 0.06,
+          "search": 864.3525,
+          "serialize": 2.8445
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ],
+    "p2": [
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 14.4075,
+          "project": 5.3535,
+          "response_drop": 0.06,
+          "search": 3616.371,
+          "serialize": 0.846
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 15.0405,
+          "project": 33.3515,
+          "response_drop": 0.083,
+          "search": 4605.256,
+          "serialize": 3.062
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 14.567,
+          "project": 4.8365,
+          "response_drop": 0.0515,
+          "search": 4579.3795,
+          "serialize": 0.845
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 14.5635,
+          "project": 31.773,
+          "response_drop": 0.0825,
+          "search": 5335.4845,
+          "serialize": 3.1475
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 16.625,
+          "project": 5.865,
+          "response_drop": 0.066,
+          "search": 7039.637,
+          "serialize": 1.068
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 16.4525,
+          "project": 36.736,
+          "response_drop": 0.084,
+          "search": 7732.7085,
+          "serialize": 3.5665
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 11.935,
+          "project": 3.801,
+          "response_drop": 0.0335,
+          "search": 608.8225,
+          "serialize": 0.666
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 12.9055,
+          "project": 28.218,
+          "response_drop": 0.058,
+          "search": 994.4885,
+          "serialize": 2.872
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.3585,
+          "project": 1.8065,
+          "response_drop": 0.0365,
+          "search": 258.842,
+          "serialize": 0.3845
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.5755,
+          "project": 17.8985,
+          "response_drop": 0.055,
+          "search": 402.956,
+          "serialize": 2.5235
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.863,
+          "project": 1.9775,
+          "response_drop": 0.034,
+          "search": 460.2865,
+          "serialize": 0.439
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 12.462,
+          "project": 27.3775,
+          "response_drop": 0.059,
+          "search": 862.5065,
+          "serialize": 2.937
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ]
+  },
+  "kernel_screens": {
+    "arm": [
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 53383791
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 176878958
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 174244375
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 46819167
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 47175792
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 177722250
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 174819417
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 47992583
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 48016916
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 176278625
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 190576209
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 52046375
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 54160208
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 75371625
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 74374125
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 51800334
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 51640583
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 70621333
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 70402166
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 49572208
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 49237250
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 70475667
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 70515375
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 48700541
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 4440042
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 6596709
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 6601041
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 4415125
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 4411375
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 6685834
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 6578709
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 4455958
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 4464750
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 6554583
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 6646875
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 4457041
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 37010834
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 6246958
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 6340375
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 37359125
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 36849459
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 6185458
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 6340500
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 36817584
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 36563917
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 6400375
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 6271000
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 47028834
+      }
+    ],
+    "x86": [
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 65191154
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 198107046
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 198460962
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 65270416
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 64982008
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 197246396
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 197551598
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 64969078
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 65070068
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 197568376
+      },
+      {
+        "fixture": "dense",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 197627094
+      },
+      {
+        "fixture": "dense",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 64964138
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 65247625
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 79765374
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 79747262
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 65211417
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 65413008
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 79736450
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 79778005
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 65136769
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 64718133
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 80225362
+      },
+      {
+        "fixture": "medium",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 80712965
+      },
+      {
+        "fixture": "medium",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 65342237
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 7633772
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 9006563
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 9113865
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 7657608
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 7626046
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 9041457
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 9125867
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 7638716
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 7615513
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 9059448
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 9117488
+      },
+      {
+        "fixture": "sparse_left",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 7634685
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 51400664
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 0,
+        "calls": 300000,
+        "ns": 9509079
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 9599364
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 1,
+        "calls": 300000,
+        "ns": 51754770
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 51601383
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 2,
+        "calls": 300000,
+        "ns": 9522796
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 9617427
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 3,
+        "calls": 300000,
+        "ns": 52110796
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 51874854
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 4,
+        "calls": 300000,
+        "ns": 9496857
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "consume_match",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 9648504
+      },
+      {
+        "fixture": "sparse_right",
+        "kernel": "baseline",
+        "pass": 5,
+        "calls": 300000,
+        "ns": 51676239
+      }
+    ]
+  },
+  "decision": "Reject general consume-match replacement; production posting kernel unchanged",
+  "limitations": [
+    "Kernel screen extracts the existing functions into a standalone harness; it is not an end-to-end workload",
+    "Native six-query CPU0 ABBA screen is separate from HTTP throughput",
+    "No BMP performance improvement is established"
+  ]
+}

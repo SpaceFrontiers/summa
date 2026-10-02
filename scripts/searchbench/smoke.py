@@ -18,7 +18,7 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("--rgb", action="store_true")
     parser.add_argument("--http-workers", type=int, choices=range(1, 65))
-    parser.add_argument("--dispatch", choices=["blocking", "in-place"])
+    parser.add_argument("--dispatch", choices=["pool", "blocking", "in-place"])
     parser.add_argument("--diagnostics", action="store_true")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="searchbench-smoke-") as directory:

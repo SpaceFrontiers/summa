@@ -39,6 +39,10 @@ cargo run -p summa-broker -- \
   --placement "documents*=0"
 ```
 
+The broker logs `Summa broker listening on <addr>` once bound; `--addr
+127.0.0.1:0` picks a free port, which the integration tests use to avoid
+probe-then-bind port races.
+
 ## Tests
 
 ```sh

@@ -1,0 +1,590 @@
+{
+  "benchmark_environment": {
+    "inventory_note": "lscpu/disk inventory carried over from the preceding campaign, not refreshed this boot. All candidates compared within one boot.",
+    "machine_type": "n2-highmem-32",
+    "minimum_cpu_platform": "Intel Cascade Lake",
+    "uname": [
+      "Linux",
+      "hermes-benchmark-32-moroni.us-east1-b.c.keenable-479912.internal",
+      "7.0.0-1011-gcp",
+      "#11~24.04.1-Ubuntu SMP PREEMPT Tue Aug 11 20:14:48 UTC 2026",
+      "x86_64"
+    ]
+  },
+  "cloud_states": {
+    "hermes-benchmark-32-moroni": "TERMINATED",
+    "hermes-validation-moroni": "TERMINATED"
+  },
+  "linux_io_uring": {
+    "base": {
+      "clean_log_sha256": "0a26271b8fec36687c4acbf2f765180ce170cf35646ff6a13dff23920ebdd10b",
+      "core_test_binaries": {
+        "summa_core-55cc34a87444ca21": "a5643c7cbd9c113394f094fcb26b92f5872c55a326374e1fd5249add315d6bc7"
+      },
+      "harness": "20260926T125308.039106Z-io-uring",
+      "logs": {
+        "01-clippy.log": "402642e80cd2283119a12a20e9323e3555fcac12653640867bdaf811784842f8",
+        "02-test.log": "06b568a84d2e40fb756deb76dc77d508c041e17e69a636897f7395615ddb12ed",
+        "03-test.log": "a2475bf2ab1e240755751a11577c42645a912a43ea5a9f98e4d1ff88e007c530",
+        "04-test.log": "beef619cf3decb912b5b4f7bb1bac24266f1f25778f7b3bd57eba2a7068ab909"
+      },
+      "passed": 63,
+      "release_build_log_sha256": "73939179c3455bde7a2fe1b58ea287f74ca43db8e4dcb58a2b780dbcb265989a",
+      "steps": [
+        {
+          "command": [
+            "cargo",
+            "clippy",
+            "--locked",
+            "-p",
+            "summa-core",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "log": "01-clippy.log",
+          "returncode": 0,
+          "seconds": 41.1374481580001
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--lib",
+            "directories::"
+          ],
+          "log": "02-test.log",
+          "returncode": 0,
+          "seconds": 105.11199501500005
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--test",
+            "document_read_batches",
+            "--test",
+            "sparse_payload_reads"
+          ],
+          "log": "03-test.log",
+          "returncode": 0,
+          "seconds": 51.37321537999992
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--bin",
+            "summa-server",
+            "payload_backends_hydrate_rpc_results_and_survive_other_index_deletion"
+          ],
+          "log": "04-test.log",
+          "returncode": 0,
+          "seconds": 64.99913723100008
+        }
+      ],
+      "variant": "base"
+    },
+    "coop": {
+      "clean_log_sha256": "00f1f0fad8571edeac46afb214db7ae26dcc2f00856f42eef9ad7500237e8792",
+      "core_test_binaries": {
+        "summa_core-55cc34a87444ca21": "d82dfc4b527f0f1cfbf5161b85102958f19c7a5fcaddd9fd315b687dd8cb2dcd"
+      },
+      "harness": "20260926T130629.861433Z-io-uring",
+      "logs": {
+        "01-clippy.log": "798d27ff06426f92dee7096f3083a61b5eb09fd701d53de725de6bc4e90ebd19",
+        "02-test.log": "2cfd47db70d33a2dcd4a984da7c3b65907f2dade00e7a8c7b863e8b6521f4582",
+        "03-test.log": "72a89be6ee9bd5c220045cda71b98d949af987fd9dc50c678c8e14ddf6d51ee0",
+        "04-test.log": "a1ddad0f9fb3997ee05ded496877edbd3abde6ba4d3efb1583133b4fdf53c0c9"
+      },
+      "passed": 63,
+      "release_build_log_sha256": "809126b2db5ac752f3834d935328f88f1c61f3defcbe54c71b2d1a69b9cbe862",
+      "steps": [
+        {
+          "command": [
+            "cargo",
+            "clippy",
+            "--locked",
+            "-p",
+            "summa-core",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "log": "01-clippy.log",
+          "returncode": 0,
+          "seconds": 40.93596860699995
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--lib",
+            "directories::"
+          ],
+          "log": "02-test.log",
+          "returncode": 0,
+          "seconds": 104.26218378199974
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--test",
+            "document_read_batches",
+            "--test",
+            "sparse_payload_reads"
+          ],
+          "log": "03-test.log",
+          "returncode": 0,
+          "seconds": 52.11925959899963
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--bin",
+            "summa-server",
+            "payload_backends_hydrate_rpc_results_and_survive_other_index_deletion"
+          ],
+          "log": "04-test.log",
+          "returncode": 0,
+          "seconds": 65.75322184900006
+        }
+      ],
+      "variant": "coop"
+    },
+    "four": {
+      "clean_log_sha256": "00f1f0fad8571edeac46afb214db7ae26dcc2f00856f42eef9ad7500237e8792",
+      "core_test_binaries": {
+        "summa_core-55cc34a87444ca21": "a00c7e4ea6cb809dd186b08a1fb8a389ed2b023ba0242454f933caba3cc42dc4"
+      },
+      "harness": "20260926T130202.992721Z-io-uring",
+      "logs": {
+        "01-clippy.log": "833ec8c6f792fa6e7790c43057bf044a256ad0a7a05e9651c0352c9f8db1c732",
+        "02-test.log": "69f3c6f97b98b7a630933b79dc4e59f1283740cb313c3ac043a6fde34e157bfd",
+        "03-test.log": "cfe72ca0f36a041f8a11f3f2c75f26b60bc9ee67a6e7aae79e277ed0a761962a",
+        "04-test.log": "86ebdec268cf9ec2baa0efa509929d0b1a3183ec59f487f63e56e1cbdbf905a2"
+      },
+      "passed": 63,
+      "release_build_log_sha256": "83060464244868df164d0252cf69c0cb99e820978eb24e6d56de01729c8e6042",
+      "steps": [
+        {
+          "command": [
+            "cargo",
+            "clippy",
+            "--locked",
+            "-p",
+            "summa-core",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "log": "01-clippy.log",
+          "returncode": 0,
+          "seconds": 40.983878716999925
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--lib",
+            "directories::"
+          ],
+          "log": "02-test.log",
+          "returncode": 0,
+          "seconds": 104.76078478100021
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--test",
+            "document_read_batches",
+            "--test",
+            "sparse_payload_reads"
+          ],
+          "log": "03-test.log",
+          "returncode": 0,
+          "seconds": 51.56926020599985
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--bin",
+            "summa-server",
+            "payload_backends_hydrate_rpc_results_and_survive_other_index_deletion"
+          ],
+          "log": "04-test.log",
+          "returncode": 0,
+          "seconds": 65.24355789399988
+        }
+      ],
+      "variant": "four"
+    },
+    "two": {
+      "clean_log_sha256": "00f1f0fad8571edeac46afb214db7ae26dcc2f00856f42eef9ad7500237e8792",
+      "core_test_binaries": {
+        "summa_core-55cc34a87444ca21": "43032a863f72214d456106236ba8670a71b9fd5e0f851a6030510223f463a2c9"
+      },
+      "harness": "20260926T125735.038152Z-io-uring",
+      "logs": {
+        "01-clippy.log": "2959b2ddb5dd7583d5f17fa523ecc4e1326500c05d8756acec786c748eea01aa",
+        "02-test.log": "19c5f57f803ee2e0c827a1df95a22aa1f52a76a2eacc46b62f2a7795f6d6b37c",
+        "03-test.log": "fbd606b030fbdfbc4fc6810d1c66fd6eaf13e73bb82f75bc0aca51fe756925a8",
+        "04-test.log": "3c78c499d1afcea752dc8c49a3ccd68f74ebce0650b54dbac898558ba6e69f1a"
+      },
+      "passed": 63,
+      "release_build_log_sha256": "aacc8ee067284d1446f8e68fc7665a753eb064b25302e809b9982d98434d6f1a",
+      "steps": [
+        {
+          "command": [
+            "cargo",
+            "clippy",
+            "--locked",
+            "-p",
+            "summa-core",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "log": "01-clippy.log",
+          "returncode": 0,
+          "seconds": 41.68650187000003
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--lib",
+            "directories::"
+          ],
+          "log": "02-test.log",
+          "returncode": 0,
+          "seconds": 104.367899738
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--test",
+            "document_read_batches",
+            "--test",
+            "sparse_payload_reads"
+          ],
+          "log": "03-test.log",
+          "returncode": 0,
+          "seconds": 52.167182769999954
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--bin",
+            "summa-server",
+            "payload_backends_hydrate_rpc_results_and_survive_other_index_deletion"
+          ],
+          "log": "04-test.log",
+          "returncode": 0,
+          "seconds": 65.39914667799985
+        }
+      ],
+      "variant": "two"
+    },
+    "wake": {
+      "clean_log_sha256": "00f1f0fad8571edeac46afb214db7ae26dcc2f00856f42eef9ad7500237e8792",
+      "core_test_binaries": {
+        "summa_core-55cc34a87444ca21": "add9edc1195c03f60e493c3446b411dab8b1204d923e664f1e5373c3f110f1d6"
+      },
+      "harness": "20260926T131057.252797Z-io-uring",
+      "logs": {
+        "01-clippy.log": "1c6bd4f42d2a5790626948a4eff63e53eae26652f27b1f8ada64d05b01485f46",
+        "02-test.log": "2e51bcd2ffa29fe4482faa49b2d09b0adcfaa91fab365c0299cd8ee2182cb0b7",
+        "03-test.log": "808d838e894c422d388a9ddf5d1565180548f9d4e095d7898bbd4fe90bc08bc7",
+        "04-test.log": "6513418b454a49679314bfa3342c4839b49ba61aa66a5273a16ee05e2c3aeea1"
+      },
+      "passed": 63,
+      "release_build_log_sha256": "6f0f3b32129c0d95c856b60e68b56dabdb7a6d3786ff14ddbbb35431b48c3345",
+      "steps": [
+        {
+          "command": [
+            "cargo",
+            "clippy",
+            "--locked",
+            "-p",
+            "summa-core",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings"
+          ],
+          "log": "01-clippy.log",
+          "returncode": 0,
+          "seconds": 41.48971433600036
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--lib",
+            "directories::"
+          ],
+          "log": "02-test.log",
+          "returncode": 0,
+          "seconds": 105.66989710300004
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-core",
+            "--features",
+            "io-uring",
+            "--test",
+            "document_read_batches",
+            "--test",
+            "sparse_payload_reads"
+          ],
+          "log": "03-test.log",
+          "returncode": 0,
+          "seconds": 52.41831650400036
+        },
+        {
+          "command": [
+            "cargo",
+            "test",
+            "--locked",
+            "-p",
+            "summa-server",
+            "--features",
+            "io-uring",
+            "--bin",
+            "summa-server",
+            "payload_backends_hydrate_rpc_results_and_survive_other_index_deletion"
+          ],
+          "log": "04-test.log",
+          "returncode": 0,
+          "seconds": 66.00056371599976
+        }
+      ],
+      "variant": "wake"
+    }
+  },
+  "native": {
+    "ignored": 25,
+    "initial_failure": "Broker discovery exceeded its 10-second deadline. Isolated retry and the complete check retry passed.",
+    "logs": {
+      "01-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "02-clippy.log": "bcb74884a78099501f6bfc31de29d15aae4eb48dcd18d5c99bdde44d75b90089",
+      "03-test.log": "40ccfa97066257c1ca38d64bd350e8bf7892009b7384e1de9ced39ec7e31c410",
+      "04-check.log": "8950be1e8f4499f41b8e38ef15f09a0e2671be53a43aa5dec4d794320908881d",
+      "05-check.log": "2bc683fb4e4f4f21ee9ee39e2b8ecce2efe20d3b1be57bda5316aa519ab3d30a"
+    },
+    "mode": "check",
+    "passed": 2118,
+    "steps": [
+      {
+        "command": ["cargo", "fmt", "--all", "--", "--check"],
+        "log": "01-fmt.log",
+        "returncode": 0,
+        "seconds": 1.9491680823266506
+      },
+      {
+        "command": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "-p",
+          "summa-broker",
+          "-p",
+          "summa-tool",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "log": "02-clippy.log",
+        "returncode": 0,
+        "seconds": 0.4945369167253375
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "-p",
+          "summa-broker",
+          "-p",
+          "summa-tool",
+          "--features",
+          "summa-core/metrics"
+        ],
+        "log": "03-test.log",
+        "returncode": 0,
+        "seconds": 92.32910124957561
+      },
+      {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "summa-core",
+          "--no-default-features",
+          "--features",
+          "native",
+          "--all-targets"
+        ],
+        "log": "04-check.log",
+        "returncode": 0,
+        "seconds": 0.3895822912454605
+      },
+      {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "summa-broker",
+          "--all-targets"
+        ],
+        "log": "05-check.log",
+        "returncode": 0,
+        "seconds": 0.286636209115386
+      }
+    ]
+  },
+  "probe_clippy_log_sha256": "97dc22935772ae5af723b20b30c6ff7e085063702cc8fab9739dfcf350da1f33",
+  "raw_archives": {
+    "source-evidence/summa-ring-workers-20260926.tar.gz": "13f261e4e1135fa79b008bb4231618832bc75c9feee60757dba7bb3a6c0f3d56",
+    "summa-ring-workers-20260926.tar.gz": "72250d124d20fe2e4597ba61f1bf25c99e8d621512bad6e527794104bf6c1652"
+  },
+  "schema": 1,
+  "unrun": [
+    "Native full harness was not rerun this turn.",
+    "WASM build/JS tests were not rerun; production Rust/Cargo files match the measured baseline.",
+    "ARM performance, sustained load, merge interference and direct Luxir replay."
+  ],
+  "validation_cache_note": "Initial cross-snapshot debug validation reused Cargo test binaries. Final evidence cleans summa-core before each variant, verifies a fresh core compilation, and records distinct executable hashes. Release builds independently compiled each variant before measurement.",
+  "wake_regression": {
+    "command": [
+      "cargo",
+      "test",
+      "--locked",
+      "-p",
+      "summa-core",
+      "--features",
+      "io-uring",
+      "--lib",
+      "queued_read_wakes_ring_while_prior_read_is_pending"
+    ],
+    "complete": true,
+    "green_exit": 0,
+    "logs": {
+      "wake-regression-green.log": "4661f8830954f394fb6297cf5ce29327c98013f2420c1f224069e8bb5a7048bd",
+      "wake-regression-red.log": "d528577ce3db1b34e726ab038a7a2006da03e8270628b7161b77c8281c8fd177"
+    },
+    "red_exit": 101,
+    "test_only_patch": true
+  }
+}

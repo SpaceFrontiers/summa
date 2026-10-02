@@ -417,6 +417,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut postings = PostingList::new();
             for doc in 0..389 {

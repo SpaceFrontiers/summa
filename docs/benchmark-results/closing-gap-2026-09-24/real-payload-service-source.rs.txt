@@ -1,0 +1,604 @@
+//! Private diagnostic service. Process abort on panic/submission failure is required.
+mod ring;
+use io_uring::IoUring;
+use std::{
+    cell::RefCell,
+    fs::File,
+    future::Future,
+    io,
+    ops::Range,
+    os::unix::fs::FileExt,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
+    thread::JoinHandle,
+};
+use summa_core::directories::{
+    Directory, DirectoryWriter, FileHandle, FsDirectory, MmapDirectory, OwnedBytes, RangeReadFn,
+    StreamingWriter,
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+const DEPTH: usize = 8;
+const BYTES: usize = 8 * 1024 * 1024;
+// Bound assembled responses separately from in-flight kernel buffers.
+const MAX_RETURN_BYTES: usize = 64 * 1024 * 1024;
+#[derive(Default)]
+pub struct Stats {
+    pub submitted: AtomicUsize,
+    pub completed: AtomicUsize,
+    pub skipped: AtomicUsize,
+    pub dropped: AtomicUsize,
+    pub errors: AtomicUsize,
+    pub bytes: AtomicUsize,
+    active: AtomicUsize,
+    pub max_active: AtomicUsize,
+    pub batches: [AtomicUsize; 9],
+    pub handoffs: [AtomicUsize; 9],
+    pub refills: AtomicUsize,
+}
+impl Stats {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({"submitted":self.submitted.load(Relaxed),"completed":self.completed.load(Relaxed),"skipped":self.skipped.load(Relaxed),"dropped":self.dropped.load(Relaxed),"errors":self.errors.load(Relaxed),"bytes":self.bytes.load(Relaxed),"max_active":self.max_active.load(Relaxed),"refills":self.refills.load(Relaxed),"handoffs":self.handoffs.iter().map(|v|v.load(Relaxed)).collect::<Vec<_>>(),"batches":self.batches.iter().map(|v|v.load(Relaxed)).collect::<Vec<_>>()})
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Pool,
+    Drain,
+    Refill,
+}
+impl Backend {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pool => "pool",
+            Self::Drain => "uring",
+            Self::Refill => "uring-refill",
+        }
+    }
+}
+struct Dispatch {
+    first: Job,
+    rest: Vec<Job>,
+}
+impl Dispatch {
+    fn single(first: Job) -> Self {
+        Self {
+            first,
+            rest: vec![],
+        }
+    }
+    fn jobs(self) -> impl Iterator<Item = Job> {
+        std::iter::once(self.first).chain(self.rest)
+    }
+}
+struct PollBatch {
+    service: usize,
+    jobs: Vec<Job>,
+}
+thread_local! { static POLL_BATCH: RefCell<Option<PollBatch>> = const { RefCell::new(None) }; }
+struct Reply {
+    result: io::Result<Vec<u8>>,
+    _bytes: OwnedSemaphorePermit,
+}
+struct Job {
+    file: Arc<File>,
+    range: Range<u64>,
+    slot: OwnedSemaphorePermit,
+    bytes: OwnedSemaphorePermit,
+    reply: oneshot::Sender<Reply>,
+}
+struct Read {
+    job: Job,
+    buffer: Vec<u8>,
+}
+#[derive(Default)]
+struct CompletionGate {
+    paused: Mutex<bool>,
+    changed: Condvar,
+    arrived: AtomicUsize,
+}
+impl CompletionGate {
+    fn wait(&self) {
+        let mut paused = self.paused.lock().unwrap();
+        if *paused {
+            self.arrived.fetch_add(1, Relaxed);
+            while *paused {
+                paused = self.changed.wait(paused).unwrap();
+            }
+        }
+    }
+    fn release(&self) {
+        *self.paused.lock().unwrap() = false;
+        self.changed.notify_all();
+    }
+}
+pub struct Service {
+    sender: async_channel::Sender<Dispatch>,
+    slots: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    workers: Vec<JoinHandle<()>>,
+    pub stats: Arc<Stats>,
+    gate: Option<Arc<CompletionGate>>,
+    backend: Backend,
+}
+fn prepare(job: Job, stats: &Stats) -> Option<Read> {
+    if job.reply.is_closed() {
+        stats.skipped.fetch_add(1, Relaxed);
+        return None;
+    }
+    let len = (job.range.end - job.range.start) as usize;
+    stats.submitted.fetch_add(1, Relaxed);
+    stats.bytes.fetch_add(len, Relaxed);
+    let active = stats.active.fetch_add(1, Relaxed) + 1;
+    stats.max_active.fetch_max(active, Relaxed);
+    Some(Read {
+        job,
+        buffer: vec![0; len],
+    })
+}
+fn finish(read: Read, result: io::Result<()>, stats: &Stats) {
+    if result.is_err() {
+        stats.errors.fetch_add(1, Relaxed);
+    }
+    stats.completed.fetch_add(1, Relaxed);
+    stats.active.fetch_sub(1, Relaxed);
+    drop(read.job.slot);
+    if read
+        .job
+        .reply
+        .send(Reply {
+            result: result.map(|()| read.buffer),
+            _bytes: read.job.bytes,
+        })
+        .is_err()
+    {
+        stats.dropped.fetch_add(1, Relaxed);
+    }
+}
+impl Service {
+    pub fn new(backend: Backend, force_async: bool) -> io::Result<Arc<Self>> {
+        // Construct before spawning so unsupported kernels fail explicitly.
+        let uring = if backend != Backend::Pool {
+            Some(IoUring::new(32)?)
+        } else {
+            None
+        };
+        let (sender, receiver) = async_channel::bounded::<Dispatch>(32);
+        let stats = Arc::new(Stats::default());
+        let mut workers = vec![];
+        let gate = force_async.then(|| Arc::new(CompletionGate::default()));
+        if let Some(ring) = uring {
+            let stats = stats.clone();
+            let gate = gate.clone();
+            workers.push(std::thread::spawn(move || {
+                ring::run(ring, receiver, &stats, backend, gate.as_deref());
+            }));
+        } else {
+            for _ in 0..DEPTH {
+                let receiver = receiver.clone();
+                let stats = stats.clone();
+                let gate = gate.clone();
+                workers.push(std::thread::spawn(move || {
+                    while let Ok(dispatch) = receiver.recv_blocking() {
+                        assert!(
+                            dispatch.rest.is_empty(),
+                            "pool control accepts individual handoffs"
+                        );
+                        let job = dispatch.first;
+                        if let Some(mut read) = prepare(job, &stats) {
+                            let result = read
+                                .job
+                                .file
+                                .read_exact_at(&mut read.buffer, read.job.range.start);
+                            if let Some(gate) = &gate {
+                                gate.wait();
+                            }
+                            finish(read, result, &stats);
+                        }
+                    }
+                }));
+            }
+        }
+        Ok(Arc::new(Self {
+            sender,
+            slots: Arc::new(Semaphore::new(DEPTH)),
+            bytes: Arc::new(Semaphore::new(BYTES)),
+            workers,
+            stats,
+            gate,
+            backend,
+        }))
+    }
+    async fn read(&self, file: Arc<File>, range: Range<u64>) -> io::Result<OwnedBytes> {
+        let len = range
+            .end
+            .checked_sub(range.start)
+            .filter(|&n| n <= BYTES as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "payload exceeds diagnostic service byte budget",
+                )
+            })? as usize;
+        if len == 0 {
+            return Ok(OwnedBytes::empty());
+        }
+        let bytes = self
+            .bytes
+            .clone()
+            .acquire_many_owned(len as u32)
+            .await
+            .map_err(io::Error::other)?;
+        let slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(io::Error::other)?;
+        let (reply, done) = oneshot::channel();
+        let job = Job {
+            file,
+            range,
+            slot,
+            bytes,
+            reply,
+        };
+        let immediate = POLL_BATCH.with(|batch| {
+            let mut batch = batch.borrow_mut();
+            if let Some(batch) = batch
+                .as_mut()
+                .filter(|b| b.service == self as *const Self as usize)
+            {
+                batch.jobs.push(job);
+                None
+            } else {
+                Some(job)
+            }
+        });
+        if let Some(job) = immediate {
+            self.stats.handoffs[1].fetch_add(1, Relaxed);
+            self.sender
+                .send(Dispatch::single(job))
+                .await
+                .map_err(io::Error::other)?;
+        }
+        let response = done.await.map_err(io::Error::other)?;
+        response.result.map(OwnedBytes::new)
+    }
+    async fn read_range(&self, file: Arc<File>, range: Range<u64>) -> io::Result<OwnedBytes> {
+        let len = range
+            .end
+            .checked_sub(range.start)
+            .filter(|&n| n <= MAX_RETURN_BYTES as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "range exceeds diagnostic response budget",
+                )
+            })? as usize;
+        if len <= BYTES {
+            return self.read(file, range).await;
+        }
+        let mut output = Vec::new();
+        output.try_reserve_exact(len).map_err(io::Error::other)?;
+        let mut start = range.start;
+        while start < range.end {
+            let end = start + (range.end - start).min(BYTES as u64);
+            let chunk = self.read(file.clone(), start..end).await?;
+            output.extend_from_slice(chunk.as_slice());
+            start = end;
+        }
+        Ok(OwnedBytes::new(output))
+    }
+    pub async fn scope<F: Future>(service: Option<&Self>, future: F) -> F::Output {
+        if let Some(service) = service {
+            service.batch_poll(future).await
+        } else {
+            future.await
+        }
+    }
+    /// Diagnostic only: coalesce same-service requests produced during one future poll.
+    pub async fn batch_poll<F: Future>(&self, future: F) -> F::Output {
+        assert_ne!(self.backend, Backend::Pool);
+        let mut future = std::pin::pin!(future);
+        futures::future::poll_fn(|cx| {
+            let old = POLL_BATCH.replace(Some(PollBatch {
+                service: self as *const Self as usize,
+                jobs: vec![],
+            }));
+            assert!(old.is_none(), "nested diagnostic batch scope");
+            let result = future.as_mut().poll(cx);
+            let mut batch = POLL_BATCH.take().unwrap();
+            if !batch.jobs.is_empty() {
+                let count = batch.jobs.len();
+                assert!(count <= DEPTH);
+                let first = batch.jobs.remove(0);
+                self.stats.handoffs[count].fetch_add(1, Relaxed);
+                // Every queued job holds one of eight permits. A 32-message queue cannot fill.
+                // The borrowed service cannot close while this poll is running.
+                assert!(
+                    self.sender
+                        .try_send(Dispatch {
+                            first,
+                            rest: batch.jobs
+                        })
+                        .is_ok()
+                );
+            }
+            result
+        })
+        .await
+    }
+    pub async fn open(self: &Arc<Self>, path: PathBuf) -> io::Result<FileHandle> {
+        let file = Arc::new(
+            tokio::task::spawn_blocking(move || File::open(path))
+                .await
+                .map_err(io::Error::other)??,
+        );
+        let len = file.metadata()?.len();
+        let service = self.clone();
+        let read: RangeReadFn = Arc::new(move |range| {
+            let file = file.clone();
+            let service = service.clone();
+            Box::pin(async move { service.read_range(file, range).await })
+        });
+        Ok(FileHandle::lazy_labeled(
+            len,
+            read,
+            Arc::from("hydration_probe"),
+        ))
+    }
+}
+impl Drop for Service {
+    fn drop(&mut self) {
+        self.sender.close();
+        if let Some(gate) = &self.gate {
+            gate.release();
+        }
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
+        assert_eq!(self.stats.active.load(Relaxed), 0);
+        assert_eq!(self.slots.available_permits(), DEPTH);
+        assert_eq!(self.bytes.available_permits(), BYTES);
+    }
+}
+
+#[derive(Clone)]
+pub struct PayloadDirectory {
+    mapped: MmapDirectory,
+    fs: FsDirectory,
+    pub service: Option<Arc<Service>>,
+    pub positional: bool,
+}
+impl PayloadDirectory {
+    pub fn new(root: &Path, service: Option<Arc<Service>>, positional: bool) -> Self {
+        Self {
+            mapped: MmapDirectory::new(root),
+            fs: FsDirectory::new(root),
+            service,
+            positional,
+        }
+    }
+}
+#[async_trait::async_trait]
+impl Directory for PayloadDirectory {
+    async fn exists(&self, p: &Path) -> io::Result<bool> {
+        self.mapped.exists(p).await
+    }
+    async fn file_size(&self, p: &Path) -> io::Result<u64> {
+        self.mapped.file_size(p).await
+    }
+    async fn open_read(&self, p: &Path) -> io::Result<FileHandle> {
+        self.mapped.open_read(p).await
+    }
+    async fn read_range(&self, p: &Path, r: Range<u64>) -> io::Result<OwnedBytes> {
+        self.mapped.read_range(p, r).await
+    }
+    async fn list_files(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+        self.mapped.list_files(p).await
+    }
+    async fn open_lazy(&self, p: &Path) -> io::Result<FileHandle> {
+        self.mapped.open_lazy(p).await
+    }
+    async fn open_payload(&self, p: &Path) -> io::Result<FileHandle> {
+        if let Some(s) = &self.service {
+            s.open(self.mapped.root().join(p)).await
+        } else if self.positional {
+            self.fs.open_lazy(p).await
+        } else {
+            self.mapped.open_lazy(p).await
+        }
+    }
+    fn set_index_label(&self, label: &str) {
+        self.mapped.set_index_label(label);
+        self.fs.set_index_label(label);
+    }
+    fn local_path(&self, p: &Path) -> Option<PathBuf> {
+        self.mapped.local_path(p)
+    }
+}
+#[async_trait::async_trait]
+impl DirectoryWriter for PayloadDirectory {
+    async fn write(&self, p: &Path, b: &[u8]) -> io::Result<()> {
+        self.mapped.write(p, b).await
+    }
+    async fn delete(&self, p: &Path) -> io::Result<()> {
+        self.mapped.delete(p).await
+    }
+    async fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
+        self.mapped.rename(a, b).await
+    }
+    async fn link(&self, a: &Path, b: &Path) -> io::Result<()> {
+        self.mapped.link(a, b).await
+    }
+    async fn sync(&self) -> io::Result<()> {
+        self.mapped.sync().await
+    }
+    async fn streaming_writer(&self, p: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        self.mapped.streaming_writer(p).await
+    }
+}
+
+async fn large_payload_ranges_use_bounded_chunks_and_preserve_bytes(
+    service: &Arc<Service>,
+    root: &Path,
+    transport: Option<&Service>,
+) -> io::Result<()> {
+    let path = root.join("large-range");
+    let expected: Vec<_> = (0..BYTES + 37).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&path, &expected)?;
+    let handle = service.open(path.clone()).await?;
+    let submitted = service.stats.submitted.load(Relaxed);
+    assert!(
+        service
+            .read_range(Arc::new(File::open(&path)?), 0..MAX_RETURN_BYTES as u64 + 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(service.stats.submitted.load(Relaxed), submitted);
+    let result =
+        Service::scope(transport, handle.read_bytes_range(3..expected.len() as u64)).await?;
+    assert_eq!(result.as_slice(), &expected[3..]);
+    drop(result);
+    File::options()
+        .write(true)
+        .open(&path)?
+        .set_len(BYTES as u64 + 4)?;
+    let error = Service::scope(transport, handle.read_bytes_range(0..expected.len() as u64))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    std::fs::write(&path, &expected)?;
+    let gate = service.gate.as_ref().unwrap();
+    gate.arrived.store(0, Relaxed);
+    *gate.paused.lock().unwrap() = true;
+    let mut pending = Box::pin(Service::scope(
+        transport,
+        handle.read_bytes_range(0..expected.len() as u64),
+    ));
+    assert!(futures::poll!(&mut pending).is_pending());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while gate.arrived.load(Relaxed) == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let dropped = service.stats.dropped.load(Relaxed);
+    drop(pending);
+    gate.release();
+    assert_eq!(
+        handle.read_bytes_range(0..4).await?.as_slice(),
+        &expected[..4]
+    );
+    while service.stats.dropped.load(Relaxed) == dropped {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    gate.arrived.store(0, Relaxed);
+    std::fs::remove_file(path)?;
+    println!(
+        "{}",
+        serde_json::json!({"case":"large_payload_ranges_use_bounded_chunks_and_preserve_bytes","backend":service.backend.label(),"grouped":transport.is_some(),"complete":true})
+    );
+    Ok(())
+}
+
+pub async fn lifecycle(root: &Path) -> io::Result<()> {
+    for (backend, grouped) in [
+        (Backend::Pool, false),
+        (Backend::Drain, false),
+        (Backend::Refill, false),
+        (Backend::Drain, true),
+        (Backend::Refill, true),
+    ] {
+        let path = root.join(format!("{}-{grouped}-lifecycle", backend.label()));
+        {
+            use std::io::Write;
+            let mut file = File::options().write(true).create_new(true).open(&path)?;
+            file.write_all(&[7; 64])?;
+        }
+        let service = Service::new(backend, true)?;
+        let transport = grouped.then_some(service.as_ref());
+        let handle = service.open(path.clone()).await?;
+        let oversize_file = Arc::new(File::open(&path)?);
+        large_payload_ranges_use_bounded_chunks_and_preserve_bytes(&service, root, transport)
+            .await?;
+        File::options().write(true).open(&path)?.set_len(8)?;
+        let error = Service::scope(transport, handle.read_bytes_ranges(&[0..4, 0..32, 4..8]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        if grouped {
+            assert_eq!(service.stats.handoffs[3].load(Relaxed), 1);
+            let other = Service::new(Backend::Pool, false)?;
+            let other_handle = other.open(path.clone()).await?;
+            let (own, foreign) = Service::scope(transport, async {
+                futures::join!(
+                    handle.read_bytes_range(0..4),
+                    other_handle.read_bytes_range(4..8)
+                )
+            })
+            .await;
+            assert_eq!(own?.as_slice(), [7; 4]);
+            assert_eq!(foreign?.as_slice(), [7; 4]);
+            assert_eq!(other.stats.handoffs[1].load(Relaxed), 1);
+            drop(other_handle);
+            drop(other);
+        }
+        assert_eq!(handle.read_bytes_range(0..4).await?.as_slice(), [7; 4]);
+        std::fs::remove_file(&path)?;
+        assert_eq!(handle.read_bytes_range(0..4).await?.as_slice(), [7; 4]);
+        assert!(
+            service
+                .read(oversize_file, 0..BYTES as u64 + 1)
+                .await
+                .is_err()
+        );
+        let gate = service.gate.as_ref().unwrap();
+        *gate.paused.lock().unwrap() = true;
+        let dropped_before = service.stats.dropped.load(Relaxed);
+        let mut read = Box::pin(Service::scope(transport, handle.read_bytes_range(0..8)));
+        assert!(futures::poll!(&mut read).is_pending());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gate.arrived.load(Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not reach completion gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(read);
+        gate.release();
+        // A subsequent read proves the worker drained the cancelled read and remains usable.
+        assert_eq!(handle.read_bytes_range(0..4).await?.as_slice(), [7; 4]);
+        while service.stats.dropped.load(Relaxed) == dropped_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled reply was not drained"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut cancelled = 0;
+        for _ in 0..128 {
+            let mut read = Box::pin(Service::scope(transport, handle.read_bytes_range(0..8)));
+            if futures::poll!(&mut read).is_pending() {
+                cancelled += 1;
+            }
+            drop(read);
+        }
+        assert!(cancelled > 0);
+        let stats = service.stats.clone();
+        drop(handle);
+        drop(service);
+        assert_eq!(stats.submitted.load(Relaxed), stats.completed.load(Relaxed));
+        assert!(stats.max_active.load(Relaxed) <= DEPTH);
+        assert!(stats.errors.load(Relaxed) >= 1);
+        println!(
+            "{}",
+            serde_json::json!({"lifecycle":backend.label(),"grouped":grouped,"cancelled_futures":cancelled,"in_flight_drop_verified":true,"stats":stats.json()})
+        );
+    }
+    Ok(())
+}

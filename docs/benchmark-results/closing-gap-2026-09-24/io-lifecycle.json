@@ -1,0 +1,12 @@
+{
+  "complete": true,
+  "ordinary_cancelled": 256,
+  "ordinary_completed": 0,
+  "registered_cancelled": 256,
+  "registered_completed": 0,
+  "slot_reuse_verified": true,
+  "unlinked_file_reads": true,
+  "source_sha256": "401075292967c8006e9acbd6d26fa3c2faff7b4bde756ba9d68947b762b4f45a",
+  "submission": "IOSQE_ASYNC to exercise actual cancellation",
+  "scope": "kernel CQE ownership and unlinked filename; not production deletion/cancellation"
+}

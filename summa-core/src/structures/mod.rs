@@ -6,16 +6,21 @@
 //! - `simd` - SIMD utilities
 //! - `sstable` - SSTable for term dictionary
 
+pub(crate) mod block_cache;
 pub(crate) mod combination;
 pub mod fast_field;
 pub(crate) mod monotone;
 pub mod postings;
 pub mod simd;
 mod sstable;
+pub(crate) use block_cache::{BlockCacheKey, BlockCacheNamespace, RetainedBytes, SharedBlockCache};
 pub(crate) use sstable::DecodedInlinePostings;
+#[cfg(feature = "native")]
+pub(crate) use sstable::{BLOOM_BITS_PER_KEY, DecodedBlock};
 mod sstable_index;
 pub mod vector;
 mod vint;
+pub(crate) mod word_pairs;
 
 // Re-export postings
 pub use postings::{
@@ -155,7 +160,7 @@ pub use simd::bits_needed;
 // Re-export sstable
 pub use sstable::{
     AsyncSSTableIterator, AsyncSSTableReader, BLOCK_SIZE as SSTABLE_BLOCK_SIZE, BloomFilter,
-    SSTABLE_MAGIC, SSTableBlockSize, SSTableStats, SSTableValue, SSTableWriter,
+    BloomSizing, SSTABLE_MAGIC, SSTableBlockSize, SSTableStats, SSTableValue, SSTableWriter,
     SSTableWriterConfig, SparseDimInfo, TermInfo,
 };
 

@@ -1,0 +1,97 @@
+{
+  "archives": {
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/source-evidence/summa-warm-io-20260926.tar.gz": "4613aa78e9c2196261d8c88e2b17803ce2e811014ae6f4d8a5d25e5293a6590f",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/summa-warm-io-20260926.tar.gz": "e1276632f645c473f926a2b6847fdc30f43f89ce6f93c8b554c8fb705b3b5310"
+  },
+  "comparative_cells": 142,
+  "comparative_verified_queries": 408541,
+  "complete": true,
+  "exporters": {
+    "docs/benchmark-results/sustained-io-2026-09-26/summarize.py": "ef9943ff3f4f06bae0ae7eded67c77a09adcf8ca247ce44b2dc40018ff279e1e",
+    "docs/benchmark-results/warm-io-2026-09-26/summarize.py": "5bc50abea7f20532da983de1a138a70197aed3b0aa613614fc7631147de68e6b"
+  },
+  "linux": {
+    "02-test.log": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 66
+    },
+    "03-test.log": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 6
+    },
+    "04-test.log": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 1
+    },
+    "linux-refills.log": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 3
+    },
+    "linux-scoring.log": {
+      "failed": 0,
+      "ignored": 0,
+      "passed": 71
+    }
+  },
+  "logs": {
+    ".context/search-harness/20260926T180003.919222Z-check/01-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ".context/search-harness/20260926T180003.919222Z-check/02-clippy.log": "ee35d44caaff6a48beca6dc0546b3e6389df8c52c25dcd5da0db5608d2f0c4f4",
+    ".context/search-harness/20260926T180003.919222Z-check/03-test.log": "78c713cbd5c2627d34107d91ef8b2b96988552f82b16b399aaf392215836a462",
+    ".context/search-harness/20260926T180003.919222Z-check/04-check.log": "b35ec958ed65b1b7b51d2452f0f07fa838694ed4686a6dc78af48c6b814769d7",
+    ".context/search-harness/20260926T180003.919222Z-check/05-check.log": "367a8261f14d3be38e32943da81019f90cc00aac01f1980fa410d7e3cb18996a",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/source-evidence/summa-warm-io-20260926/linux-refills.log": "24b99b7c9ee04ec2614bf206ecd7759ade057e128d425dc79dbb7c71895ac007",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/source-evidence/summa-warm-io-20260926/linux-scoring.log": "531b26efffc8ce5949c858dac3552fd01fe14763142f3568c90a4253ec449a46",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/source-evidence/summa-warm-io-20260926/validation-harness/20260926T180116.721414Z-io-uring/01-clippy.log": "afe70a03bdb0da11886edabab0bedb4ca8a211e52625a6c372b56f332ba7ff2a",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/source-evidence/summa-warm-io-20260926/validation-harness/20260926T180116.721414Z-io-uring/02-test.log": "0285ea585934bbe10bb2cffcd17a305fd90cd8def359db15c2efb8fde9692d6b",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/source-evidence/summa-warm-io-20260926/validation-harness/20260926T180116.721414Z-io-uring/03-test.log": "2d8af7bee5ba26353afacf1f0f82c74914a193dea5347b559feef56c8b98ae9c",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/source-evidence/summa-warm-io-20260926/validation-harness/20260926T180116.721414Z-io-uring/04-test.log": "82a34557884f96cc5249bd39a876a5a0b1bae6d4a266120cb1fbe286a0169ce0",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/wasm-build.log": "f83bd158b1a0c4bf3897ef0fb4f20d0299f1aa441d965dbe30de1b53616dea2a",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/wasm-install.log": "f0bdc53c54a79176433ed642cd9ebe0cd3398bc325759ce945e80c1f7fea0dc3",
+    "/Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/warm-io-20260926/wasm-tests.log": "90cd446dccd24eaa302a9a6d7f03d12a9781c0d0f2d5ce83c38bcea1499d6e97"
+  },
+  "native": {
+    "failed": 0,
+    "ignored": 25,
+    "passed": 2119
+  },
+  "native_stages": 5,
+  "post_build_changes_only_in_native_tests": true,
+  "prior_report_byte_identical": true,
+  "profile_lost_samples": 0,
+  "profile_verified_queries": 136147,
+  "resolved_attempts": [
+    "First Clippy detected now-unused async cursor wrappers; they are test-only in final sources.",
+    "First isolated Linux harness lacked Git provenance; initialized isolated metadata and reran after a clean core build.",
+    "First archive could not read root-owned perf data; complete archive collected with sudo tar over the private experiment directory.",
+    "Standalone focused Mac test emitted a linker unwind-size warning; final strict harness passed."
+  ],
+  "source_files_verified": 533,
+  "states": {
+    "benchmark": {
+      "cpuPlatform": "Unknown CPU Platform",
+      "lastStartTimestamp": "2026-09-26T10:45:20.072-07:00",
+      "lastStopTimestamp": "2026-09-26T11:11:41.483-07:00",
+      "machineType": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b/machineTypes/n2-highmem-32",
+      "name": "hermes-benchmark-32-moroni",
+      "status": "TERMINATED"
+    },
+    "source": {
+      "cpuPlatform": "Unknown CPU Platform",
+      "lastStartTimestamp": "2026-09-26T10:47:28.130-07:00",
+      "lastStopTimestamp": "2026-09-26T11:11:42.242-07:00",
+      "machineType": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b/machineTypes/n2-highmem-8",
+      "name": "hermes-validation-moroni",
+      "status": "TERMINATED"
+    }
+  },
+  "unrun": [
+    "Native full (no lifecycle/RPC implementation changes); Linux RPC/lifecycle suite was run",
+    "ARM performance, larger cold sets, concurrent merges, slower storage, HTTP and direct Luxir comparison"
+  ],
+  "wasm_release": true,
+  "wasm_tests": 41
+}

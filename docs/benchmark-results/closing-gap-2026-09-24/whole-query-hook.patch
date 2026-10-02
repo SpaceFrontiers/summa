@@ -1,0 +1,94 @@
+--- a/summa-core/src/structures/sstable.rs
++++ b/summa-core/src/structures/sstable.rs
+@@ -1819,6 +1819,39 @@
+     /// Look up multiple keys, loading each distinct block once regardless of
+     /// cache retention. Results preserve input order and duplicate keys.
+     /// Scratch is O(keys), plus one ordinary bounded decompressed block.
++    // Uses canonical get_batch, wildcard predicate, term limits, posting readers and scorers.
++    fn prototype_reverse_values(
++        &self, prefix: &[u8], max_results: usize, max_scanned: usize,
++        accepts: &mut impl FnMut(&[u8]) -> bool,
++    ) -> Option<io::Result<(Vec<V>, bool)>> {
++        use fst::{IntoStreamer, Streamer};
++        let state=PROTOTYPE_PATTERN.read().unwrap();
++        let (expected,suffix)=state.as_ref()?;
++        if prefix!=expected || suffix.is_empty() {return None}
++        let map=PROTOTYPE_REVERSE.get().unwrap();
++        let reversed:Vec<_>=suffix.iter().rev().copied().collect();
++        let upper=prototype_upper(&reversed);
++        let lower_rank=map.range().ge(&reversed).into_stream().next().map(|(_,rank)|rank).unwrap_or(map.len() as u64);
++        let end_rank=upper.as_ref().map(|upper|map.range().ge(upper).into_stream().next().map(|(_,rank)|rank).unwrap_or(map.len() as u64)).unwrap_or(map.len() as u64);
++        let start=self.block_index.locate(prefix).unwrap_or(0);
++        let end=prototype_upper(prefix).as_ref().and_then(|p|self.block_index.locate(p)).unwrap_or(self.block_index.len());
++        if end_rank-lower_rank > end.saturating_sub(start).saturating_add(1).saturating_mul(128) as u64 {return None}
++        let range=map.range().ge(&reversed);let range=if let Some(upper)=&upper{range.lt(upper)}else{range};
++        let mut stream=range.into_stream();let mut keys=Vec::new();
++        let reverse_prefix:Vec<_>=prefix[4..].iter().rev().copied().collect();
++        let mut scanned=0;
++        while let Some((key,_))=stream.next() {
++            if scanned==max_scanned {return Some(Err(io::Error::other(format!("term dictionary scan exceeds {max_scanned} terms"))))}
++            scanned+=1;
++            if key.len()<prefix.len()-4+suffix.len() || !key.ends_with(&reverse_prefix) {continue}
++            let mut forward=prefix[..4].to_vec();forward.extend(key.iter().rev());
++            if accepts(&forward) {keys.push(forward);}
++            if keys.len()>max_results {return Some(Ok((Vec::new(),true)))}
++        }
++        keys.sort_unstable();let refs:Vec<_>=keys.iter().map(Vec::as_slice).collect();
++        Some(futures::executor::block_on(self.get_batch(&refs)).and_then(|values|values.into_iter().map(|v|v.ok_or_else(||io::Error::other("reverse term absent from canonical dictionary"))).collect()).map(|v|(v,false)))
++    }
++
+     pub async fn get_batch(&self, keys: &[&[u8]]) -> io::Result<Vec<Option<V>>> {
+         let mut requests = Vec::with_capacity(keys.len());
+         for (position, key) in keys.iter().enumerate() {
+@@ -2182,8 +2215,9 @@
+         prefix: &[u8],
+         max_results: usize,
+         max_scanned: usize,
+-        accepts: impl FnMut(&[u8]) -> bool + Send,
++        mut accepts: impl FnMut(&[u8]) -> bool + Send,
+     ) -> io::Result<(Vec<V>, bool)> {
++        if let Some(result)=self.prototype_reverse_values(prefix,max_results,max_scanned,&mut accepts) {return result}
+         self.prefix_scan_projected(prefix, max_results, max_scanned, accepts, |_, value| value)
+             .await
+     }
+@@ -2276,8 +2310,9 @@
+         prefix: &[u8],
+         max_results: usize,
+         max_scanned: usize,
+-        accepts: impl FnMut(&[u8]) -> bool,
++        mut accepts: impl FnMut(&[u8]) -> bool,
+     ) -> io::Result<(Vec<V>, bool)> {
++        if let Some(result)=self.prototype_reverse_values(prefix,max_results,max_scanned,&mut accepts) {return result}
+         self.prefix_scan_projected_sync(prefix, max_results, max_scanned, accepts, |_, value| value)
+     }
+ 
+@@ -2904,3 +2939,21 @@
+         assert_eq!(error.to_string(), "SSTable block suffix truncated");
+     }
+ }
++
++// Private experiment hook: never included in the production crate.
++static PROTOTYPE_REVERSE: std::sync::OnceLock<fst::Map<memmap2::Mmap>> = std::sync::OnceLock::new();
++static PROTOTYPE_PATTERN: std::sync::RwLock<Option<(Vec<u8>, Vec<u8>)>> = std::sync::RwLock::new(None);
++pub fn prototype_initialize(path: &std::path::Path) {
++    let file = std::fs::File::open(path).unwrap();
++    PROTOTYPE_REVERSE.set(fst::Map::new(unsafe { memmap2::Mmap::map(&file).unwrap() }).unwrap()).unwrap();
++}
++pub fn prototype_mode(pattern: Option<&str>) {
++    *PROTOTYPE_PATTERN.write().unwrap() = pattern.and_then(|s|s.split_once('*')).map(|(prefix,suffix)| {
++        let mut key=0u32.to_le_bytes().to_vec(); key.extend_from_slice(prefix.as_bytes());
++        (key,suffix.as_bytes().to_vec())
++    });
++}
++fn prototype_upper(prefix: &[u8]) -> Option<Vec<u8>> {
++    let mut upper=prefix.to_vec();
++    let i=upper.iter().rposition(|&b|b!=255)?;upper[i]+=1;upper.truncate(i+1);Some(upper)
++}
+--- a/summa-core/src/structures/mod.rs
++++ b/summa-core/src/structures/mod.rs
+@@ -163,3 +163,5 @@
+ #[cfg(feature = "fst-index")]
+ pub use sstable_index::FstBlockIndex;
+ pub use sstable_index::{BlockAddr, BlockAddrStore, BlockIndex, MmapBlockIndex};
++
++pub use sstable::{prototype_initialize,prototype_mode};

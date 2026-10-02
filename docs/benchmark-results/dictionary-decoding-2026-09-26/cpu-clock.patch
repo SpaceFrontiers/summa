@@ -1,0 +1,85 @@
+--- a/summa-core/benches/search_pipeline.rs
++++ b/summa-core/benches/search_pipeline.rs
+@@ -128,7 +128,7 @@
+     }
+ }
+ 
+-fn bench_search_pipeline(c: &mut Criterion) {
++fn bench_search_pipeline(c: &mut CpuCriterion) {
+     let runtime = tokio::runtime::Builder::new_multi_thread()
+         .worker_threads(2)
+         .enable_all()
+@@ -264,7 +264,7 @@
+ // Ranked plain text must be measured through the planner: a cursor-only
+ // benchmark cannot expose a TermQuery that never admits block-max execution.
+ #[cfg(feature = "sync")]
+-fn bench_plain_ranked_text(c: &mut Criterion) {
++fn bench_plain_ranked_text(c: &mut CpuCriterion) {
+     use summa_core::query::{BooleanQuery, TopKCollector, collect_segment};
+     let runtime = tokio::runtime::Builder::new_current_thread()
+         .enable_all()
+@@ -388,7 +388,7 @@
+ }
+ 
+ #[cfg(feature = "sync")]
+-fn bench_pattern_filters(c: &mut Criterion) {
++fn bench_pattern_filters(c: &mut CpuCriterion) {
+     use summa_core::query::{TopKCollector, collect_segment_with_limit_sync};
+     use summa_core::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId, SegmentReader};
+     let runtime = tokio::runtime::Builder::new_current_thread()
+@@ -464,7 +464,7 @@
+ }
+ 
+ #[cfg(feature = "sync")]
+-fn bench_union_membership(c: &mut Criterion) {
++fn bench_union_membership(c: &mut CpuCriterion) {
+     use summa_core::query::{CountCollector, PrefixQuery, collect_segment};
+     use summa_core::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId, SegmentReader};
+     let runtime = tokio::runtime::Builder::new_current_thread()
+@@ -518,7 +518,7 @@
+ }
+ 
+ #[cfg(feature = "sync")]
+-fn bench_membership_density(c: &mut Criterion) {
++fn bench_membership_density(c: &mut CpuCriterion) {
+     use summa_core::query::{BooleanQuery, CountCollector, collect_segment};
+     use summa_core::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId, SegmentReader};
+     let runtime = tokio::runtime::Builder::new_current_thread()
+@@ -574,8 +574,9 @@
+ 
+ #[cfg(feature = "sync")]
+ criterion_group!(
+-    benches,
+-    bench_search_pipeline,
++    name = benches;
++    config = Criterion::default().with_measurement(CpuTime);
++    targets = bench_search_pipeline,
+     bench_plain_ranked_text,
+     bench_pattern_filters,
+     bench_union_membership,
+@@ -584,3 +585,25 @@
+ #[cfg(not(feature = "sync"))]
+ criterion_group!(benches, bench_search_pipeline);
+ criterion_main!(benches);
++
++// Experiment-only clock adapter; the canonical fixture and query paths are unchanged.
++use criterion::measurement::{Measurement, ValueFormatter, WallTime};
++struct CpuTime;
++type CpuCriterion = Criterion<CpuTime>;
++impl CpuTime {
++    fn now() -> std::time::Duration {
++        let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++        assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) }, 0);
++        std::time::Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
++    }
++}
++impl Measurement for CpuTime {
++    type Intermediate = std::time::Duration;
++    type Value = std::time::Duration;
++    fn start(&self) -> Self::Intermediate { Self::now() }
++    fn end(&self, start: Self::Intermediate) -> Self::Value { Self::now() - start }
++    fn add(&self, a: &Self::Value, b: &Self::Value) -> Self::Value { *a + *b }
++    fn zero(&self) -> Self::Value { std::time::Duration::ZERO }
++    fn to_f64(&self, value: &Self::Value) -> f64 { value.as_nanos() as f64 }
++    fn formatter(&self) -> &dyn ValueFormatter { static WALL: WallTime = WallTime; WALL.formatter() }
++}

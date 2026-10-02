@@ -3,6 +3,9 @@
 //! Supports network, local filesystem, and in-memory storage.
 //! All reads are async to minimize blocking on network latency.
 
+use super::{FileHandle, OwnedBytes};
+#[cfg(feature = "native")]
+use super::{IndexLabel, RangeReadFn};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -10,536 +13,6 @@ use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-/// Callback type for lazy range reading
-#[cfg(not(target_arch = "wasm32"))]
-pub type RangeReadFn = Arc<
-    dyn Fn(
-            Range<u64>,
-        )
-            -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<OwnedBytes>> + Send>>
-        + Send
-        + Sync,
->;
-
-#[cfg(target_arch = "wasm32")]
-pub type RangeReadFn = Arc<
-    dyn Fn(
-        Range<u64>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<OwnedBytes>>>>,
->;
-
-/// Unified file handle for both inline (mmap/RAM) and lazy (HTTP/filesystem) access.
-///
-/// Replaces the previous `FileSlice`, `LazyFileHandle`, and `LazyFileSlice` types.
-/// - **Inline**: data is available synchronously (mmap, RAM). Sync reads via `read_bytes_range_sync`.
-/// - **Lazy**: data is fetched on-demand via async callback (HTTP, filesystem).
-///
-/// Use `.slice()` to create sub-range views (zero-copy for Inline, offset-adjusted for Lazy).
-#[derive(Clone)]
-pub struct FileHandle {
-    inner: FileHandleInner,
-}
-
-#[derive(Clone)]
-enum FileHandleInner {
-    /// Data available inline — sync reads possible (mmap, RAM)
-    Inline {
-        data: OwnedBytes,
-        offset: u64,
-        len: u64,
-    },
-    /// Data fetched on-demand via async callback (HTTP, filesystem)
-    Lazy {
-        read_fn: RangeReadFn,
-        offset: u64,
-        len: u64,
-        /// Index name for the `summa_directory_read_*` metric labels.
-        label: Arc<str>,
-    },
-}
-
-/// Late-bound index name for Directory-layer metric labels
-/// (`summa_directory_read_*`, `summa_cold_write_bytes_total`).
-///
-/// Directories are constructed before the schema is loaded, so the label is
-/// attached afterwards: `Index::open`/`create` call
-/// `Directory::set_index_label(schema.index_label())` on the index's
-/// directory instance. Reads happen at handle/writer creation, not per IO.
-#[derive(Clone, Debug)]
-pub struct IndexLabel(Arc<std::sync::RwLock<Arc<str>>>);
-
-impl Default for IndexLabel {
-    fn default() -> Self {
-        Self(Arc::new(std::sync::RwLock::new(Arc::from("unknown"))))
-    }
-}
-
-impl IndexLabel {
-    /// Current label ("unknown" until set).
-    pub fn get(&self) -> Arc<str> {
-        self.0.read().expect("IndexLabel lock poisoned").clone()
-    }
-
-    /// Set the label (idempotent; last write wins).
-    pub fn set(&self, label: &str) {
-        *self.0.write().expect("IndexLabel lock poisoned") = Arc::from(label);
-    }
-}
-
-impl std::fmt::Debug for FileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.inner {
-            FileHandleInner::Inline { len, offset, .. } => f
-                .debug_struct("FileHandle::Inline")
-                .field("offset", offset)
-                .field("len", len)
-                .finish(),
-            FileHandleInner::Lazy { len, offset, .. } => f
-                .debug_struct("FileHandle::Lazy")
-                .field("offset", offset)
-                .field("len", len)
-                .finish(),
-        }
-    }
-}
-
-impl FileHandle {
-    /// Give a batch of borrowed ranges one local reference-count owner.
-    /// Lazy handles keep their original bounded range-read behavior.
-    pub(crate) fn with_local_owner(&self) -> Self {
-        match &self.inner {
-            FileHandleInner::Inline { data, offset, len } => Self {
-                inner: FileHandleInner::Inline {
-                    data: data.clone().with_local_owner(),
-                    offset: *offset,
-                    len: *len,
-                },
-            },
-            FileHandleInner::Lazy { .. } => self.clone(),
-        }
-    }
-
-    /// Create an inline file handle from owned bytes (mmap, RAM).
-    /// Sync reads are available.
-    pub fn from_bytes(data: OwnedBytes) -> Self {
-        let len = data.len() as u64;
-        Self {
-            inner: FileHandleInner::Inline {
-                data,
-                offset: 0,
-                len,
-            },
-        }
-    }
-
-    /// Create an empty file handle.
-    pub fn empty() -> Self {
-        Self::from_bytes(OwnedBytes::empty())
-    }
-
-    /// Create a lazy file handle from an async range-read callback.
-    /// Only async reads are available. Reads emit `summa_directory_read_*`
-    /// with `index="unknown"` — use [`FileHandle::lazy_labeled`] when the
-    /// owning index is known.
-    pub fn lazy(len: u64, read_fn: RangeReadFn) -> Self {
-        Self::lazy_labeled(len, read_fn, Arc::from("unknown"))
-    }
-
-    /// [`FileHandle::lazy`] with an index name for metric labels.
-    pub fn lazy_labeled(len: u64, read_fn: RangeReadFn, label: Arc<str>) -> Self {
-        Self {
-            inner: FileHandleInner::Lazy {
-                read_fn,
-                offset: 0,
-                len,
-                label,
-            },
-        }
-    }
-
-    /// Total length in bytes.
-    #[inline]
-    pub fn len(&self) -> u64 {
-        match &self.inner {
-            FileHandleInner::Inline { len, .. } => *len,
-            FileHandleInner::Lazy { len, .. } => *len,
-        }
-    }
-
-    /// Check if empty.
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Whether synchronous reads are available (inline/mmap data).
-    #[inline]
-    pub fn is_sync(&self) -> bool {
-        matches!(&self.inner, FileHandleInner::Inline { .. })
-    }
-
-    /// Create a sub-range view. Zero-copy for Inline, offset-adjusted for Lazy.
-    pub fn slice(&self, range: Range<u64>) -> Self {
-        match &self.inner {
-            FileHandleInner::Inline { data, offset, len } => {
-                let new_offset = offset + range.start;
-                let new_len = range.end - range.start;
-                debug_assert!(
-                    new_offset + new_len <= offset + len,
-                    "slice out of bounds: {}+{} > {}+{}",
-                    new_offset,
-                    new_len,
-                    offset,
-                    len
-                );
-                Self {
-                    inner: FileHandleInner::Inline {
-                        data: data.clone(),
-                        offset: new_offset,
-                        len: new_len,
-                    },
-                }
-            }
-            FileHandleInner::Lazy {
-                read_fn,
-                offset,
-                len,
-                label,
-            } => {
-                let new_offset = offset + range.start;
-                let new_len = range.end - range.start;
-                debug_assert!(
-                    new_offset + new_len <= offset + len,
-                    "slice out of bounds: {}+{} > {}+{}",
-                    new_offset,
-                    new_len,
-                    offset,
-                    len
-                );
-                Self {
-                    inner: FileHandleInner::Lazy {
-                        read_fn: Arc::clone(read_fn),
-                        offset: new_offset,
-                        len: new_len,
-                        label: Arc::clone(label),
-                    },
-                }
-            }
-        }
-    }
-
-    /// Advise the kernel about the access pattern for a byte range of this handle.
-    ///
-    /// Only effective for Inline handles backed by mmap; no-op for Lazy
-    /// handles (HTTP, filesystem callbacks) and heap-backed data.
-    #[cfg(feature = "native")]
-    pub fn madvise_range(&self, range: Range<u64>, advice: libc::c_int) {
-        if let FileHandleInner::Inline { data, offset, len } = &self.inner {
-            let end = range.end.min(*len);
-            if range.start >= end {
-                return;
-            }
-            let start = (*offset + range.start) as usize;
-            let end = (*offset + end) as usize;
-            data.madvise_range(start..end, advice);
-        }
-    }
-
-    /// Async range read — works for both Inline and Lazy.
-    pub async fn read_bytes_range(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
-        match &self.inner {
-            FileHandleInner::Inline { data, offset, len } => {
-                if range.end > *len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Range {:?} out of bounds (len: {})", range, len),
-                    ));
-                }
-                let start = (*offset + range.start) as usize;
-                let end = (*offset + range.end) as usize;
-                Ok(data.slice(start..end))
-            }
-            FileHandleInner::Lazy {
-                read_fn,
-                offset,
-                len,
-                label,
-            } => {
-                if range.end > *len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Range {:?} out of bounds (len: {})", range, len),
-                    ));
-                }
-                let abs_start = offset + range.start;
-                let abs_end = offset + range.end;
-                // Real IO (HTTP / custom read_fn) — mmap-backed Inline handles
-                // above are zero-copy slices whose latency materializes as
-                // page faults inside the query-phase histograms instead.
-                let t = crate::observe::Timer::start();
-                let result = (read_fn)(abs_start..abs_end).await;
-                if let Ok(bytes) = &result {
-                    crate::observe::directory_read(label, "lazy_range", t.secs(), bytes.len());
-                }
-                result
-            }
-        }
-    }
-
-    /// Read all bytes.
-    pub async fn read_bytes(&self) -> io::Result<OwnedBytes> {
-        self.read_bytes_range(0..self.len()).await
-    }
-
-    /// Synchronous range read — only works for Inline handles.
-    /// Returns `Err` if the handle is Lazy.
-    #[inline]
-    pub fn read_bytes_range_sync(&self, range: Range<u64>) -> io::Result<OwnedBytes> {
-        match &self.inner {
-            FileHandleInner::Inline { data, offset, len } => {
-                if range.end > *len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Range {:?} out of bounds (len: {})", range, len),
-                    ));
-                }
-                let start = (*offset + range.start) as usize;
-                let end = (*offset + range.end) as usize;
-                Ok(data.slice(start..end))
-            }
-            FileHandleInner::Lazy { .. } => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Synchronous read not available on lazy file handle",
-            )),
-        }
-    }
-
-    /// Synchronous read of all bytes — only works for Inline handles.
-    #[inline]
-    pub fn read_bytes_sync(&self) -> io::Result<OwnedBytes> {
-        self.read_bytes_range_sync(0..self.len())
-    }
-}
-
-/// Backing store for OwnedBytes — supports both heap Vec and mmap.
-#[derive(Clone)]
-enum SharedBytes {
-    Vec(Arc<Vec<u8>>),
-    #[cfg(feature = "native")]
-    Mmap(Arc<memmap2::Mmap>),
-    Local(Arc<SharedBytes>),
-}
-
-impl SharedBytes {
-    #[inline]
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            SharedBytes::Vec(v) => v.as_slice(),
-            #[cfg(feature = "native")]
-            SharedBytes::Mmap(m) => m.as_ref(),
-            SharedBytes::Local(owner) => owner.as_bytes(),
-        }
-    }
-}
-
-impl std::fmt::Debug for SharedBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SharedBytes::Vec(v) => write!(f, "Vec(len={})", v.len()),
-            #[cfg(feature = "native")]
-            SharedBytes::Mmap(m) => write!(f, "Mmap(len={})", m.len()),
-            SharedBytes::Local(owner) => owner.fmt(f),
-        }
-    }
-}
-
-/// Owned bytes with cheap cloning (Arc-backed)
-///
-/// Supports two backing stores:
-/// - `Vec<u8>` for owned data (RamDirectory, FsDirectory, decompressed blocks)
-/// - `Mmap` for zero-copy memory-mapped files (MmapDirectory, native only)
-#[derive(Clone)]
-pub struct OwnedBytes {
-    data: SharedBytes,
-    /// Validated subview into `data`. Its allocation is immutable and stable
-    /// for the lifetime of the retained Arc; see `docs/owned-byte-views.md`.
-    view: std::ptr::NonNull<[u8]>,
-}
-
-// SAFETY: the view points into immutable storage owned by `data`. Both Arc
-// variants are Send + Sync, keep their allocation stable, and expose no mutable
-// access through this type. Every clone retains that same backing allocation.
-unsafe impl Send for OwnedBytes {}
-// SAFETY: shared access only yields immutable slices tied to the owner's borrow.
-unsafe impl Sync for OwnedBytes {}
-
-impl std::fmt::Debug for OwnedBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OwnedBytes")
-            .field("data", &self.data)
-            .field("len", &self.len())
-            .finish()
-    }
-}
-
-impl OwnedBytes {
-    fn with_local_owner(mut self) -> Self {
-        if !matches!(self.data, SharedBytes::Local(_)) {
-            self.data = SharedBytes::Local(Arc::new(self.data));
-        }
-        self
-    }
-
-    /// Validate a view while its stable backing owner is available. Moving the
-    /// Arc handle below does not move the Vec buffer or memory mapping.
-    fn with_range(data: SharedBytes, range: Range<usize>) -> Self {
-        let view = std::ptr::NonNull::from(&data.as_bytes()[range]);
-        Self { data, view }
-    }
-
-    pub fn new(data: Vec<u8>) -> Self {
-        let len = data.len();
-        Self::with_range(SharedBytes::Vec(Arc::new(data)), 0..len)
-    }
-
-    pub fn empty() -> Self {
-        Self::new(Vec::new())
-    }
-
-    /// Create from a pre-existing Arc<Vec<u8>> with a checked sub-range.
-    /// Used by RamDirectory and CachingDirectory to share data without copying.
-    pub(crate) fn from_arc_vec(data: Arc<Vec<u8>>, range: Range<usize>) -> Self {
-        Self::with_range(SharedBytes::Vec(data), range)
-    }
-
-    /// Create from a memory-mapped file (zero-copy).
-    #[cfg(feature = "native")]
-    pub(crate) fn from_mmap(mmap: Arc<memmap2::Mmap>) -> Self {
-        let len = mmap.len();
-        Self::with_range(SharedBytes::Mmap(mmap), 0..len)
-    }
-
-    /// Create from a memory-mapped file with a checked sub-range (zero-copy).
-    #[cfg(feature = "native")]
-    pub(crate) fn from_mmap_range(mmap: Arc<memmap2::Mmap>, range: Range<usize>) -> Self {
-        Self::with_range(SharedBytes::Mmap(mmap), range)
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.view.len()
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Create a checked subview bounded by this view, retaining the same owner.
-    pub fn slice(&self, range: Range<usize>) -> Self {
-        let view = std::ptr::NonNull::from(&self.as_slice()[range]);
-        Self {
-            data: self.data.clone(),
-            view,
-        }
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: constructors and slice validate this view against immutable
-        // Arc-owned storage. The owner outlives the returned borrow of self;
-        // neither moving a handle nor cloning it can move its backing bytes.
-        unsafe { self.view.as_ref() }
-    }
-
-    /// Returns `true` if the backing store is a memory-mapped file.
-    ///
-    /// Used to guard `madvise` calls: `MADV_DONTNEED` on heap memory
-    /// zeroes pages on Linux and corrupts allocator metadata.
-    #[cfg(feature = "native")]
-    #[inline]
-    pub fn is_mmap(&self) -> bool {
-        match &self.data {
-            SharedBytes::Mmap(_) => true,
-            SharedBytes::Local(owner) => matches!(owner.as_ref(), SharedBytes::Mmap(_)),
-            SharedBytes::Vec(_) => false,
-        }
-    }
-
-    /// Advise the kernel about the access pattern for these bytes.
-    ///
-    /// No-op unless the backing store is mmap (heap memory must never be
-    /// madvised: `MADV_DONTNEED` on heap zeroes pages and corrupts allocator
-    /// metadata) or the range is empty.
-    #[cfg(feature = "native")]
-    pub fn madvise(&self, advice: libc::c_int) {
-        self.madvise_range(0..self.len(), advice);
-    }
-
-    /// Pin these bytes in physical memory (`mlock`). mmap-backed only —
-    /// heap memory is not evictable by the page cache. Returns whether the
-    /// lock succeeded; failure (e.g. RLIMIT_MEMLOCK) is not fatal.
-    /// Locks are released automatically when the mapping is unmapped.
-    #[cfg(feature = "native")]
-    pub fn mlock(&self) -> bool {
-        if !self.is_mmap() {
-            return false;
-        }
-        let slice = self.as_slice();
-        if slice.is_empty() {
-            return true;
-        }
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-        let page_size = 4096usize;
-        let aligned_ptr = (ptr as usize) & !(page_size - 1);
-        let aligned_len = len + (ptr as usize - aligned_ptr);
-        unsafe { libc::mlock(aligned_ptr as *const libc::c_void, aligned_len) == 0 }
-    }
-
-    /// Advise the kernel about the access pattern for a sub-range.
-    ///
-    /// The range is relative to these bytes. Same mmap-only guard as
-    /// [`Self::madvise`]. The pointer is aligned down to a page boundary
-    /// as required by `madvise`.
-    #[cfg(feature = "native")]
-    pub fn madvise_range(&self, range: Range<usize>, advice: libc::c_int) {
-        if !self.is_mmap() {
-            return;
-        }
-        let slice = &self.as_slice()[range];
-        if slice.is_empty() {
-            return;
-        }
-        let ptr = slice.as_ptr();
-        let len = slice.len();
-        let page_size = 4096usize;
-        let aligned_ptr = (ptr as usize) & !(page_size - 1);
-        let aligned_len = len + (ptr as usize - aligned_ptr);
-        unsafe {
-            libc::madvise(aligned_ptr as *mut libc::c_void, aligned_len, advice);
-        }
-    }
-
-    pub fn to_vec(&self) -> Vec<u8> {
-        self.as_slice().to_vec()
-    }
-}
-
-impl AsRef<[u8]> for OwnedBytes {
-    fn as_ref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl std::ops::Deref for OwnedBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
-    }
-}
 
 /// Async directory trait for reading index files
 #[cfg(not(target_arch = "wasm32"))]
@@ -564,6 +37,18 @@ pub trait Directory: Send + Sync + 'static {
     /// For mmap directories this returns an Inline handle (sync-capable).
     /// For HTTP/filesystem directories this returns a Lazy handle.
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle>;
+
+    /// Open an asynchronously consumed payload, independently of sync-capable metadata.
+    /// The default preserves this backend's existing lazy-read policy.
+    async fn open_payload(&self, path: &Path) -> io::Result<FileHandle> {
+        self.open_lazy(path).await
+    }
+
+    /// Optional explicit reads for sparse blocks, separate from mapped metadata.
+    /// None preserves the original handle and does not reopen the file.
+    async fn open_sparse_payload(&self, _path: &Path) -> io::Result<Option<FileHandle>> {
+        Ok(None)
+    }
 
     /// Attach the owning index's name for Directory-layer metric labels
     /// (`summa_directory_read_*`, `summa_cold_write_bytes_total`).
@@ -604,6 +89,18 @@ pub trait Directory: 'static {
 
     /// Open a file handle that fetches ranges on demand.
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle>;
+
+    /// Open an asynchronously consumed payload, independently of sync-capable metadata.
+    /// The default preserves this backend's existing lazy-read policy.
+    async fn open_payload(&self, path: &Path) -> io::Result<FileHandle> {
+        self.open_lazy(path).await
+    }
+
+    /// Optional explicit reads for sparse blocks, separate from mapped metadata.
+    /// None preserves the original handle and does not reopen the file.
+    async fn open_sparse_payload(&self, _path: &Path) -> io::Result<Option<FileHandle>> {
+        Ok(None)
+    }
 
     /// Attach the owning index's name for Directory-layer metric labels.
     /// No-op default; metrics are native-only but the label is harmless.
@@ -944,17 +441,8 @@ impl Directory for RamDirectory {
             .get(path)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
 
-        let start = range.start as usize;
-        let end = range.end as usize;
-
-        if end > data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Range out of bounds",
-            ));
-        }
-
-        Ok(OwnedBytes::from_arc_vec(Arc::clone(data), start..end))
+        FileHandle::from_bytes(OwnedBytes::from_arc_vec(Arc::clone(data), 0..data.len()))
+            .read_bytes_range_sync(range)
     }
 
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
@@ -1028,36 +516,6 @@ pub struct FsDirectory {
     label: IndexLabel,
 }
 
-/// Positional exact read that does not move the shared file cursor, so one
-/// `File` can serve concurrent range reads.
-#[cfg(all(feature = "native", unix))]
-fn read_exact_at(file: &std::fs::File, buffer: &mut [u8], offset: u64) -> io::Result<()> {
-    use std::os::unix::fs::FileExt;
-    file.read_exact_at(buffer, offset)
-}
-
-#[cfg(all(feature = "native", windows))]
-fn read_exact_at(file: &std::fs::File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
-    use std::os::windows::fs::FileExt;
-    while !buffer.is_empty() {
-        match file.seek_read(buffer, offset) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "failed to fill whole buffer",
-                ));
-            }
-            Ok(read) => {
-                buffer = &mut buffer[read..];
-                offset += read as u64;
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(feature = "native")]
 impl FsDirectory {
     pub fn new(root: impl AsRef<Path>) -> Self {
@@ -1098,18 +556,11 @@ impl Directory for FsDirectory {
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-        let full_path = self.resolve(path);
-        let mut file = tokio::fs::File::open(&full_path).await?;
-
-        file.seek(std::io::SeekFrom::Start(range.start)).await?;
-
-        let len = (range.end - range.start) as usize;
-        let mut buffer = vec![0u8; len];
-        file.read_exact(&mut buffer).await?;
-
-        Ok(OwnedBytes::new(buffer))
+        // The outer FileHandle/cache wrapper meters the logical read once.
+        self.open_lazy(path)
+            .await?
+            .read_bytes_range_unmetered(range)
+            .await
     }
 
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
@@ -1136,7 +587,7 @@ impl Directory for FsDirectory {
                 tokio::task::spawn_blocking(move || {
                     let len = (range.end - range.start) as usize;
                     let mut buffer = vec![0u8; len];
-                    read_exact_at(&file, &mut buffer, range.start)?;
+                    super::local::read_exact_at(&file, &mut buffer, range.start)?;
                     Ok(OwnedBytes::new(buffer))
                 })
                 .await
@@ -1291,9 +742,11 @@ impl<D: Directory> Directory for CachingDirectory<D> {
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
         // Check cache first
         if let Some(data) = self.cache.read().get(path) {
-            let start = range.start as usize;
-            let end = range.end as usize;
-            return Ok(OwnedBytes::from_arc_vec(Arc::clone(data), start..end));
+            return FileHandle::from_bytes(OwnedBytes::from_arc_vec(
+                Arc::clone(data),
+                0..data.len(),
+            ))
+            .read_bytes_range_sync(range);
         }
 
         self.inner.read_range(path, range).await
@@ -1308,6 +761,14 @@ impl<D: Directory> Directory for CachingDirectory<D> {
         self.inner.open_lazy(path).await
     }
 
+    async fn open_payload(&self, path: &Path) -> io::Result<FileHandle> {
+        self.inner.open_payload(path).await
+    }
+
+    async fn open_sparse_payload(&self, path: &Path) -> io::Result<Option<FileHandle>> {
+        self.inner.open_sparse_payload(path).await
+    }
+
     fn set_index_label(&self, label: &str) {
         self.inner.set_index_label(label);
     }
@@ -1320,6 +781,84 @@ impl<D: Directory> Directory for CachingDirectory<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn local_and_cached_directories_reject_invalid_ranges() {
+        async fn check(directory: &dyn Directory) {
+            for range in [Range { start: 5, end: 3 }, 0..9, u64::MAX..u64::MAX] {
+                assert_eq!(
+                    directory
+                        .read_range(Path::new("data"), range)
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::InvalidInput
+                );
+            }
+        }
+        let ram = RamDirectory::new();
+        ram.write(Path::new("data"), b"12345678").await.unwrap();
+        check(&ram).await;
+        let cache = CachingDirectory::new(ram.clone(), 1024);
+        cache.open_read(Path::new("data")).await.unwrap();
+        check(&cache).await;
+        let slices = crate::directories::SliceCachingDirectory::new(ram, 1024);
+        slices.open_read(Path::new("data")).await.unwrap();
+        check(&slices).await;
+        let temp = tempfile::tempdir().unwrap();
+        let fs = FsDirectory::new(temp.path());
+        fs.write(Path::new("data"), b"12345678").await.unwrap();
+        check(&fs).await;
+        check(&crate::directories::MmapDirectory::new(temp.path())).await;
+    }
+
+    #[cfg(all(feature = "native", feature = "metrics"))]
+    #[test]
+    fn filesystem_cache_wrappers_meter_each_logical_read_once() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("data"), b"1234").unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let directory = crate::directories::SliceCachingDirectory::new(
+                    FsDirectory::new(root.path()),
+                    1024,
+                );
+                directory.set_index_label("range_metering_test");
+                let lazy = directory.open_lazy(Path::new("data")).await.unwrap();
+                let payload = directory.open_payload(Path::new("data")).await.unwrap();
+                for (handle, range) in [(&lazy, 0..2), (&payload, 2..4)] {
+                    for _ in 0..2 {
+                        handle.read_bytes_range(range.clone()).await.unwrap();
+                    }
+                }
+            })
+        });
+        let observations: usize = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                DebugValue::Histogram(values)
+                    if key.key().name() == "summa_directory_read_bytes" =>
+                {
+                    Some(values.len())
+                }
+                _ => None,
+            })
+            .sum();
+        assert_eq!(
+            observations, 4,
+            "each miss/hit must be metered once by its outer handle"
+        );
+    }
 
     #[tokio::test]
     async fn test_ram_directory() {
@@ -1382,150 +921,5 @@ mod tests {
         assert_ne!(error.kind(), io::ErrorKind::NotFound);
         // Once stat succeeds again the file is reported present.
         assert!(dir.exists(Path::new("locked/seg.meta")).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_file_handle() {
-        let data = OwnedBytes::new(b"hello world".to_vec());
-        let handle = FileHandle::from_bytes(data);
-
-        assert_eq!(handle.len(), 11);
-        assert!(handle.is_sync());
-
-        let sub = handle.slice(0..5);
-        let bytes = sub.read_bytes().await.unwrap();
-        assert_eq!(bytes.as_slice(), b"hello");
-
-        let sub2 = handle.slice(6..11);
-        let bytes2 = sub2.read_bytes().await.unwrap();
-        assert_eq!(bytes2.as_slice(), b"world");
-
-        // Sync reads work on inline handles
-        let sync_bytes = handle.read_bytes_range_sync(0..5).unwrap();
-        assert_eq!(sync_bytes.as_slice(), b"hello");
-    }
-
-    #[test]
-    fn local_byte_owners_share_storage_without_repeated_global_refcounts() {
-        let backing = Arc::new((0u8..64).collect::<Vec<_>>());
-        let handle = FileHandle::from_bytes(OwnedBytes::from_arc_vec(backing.clone(), 3..61));
-        let local = handle.slice(2..40).with_local_owner().with_local_owner();
-        let count = Arc::strong_count(&backing);
-        let views: Vec<_> = (0..20)
-            .map(|i| local.read_bytes_range_sync(i..i + 3).unwrap())
-            .collect();
-        assert_eq!(Arc::strong_count(&backing), count);
-        drop(local);
-        drop(handle);
-        let survivor = std::thread::spawn(move || {
-            for (i, view) in views.iter().enumerate() {
-                assert_eq!(
-                    view.as_slice(),
-                    &[(i + 5) as u8, (i + 6) as u8, (i + 7) as u8]
-                );
-            }
-            views[7].clone()
-        })
-        .join()
-        .unwrap();
-        assert_eq!(survivor.as_slice(), &[12, 13, 14]);
-        drop(survivor);
-        assert_eq!(Arc::strong_count(&backing), 1);
-    }
-
-    #[test]
-    fn owned_byte_views_retain_heap_storage_across_moves_clones_and_empty_slices() {
-        let backing = Arc::new((0u8..64).collect::<Vec<_>>());
-        let weak = Arc::downgrade(&backing);
-        let bytes = OwnedBytes::from_arc_vec(backing.clone(), 3..61);
-        let nested = bytes.slice(1..57).slice(2..53);
-        let expected = (6u8..57).collect::<Vec<_>>();
-        let pointer = nested.as_slice().as_ptr();
-        let empty = nested.slice(nested.len()..nested.len());
-        assert!(empty.is_empty());
-        assert!(OwnedBytes::empty().slice(0..0).as_slice().is_empty());
-        let cloned = nested.clone();
-        drop(backing);
-        drop(bytes);
-        drop(nested);
-        assert_eq!(cloned.as_slice().as_ptr(), pointer);
-        assert_eq!(cloned.as_slice(), expected);
-        drop(cloned);
-        assert!(
-            weak.upgrade().is_some(),
-            "empty views also retain their owner"
-        );
-        drop(empty);
-        assert!(weak.upgrade().is_none());
-        assert_eq!(
-            std::mem::size_of::<OwnedBytes>(),
-            std::mem::size_of::<super::SharedBytes>() + 2 * std::mem::size_of::<usize>()
-        );
-    }
-
-    #[cfg(feature = "native")]
-    #[test]
-    fn owned_byte_views_keep_heap_and_mmap_owners_alive_across_threads() {
-        fn check(bytes: OwnedBytes, mapped: bool) {
-            assert_eq!(bytes.is_mmap(), mapped);
-            let survivor = bytes.slice(3..61).slice(1..56);
-            let copied = survivor.clone();
-            drop(bytes);
-            let thread = std::thread::spawn(move || {
-                assert_eq!(survivor.as_slice(), &(4u8..59).collect::<Vec<_>>());
-                assert_eq!(survivor.is_mmap(), mapped);
-                survivor.slice(2..9)
-            });
-            assert_eq!(copied.as_slice(), &(4u8..59).collect::<Vec<_>>());
-            drop(copied);
-            let final_view = thread.join().unwrap();
-            assert_eq!(final_view.as_slice(), &[6, 7, 8, 9, 10, 11, 12]);
-            assert_eq!(final_view.is_mmap(), mapped);
-        }
-        check(OwnedBytes::new((0u8..64).collect()), false);
-        let mut mapping = memmap2::MmapMut::map_anon(64).unwrap();
-        mapping.copy_from_slice(&(0u8..64).collect::<Vec<_>>());
-        let mapping = Arc::new(mapping.make_read_only().unwrap());
-        let weak = Arc::downgrade(&mapping);
-        check(OwnedBytes::from_mmap_range(mapping.clone(), 0..64), true);
-        check(
-            OwnedBytes::from_mmap_range(mapping.clone(), 0..64).with_local_owner(),
-            true,
-        );
-        check(
-            OwnedBytes::new((0u8..64).collect()).with_local_owner(),
-            false,
-        );
-        assert_eq!(Arc::strong_count(&mapping), 1);
-        drop(mapping);
-        assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
-    fn owned_byte_subslices_reject_access_outside_the_parent_view() {
-        let bytes = OwnedBytes::new(vec![1, 2, 3, 4, 5]);
-        let parent = bytes.slice(1..3);
-        assert_eq!(parent.slice(0..2).as_slice(), &[2, 3]);
-        assert!(std::panic::catch_unwind(|| parent.slice(0..3).to_vec()).is_err());
-        assert!(
-            std::panic::catch_unwind(|| parent.slice(Range { start: 2, end: 1 }).to_vec()).is_err()
-        );
-        assert!(
-            std::panic::catch_unwind(|| parent.slice(usize::MAX..usize::MAX).to_vec()).is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_owned_bytes() {
-        let bytes = OwnedBytes::new(vec![1, 2, 3, 4, 5]);
-
-        assert_eq!(bytes.len(), 5);
-        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4, 5]);
-
-        let sliced = bytes.slice(1..4);
-        assert_eq!(sliced.as_slice(), &[2, 3, 4]);
-
-        // Original unchanged
-        assert_eq!(bytes.as_slice(), &[1, 2, 3, 4, 5]);
     }
 }

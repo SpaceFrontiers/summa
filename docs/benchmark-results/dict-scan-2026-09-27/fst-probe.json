@@ -1,0 +1,429 @@
+{
+  "host": "hermes-validation-moroni n2-highmem-8 (x86-64), each mode pinned to CPU 0 with taskset",
+  "source": "production seg_01a0d51ecbb0761de69d68e5da1a9889.terms (503,593,473 bytes, 51,874,769 keys)",
+  "segments": 8,
+  "assignment": "deterministic hash: 70% of keys in one segment, 30% in two or three",
+  "provenance": {
+    "archive": {
+      "archive_sha256": "ecd27475a18d84055e49e49e1b59f600fd24216c41ef22fba082f90611f03be5",
+      "binary_sha256": "4b9f340253a5e4f2b83d28d792254c7c9e22afc3f26cdfad58a918b0c4ba3b55",
+      "compiler": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+      "flags": "-C target-cpu=native",
+      "command": [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "-p",
+        "summa-core",
+        "--example",
+        "fst_probe"
+      ]
+    },
+    "probe_source_sha256": "97b860e8f967e11ffddf6b889631c1eac587ac5b0e7c84f4979e7c6949dcfbff"
+  },
+  "split": {
+    "fst": {
+      "cpu_s": 73.169285363,
+      "segment_bytes": 1281162942,
+      "source_entries": 51874769,
+      "wall_s": 73.34913265
+    },
+    "sstable": {
+      "cpu_s": 62.657984682,
+      "segment_bytes": 820267938,
+      "source_entries": 51874769,
+      "wall_s": 63.011571013
+    },
+    "process_peak_rss_kib": 1680016,
+    "process_wall": "2:16.37"
+  },
+  "merge_sstable": {
+    "cpu_s": 62.314276699,
+    "format": "sstable",
+    "merged_bytes": 503593473,
+    "merged_terms": 51874769,
+    "peak_rss_mib": 1656.93359375,
+    "rss_after_loading_sources_mib": 786.73046875,
+    "wall_s": 62.318327199,
+    "process_peak_rss_kib": 1696700,
+    "process_wall": "1:02.78"
+  },
+  "merge_fst": {
+    "cpu_s": 41.886544534,
+    "format": "fst",
+    "merged_bytes": 800214938,
+    "merged_terms": 51874769,
+    "peak_rss_mib": 1247.35546875,
+    "rss_after_loading_sources_mib": 1224.60546875,
+    "wall_s": 42.006373577,
+    "process_peak_rss_kib": 1277292,
+    "process_wall": "0:42.68"
+  },
+  "scan": {
+    "fst_bytes": 273347138,
+    "fst_lookup_ns": 541.9492028158825,
+    "patterns": [
+      {
+        "fst_cpu_ms": 0.050797999999999996,
+        "matched_terms": 385,
+        "pattern": "wou*",
+        "scanned_terms": 385,
+        "sstable_cpu_ms": 0.015494,
+        "sstable_warm_cpu_ms": 0.015446999999999999
+      },
+      {
+        "fst_cpu_ms": 0.11649000000000001,
+        "matched_terms": 750,
+        "pattern": "bef*",
+        "scanned_terms": 750,
+        "sstable_cpu_ms": 0.028364,
+        "sstable_warm_cpu_ms": 0.028453
+      },
+      {
+        "fst_cpu_ms": 69.972035,
+        "matched_terms": 66,
+        "pattern": "h*band",
+        "scanned_terms": 482291,
+        "sstable_cpu_ms": 16.130003000000002,
+        "sstable_warm_cpu_ms": 16.099251
+      },
+      {
+        "fst_cpu_ms": 106.143574,
+        "matched_terms": 295,
+        "pattern": "a*nder",
+        "scanned_terms": 712266,
+        "sstable_cpu_ms": 23.751682,
+        "sstable_warm_cpu_ms": 23.751814
+      },
+      {
+        "fst_cpu_ms": 78.375473,
+        "matched_terms": 264,
+        "pattern": "e*tive",
+        "scanned_terms": 532659,
+        "sstable_cpu_ms": 17.485425999999997,
+        "sstable_warm_cpu_ms": 17.520509
+      },
+      {
+        "fst_cpu_ms": 82.383441,
+        "matched_terms": 30,
+        "pattern": "n*arly",
+        "scanned_terms": 590037,
+        "sstable_cpu_ms": 19.404687,
+        "sstable_warm_cpu_ms": 19.215927
+      },
+      {
+        "fst_cpu_ms": 123.449176,
+        "matched_terms": 137,
+        "pattern": "c*mics",
+        "scanned_terms": 830158,
+        "sstable_cpu_ms": 65.132436,
+        "sstable_warm_cpu_ms": 28.091523
+      },
+      {
+        "fst_cpu_ms": 95.500728,
+        "matched_terms": 366,
+        "pattern": "m*sion",
+        "scanned_terms": 659034,
+        "sstable_cpu_ms": 22.383602999999997,
+        "sstable_warm_cpu_ms": 22.407100999999997
+      },
+      {
+        "fst_cpu_ms": 27.847465,
+        "matched_terms": 24,
+        "pattern": "j*tice",
+        "scanned_terms": 187869,
+        "sstable_cpu_ms": 6.289888,
+        "sstable_warm_cpu_ms": 6.275701
+      },
+      {
+        "fst_cpu_ms": 142.553711,
+        "matched_terms": 346,
+        "pattern": "i*ally",
+        "scanned_terms": 776890,
+        "sstable_cpu_ms": 61.658933,
+        "sstable_warm_cpu_ms": 25.329507
+      },
+      {
+        "fst_cpu_ms": 108.01674899999999,
+        "matched_terms": 335,
+        "pattern": "p*ture",
+        "scanned_terms": 809232,
+        "sstable_cpu_ms": 62.851828999999995,
+        "sstable_warm_cpu_ms": 27.054123
+      },
+      {
+        "fst_cpu_ms": 105.129069,
+        "matched_terms": 317,
+        "pattern": "a*ties",
+        "scanned_terms": 712266,
+        "sstable_cpu_ms": 23.804765,
+        "sstable_warm_cpu_ms": 23.86328
+      },
+      {
+        "fst_cpu_ms": 105.427491,
+        "matched_terms": 12,
+        "pattern": "a*rded",
+        "scanned_terms": 712266,
+        "sstable_cpu_ms": 23.864462,
+        "sstable_warm_cpu_ms": 23.916486
+      },
+      {
+        "fst_cpu_ms": 96.503513,
+        "matched_terms": 63,
+        "pattern": "m*utes",
+        "scanned_terms": 659034,
+        "sstable_cpu_ms": 22.422311,
+        "sstable_warm_cpu_ms": 22.361099999999997
+      },
+      {
+        "fst_cpu_ms": 130.444123,
+        "matched_terms": 23,
+        "pattern": "f*iend",
+        "scanned_terms": 779673,
+        "sstable_cpu_ms": 61.85364,
+        "sstable_warm_cpu_ms": 25.745168
+      },
+      {
+        "fst_cpu_ms": 105.402257,
+        "matched_terms": 22,
+        "pattern": "a*mbly",
+        "scanned_terms": 712266,
+        "sstable_cpu_ms": 23.794033,
+        "sstable_warm_cpu_ms": 23.777861
+      },
+      {
+        "fst_cpu_ms": 121.463475,
+        "matched_terms": 213,
+        "pattern": "c*date",
+        "scanned_terms": 830158,
+        "sstable_cpu_ms": 64.667856,
+        "sstable_warm_cpu_ms": 27.989731
+      },
+      {
+        "fst_cpu_ms": 51.65272,
+        "matched_terms": 47,
+        "pattern": "g*lden",
+        "scanned_terms": 371128,
+        "sstable_cpu_ms": 12.662352,
+        "sstable_warm_cpu_ms": 12.619802
+      },
+      {
+        "fst_cpu_ms": 34.438054,
+        "matched_terms": 103,
+        "pattern": "v*oria",
+        "scanned_terms": 257563,
+        "sstable_cpu_ms": 8.587235,
+        "sstable_warm_cpu_ms": 8.627393000000001
+      },
+      {
+        "fst_cpu_ms": 109.927818,
+        "matched_terms": 82,
+        "pattern": "p*ssor",
+        "scanned_terms": 809232,
+        "sstable_cpu_ms": 62.375895,
+        "sstable_warm_cpu_ms": 27.177748
+      },
+      {
+        "fst_cpu_ms": 84.829822,
+        "matched_terms": 145,
+        "pattern": "r*ally",
+        "scanned_terms": 561336,
+        "sstable_cpu_ms": 18.738473,
+        "sstable_warm_cpu_ms": 18.906572999999998
+      },
+      {
+        "fst_cpu_ms": 95.361969,
+        "matched_terms": 16,
+        "pattern": "b*eved",
+        "scanned_terms": 659364,
+        "sstable_cpu_ms": 22.375438000000003,
+        "sstable_warm_cpu_ms": 22.240101000000003
+      },
+      {
+        "fst_cpu_ms": 130.05366800000002,
+        "matched_terms": 14,
+        "pattern": "f*rced",
+        "scanned_terms": 779673,
+        "sstable_cpu_ms": 61.587931,
+        "sstable_warm_cpu_ms": 25.756369
+      },
+      {
+        "fst_cpu_ms": 83.655482,
+        "matched_terms": 59,
+        "pattern": "r*ican",
+        "scanned_terms": 561336,
+        "sstable_cpu_ms": 18.709719,
+        "sstable_warm_cpu_ms": 18.720398
+      },
+      {
+        "fst_cpu_ms": 34.817197,
+        "matched_terms": 103,
+        "pattern": "v*tory",
+        "scanned_terms": 257563,
+        "sstable_cpu_ms": 8.551556,
+        "sstable_warm_cpu_ms": 8.614293
+      },
+      {
+        "fst_cpu_ms": 96.143292,
+        "matched_terms": 515,
+        "pattern": "m*ster",
+        "scanned_terms": 659034,
+        "sstable_cpu_ms": 22.440158,
+        "sstable_warm_cpu_ms": 22.407711
+      },
+      {
+        "fst_cpu_ms": 83.045155,
+        "matched_terms": 29,
+        "pattern": "r*rove",
+        "scanned_terms": 561336,
+        "sstable_cpu_ms": 18.737093,
+        "sstable_warm_cpu_ms": 18.766341
+      },
+      {
+        "fst_cpu_ms": 97.064951,
+        "matched_terms": 223,
+        "pattern": "m*sing",
+        "scanned_terms": 659034,
+        "sstable_cpu_ms": 22.435262,
+        "sstable_warm_cpu_ms": 22.35629
+      },
+      {
+        "fst_cpu_ms": 45.453377,
+        "matched_terms": 19,
+        "pattern": "u*nown",
+        "scanned_terms": 273915,
+        "sstable_cpu_ms": 9.209982,
+        "sstable_warm_cpu_ms": 9.234657
+      },
+      {
+        "fst_cpu_ms": 121.39541700000001,
+        "matched_terms": 19,
+        "pattern": "c*imed",
+        "scanned_terms": 830158,
+        "sstable_cpu_ms": 64.92684799999999,
+        "sstable_warm_cpu_ms": 28.024510999999997
+      },
+      {
+        "fst_cpu_ms": 77.04838799999999,
+        "matched_terms": 16,
+        "pattern": "e*cept",
+        "scanned_terms": 532659,
+        "sstable_cpu_ms": 17.562074,
+        "sstable_warm_cpu_ms": 17.564795
+      },
+      {
+        "fst_cpu_ms": 8.042532,
+        "matched_terms": 153,
+        "pattern": "q*tion",
+        "scanned_terms": 54262,
+        "sstable_cpu_ms": 1.81803,
+        "sstable_warm_cpu_ms": 1.8278109999999999
+      },
+      {
+        "fst_cpu_ms": 103.671417,
+        "matched_terms": 22,
+        "pattern": "d*ctly",
+        "scanned_terms": 794144,
+        "sstable_cpu_ms": 61.308454,
+        "sstable_warm_cpu_ms": 26.275723
+      },
+      {
+        "fst_cpu_ms": 109.585046,
+        "matched_terms": 748,
+        "pattern": "p*ical",
+        "scanned_terms": 809232,
+        "sstable_cpu_ms": 62.526582999999995,
+        "sstable_warm_cpu_ms": 27.007312
+      },
+      {
+        "fst_cpu_ms": 122.506638,
+        "matched_terms": 324,
+        "pattern": "c*lina",
+        "scanned_terms": 830158,
+        "sstable_cpu_ms": 64.638746,
+        "sstable_warm_cpu_ms": 28.108695
+      },
+      {
+        "fst_cpu_ms": 8.167014,
+        "matched_terms": 32,
+        "pattern": "q*lity",
+        "scanned_terms": 54262,
+        "sstable_cpu_ms": 1.811149,
+        "sstable_warm_cpu_ms": 1.809962
+      },
+      {
+        "fst_cpu_ms": 121.593924,
+        "matched_terms": 331,
+        "pattern": "c*idge",
+        "scanned_terms": 830158,
+        "sstable_cpu_ms": 64.949037,
+        "sstable_warm_cpu_ms": 28.163798
+      },
+      {
+        "fst_cpu_ms": 78.271491,
+        "matched_terms": 370,
+        "pattern": "e*ence",
+        "scanned_terms": 532659,
+        "sstable_cpu_ms": 17.605072,
+        "sstable_warm_cpu_ms": 17.571879
+      },
+      {
+        "fst_cpu_ms": 104.754968,
+        "matched_terms": 231,
+        "pattern": "a*ress",
+        "scanned_terms": 712266,
+        "sstable_cpu_ms": 23.992703000000002,
+        "sstable_warm_cpu_ms": 23.958589
+      },
+      {
+        "fst_cpu_ms": 69.805406,
+        "matched_terms": 16,
+        "pattern": "h*olds",
+        "scanned_terms": 482291,
+        "sstable_cpu_ms": 16.179196,
+        "sstable_warm_cpu_ms": 16.157918
+      },
+      {
+        "fst_cpu_ms": 105.914379,
+        "matched_terms": 71,
+        "pattern": "a*ysis",
+        "scanned_terms": 712266,
+        "sstable_cpu_ms": 23.870117,
+        "sstable_warm_cpu_ms": 23.857463
+      },
+      {
+        "fst_cpu_ms": 95.55790999999999,
+        "matched_terms": 134,
+        "pattern": "b*ming",
+        "scanned_terms": 659364,
+        "sstable_cpu_ms": 22.274414999999998,
+        "sstable_warm_cpu_ms": 22.188323999999998
+      },
+      {
+        "fst_cpu_ms": 52.017821,
+        "matched_terms": 15,
+        "pattern": "g*itar",
+        "scanned_terms": 371128,
+        "sstable_cpu_ms": 12.678676999999999,
+        "sstable_warm_cpu_ms": 12.647621
+      },
+      {
+        "fst_cpu_ms": 129.721122,
+        "matched_terms": 443,
+        "pattern": "f*nder",
+        "scanned_terms": 779673,
+        "sstable_cpu_ms": 61.763483,
+        "sstable_warm_cpu_ms": 26.018942
+      }
+    ],
+    "point_lookups": 179695,
+    "sstable_bytes": 503593473,
+    "sstable_lookup_ns": 6506.26635131751,
+    "sstable_warm_retained_blocks": 12503,
+    "sstable_warm_retained_bytes": 207398399,
+    "value_bytes": 526867800,
+    "process_peak_rss_kib": 2007112,
+    "process_wall": "2:42.81"
+  }
+}

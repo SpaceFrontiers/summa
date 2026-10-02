@@ -69,3 +69,12 @@ Tests cover dropped owners, cross-thread clones, empty views, unaligned
 subviews, invalid/reversed ranges and mmap ownership. The search harness,
 native-without-sync and portable compilation pass, along with whole-fixture
 score/count and immutable-byte comparisons. Portable release builds and JavaScript tests are recorded in the performance review.
+
+### Recyclable native backing
+
+The native recyclable variant retains an Arc over an initialized vector plus a
+weak reference to its bounded pool. The vector cannot be mutated while any view
+exists. Its final owner returns the allocation (or frees it if the pool stopped).
+Empty slices, local owners and cross-thread clones retain the same lifetime.
+The variant is heap-backed and must never receive mmap advice. Pool return does
+not hold file descriptors, service owners or byte-admission permits.

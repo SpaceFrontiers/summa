@@ -1,0 +1,100 @@
+--- a/summa-core/src/directories/directory.rs
++++ b/summa-core/src/directories/directory.rs
+@@ -349,10 +349,21 @@
+         let reads: Vec<_> = requests
+             .iter()
+             .cloned()
+-            .map(Self::read_exact_request)
++            .enumerate()
++            .map(|(position, request)| async move {
++                (position, Self::read_exact_request(request).await)
++            })
+             .collect();
+-        let results: Vec<io::Result<OwnedBytes>> = stream::iter(reads).buffered(8).collect().await;
+-        results.into_iter().collect()
++        // Replenish from any completed read. An ordered future buffer would
++        // leave storage idle behind an early slow read, even with free slots.
++        let mut results: Vec<Option<io::Result<OwnedBytes>>> =
++            (0..reads.len()).map(|_| None).collect();
++        let mut pending = stream::iter(reads).buffer_unordered(8);
++        while let Some((position, result)) = pending.next().await {
++            results[position] = Some(result);
++        }
++        // Restore both result order and first-input-error selection after draining.
++        results.into_iter().map(Option::unwrap).collect()
+     }
+ 
+     async fn read_exact_request(
+@@ -1558,6 +1569,72 @@
+     }
+ 
+     #[tokio::test]
++    async fn batched_reads_replenish_slots_while_the_first_read_is_stalled() {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        let started = Arc::new(AtomicUsize::new(0));
++        let release = Arc::new(tokio::sync::Semaphore::new(0));
++        let (observed, gate) = (started.clone(), release.clone());
++        let handle = FileHandle::lazy(
++            32,
++            Arc::new(move |range| {
++                let (observed, gate) = (observed.clone(), gate.clone());
++                Box::pin(async move {
++                    observed.fetch_add(1, Ordering::SeqCst);
++                    if range.start == 0 {
++                        gate.acquire().await.unwrap().forget();
++                    }
++                    Ok(OwnedBytes::new(vec![range.start as u8]))
++                })
++            }),
++        );
++        let ranges: Vec<_> = (0..32).map(|i| i..i + 1).collect();
++        let mut pending = Box::pin(handle.read_bytes_ranges(&ranges));
++        assert!(futures::poll!(&mut pending).is_pending());
++        assert!(
++            started.load(Ordering::SeqCst) > 8,
++            "completed later reads must free admission without waiting for the first result"
++        );
++        release.add_permits(1);
++        let bytes = pending.await.unwrap();
++        for (i, bytes) in bytes.iter().enumerate() {
++            assert_eq!(bytes.as_slice(), &[i as u8]);
++        }
++    }
++
++    #[tokio::test]
++    async fn batched_reads_return_the_first_input_error_after_draining_later_errors() {
++        use std::sync::atomic::{AtomicUsize, Ordering};
++        let completed = Arc::new(AtomicUsize::new(0));
++        let observed = completed.clone();
++        let handle = FileHandle::lazy(
++            16,
++            Arc::new(move |range| {
++                let observed = observed.clone();
++                Box::pin(async move {
++                    if range.start == 0 {
++                        tokio::task::yield_now().await;
++                    }
++                    observed.fetch_add(1, Ordering::SeqCst);
++                    if range.start == 0 {
++                        Err(io::Error::other("first input error"))
++                    } else if range.start == 1 {
++                        Err(io::Error::new(
++                            io::ErrorKind::PermissionDenied,
++                            "later error",
++                        ))
++                    } else {
++                        Ok(OwnedBytes::new(vec![range.start as u8]))
++                    }
++                })
++            }),
++        );
++        let ranges: Vec<_> = (0..16).map(|i| i..i + 1).collect();
++        let error = handle.read_bytes_ranges(&ranges).await.unwrap_err();
++        assert_eq!(error.to_string(), "first input error");
++        assert_eq!(completed.load(Ordering::SeqCst), 16);
++    }
++
++    #[tokio::test]
+     async fn batched_reads_share_one_concurrency_limit_across_files() {
+         use std::sync::atomic::{AtomicUsize, Ordering};
+         let active = Arc::new(AtomicUsize::new(0));

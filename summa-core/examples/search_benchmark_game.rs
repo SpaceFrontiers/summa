@@ -32,6 +32,8 @@ impl Options {
             background_merges: true,
             reorder_text: false,
         };
+        let mut per_segment_cache = false;
+        let mut process_cache = None;
         let mut args = args.iter();
         while let Some(flag) = args.next() {
             match flag.as_str() {
@@ -47,11 +49,20 @@ impl Options {
                 "--term-cache-blocks" => {
                     options.config.term_cache_blocks =
                         args.next().ok_or("missing term cache capacity")?.parse()?;
+                    per_segment_cache = true;
                 }
                 "--term-cache-bytes" => {
                     options.config.term_cache_budget_bytes = Some(
                         args.next()
                             .ok_or("missing term cache byte budget")?
+                            .parse()?,
+                    );
+                    per_segment_cache = true;
+                }
+                "--term-cache-process-bytes" => {
+                    process_cache = Some(
+                        args.next()
+                            .ok_or("missing process-wide term cache budget")?
                             .parse()?,
                     );
                 }
@@ -66,10 +77,9 @@ impl Options {
                 "--compact-text" => options.config.compact_text = true,
                 "--posting-codec" => {
                     let value = args.next().ok_or("missing posting codec")?;
-                    options.config.posting_codec = Some(
-                        PostingCodec::parse(value)
-                            .ok_or("posting codec must be rounded, packed, pfor, or simd4x")?,
-                    );
+                    options.config.posting_codec = Some(PostingCodec::parse(value).ok_or(
+                        "posting codec must be rounded, rounded_bitmap, packed, pfor, or simd4x",
+                    )?);
                 }
                 "--indexing-threads" => {
                     let value: usize = args
@@ -94,6 +104,13 @@ impl Options {
                 _ => return Err(format!("unknown option: {flag}").into()),
             }
         }
+        // Per-segment flags keep their historical meaning unless a process-wide
+        // budget is also given explicitly.
+        options.config.term_cache_process_bytes = match process_cache {
+            Some(bytes) => bytes,
+            None if per_segment_cache => 0,
+            None => options.config.term_cache_process_bytes,
+        };
         Ok(options)
     }
 }
@@ -366,7 +383,7 @@ impl<C: Collector> Collector for Exhaustive<C> {
 async fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 3 {
-        return Err("usage: search_benchmark_game <index|reorder|serve|validate-queries> <path> [--exhaustive] [--indexing-threads N] [--indexing-memory-bytes N] [--posting-codec rounded|packed|pfor|simd4x] [--compact-text] [--quantized-norms] [--reorder-text] [--term-cache-blocks N] [--term-cache-bytes N] [--term-dict-block-bytes N] [--posting-ratio-bounds] [--posting-impact-bounds] [--no-background-merges]".into());
+        return Err("usage: search_benchmark_game <index|reorder|serve|validate-queries> <path> [--exhaustive] [--indexing-threads N] [--indexing-memory-bytes N] [--posting-codec rounded|rounded_bitmap|packed|pfor|simd4x] [--compact-text] [--quantized-norms] [--reorder-text] [--term-cache-blocks N] [--term-cache-bytes N] [--term-cache-process-bytes N] [--term-dict-block-bytes N] [--posting-ratio-bounds] [--posting-impact-bounds] [--no-background-merges]".into());
     }
     let options = Options::parse(&args[3..])?;
     if options.reorder_text && args[1] != "index" {
@@ -376,12 +393,13 @@ async fn main() -> Result<()> {
         );
     }
     eprintln!(
-        "indexing_threads={} indexing_memory_bytes={} posting_codec={} term_cache_blocks={} term_cache_budget_bytes={:?} term_dict_block_bytes={} exhaustive={} posting_ratio_bounds={} posting_impact_bounds={} background_merges={} compact_text={} quantized_norms={} reorder_text={}",
+        "indexing_threads={} indexing_memory_bytes={} posting_codec={} term_cache_blocks={} term_cache_budget_bytes={:?} term_cache_process_bytes={} term_dict_block_bytes={} exhaustive={} posting_ratio_bounds={} posting_impact_bounds={} background_merges={} compact_text={} quantized_norms={} reorder_text={}",
         options.config.num_indexing_threads,
         options.config.max_indexing_memory_bytes,
         options.config.effective_posting_codec(),
         options.config.term_cache_blocks,
         options.config.term_cache_budget_bytes,
+        options.config.term_cache_process_bytes,
         options.config.term_dict_block_size,
         options.exhaustive,
         options.config.effective_posting_bounds().ratio,

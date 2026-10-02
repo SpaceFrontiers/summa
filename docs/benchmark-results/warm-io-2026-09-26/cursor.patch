@@ -1,0 +1,301 @@
+--- a/summa-core/src/query/scoring.rs
++++ b/summa-core/src/query/scoring.rs
+@@ -861,28 +861,36 @@
+ }
+ 
+ macro_rules! cursor_advance {
+-    ($self:ident, $ensure_fn:ident, $($aw:tt)*) => {{
+-        if $self.exhausted {
+-            return Ok(u32::MAX);
+-        }
+-        $self.$ensure_fn() $($aw)* ?;
+-        if $self.exhausted {
+-            return Ok(u32::MAX);
+-        }
+-        Ok($self.advance_pos())
++    ($cursor:expr, $ensure_fn:ident, $($aw:tt)*) => {{
++        let cursor = &mut $cursor;
++        if cursor.exhausted {
++            Ok::<_, crate::Error>(u32::MAX)
++        } else {
++            if !cursor.block_loaded {
++                cursor.$ensure_fn() $($aw)* ?;
++            }
++            if cursor.exhausted {
++                Ok(u32::MAX)
++            } else {
++                Ok(cursor.advance_pos())
++            }
++        }
+     }};
+ }
+ 
+ macro_rules! cursor_seek {
+-    ($self:ident, $ensure_fn:ident, $target:expr, $($aw:tt)*) => {{
+-        if let Some(doc) = $self.seek_prepare($target) {
+-            return Ok(doc);
+-        }
+-        $self.$ensure_fn() $($aw)* ?;
+-        if $self.seek_finish($target) {
+-            $self.$ensure_fn() $($aw)* ?;
+-        }
+-        Ok($self.doc())
++    ($cursor:expr, $ensure_fn:ident, $target:expr, $($aw:tt)*) => {{
++        let cursor = &mut $cursor;
++        let target = $target;
++        if let Some(doc) = cursor.seek_prepare(target) {
++            Ok::<_, crate::Error>(doc)
++        } else {
++            cursor.$ensure_fn() $($aw)* ?;
++            if cursor.seek_finish(target) {
++                cursor.$ensure_fn() $($aw)* ?;
++            }
++            Ok(cursor.doc())
++        }
+     }};
+ }
+ 
+@@ -1709,20 +1717,22 @@
+         cursor_ensure_block!(self, read_sparse_block_sync,)
+     }
+ 
+-    pub async fn advance(&mut self) -> crate::Result<DocId> {
+-        cursor_advance!(self, ensure_block_loaded, .await)
++    #[cfg(test)]
++    async fn advance(&mut self) -> crate::Result<DocId> {
++        cursor_advance!(*self, ensure_block_loaded, .await)
+     }
+ 
+     pub fn advance_sync(&mut self) -> crate::Result<DocId> {
+-        cursor_advance!(self, ensure_block_loaded_sync,)
+-    }
+-
+-    pub async fn seek(&mut self, target: DocId) -> crate::Result<DocId> {
+-        cursor_seek!(self, ensure_block_loaded, target, .await)
++        cursor_advance!(*self, ensure_block_loaded_sync,)
++    }
++
++    #[cfg(test)]
++    async fn seek(&mut self, target: DocId) -> crate::Result<DocId> {
++        cursor_seek!(*self, ensure_block_loaded, target, .await)
+     }
+ 
+     pub fn seek_sync(&mut self, target: DocId) -> crate::Result<DocId> {
+-        cursor_seek!(self, ensure_block_loaded_sync, target,)
++        cursor_seek!(*self, ensure_block_loaded_sync, target,)
+     }
+ 
+     #[inline]
+@@ -1820,10 +1830,12 @@
+ 
+ /// Macro to stamp out the Block-Max MaxScore loop for both async and sync paths.
+ ///
+-/// `$ensure`, `$advance`, `$seek` are cursor method idents (async or _sync variants).
++/// `$ensure` selects async or synchronous block loading. Cursor navigation is
++/// expanded here as well as in the cursor methods, so already-decoded
++/// postings do not construct nested advance/seek futures.
+ /// `$($aw:tt)*` captures `.await` for async or nothing for sync.
+ macro_rules! bms_execute_loop {
+-    ($self:ident, $ensure:ident, $advance:ident, $seek:ident, $($aw:tt)*) => {{
++    ($self:ident, $ensure:ident, $($aw:tt)*) => {{
+         let n = $self.cursors.len();
+ 
+         // Load first block for each cursor (ensures doc() returns real values)
+@@ -1919,7 +1931,7 @@
+                     while mask != 0 {
+                         let i = mask.trailing_zeros() as usize;
+                         $self.cursors[i].$ensure() $($aw)* ?;
+-                        $self.cursors[i].$advance() $($aw)* ?;
++                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
+                         mask &= mask - 1;
+                     }
+                     conjunction_skipped += 1;
+@@ -1982,7 +1994,7 @@
+                             }
+                             $self.cursors[i].$ensure() $($aw)* ?;
+                         } else {
+-                            $self.cursors[i].$seek(next_other) $($aw)* ?;
++                            cursor_seek!($self.cursors[i], $ensure, next_other, $($aw)*)?;
+                         }
+                         mask &= mask - 1;
+                     }
+@@ -1998,7 +2010,7 @@
+                     while mask != 0 {
+                         let i = mask.trailing_zeros() as usize;
+                         $self.cursors[i].$ensure() $($aw)* ?;
+-                        $self.cursors[i].$advance() $($aw)* ?;
++                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
+                         mask &= mask - 1;
+                     }
+                     continue;
+@@ -2017,7 +2029,7 @@
+                         let ord = $self.cursors[i].ordinal_mut();
+                         let sc = $self.cursors[i].score();
+                         ordinal_scores.push((ord, sc));
+-                        $self.cursors[i].$advance() $($aw)* ?;
++                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
+                     }
+                     mask &= mask - 1;
+                 }
+@@ -2040,7 +2052,7 @@
+                     break;
+                 }
+ 
+-                let doc = $self.cursors[i].$seek(min_doc) $($aw)* ?;
++                let doc = cursor_seek!($self.cursors[i], $ensure, min_doc, $($aw)*)?;
+                 if doc == min_doc {
+                     $self.cursors[i].ensure_scores();
+                     while $self.cursors[i].doc() == min_doc {
+@@ -2048,7 +2060,7 @@
+                         running_total += s;
+                         let ord = $self.cursors[i].ordinal_mut();
+                         ordinal_scores.push((ord, s));
+-                        $self.cursors[i].$advance() $($aw)* ?;
++                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
+                     }
+                 }
+             }
+@@ -2417,7 +2429,7 @@
+         let results = if self.all_text() {
+             self.dispatch_sync()
+         } else {
+-            bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await)
++            bms_execute_loop!(self, ensure_block_loaded, .await)
+         };
+         self.record(timer, &results);
+         results
+@@ -2459,7 +2471,7 @@
+         } else if self.all_text() {
+             self.execute_windowed()
+         } else {
+-            bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
++            bms_execute_loop!(self, ensure_block_loaded_sync,)
+         }
+     }
+ 
+@@ -2504,7 +2516,7 @@
+         if self.cursors.is_empty() {
+             return Ok(Vec::new());
+         }
+-        bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
++        bms_execute_loop!(self, ensure_block_loaded_sync,)
+     }
+ 
+     /// A lone bounded text cursor needs no window partition or reduction.
+--- a/summa-core/src/segment/reader/types/sparse_reads.rs
++++ b/summa-core/src/segment/reader/types/sparse_reads.rs
+@@ -54,12 +54,11 @@
+         );
+     }
+ 
+-    #[tokio::test]
+-    async fn cursor_window_preserves_bytes_and_recovers_after_failed_or_cancelled_refill() {
++    fn encoded_blocks(count: u32) -> (SparseIndex, OwnedBytes, Vec<std::ops::Range<usize>>) {
+         let mut bytes = Vec::new();
+         let mut skips = Vec::new();
+         let mut ranges = Vec::new();
+-        for block in 0..20 {
++        for block in 0..count {
+             let start = bytes.len();
+             SparseBlock::from_postings(&[(block, 2, 0.5)], WeightQuantization::Float32)
+                 .unwrap()
+@@ -76,15 +75,23 @@
+             .write_to_vec(&mut skips);
+         }
+         let bytes = OwnedBytes::new(bytes);
++        let mut dims = super::super::DimensionTable::new();
++        dims.push(1, 0, 0, count, count, 0.5);
++        let index = SparseIndex::new(
++            FileHandle::from_bytes(bytes.clone()),
++            dims,
++            OwnedBytes::new(skips),
++            count,
++            count,
++        );
++        (index, bytes, ranges)
++    }
++
++    #[tokio::test]
++    async fn cursor_window_preserves_bytes_and_recovers_after_failed_or_cancelled_refill() {
++        let (mut index, bytes, ranges) = encoded_blocks(20);
+         let mode = Arc::new(AtomicUsize::new(0));
+         let reads = Arc::new(Mutex::new(Vec::new()));
+-        let mut index = SparseIndex::new(
+-            FileHandle::from_bytes(bytes.clone()),
+-            super::super::DimensionTable::new(),
+-            OwnedBytes::new(skips),
+-            20,
+-            20,
+-        );
+         index.set_payload_handle(FileHandle::lazy(
+             bytes.len() as u64,
+             Arc::new({
+@@ -165,6 +172,68 @@
+                 .all(|r| r.end - r.start <= MAX_BYTES)
+         );
+     }
++
++    #[tokio::test]
++    async fn maxscore_refill_failure_is_not_partial_success_and_cancelled_queries_release_reads() {
++        use crate::query::MaxScoreExecutor;
++        let (mut index, bytes, _) = encoded_blocks(20);
++        let mode = Arc::new(AtomicUsize::new(0));
++        let pending = Arc::new(AtomicUsize::new(0));
++        struct PendingRead(Arc<AtomicUsize>);
++        impl Drop for PendingRead {
++            fn drop(&mut self) {
++                self.0.fetch_sub(1, Ordering::Relaxed);
++            }
++        }
++        index.set_payload_handle(FileHandle::lazy(
++            bytes.len() as u64,
++            Arc::new({
++                let mode = mode.clone();
++                let pending = pending.clone();
++                move |range| {
++                    let bytes = bytes.clone();
++                    let mode = mode.load(Ordering::Relaxed);
++                    let pending = pending.clone();
++                    Box::pin(async move {
++                        // First eight blocks complete; suspend/fail only a refill
++                        // after scoring has already accumulated partial results.
++                        if range.start != 0 {
++                            match mode {
++                                1 => return Err(std::io::Error::other("injected refill failure")),
++                                2 => {
++                                    pending.fetch_add(1, Ordering::Relaxed);
++                                    let _read = PendingRead(pending);
++                                    std::future::pending::<()>().await;
++                                }
++                                _ => {}
++                            }
++                        }
++                        Ok(bytes.slice(range.start as usize..range.end as usize))
++                    })
++                }
++            }),
++        ));
++        let make = || MaxScoreExecutor::sparse(&index, vec![(1, 1.0)], 20, 1.0);
++        let expected = make().execute_sync().unwrap();
++        mode.store(1, Ordering::Relaxed);
++        assert!(make().execute().await.is_err());
++        mode.store(2, Ordering::Relaxed);
++        {
++            let query = make().execute();
++            futures::pin_mut!(query);
++            assert!(futures::poll!(query).is_pending());
++            assert_eq!(pending.load(Ordering::Relaxed), 1);
++        }
++        assert_eq!(pending.load(Ordering::Relaxed), 0);
++        mode.store(0, Ordering::Relaxed);
++        let actual = make().execute().await.unwrap();
++        let identities = |rows: Vec<crate::query::ScoredDoc>| {
++            rows.into_iter()
++                .map(|row| (row.doc_id, row.score.to_bits(), row.ordinal))
++                .collect::<Vec<_>>()
++        };
++        assert_eq!(identities(actual), identities(expected));
++    }
+ }
+ 
+ impl SparseIndex {

@@ -742,7 +742,7 @@ impl ColumnBlock {
 ///
 /// **Lazy text state**: for text-ordinal columns, the global merged dictionary
 /// and per-block ordinal maps are built lazily on first access (not at load time).
-/// This avoids scanning all dictionary pages from mmap during segment loading.
+/// Opening still validates dictionary bytes; only the derived heap state is deferred.
 pub struct FastFieldReader {
     pub column_type: FastFieldColumnType,
     pub num_docs: u32,
@@ -824,12 +824,32 @@ struct TextState {
     /// Per-block ordinal maps: `ordinal_maps[block_idx][local_ord] → global_ord`.
     /// Empty Vec for blocks without dicts or single-block columns (identity mapping).
     ordinal_maps: Vec<Vec<u32>>,
+    /// Capacity of the newly serialized merged dictionary; zero for borrowed bytes.
+    owned_dict_bytes: usize,
 }
 
 impl FastFieldReader {
-    /// Heap directory only; encoded values and dictionaries remain file-backed.
+    /// Allocated metadata and initialized derived text state; shared encoded
+    /// input bytes are excluded. Observing memory never initializes lazy state.
     pub(crate) fn block_metadata_bytes(&self) -> usize {
-        self.blocks.capacity() * std::mem::size_of::<ColumnBlock>() + self.checkpoints.heap_bytes()
+        self.blocks.capacity() * std::mem::size_of::<ColumnBlock>()
+            + self.checkpoints.heap_bytes()
+            + self
+                .blocks
+                .iter()
+                .filter_map(|block| block.dict.as_ref())
+                .map(TextDictReader::offset_heap_bytes)
+                .sum::<usize>()
+            + self.text_state.get().map_or(0, |state| {
+                state.owned_dict_bytes
+                    + state.global_dict.offset_heap_bytes()
+                    + state.ordinal_maps.capacity() * std::mem::size_of::<Vec<u32>>()
+                    + state
+                        .ordinal_maps
+                        .iter()
+                        .map(|map| map.capacity() * std::mem::size_of::<u32>())
+                        .sum::<usize>()
+            })
     }
 
     /// Bytes of column data backing this reader (values, offsets, dicts).
@@ -847,8 +867,8 @@ impl FastFieldReader {
 
     /// Open a blocked column from an `OwnedBytes` file buffer using a TOC entry.
     ///
-    /// For text-ordinal columns, dictionary scanning and global dict merging are
-    /// deferred to first access — no mmap pages are touched for dict data here.
+    /// Text dictionary bytes are validated here, touching their mapped pages.
+    /// Offset tables and the global dictionary merge are deferred to first access.
     pub fn open(file_data: &OwnedBytes, toc: &FastFieldTocEntry) -> io::Result<Self> {
         let region_start = usize::try_from(toc.data_offset).map_err(|_| {
             io::Error::new(
@@ -1103,6 +1123,7 @@ impl FastFieldReader {
                     return TextState {
                         global_dict: TextDictReader::new_lazy(block.raw_dict.clone(), dict.len()),
                         ordinal_maps: vec![Vec::new(); blocks.len()],
+                        owned_dict_bytes: 0,
                     };
                 }
             }
@@ -1110,6 +1131,7 @@ impl FastFieldReader {
             return TextState {
                 global_dict: TextDictReader::new_lazy(OwnedBytes::new(Vec::new()), 0),
                 ordinal_maps: vec![Vec::new(); blocks.len()],
+                owned_dict_bytes: 0,
             };
         }
 
@@ -1167,7 +1189,9 @@ impl FastFieldReader {
             dict_buf.extend_from_slice(bytes);
         }
 
+        let owned_dict_bytes = dict_buf.capacity();
         TextState {
+            owned_dict_bytes,
             global_dict: TextDictReader::new_lazy(OwnedBytes::new(dict_buf), count),
             ordinal_maps,
         }
@@ -1505,6 +1529,12 @@ pub struct TextDictReader {
 }
 
 impl TextDictReader {
+    fn offset_heap_bytes(&self) -> usize {
+        self.offsets.get().map_or(0, |offsets| {
+            offsets.capacity() * std::mem::size_of::<(u32, u32)>()
+        })
+    }
+
     /// Create a lazy text dictionary from pre-sliced data.
     /// No scanning is performed — offsets are built on first `get()`/`ordinal()` call.
     fn new_lazy(data: OwnedBytes, count: u32) -> Self {
@@ -2440,9 +2470,17 @@ mod tests {
 
         assert_eq!(reader.num_docs, 4);
         assert_eq!(reader.num_blocks(), 2);
+        let before = reader.block_metadata_bytes();
+        assert!(reader.text_state.get().is_none());
 
         // Global dict should be: alpha(0), beta(1), gamma(2)
         assert_eq!(reader.text_dict().unwrap().len(), 3);
+        let after_merge = reader.block_metadata_bytes();
+        // Four local offset pairs, four ordinal-map entries, map headers, and
+        // newly owned dictionary bytes are all additional retained heap.
+        assert!(after_merge >= before + 4 * 8 + 4 * 4 + 2 * std::mem::size_of::<Vec<u32>>() + 26);
+        assert_eq!(reader.text_ordinal("alpha"), Some(0));
+        assert_eq!(reader.block_metadata_bytes(), after_merge + 3 * 8);
 
         // Block A: alpha=local0→global0, beta=local1→global1
         assert_eq!(reader.get_text(0), Some("alpha"));

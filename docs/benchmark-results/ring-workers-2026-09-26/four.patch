@@ -1,0 +1,53 @@
+--- a/summa-core/src/directories/payload/ring.rs
++++ b/summa-core/src/directories/payload/ring.rs
+@@ -174,7 +174,7 @@
+                     Err(_) => return Ok(()),
+                 }
+             }
+-            while outstanding + added < DEPTH {
++            while outstanding + added < DEPTH / 4 {
+                 let Ok(job) = receiver.try_recv() else {
+                     break;
+                 };
+@@ -197,15 +197,32 @@
+     counters: Arc<Counters>,
+     admission: Arc<Admission>,
+ ) -> io::Result<Vec<JoinHandle<io::Result<()>>>> {
+-    let reactor = Reactor::new(counters.clone())?;
+-    let reads = receiver.clone();
+-    Ok(vec![super::spawn_worker(
+-        "summa-payload-uring",
+-        receiver,
+-        counters,
+-        admission,
+-        move || reactor.run(reads),
+-    )?])
++    // Build every ring before starting consumers; no partial live service on error.
++    let reactors = (0..4)
++        .map(|_| Reactor::new(counters.clone()))
++        .collect::<io::Result<Vec<_>>>()?;
++    let mut workers = Vec::with_capacity(4);
++    for reactor in reactors {
++        let reads = receiver.clone();
++        match super::spawn_worker(
++            "summa-payload-uring",
++            receiver.clone(),
++            counters.clone(),
++            admission.clone(),
++            move || reactor.run(reads),
++        ) {
++            Ok(worker) => workers.push(worker),
++            Err(error) => {
++                receiver.close();
++                admission.close();
++                for worker in workers {
++                    let _ = worker.join();
++                }
++                return Err(error);
++            }
++        }
++    }
++    Ok(workers)
+ }
+ 
+ #[cfg(test)]

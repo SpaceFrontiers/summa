@@ -1,0 +1,189 @@
+--- a/summa-core/src/directories/payload/ring.rs
++++ b/summa-core/src/directories/payload/ring.rs
+@@ -3,15 +3,64 @@
+ use io_uring::{IoUring, opcode, types};
+ use std::{
+     io,
+-    os::fd::AsRawFd,
++    os::fd::{AsRawFd, FromRawFd, OwnedFd},
+     sync::{Arc, atomic::Ordering::Relaxed},
+     thread::JoinHandle,
+ };
++
++const WAKE_TOKEN: u64 = u64::MAX;
++pub(super) struct Wake(OwnedFd);
++impl Wake {
++    pub(super) fn new() -> io::Result<Self> {
++        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
++        if fd < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        // SAFETY: newly created descriptor; this owner closes it exactly once.
++        Ok(Self(unsafe { OwnedFd::from_raw_fd(fd) }))
++    }
++    fn transfer(&self, write: bool) -> io::Result<()> {
++        let mut count = 1u64;
++        for _ in 0..8 {
++            // SAFETY: one live u64, valid owned nonblocking eventfd. No pointer
++            // escapes this syscall; read drains the counter, write increments it.
++            let result = unsafe {
++                if write {
++                    libc::write(self.0.as_raw_fd(), (&count as *const u64).cast(), 8)
++                } else {
++                    libc::read(self.0.as_raw_fd(), (&mut count as *mut u64).cast(), 8)
++                }
++            };
++            if result == 8 {
++                return Ok(());
++            }
++            let error = io::Error::last_os_error();
++            if error.kind() == io::ErrorKind::WouldBlock {
++                return Ok(());
++            }
++            if error.kind() != io::ErrorKind::Interrupted {
++                return Err(error);
++            }
++        }
++        Err(io::Error::new(
++            io::ErrorKind::Interrupted,
++            "eventfd repeatedly interrupted",
++        ))
++    }
++    pub(super) fn notify(&self) -> io::Result<()> {
++        self.transfer(true)
++    }
++    fn drain(&self) -> io::Result<()> {
++        self.transfer(false)
++    }
++}
+ 
+ struct Reactor {
+     ring: Option<IoUring>,
+     slots: [Option<Read>; DEPTH],
+     counters: Arc<Counters>,
++    wake: Arc<Wake>,
++    wake_armed: bool,
+ }
+ 
+ /// The only submitter is this worker; SQPOLL is deliberately disabled.
+@@ -77,7 +126,11 @@
+         }
+     }
+ 
++    #[cfg(test)]
+     fn new(counters: Arc<Counters>) -> io::Result<Self> {
++        Self::with_wake(counters, Arc::new(Wake::new()?))
++    }
++    fn with_wake(counters: Arc<Counters>, wake: Arc<Wake>) -> io::Result<Self> {
+         let ring = IoUring::new((DEPTH * 2) as u32)?;
+         // Refuse kernels where exceptional teardown has no proven drain path.
+         cancel(&ring)?;
+@@ -93,6 +146,8 @@
+             ring: Some(ring),
+             slots: std::array::from_fn(|_| None),
+             counters,
++            wake,
++            wake_armed: false,
+         })
+     }
+ 
+@@ -126,6 +181,17 @@
+ 
+     fn wait(&mut self) -> io::Result<()> {
+         let ring = self.ring.as_mut().unwrap();
++        if !self.wake_armed {
++            let entry =
++                opcode::PollAdd::new(types::Fd(self.wake.0.as_raw_fd()), libc::POLLIN as u32)
++                    .build()
++                    .user_data(WAKE_TOKEN);
++            // SAFETY: eventfd owner lives through ring teardown; PollAdd holds
++            // no userspace buffer. One control SQE plus at most DEPTH read SQEs.
++            unsafe { ring.submission().push(&entry) }
++                .map_err(|_| io::Error::other("wake submission queue full"))?;
++            self.wake_armed = true;
++        }
+         for _ in 0..8 {
+             match ring.submit_and_wait(1) {
+                 Ok(_) => return Ok(()),
+@@ -142,6 +208,14 @@
+     fn complete(&mut self) -> io::Result<usize> {
+         let mut count = 0;
+         for cqe in self.ring.as_mut().unwrap().completion() {
++            if cqe.user_data() == WAKE_TOKEN {
++                self.wake_armed = false;
++                if cqe.result() < 0 {
++                    return Err(io::Error::from_raw_os_error(-cqe.result()));
++                }
++                self.wake.drain()?;
++                continue;
++            }
+             let id = usize::try_from(cqe.user_data()).map_err(io::Error::other)?;
+             let read = self
+                 .slots
+@@ -196,8 +270,9 @@
+     receiver: async_channel::Receiver<Job>,
+     counters: Arc<Counters>,
+     admission: Arc<Admission>,
++    wake: Arc<Wake>,
+ ) -> io::Result<Vec<JoinHandle<io::Result<()>>>> {
+-    let reactor = Reactor::new(counters.clone())?;
++    let reactor = Reactor::with_wake(counters.clone(), wake)?;
+     let reads = receiver.clone();
+     Ok(vec![super::spawn_worker(
+         "summa-payload-uring",
+--- a/summa-core/src/directories/payload/mod.rs
++++ b/summa-core/src/directories/payload/mod.rs
+@@ -77,6 +77,8 @@
+     workers: Mutex<Vec<JoinHandle<io::Result<()>>>>,
+     counters: Arc<Counters>,
+     backend: PayloadReadBackend,
++    #[cfg(all(target_os = "linux", feature = "io-uring"))]
++    wake: Option<Arc<ring::Wake>>,
+     scopes: scope::Registry,
+     buffers: Arc<buffers::BufferPool>,
+ }
+@@ -168,12 +170,23 @@
+             slots: Arc::new(Semaphore::new(DEPTH)),
+             bytes: Arc::new(Semaphore::new(BYTES)),
+         });
++        #[cfg(all(target_os = "linux", feature = "io-uring"))]
++        let wake = if backend == PayloadReadBackend::IoUring {
++            Some(Arc::new(ring::Wake::new()?))
++        } else {
++            None
++        };
+         let workers = match backend {
+             PayloadReadBackend::Pool => pool::start(receiver, counters.clone(), admission.clone())?,
+             PayloadReadBackend::IoUring => {
+                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                 {
+-                    ring::start(receiver, counters.clone(), admission.clone())?
++                    ring::start(
++                        receiver,
++                        counters.clone(),
++                        admission.clone(),
++                        wake.as_ref().unwrap().clone(),
++                    )?
+                 }
+                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                 {
+@@ -191,6 +204,8 @@
+             workers: Mutex::new(workers),
+             counters,
+             backend,
++            #[cfg(all(target_os = "linux", feature = "io-uring"))]
++            wake,
+             scopes: scope::Registry::default(),
+             buffers: buffers::BufferPool::new(idle_bytes),
+         }))
+@@ -370,6 +385,10 @@
+             })
+             .await
+             .map_err(|_| closed())?;
++        #[cfg(all(target_os = "linux", feature = "io-uring"))]
++        if let Some(wake) = &self.wake {
++            wake.notify()?;
++        }
+         let response = done.await.map_err(|_| closed())?;
+         response.result
+     }

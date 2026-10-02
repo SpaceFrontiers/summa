@@ -1024,6 +1024,27 @@ pub async fn collect_segment<C: Collector>(
     }
     if !collector.needs_scores()
         && !collector.needs_positions()
+        && reader.alive_docs().is_none()
+        && collector.collect_count(0)
+        && let Some(count) = query.exact_count(reader)
+        && collector.collect_count(u64::from(count.await?))
+    {
+        return reader.check_posting_integrity();
+    }
+    // A pair's document frequency is its phrase's exact count; an absent pair
+    // means no document contains the phrase (`docs/common-word-pairs.md`).
+    if !collector.needs_scores()
+        && !collector.needs_positions()
+        && reader.alive_docs().is_none()
+        && let Some(info) = query.word_pair_term(reader)
+    {
+        let count = reader.text_doc_freq(info.field, &info.term).await?;
+        if collector.collect_count(u64::from(count)) {
+            return reader.check_posting_integrity();
+        }
+    }
+    if !collector.needs_scores()
+        && !collector.needs_positions()
         && query
             .should_children()
             .is_some_and(|children| children.len() == 2)
@@ -1484,11 +1505,12 @@ pub(crate) fn search_segment_shared_sync_planned(
     let map = super::text_mapping::prepare(reader, query, &mut options, false);
     let scorer = query.scorer_sync_with_options(reader, segment_limit, options)?;
     let mut scorer = super::text_mapping::filtered(scorer, reader.alive_docs(), map);
-    let results = top_k_from_mapped_scorer(
+    let results = ranked_top_k(
+        query,
         scorer.as_mut(),
         segment_limit,
         collect_positions,
-        Some(&shared_threshold),
+        &shared_threshold,
         map,
     );
     reader.check_posting_integrity()?;
@@ -1509,6 +1531,35 @@ fn top_k_from_scorer(
     budget: Option<&super::SharedThreshold>,
 ) -> (Vec<SearchResult>, u32) {
     top_k_from_mapped_scorer(scorer, segment_limit, collect_positions, budget, None)
+}
+
+/// A segment's ranked top-k. A constant-score query on a document-mapped
+/// field ranks its matches in physical order (`docs/physical-tie-order.md`):
+/// the heap compares physical slots, so the stream stops once `k` matches are
+/// held, and each hit is translated to its document afterwards, in order.
+fn ranked_top_k(
+    query: &dyn super::Query,
+    scorer: &mut dyn super::Scorer,
+    segment_limit: usize,
+    collect_positions: bool,
+    budget: &super::SharedThreshold,
+    map: Option<&crate::segment::chunk_map::ChunkMap>,
+) -> (Vec<SearchResult>, u32) {
+    let Some(map) = map.filter(|_| query.constant_score()) else {
+        return top_k_from_mapped_scorer(
+            scorer,
+            segment_limit,
+            collect_positions,
+            Some(budget),
+            map,
+        );
+    };
+    let (mut results, seen) =
+        top_k_from_mapped_scorer(scorer, segment_limit, collect_positions, Some(budget), None);
+    for result in &mut results {
+        result.doc_id = map.doc_id(result.doc_id);
+    }
+    (results, seen)
 }
 
 fn top_k_from_mapped_scorer(
@@ -1701,11 +1752,12 @@ pub(crate) async fn search_segment_shared_planned(
         .scorer_with_options(reader, segment_limit, options)
         .await?;
     let mut scorer = super::text_mapping::filtered(scorer, reader.alive_docs(), map);
-    let results = top_k_from_mapped_scorer(
+    let results = ranked_top_k(
+        query,
         scorer.as_mut(),
         segment_limit,
         collect_positions,
-        Some(&shared_threshold),
+        &shared_threshold,
         map,
     );
     reader.check_posting_integrity()?;
@@ -1935,6 +1987,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let dir = crate::RamDirectory::new();
             let mut schema = crate::SchemaBuilder::default();
@@ -2154,6 +2207,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let dir = crate::RamDirectory::new();
             let mut schema = crate::SchemaBuilder::default();

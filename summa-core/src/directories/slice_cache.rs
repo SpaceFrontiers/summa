@@ -557,6 +557,23 @@ impl SliceCacheShared {
         }
     }
 
+    async fn read_through<F>(
+        &self,
+        path: &Path,
+        range: Range<u64>,
+        fetch: impl FnOnce() -> F,
+    ) -> io::Result<OwnedBytes>
+    where
+        F: std::future::Future<Output = io::Result<OwnedBytes>>,
+    {
+        if let Some(data) = self.try_read(path, range.clone()) {
+            return Ok(data);
+        }
+        let data = fetch().await?;
+        self.insert(path, range, data.clone());
+        Ok(data)
+    }
+
     /// Hit path: shared lock, atomic stamp update, and sharded accounting.
     fn try_read(&self, path: &Path, range: Range<u64>) -> Option<OwnedBytes> {
         let hit = {
@@ -913,6 +930,27 @@ pub struct SliceCacheStats {
     pub evicted_bytes: u64,
 }
 
+impl<D: Directory> SliceCachingDirectory<D> {
+    fn cache_payload_handle(&self, path: &Path, handle: FileHandle) -> FileHandle {
+        let file_size = handle.len();
+        let path: Arc<Path> = Arc::from(path);
+        let shared = Arc::clone(&self.shared);
+        let read: RangeReadFn = Arc::new(move |range| {
+            let handle = handle.clone();
+            let path = Arc::clone(&path);
+            let shared = Arc::clone(&shared);
+            Box::pin(async move {
+                shared
+                    .read_through(&path, range.clone(), || {
+                        handle.read_bytes_range_unmetered(range)
+                    })
+                    .await
+            })
+        });
+        FileHandle::lazy_labeled(file_size, read, self.shared.label.get())
+    }
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<D: Directory> Directory for SliceCachingDirectory<D> {
@@ -959,6 +997,12 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
+        if range.start > range.end {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reversed read range",
+            ));
+        }
         // Try cache first
         if let Some(data) = self.try_cache_read(path, range.clone()) {
             return Ok(data);
@@ -978,41 +1022,37 @@ impl<D: Directory> Directory for SliceCachingDirectory<D> {
     }
 
     async fn open_lazy(&self, path: &Path) -> io::Result<FileHandle> {
-        // Get file size (uses cache to avoid HEAD requests)
         let file_size = self.file_size(path).await?;
-
-        // Create a caching wrapper around the inner directory's read_range.
-        // The path is shared, not cloned, per read.
         let path: Arc<Path> = Arc::from(path);
         let shared = Arc::clone(&self.shared);
         let inner = Arc::clone(&self.inner);
-
-        let read_fn: RangeReadFn = Arc::new(move |range: Range<u64>| {
+        let read: RangeReadFn = Arc::new(move |range| {
             let path = Arc::clone(&path);
             let shared = Arc::clone(&shared);
             let inner = Arc::clone(&inner);
-
             Box::pin(async move {
-                // Try cache first
-                if let Some(data) = shared.try_read(&path, range.clone()) {
-                    return Ok(data);
-                }
-
-                // Read from inner
-                let data = inner.read_range(&path, range.clone()).await?;
-
-                // Cache the result
-                shared.insert(&path, range, data.clone());
-
-                Ok(data)
+                shared
+                    .read_through(&path, range.clone(), || inner.read_range(&path, range))
+                    .await
             })
         });
-
         Ok(FileHandle::lazy_labeled(
             file_size,
-            read_fn,
+            read,
             self.shared.label.get(),
         ))
+    }
+
+    async fn open_payload(&self, path: &Path) -> io::Result<FileHandle> {
+        Ok(self.cache_payload_handle(path, self.inner.open_payload(path).await?))
+    }
+
+    async fn open_sparse_payload(&self, path: &Path) -> io::Result<Option<FileHandle>> {
+        Ok(self
+            .inner
+            .open_sparse_payload(path)
+            .await?
+            .map(|handle| self.cache_payload_handle(path, handle)))
     }
 
     fn local_path(&self, path: &Path) -> Option<PathBuf> {

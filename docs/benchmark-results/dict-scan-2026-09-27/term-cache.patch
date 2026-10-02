@@ -1,0 +1,22 @@
+--- a/summa-server/examples/searchbench_http/main.rs
++++ b/summa-server/examples/searchbench_http/main.rs
+@@ -303,6 +303,19 @@
+         max_indexing_memory_bytes: 2_000_000_000,
+         ..Default::default()
+     };
++    // Experiment-only: term dictionary block cache override for paired phases.
++    let mut config = config;
++    if let Ok(blocks) = std::env::var("SEARCHBENCH_TERM_CACHE_BLOCKS") {
++        config.term_cache_blocks = blocks.parse()?;
++        config.term_cache_budget_bytes = std::env::var("SEARCHBENCH_TERM_CACHE_BYTES")
++            .ok()
++            .map(|bytes| bytes.parse())
++            .transpose()?;
++        eprintln!(
++            "term cache override: {} blocks, {:?} bytes",
++            config.term_cache_blocks, config.term_cache_budget_bytes
++        );
++    }
+     let runtime = tokio::runtime::Builder::new_multi_thread()
+         .worker_threads(http_workers)
+         .max_blocking_threads(workers.max(4))

@@ -144,6 +144,20 @@ impl PhraseQuery {
         self.offsets.windows(2).all(|pair| pair[1] == pair[0] + 1)
     }
 
+    /// The common word pair holding this phrase's matches in `reader`: an
+    /// exact adjacent two-word phrase whose words the field pairs
+    /// (`docs/common-word-pairs.md`). An absent pair term means no match.
+    fn word_pair(&self, reader: &SegmentReader) -> Option<Vec<u8>> {
+        if self.terms.len() != 2 || self.slop != 0 || !self.is_adjacent() {
+            return None;
+        }
+        let words = &reader.schema().get_field_entry(self.field)?.common_grams;
+        self.terms
+            .iter()
+            .all(|term| words.iter().any(|word| word.as_bytes() == term.as_slice()))
+            .then(|| crate::structures::word_pairs::word_pair_term(&self.terms[0], &self.terms[1]))
+    }
+
     /// Set slop (max distance between terms)
     pub fn with_slop(mut self, slop: u32) -> Self {
         self.slop = slop;
@@ -344,6 +358,28 @@ fn prepare_phrase_scorer(
     Ok(scorer)
 }
 
+/// The pair's term query, scored as its phrase: the words' summed idf and the
+/// last word's average length, exactly as `prepare_phrase_scorer` computes
+/// them; `None` when a word is absent (no document can match).
+fn word_pair_query(
+    reader: &SegmentReader,
+    field: Field,
+    terms: &[Vec<u8>],
+    words: &[Option<BlockPostingList>],
+    pair: Vec<u8>,
+    stats: Option<&Arc<GlobalStats>>,
+) -> Option<super::TermQuery> {
+    let mut avg_len = reader.avg_field_len(field);
+    let mut idf = 0.0;
+    for (postings, term) in words.iter().zip(terms) {
+        let (term_idf, length) =
+            super::term::compute_term_idf(postings.as_ref()?, field, reader, stats, term);
+        idf += term_idf;
+        avg_len = length;
+    }
+    Some(super::TermQuery::new(field, pair).with_statistics(idf, avg_len))
+}
+
 /// Ordinary retrieval enumerates phrase matches; point scoring below parks
 /// these same cursors only on nominated targets and shares frequency/scoring.
 fn finish_phrase_scorer<'a>(
@@ -464,7 +500,22 @@ macro_rules! phrase_early_returns {
 }
 
 impl Query for PhraseQuery {
-    fn physical_text_field(&self, reader: &SegmentReader, _complete: bool) -> Option<Field> {
+    fn word_pair_term(&self, reader: &SegmentReader) -> Option<super::TermQueryInfo> {
+        Some(super::TermQueryInfo {
+            field: self.field,
+            term: self.word_pair(reader)?,
+            weight: 1.0,
+            global_stats: None,
+        })
+    }
+
+    fn physical_text_field(&self, reader: &SegmentReader, complete: bool) -> Option<Field> {
+        // A ranked word pair keeps the term's logical plan, which stops after
+        // `k` stable IDs; like terms, it traverses physical IDs only when
+        // complete (`docs/common-word-pairs.md`).
+        if !complete && self.word_pair(reader).is_some() {
+            return None;
+        }
         let entry = reader.schema().get_field_entry(self.field)?;
         (entry.indexed
             && !entry.fast
@@ -504,6 +555,7 @@ impl Query for PhraseQuery {
             .global_stats
             .clone()
             .or_else(|| options.global_stats.clone());
+        let query = self.clone();
 
         Box::pin(async move {
             phrase_early_returns!(
@@ -515,6 +567,26 @@ impl Query for PhraseQuery {
                 options,
                 await
             );
+
+            if !options.collect_positions
+                && let Some(pair) = query.word_pair(reader)
+            {
+                let (first, second) = futures::join!(
+                    reader.get_postings(field, &terms[0]),
+                    reader.get_postings(field, &terms[1])
+                );
+                return match word_pair_query(
+                    reader,
+                    field,
+                    &terms,
+                    &[first?, second?],
+                    pair,
+                    stats.as_ref(),
+                ) {
+                    Some(pair) => pair.scorer_with_options(reader, limit, options).await,
+                    None => Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
+                };
+            }
 
             // Fetch postings + positions in parallel per term via futures::join!
             let mut term_data = Vec::with_capacity(terms.len());
@@ -573,6 +645,20 @@ impl Query for PhraseQuery {
             scorer_sync_with_options,
             options
         );
+
+        if !options.collect_positions
+            && let Some(pair) = self.word_pair(reader)
+        {
+            let words = [
+                reader.get_postings_sync(self.field, &self.terms[0])?,
+                reader.get_postings_sync(self.field, &self.terms[1])?,
+            ];
+            let stats = self.global_stats.as_ref().or(options.global_stats.as_ref());
+            return match word_pair_query(reader, self.field, &self.terms, &words, pair, stats) {
+                Some(pair) => pair.scorer_sync_with_options(reader, limit, options),
+                None => Ok(Box::new(EmptyScorer) as Box<dyn Scorer + 'a>),
+            };
+        }
 
         // Two memory-backed term lookups do not need nested worker tasks.
         // Larger phrases retain parallel fetching on the shared search pool.
@@ -1826,6 +1912,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let lengths: Vec<u16> = (0..389)
                 .map(|i| [0, 1, 17, 255, 4096, 65535][i % 6])
@@ -1893,6 +1980,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let lengths: Vec<u16> = (0..2053).map(|doc| 3 + (doc % 1030) as u16).collect();
             let mut lists = Vec::new();
@@ -2104,6 +2192,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut lists = Vec::new();
             let mut positions = Vec::new();
@@ -2320,6 +2409,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             for lead in 0..2 {
                 for offset in [0, 1, 7, u32::MAX] {
@@ -2406,6 +2496,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             for rare in 0..values.len() {
                 let mut lists = Vec::new();
@@ -2465,6 +2556,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut lists = Vec::new();
             let mut positions = Vec::new();
@@ -2508,6 +2600,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let values = [
                 [vec![0, 10], vec![0, 10, 20]],
@@ -2640,6 +2733,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             for terms in [2, 3, 5, 9] {
                 let offsets: Vec<_> = (0..terms).map(|term| (term / 2) as u32 * 2).collect();

@@ -126,6 +126,10 @@ enum PostingCodecArg {
     /// SIMD bitpacking for full document, frequency and position blocks
     #[value(name = "simd4x")]
     Simd4x,
+    /// Rounded, with bitmap document blocks where at least one ID in four
+    /// matches: faster counts and conjunctions over frequent terms (the
+    /// adaptive and performance default)
+    RoundedBitmap,
 }
 
 impl PostingCodecArg {
@@ -135,6 +139,7 @@ impl PostingCodecArg {
             Self::Packed => summa_core::structures::PostingCodec::Packed,
             Self::Pfor => summa_core::structures::PostingCodec::Pfor,
             Self::Simd4x => summa_core::structures::PostingCodec::Simd4x,
+            Self::RoundedBitmap => summa_core::structures::PostingCodec::RoundedBitmap,
         }
     }
 }
@@ -401,12 +406,17 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         offset: usize,
 
-        /// Per-segment dictionary cache block cap (maximum 65536)
+        /// Per-segment dictionary cache block cap (maximum 65536); applies when
+        /// --term-cache-process-bytes is 0
         #[arg(long, default_value_t = 256)]
         term_cache_blocks: usize,
         /// Optional per-segment decompressed dictionary cache byte cap (0 disables retention)
         #[arg(long)]
         term_cache_bytes: Option<usize>,
+        /// Process-wide decompressed dictionary cache bytes shared by all
+        /// segments; 0 selects the per-segment caps above
+        #[arg(long, default_value_t = summa_core::index::DEFAULT_TERM_CACHE_PROCESS_BYTES)]
+        term_cache_process_bytes: usize,
     },
 
     /// Warm up slice cache and save to file
@@ -663,9 +673,14 @@ async fn main() -> Result<()> {
             offset,
             term_cache_blocks,
             term_cache_bytes,
+            term_cache_process_bytes,
         } => {
-            let config =
-                index_ops::search_config(term_cache_blocks, term_cache_bytes, search_threads);
+            let config = index_ops::search_config(
+                term_cache_blocks,
+                term_cache_bytes,
+                term_cache_process_bytes,
+                search_threads,
+            );
 
             if let Some(queries_file) = queries_file {
                 anyhow::ensure!(offset == 0, "--offset is not supported with --queries-file");

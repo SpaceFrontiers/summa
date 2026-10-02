@@ -465,3 +465,106 @@ async fn test_multivalue_field_with_custom_tokenizer() {
         "Case-insensitive search should find the doc"
     );
 }
+
+#[cfg(feature = "sync")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn search_pool_jobs_and_owned_searches_match_async_search_and_report_panics() {
+    let mut schema_builder = SchemaBuilder::default();
+    let title = schema_builder.add_text_field("title", true, true);
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema_builder.build(), config.clone())
+        .await
+        .unwrap();
+    for text in ["hello world", "hello there", "goodbye world"] {
+        let mut doc = Document::new();
+        doc.add_text(title, text);
+        writer.add_document(doc).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+
+    let query = crate::query::TermQuery::text(title, "world");
+    let expected = searcher.search(&query, 10).await.unwrap();
+    let pooled = std::sync::Arc::clone(&searcher);
+    let (on_pool, results) = searcher
+        .run_on_search_pool(move || {
+            let query = crate::query::TermQuery::text(title, "world");
+            let results = pooled.search_with_offset_and_count_sync(&query, 10, 0);
+            (rayon::current_thread_index().is_some(), results)
+        })
+        .await
+        .unwrap();
+    assert!(on_pool, "work runs on a search pool thread");
+    assert_eq!(results.unwrap().0, expected);
+
+    let query: std::sync::Arc<dyn crate::query::Query> =
+        std::sync::Arc::new(crate::query::TermQuery::text(title, "hello"));
+    let borrowed = searcher
+        .search_with_positions_budgeted_stats(query.as_ref(), 10, None, None)
+        .await
+        .unwrap();
+    let pooled = searcher
+        .search_budgeted_on_pool(std::sync::Arc::clone(&query), 10, true, None, None, ())
+        .await
+        .unwrap();
+    assert_eq!(pooled, borrowed);
+    let borrowed = searcher
+        .search_with_count_budgeted_stats(query.as_ref(), 10, None, None)
+        .await
+        .unwrap();
+    let hold = std::sync::Arc::new(());
+    let pooled = searcher
+        .search_budgeted_on_pool(query, 10, false, None, None, std::sync::Arc::clone(&hold))
+        .await
+        .unwrap();
+    assert_eq!(pooled, borrowed);
+    assert_eq!(
+        std::sync::Arc::strong_count(&hold),
+        1,
+        "the job releases its hold"
+    );
+
+    // A cancelled request's job keeps its hold (admission) until it finishes.
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let (started, running) = std::sync::mpsc::channel();
+    let held = std::sync::Arc::clone(&hold);
+    let pooled_searcher = std::sync::Arc::clone(&searcher);
+    let task = tokio::spawn(async move {
+        pooled_searcher
+            .run_on_search_pool(move || {
+                let _hold = held;
+                started.send(()).unwrap();
+                gate.recv().unwrap();
+            })
+            .await
+    });
+    running
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        std::sync::Arc::strong_count(&hold),
+        2,
+        "cancellation kept the hold"
+    );
+    release.send(()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::sync::Arc::strong_count(&hold) > 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "job never released its hold"
+        );
+        std::thread::yield_now();
+    }
+
+    let error = searcher
+        .run_on_search_pool(|| -> u32 { panic!("search job failure") })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("panicked"), "{error}");
+    assert_eq!(searcher.run_on_search_pool(|| 7).await.unwrap(), 7);
+}

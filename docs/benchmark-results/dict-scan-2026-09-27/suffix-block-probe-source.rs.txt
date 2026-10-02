@@ -1,0 +1,77 @@
+//! Experiment-only: how many dictionary blocks a per-block suffix filter lets
+//! broad single-star scans skip on a real `.terms` file.
+//!   suffix_block_probe <path.terms> <field> <prefix*suffix>...
+use std::collections::HashSet;
+use summa_core::directories::{FileHandle, OwnedBytes};
+use summa_core::structures::{AsyncSSTableReader, TermInfo};
+
+fn hash(ending: u32, seed: u64) -> u64 {
+    (ending as u64 ^ seed).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+}
+
+struct Bloom(Vec<u64>);
+impl Bloom {
+    fn new(bits: usize, endings: &HashSet<u32>) -> Self {
+        let mut words = vec![0u64; bits / 64];
+        for &e in endings {
+            for seed in 0..3 {
+                let bit = (hash(e, seed) as usize) % bits;
+                words[bit / 64] |= 1 << (bit % 64);
+            }
+        }
+        Self(words)
+    }
+    fn may_contain(&self, e: u32) -> bool {
+        let bits = self.0.len() * 64;
+        (0..3).all(|seed| {
+            let bit = (hash(e, seed) as usize) % bits;
+            self.0[bit / 64] >> (bit % 64) & 1 == 1
+        })
+    }
+}
+
+fn ending(key: &[u8]) -> Option<u32> {
+    key.last_chunk::<4>().map(|t| u32::from_le_bytes(*t))
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let data = OwnedBytes::new(std::fs::read(&args[0]).unwrap());
+    let reader = AsyncSSTableReader::<TermInfo>::open(FileHandle::from_bytes(data), 16)
+        .await
+        .unwrap();
+    let field: u32 = args[1].parse().unwrap();
+    let mut rows = Vec::new();
+    for pattern in &args[2..] {
+        let (prefix, suffix) = pattern.split_once('*').unwrap();
+        let mut key_prefix = field.to_le_bytes().to_vec();
+        key_prefix.extend_from_slice(prefix.as_bytes());
+        let target = ending(suffix.as_bytes()).expect("suffix of at least 4 bytes");
+        let start = reader.probe_locate(&key_prefix).unwrap_or(0);
+        let (mut blocks, mut exact, mut bloom2k, mut bloom4k, mut endings_sum) = (0, 0, 0, 0, 0);
+        for block in start..reader.probe_num_blocks() {
+            let keys = reader.probe_block_keys(block).unwrap();
+            if keys.first().is_some_and(|k| k.as_slice() > key_prefix.as_slice() && !k.starts_with(&key_prefix)) {
+                break;
+            }
+            let in_range: Vec<_> = keys.iter().filter(|k| k.starts_with(&key_prefix)).collect();
+            if in_range.is_empty() {
+                continue;
+            }
+            blocks += 1;
+            // The filter covers every key of the block, as a lazily built one would.
+            let endings: HashSet<u32> = keys.iter().filter_map(|k| ending(&k[4..])).collect();
+            endings_sum += endings.len();
+            exact += usize::from(in_range.iter().any(|k| ending(&k[4..]) == Some(target)));
+            bloom2k += usize::from(Bloom::new(16384, &endings).may_contain(target));
+            bloom4k += usize::from(Bloom::new(32768, &endings).may_contain(target));
+        }
+        rows.push(serde_json::json!({
+            "pattern": pattern, "range_blocks": blocks, "blocks_with_ending": exact,
+            "bloom_2kib_blocks": bloom2k, "bloom_4kib_blocks": bloom4k,
+            "mean_distinct_endings": endings_sum as f64 / blocks.max(1) as f64,
+        }));
+    }
+    println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+}

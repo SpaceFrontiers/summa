@@ -10,6 +10,7 @@ use tonic::Status;
 
 use log::{info, warn};
 
+use summa_core::directories::PayloadReadService;
 use summa_core::segment::{SegmentId, SegmentReader, delete_segment};
 use summa_core::structures::QueryWeighting;
 use summa_core::{Index, IndexConfig, IndexMetadata, IndexWriter, MmapDirectory, Schema};
@@ -24,6 +25,7 @@ pub struct IndexHandle {
 /// serializes deletion with an index already being opened or created, closing
 /// the race where an in-flight opener could reinsert a handle after eviction.
 pub struct IndexDeleteLease {
+    directory: MmapDirectory,
     index_path: PathBuf,
     handle: Option<IndexHandle>,
     _open_guard: tokio::sync::OwnedMutexGuard<()>,
@@ -72,6 +74,13 @@ impl IndexDeleteLease {
             segment_manager.wait_for_shutdown().await;
         }
 
+        // A cancelled opener may have accepted jobs without publishing a
+        // registry handle. The service/root gate also retains that ownership.
+        self.directory
+            .retire_payload_reads()
+            .await
+            .map_err(|error| Status::internal(format!("Payload drain failed: {error}")))?;
+
         if self.index_path.exists() {
             let index_path = self.index_path.clone();
             tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&index_path))
@@ -91,6 +100,8 @@ pub struct IndexRegistry {
     open_locks: RwLock<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     pub(crate) data_dir: PathBuf,
     config: IndexConfig,
+    payload_reads: Option<Arc<PayloadReadService>>,
+    sparse_payload_reads: bool,
     shutting_down: AtomicBool,
 }
 
@@ -101,7 +112,30 @@ impl IndexRegistry {
             open_locks: RwLock::new(HashMap::new()),
             data_dir,
             config,
+            payload_reads: None,
+            sparse_payload_reads: false,
             shutting_down: AtomicBool::new(false),
+        }
+    }
+
+    pub fn with_payload_reads(
+        mut self,
+        service: Option<Arc<PayloadReadService>>,
+        sparse: bool,
+    ) -> Self {
+        self.payload_reads = service;
+        self.sparse_payload_reads = sparse;
+        self
+    }
+
+    fn directory(&self, path: &std::path::Path) -> MmapDirectory {
+        let directory = MmapDirectory::new(path);
+        match &self.payload_reads {
+            Some(service) if self.sparse_payload_reads => {
+                directory.with_sparse_payload_reads(service.clone())
+            }
+            Some(service) => directory.with_payload_reads(service.clone()),
+            None => directory,
         }
     }
 
@@ -153,6 +187,14 @@ impl IndexRegistry {
             info!("[shutdown] index '{}' drained", name);
         }
 
+        if let Some(service) = &self.payload_reads {
+            if let Err(error) = service.shutdown().await {
+                first_error.get_or_insert_with(|| {
+                    Status::internal(format!("Payload shutdown failed: {error}"))
+                });
+            }
+            info!("[shutdown] payload I/O: {:?}", service.stats());
+        }
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -247,7 +289,7 @@ impl IndexRegistry {
             return Err(Status::not_found(format!("Index '{}' not found", name)));
         }
 
-        let dir = MmapDirectory::new(&index_path);
+        let dir = self.directory(&index_path);
         // Core acquires the OS writer lock before loading the metadata used
         // for cleanup. The registry mutex only serializes this process.
         let (index, mut w) = Index::open_with_writer(dir, self.config.clone())
@@ -307,7 +349,7 @@ impl IndexRegistry {
         std::fs::create_dir_all(&index_path)
             .map_err(|e| Status::internal(format!("Failed to create directory: {}", e)))?;
 
-        let dir = MmapDirectory::new(&index_path);
+        let dir = self.directory(&index_path);
         let index = Index::create(dir, schema, self.config.clone())
             .await
             .map_err(crate::error::summa_error_to_status)?;
@@ -427,6 +469,7 @@ impl IndexRegistry {
             handle.index.segment_manager().begin_shutdown();
         }
         Ok(IndexDeleteLease {
+            directory: self.directory(&index_path),
             index_path,
             handle,
             _open_guard: open_guard,

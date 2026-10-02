@@ -1,0 +1,468 @@
+//! Private diagnostic service. Process abort on panic/submission failure is required.
+use io_uring::{IoUring, opcode, types};
+use std::{
+    fs::File,
+    io,
+    ops::Range,
+    os::{fd::AsRawFd, unix::fs::FileExt},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering::Relaxed},
+    },
+    thread::JoinHandle,
+};
+use summa_core::directories::{
+    Directory, DirectoryWriter, FileHandle, FsDirectory, MmapDirectory, OwnedBytes, RangeReadFn,
+    StreamingWriter,
+};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+const DEPTH: usize = 8;
+const BYTES: usize = 8 * 1024 * 1024;
+#[derive(Default)]
+pub struct Stats {
+    pub submitted: AtomicUsize,
+    pub completed: AtomicUsize,
+    pub skipped: AtomicUsize,
+    pub dropped: AtomicUsize,
+    pub errors: AtomicUsize,
+    pub bytes: AtomicUsize,
+    active: AtomicUsize,
+    pub max_active: AtomicUsize,
+    pub batches: [AtomicUsize; 9],
+}
+impl Stats {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({"submitted":self.submitted.load(Relaxed),"completed":self.completed.load(Relaxed),"skipped":self.skipped.load(Relaxed),"dropped":self.dropped.load(Relaxed),"errors":self.errors.load(Relaxed),"bytes":self.bytes.load(Relaxed),"max_active":self.max_active.load(Relaxed),"batches":self.batches.iter().map(|v|v.load(Relaxed)).collect::<Vec<_>>()})
+    }
+}
+struct Reply {
+    result: io::Result<Vec<u8>>,
+    _bytes: OwnedSemaphorePermit,
+}
+struct Job {
+    file: Arc<File>,
+    range: Range<u64>,
+    slot: OwnedSemaphorePermit,
+    bytes: OwnedSemaphorePermit,
+    reply: oneshot::Sender<Reply>,
+}
+struct Read {
+    job: Job,
+    buffer: Vec<u8>,
+}
+#[derive(Default)]
+struct CompletionGate {
+    paused: Mutex<bool>,
+    changed: Condvar,
+    arrived: AtomicUsize,
+}
+impl CompletionGate {
+    fn wait(&self) {
+        let mut paused = self.paused.lock().unwrap();
+        if *paused {
+            self.arrived.fetch_add(1, Relaxed);
+            while *paused {
+                paused = self.changed.wait(paused).unwrap();
+            }
+        }
+    }
+    fn release(&self) {
+        *self.paused.lock().unwrap() = false;
+        self.changed.notify_all();
+    }
+}
+pub struct Service {
+    sender: async_channel::Sender<Job>,
+    slots: Arc<Semaphore>,
+    bytes: Arc<Semaphore>,
+    workers: Vec<JoinHandle<()>>,
+    pub stats: Arc<Stats>,
+    gate: Option<Arc<CompletionGate>>,
+}
+fn prepare(job: Job, stats: &Stats) -> Option<Read> {
+    if job.reply.is_closed() {
+        stats.skipped.fetch_add(1, Relaxed);
+        return None;
+    }
+    let len = (job.range.end - job.range.start) as usize;
+    stats.submitted.fetch_add(1, Relaxed);
+    stats.bytes.fetch_add(len, Relaxed);
+    let active = stats.active.fetch_add(1, Relaxed) + 1;
+    stats.max_active.fetch_max(active, Relaxed);
+    Some(Read {
+        job,
+        buffer: vec![0; len],
+    })
+}
+fn finish(read: Read, result: io::Result<()>, stats: &Stats) {
+    if result.is_err() {
+        stats.errors.fetch_add(1, Relaxed);
+    }
+    stats.completed.fetch_add(1, Relaxed);
+    stats.active.fetch_sub(1, Relaxed);
+    drop(read.job.slot);
+    if read
+        .job
+        .reply
+        .send(Reply {
+            result: result.map(|()| read.buffer),
+            _bytes: read.job.bytes,
+        })
+        .is_err()
+    {
+        stats.dropped.fetch_add(1, Relaxed);
+    }
+}
+impl Service {
+    pub fn new(ring: bool, force_async: bool) -> io::Result<Arc<Self>> {
+        // Construct before spawning so unsupported kernels fail explicitly.
+        let uring = if ring { Some(IoUring::new(32)?) } else { None };
+        let (sender, receiver) = async_channel::bounded::<Job>(32);
+        let stats = Arc::new(Stats::default());
+        let mut workers = vec![];
+        let gate = force_async.then(|| Arc::new(CompletionGate::default()));
+        if let Some(mut ring) = uring {
+            let stats = stats.clone();
+            let gate = gate.clone();
+            workers.push(std::thread::spawn(move || {
+                while let Ok(first) = receiver.recv_blocking() {
+                    let mut batch = Vec::with_capacity(DEPTH);
+                    if let Some(read) = prepare(first, &stats) {
+                        batch.push(read);
+                    }
+                    while batch.len() < DEPTH {
+                        match receiver.try_recv() {
+                            Ok(job) => {
+                                if let Some(read) = prepare(job, &stats) {
+                                    batch.push(read);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if batch.is_empty() {
+                        continue;
+                    }
+                    stats.batches[batch.len()].fetch_add(1, Relaxed);
+                    for (id, read) in batch.iter_mut().enumerate() {
+                        let mut entry = opcode::Read::new(
+                            types::Fd(read.job.file.as_raw_fd()),
+                            read.buffer.as_mut_ptr(),
+                            read.buffer.len() as u32,
+                        )
+                        .offset(read.job.range.start)
+                        .build()
+                        .user_data(id as u64);
+                        if force_async {
+                            entry = entry.flags(io_uring::squeue::Flags::ASYNC);
+                        }
+                        // The batch owns every allocation, FD and permit until all original CQEs.
+                        // The diagnostic build aborts on panic and fatal submission errors.
+                        unsafe {
+                            ring.submission().push(&entry).unwrap();
+                        }
+                    }
+                    if let Some(gate) = &gate {
+                        loop {
+                            match ring.submit_and_wait(0) {
+                                Ok(_) => break,
+                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                Err(e) => {
+                                    eprintln!("fatal diagnostic submission failure: {e}");
+                                    std::process::abort();
+                                }
+                            }
+                        }
+                        // Test-only pause after submission, before original CQEs are consumed.
+                        gate.wait();
+                    }
+                    let mut errors: Vec<Option<io::Error>> =
+                        (0..batch.len()).map(|_| None).collect();
+                    let mut seen = 0usize;
+                    while seen.count_ones() as usize != batch.len() {
+                        if let Err(e) = ring.submit_and_wait(1) {
+                            if e.kind() == io::ErrorKind::Interrupted {
+                                continue;
+                            }
+                            eprintln!("fatal diagnostic submission failure: {e}");
+                            std::process::abort();
+                        }
+                        for cqe in ring.completion() {
+                            let id = cqe.user_data() as usize;
+                            assert!(id < batch.len() && seen & (1 << id) == 0);
+                            seen |= 1 << id;
+                            if cqe.result() != batch[id].buffer.len() as i32 {
+                                errors[id] = Some(if cqe.result() < 0 {
+                                    io::Error::from_raw_os_error(-cqe.result())
+                                } else {
+                                    io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "short payload read",
+                                    )
+                                });
+                            }
+                        }
+                    }
+                    for (read, error) in batch.into_iter().zip(errors) {
+                        finish(read, error.map_or(Ok(()), Err), &stats);
+                    }
+                }
+            }));
+        } else {
+            for _ in 0..DEPTH {
+                let receiver = receiver.clone();
+                let stats = stats.clone();
+                let gate = gate.clone();
+                workers.push(std::thread::spawn(move || {
+                    while let Ok(job) = receiver.recv_blocking() {
+                        if let Some(mut read) = prepare(job, &stats) {
+                            let result = read
+                                .job
+                                .file
+                                .read_exact_at(&mut read.buffer, read.job.range.start);
+                            if let Some(gate) = &gate {
+                                gate.wait();
+                            }
+                            finish(read, result, &stats);
+                        }
+                    }
+                }));
+            }
+        }
+        Ok(Arc::new(Self {
+            sender,
+            slots: Arc::new(Semaphore::new(DEPTH)),
+            bytes: Arc::new(Semaphore::new(BYTES)),
+            workers,
+            stats,
+            gate,
+        }))
+    }
+    async fn read(&self, file: Arc<File>, range: Range<u64>) -> io::Result<OwnedBytes> {
+        let len = range
+            .end
+            .checked_sub(range.start)
+            .filter(|&n| n <= BYTES as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "payload exceeds diagnostic service byte budget",
+                )
+            })? as usize;
+        if len == 0 {
+            return Ok(OwnedBytes::empty());
+        }
+        let bytes = self
+            .bytes
+            .clone()
+            .acquire_many_owned(len as u32)
+            .await
+            .map_err(io::Error::other)?;
+        let slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(io::Error::other)?;
+        let (reply, done) = oneshot::channel();
+        self.sender
+            .send(Job {
+                file,
+                range,
+                slot,
+                bytes,
+                reply,
+            })
+            .await
+            .map_err(io::Error::other)?;
+        let response = done.await.map_err(io::Error::other)?;
+        response.result.map(OwnedBytes::new)
+    }
+    pub async fn open(self: &Arc<Self>, path: PathBuf) -> io::Result<FileHandle> {
+        let file = Arc::new(
+            tokio::task::spawn_blocking(move || File::open(path))
+                .await
+                .map_err(io::Error::other)??,
+        );
+        let len = file.metadata()?.len();
+        let service = self.clone();
+        let read: RangeReadFn = Arc::new(move |range| {
+            let file = file.clone();
+            let service = service.clone();
+            Box::pin(async move { service.read(file, range).await })
+        });
+        Ok(FileHandle::lazy_labeled(
+            len,
+            read,
+            Arc::from("hydration_probe"),
+        ))
+    }
+}
+impl Drop for Service {
+    fn drop(&mut self) {
+        self.sender.close();
+        if let Some(gate) = &self.gate {
+            gate.release();
+        }
+        for worker in self.workers.drain(..) {
+            worker.join().unwrap();
+        }
+        assert_eq!(self.stats.active.load(Relaxed), 0);
+        assert_eq!(self.slots.available_permits(), DEPTH);
+        assert_eq!(self.bytes.available_permits(), BYTES);
+    }
+}
+
+#[derive(Clone)]
+pub struct PayloadDirectory {
+    mapped: MmapDirectory,
+    fs: FsDirectory,
+    pub service: Option<Arc<Service>>,
+    pub positional: bool,
+}
+impl PayloadDirectory {
+    pub fn new(root: &Path, service: Option<Arc<Service>>, positional: bool) -> Self {
+        Self {
+            mapped: MmapDirectory::new(root),
+            fs: FsDirectory::new(root),
+            service,
+            positional,
+        }
+    }
+}
+#[async_trait::async_trait]
+impl Directory for PayloadDirectory {
+    async fn exists(&self, p: &Path) -> io::Result<bool> {
+        self.mapped.exists(p).await
+    }
+    async fn file_size(&self, p: &Path) -> io::Result<u64> {
+        self.mapped.file_size(p).await
+    }
+    async fn open_read(&self, p: &Path) -> io::Result<FileHandle> {
+        self.mapped.open_read(p).await
+    }
+    async fn read_range(&self, p: &Path, r: Range<u64>) -> io::Result<OwnedBytes> {
+        self.mapped.read_range(p, r).await
+    }
+    async fn list_files(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+        self.mapped.list_files(p).await
+    }
+    async fn open_lazy(&self, p: &Path) -> io::Result<FileHandle> {
+        self.mapped.open_lazy(p).await
+    }
+    async fn open_payload(&self, p: &Path) -> io::Result<FileHandle> {
+        if let Some(s) = &self.service {
+            s.open(self.mapped.root().join(p)).await
+        } else if self.positional {
+            self.fs.open_lazy(p).await
+        } else {
+            self.mapped.open_lazy(p).await
+        }
+    }
+    fn set_index_label(&self, label: &str) {
+        self.mapped.set_index_label(label);
+        self.fs.set_index_label(label);
+    }
+    fn local_path(&self, p: &Path) -> Option<PathBuf> {
+        self.mapped.local_path(p)
+    }
+}
+#[async_trait::async_trait]
+impl DirectoryWriter for PayloadDirectory {
+    async fn write(&self, p: &Path, b: &[u8]) -> io::Result<()> {
+        self.mapped.write(p, b).await
+    }
+    async fn delete(&self, p: &Path) -> io::Result<()> {
+        self.mapped.delete(p).await
+    }
+    async fn rename(&self, a: &Path, b: &Path) -> io::Result<()> {
+        self.mapped.rename(a, b).await
+    }
+    async fn link(&self, a: &Path, b: &Path) -> io::Result<()> {
+        self.mapped.link(a, b).await
+    }
+    async fn sync(&self) -> io::Result<()> {
+        self.mapped.sync().await
+    }
+    async fn streaming_writer(&self, p: &Path) -> io::Result<Box<dyn StreamingWriter>> {
+        self.mapped.streaming_writer(p).await
+    }
+}
+
+pub async fn lifecycle(root: &Path) -> io::Result<()> {
+    for ring in [false, true] {
+        let path = root.join(if ring {
+            "ring-lifecycle"
+        } else {
+            "pool-lifecycle"
+        });
+        {
+            use std::io::Write;
+            let mut file = File::options().write(true).create_new(true).open(&path)?;
+            file.write_all(&[7; 64])?;
+        }
+        let service = Service::new(ring, true)?;
+        let handle = service.open(path.clone()).await?;
+        let oversize_file = Arc::new(File::open(&path)?);
+        File::options().write(true).open(&path)?.set_len(8)?;
+        let error = handle
+            .read_bytes_ranges(&[0..4, 0..32, 4..8])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(handle.read_bytes_range(0..4).await?.as_slice(), [7; 4]);
+        std::fs::remove_file(&path)?;
+        assert_eq!(handle.read_bytes_range(0..4).await?.as_slice(), [7; 4]);
+        assert!(
+            service
+                .read(oversize_file, 0..BYTES as u64 + 1)
+                .await
+                .is_err()
+        );
+        let gate = service.gate.as_ref().unwrap();
+        *gate.paused.lock().unwrap() = true;
+        let dropped_before = service.stats.dropped.load(Relaxed);
+        let mut read = Box::pin(handle.read_bytes_range(0..8));
+        assert!(futures::poll!(&mut read).is_pending());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gate.arrived.load(Relaxed) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker did not reach completion gate"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop(read);
+        gate.release();
+        // A subsequent read proves the worker drained the cancelled read and remains usable.
+        assert_eq!(handle.read_bytes_range(0..4).await?.as_slice(), [7; 4]);
+        while service.stats.dropped.load(Relaxed) == dropped_before {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled reply was not drained"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let mut cancelled = 0;
+        for _ in 0..128 {
+            let mut read = Box::pin(handle.read_bytes_range(0..8));
+            if futures::poll!(&mut read).is_pending() {
+                cancelled += 1;
+            }
+            drop(read);
+        }
+        assert!(cancelled > 0);
+        let stats = service.stats.clone();
+        drop(handle);
+        drop(service);
+        assert_eq!(stats.submitted.load(Relaxed), stats.completed.load(Relaxed));
+        assert!(stats.max_active.load(Relaxed) <= DEPTH);
+        assert!(stats.errors.load(Relaxed) >= 1);
+        println!(
+            "{}",
+            serde_json::json!({"lifecycle":if ring{"uring"}else{"pool"},"cancelled_futures":cancelled,"in_flight_drop_verified":true,"stats":stats.json()})
+        );
+    }
+    Ok(())
+}

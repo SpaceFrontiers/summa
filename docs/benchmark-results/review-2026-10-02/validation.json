@@ -1,0 +1,60 @@
+{
+  "native_full": {
+    "success": true,
+    "passed": 2165,
+    "failed": 0,
+    "ignored": 25,
+    "evidence": ".context/search-harness/20261002T062653.356326Z-full"
+  },
+  "native_final": {
+    "success": true,
+    "passed": 2160,
+    "failed": 0,
+    "ignored": 25,
+    "evidence": ".context/search-harness/20261002T064242.152235Z-check"
+  },
+  "wasm": {
+    "passed": 41,
+    "test_files": 9,
+    "build": true,
+    "evidence": ".context/review-all-20261002/wasm.log"
+  },
+  "regression": {
+    "prefix_initially_failed": true,
+    "optional_bitset_initially_failed": true
+  },
+  "linux_io_uring": {
+    "success": true,
+    "passed": 73,
+    "failed": 0,
+    "ignored": 0,
+    "simd_tests": 75,
+    "prefix_regression": 1,
+    "probe_tests": 4,
+    "source_files_verified": 800,
+    "archive_sha256": "dcdc4e2e922e95238746775c53bab1c2d6512fabb596b8685a1a166b5f4ba7b8",
+    "initial_setup_failure": {
+      "stage": "provenance capture before tests",
+      "reason": "source snapshot had no Git repository",
+      "resolution": "initialized only the isolated cloud source snapshot, then reran the harness successfully"
+    }
+  },
+  "contracts": {
+    "success": true,
+    "evidence": ".context/search-harness/20261002T090854.330363Z-contracts"
+  },
+  "final": {
+    "pre_commit": true,
+    "diff_check": true,
+    "source_files_unchanged": 800,
+    "matrix_requests": 121717668,
+    "control_requests": 49686066,
+    "http_errors": 0,
+    "io_load_cells": 54,
+    "io_smoke_cells": 3,
+    "io_offered": 259200,
+    "io_verified": 228080,
+    "io_rejected": 31120,
+    "io_failures": 0
+  }
+}

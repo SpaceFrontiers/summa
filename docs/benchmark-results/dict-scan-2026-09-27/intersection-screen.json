@@ -1,0 +1,510 @@
+{
+  "host": "Apple M4 (arm64), rustc -O -C target-cpu=native",
+  "note": "extracted-kernel screen; the harness asserts identical intersections for limits 1/7/128 before timing; x86 not run because the candidate is rejected on aarch64",
+  "rows": [
+    {
+      "fixture": "dense",
+      "kernel": "baseline",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 48189000
+    },
+    {
+      "fixture": "dense",
+      "kernel": "gallop",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 22730542
+    },
+    {
+      "fixture": "dense",
+      "kernel": "gallop",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 22648583
+    },
+    {
+      "fixture": "dense",
+      "kernel": "baseline",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 47489458
+    },
+    {
+      "fixture": "dense",
+      "kernel": "baseline",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 47846375
+    },
+    {
+      "fixture": "dense",
+      "kernel": "gallop",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 22548459
+    },
+    {
+      "fixture": "dense",
+      "kernel": "gallop",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 22552542
+    },
+    {
+      "fixture": "dense",
+      "kernel": "baseline",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 47740667
+    },
+    {
+      "fixture": "dense",
+      "kernel": "baseline",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 47823792
+    },
+    {
+      "fixture": "dense",
+      "kernel": "gallop",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 22727417
+    },
+    {
+      "fixture": "dense",
+      "kernel": "gallop",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 23231750
+    },
+    {
+      "fixture": "dense",
+      "kernel": "baseline",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 47837875
+    },
+    {
+      "fixture": "medium",
+      "kernel": "baseline",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 50815000
+    },
+    {
+      "fixture": "medium",
+      "kernel": "gallop",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 300346542
+    },
+    {
+      "fixture": "medium",
+      "kernel": "gallop",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 300845167
+    },
+    {
+      "fixture": "medium",
+      "kernel": "baseline",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 50823167
+    },
+    {
+      "fixture": "medium",
+      "kernel": "baseline",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 50998166
+    },
+    {
+      "fixture": "medium",
+      "kernel": "gallop",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 300813916
+    },
+    {
+      "fixture": "medium",
+      "kernel": "gallop",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 303288083
+    },
+    {
+      "fixture": "medium",
+      "kernel": "baseline",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 49988083
+    },
+    {
+      "fixture": "medium",
+      "kernel": "baseline",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 50333292
+    },
+    {
+      "fixture": "medium",
+      "kernel": "gallop",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 301069750
+    },
+    {
+      "fixture": "medium",
+      "kernel": "gallop",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 300887584
+    },
+    {
+      "fixture": "medium",
+      "kernel": "baseline",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 51750250
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "baseline",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 23060250
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "gallop",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 66440709
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "gallop",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 64117500
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "baseline",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 18830459
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "baseline",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 20076708
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "gallop",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 64090125
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "gallop",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 64058125
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "baseline",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 20763875
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "baseline",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 18799458
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "gallop",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 64132375
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "gallop",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 64159291
+    },
+    {
+      "fixture": "ratio4",
+      "kernel": "baseline",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 18706625
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "baseline",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 6806583
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "gallop",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 9032791
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "gallop",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 8904583
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "baseline",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 7032875
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "baseline",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 6613084
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "gallop",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 9159708
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "gallop",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 8834541
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "baseline",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 6874958
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "baseline",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 6545875
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "gallop",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 8825500
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "gallop",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 8748292
+    },
+    {
+      "fixture": "ratio30",
+      "kernel": "baseline",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 6800375
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "baseline",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 4529500
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "gallop",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 4887333
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "gallop",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 4867625
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "baseline",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 4563250
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "baseline",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 4517833
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "gallop",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 4870542
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "gallop",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 4983917
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "baseline",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 4495333
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "baseline",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 4464167
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "gallop",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 4869666
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "gallop",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 4949459
+    },
+    {
+      "fixture": "sparse_left",
+      "kernel": "baseline",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 4497541
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "baseline",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 37317542
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "gallop",
+      "pass": 0,
+      "calls": 300000,
+      "ns": 4364083
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "gallop",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 4506541
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "baseline",
+      "pass": 1,
+      "calls": 300000,
+      "ns": 37602792
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "baseline",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 37495791
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "gallop",
+      "pass": 2,
+      "calls": 300000,
+      "ns": 4538042
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "gallop",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 4343083
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "baseline",
+      "pass": 3,
+      "calls": 300000,
+      "ns": 37473375
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "baseline",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 37535208
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "gallop",
+      "pass": 4,
+      "calls": 300000,
+      "ns": 4516541
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "gallop",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 4487625
+    },
+    {
+      "fixture": "sparse_right",
+      "kernel": "baseline",
+      "pass": 5,
+      "calls": 300000,
+      "ns": 37537500
+    }
+  ]
+}

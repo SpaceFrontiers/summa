@@ -756,8 +756,11 @@ The completed [dispatch and lookup study](benchmark-results/searchbench-2026-09-
 preserves the existing search owner, scores, response bytes, 64-request admission,
 and all persisted formats. It implements three changes:
 
-- An explicit benchmark `serve ... [DISPATCH]` override (`blocking`, the
-  unchanged default, or `in-place`). The latter uses Tokio `block_in_place`
+- An explicit benchmark `serve ... [DISPATCH]` override (`blocking`, then the
+  default, or `in-place`; since September 27 the default is `pool`, which
+  submits the request as one search-pool job — see the
+  [dispatch comparison](benchmark-results/dict-scan-2026-09-27/README.md#single-hop-search-dispatch)).
+  `in-place` uses Tokio `block_in_place`
   around the same admitted parse/search/project/encode closure. Tokio may still
   transfer its runtime core through the blocking pool; this is not zero-hop
   execution. Both modes retain the reader and permit until work finishes,

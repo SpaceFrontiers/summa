@@ -1,0 +1,12 @@
+{
+  "Architecture": "x86_64",
+  "CPU(s)": "32",
+  "On-line CPU(s) list": "0-31",
+  "Thread(s) per core": "2",
+  "Core(s) per socket": "8",
+  "Socket(s)": "2",
+  "Model name": "Intel(R) Xeon(R) CPU @ 2.80GHz",
+  "NUMA node(s)": "2",
+  "kernel": "Linux 7.0.0-1011-gcp x86_64",
+  "perf": "perf version 7.0.14"
+}

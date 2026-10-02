@@ -1,0 +1,39 @@
+[package]
+name = "summa-io-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Standalone Linux measurement driver; hydration reuses the core payload service.
+[workspace]
+
+[features]
+hydration = ["dep:summa-core", "dep:async-trait", "dep:async-channel", "dep:tokio", "dep:futures"]
+
+[[bin]]
+name = "summa-hydration-probe"
+path = "src/hydration.rs"
+required-features = ["hydration"]
+
+[[bin]]
+name = "summa-sparse-io-probe"
+path = "src/sparse.rs"
+required-features = ["hydration"]
+
+[dependencies]
+blake3 = "1"
+io-uring = "=0.7.14"
+libc = "0.2"
+memmap2 = "0.9"
+serde_json = "1"
+summa-core = { path = "../../../summa-core", features = ["io-uring"], optional = true }
+async-trait = { version = "0.1", optional = true }
+async-channel = { version = "2.3", optional = true }
+tokio = { version = "1.49", features = ["rt-multi-thread", "sync", "fs", "io-util", "macros"], optional = true }
+futures = { version = "0.3", optional = true }
+
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"

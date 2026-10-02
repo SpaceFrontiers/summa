@@ -171,6 +171,7 @@ harness = false
 default = ["sync"]
 native = ["fst-index", "dep:tokio", "dep:async-channel", "dep:num_cpus", "dep:rayon", "dep:lasso", "dep:memmap2", "dep:tempfile", "dep:libc", "dep:uuid", "dep:tokenizers", "dep:hf-hub"]
 sync = ["native"]
+io-uring = ["native", "dep:io-uring"]
 diagnostics = []
 # Per-query work accounting for dedicated diagnostic builds; absent by default.
 query-diagnostics = ["native"]
@@ -192,3 +193,6 @@ optional = true
 version = "0.13"
 default-features = false
 optional = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "=0.7.14", optional = true }

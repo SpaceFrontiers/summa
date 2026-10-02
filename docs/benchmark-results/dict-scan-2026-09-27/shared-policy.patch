@@ -1,0 +1,18 @@
+--- a/summa-server/examples/searchbench_http/main.rs
++++ b/summa-server/examples/searchbench_http/main.rs
+@@ -303,6 +303,15 @@
+         max_indexing_memory_bytes: 2_000_000_000,
+         ..Default::default()
+     };
++    // Experiment-only: select the dictionary cache policy for paired phases.
++    let mut config = config;
++    if let Ok(bytes) = std::env::var("SEARCHBENCH_TERM_CACHE_PROCESS_BYTES") {
++        config.term_cache_process_bytes = bytes.parse()?;
++    }
++    eprintln!(
++        "term cache policy: process_bytes={} per_segment_blocks={}",
++        config.term_cache_process_bytes, config.term_cache_blocks
++    );
+     let runtime = tokio::runtime::Builder::new_multi_thread()
+         .worker_threads(http_workers)
+         .max_blocking_threads(workers.max(4))

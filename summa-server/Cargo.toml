@@ -24,6 +24,7 @@ name = "test-doc-retrieval"
 path = "src/bin/test_doc_retrieval.rs"
 
 [features]
+io-uring = ["summa-core/io-uring"]
 # Opt-in core work counters for benchmark diagnosis; never enabled by default.
 query-diagnostics = ["summa-core/query-diagnostics"]
 

@@ -88,9 +88,56 @@ pub struct FieldEntry {
     /// BM25 b of a text field; `None` = `BM25_B`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bm25_b: Option<f32>,
+    /// Common words of a text field: every adjacent pair of them is indexed
+    /// as one extra term so exact two-word phrases of common words read a
+    /// single posting list (`docs/common-word-pairs.md`). Fixed for the life
+    /// of the index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub common_grams: Vec<String>,
 }
 
+/// Most common words one field may pair (`docs/common-word-pairs.md`).
+pub const MAX_COMMON_GRAMS: usize = 4096;
+
 impl FieldEntry {
+    /// Common word pairs need exact phrase positions on one plain text field.
+    fn validate_common_grams(&self) -> crate::Result<()> {
+        if self.common_grams.is_empty() {
+            return Ok(());
+        }
+        let reject = |reason: &str| {
+            Err(crate::Error::Schema(format!(
+                "field '{}' declares common_grams, which {reason}",
+                self.name
+            )))
+        };
+        if self.field_type != FieldType::Text || !self.indexed {
+            return reject("requires an indexed text field");
+        }
+        if self.chunked {
+            return reject("is not supported on chunked text fields");
+        }
+        if !self
+            .positions
+            .is_some_and(|mode| mode.tracks_token_position())
+        {
+            return reject("requires token positions (positions: token_position or full)");
+        }
+        if self.common_grams.len() > MAX_COMMON_GRAMS {
+            return reject(&format!("is limited to {MAX_COMMON_GRAMS} words"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for word in &self.common_grams {
+            if word.is_empty() || word.contains('\0') {
+                return reject(&format!("contains an invalid word {word:?}"));
+            }
+            if !seen.insert(word.as_str()) {
+                return reject(&format!("lists {word:?} twice"));
+            }
+        }
+        Ok(())
+    }
+
     /// Parsed tokenizer spec of a text field (`None` for non-text fields,
     /// fields without a tokenizer, or unparsable names).
     pub fn tokenizer_spec(&self) -> Option<crate::tokenizer::TokenizerSpec> {
@@ -1022,6 +1069,7 @@ impl Schema {
                     entry.name
                 )));
             }
+            entry.validate_common_grams()?;
         }
         self.validate_content_hash()
     }
@@ -1178,6 +1226,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            common_grams: Vec::new(),
         });
         field
     }
@@ -1234,6 +1283,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            common_grams: Vec::new(),
         });
         field
     }
@@ -1285,6 +1335,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            common_grams: Vec::new(),
         });
         field
     }
@@ -1338,6 +1389,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            common_grams: Vec::new(),
         });
         field
     }
@@ -1384,6 +1436,14 @@ impl SchemaBuilder {
     pub fn set_reorder(&mut self, field: Field, reorder: bool) {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.reorder = reorder;
+        }
+    }
+
+    /// Index every adjacent pair of `words` in a text field as one extra term
+    /// (`docs/common-word-pairs.md`). Validated at schema admission.
+    pub fn set_common_grams(&mut self, field: Field, words: Vec<String>) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.common_grams = words;
         }
     }
 

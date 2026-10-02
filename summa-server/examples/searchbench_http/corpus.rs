@@ -10,11 +10,22 @@ use summa_core::{IndexConfig, IndexWriter};
 
 pub const BODY_TOKENIZER: &str = "lex(segmenter: unicode, stem: none, stop_words: false, variants: false, fold: false, max_token_length: 255)";
 
-pub fn schema(reorder: bool, tokenizer: &str) -> Schema {
+pub fn schema(reorder: bool, tokenizer: &str) -> Result<Schema> {
     let mut schema = SchemaBuilder::default();
     let body = schema.add_text_field_with_tokenizer("body", true, true, tokenizer);
     schema.set_positions(body, PositionMode::TokenPosition);
     schema.set_reorder(body, reorder);
+    // Common word pairs (`docs/common-word-pairs.md`): one word per line.
+    if let Some(list) = std::env::var_os("SEARCHBENCH_COMMON_GRAMS") {
+        let words: Vec<String> = std::fs::read_to_string(&list)
+            .with_context(|| format!("reading SEARCHBENCH_COMMON_GRAMS {list:?}"))?
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        eprintln!("body pairs {} common words", words.len());
+        schema.set_common_grams(body, words);
+    }
     schema.set_default_fields(vec!["body".into()]);
     for name in [
         "id",
@@ -45,7 +56,7 @@ pub fn schema(reorder: bool, tokenizer: &str) -> Schema {
         let field = schema.add_u64_field(name, true, false);
         schema.set_fast(field, true);
     }
-    schema.build()
+    Ok(schema.build())
 }
 
 pub async fn build(
@@ -59,7 +70,7 @@ pub async fn build(
         bail!("output index already exists: {}", path.display());
     }
     std::fs::create_dir_all(path)?;
-    let schema = schema(reorder, tokenizer);
+    let schema = schema(reorder, tokenizer)?;
     let mut writer = IndexWriter::create(MmapDirectory::new(path), schema.clone(), config).await?;
     let source = std::io::BufReader::new(std::fs::File::open(input)?);
     let mut count = 0u64;
@@ -101,5 +112,34 @@ pub async fn build(
     }
     writer.shutdown().await?;
     eprintln!("committed and merged {count} documents");
+    Ok(())
+}
+
+/// The `count` most document-frequent body words of the first `docs` rows,
+/// tokenized as the body field indexes them (ties by word), one per line.
+pub fn common_words(input: &Path, tokenizer: &str, count: usize, docs: usize) -> Result<()> {
+    let tokenizer = summa_core::tokenizer::TokenizerRegistry::new()
+        .get(tokenizer)
+        .with_context(|| format!("unknown tokenizer {tokenizer}"))?;
+    let source = std::io::BufReader::new(std::fs::File::open(input)?);
+    let mut frequencies: std::collections::HashMap<String, u64> = Default::default();
+    let mut seen = std::collections::HashSet::new();
+    for line in source.lines().take(docs) {
+        let value: serde_json::Value = serde_json::from_str(&line?)?;
+        let body = value["body"]
+            .as_str()
+            .context("corpus row requires string body")?;
+        seen.clear();
+        for token in tokenizer.tokenize(body) {
+            if seen.insert(token.text.clone()) {
+                *frequencies.entry(token.text).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<_> = frequencies.into_iter().collect();
+    ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (word, _) in ranked.into_iter().take(count) {
+        println!("{word}");
+    }
     Ok(())
 }

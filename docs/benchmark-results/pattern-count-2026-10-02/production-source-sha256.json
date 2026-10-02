@@ -1,0 +1,10 @@
+{
+  "summa-core/src/query/term_union.rs": "5e8515aef7df697b9ce3f44dac1437b19c9180f9c93d4bea58cf3bd7b2517056",
+  "summa-core/src/query/traits.rs": "565c88a1f4536b70896e40745562c5a8d261169e2442d2310e8f61229b498b31",
+  "summa-core/src/query/collector.rs": "d895bb205024b348c83bc41b6d1863b56f263827aaa724bf9bddee402ce8809b",
+  "summa-core/src/query/term_pattern.rs": "275de42d06e5c0687580e76edb93cb610b067310ab8c6f49b80e7e72a9fcddff",
+  "summa-core/src/query/prefix.rs": "e5b7d60f28b1f66eb0f8bc12152df41742228c3e99dc4fa9bb025fcabf5084ee",
+  "summa-core/src/query/regex.rs": "797e80c3e8ec3611b38c7e4a9c3c20d90ac1b1989eca22d20c68ab737555a2e7",
+  "summa-core/src/query/wildcard.rs": "de2bd88af0690b91fe9a4717c518384e2bc07aebe99a3717395513be0b82c761",
+  "summa-core/src/query/boolean.rs": "1a7688d8a78c15fda629c7621c6adbbeba78ce9d98b0e7d4e047c8acfa938168"
+}

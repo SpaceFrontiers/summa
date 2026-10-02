@@ -1,0 +1,120 @@
+//! Experiment-only: dictionary cache policy through the public search path.
+//!   build <dir> <candidates>          one segment of synthetic whole terms
+//!   run <dir> <process_bytes> <pat>.. rotate wildcards; median CPU ms per cycle
+use std::time::Duration;
+use summa_core::query::WildcardQuery;
+use summa_core::{Document, Index, IndexConfig, IndexWriter, MmapDirectory, SchemaBuilder};
+
+struct Rng(u64);
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % n
+    }
+}
+
+fn cpu_now() -> Duration {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) }, 0);
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let dir = std::path::PathBuf::from(&args[1]);
+    match args[0].as_str() {
+        "build" => {
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut schema = SchemaBuilder::default();
+            let field = schema.add_text_field_with_tokenizer("t", true, false, "raw");
+            let config = IndexConfig {
+                num_threads: 1,
+                num_indexing_threads: 1,
+                max_indexing_memory_bytes: 8 << 30,
+                merge_policy: Box::new(summa_core::merge::NoMergePolicy),
+                ..Default::default()
+            };
+            let mut writer = IndexWriter::create(MmapDirectory::new(&dir), schema.build(), config)
+                .await
+                .unwrap();
+            let words: Vec<String> = std::fs::read_to_string("/usr/share/dict/words")
+                .unwrap()
+                .lines()
+                .map(str::to_ascii_lowercase)
+                .filter(|w| w.bytes().all(|b| b.is_ascii_lowercase()))
+                .collect();
+            let suffixes = ["", "s", "ed", "ing", "er", "ly", "tion", "ness"];
+            let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+            for _ in 0..args[2].parse::<usize>().unwrap() {
+                let word = &words[rng.below(words.len() as u64) as usize];
+                let term = match rng.below(4) {
+                    0 => format!("{word}{}", suffixes[rng.below(8) as usize]),
+                    1 => format!("{word}{}", words[rng.below(words.len() as u64) as usize]),
+                    2 => format!("{word}{}", rng.below(10_000)),
+                    _ => (0..3 + rng.below(12))
+                        .map(|_| (b'a' + rng.below(26) as u8) as char)
+                        .collect(),
+                };
+                let mut doc = Document::new();
+                doc.add_text(field, term);
+                loop {
+                    match writer.add_document(doc.clone()) {
+                        Ok(()) => break,
+                        Err(summa_core::Error::QueueFull) => {
+                            tokio::time::sleep(Duration::from_millis(1)).await
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                }
+            }
+            writer.commit().await.unwrap();
+            writer.shutdown().await.unwrap();
+        }
+        "run" => {
+            let config = IndexConfig {
+                num_threads: 1,
+                term_cache_process_bytes: args[2].parse().unwrap(),
+                ..Default::default()
+            };
+            let index = Index::open(MmapDirectory::new(&dir), config).await.unwrap();
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            let field = searcher.schema().get_field("t").unwrap();
+            let queries: Vec<_> = args[3..]
+                .iter()
+                .map(|p| WildcardQuery::new(field, p).unwrap())
+                .collect();
+            let mut hits = 0;
+            let mut cycle = || async {
+                let start = cpu_now();
+                let mut n = 0;
+                for query in &queries {
+                    n += searcher.search(query, 10).await.unwrap().len();
+                }
+                ((cpu_now() - start).as_secs_f64() * 1e3, n)
+            };
+            for _ in 0..3 {
+                hits = cycle().await.1;
+            }
+            let mut samples = Vec::new();
+            for _ in 0..15 {
+                let (ms, n) = cycle().await;
+                assert_eq!(n, hits);
+                samples.push(ms);
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "process_bytes={} median_cycle_ms={:.2} hits={} segments={} docs={}",
+                args[2],
+                samples[samples.len() / 2],
+                hits,
+                searcher.num_segments(),
+                searcher.num_docs()
+            );
+        }
+        other => panic!("unknown mode {other}"),
+    }
+}

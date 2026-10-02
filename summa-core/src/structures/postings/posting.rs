@@ -52,12 +52,19 @@ pub enum PostingCodec {
     /// Library SIMD packing of full blocks with exact horizontal tails.
     /// Documents use gap-minus-one values; positions use the same block policy.
     Simd4x = 3,
+    /// `Rounded`, except that blocks denser than about one document in four
+    /// store their documents as a bitmap (`docs/bitmap-posting-blocks.md`).
+    /// Headers never name it: its other blocks are ordinary `Rounded` blocks.
+    RoundedBitmap = 4,
 }
 
 impl PostingCodec {
     /// Codec id stored in the top two bits of the block header's `doc_bits`.
     const HEADER_SHIFT: u32 = 6;
     const WIDTH_MASK: u8 = 0x3F;
+    /// Document width of a bitmap block (codec bits `Rounded`). Codecs emit
+    /// widths up to 32, and earlier readers reject anything larger.
+    pub(super) const BITMAP_WIDTH: u8 = 63;
 
     /// The two-bit id field is fully assigned. A fifth codec cannot be
     /// signalled in the block header: it needs a footer flag plus an
@@ -70,7 +77,7 @@ impl PostingCodec {
             2 => PostingCodec::Pfor,
             _ => PostingCodec::Simd4x,
         };
-        if width > 32 {
+        if width > 32 && !(codec == PostingCodec::Rounded && width == Self::BITMAP_WIDTH) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("posting block doc-id width {width} exceeds 32 bits"),
@@ -90,7 +97,12 @@ impl PostingCodec {
     }
 
     fn header_byte(self, width: u8) -> u8 {
-        ((self as u8) << Self::HEADER_SHIFT) | width
+        let id = if self == Self::RoundedBitmap {
+            Self::Rounded
+        } else {
+            self
+        };
+        ((id as u8) << Self::HEADER_SHIFT) | width
     }
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -99,6 +111,7 @@ impl PostingCodec {
             "packed" | "bp128" | "exact" => Some(PostingCodec::Packed),
             "pfor" | "optp4d" | "patched" => Some(PostingCodec::Pfor),
             "simd4x" => Some(PostingCodec::Simd4x),
+            "rounded_bitmap" | "bitmap" => Some(PostingCodec::RoundedBitmap),
             _ => None,
         }
     }
@@ -111,6 +124,7 @@ impl std::fmt::Display for PostingCodec {
             PostingCodec::Packed => "packed",
             PostingCodec::Pfor => "pfor",
             PostingCodec::Simd4x => "simd4x",
+            PostingCodec::RoundedBitmap => "rounded_bitmap",
         })
     }
 }
@@ -637,6 +651,114 @@ impl Footer {
     }
 }
 
+/// Set the bits of strictly increasing `docs` (relative to `base`) in words
+/// no earlier call of this pass has written, starting from zeroed words. The
+/// current word stays in a register and is stored after every document: an
+/// OR into memory per document instead waits on store-to-load forwarding
+/// whenever neighbours share a word. `run` carries `(word, bits)` between
+/// calls of one pass and starts as `(usize::MAX, 0)`.
+#[inline]
+pub(crate) fn set_sorted_doc_bits(
+    bits: &mut [u64],
+    base: DocId,
+    docs: &[u32],
+    run: &mut (usize, u64),
+) {
+    let (mut word, mut acc) = *run;
+    for &doc in docs {
+        let offset = (doc - base) as usize;
+        let next = offset / 64;
+        // Branch-free: a word change clears the accumulator.
+        acc = (acc & u64::from(next == word).wrapping_neg()) | 1u64 << (offset % 64);
+        bits[next] = acc;
+        word = next;
+    }
+    *run = (word, acc);
+}
+
+/// A bitmap block's words with a forward rank cursor. `tf_state` is the
+/// block's deferred-frequency state, as `decode_block_doc_ids_only` returns.
+pub(crate) struct BitmapBlock<'a> {
+    pub(crate) first: DocId,
+    pub(crate) last: DocId,
+    words: &'a [u8],
+    pub(crate) tf_state: (usize, usize, usize),
+    word: usize,
+    rank_before: usize,
+}
+
+impl BitmapBlock<'_> {
+    /// Index of `doc` among the block's documents (its frequency slot), or
+    /// `None` when absent. Probes must not decrease.
+    #[inline]
+    pub(crate) fn rank_of(&mut self, doc: DocId) -> Option<usize> {
+        if doc < self.first || doc > self.last {
+            return None;
+        }
+        let offset = (doc - self.first) as usize;
+        let word = |index: usize| {
+            u64::from_le_bytes(self.words[index * 8..index * 8 + 8].try_into().unwrap())
+        };
+        while self.word < offset / 64 {
+            self.rank_before += word(self.word).count_ones() as usize;
+            self.word += 1;
+        }
+        let bits = word(self.word);
+        let bit = offset % 64;
+        (bits >> bit & 1 == 1)
+            .then(|| self.rank_before + (bits & ((1u64 << bit) - 1)).count_ones() as usize)
+    }
+}
+
+/// Membership-bit kernel by list density. `Dense` lists (one ID in eight to
+/// one in two) share words often enough that a read-modify-write per
+/// document waits on store forwarding; `Packed` lists (denser) fill whole
+/// words, where grouping a word's documents before one OR measured faster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListDensity {
+    Sparse,
+    Dense,
+    Packed,
+}
+
+/// OR strictly increasing `docs` (relative to `base`) into membership words,
+/// one store per word.
+#[inline]
+fn set_sorted_doc_bit_groups(bits: &mut [u64], base: DocId, docs: &[u32]) {
+    let mut index = 0;
+    while index < docs.len() {
+        let offset = (docs[index] - base) as usize;
+        let word = offset / 64;
+        let mut mask = 1u64 << (offset % 64);
+        index += 1;
+        while index < docs.len() {
+            let offset = (docs[index] - base) as usize;
+            if offset / 64 != word {
+                break;
+            }
+            mask |= 1u64 << (offset % 64);
+            index += 1;
+        }
+        bits[word] |= mask;
+    }
+}
+
+/// OR a bitmap block's little-endian words into membership words, with the
+/// block's first document `offset` IDs after the words' base.
+#[inline]
+fn or_bitmap_words(bits: &mut [u64], offset: u32, words: &[u8]) {
+    let (at, shift) = ((offset / 64) as usize, offset % 64);
+    for (index, word) in words.chunks_exact(8).enumerate() {
+        let word = u64::from_le_bytes(word.try_into().unwrap());
+        bits[at + index] |= word << shift;
+        if shift != 0
+            && let Some(next) = bits.get_mut(at + index + 1)
+        {
+            *next |= word >> (64 - shift);
+        }
+    }
+}
+
 /// Read a compact L0 entry from raw bytes at the given index: `(first_doc,
 /// last_doc, offset, bounds word)`. The bounds word is packed `(max_tf,
 /// min_len)` for current lists and an `f32` max tf for legacy ones; see
@@ -718,6 +840,19 @@ fn block_len_from_l0(l0_bytes: &[u8], l0_count: usize, stream_len: usize, idx: u
     end.saturating_sub(offset as usize)
 }
 
+/// Bytes of a bitmap document array covering `span + 1` IDs: whole
+/// little-endian words, so readers can copy them into membership windows.
+#[inline]
+fn bitmap_bytes(span: u32) -> usize {
+    (span as usize + 1).div_ceil(64) * 8
+}
+
+/// Bytes per value of the rounded delta array for `deltas`.
+fn rounded_delta_bytes(deltas: &[u32]) -> usize {
+    let max = deltas.iter().copied().max().unwrap_or(0);
+    simd::RoundedBitWidth::from_u8(simd::round_bit_width(simd::bits_needed(max))).bytes_per_value()
+}
+
 /// Encoded doc-id delta array and tf array of one block, with the header
 /// width bytes to store for them.
 struct EncodedBlock {
@@ -725,20 +860,46 @@ struct EncodedBlock {
     tf_bits: u8,
 }
 
-/// Append the packed arrays of one block to `stream` using `codec`.
+/// Append the packed arrays of one block to `stream` using `codec`. `span`
+/// is `last_doc - first_doc`.
 fn encode_block_arrays(
     codec: PostingCodec,
+    span: u32,
     deltas: &[u32],
     tfs: &[u32],
     stream: &mut Vec<u8>,
 ) -> EncodedBlock {
     let codec = codec.for_count(tfs.len());
     match codec {
+        // At most half the delta bytes (about one ID in four or denser):
+        // sparser bitmaps expand slower than their deltas decode.
+        PostingCodec::RoundedBitmap
+            if 2 * bitmap_bytes(span) <= deltas.len() * rounded_delta_bytes(deltas) =>
+        {
+            let start = stream.len();
+            stream.resize(start + bitmap_bytes(span), 0);
+            let words = &mut stream[start..];
+            let mut offset = 0;
+            for delta in std::iter::once(0).chain(deltas.iter().copied()) {
+                offset += delta as usize;
+                words[offset / 8] |= 1 << (offset % 8);
+            }
+            let tf_bits =
+                simd::round_bit_width(simd::bits_needed(tfs.iter().copied().max().unwrap_or(0)));
+            let rounded = simd::RoundedBitWidth::from_u8(tf_bits);
+            let start = stream.len();
+            stream.resize(start + tfs.len() * rounded.bytes_per_value(), 0);
+            simd::pack_rounded(tfs, rounded, &mut stream[start..]);
+            EncodedBlock {
+                doc_bits: codec.header_byte(PostingCodec::BITMAP_WIDTH),
+                tf_bits,
+            }
+        }
         PostingCodec::Simd4x => EncodedBlock {
             doc_bits: codec.header_byte(bitpacking4x::encode_gaps(deltas, stream)),
             tf_bits: bitpacking4x::encode(tfs, stream),
         },
-        PostingCodec::Rounded => {
+        PostingCodec::Rounded | PostingCodec::RoundedBitmap => {
             let max_delta = deltas.iter().copied().max().unwrap_or(0);
             let doc_bits = simd::round_bit_width(simd::bits_needed(max_delta));
             let max_tf = tfs.iter().copied().max().unwrap_or(0);
@@ -994,7 +1155,13 @@ impl BlockPostingList {
             let header_at = stream.len();
             stream.push(0);
             stream.push(0);
-            let encoded = encode_block_arrays(codec, &deltas, &tf_buf, &mut stream);
+            let encoded = encode_block_arrays(
+                codec,
+                last_doc_id - base_doc_id,
+                &deltas,
+                &tf_buf,
+                &mut stream,
+            );
             stream[header_at] = encoded.doc_bits;
             stream[header_at + 1] = encoded.tf_bits;
 
@@ -2031,6 +2198,7 @@ impl BlockPostingList {
             let state = self.decode_block_doc_ids_unchecked(
                 offset as usize,
                 block_idx,
+                last,
                 header,
                 payload,
                 doc_ids,
@@ -2053,7 +2221,14 @@ impl BlockPostingList {
                 let strict_gap_width = (header[6] >> PostingCodec::HEADER_SHIFT
                     == PostingCodec::Simd4x as u8)
                     .then_some(header[6] & PostingCodec::WIDTH_MASK);
-                if !verify_block_docs(doc_ids, first, last, byte_gaps, strict_gap_width) {
+                let valid = if header[6] == PostingCodec::BITMAP_WIDTH {
+                    // Set bits expand in increasing order: only the endpoints
+                    // need the directory check.
+                    doc_ids.first() == Some(&first) && doc_ids.last() == Some(&last)
+                } else {
+                    verify_block_docs(doc_ids, first, last, byte_gaps, strict_gap_width)
+                };
+                if !valid {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("decoded doc ids leave the directory range {first}..={last}"),
@@ -2081,6 +2256,7 @@ impl BlockPostingList {
         &self,
         pos: usize,
         block_idx: usize,
+        last: DocId,
         header: [u8; 8],
         payload: &[u8],
         doc_ids: &mut Vec<u32>,
@@ -2100,6 +2276,22 @@ impl BlockPostingList {
         doc_ids.resize(count, 0);
         doc_ids[0] = first_doc;
 
+        if doc_width == PostingCodec::BITMAP_WIDTH {
+            let span = last
+                .checked_sub(first_doc)
+                .ok_or_else(|| invalid("bitmap posting block ends before it starts"))?;
+            let bytes = bitmap_bytes(span);
+            let words = payload
+                .get(..bytes)
+                .ok_or_else(|| invalid("truncated bitmap posting block"))?;
+            doc_ids.resize(count + simd::BITMAP_EXPAND_SLACK, 0);
+            let population = simd::expand_bitmap(words, first_doc, doc_ids);
+            doc_ids.truncate(count);
+            if population != count {
+                return Err(invalid("bitmap population disagrees with the block count"));
+            }
+            return Ok((state, header_len + bytes, count));
+        }
         if codec == PostingCodec::Simd4x {
             let values = if count == BLOCK_SIZE {
                 count
@@ -2112,7 +2304,7 @@ impl BlockPostingList {
         }
         let deltas_bytes = if count > 1 {
             match codec {
-                PostingCodec::Rounded => {
+                PostingCodec::Rounded | PostingCodec::RoundedBitmap => {
                     let rounded = simd::RoundedBitWidth::try_from_u8(doc_width)
                         .ok_or_else(|| invalid("invalid rounded posting width"))?;
                     let bytes = (count - 1) * rounded.bytes_per_value();
@@ -2194,7 +2386,7 @@ impl BlockPostingList {
             PostingCodec::Simd4x => {
                 bitpacking4x::decode(&payload[..packed_bytes(count, tf_bits)], tf_bits, tfs);
             }
-            PostingCodec::Rounded => {
+            PostingCodec::Rounded | PostingCodec::RoundedBitmap => {
                 let rounded = simd::RoundedBitWidth::try_from_u8(tf_bits)
                     .expect("invalid rounded posting frequency width");
                 simd::unpack_rounded(
@@ -2228,13 +2420,79 @@ impl BlockPostingList {
     }
 
     /// Codec of block `block_idx` (diagnostics).
+    /// Codec of block `block_idx` (diagnostics); `RoundedBitmap` names a
+    /// bitmap block.
     pub fn block_codec(&self, block_idx: usize) -> Option<PostingCodec> {
         if block_idx >= self.l0_count {
             return None;
         }
         PostingCodec::from_header_byte(self.block_header(block_idx)[6])
             .ok()
-            .map(|(codec, _)| codec)
+            .map(|(codec, width)| {
+                if width == PostingCodec::BITMAP_WIDTH {
+                    PostingCodec::RoundedBitmap
+                } else {
+                    codec
+                }
+            })
+    }
+
+    /// Block `block` when it is a bitmap block, for membership probes that
+    /// skip decoding its IDs.
+    pub(crate) fn bitmap_block(&self, block: usize) -> Option<BitmapBlock<'_>> {
+        self.bitmap_block_before(block, TERMINATED)
+    }
+
+    /// Block `block` when it is a bitmap block ending before `end`. Reads one
+    /// header byte, so asking about a delta block costs only its directory
+    /// entry, which loading it reads anyway.
+    #[inline]
+    fn bitmap_block_before(&self, block: usize, end: DocId) -> Option<BitmapBlock<'_>> {
+        if block >= self.l0_count {
+            return None;
+        }
+        let (first, last, offset, _) = self.read_l0_entry(block);
+        let doc_bits = if self.compact_headers {
+            self.l0_bytes[self.l0_count * L0_SIZE + block * 4 + 2]
+        } else {
+            self.stream[offset as usize + 6]
+        };
+        if last >= end || doc_bits != PostingCodec::BITMAP_WIDTH {
+            return None;
+        }
+        let header = self.block_header(block);
+        let bytes = bitmap_bytes(last - first);
+        let (state, header_len) = if self.compact_headers {
+            (block, 0)
+        } else {
+            (offset as usize, 8)
+        };
+        let count = u16::from_le_bytes([header[0], header[1]]) as usize;
+        Some(BitmapBlock {
+            first,
+            last,
+            words: &self.block_payload(block)[..bytes],
+            tf_state: (state, header_len + bytes, count),
+            word: 0,
+            rank_before: 0,
+        })
+    }
+
+    /// How densely the list's documents fill its ID range, which picks the
+    /// membership-bit kernel (`fill_doc_window`).
+    pub(crate) fn density(&self) -> ListDensity {
+        let span = self
+            .block_first_doc(0)
+            .zip(self.block_last_doc(self.l0_count.saturating_sub(1)))
+            .map_or(u64::MAX, |(first, last)| u64::from(last - first));
+        let count = u64::from(self.doc_count());
+        if count < 16 || span >= count * 8 {
+            ListDensity::Sparse
+        } else if span >= count * 2 {
+            ListDensity::Dense
+        } else {
+            ListDensity::Packed
+        }
     }
 
     /// First doc_id of a block (from L0 skip entry). Returns `None` if out of range.
@@ -2693,9 +2951,38 @@ impl<'a> BlockPostingIterator<'a> {
         assert!(docs.len() <= BLOCK_SIZE);
         let mut input = 0;
         let mut kept = 0;
-        while input < docs.len() {
-            if self.seek(docs[input]) == TERMINATED {
-                break;
+        let mut next = self.current_block + 1;
+        while input < docs.len() && !self.exhausted {
+            if docs[input] > *self.block_doc_ids.last().unwrap() {
+                // One directory search per block the probes move into.
+                let Some(block) = self.block_list.seek_block(docs[input], next) else {
+                    self.exhausted = true;
+                    break;
+                };
+                next = block + 1;
+                // Membership in a bitmap block is a bit test: decoding the
+                // block for a few probes cost more than the probes.
+                if !WITH_FREQUENCIES && let Some(mut bitmap) = self.block_list.bitmap_block(block) {
+                    while input < docs.len() && docs[input] <= bitmap.last {
+                        if bitmap.rank_of(docs[input]).is_some() {
+                            docs[kept] = docs[input];
+                            kept += 1;
+                        }
+                        input += 1;
+                    }
+                    if input == docs.len() {
+                        // Rest at the last probe, as `retain_doc_batch` promises.
+                        self.load_block(block);
+                        let probe = docs[input - 1];
+                        self.position_in_block =
+                            self.block_doc_ids.partition_point(|&doc| doc < probe);
+                    }
+                    continue;
+                }
+                self.load_block(block);
+                if self.exhausted {
+                    break;
+                }
             }
             let last = *self.block_doc_ids.last().unwrap();
             while input < docs.len() && docs[input] <= last {
@@ -2725,51 +3012,39 @@ impl<'a> BlockPostingIterator<'a> {
         let end = base.saturating_add(span);
         bits.fill(0);
         self.seek(base);
-        let list = self.block_list.as_ref();
-        let dense = list.doc_count() >= 16
-            && list
-                .block_first_doc(0)
-                .zip(list.block_last_doc(list.num_blocks().saturating_sub(1)))
-                .is_some_and(|(first, last)| {
-                    u64::from(last)
-                        .checked_sub(u64::from(first))
-                        .is_some_and(|span| span < u64::from(list.doc_count()) * 2)
-                });
-        if dense {
-            self.fill_doc_words::<true>(base, end, bits);
-        } else {
-            self.fill_doc_words::<false>(base, end, bits);
-        }
-    }
-
-    fn fill_doc_words<const GROUPED: bool>(&mut self, base: DocId, end: DocId, bits: &mut [u64]) {
-        self.visit_until::<false>(end, |docs, _| {
-            // Decide once per window, outside the hot decoded-run loop.
-            if !GROUPED {
-                for &doc in docs {
-                    let offset = (doc - base) as usize;
-                    bits[offset / 64] |= 1u64 << (offset % 64);
-                }
-                return true;
-            }
-            let mut index = 0;
-            while index < docs.len() {
-                let offset = (docs[index] - base) as usize;
-                let word_index = offset / 64;
-                let mut mask = 1u64 << (offset % 64);
-                index += 1;
-                while index < docs.len() {
-                    let offset = (docs[index] - base) as usize;
-                    if offset / 64 != word_index {
-                        break;
+        // Decide once per window, outside the hot decoded-run loop.
+        let density = self.block_list.as_ref().density();
+        let mut run = (usize::MAX, 0);
+        while self.doc() < end {
+            let docs = &self.block_doc_ids[self.position_in_block..];
+            let count = docs.partition_point(|&doc| doc < end);
+            match density {
+                ListDensity::Sparse => {
+                    for &doc in &docs[..count] {
+                        let offset = (doc - base) as usize;
+                        bits[offset / 64] |= 1u64 << (offset % 64);
                     }
-                    mask |= 1u64 << (offset % 64);
-                    index += 1;
                 }
-                bits[word_index] |= mask;
+                ListDensity::Dense => set_sorted_doc_bits(bits, base, &docs[..count], &mut run),
+                ListDensity::Packed => set_sorted_doc_bit_groups(bits, base, &docs[..count]),
             }
-            true
-        });
+            self.position_in_block += count;
+            if self.position_in_block < self.block_doc_ids.len() {
+                break;
+            }
+            // Bitmap blocks that end inside the window are copied as words,
+            // never decoded. Block cursors make skipping them equivalent to
+            // loading each in turn.
+            let mut next = self.current_block + 1;
+            while let Some(bitmap) = self.block_list.bitmap_block_before(next, end) {
+                or_bitmap_words(bits, bitmap.first - base, bitmap.words);
+                // Later documents may share only the last copied word.
+                let word = ((bitmap.last - base) / 64) as usize;
+                run = (word, bits[word]);
+                next += 1;
+            }
+            self.load_block(next);
+        }
     }
 
     /// Visit already decoded posting runs before `end` (exclusive). Each run
@@ -2980,6 +3255,7 @@ mod compact_layout_tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let make = |divisor| {
                 let mut postings = PostingList::new();
@@ -3175,6 +3451,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             for count in [128, 1, 127, 128, 17, 256, 257] {
                 for freq in [0, 1, 255, 65536] {
@@ -3213,12 +3490,85 @@ mod tests {
     }
 
     #[test]
+    fn membership_probes_test_bitmap_blocks_without_losing_cursor_state() {
+        // Bitmap blocks (dense runs) interleaved with delta blocks (one ID in
+        // nine), with positions so resting cursors must keep their prefixes.
+        let docs: Vec<u32> = (0..1000)
+            .chain((0..128).map(|i| 1000 + i * 9))
+            .chain(2200..3000)
+            .chain((0..200).map(|i| 3100 + i * 9))
+            .collect();
+        let mut postings = PostingList::new();
+        let mut prefixes = Vec::new();
+        let mut prefix = 0u64;
+        for &doc in &docs {
+            let tf = doc % 5 + 1;
+            postings.push(doc, tf);
+            prefixes.push(prefix);
+            prefix += u64::from(tf);
+        }
+        let list = BlockPostingList::from_posting_list_with_options(
+            &postings,
+            true,
+            None,
+            PostingCodec::RoundedBitmap,
+        )
+        .unwrap();
+        assert!((0..list.num_blocks()).any(|b| list.block_codec(b) == Some(PostingCodec::Rounded)));
+        assert!(
+            (0..list.num_blocks())
+                .any(|b| list.block_codec(b) == Some(PostingCodec::RoundedBitmap))
+        );
+        let probe_sets: [Vec<u32>; 5] = [
+            // Ends inside a bitmap block.
+            (0..128).map(|i| 3 + i * 23).collect(),
+            // Crosses bitmap and delta blocks and ends inside a delta block.
+            (0..128).map(|i| 500 + i * 31).collect(),
+            // Runs past the last document.
+            (0..128).map(|i| 2900 + i * 17).collect(),
+            // Starts inside the loaded block.
+            (0..60).map(|i| i * 3).collect(),
+            vec![2999, 3000, 3001],
+        ];
+        for probes in &probe_sets {
+            let mut cursor = list.iterator();
+            let mut kept = probes.clone();
+            let count = cursor.retain_doc_batch(&mut kept);
+            let expected: Vec<u32> = probes
+                .iter()
+                .copied()
+                .filter(|doc| docs.binary_search(doc).is_ok())
+                .collect();
+            assert_eq!(&kept[..count], expected.as_slice(), "{:?}", &probes[..2]);
+            // The cursor rests at or beyond the last probe, on a real document.
+            let last = *probes.last().unwrap();
+            let at = docs.partition_point(|&doc| doc < last);
+            assert!(cursor.doc() >= last);
+            if cursor.doc() != TERMINATED {
+                let index = docs.binary_search(&cursor.doc()).unwrap();
+                assert!(index >= at);
+                assert_eq!(cursor.term_freq(), cursor.doc() % 5 + 1);
+                assert_eq!(cursor.position_cursor(), prefixes[index]);
+            }
+            // Later (forward) movement stays exact.
+            for target in [last + 1, last + 50, last + 400] {
+                let expected = docs.iter().copied().find(|&doc| doc >= target);
+                assert_eq!(cursor.seek(target), expected.unwrap_or(TERMINATED));
+                if let Some(doc) = expected {
+                    assert_eq!(cursor.term_freq(), doc % 5 + 1);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn compact_membership_batches_preserve_resume_frequencies_and_position_prefixes() {
         for codec in [
             PostingCodec::Rounded,
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut postings = PostingList::new();
             let mut expected = Vec::new();
@@ -3284,8 +3634,9 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
-            for stride in [1, 2, 3, 67, 129] {
+            for stride in [1, 2, 3, 7, 9, 67, 129] {
                 let docs: Vec<u32> = (0..10_000).step_by(stride).collect();
                 let mut postings = PostingList::new();
                 for &doc in &docs {
@@ -3329,6 +3680,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut postings = PostingList::new();
             let mut expected = Vec::new();
@@ -3434,6 +3786,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut postings = PostingList::new();
             let mut expected = Vec::new();
@@ -3469,6 +3822,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let docs: Vec<_> = (0..600u32).map(|doc| (doc * 11, u32::MAX - doc)).collect();
             let prefixes = expected_cursors(&docs);
@@ -3516,6 +3870,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let postings = BlockPostingList::build(&list, true, None, codec, false, false).unwrap();
             let bytes = serialize_bpl(&postings);
@@ -3570,6 +3925,7 @@ mod tests {
                 PostingCodec::Packed,
                 PostingCodec::Pfor,
                 PostingCodec::Simd4x,
+                PostingCodec::RoundedBitmap,
             ] {
                 let postings =
                     BlockPostingList::build(&list, true, None, codec, false, false).unwrap();
@@ -3615,6 +3971,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let postings = BlockPostingList::build(&list, true, None, codec, false, false).unwrap();
             let bytes = serialize_bpl(&postings);
@@ -4312,11 +4669,13 @@ mod tests {
         }
         let rounded = BlockPostingList::from_posting_list(&list).unwrap();
         let mut sizes = Vec::new();
+        let mut bitmap_blocks = 0;
         for codec in [
             PostingCodec::Rounded,
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let bpl = BlockPostingList::from_posting_list_with_codec(&list, codec).unwrap();
             assert_eq!(collect_postings(&bpl), postings, "{codec}");
@@ -4327,7 +4686,17 @@ mod tests {
                 } else {
                     codec
                 };
-                assert_eq!(bpl.block_codec(b), Some(expected_codec));
+                if codec == PostingCodec::RoundedBitmap {
+                    // Blocks are bitmaps only where that is smaller.
+                    let actual = bpl.block_codec(b).unwrap();
+                    assert!(matches!(
+                        actual,
+                        PostingCodec::Rounded | PostingCodec::RoundedBitmap
+                    ));
+                    bitmap_blocks += usize::from(actual == PostingCodec::RoundedBitmap);
+                } else {
+                    assert_eq!(bpl.block_codec(b), Some(expected_codec));
+                }
                 assert_eq!(bpl.block_max_tf(b), rounded.block_max_tf(b));
             }
             // Serialized round trip (both copying and zero-copy paths).
@@ -4360,6 +4729,139 @@ mod tests {
         let size = |c: PostingCodec| sizes.iter().find(|(k, _)| *k == c).unwrap().1;
         assert!(size(PostingCodec::Packed) < size(PostingCodec::Rounded));
         assert!(size(PostingCodec::Pfor) < size(PostingCodec::Packed));
+        // Every block holds a 100,000-ID gap, so none is a bitmap.
+        assert_eq!(bitmap_blocks, 0);
+        assert_eq!(
+            size(PostingCodec::RoundedBitmap),
+            size(PostingCodec::Rounded)
+        );
+    }
+
+    #[test]
+    fn bitmap_blocks_decode_seek_fill_windows_and_merge_like_delta_blocks() {
+        let shapes: Vec<Vec<u32>> = vec![
+            (0..1000).collect(),
+            (5..3000).step_by(3).collect(),
+            (0..4000).step_by(7).collect(),
+            // One doc in nine: a bitmap would be larger than 8-bit deltas.
+            (0..4000).step_by(9).collect(),
+            // A 128-ID span (a third word holding only its last bit), then a
+            // singleton tail block.
+            (0..=128)
+                .filter(|&d| d != 64)
+                .chain((129..400).step_by(2))
+                .collect(),
+            (0..257).map(|i| i * 2).collect(),
+            // A dense list whose bitmap blocks end mid-word (393), then a
+            // delta block (one ID in nine) whose first document (400) shares
+            // that word inside the same window.
+            (10..394)
+                .chain((0..128).map(|i| 400 + i * 9))
+                .chain(1600..5000)
+                .collect(),
+            (0..300u32).map(|i| TERMINATED - 30_000 + i * 2).collect(),
+        ];
+        for docs in &shapes {
+            let postings: Vec<(u32, u32)> = docs.iter().map(|&d| (d, 1 + d % 5)).collect();
+            let mut list = PostingList::new();
+            postings.iter().for_each(|&(d, tf)| list.push(d, tf));
+            let delta =
+                BlockPostingList::from_posting_list_with_codec(&list, PostingCodec::Rounded)
+                    .unwrap();
+            let bitmap =
+                BlockPostingList::from_posting_list_with_codec(&list, PostingCodec::RoundedBitmap)
+                    .unwrap();
+            let bitmaps = (0..bitmap.num_blocks())
+                .filter(|&b| bitmap.block_codec(b) == Some(PostingCodec::RoundedBitmap))
+                .count();
+            let bytes = serialize_bpl(&bitmap);
+            if bitmaps == 0 {
+                assert_eq!(bytes, serialize_bpl(&delta), "{:?}", &docs[..3]);
+            } else {
+                assert!(bytes.len() < serialize_bpl(&delta).len());
+            }
+            for candidate in [
+                bitmap.clone(),
+                BlockPostingList::deserialize(&bytes).unwrap(),
+            ] {
+                assert_eq!(collect_postings(&candidate), postings);
+                for target in [0, 1, 63, 64, 65, 500, 1024, 2999, TERMINATED - 29_999] {
+                    let mut it = candidate.iterator();
+                    let expected = postings.iter().find(|p| p.0 >= target).copied();
+                    assert_eq!(it.seek(target), expected.map_or(TERMINATED, |p| p.0));
+                    if let Some((_, tf)) = expected {
+                        assert_eq!(it.term_freq(), tf);
+                    }
+                }
+                let mut it = candidate.iterator();
+                let mut windowed = Vec::new();
+                while it.doc() != TERMINATED {
+                    let base = it.doc() / 4096 * 4096;
+                    let mut bits = [u64::MAX; 64];
+                    it.fill_doc_window(base, &mut bits);
+                    for (index, word) in bits.iter().enumerate() {
+                        for bit in 0..64 {
+                            if word >> bit & 1 == 1 {
+                                windowed.push(base + index as u32 * 64 + bit);
+                            }
+                        }
+                    }
+                }
+                assert_eq!(&windowed, docs);
+            }
+            // Copy merges keep bitmap payloads and patch only the first document.
+            if docs[0] < 1_000_000 {
+                let offset = 7_000_001;
+                let merged = BlockPostingList::concatenate_blocks(&[
+                    (bitmap.clone(), 0),
+                    (delta.clone(), offset),
+                ])
+                .unwrap();
+                let expected: Vec<_> = postings
+                    .iter()
+                    .copied()
+                    .chain(postings.iter().map(|&(d, tf)| (d + offset, tf)))
+                    .collect();
+                assert_eq!(collect_postings(&merged), expected);
+                let mut out = Vec::new();
+                BlockPostingList::concatenate_streaming(
+                    &[
+                        (bytes.as_slice(), 0),
+                        (serialize_bpl(&delta).as_slice(), offset),
+                    ],
+                    &mut out,
+                )
+                .unwrap();
+                assert_eq!(
+                    collect_postings(&BlockPostingList::deserialize(&out).unwrap()),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_blocks_that_disagree_with_their_directory_are_rejected() {
+        let mut list = PostingList::new();
+        (0..128u32).for_each(|d| list.push(d * 2, 1));
+        let bitmap =
+            BlockPostingList::from_posting_list_with_codec(&list, PostingCodec::RoundedBitmap)
+                .unwrap();
+        assert_eq!(bitmap.block_codec(0), Some(PostingCodec::RoundedBitmap));
+        let bytes = serialize_bpl(&bitmap);
+        assert!(BlockPostingList::deserialize(&bytes).is_ok());
+        // Payload starts after the 8-byte header: bit 0 is the first document,
+        // bit 1 is absent, bit 254 is the last document and bit 255 is past it.
+        for (bit, reason) in [(0, "first"), (1, "extra"), (254, "last")] {
+            let mut corrupt = bytes.clone();
+            corrupt[8 + bit / 8] ^= 1 << (bit % 8);
+            assert!(BlockPostingList::deserialize(&corrupt).is_err(), "{reason}");
+        }
+        // A bit past the range, compensated by clearing an interior one.
+        let mut corrupt = bytes.clone();
+        corrupt[8 + 255 / 8] ^= 1 << (255 % 8);
+        corrupt[8] ^= 1 << 2;
+        assert!(BlockPostingList::deserialize(&corrupt).is_err());
     }
 
     /// Blocks of different codecs merge by verbatim copy and decode correctly.
@@ -4440,6 +4942,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut postings = PostingList::new();
             for i in 0..3457u32 {
@@ -4817,6 +5320,7 @@ mod tests {
             PostingCodec::Packed,
             PostingCodec::Pfor,
             PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
         ] {
             let mut postings = PostingList::new();
             for i in 0..1100 {

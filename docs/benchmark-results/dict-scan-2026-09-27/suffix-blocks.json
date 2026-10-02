@@ -1,0 +1,353 @@
+{
+  "host": "hermes-validation-moroni (x86-64), CPU 0",
+  "dictionary": "production seg_01a0d51ecbb0761de69d68e5da1a9889.terms, field 0",
+  "build": {
+    "archive_sha256": "f849485f5ae447cc1f2756c68363fcf53eb1d705448f82c91894d14582ad1173",
+    "note": "experiment snapshot with read-only probe accessors on AsyncSSTableReader"
+  },
+  "method": "for each broad wildcard, blocks whose keys overlap the prefix range; blocks with an in-range key ending in the last four suffix bytes; blocks a 3-probe bloom filter over all keys' last four bytes would pass at 2 KiB and 4 KiB",
+  "totals": {
+    "range_blocks": 34010,
+    "blocks_with_ending": 4528,
+    "bloom_2kib_blocks": 5027,
+    "bloom_4kib_blocks": 4896
+  },
+  "patterns": [
+    {
+      "blocks_with_ending": 57,
+      "bloom_2kib_blocks": 59,
+      "bloom_4kib_blocks": 59,
+      "mean_distinct_endings": 541.2706065318818,
+      "pattern": "h*band",
+      "range_blocks": 643
+    },
+    {
+      "blocks_with_ending": 206,
+      "bloom_2kib_blocks": 209,
+      "bloom_4kib_blocks": 207,
+      "mean_distinct_endings": 566.2824267782427,
+      "pattern": "a*nder",
+      "range_blocks": 956
+    },
+    {
+      "blocks_with_ending": 152,
+      "bloom_2kib_blocks": 161,
+      "bloom_4kib_blocks": 161,
+      "mean_distinct_endings": 579.5332390381895,
+      "pattern": "e*tive",
+      "range_blocks": 707
+    },
+    {
+      "blocks_with_ending": 29,
+      "bloom_2kib_blocks": 32,
+      "bloom_4kib_blocks": 29,
+      "mean_distinct_endings": 615.6421188630491,
+      "pattern": "n*arly",
+      "range_blocks": 774
+    },
+    {
+      "blocks_with_ending": 108,
+      "bloom_2kib_blocks": 141,
+      "bloom_4kib_blocks": 126,
+      "mean_distinct_endings": 561.2271095152603,
+      "pattern": "c*mics",
+      "range_blocks": 1114
+    },
+    {
+      "blocks_with_ending": 257,
+      "bloom_2kib_blocks": 262,
+      "bloom_4kib_blocks": 261,
+      "mean_distinct_endings": 558.6825396825396,
+      "pattern": "m*sion",
+      "range_blocks": 882
+    },
+    {
+      "blocks_with_ending": 22,
+      "bloom_2kib_blocks": 29,
+      "bloom_4kib_blocks": 29,
+      "mean_distinct_endings": 576.3968253968254,
+      "pattern": "j*tice",
+      "range_blocks": 252
+    },
+    {
+      "blocks_with_ending": 180,
+      "bloom_2kib_blocks": 182,
+      "bloom_4kib_blocks": 181,
+      "mean_distinct_endings": 462.9105691056911,
+      "pattern": "i*ally",
+      "range_blocks": 1107
+    },
+    {
+      "blocks_with_ending": 246,
+      "bloom_2kib_blocks": 262,
+      "bloom_4kib_blocks": 262,
+      "mean_distinct_endings": 608.0113744075829,
+      "pattern": "p*ture",
+      "range_blocks": 1055
+    },
+    {
+      "blocks_with_ending": 210,
+      "bloom_2kib_blocks": 215,
+      "bloom_4kib_blocks": 213,
+      "mean_distinct_endings": 566.2824267782427,
+      "pattern": "a*ties",
+      "range_blocks": 956
+    },
+    {
+      "blocks_with_ending": 12,
+      "bloom_2kib_blocks": 30,
+      "bloom_4kib_blocks": 28,
+      "mean_distinct_endings": 566.2824267782427,
+      "pattern": "a*rded",
+      "range_blocks": 956
+    },
+    {
+      "blocks_with_ending": 55,
+      "bloom_2kib_blocks": 62,
+      "bloom_4kib_blocks": 62,
+      "mean_distinct_endings": 558.6825396825396,
+      "pattern": "m*utes",
+      "range_blocks": 882
+    },
+    {
+      "blocks_with_ending": 23,
+      "bloom_2kib_blocks": 25,
+      "bloom_4kib_blocks": 24,
+      "mean_distinct_endings": 519.3012048192771,
+      "pattern": "f*iend",
+      "range_blocks": 1079
+    },
+    {
+      "blocks_with_ending": 20,
+      "bloom_2kib_blocks": 30,
+      "bloom_4kib_blocks": 27,
+      "mean_distinct_endings": 566.2824267782427,
+      "pattern": "a*mbly",
+      "range_blocks": 956
+    },
+    {
+      "blocks_with_ending": 156,
+      "bloom_2kib_blocks": 182,
+      "bloom_4kib_blocks": 164,
+      "mean_distinct_endings": 561.2271095152603,
+      "pattern": "c*date",
+      "range_blocks": 1114
+    },
+    {
+      "blocks_with_ending": 43,
+      "bloom_2kib_blocks": 63,
+      "bloom_4kib_blocks": 58,
+      "mean_distinct_endings": 585.1020408163265,
+      "pattern": "g*lden",
+      "range_blocks": 490
+    },
+    {
+      "blocks_with_ending": 79,
+      "bloom_2kib_blocks": 79,
+      "bloom_4kib_blocks": 79,
+      "mean_distinct_endings": 613.9821428571429,
+      "pattern": "v*oria",
+      "range_blocks": 336
+    },
+    {
+      "blocks_with_ending": 58,
+      "bloom_2kib_blocks": 67,
+      "bloom_4kib_blocks": 64,
+      "mean_distinct_endings": 608.0113744075829,
+      "pattern": "p*ssor",
+      "range_blocks": 1055
+    },
+    {
+      "blocks_with_ending": 107,
+      "bloom_2kib_blocks": 110,
+      "bloom_4kib_blocks": 110,
+      "mean_distinct_endings": 501.1899070385126,
+      "pattern": "r*ally",
+      "range_blocks": 753
+    },
+    {
+      "blocks_with_ending": 15,
+      "bloom_2kib_blocks": 17,
+      "bloom_4kib_blocks": 16,
+      "mean_distinct_endings": 540.6712018140589,
+      "pattern": "b*eved",
+      "range_blocks": 882
+    },
+    {
+      "blocks_with_ending": 14,
+      "bloom_2kib_blocks": 23,
+      "bloom_4kib_blocks": 20,
+      "mean_distinct_endings": 519.3012048192771,
+      "pattern": "f*rced",
+      "range_blocks": 1079
+    },
+    {
+      "blocks_with_ending": 49,
+      "bloom_2kib_blocks": 49,
+      "bloom_4kib_blocks": 49,
+      "mean_distinct_endings": 501.1899070385126,
+      "pattern": "r*ican",
+      "range_blocks": 753
+    },
+    {
+      "blocks_with_ending": 75,
+      "bloom_2kib_blocks": 76,
+      "bloom_4kib_blocks": 75,
+      "mean_distinct_endings": 613.9821428571429,
+      "pattern": "v*tory",
+      "range_blocks": 336
+    },
+    {
+      "blocks_with_ending": 329,
+      "bloom_2kib_blocks": 343,
+      "bloom_4kib_blocks": 335,
+      "mean_distinct_endings": 558.6825396825396,
+      "pattern": "m*ster",
+      "range_blocks": 882
+    },
+    {
+      "blocks_with_ending": 28,
+      "bloom_2kib_blocks": 53,
+      "bloom_4kib_blocks": 36,
+      "mean_distinct_endings": 501.1899070385126,
+      "pattern": "r*rove",
+      "range_blocks": 753
+    },
+    {
+      "blocks_with_ending": 174,
+      "bloom_2kib_blocks": 213,
+      "bloom_4kib_blocks": 207,
+      "mean_distinct_endings": 558.6825396825396,
+      "pattern": "m*sing",
+      "range_blocks": 882
+    },
+    {
+      "blocks_with_ending": 16,
+      "bloom_2kib_blocks": 21,
+      "bloom_4kib_blocks": 17,
+      "mean_distinct_endings": 499.9391534391534,
+      "pattern": "u*nown",
+      "range_blocks": 378
+    },
+    {
+      "blocks_with_ending": 19,
+      "bloom_2kib_blocks": 26,
+      "bloom_4kib_blocks": 19,
+      "mean_distinct_endings": 561.2271095152603,
+      "pattern": "c*imed",
+      "range_blocks": 1114
+    },
+    {
+      "blocks_with_ending": 16,
+      "bloom_2kib_blocks": 22,
+      "bloom_4kib_blocks": 17,
+      "mean_distinct_endings": 579.5332390381895,
+      "pattern": "e*cept",
+      "range_blocks": 707
+    },
+    {
+      "blocks_with_ending": 48,
+      "bloom_2kib_blocks": 49,
+      "bloom_4kib_blocks": 49,
+      "mean_distinct_endings": 583.6216216216217,
+      "pattern": "q*tion",
+      "range_blocks": 74
+    },
+    {
+      "blocks_with_ending": 22,
+      "bloom_2kib_blocks": 33,
+      "bloom_4kib_blocks": 33,
+      "mean_distinct_endings": 624.6911907066795,
+      "pattern": "d*ctly",
+      "range_blocks": 1033
+    },
+    {
+      "blocks_with_ending": 291,
+      "bloom_2kib_blocks": 291,
+      "bloom_4kib_blocks": 291,
+      "mean_distinct_endings": 608.0113744075829,
+      "pattern": "p*ical",
+      "range_blocks": 1055
+    },
+    {
+      "blocks_with_ending": 235,
+      "bloom_2kib_blocks": 266,
+      "bloom_4kib_blocks": 258,
+      "mean_distinct_endings": 561.2271095152603,
+      "pattern": "c*lina",
+      "range_blocks": 1114
+    },
+    {
+      "blocks_with_ending": 17,
+      "bloom_2kib_blocks": 21,
+      "bloom_4kib_blocks": 17,
+      "mean_distinct_endings": 583.6216216216217,
+      "pattern": "q*lity",
+      "range_blocks": 74
+    },
+    {
+      "blocks_with_ending": 246,
+      "bloom_2kib_blocks": 252,
+      "bloom_4kib_blocks": 251,
+      "mean_distinct_endings": 561.2271095152603,
+      "pattern": "c*idge",
+      "range_blocks": 1114
+    },
+    {
+      "blocks_with_ending": 216,
+      "bloom_2kib_blocks": 240,
+      "bloom_4kib_blocks": 236,
+      "mean_distinct_endings": 579.5332390381895,
+      "pattern": "e*ence",
+      "range_blocks": 707
+    },
+    {
+      "blocks_with_ending": 183,
+      "bloom_2kib_blocks": 184,
+      "bloom_4kib_blocks": 183,
+      "mean_distinct_endings": 566.2824267782427,
+      "pattern": "a*ress",
+      "range_blocks": 956
+    },
+    {
+      "blocks_with_ending": 16,
+      "bloom_2kib_blocks": 24,
+      "bloom_4kib_blocks": 23,
+      "mean_distinct_endings": 541.2706065318818,
+      "pattern": "h*olds",
+      "range_blocks": 643
+    },
+    {
+      "blocks_with_ending": 58,
+      "bloom_2kib_blocks": 61,
+      "bloom_4kib_blocks": 60,
+      "mean_distinct_endings": 566.2824267782427,
+      "pattern": "a*ysis",
+      "range_blocks": 956
+    },
+    {
+      "blocks_with_ending": 108,
+      "bloom_2kib_blocks": 226,
+      "bloom_4kib_blocks": 223,
+      "mean_distinct_endings": 540.6712018140589,
+      "pattern": "b*ming",
+      "range_blocks": 882
+    },
+    {
+      "blocks_with_ending": 14,
+      "bloom_2kib_blocks": 14,
+      "bloom_4kib_blocks": 14,
+      "mean_distinct_endings": 585.1020408163265,
+      "pattern": "g*itar",
+      "range_blocks": 490
+    },
+    {
+      "blocks_with_ending": 319,
+      "bloom_2kib_blocks": 323,
+      "bloom_4kib_blocks": 323,
+      "mean_distinct_endings": 519.3012048192771,
+      "pattern": "f*nder",
+      "range_blocks": 1079
+    }
+  ]
+}

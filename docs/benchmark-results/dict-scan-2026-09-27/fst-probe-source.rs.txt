@@ -1,0 +1,501 @@
+//! Experiment-only probe: canonical SSTable term dictionary versus an FST keyed
+//! dictionary with an offset-addressed TermInfo value stream.
+//!
+//! Modes (each run in its own process so peak RSS is attributable):
+//!   split <out> synthetic <candidates> | real <path.terms>
+//!       stream a sorted source into K overlapping segment dictionaries,
+//!       written once per format; reports build time and bytes.
+//!   merge-sstable <out>   k-way heap over segment SSTables -> SSTableWriter
+//!   merge-fst <out>       fst::map::OpBuilder union -> MapBuilder + values
+//!   scan <out>            single-star/prefix patterns and point lookups on
+//!                         both merged dictionaries; results must agree.
+use fst::{IntoStreamer, Map, MapBuilder, Streamer};
+use std::collections::BinaryHeap;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+use summa_core::directories::{FileHandle, OwnedBytes};
+use summa_core::structures::{
+    AsyncSSTableReader, SSTableValue, SSTableWriter, SSTableWriterConfig, TermInfo,
+};
+
+const SEGMENTS: usize = 8;
+const TERM_CACHE_BLOCKS: usize = 1024;
+const TERM_CACHE_BYTES: usize = 16 << 20;
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+fn cpu_now() -> Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+        0
+    );
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+fn peak_rss_mib() -> f64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    let raw = usage.ru_maxrss as f64;
+    if cfg!(target_os = "macos") {
+        raw / (1 << 20) as f64
+    } else {
+        raw / 1024.0
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn open_sstable(path: &Path, blocks: usize, bytes: Option<usize>) -> AsyncSSTableReader<TermInfo> {
+    let data = OwnedBytes::new(fs::read(path).unwrap());
+    runtime()
+        .block_on(AsyncSSTableReader::open_with_cache_budget(
+            FileHandle::from_bytes(data),
+            blocks,
+            bytes,
+        ))
+        .unwrap()
+}
+
+// ---------------------------------------------------------------- sources
+
+fn synthetic_terms(candidates: usize) -> Vec<(Vec<u8>, TermInfo)> {
+    let words: Vec<String> = fs::read_to_string("/usr/share/dict/words")
+        .unwrap()
+        .lines()
+        .map(str::to_ascii_lowercase)
+        .filter(|w| w.bytes().all(|b| b.is_ascii_lowercase()))
+        .collect();
+    let suffixes = ["", "s", "ed", "ing", "er", "ly", "tion", "ness", "ism"];
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut keys = Vec::with_capacity(candidates);
+    for _ in 0..candidates {
+        let word = &words[rng.below(words.len() as u64) as usize];
+        let term = match rng.below(100) {
+            0..30 => format!("{word}{}", suffixes[rng.below(9) as usize]),
+            30..50 => format!("{word}{}", words[rng.below(words.len() as u64) as usize]),
+            50..70 => format!("{word}{}", rng.below(10_000)),
+            _ => (0..3 + rng.below(12))
+                .map(|_| b"abcdefghijklmnopqrstuvwxyz0123456789"[rng.below(36) as usize] as char)
+                .collect(),
+        };
+        let mut key = 0u32.to_le_bytes().to_vec();
+        key.extend_from_slice(term.as_bytes());
+        keys.push(key);
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let mut offset = 0u64;
+    keys.into_iter()
+        .map(|key| {
+            let info = match rng.below(100) {
+                0..65 => TermInfo::try_inline(&[rng.below(10_000_000) as u32], &[1]).unwrap(),
+                65..80 => {
+                    let first = rng.below(5_000_000) as u32;
+                    TermInfo::try_inline(&[first, first + 1 + rng.below(4_000_000) as u32], &[1, 2])
+                        .unwrap()
+                }
+                _ => {
+                    let scale = 1 << rng.below(20);
+                    let doc_freq = 4 + (rng.below(scale) as u32);
+                    let len = doc_freq as u64 * 2;
+                    offset += len;
+                    if rng.below(2) == 0 {
+                        TermInfo::external(offset - len, len, doc_freq)
+                    } else {
+                        TermInfo::external_with_positions(offset - len, len, doc_freq, offset * 3, len)
+                    }
+                }
+            };
+            (key, info)
+        })
+        .collect()
+}
+
+/// Deterministic overlapping assignment: 70% of terms live in one segment,
+/// the rest in two or three, like frequent words across flushed segments.
+fn segments_for(key: &[u8]) -> Vec<usize> {
+    let mut rng = Rng(key.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+    }) | 1);
+    let count = if rng.below(10) < 7 { 1 } else { 2 + rng.below(2) as usize };
+    let mut chosen = Vec::with_capacity(count);
+    while chosen.len() < count {
+        let segment = rng.below(SEGMENTS as u64) as usize;
+        if !chosen.contains(&segment) {
+            chosen.push(segment);
+        }
+    }
+    chosen
+}
+
+fn for_each_source(source: &[String], mut visit: impl FnMut(&[u8], &TermInfo)) -> usize {
+    match source[0].as_str() {
+        "synthetic" => {
+            let terms = synthetic_terms(source[1].parse().unwrap());
+            for (key, info) in &terms {
+                visit(key, info);
+            }
+            terms.len()
+        }
+        "real" => {
+            let reader = open_sstable(Path::new(&source[1]), 16, None);
+            let rt = runtime();
+            let mut iter = reader.iter();
+            let mut count = 0;
+            while let Some((key, info)) = rt.block_on(iter.next()).unwrap() {
+                visit(&key, &info);
+                count += 1;
+            }
+            count
+        }
+        other => panic!("unknown source {other}"),
+    }
+}
+
+// ---------------------------------------------------------------- writers
+
+struct FstWriter {
+    map: MapBuilder<BufWriter<File>>,
+    values: BufWriter<File>,
+    offset: u64,
+    scratch: Vec<u8>,
+}
+
+impl FstWriter {
+    fn create(dir: &Path, name: &str) -> Self {
+        Self {
+            map: MapBuilder::new(BufWriter::new(File::create(dir.join(format!("{name}.fst"))).unwrap()))
+                .unwrap(),
+            values: BufWriter::new(File::create(dir.join(format!("{name}.val"))).unwrap()),
+            offset: 0,
+            scratch: Vec::with_capacity(64),
+        }
+    }
+
+    fn insert(&mut self, key: &[u8], info: &TermInfo) {
+        self.scratch.clear();
+        info.serialize(&mut self.scratch).unwrap();
+        self.values.write_all(&self.scratch).unwrap();
+        self.map.insert(key, self.offset).unwrap();
+        self.offset += self.scratch.len() as u64;
+    }
+
+    fn finish(self) {
+        self.map.finish().unwrap();
+        self.values.into_inner().unwrap().sync_all().unwrap();
+    }
+}
+
+fn sstable_writer(dir: &Path, name: &str) -> SSTableWriter<BufWriter<File>, TermInfo> {
+    let file = File::create(dir.join(format!("{name}.sst"))).unwrap();
+    SSTableWriter::with_config(BufWriter::new(file), SSTableWriterConfig::default())
+}
+
+fn file_len(path: PathBuf) -> u64 {
+    fs::metadata(path).unwrap().len()
+}
+
+fn split(dir: &Path, source: &[String]) {
+    fs::create_dir_all(dir).unwrap();
+    let mut report = serde_json::Map::new();
+    for format in ["sstable", "fst"] {
+        let start = Instant::now();
+        let cpu = cpu_now();
+        let entries = if format == "sstable" {
+            let mut writers: Vec<_> = (0..SEGMENTS)
+                .map(|i| sstable_writer(dir, &format!("seg{i}")))
+                .collect();
+            let n = for_each_source(source, |key, info| {
+                for segment in segments_for(key) {
+                    writers[segment].insert(key, info).unwrap();
+                }
+            });
+            writers.into_iter().for_each(|w| drop(w.finish().unwrap().into_inner().unwrap()));
+            n
+        } else {
+            let mut writers: Vec<_> = (0..SEGMENTS)
+                .map(|i| FstWriter::create(dir, &format!("seg{i}")))
+                .collect();
+            let n = for_each_source(source, |key, info| {
+                for segment in segments_for(key) {
+                    writers[segment].insert(key, info);
+                }
+            });
+            writers.into_iter().for_each(FstWriter::finish);
+            n
+        };
+        let bytes: u64 = (0..SEGMENTS)
+            .map(|i| match format {
+                "sstable" => file_len(dir.join(format!("seg{i}.sst"))),
+                _ => file_len(dir.join(format!("seg{i}.fst"))) + file_len(dir.join(format!("seg{i}.val"))),
+            })
+            .sum();
+        report.insert(
+            format.into(),
+            serde_json::json!({
+                "source_entries": entries,
+                "wall_s": start.elapsed().as_secs_f64(),
+                "cpu_s": (cpu_now() - cpu).as_secs_f64(),
+                "segment_bytes": bytes,
+            }),
+        );
+    }
+    println!("{}", serde_json::Value::Object(report));
+}
+
+// ---------------------------------------------------------------- merges
+
+fn merge_sstable(dir: &Path) {
+    let readers: Vec<_> = (0..SEGMENTS)
+        .map(|i| open_sstable(&dir.join(format!("seg{i}.sst")), 16, None))
+        .collect();
+    let loaded_rss = peak_rss_mib();
+    let rt = runtime();
+    let start = Instant::now();
+    let cpu = cpu_now();
+    let mut iters: Vec<_> = readers.iter().map(|r| r.iter()).collect();
+    // Same shape as `MergedTerms`: min-heap on (key, segment).
+    let mut heap = BinaryHeap::new();
+    let mut heads: Vec<Option<TermInfo>> = vec![None; SEGMENTS];
+    for (segment, iter) in iters.iter_mut().enumerate() {
+        if let Some((key, info)) = rt.block_on(iter.next()).unwrap() {
+            heads[segment] = Some(info);
+            heap.push(std::cmp::Reverse((key, segment)));
+        }
+    }
+    let mut writer = sstable_writer(dir, "merged");
+    let mut terms = 0u64;
+    while let Some(std::cmp::Reverse((key, segment))) = heap.pop() {
+        let info = heads[segment].take().unwrap();
+        while heap.peek().is_some_and(|top| top.0.0 == key) {
+            let std::cmp::Reverse((_, other)) = heap.pop().unwrap();
+            heads[other] = None;
+            advance(&rt, &mut iters[other], other, &mut heads, &mut heap);
+        }
+        writer.insert(&key, &info).unwrap();
+        terms += 1;
+        advance(&rt, &mut iters[segment], segment, &mut heads, &mut heap);
+    }
+    drop(writer.finish().unwrap().into_inner().unwrap());
+    report_merge("sstable", terms, start, cpu, loaded_rss, file_len(dir.join("merged.sst")));
+}
+
+fn advance(
+    rt: &tokio::runtime::Runtime,
+    iter: &mut summa_core::structures::AsyncSSTableIterator<'_, TermInfo>,
+    segment: usize,
+    heads: &mut [Option<TermInfo>],
+    heap: &mut BinaryHeap<std::cmp::Reverse<(Vec<u8>, usize)>>,
+) {
+    if let Some((key, info)) = rt.block_on(iter.next()).unwrap() {
+        heads[segment] = Some(info);
+        heap.push(std::cmp::Reverse((key, segment)));
+    }
+}
+
+fn merge_fst(dir: &Path) {
+    let maps: Vec<Map<Vec<u8>>> = (0..SEGMENTS)
+        .map(|i| Map::new(fs::read(dir.join(format!("seg{i}.fst"))).unwrap()).unwrap())
+        .collect();
+    let values: Vec<Vec<u8>> = (0..SEGMENTS)
+        .map(|i| fs::read(dir.join(format!("seg{i}.val"))).unwrap())
+        .collect();
+    let loaded_rss = peak_rss_mib();
+    let start = Instant::now();
+    let cpu = cpu_now();
+    let mut op = fst::map::OpBuilder::new();
+    for map in &maps {
+        op = op.add(map);
+    }
+    let mut union = op.union();
+    let mut writer = FstWriter::create(dir, "merged");
+    let mut terms = 0u64;
+    while let Some((key, sources)) = union.next() {
+        // Lowest segment wins, matching the SSTable heap's tie order.
+        let source = sources.iter().min_by_key(|s| s.index).unwrap();
+        let info = TermInfo::deserialize(&mut &values[source.index][source.value as usize..]).unwrap();
+        writer.insert(key, &info);
+        terms += 1;
+    }
+    writer.finish();
+    let bytes = file_len(dir.join("merged.fst")) + file_len(dir.join("merged.val"));
+    report_merge("fst", terms, start, cpu, loaded_rss, bytes);
+}
+
+fn report_merge(format: &str, terms: u64, start: Instant, cpu: Duration, loaded_rss: f64, bytes: u64) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "format": format,
+            "merged_terms": terms,
+            "wall_s": start.elapsed().as_secs_f64(),
+            "cpu_s": (cpu_now() - cpu).as_secs_f64(),
+            "rss_after_loading_sources_mib": loaded_rss,
+            "peak_rss_mib": peak_rss_mib(),
+            "merged_bytes": bytes,
+        })
+    );
+}
+
+// ---------------------------------------------------------------- scans
+
+fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.pop() {
+        if last < 0xff {
+            upper.push(last + 1);
+            return Some(upper);
+        }
+    }
+    None
+}
+
+fn median_cpu(iterations: usize, mut run: impl FnMut()) -> f64 {
+    for _ in 0..3 {
+        run();
+    }
+    let mut samples: Vec<f64> = (0..iterations)
+        .map(|_| {
+            let start = cpu_now();
+            run();
+            (cpu_now() - start).as_secs_f64() * 1e3
+        })
+        .collect();
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
+}
+
+fn scan(dir: &Path, field: u32, patterns: &[String]) {
+    let sstable = open_sstable(&dir.join("merged.sst"), TERM_CACHE_BLOCKS, Some(TERM_CACHE_BYTES));
+    // Every block retained: isolates entry decoding from block decompression
+    // (the ceiling for a larger term cache or uncompressed blocks).
+    // Warmup iterations fill it; one pattern's range must fit the block cap.
+    let warm = open_sstable(&dir.join("merged.sst"), usize::MAX, None);
+    let map = Map::new(fs::read(dir.join("merged.fst")).unwrap()).unwrap();
+    let values = fs::read(dir.join("merged.val")).unwrap();
+    let mut rows = Vec::new();
+    for pattern in patterns {
+        let (prefix, suffix) = pattern.split_once('*').unwrap_or((pattern, ""));
+        let mut key_prefix = field.to_le_bytes().to_vec();
+        key_prefix.extend_from_slice(prefix.as_bytes());
+        let min_len = key_prefix.len() + suffix.len();
+        let accepts = |key: &[u8]| key.len() >= min_len && key.ends_with(suffix.as_bytes());
+
+        let mut scanned = 0usize;
+        let scan_sstable = |reader: &AsyncSSTableReader<TermInfo>, scanned: &mut usize| {
+            reader
+                .prefix_scan_values_sync(&key_prefix, usize::MAX, usize::MAX, |key| {
+                    *scanned += 1;
+                    accepts(key)
+                })
+                .unwrap()
+                .0
+        };
+        let sstable_scan = |scanned: &mut usize| scan_sstable(&sstable, scanned);
+        let warm_scan = |scanned: &mut usize| scan_sstable(&warm, scanned);
+        let fst_scan = |scanned: &mut usize| {
+            let range = map.range().ge(&key_prefix);
+            let mut stream = match successor(&key_prefix) {
+                Some(upper) => range.lt(upper).into_stream(),
+                None => range.into_stream(),
+            };
+            let mut out = Vec::new();
+            while let Some((key, offset)) = stream.next() {
+                *scanned += 1;
+                if accepts(key) {
+                    out.push(TermInfo::deserialize(&mut &values[offset as usize..]).unwrap());
+                }
+            }
+            out
+        };
+        let expected = sstable_scan(&mut scanned);
+        let mut fst_scanned = 0;
+        assert_eq!(fst_scan(&mut fst_scanned), expected, "{pattern}");
+        assert_eq!(fst_scanned, scanned, "{pattern}");
+        assert_eq!(warm_scan(&mut 0), expected, "{pattern}");
+        let mut sink = 0;
+        rows.push(serde_json::json!({
+            "pattern": pattern,
+            "scanned_terms": scanned,
+            "matched_terms": expected.len(),
+            "sstable_cpu_ms": median_cpu(21, || { std::hint::black_box(sstable_scan(&mut sink)); }),
+            "sstable_warm_cpu_ms": median_cpu(21, || { std::hint::black_box(warm_scan(&mut sink)); }),
+            "fst_cpu_ms": median_cpu(21, || { std::hint::black_box(fst_scan(&mut sink)); }),
+        }));
+    }
+
+    // Point lookups for every 97th key of the field range.
+    let mut probes = Vec::new();
+    let mut stream = map.range().ge(field.to_le_bytes()).into_stream();
+    let mut index = 0usize;
+    while let Some((key, _)) = stream.next() {
+        if key[..4] != field.to_le_bytes() {
+            break;
+        }
+        if index % 97 == 0 {
+            probes.push(key.to_vec());
+        }
+        index += 1;
+    }
+    probes.truncate(200_000);
+    let rt = runtime();
+    let sstable_lookup = median_cpu(5, || {
+        for key in &probes {
+            std::hint::black_box(rt.block_on(sstable.get(key)).unwrap().unwrap());
+        }
+    });
+    let fst_lookup = median_cpu(5, || {
+        for key in &probes {
+            let offset = map.get(key).unwrap();
+            std::hint::black_box(TermInfo::deserialize(&mut &values[offset as usize..]).unwrap());
+        }
+    });
+    println!(
+        "{}",
+        serde_json::json!({
+            "patterns": rows,
+            "point_lookups": probes.len(),
+            "sstable_lookup_ns": sstable_lookup * 1e6 / probes.len() as f64,
+            "fst_lookup_ns": fst_lookup * 1e6 / probes.len() as f64,
+            "sstable_bytes": file_len(dir.join("merged.sst")),
+            "sstable_warm_retained_bytes": warm.cached_bytes(),
+            "sstable_warm_retained_blocks": warm.cached_blocks(),
+            "fst_bytes": file_len(dir.join("merged.fst")),
+            "value_bytes": file_len(dir.join("merged.val")),
+        })
+    );
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let dir = PathBuf::from(&args[1]);
+    match args[0].as_str() {
+        "split" => split(&dir, &args[2..]),
+        "merge-sstable" => merge_sstable(&dir),
+        "merge-fst" => merge_fst(&dir),
+        "scan" => scan(&dir, args[2].parse().unwrap(), &args[3..]),
+        other => panic!("unknown mode {other}"),
+    }
+}

@@ -1,0 +1,143 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 732  of event 'cpu-clock'
+# Event count (approx.): 3678391500
+#
+# Overhead  Command          Shared Object      Symbol
+# ........  ...............  .................  ..................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    43.85%  after-bin        after-bin          [.] <summa_core::query::scoring::MaxScoreExecutor>::execute::{closure#0}
+            |
+             --19.67%--<summa_core::query::scoring::MaxScoreExecutor>::execute::{closure#0}
+                       |
+                        --4.37%--<summa_core::query::vector::sparse::SparseVectorQuery as summa_core::query::traits::Query>::scorer_with_options::{closure#0}
+                                  0x895258b2984bcdff
+
+     6.56%  after-bin        after-bin          [.] <summa_core::query::scoring::TermCursor>::seek::{closure#0}
+            |
+             --2.60%--<summa_core::query::scoring::TermCursor>::seek::{closure#0}
+                       |
+                       |--1.78%--0x7
+                       |
+                        --0.55%--0x3f
+
+     5.05%  after-bin        after-bin          [.] <summa_core::query::scoring::TermCursor>::advance::{closure#0}
+            |
+             --1.37%--<summa_core::query::scoring::TermCursor>::advance::{closure#0}
+
+     2.60%  after-bin        after-bin          [.] <summa_core::query::scoring::TermCursor>::ensure_block_loaded::{closure#0}
+            |
+             --1.37%--<summa_core::query::scoring::TermCursor>::ensure_block_loaded::{closure#0}
+
+     1.78%  after-bin        [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               schedule_hrtimeout_range_clock
+               schedule_hrtimeout_range
+               ep_poll
+               do_epoll_wait
+               __x64_sys_epoll_wait
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+               epoll_wait
+               |
+                --0.82%--<mio::poll::Poll>::poll
+
+     1.78%  summa-payload-u  [kernel.kallsyms]  [k] rep_movs_alternative
+            |
+            ---rep_movs_alternative
+               copy_page_to_iter
+               filemap_read
+               generic_file_read_iter
+               ext4_file_read_iter
+               __io_read
+               io_read
+               __io_issue_sqe
+               io_issue_sqe
+               io_submit_sqe
+               io_submit_sqes
+               __do_sys_io_uring_enter
+               __x64_sys_io_uring_enter
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.64%  after-bin        after-bin          [.] <summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into
+            |
+             --0.96%--<summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into
+
+     1.64%  after-bin        after-bin          [.] _blake3_hash_many_avx512
+            |
+             --0.96%--_blake3_hash_many_avx512
+
+     1.37%  after-bin        [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               |
+                --1.23%--try_to_wake_up
+                          wake_up_q
+                          futex_wake
+                          do_futex
+                          __x64_sys_futex
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+                          syscall
+                          |
+                           --0.82%--<parking::Inner>::unpark
+
+     1.37%  summa-payload-u  [kernel.kallsyms]  [k] _raw_spin_unlock_irq
+            |
+            ---_raw_spin_unlock_irq
+               eventfd_write
+               vfs_write
+               ksys_write
+               __x64_sys_write
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.37%  summa-payload-u  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               futex_do_wait
+               __futex_wait
+               futex_wait
+               do_futex
+               __x64_sys_futex
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.23%  after-bin        after-bin          [.] serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>
+     1.09%  after-bin        after-bin          [.] <alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop
+            |
+             --0.55%--<alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop
+
+     0.96%  after-bin        after-bin          [.] 0x0000000000975169
+            |
+             --0.55%--0x6301e300b169
+
+     0.68%  after-bin        after-bin          [.] 0x000000000097514f
+     0.68%  summa-payload-u  [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.55%  after-bin        after-bin          [.] <summa_core::directories::payload::PayloadReadService>::read::{closure#0}
+     0.55%  after-bin        after-bin          [.] 0x0000000000974fac
+     0.55%  after-bin        after-bin          [.] 0x00000000009751bd
+     0.55%  after-bin        after-bin          [.] 0x00000000009751d8
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#
