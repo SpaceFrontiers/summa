@@ -32,7 +32,7 @@ num_cpus = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
 log = "0.4"
-lru = "0.12"
+lru = "0.16"
 rust-stemmers = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-normalization = { workspace = true }
