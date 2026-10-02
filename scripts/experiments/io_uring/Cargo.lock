@@ -2929,7 +2929,6 @@ dependencies = [
 name = "summa-io-probe"
 version = "0.1.0"
 dependencies = [
- "async-channel",
  "async-trait",
  "blake3",
  "futures",
