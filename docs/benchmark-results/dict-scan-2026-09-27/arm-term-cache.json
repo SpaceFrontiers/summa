@@ -1,0 +1,55 @@
+{
+  "host": "Apple M4 (arm64)",
+  "compiler": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "profile": "release, default codegen units",
+  "fixture": "one segment, 6,000,000 documents with one synthetic raw term each (dictionary 67 MB compressed); /usr/share/dict/words-derived generator in the source",
+  "protocol": "single binary; Index::open with num_threads=1 and term_cache_process_bytes as listed; 12 broad wildcards searched top-10 in rotation per cycle; 3 warmup cycles, median of 15; process CPU time (includes the search pool); order a1 b1 b2 a2",
+  "patterns": [
+    "h*band",
+    "a*nder",
+    "e*tive",
+    "m*sion",
+    "p*ture",
+    "c*mics",
+    "g*itar",
+    "v*tory",
+    "f*iend",
+    "b*eved",
+    "r*ican",
+    "u*nown"
+  ],
+  "rows": [
+    {
+      "phase": "a1",
+      "term_cache_process_bytes": 0,
+      "median_cycle_cpu_ms": 129.4,
+      "hits": 96,
+      "docs": 6000000,
+      "segments": 1
+    },
+    {
+      "phase": "b1",
+      "term_cache_process_bytes": 268435456,
+      "median_cycle_cpu_ms": 70.48,
+      "hits": 96,
+      "docs": 6000000,
+      "segments": 1
+    },
+    {
+      "phase": "b2",
+      "term_cache_process_bytes": 268435456,
+      "median_cycle_cpu_ms": 70.2,
+      "hits": 96,
+      "docs": 6000000,
+      "segments": 1
+    },
+    {
+      "phase": "a2",
+      "term_cache_process_bytes": 0,
+      "median_cycle_cpu_ms": 128.69,
+      "hits": 96,
+      "docs": 6000000,
+      "segments": 1
+    }
+  ]
+}

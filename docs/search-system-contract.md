@@ -220,3 +220,15 @@ defaults. Proposed improvements remain hypotheses until measured.
 Choose a [Criterion timing loop](https://docs.rs/criterion/latest/criterion/struct.Bencher.html)
 that makes setup and destruction costs explicit; the merge benchmark intentionally
 includes replacement-output writing and dropping each returned result.
+
+### Optional Linux payload backend validation
+
+`python3 scripts/check_search.py io-uring` validates the optional directory-owned
+service with strict core/server Clippy, lifecycle regressions, canonical document
+batches, sparse block routing/equivalence on both runtime types, and RPC
+hydration/deletion with both explicit backends. It requires Linux 6.0+ and permission to create a ring; backend
+unavailability is an error. This supplements `full` and WASM validation when
+editing [payload I/O ownership](batched-payload-reads.md). The server default stays
+mapped. Directory unlink drains accepted payload leases; whole-index deletion
+retires its directory after the existing lifecycle drain. Process shutdown drains
+the single shared service. Unproven kernel cancellation forbids deletion.

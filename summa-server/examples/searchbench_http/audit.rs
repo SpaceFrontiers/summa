@@ -96,13 +96,31 @@ pub async fn run(path: &Path, input: &Path, config: IndexConfig) -> Result<()> {
                 .search_with_offset_and_count_sync(request.query.as_ref(), 100, 0)?
                 .0;
             let expected = oracle.into_sorted_results();
+            // Constant-score ties follow the field's physical order on
+            // reordered builds (docs/physical-tie-order.md): any distinct
+            // matches are a correct answer; other queries keep exact IDs.
+            let physical_ties = request.query.constant_score();
             anyhow::ensure!(
                 actual.len() == expected.len()
-                    && actual.iter().zip(&expected).all(
-                        |(a, b)| a.doc_id == b.doc_id && a.score.to_bits() == b.score.to_bits()
-                    ),
+                    && actual.iter().zip(&expected).all(|(a, b)| {
+                        (physical_ties || a.doc_id == b.doc_id)
+                            && a.score.to_bits() == b.score.to_bits()
+                    }),
                 "ranked results differ from exhaustive oracle"
             );
+            if physical_ties {
+                let mut docs: Vec<u32> = actual.iter().map(|hit| hit.doc_id).collect();
+                docs.sort_unstable();
+                let mut scorer = request
+                    .query
+                    .scorer_sync(&searcher.segment_readers()[0], 0)?;
+                for (i, &doc) in docs.iter().enumerate() {
+                    anyhow::ensure!(
+                        (i == 0 || docs[i - 1] != doc) && scorer.seek(doc) == doc,
+                        "ranked tie {doc} is a duplicate or not a match"
+                    );
+                }
+            }
             let column = searcher.segment_readers()[0]
                 .fast_field(id.0)
                 .context("missing id column")?;

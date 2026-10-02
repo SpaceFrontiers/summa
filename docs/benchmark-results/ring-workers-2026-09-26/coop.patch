@@ -1,0 +1,13 @@
+--- a/summa-core/src/directories/payload/ring.rs
++++ b/summa-core/src/directories/payload/ring.rs
+@@ -78,7 +78,9 @@
+     }
+ 
+     fn new(counters: Arc<Counters>) -> io::Result<Self> {
+-        let ring = IoUring::new((DEPTH * 2) as u32)?;
++        let ring = IoUring::builder()
++            .setup_coop_taskrun()
++            .build((DEPTH * 2) as u32)?;
+         // Refuse kernels where exceptional teardown has no proven drain path.
+         cancel(&ring)?;
+         let mut probe = io_uring::Probe::new();

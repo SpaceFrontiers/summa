@@ -1,0 +1,1834 @@
+{
+  "captures": [
+    {
+      "family": "regex",
+      "engine": "summa",
+      "symbols": [
+        {
+          "self_percent": 15.64,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::vint::read_vint::<&[u8]>"
+        },
+        {
+          "self_percent": 14.06,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_decompressSequences_bmi2.constprop.0"
+        },
+        {
+          "self_percent": 9.02,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "core::str::converts::from_utf8"
+        },
+        {
+          "self_percent": 7.13,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::sstable::decode_block_entry::<summa_core::structures::sstable::TermInfo>"
+        },
+        {
+          "self_percent": 5.92,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::Pattern>::matches"
+        },
+        {
+          "self_percent": 4.81,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "regex_automata::dfa::search::find_fwd::<&regex_automata::dfa::dense::DFA<alloc::vec::Vec<u32>>>"
+        },
+        {
+          "self_percent": 4.18,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "core::slice::sort::unstable::quicksort::quicksort::<u32, <u32 as core::cmp::PartialOrd>::lt>"
+        },
+        {
+          "self_percent": 4.09,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::sstable::AsyncSSTableReader<summa_core::structures::sstable::TermInfo>>::prefix_scan_values_sync::<<summa_core::segment::reader::SegmentReader>::get_matching_postings_sync<<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer_sync::{closure#0}>::{closure#0}>"
+        },
+        {
+          "self_percent": 3.02,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_union::TermUnionScorer>::from_expanded"
+        },
+        {
+          "self_percent": 1.57,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer::{closure#0}"
+        },
+        {
+          "self_percent": 1.41,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<regex_automata::meta::strategy::Core as regex_automata::meta::strategy::Strategy>::search_half"
+        },
+        {
+          "self_percent": 1.35,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_buildFSETable_body_bmi2.isra.0"
+        },
+        {
+          "self_percent": 1.16,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "finish_task_switch.isra.0"
+        },
+        {
+          "self_percent": 0.81,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "_raw_spin_unlock_irqrestore"
+        },
+        {
+          "self_percent": 0.79,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>"
+        },
+        {
+          "self_percent": 0.77,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<regex_automata::dfa::dense::DFA<alloc::vec::Vec<u32>> as regex_automata::dfa::automaton::Automaton>::start_state_forward"
+        },
+        {
+          "self_percent": 0.63,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198c40"
+        },
+        {
+          "self_percent": 0.54,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "__schedule"
+        },
+        {
+          "self_percent": 0.52,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::docset::BitsetDocSet as summa_core::query::docset::DocSet>::fill_doc_window"
+        },
+        {
+          "self_percent": 0.5,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198680"
+        }
+      ],
+      "report_sha256": "a03623eea90d497788952a4b2fa0c63a918e2a41f901e8422c32c4ad4684df22",
+      "binary_sha256": "8410fac8ef2d87ff5a9464bd8072011777ce964b039887dbd38e4bfb69903cb7",
+      "samples": "215K",
+      "event": "task-clock",
+      "raw_sha256": "0222c8ef6df7e26347e2955de3c0b86fdcb0a51ecf667224f299b4cad2be962c"
+    },
+    {
+      "family": "regex",
+      "engine": "luxir",
+      "symbols": [
+        {
+          "self_percent": 3.05,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f511b"
+        },
+        {
+          "self_percent": 3.04,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "malloc"
+        },
+        {
+          "self_percent": 1.85,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "cfree"
+        },
+        {
+          "self_percent": 1.71,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e95d"
+        },
+        {
+          "self_percent": 1.55,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e65f"
+        },
+        {
+          "self_percent": 1.38,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f5100"
+        },
+        {
+          "self_percent": 1.28,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f510c"
+        },
+        {
+          "self_percent": 1.18,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c890"
+        },
+        {
+          "self_percent": 1.14,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000056bd2e"
+        },
+        {
+          "self_percent": 1.12,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c949"
+        },
+        {
+          "self_percent": 1.1,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca6c"
+        },
+        {
+          "self_percent": 1.02,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c954"
+        },
+        {
+          "self_percent": 1.02,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000056bd20"
+        },
+        {
+          "self_percent": 0.92,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x000000000019973a"
+        },
+        {
+          "self_percent": 0.83,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "finish_task_switch.isra.0"
+        },
+        {
+          "self_percent": 0.83,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca86"
+        },
+        {
+          "self_percent": 0.81,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca69"
+        },
+        {
+          "self_percent": 0.77,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "_raw_spin_unlock_irqrestore"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c945"
+        },
+        {
+          "self_percent": 0.74,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c936"
+        },
+        {
+          "self_percent": 0.73,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c4f3"
+        },
+        {
+          "self_percent": 0.7,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e96e"
+        },
+        {
+          "self_percent": 0.69,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090f136"
+        },
+        {
+          "self_percent": 0.68,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c92a"
+        },
+        {
+          "self_percent": 0.64,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca53"
+        },
+        {
+          "self_percent": 0.62,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca80"
+        },
+        {
+          "self_percent": 0.6,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e658"
+        },
+        {
+          "self_percent": 0.6,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e648"
+        },
+        {
+          "self_percent": 0.58,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c932"
+        },
+        {
+          "self_percent": 0.56,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090f513"
+        },
+        {
+          "self_percent": 0.55,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c8e8"
+        },
+        {
+          "self_percent": 0.5,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e8c8"
+        }
+      ],
+      "report_sha256": "149203b9d176f22c01f5ae7b8fc8759ce24a85543b95d410cc8f4bd6fc139238",
+      "binary_sha256": "d848ed884ff43788e8a05596006622c907912c8905f8314f59b08322b4150b89",
+      "samples": "199K",
+      "event": "task-clock",
+      "raw_sha256": "f8ea568e6d081d02e1af52fe0e2be6ad11422a06c23e4bbb95ec0be73d970ffb"
+    },
+    {
+      "family": "wildcard_scan",
+      "engine": "summa",
+      "symbols": [
+        {
+          "self_percent": 32.29,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_decompressSequences_bmi2.constprop.0"
+        },
+        {
+          "self_percent": 20.16,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::vint::read_vint::<&[u8]>"
+        },
+        {
+          "self_percent": 9.22,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::sstable::decode_block_entry::<summa_core::structures::sstable::TermInfo>"
+        },
+        {
+          "self_percent": 4.89,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::sstable::AsyncSSTableReader<summa_core::structures::sstable::TermInfo>>::prefix_scan_values_sync::<<summa_core::segment::reader::SegmentReader>::get_matching_postings_sync<<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer_sync::{closure#0}>::{closure#0}>"
+        },
+        {
+          "self_percent": 3.63,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::Pattern>::matches"
+        },
+        {
+          "self_percent": 3.37,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_buildFSETable_body_bmi2.isra.0"
+        },
+        {
+          "self_percent": 2.37,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer::{closure#0}"
+        },
+        {
+          "self_percent": 2.01,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198680"
+        },
+        {
+          "self_percent": 1.49,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986a5"
+        },
+        {
+          "self_percent": 0.95,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198694"
+        },
+        {
+          "self_percent": 0.84,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "HUF_readDTableX1_wksp"
+        },
+        {
+          "self_percent": 0.76,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198c40"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "core::slice::sort::unstable::quicksort::quicksort::<u32, <u32 as core::cmp::PartialOrd>::lt>"
+        },
+        {
+          "self_percent": 0.53,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "FSE_decompress_wksp_body_bmi2"
+        },
+        {
+          "self_percent": 0.51,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986b7"
+        },
+        {
+          "self_percent": 0.51,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "HUF_readStats_body_bmi2"
+        }
+      ],
+      "report_sha256": "0151703f82305b2915e045122ec1bdde483fb11b44add0f9de3a1dc3289bcfb3",
+      "binary_sha256": "8410fac8ef2d87ff5a9464bd8072011777ce964b039887dbd38e4bfb69903cb7",
+      "samples": "227K",
+      "event": "task-clock",
+      "raw_sha256": "5653d8be876a3b97a6e8ca0fd8206f3d5f4b9031d8343e9b026e9dcec3f812e8"
+    },
+    {
+      "family": "wildcard_scan",
+      "engine": "luxir",
+      "symbols": [
+        {
+          "self_percent": 6.66,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986a5"
+        },
+        {
+          "self_percent": 2.99,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e65f"
+        },
+        {
+          "self_percent": 2.62,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c949"
+        },
+        {
+          "self_percent": 2.47,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca6c"
+        },
+        {
+          "self_percent": 2.38,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c890"
+        },
+        {
+          "self_percent": 2.2,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c954"
+        },
+        {
+          "self_percent": 2.14,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e966"
+        },
+        {
+          "self_percent": 2.13,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c4f3"
+        },
+        {
+          "self_percent": 2.05,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "memcmp@plt"
+        },
+        {
+          "self_percent": 1.91,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e8fc"
+        },
+        {
+          "self_percent": 1.91,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c8e8"
+        },
+        {
+          "self_percent": 1.84,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e96e"
+        },
+        {
+          "self_percent": 1.79,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e648"
+        },
+        {
+          "self_percent": 1.79,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x000000000019869e"
+        },
+        {
+          "self_percent": 1.74,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198680"
+        },
+        {
+          "self_percent": 1.72,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c8c0"
+        },
+        {
+          "self_percent": 1.7,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c8d4"
+        },
+        {
+          "self_percent": 1.69,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca53"
+        },
+        {
+          "self_percent": 1.68,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c8a1"
+        },
+        {
+          "self_percent": 1.66,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e901"
+        },
+        {
+          "self_percent": 1.63,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e8c8"
+        },
+        {
+          "self_percent": 1.59,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c936"
+        },
+        {
+          "self_percent": 1.48,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198694"
+        },
+        {
+          "self_percent": 1.47,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e8f4"
+        },
+        {
+          "self_percent": 1.46,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e93b"
+        },
+        {
+          "self_percent": 1.44,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e90d"
+        },
+        {
+          "self_percent": 1.43,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e8dd"
+        },
+        {
+          "self_percent": 1.43,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c8fa"
+        },
+        {
+          "self_percent": 1.42,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca86"
+        },
+        {
+          "self_percent": 1.4,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca69"
+        },
+        {
+          "self_percent": 1.39,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c945"
+        },
+        {
+          "self_percent": 1.39,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e65b"
+        },
+        {
+          "self_percent": 1.37,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c90e"
+        },
+        {
+          "self_percent": 1.36,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c92a"
+        },
+        {
+          "self_percent": 1.27,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986a9"
+        },
+        {
+          "self_percent": 1.22,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e94e"
+        },
+        {
+          "self_percent": 1.14,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca80"
+        },
+        {
+          "self_percent": 1.12,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e924"
+        },
+        {
+          "self_percent": 1.09,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e658"
+        },
+        {
+          "self_percent": 1.05,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c963"
+        },
+        {
+          "self_percent": 0.99,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c932"
+        },
+        {
+          "self_percent": 0.98,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986ad"
+        },
+        {
+          "self_percent": 0.78,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c8f6"
+        },
+        {
+          "self_percent": 0.76,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c93d"
+        },
+        {
+          "self_percent": 0.74,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c922"
+        },
+        {
+          "self_percent": 0.73,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca50"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c952"
+        },
+        {
+          "self_percent": 0.6,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c93a"
+        },
+        {
+          "self_percent": 0.59,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c95e"
+        },
+        {
+          "self_percent": 0.53,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044ca2d"
+        },
+        {
+          "self_percent": 0.5,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000090e942"
+        }
+      ],
+      "report_sha256": "6316e2338d4a830c6927d1551065846e3c1da2340ad7cf345eca7e5646f230cb",
+      "binary_sha256": "d848ed884ff43788e8a05596006622c907912c8905f8314f59b08322b4150b89",
+      "samples": "212K",
+      "event": "task-clock",
+      "raw_sha256": "668d955a41f3a659e13950ca61a3d08d83bfb722a4a040c40aef60e6d482a38a"
+    },
+    {
+      "family": "and_high_med",
+      "engine": "summa",
+      "symbols": [
+        {
+          "self_percent": 24.21,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::intersect_posting_blocks"
+        },
+        {
+          "self_percent": 11.38,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::avx2::unpack_8bit_delta_decode_with_offset::<0>"
+        },
+        {
+          "self_percent": 9.46,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::fill_doc_window"
+        },
+        {
+          "self_percent": 7.16,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::text_block_bound_for_threshold"
+        },
+        {
+          "self_percent": 7.04,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::run_ranked_conjunction"
+        },
+        {
+          "self_percent": 5.33,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::retain_doc_batch"
+        },
+        {
+          "self_percent": 4.36,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_doc_ids_checked"
+        },
+        {
+          "self_percent": 2.86,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_tfs_slice"
+        },
+        {
+          "self_percent": 2.22,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::segment::chunk_map::DocLengths>::gather_lengths"
+        },
+        {
+          "self_percent": 2.16,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::bm25::PreparedBounds>::impacts::<<summa_core::query::scoring::TermCursor>::text_block_bound_for_threshold::{closure#0}::{closure#1}::{closure#0}>"
+        },
+        {
+          "self_percent": 1.84,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::impacts::ImpactTable>::minimum"
+        },
+        {
+          "self_percent": 1.53,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::seek"
+        },
+        {
+          "self_percent": 1.34,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::load_block"
+        },
+        {
+          "self_percent": 1.29,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::ensure_block_loaded_sync"
+        },
+        {
+          "self_percent": 1.26,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::block_header"
+        },
+        {
+          "self_percent": 1.15,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::seek"
+        },
+        {
+          "self_percent": 1.06,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_doc_ids_only"
+        },
+        {
+          "self_percent": 1.05,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::vint::read_vint::<&[u8]>"
+        },
+        {
+          "self_percent": 0.99,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::block_payload"
+        },
+        {
+          "self_percent": 0.79,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::unpack_rounded_raw_delta_decode"
+        },
+        {
+          "self_percent": 0.79,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::decode_deferred_tfs"
+        },
+        {
+          "self_percent": 0.76,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::advance_pos"
+        },
+        {
+          "self_percent": 0.72,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::avx2::unpack_16bit_delta_decode_with_offset::<0>"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::seek_block"
+        },
+        {
+          "self_percent": 0.61,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::impacts::ImpactTable>::record"
+        },
+        {
+          "self_percent": 0.6,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::boolean::BooleanScorer as summa_core::query::docset::DocSet>::fill_doc_window"
+        }
+      ],
+      "report_sha256": "9881eebdeb76e9a06cc0d440062bc0bdcd9950782f9188c56f6051418af56d75",
+      "binary_sha256": "8410fac8ef2d87ff5a9464bd8072011777ce964b039887dbd38e4bfb69903cb7",
+      "samples": "217K",
+      "event": "task-clock",
+      "raw_sha256": "a8dc5665740a0a8c42bc9436c28345b28962822e3c5d78795b2ec101b02b5e05"
+    },
+    {
+      "family": "and_high_med",
+      "engine": "luxir",
+      "symbols": [
+        {
+          "self_percent": 4.42,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f8b5a"
+        },
+        {
+          "self_percent": 3.97,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9be9"
+        },
+        {
+          "self_percent": 2.21,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f8b4b"
+        },
+        {
+          "self_percent": 2.06,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f8b40"
+        },
+        {
+          "self_percent": 1.74,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006b7015"
+        },
+        {
+          "self_percent": 1.69,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000066b724"
+        },
+        {
+          "self_percent": 1.41,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006b6ff0"
+        },
+        {
+          "self_percent": 1.34,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005d3140"
+        },
+        {
+          "self_percent": 1.32,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9c20"
+        },
+        {
+          "self_percent": 1.29,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9c34"
+        },
+        {
+          "self_percent": 1.24,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005d314f"
+        },
+        {
+          "self_percent": 1.24,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9be0"
+        },
+        {
+          "self_percent": 1.09,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9bf1"
+        },
+        {
+          "self_percent": 0.96,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006b6ff3"
+        },
+        {
+          "self_percent": 0.87,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006b6ff7"
+        },
+        {
+          "self_percent": 0.82,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005d3145"
+        },
+        {
+          "self_percent": 0.72,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006b6ffc"
+        },
+        {
+          "self_percent": 0.56,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006792af"
+        }
+      ],
+      "report_sha256": "1cf833dd39e6e4e63dbd5a19e417dfd59b57b5f08f217a2aea543df0cccb23ca",
+      "binary_sha256": "d848ed884ff43788e8a05596006622c907912c8905f8314f59b08322b4150b89",
+      "samples": "211K",
+      "event": "task-clock",
+      "raw_sha256": "35d437a9aba0aaf622ef85ba7ee02af8a60b95f374bb397c5770dd4c1e15e6fe"
+    },
+    {
+      "family": "or_high_low",
+      "engine": "summa",
+      "symbols": [
+        {
+          "self_percent": 9.81,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::avx2::unpack_8bit_delta_decode_with_offset::<0>"
+        },
+        {
+          "self_percent": 7.97,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::run_text_windows::<false>"
+        },
+        {
+          "self_percent": 7.7,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::seek_block"
+        },
+        {
+          "self_percent": 6.81,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::text_block_bound_for_threshold"
+        },
+        {
+          "self_percent": 5.81,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::block_header"
+        },
+        {
+          "self_percent": 4.2,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_doc_ids_checked"
+        },
+        {
+          "self_percent": 2.71,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::impacts::ImpactTable>::minimum"
+        },
+        {
+          "self_percent": 2.6,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::segment::chunk_map::DocLengths>::gather_lengths"
+        },
+        {
+          "self_percent": 2.56,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::append_scored_window_sync"
+        },
+        {
+          "self_percent": 2.39,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::text_group_bound_for_threshold"
+        },
+        {
+          "self_percent": 2.15,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::window_upper_bound"
+        },
+        {
+          "self_percent": 2.08,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::bm25::PreparedBounds>::impacts::<<summa_core::query::scoring::TermCursor>::text_block_bound_for_threshold::{closure#0}::{closure#1}::{closure#0}>"
+        },
+        {
+          "self_percent": 1.98,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::load_block"
+        },
+        {
+          "self_percent": 1.66,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::retain_doc_batch"
+        },
+        {
+          "self_percent": 1.65,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingIterator>::seek"
+        },
+        {
+          "self_percent": 1.54,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "_raw_spin_unlock_irqrestore"
+        },
+        {
+          "self_percent": 1.54,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "finish_task_switch.isra.0"
+        },
+        {
+          "self_percent": 1.49,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop"
+        },
+        {
+          "self_percent": 1.44,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::skip_noncompetitive_group"
+        },
+        {
+          "self_percent": 1.4,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::vint::read_vint::<&[u8]>"
+        },
+        {
+          "self_percent": 1.19,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>"
+        },
+        {
+          "self_percent": 1.18,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::skip_past_sync"
+        },
+        {
+          "self_percent": 1.09,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::score_candidates_sync"
+        },
+        {
+          "self_percent": 1.05,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::query::scoring::score_text_run"
+        },
+        {
+          "self_percent": 0.95,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::impacts::ImpactTable>::record"
+        },
+        {
+          "self_percent": 0.88,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::block_payload"
+        },
+        {
+          "self_percent": 0.81,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::fast_field::FastFieldReader>::get_text"
+        },
+        {
+          "self_percent": 0.78,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "__schedule"
+        },
+        {
+          "self_percent": 0.76,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_tfs_slice"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_doc_ids_only"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::avx2::unpack_16bit_delta_decode_with_offset::<0>"
+        },
+        {
+          "self_percent": 0.71,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::seek_sync"
+        },
+        {
+          "self_percent": 0.69,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::unpack_rounded_raw_delta_decode"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<crossbeam_epoch::internal::Global>::try_advance"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::find_first_ge_block_from"
+        },
+        {
+          "self_percent": 0.57,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::ensure_block_loaded_sync"
+        },
+        {
+          "self_percent": 0.53,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::bm25::PreparedBounds>::impacts::<<summa_core::query::scoring::TermCursor>::text_group_bound_for_threshold::{closure#0}::{closure#1}::{closure#0}>"
+        }
+      ],
+      "report_sha256": "19d961bcea7f8846a36c81fed79b58014823a95405f6d30c42b5b5d8526352b6",
+      "binary_sha256": "8410fac8ef2d87ff5a9464bd8072011777ce964b039887dbd38e4bfb69903cb7",
+      "samples": "199K",
+      "event": "task-clock",
+      "raw_sha256": "5b3603d3b1da28e0c6d5d69975194df620ea3a9f632e3ea7424e5fd7648b9638"
+    },
+    {
+      "family": "or_high_low",
+      "engine": "luxir",
+      "symbols": [
+        {
+          "self_percent": 6.21,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000066b724"
+        },
+        {
+          "self_percent": 5.5,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f8b5a"
+        },
+        {
+          "self_percent": 5.03,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9be9"
+        },
+        {
+          "self_percent": 2.38,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f8b4b"
+        },
+        {
+          "self_percent": 2.32,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f8b40"
+        },
+        {
+          "self_percent": 1.4,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000064e055"
+        },
+        {
+          "self_percent": 0.93,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005d3140"
+        },
+        {
+          "self_percent": 0.85,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005d314f"
+        },
+        {
+          "self_percent": 0.8,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006a9f2a"
+        },
+        {
+          "self_percent": 0.78,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006ab90e"
+        },
+        {
+          "self_percent": 0.76,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9c20"
+        },
+        {
+          "self_percent": 0.72,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9be0"
+        },
+        {
+          "self_percent": 0.71,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9c34"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f9bf1"
+        },
+        {
+          "self_percent": 0.66,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006a9f1b"
+        },
+        {
+          "self_percent": 0.65,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006ab900"
+        },
+        {
+          "self_percent": 0.62,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005d3145"
+        },
+        {
+          "self_percent": 0.6,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000006ab91c"
+        },
+        {
+          "self_percent": 0.58,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005f8b56"
+        }
+      ],
+      "report_sha256": "0be6a4da5ed710a4eed1f74dc55f4b3a583ca6747dc3e75457c635a36fef9051",
+      "binary_sha256": "d848ed884ff43788e8a05596006622c907912c8905f8314f59b08322b4150b89",
+      "samples": "206K",
+      "event": "task-clock",
+      "raw_sha256": "9dc09e42d2985818ab228ac885683201ee595324b41869812bf143f8cbc20b75"
+    },
+    {
+      "family": "low_term",
+      "engine": "summa",
+      "symbols": [
+        {
+          "self_percent": 11.39,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::segment::chunk_map::DocLengths>::gather_lengths"
+        },
+        {
+          "self_percent": 7.59,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "finish_task_switch.isra.0"
+        },
+        {
+          "self_percent": 7.09,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>"
+        },
+        {
+          "self_percent": 5.77,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "_raw_spin_unlock_irqrestore"
+        },
+        {
+          "self_percent": 4.74,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::ScoreCollector>::insert_text_run"
+        },
+        {
+          "self_percent": 4.27,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop"
+        },
+        {
+          "self_percent": 3.54,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "__schedule"
+        },
+        {
+          "self_percent": 3.3,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::text_block_bound_for_threshold"
+        },
+        {
+          "self_percent": 2.85,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<crossbeam_epoch::internal::Global>::try_advance"
+        },
+        {
+          "self_percent": 2.67,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::fast_field::FastFieldReader>::get_text"
+        },
+        {
+          "self_percent": 2.21,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::query::scoring::score_text_run"
+        },
+        {
+          "self_percent": 2.01,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<crossbeam_deque::deque::Stealer<rayon_core::job::JobRef>>::steal"
+        },
+        {
+          "self_percent": 1.87,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "do_syscall_64"
+        },
+        {
+          "self_percent": 1.84,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::simd::avx2::unpack_16bit_delta_decode_with_offset::<0>"
+        },
+        {
+          "self_percent": 1.65,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::dispatch_sync"
+        },
+        {
+          "self_percent": 1.34,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::scoring::TermCursor>::text_group_bound_for_threshold"
+        },
+        {
+          "self_percent": 1.2,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_tfs_slice"
+        },
+        {
+          "self_percent": 0.98,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "__sched_yield"
+        },
+        {
+          "self_percent": 0.92,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::fast_field::codec::blockwise_linear_read_from"
+        },
+        {
+          "self_percent": 0.92,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<core::iter::adapters::chain::Chain<core::ops::range::Range<usize>, core::ops::range::Range<usize>> as core::iter::traits::iterator::Iterator>::try_fold::<(), core::iter::adapters::filter::filter_try_fold<usize, (), core::ops::control_flow::ControlFlow<rayon_core::job::JobRef>, <rayon_core::registry::WorkerThread>::steal::{closure#0}, core::iter::traits::iterator::Iterator::find_map::check<usize, rayon_core::job::JobRef, <rayon_core::registry::WorkerThread>::steal::{closure#1}>::{closure#0}>::{closure#0}, core::ops::control_flow::ControlFlow<rayon_core::job::JobRef>>"
+        },
+        {
+          "self_percent": 0.88,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "core::str::converts::from_utf8"
+        },
+        {
+          "self_percent": 0.81,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "malloc"
+        },
+        {
+          "self_percent": 0.8,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "do_sched_yield"
+        },
+        {
+          "self_percent": 0.79,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::decode_block_doc_ids_checked"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<std::sys::sync::mutex::futex::Mutex>::lock_contended"
+        },
+        {
+          "self_percent": 0.71,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "syscall"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<alloc::vec::Vec<f32>>::resize"
+        },
+        {
+          "self_percent": 0.57,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "cfree"
+        },
+        {
+          "self_percent": 0.55,
+          "object": "summa-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::postings::posting::BlockPostingList>::block_header"
+        }
+      ],
+      "report_sha256": "5657e64a4509e60a15392a0518f82c8ac1af418b3d06f74e05f7f332fe31dddc",
+      "binary_sha256": "8410fac8ef2d87ff5a9464bd8072011777ce964b039887dbd38e4bfb69903cb7",
+      "samples": "164K",
+      "event": "task-clock",
+      "raw_sha256": "8e3d049bad3715ef9bb9ca2695b60cf3517f4a3cc8413a41d787c38624696446"
+    },
+    {
+      "family": "low_term",
+      "engine": "luxir",
+      "symbols": [
+        {
+          "self_percent": 6.89,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000692e93"
+        },
+        {
+          "self_percent": 1.84,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000692e80"
+        },
+        {
+          "self_percent": 1.82,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fabb2"
+        },
+        {
+          "self_percent": 1.76,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fabcb"
+        },
+        {
+          "self_percent": 1.75,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fabbe"
+        },
+        {
+          "self_percent": 1.44,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044dd00"
+        },
+        {
+          "self_percent": 1.39,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669c80"
+        },
+        {
+          "self_percent": 1.24,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "finish_task_switch.isra.0"
+        },
+        {
+          "self_percent": 1.1,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669ce1"
+        },
+        {
+          "self_percent": 1.1,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669c8e"
+        },
+        {
+          "self_percent": 1.02,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669cb9"
+        },
+        {
+          "self_percent": 1.02,
+          "object": "[kernel.kallsyms]",
+          "mode": "[k]",
+          "symbol": "_raw_spin_unlock_irqrestore"
+        },
+        {
+          "self_percent": 1.01,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fabc2"
+        },
+        {
+          "self_percent": 0.93,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c4f3"
+        },
+        {
+          "self_percent": 0.93,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000693a60"
+        },
+        {
+          "self_percent": 0.83,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000693a2e"
+        },
+        {
+          "self_percent": 0.78,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669d0f"
+        },
+        {
+          "self_percent": 0.77,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669d18"
+        },
+        {
+          "self_percent": 0.76,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fab83"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669d41"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669cab"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044de00"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669d06"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fab30"
+        },
+        {
+          "self_percent": 0.74,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669d2e"
+        },
+        {
+          "self_percent": 0.74,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fab38"
+        },
+        {
+          "self_percent": 0.73,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005faba7"
+        },
+        {
+          "self_percent": 0.72,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fab91"
+        },
+        {
+          "self_percent": 0.7,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fab7e"
+        },
+        {
+          "self_percent": 0.69,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669c87"
+        },
+        {
+          "self_percent": 0.69,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000669cc8"
+        },
+        {
+          "self_percent": 0.69,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fab5e"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x0000000000647de0"
+        },
+        {
+          "self_percent": 0.67,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fab6b"
+        },
+        {
+          "self_percent": 0.65,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x00000000005fabe3"
+        },
+        {
+          "self_percent": 0.6,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "malloc"
+        },
+        {
+          "self_percent": 0.6,
+          "object": "luxir-0.1.0-linux-x86_64-v4",
+          "mode": "[.]",
+          "symbol": "0x000000000044c48f"
+        }
+      ],
+      "report_sha256": "4d0a2dd35b4d55d686778325dd8f46f6e8a4d089423e716c10f9bcbb67082735",
+      "binary_sha256": "d848ed884ff43788e8a05596006622c907912c8905f8314f59b08322b4150b89",
+      "samples": "163K",
+      "event": "task-clock",
+      "raw_sha256": "733a440c7bfe0a8315de54e27125979a74fa767c6f89899546b176bd5d7982ea"
+    }
+  ],
+  "frequency_hz": 199,
+  "sort": ["dso", "symbol"],
+  "limitations": [
+    "Each family profile mixes warmup and top-10/top-100/count operations",
+    "The 90-second process captures include idle intervals; scheduling attribution is not active-request-only",
+    "Self percentages are sampled CPU attribution, not wall-time fractions",
+    "Profiled throughput is excluded from the ABBA comparison",
+    "Frame-pointer callgraphs may be incomplete; flat self attribution is primary",
+    "The Luxir release lacks application symbols; addresses do not establish corresponding internal algorithms"
+  ]
+}

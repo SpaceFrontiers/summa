@@ -8,8 +8,10 @@ submodules (`posting/{validation,reader,impacts,compact}.rs`).
 
 Implemented and retained:
 
-- Four per-block codecs, `Rounded` (default), `Packed`, `Pfor`, `Simd4x`
-  (opt-in), sharing one container and copy-through merges.
+- Four per-block codecs, `Rounded`, `Packed`, `Pfor`, `Simd4x` (opt-in),
+  sharing one container and copy-through merges, plus `RoundedBitmap`
+  (default): `Rounded` with [bitmap document arrays](bitmap-posting-blocks.md)
+  for blocks denser than about one ID in four.
 - Extended `BPL2` footer with flags 1/2/4/8/16/32 (position cursors, packed
   length bounds, L1 bounds, ratio bounds, impact envelopes, group envelopes).
   The BM25 impact envelope is implemented (`posting/impacts.rs`), opt-in, and
@@ -126,13 +128,24 @@ values ≤ 32).
 `Pfor` uses the OptP4D width rule: minimise `n·b + exceptions·(8+32)` with at
 most 10 % exceptions; exceptions store the high bits.
 
+A **bitmap block** has `doc_bits = 0x3F` (codec bits `Rounded`, width 63, which
+no delta codec emits) and stores `ceil((last_doc − first_doc + 1) / 64)`
+little-endian `u64` words, bit `i` ↔ document `first_doc + i`, then
+`Rounded` term frequencies. Its extent comes from the L0 range, so compact
+descriptors stay metadata-only. `PostingCodec::RoundedBitmap` writes one
+wherever it takes at most half the rounded delta bytes; headers never name
+`RoundedBitmap`, and its other blocks are ordinary `Rounded` blocks.
+Admission checks the first and last bits, the population and clear bits past
+the range. Membership windows copy bitmap words, and membership probes and
+ranked conjunctions test bits, without decoding IDs.
+
 Merges copy blocks verbatim and patch only `first_doc` and the skip metadata,
 so one list may mix codecs. `Simd4x` writers emit `Rounded` tails; readers
 accept codec-3 tails from the first prototype (pinned by
 `simd4x_exact_tail_blocks_decode_seek_and_copy_through_merge`).
 
 **The codec id space is exhausted.** A fifth codec cannot be signalled in the
-header. Adding one requires a new footer flag (rejected by current readers)
+header's codec bits (the bitmap block form reuses an unused width instead). Adding one requires a new footer flag (rejected by current readers)
 and an `INDEX_META_FORMAT_VERSION` bump so old binaries refuse the index
 before touching a block.
 
@@ -142,11 +155,11 @@ tags are rejected at admission.
 
 ## Selection
 
-| `-O` / `IndexOptimization` | posting codec | term dictionary zstd |
-| -------------------------- | ------------- | -------------------- |
-| `adaptive` (default)       | `Rounded`     | 9                    |
-| `performance`              | `Rounded`     | 1                    |
-| `size`                     | `Pfor`        | 22                   |
+| `-O` / `IndexOptimization` | posting codec   | term dictionary zstd |
+| -------------------------- | --------------- | -------------------- |
+| `adaptive` (default)       | `RoundedBitmap` | 9                    |
+| `performance`              | `RoundedBitmap` | 1                    |
+| `size`                     | `Pfor`          | 22                   |
 
 `IndexConfig::posting_codec` (`summa-tool index --posting-codec`) selects any
 codec explicitly. Repository benchmark (`cargo bench --bench
@@ -167,7 +180,7 @@ gates as the rounded control
 
 ## Format gates
 
-Metadata format **9** is required; formats 6–8 are upgraded on open (see
+Metadata format **10** is required; formats 6–9 are upgraded on open (see
 [row deletion](row-deletion.md)), older indexes must be rebuilt. See
 [`INDEX_META_FORMAT_VERSION`](../summa-core/src/index/metadata.rs) and the
 [SSTable format gates](../summa-core/src/structures/sstable.rs). The gate is

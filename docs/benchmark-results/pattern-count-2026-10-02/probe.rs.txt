@@ -1,0 +1,85 @@
+//! Count probe: median exact-count latency per query (out-of-tree tool).
+//! COUNT_THREADS runs the same loop on N OS threads at once; thread 0 reports.
+use std::io::{BufRead, Write};
+use std::path::Path;
+use std::time::Instant;
+
+use anyhow::Result;
+use serde_json::Value;
+use summa_core::IndexConfig;
+use summa_core::query::{CountCollector, collect_segment};
+
+fn env(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+pub async fn run(path: &Path, input: &Path, config: IndexConfig) -> Result<()> {
+    let app = std::sync::Arc::new(super::open_app(path, config).await?);
+    let (iterations, threads) = (env("COUNT_ITERS", 60), env("COUNT_THREADS", 1));
+    // PROBE_LIMIT > 0 times the adapter's ranked path instead of exact counts.
+    let limit = env("PROBE_LIMIT", 0);
+    let source = std::io::BufReader::new(std::fs::File::open(input)?);
+    let mut output = std::io::stdout().lock();
+    for line in source.lines() {
+        let value: Value = serde_json::from_str(&line?)?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let (app, value, barrier) = (app.clone(), value.clone(), barrier.clone());
+                std::thread::spawn(move || -> Result<(u64, f64, f64)> {
+                    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+                    let request = super::query::Envelope::from_value(value)?
+                        .parse(&app.parser, app.body, &app.tokenizer)?;
+                    let segment = &app.searcher.segment_readers()[0];
+                    let mut samples = Vec::with_capacity(iterations + 5);
+                    let mut found = 0;
+                    barrier.wait();
+                    let cpu = cpu_time();
+                    for _ in 0..iterations + 5 {
+                        let start = Instant::now();
+                        if limit > 0 {
+                            let (hits, _) = app.searcher.search_with_offset_and_count_sync(
+                                request.query.as_ref(),
+                                limit,
+                                0,
+                            )?;
+                            samples.push(start.elapsed().as_nanos() as u64);
+                            // Order-sensitive digest of IDs and score bits.
+                            found = hits.iter().fold(0u64, |digest, hit| {
+                                (digest ^ (u64::from(hit.doc_id) << 32 | u64::from(hit.score.to_bits())))
+                                    .wrapping_mul(0x100_0000_01b3)
+                            });
+                            continue;
+                        }
+                        let mut collector = CountCollector::new();
+                        runtime.block_on(collect_segment(segment, request.query.as_ref(), &mut collector))?;
+                        samples.push(start.elapsed().as_nanos() as u64);
+                        found = collector.count();
+                    }
+                    let cpu = (cpu_time() - cpu) / (iterations + 5) as f64;
+                    let mut samples = samples.split_off(5);
+                    samples.sort_unstable();
+                    Ok((found, samples[samples.len() / 2] as f64 / 1000.0, cpu))
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect::<Result<_>>()?;
+        let (found, median, cpu) = results[0];
+        writeln!(output, "{}\t{}\t{:.1}\t{:.1}", value["query"], found, median, cpu)?;
+    }
+    Ok(())
+}
+
+/// Thread CPU time in microseconds on the two benchmark platforms.
+fn cpu_time() -> f64 {
+    #[repr(C)]
+    struct Timespec { sec: std::ffi::c_long, nsec: std::ffi::c_long }
+    unsafe extern "C" { fn clock_gettime(clock: i32, value: *mut Timespec) -> i32; }
+    #[cfg(target_os = "macos")]
+    const THREAD_CLOCK: i32 = 16;
+    #[cfg(target_os = "linux")]
+    const THREAD_CLOCK: i32 = 3;
+    let mut time = Timespec { sec: 0, nsec: 0 };
+    assert_eq!(unsafe { clock_gettime(THREAD_CLOCK, &mut time) }, 0);
+    time.sec as f64 * 1e6 + time.nsec as f64 / 1e3
+}

@@ -4,7 +4,7 @@ pub(crate) mod bmp;
 pub(crate) mod candidate_lookup;
 pub(crate) mod loader;
 mod term_expansion;
-pub(crate) use term_expansion::ExpandedPosting;
+pub(crate) use term_expansion::{ExpandedPosting, TermDictionaryLookup};
 mod types;
 
 pub use bmp::{BmpDimStats, BmpIndex};
@@ -99,7 +99,7 @@ impl SegmentMemoryStats {
     }
 }
 
-pub(crate) use types::SparseProbeBudget;
+pub(crate) use types::{SparseProbeBudget, SparseReadWindow};
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -1916,6 +1916,21 @@ fn binary_scann_probe_clusters(
         .map(|plan| plan.leaf_ids.into())
 }
 
+/// How a segment reader retains decompressed term-dictionary blocks.
+#[derive(Clone, Debug)]
+pub(crate) enum TermCachePolicy {
+    /// Private cache with a block cap and optional byte cap: merges,
+    /// maintenance, standalone searchers and `term_cache_process_bytes = 0`.
+    PerSegment {
+        blocks: usize,
+        budget_bytes: Option<usize>,
+    },
+    /// One byte-bounded cache shared by all search-time dictionaries in the
+    /// process (`docs/term-dictionary-cache.md`).
+    #[cfg(feature = "native")]
+    Shared(Arc<crate::structures::SharedBlockCache<crate::structures::DecodedBlock>>),
+}
+
 /// Async segment reader with lazy loading
 ///
 /// - Term dictionary: only index loaded, blocks loaded on-demand
@@ -1990,27 +2005,29 @@ impl SegmentReader {
         term_cache_blocks: usize,
         term_cache_budget_bytes: Option<usize>,
     ) -> Result<Self> {
-        Self::open_with_store_cache(
+        Self::open_with_shared_caches(
             dir,
             segment_id,
             schema,
-            term_cache_blocks,
-            term_cache_budget_bytes,
+            TermCachePolicy::PerSegment {
+                blocks: term_cache_blocks,
+                budget_bytes: term_cache_budget_bytes,
+            },
             dir as *const D as usize,
             Arc::new(super::SharedStoreCache::new(0)),
         )
         .await
     }
 
-    /// Open a search segment against the process-wide document-store cache.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn open_with_store_cache<D: Directory>(
+    /// Open a search segment against the process-wide document-store cache
+    /// and the given dictionary cache policy. `cache_directory_namespace`
+    /// separates independent index copies in both shared caches.
+    pub(crate) async fn open_with_shared_caches<D: Directory>(
         dir: &D,
         segment_id: SegmentId,
         schema: Arc<Schema>,
-        term_cache_blocks: usize,
-        term_cache_budget_bytes: Option<usize>,
-        store_cache_directory_namespace: usize,
+        term_cache: TermCachePolicy,
+        cache_directory_namespace: usize,
         store_cache: Arc<super::SharedStoreCache>,
     ) -> Result<Self> {
         let files = SegmentFiles::new(segment_id.0);
@@ -2023,12 +2040,24 @@ impl SegmentReader {
 
         // Open term dictionary with lazy loading (fetches ranges on demand)
         let term_dict_handle = dir.open_lazy(&files.term_dict).await?;
-        let term_dict = AsyncSSTableReader::open_with_cache_budget(
-            term_dict_handle,
-            term_cache_blocks,
-            term_cache_budget_bytes,
-        )
-        .await?;
+        let term_dict = match term_cache {
+            TermCachePolicy::PerSegment {
+                blocks,
+                budget_bytes,
+            } => {
+                AsyncSSTableReader::open_with_cache_budget(term_dict_handle, blocks, budget_bytes)
+                    .await?
+            }
+            #[cfg(feature = "native")]
+            TermCachePolicy::Shared(cache) => {
+                let namespace = crate::structures::BlockCacheNamespace {
+                    directory: cache_directory_namespace,
+                    segment: segment_id.0,
+                };
+                AsyncSSTableReader::open_with_shared_cache(term_dict_handle, cache, namespace)
+                    .await?
+            }
+        };
 
         // Own both text files for borrowed query views.
         let positions_handle = loader::open_positions_file(dir, &files, &schema).await?;
@@ -2037,11 +2066,11 @@ impl SegmentReader {
             positions_handle,
         );
 
-        // Open store with lazy loading
-        let store_handle = dir.open_lazy(&files.store).await?;
+        // Stored blocks permit async-only I/O independently of synchronous postings.
+        let store_handle = dir.open_payload(&files.store).await?;
         let store = AsyncStoreReader::open(
             store_handle,
-            store_cache_directory_namespace,
+            cache_directory_namespace,
             segment_id.0,
             store_cache,
         )
@@ -2768,27 +2797,47 @@ impl SegmentReader {
         local_doc_id: DocId,
         fields: Option<&rustc_hash::FxHashSet<u32>>,
     ) -> Result<Option<Document>> {
+        self.doc_with_reads(
+            local_doc_id,
+            fields,
+            &super::store::PreparedStoreReads::default(),
+        )
+        .await
+    }
+
+    pub(crate) fn has_lazy_document_reads(&self) -> bool {
+        !self.store.data_slice().is_sync()
+    }
+
+    pub(crate) fn plan_document_reads(
+        &self,
+        docs: &[DocId],
+        remaining: &mut usize,
+    ) -> Result<super::store::StoreReadPlan<'_>> {
+        let live: Vec<_> = docs
+            .iter()
+            .copied()
+            .filter(|&doc| self.is_alive(doc))
+            .collect();
+        Ok(self.store.plan_reads(&live, remaining)?)
+    }
+
+    pub(crate) async fn doc_with_reads(
+        &self,
+        local_doc_id: DocId,
+        fields: Option<&rustc_hash::FxHashSet<u32>>,
+        reads: &super::store::PreparedStoreReads,
+    ) -> Result<Option<Document>> {
         if !self.is_alive(local_doc_id) {
             return Ok(None);
         }
-        let mut doc = match fields {
-            Some(set) => {
-                let field_ids: Vec<u32> = set.iter().copied().collect();
-                match self
-                    .store
-                    .get_fields(local_doc_id, &self.schema, &field_ids)
-                    .await
-                {
-                    Ok(Some(d)) => d,
-                    Ok(None) => return Ok(None),
-                    Err(e) => return Err(Error::from(e)),
-                }
-            }
-            None => match self.store.get(local_doc_id, &self.schema).await {
-                Ok(Some(d)) => d,
-                Ok(None) => return Ok(None),
-                Err(e) => return Err(Error::from(e)),
-            },
+        let field_ids = fields.map(|set| set.iter().copied().collect::<Vec<_>>());
+        let Some(mut doc) = self
+            .store
+            .get_with_reads(local_doc_id, &self.schema, field_ids.as_deref(), reads)
+            .await?
+        else {
+            return Ok(None);
         };
 
         // Hydrate dense vector fields from flat vector data

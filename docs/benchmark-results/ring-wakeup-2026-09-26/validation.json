@@ -1,0 +1,707 @@
+{
+  "benchmark_environment": {
+    "cpu": {
+      "lscpu": [
+        {
+          "data": "x86_64",
+          "field": "Architecture:"
+        },
+        {
+          "data": "32-bit, 64-bit",
+          "field": "CPU op-mode(s):"
+        },
+        {
+          "data": "46 bits physical, 48 bits virtual",
+          "field": "Address sizes:"
+        },
+        {
+          "data": "Little Endian",
+          "field": "Byte Order:"
+        },
+        {
+          "data": "32",
+          "field": "CPU(s):"
+        },
+        {
+          "data": "0-31",
+          "field": "On-line CPU(s) list:"
+        },
+        {
+          "data": "GenuineIntel",
+          "field": "Vendor ID:"
+        },
+        {
+          "data": "Intel(R) Xeon(R) CPU @ 2.80GHz",
+          "field": "Model name:"
+        },
+        {
+          "data": "6",
+          "field": "CPU family:"
+        },
+        {
+          "data": "85",
+          "field": "Model:"
+        },
+        {
+          "data": "2",
+          "field": "Thread(s) per core:"
+        },
+        {
+          "data": "8",
+          "field": "Core(s) per socket:"
+        },
+        {
+          "data": "2",
+          "field": "Socket(s):"
+        },
+        {
+          "data": "7",
+          "field": "Stepping:"
+        },
+        {
+          "data": "5599.99",
+          "field": "BogoMIPS:"
+        },
+        {
+          "data": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512_vnni md_clear arch_capabilities",
+          "field": "Flags:"
+        },
+        {
+          "data": "KVM",
+          "field": "Hypervisor vendor:"
+        },
+        {
+          "data": "full",
+          "field": "Virtualization type:"
+        },
+        {
+          "data": "512 KiB (16 instances)",
+          "field": "L1d cache:"
+        },
+        {
+          "data": "512 KiB (16 instances)",
+          "field": "L1i cache:"
+        },
+        {
+          "data": "16 MiB (16 instances)",
+          "field": "L2 cache:"
+        },
+        {
+          "data": "66 MiB (2 instances)",
+          "field": "L3 cache:"
+        },
+        {
+          "data": "2",
+          "field": "NUMA node(s):"
+        },
+        {
+          "data": "0-7,16-23",
+          "field": "NUMA node0 CPU(s):"
+        },
+        {
+          "data": "8-15,24-31",
+          "field": "NUMA node1 CPU(s):"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Gather data sampling:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Ghostwrite:"
+        },
+        {
+          "data": "Mitigation; Aligned branch/return thunks",
+          "field": "Vulnerability Indirect target selection:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Itlb multihit:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability L1tf:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Mds:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Meltdown:"
+        },
+        {
+          "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+          "field": "Vulnerability Mmio stale data:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Old microcode:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Reg file data sampling:"
+        },
+        {
+          "data": "Mitigation; Enhanced IBRS",
+          "field": "Vulnerability Retbleed:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Spec rstack overflow:"
+        },
+        {
+          "data": "Mitigation; Speculative Store Bypass disabled via prctl",
+          "field": "Vulnerability Spec store bypass:"
+        },
+        {
+          "data": "Mitigation; usercopy/swapgs barriers and __user pointer sanitization",
+          "field": "Vulnerability Spectre v1:"
+        },
+        {
+          "data": "Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop",
+          "field": "Vulnerability Spectre v2:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Srbds:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Tsa:"
+        },
+        {
+          "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+          "field": "Vulnerability Tsx async abort:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Vmscape:"
+        }
+      ]
+    },
+    "disk": "NAME    MODEL            SIZE TYPE MOUNTPOINTS\nloop0                   66.8M loop /snap/core24/2124\nloop1                  348.2M loop /snap/google-cloud-cli/499\nloop2                   50.3M loop /snap/snapd/27738\nsda     PersistentDisk   200G disk \n\u251c\u2500sda1                   199G part /\n\u251c\u2500sda14                    4M part \n\u251c\u2500sda15                  106M part /boot/efi\n\u2514\u2500sda16                  913M part /boot\n",
+    "inventory_note": "Fresh inventory captured during this benchmark boot; build and measurements on separate hosts.",
+    "uname": [
+      "Linux",
+      "hermes-benchmark-32-moroni.us-east1-b.c.keenable-479912.internal",
+      "7.0.0-1011-gcp",
+      "#11~24.04.1-Ubuntu SMP PREEMPT Tue Aug 11 20:14:48 UTC 2026",
+      "x86_64"
+    ]
+  },
+  "build_cpu": {
+    "lscpu": [
+      {
+        "data": "x86_64",
+        "field": "Architecture:"
+      },
+      {
+        "data": "32-bit, 64-bit",
+        "field": "CPU op-mode(s):"
+      },
+      {
+        "data": "46 bits physical, 48 bits virtual",
+        "field": "Address sizes:"
+      },
+      {
+        "data": "Little Endian",
+        "field": "Byte Order:"
+      },
+      {
+        "data": "8",
+        "field": "CPU(s):"
+      },
+      {
+        "data": "0-7",
+        "field": "On-line CPU(s) list:"
+      },
+      {
+        "data": "GenuineIntel",
+        "field": "Vendor ID:"
+      },
+      {
+        "data": "Intel(R) Xeon(R) CPU @ 2.80GHz",
+        "field": "Model name:"
+      },
+      {
+        "data": "6",
+        "field": "CPU family:"
+      },
+      {
+        "data": "85",
+        "field": "Model:"
+      },
+      {
+        "data": "2",
+        "field": "Thread(s) per core:"
+      },
+      {
+        "data": "4",
+        "field": "Core(s) per socket:"
+      },
+      {
+        "data": "1",
+        "field": "Socket(s):"
+      },
+      {
+        "data": "7",
+        "field": "Stepping:"
+      },
+      {
+        "data": "5599.99",
+        "field": "BogoMIPS:"
+      },
+      {
+        "data": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512_vnni md_clear arch_capabilities",
+        "field": "Flags:"
+      },
+      {
+        "data": "KVM",
+        "field": "Hypervisor vendor:"
+      },
+      {
+        "data": "full",
+        "field": "Virtualization type:"
+      },
+      {
+        "data": "128 KiB (4 instances)",
+        "field": "L1d cache:"
+      },
+      {
+        "data": "128 KiB (4 instances)",
+        "field": "L1i cache:"
+      },
+      {
+        "data": "4 MiB (4 instances)",
+        "field": "L2 cache:"
+      },
+      {
+        "data": "33 MiB (1 instance)",
+        "field": "L3 cache:"
+      },
+      {
+        "data": "1",
+        "field": "NUMA node(s):"
+      },
+      {
+        "data": "0-7",
+        "field": "NUMA node0 CPU(s):"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Gather data sampling:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Ghostwrite:"
+      },
+      {
+        "data": "Mitigation; Aligned branch/return thunks",
+        "field": "Vulnerability Indirect target selection:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Itlb multihit:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability L1tf:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Mds:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Meltdown:"
+      },
+      {
+        "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+        "field": "Vulnerability Mmio stale data:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Old microcode:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Reg file data sampling:"
+      },
+      {
+        "data": "Mitigation; Enhanced IBRS",
+        "field": "Vulnerability Retbleed:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Spec rstack overflow:"
+      },
+      {
+        "data": "Mitigation; Speculative Store Bypass disabled via prctl",
+        "field": "Vulnerability Spec store bypass:"
+      },
+      {
+        "data": "Mitigation; usercopy/swapgs barriers and __user pointer sanitization",
+        "field": "Vulnerability Spectre v1:"
+      },
+      {
+        "data": "Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop",
+        "field": "Vulnerability Spectre v2:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Srbds:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Tsa:"
+      },
+      {
+        "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+        "field": "Vulnerability Tsx async abort:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Vmscape:"
+      }
+    ]
+  },
+  "cloud_states": {
+    "hermes-benchmark-32-moroni": {
+      "cpuPlatform": "Unknown CPU Platform",
+      "lastStartTimestamp": "2026-09-26T09:45:46.679-07:00",
+      "lastStopTimestamp": "2026-09-26T10:06:05.392-07:00",
+      "machineType": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b/machineTypes/n2-highmem-32",
+      "name": "hermes-benchmark-32-moroni",
+      "status": "TERMINATED"
+    },
+    "hermes-validation-moroni": {
+      "cpuPlatform": "Unknown CPU Platform",
+      "lastStartTimestamp": "2026-09-26T09:32:58.414-07:00",
+      "lastStopTimestamp": "2026-09-26T10:07:55.169-07:00",
+      "machineType": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b/machineTypes/n2-highmem-8",
+      "name": "hermes-validation-moroni",
+      "status": "TERMINATED"
+    }
+  },
+  "linux_io_uring": {
+    "core_test_binaries": {
+      "summa_core-55cc34a87444ca21": "b33f75504dd48ef7336224552de0968b038445216256c91048aea3c946f720bd"
+    },
+    "environment": {
+      "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+      "cpu_model": "x86_64",
+      "flags": {
+        "CARGO_BUILD_JOBS": "8",
+        "CARGO_BUILD_TARGET": "",
+        "CARGO_ENCODED_RUSTFLAGS": "",
+        "CARGO_TARGET_DIR": "/mnt/hermes-copy/target",
+        "CRITERION_HOME": "",
+        "RAYON_NUM_THREADS": "",
+        "RUSTFLAGS": "-C target-cpu=native",
+        "SUMMA_PIN_METADATA_BUDGET_MB": "",
+        "SUMMA_PIN_MODE": ""
+      },
+      "host": "Linux-7.0.0-1011-gcp-x86_64-with-glibc2.39",
+      "logical_cpus": 8,
+      "machine": "x86_64",
+      "processor": "x86_64",
+      "revision": "375cb17ee78d73f1f1bc2950fd6bef88e8264b94",
+      "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-unknown-linux-gnu\nrelease: 1.98.1\nLLVM version: 22.1.8",
+      "status": "",
+      "working_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "harness": "20260926T170143.638619Z-io-uring",
+    "logs": {
+      "01-clippy.log": "913207459dfb1e00d6da1f98af4ca8e06f37494684e52c91e079fdc081e619cb",
+      "02-test.log": "450b1a7666180b73f5bdd39c170e55b5bfb600e637d63905866e98a34443a0ad",
+      "03-test.log": "36a0d4cefd54e7503c45e3ea1c83e6e0a6c86f6deb17441280c114213af96325",
+      "04-test.log": "4075dcb72f2702e226b81ae7bee0b36ec9273910d180c86b078f893c36b6205e"
+    },
+    "passed": 73,
+    "steps": [
+      {
+        "command": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "--features",
+          "io-uring",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "log": "01-clippy.log",
+        "returncode": 0,
+        "seconds": 41.745494390999966
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "summa-core",
+          "--features",
+          "io-uring",
+          "--lib",
+          "directories::"
+        ],
+        "log": "02-test.log",
+        "returncode": 0,
+        "seconds": 105.06844519900005
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "summa-core",
+          "--features",
+          "io-uring",
+          "--test",
+          "document_read_batches",
+          "--test",
+          "sparse_payload_reads"
+        ],
+        "log": "03-test.log",
+        "returncode": 0,
+        "seconds": 53.43353525900011
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "summa-server",
+          "--features",
+          "io-uring",
+          "--bin",
+          "summa-server",
+          "payload_backends_hydrate_rpc_results_and_survive_other_index_deletion"
+        ],
+        "log": "04-test.log",
+        "returncode": 0,
+        "seconds": 69.96547251799984
+      }
+    ],
+    "verified_source_files": {
+      "after": 532,
+      "base": 537
+    }
+  },
+  "native_full": {
+    "environment": {
+      "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+      "cpu_model": "Apple M4",
+      "flags": {
+        "CARGO_BUILD_JOBS": "",
+        "CARGO_BUILD_TARGET": "",
+        "CARGO_ENCODED_RUSTFLAGS": "",
+        "CARGO_TARGET_DIR": "",
+        "CRITERION_HOME": "",
+        "RAYON_NUM_THREADS": "",
+        "RUSTFLAGS": "",
+        "SUMMA_PIN_METADATA_BUDGET_MB": "",
+        "SUMMA_PIN_MODE": ""
+      },
+      "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+      "logical_cpus": 10,
+      "machine": "arm64",
+      "processor": "arm",
+      "revision": "fc60c34b3241d0bbbeac19bdd1afb1b1ed337416",
+      "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+      "working_diff_sha256": "7c59033cf88e04df1970ca76f6ada46067038cbff331dd563c6b7bc688fbcdc9"
+    },
+    "harness": "20260926T164911.644093Z-full",
+    "logs": {
+      "01-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "02-clippy.log": "f8a1263a2cf0141ddcf7415bb0e291814096330237c25ef2ebae1d17fd663af7",
+      "03-test.log": "e88e17c88c89d8b51f42647319393a3ac3894e35f2d784057fd1130f465eb4f8",
+      "04-check.log": "2b483b2f3edaa665c8f159a099a00d2f77a8dce1b708ab5109f02a960b1c2477",
+      "05-check.log": "3e43b255d4b20a7b309afeb5012d5088aa471e53c75606d9df8a98bab335f40e",
+      "06-check.log": "2b34696728dc82b03cbf6311d7e3a6a41658bbde097834c3010a78bc82842c1a",
+      "07-doc.log": "524f73368919ca1579a5b45f379c5fbd6935080ef84f06e9387a47c9ea3516e0",
+      "08-build.log": "034a560aa92559afb1a32ce8534f98fb009a5149b3b9f569c7041f51bea87fc6",
+      "09-test.log": "e3bb8edfeab229849848fb3a43d0a3003684d4cd7c1022bbe54b0ed00f0b41a2"
+    },
+    "mode": "full",
+    "passed": 2118,
+    "real_server_passed": 5,
+    "steps": [
+      {
+        "command": ["cargo", "fmt", "--all", "--", "--check"],
+        "log": "01-fmt.log",
+        "returncode": 0,
+        "seconds": 1.9573149578645825
+      },
+      {
+        "command": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "-p",
+          "summa-broker",
+          "-p",
+          "summa-tool",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "log": "02-clippy.log",
+        "returncode": 0,
+        "seconds": 12.378239125013351
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "-p",
+          "summa-broker",
+          "-p",
+          "summa-tool",
+          "--features",
+          "summa-core/metrics"
+        ],
+        "log": "03-test.log",
+        "returncode": 0,
+        "seconds": 272.81517037563026
+      },
+      {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "summa-core",
+          "--no-default-features",
+          "--features",
+          "native",
+          "--all-targets"
+        ],
+        "log": "04-check.log",
+        "returncode": 0,
+        "seconds": 13.466075167059898
+      },
+      {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "summa-broker",
+          "--all-targets"
+        ],
+        "log": "05-check.log",
+        "returncode": 0,
+        "seconds": 0.6017418345436454
+      },
+      {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "summa-core",
+          "--no-default-features",
+          "--lib"
+        ],
+        "log": "06-check.log",
+        "returncode": 0,
+        "seconds": 0.23797750007361174
+      },
+      {
+        "command": [
+          "cargo",
+          "doc",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "-p",
+          "summa-broker",
+          "-p",
+          "summa-tool",
+          "--no-deps"
+        ],
+        "log": "07-doc.log",
+        "returncode": 0,
+        "seconds": 11.02596658281982
+      },
+      {
+        "command": [
+          "cargo",
+          "build",
+          "--locked",
+          "-p",
+          "summa-server",
+          "--bin",
+          "summa-server"
+        ],
+        "log": "08-build.log",
+        "returncode": 0,
+        "seconds": 14.68265400081873
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "summa-broker",
+          "--test",
+          "e2e_real_server",
+          "--",
+          "--ignored"
+        ],
+        "log": "09-test.log",
+        "returncode": 0,
+        "seconds": 5.332769417203963
+      }
+    ],
+    "success": true
+  },
+  "raw_archives": {
+    "source-evidence/summa-ring-wakeup-20260926.tar.gz": "8a4b1bf8f7e6605c75a9273420ac44940842daa536252bc79cf63b8c9636e50e",
+    "summa-ring-wakeup-20260926.tar.gz": "885e57b30a9e9b0056a3e6618f4d1666b62fabef0acc40292f5a55ea441a6e9f"
+  },
+  "regressions": {
+    "idle_exit_red": "0faa564261abeb309ef5ad4a47dbf3b00d6525fbcd44092603c9d6e6bc01ce2a",
+    "notification_failure_red": "4f1c0a0fb13a73761b76a961c248edb3ce33d67a5a6010c03990f911f692513e",
+    "payload_green": "b389f48a009091e0d23753839965a6b6b37b4c079a13f0be72eaab51ea696886",
+    "payload_tests_passed": 27,
+    "shared_queued_lease_green": "f4d6a4d3a341665819a9bc823ad55160c34dbf4e16b054b2bc4ee41e13cda681",
+    "shared_queued_lease_red": "c807e3aea8573ddbb7475b061172813b58ee15ed33871d362d7b5feb43fea377"
+  },
+  "source_files_verified_against_workspace": 532,
+  "superseded_runs": {
+    "initial_linux": "Two notification cleanup tests exposed retained queued permits; shared wrapper fixed. Original red/green logs preserved under initial/.",
+    "pre_lint": "Linux Clippy rejected nested if syntax. Collapsed the condition, rebuilt final binary and reran all 72 cells. Pre-lint measurements retained separately and excluded from published results."
+  },
+  "unchanged_defaults": true,
+  "wasm": {
+    "command": "cd summa-wasm && bash build.sh && npm ci && npm test",
+    "files": 9,
+    "log_sha256": "78cfc844a88cf11c14c0524aea4b99cb64aea08a9ab660f91384c167c90c061b",
+    "note": "All edited payload modules are native-only; final cleanup after this run did not change WASM inputs. npm reports four existing audit findings (three moderate, one high); no dependency changes.",
+    "passed": 41
+  }
+}

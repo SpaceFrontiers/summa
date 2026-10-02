@@ -48,12 +48,13 @@ impl IndexOptimization {
 
     /// Posting block codec implied by this mode (`docs/posting-codecs.md`):
     /// `SizeOptimized` packs with patched exceptions, the others keep the
-    /// SIMD-widening rounded layout.
+    /// SIMD-widening rounded layout with bitmap blocks where dense
+    /// (`docs/bitmap-posting-blocks.md`).
     pub fn default_posting_codec(&self) -> super::posting::PostingCodec {
         match self {
             IndexOptimization::SizeOptimized => super::posting::PostingCodec::Pfor,
             IndexOptimization::Adaptive | IndexOptimization::PerformanceOptimized => {
-                super::posting::PostingCodec::Rounded
+                super::posting::PostingCodec::RoundedBitmap
             }
         }
     }

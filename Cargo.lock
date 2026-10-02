@@ -3964,6 +3964,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+dependencies = [
+ "bitflags 2.13.2",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7261,6 +7272,7 @@ dependencies = [
  "hf-hub 1.0.0",
  "icu_segmenter",
  "instant",
+ "io-uring",
  "lasso",
  "libc",
  "lindera",

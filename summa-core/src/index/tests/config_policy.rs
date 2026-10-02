@@ -102,6 +102,7 @@ async fn zero_term_cache_budget_disables_dictionary_retention_at_index_level() {
             num_threads: 1,
             term_cache_blocks: 64,
             term_cache_budget_bytes: Some(0),
+            term_cache_process_bytes: 0,
             ..IndexConfig::default()
         }),
     )
@@ -129,5 +130,76 @@ async fn zero_term_cache_budget_disables_dictionary_retention_at_index_level() {
         0,
         "Some(0) must reach the segment readers and disable block retention"
     );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn process_term_cache_bounds_all_segments_together_and_merges_do_not_fill_it() {
+    // A budget no other test uses, so this index owns its process-wide cache.
+    const BUDGET: usize = 48 * 1024 + 7;
+    let mut schema = SchemaBuilder::default();
+    let body = schema.add_text_field("body", true, false);
+    let index = Index::create(
+        RamDirectory::new(),
+        schema.build(),
+        no_merge(IndexConfig {
+            num_threads: 1,
+            term_dict_block_size: crate::structures::SSTableBlockSize::try_from(512).unwrap(),
+            term_cache_process_bytes: BUDGET,
+            ..IndexConfig::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut writer = index.writer();
+    for segment in 0..3 {
+        for i in 0..3000 {
+            let mut doc = Document::new();
+            doc.add_text(body, format!("common word{segment}x{i:05}"));
+            writer.add_document(doc).unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    let reader = index.reader().await.unwrap();
+    let searcher = reader.searcher().await.unwrap();
+    assert_eq!(searcher.num_segments(), 3);
+    let cached = |searcher: &crate::index::Searcher<RamDirectory>| {
+        searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| segment.memory_stats().term_dict_cache_bytes)
+            .collect::<Vec<_>>()
+    };
+    let mut peaks = Vec::new();
+    for segment in searcher.segment_readers() {
+        let mut terms = segment.term_dict_iter();
+        while terms.next().await.unwrap().is_some() {}
+        peaks.push(segment.memory_stats().term_dict_cache_bytes);
+        let total: usize = cached(&searcher).iter().sum();
+        assert!(total <= BUDGET, "{total} exceeds the process-wide budget");
+    }
+    // Per-segment caches would retain every peak at once; the shared ceiling
+    // evicts across segments instead.
+    assert!(peaks.iter().all(|&bytes| bytes > 0), "{peaks:?}");
+    assert!(peaks.iter().sum::<usize>() > BUDGET, "{peaks:?}");
+
+    writer.force_merge().await.unwrap();
+    reader.reload().await.unwrap();
+    let merged = reader.searcher().await.unwrap();
+    assert_eq!(merged.num_segments(), 1);
+    assert_eq!(
+        cached(&merged),
+        [0],
+        "merge reads must not populate the search cache"
+    );
+    let mut count = CountCollector::new();
+    collect_segment(
+        &merged.segment_readers()[0],
+        &TermQuery::text(body, "common"),
+        &mut count,
+    )
+    .await
+    .unwrap();
+    assert_eq!(count.count(), 9000);
     writer.shutdown().await.unwrap();
 }

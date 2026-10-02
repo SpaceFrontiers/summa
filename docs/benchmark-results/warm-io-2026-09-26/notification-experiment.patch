@@ -1,0 +1,39 @@
+--- a/summa-core/src/directories/payload/ring/wake.rs
++++ b/summa-core/src/directories/payload/ring/wake.rs
+@@ -12,6 +12,7 @@
+ pub(in super::super) struct Wake {
+     fd: OwnedFd,
+     failed: AtomicBool,
++    pending: AtomicBool,
+     counters: Arc<Counters>,
+     #[cfg(test)]
+     fail_next: AtomicBool,
+@@ -54,6 +55,7 @@
+             // SAFETY: successful eventfd transfers exactly one descriptor owner.
+             fd: unsafe { OwnedFd::from_raw_fd(fd) },
+             failed: AtomicBool::new(false),
++            pending: AtomicBool::new(false),
+             counters,
+             #[cfg(test)]
+             fail_next: AtomicBool::new(false),
+@@ -73,6 +75,9 @@
+ 
+     pub(in super::super) fn notify(&self) -> io::Result<()> {
+         self.check()?;
++        if self.pending.swap(true, Ordering::AcqRel) {
++            return self.check();
++        }
+         let result = transfer(|| {
+             #[cfg(test)]
+             if self.fail_next.swap(false, Ordering::Relaxed) {
+@@ -93,7 +98,9 @@
+             let mut count = 0u64;
+             // SAFETY: one writable u64, valid descriptor, no pointer escapes.
+             transferred(unsafe { libc::read(self.as_raw_fd(), (&mut count as *mut u64).cast(), 8) })
+-        })
++        })?;
++        self.pending.store(false, Ordering::Release);
++        Ok(())
+     }
+ 
+     #[cfg(test)]

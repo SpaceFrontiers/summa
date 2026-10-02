@@ -1,0 +1,570 @@
+{
+  "iterations": 200,
+  "warmup": 5,
+  "queries": 59,
+  "indexes": {
+    "default": {
+      "0": {
+        "prefix3": {
+          "queries": 2,
+          "before": {
+            "median_us": 3995.45,
+            "cpu_us": 4167.0
+          },
+          "after": {
+            "median_us": 2831.5,
+            "cpu_us": 2839.75
+          },
+          "speedup": {
+            "median_us": 1.4110718700335512,
+            "cpu_us": 1.4673826921383926
+          },
+          "phases": {
+            "a1": {
+              "median_us": 3961.5,
+              "cpu_us": 4133.1
+            },
+            "b1": {
+              "median_us": 2827.6,
+              "cpu_us": 2836.4
+            },
+            "b2": {
+              "median_us": 2835.3999999999996,
+              "cpu_us": 2843.1
+            },
+            "a2": {
+              "median_us": 4029.4,
+              "cpu_us": 4200.9
+            }
+          }
+        },
+        "regex": {
+          "queries": 4,
+          "before": {
+            "median_us": 16743.15,
+            "cpu_us": 17269.7
+          },
+          "after": {
+            "median_us": 14899.8,
+            "cpu_us": 15252.7
+          },
+          "speedup": {
+            "median_us": 1.1237164257238355,
+            "cpu_us": 1.1322388822962492
+          },
+          "phases": {
+            "a1": {
+              "median_us": 16768.0,
+              "cpu_us": 17293.0
+            },
+            "b1": {
+              "median_us": 14850.7,
+              "cpu_us": 15189.8
+            },
+            "b2": {
+              "median_us": 14948.9,
+              "cpu_us": 15315.6
+            },
+            "a2": {
+              "median_us": 16718.3,
+              "cpu_us": 17246.4
+            }
+          }
+        },
+        "wildcard": {
+          "queries": 11,
+          "before": {
+            "median_us": 33071.9,
+            "cpu_us": 34209.85
+          },
+          "after": {
+            "median_us": 14811.95,
+            "cpu_us": 15208.95
+          },
+          "speedup": {
+            "median_us": 2.2327850148022375,
+            "cpu_us": 2.249323589070909
+          },
+          "phases": {
+            "a1": {
+              "median_us": 33215.4,
+              "cpu_us": 34416.0
+            },
+            "b1": {
+              "median_us": 14878.3,
+              "cpu_us": 15285.8
+            },
+            "b2": {
+              "median_us": 14745.6,
+              "cpu_us": 15132.1
+            },
+            "a2": {
+              "median_us": 32928.4,
+              "cpu_us": 34003.7
+            }
+          }
+        },
+        "wildcard_scan": {
+          "queries": 42,
+          "before": {
+            "median_us": 84881.15,
+            "cpu_us": 92239.95000000001
+          },
+          "after": {
+            "median_us": 62994.3,
+            "cpu_us": 67352.20000000001
+          },
+          "speedup": {
+            "median_us": 1.347441752666511,
+            "cpu_us": 1.3695165117100851
+          },
+          "phases": {
+            "a1": {
+              "median_us": 85373.3,
+              "cpu_us": 92580.8
+            },
+            "b1": {
+              "median_us": 62817.0,
+              "cpu_us": 67146.1
+            },
+            "b2": {
+              "median_us": 63171.6,
+              "cpu_us": 67558.3
+            },
+            "a2": {
+              "median_us": 84389.0,
+              "cpu_us": 91899.1
+            }
+          }
+        }
+      },
+      "100": {
+        "prefix3": {
+          "queries": 2,
+          "before": {
+            "median_us": 184.9,
+            "cpu_us": 8.25
+          },
+          "after": {
+            "median_us": 176.95,
+            "cpu_us": 8.2
+          },
+          "speedup": {
+            "median_us": 1.0449279457473863,
+            "cpu_us": 1.0060975609756098
+          },
+          "phases": {
+            "a1": {
+              "median_us": 184.5,
+              "cpu_us": 8.2
+            },
+            "b1": {
+              "median_us": 176.8,
+              "cpu_us": 8.2
+            },
+            "b2": {
+              "median_us": 177.1,
+              "cpu_us": 8.2
+            },
+            "a2": {
+              "median_us": 185.3,
+              "cpu_us": 8.3
+            }
+          }
+        },
+        "regex": {
+          "queries": 4,
+          "before": {
+            "median_us": 11224.2,
+            "cpu_us": 25.2
+          },
+          "after": {
+            "median_us": 11085.7,
+            "cpu_us": 25.2
+          },
+          "speedup": {
+            "median_us": 1.0124935728009958,
+            "cpu_us": 1.0
+          },
+          "phases": {
+            "a1": {
+              "median_us": 11230.1,
+              "cpu_us": 25.3
+            },
+            "b1": {
+              "median_us": 11096.7,
+              "cpu_us": 25.4
+            },
+            "b2": {
+              "median_us": 11074.7,
+              "cpu_us": 25.0
+            },
+            "a2": {
+              "median_us": 11218.3,
+              "cpu_us": 25.099999999999998
+            }
+          }
+        },
+        "wildcard": {
+          "queries": 11,
+          "before": {
+            "median_us": 3870.6000000000004,
+            "cpu_us": 49.3
+          },
+          "after": {
+            "median_us": 3837.9,
+            "cpu_us": 48.7
+          },
+          "speedup": {
+            "median_us": 1.0085202845306027,
+            "cpu_us": 1.0123203285420943
+          },
+          "phases": {
+            "a1": {
+              "median_us": 3863.3,
+              "cpu_us": 49.1
+            },
+            "b1": {
+              "median_us": 3856.3,
+              "cpu_us": 48.6
+            },
+            "b2": {
+              "median_us": 3819.5,
+              "cpu_us": 48.8
+            },
+            "a2": {
+              "median_us": 3877.9,
+              "cpu_us": 49.5
+            }
+          }
+        },
+        "wildcard_scan": {
+          "queries": 42,
+          "before": {
+            "median_us": 46585.0,
+            "cpu_us": 239.5
+          },
+          "after": {
+            "median_us": 46538.8,
+            "cpu_us": 233.1
+          },
+          "speedup": {
+            "median_us": 1.000992720052945,
+            "cpu_us": 1.0274560274560274
+          },
+          "phases": {
+            "a1": {
+              "median_us": 46786.3,
+              "cpu_us": 244.1
+            },
+            "b1": {
+              "median_us": 46788.7,
+              "cpu_us": 230.6
+            },
+            "b2": {
+              "median_us": 46288.9,
+              "cpu_us": 235.6
+            },
+            "a2": {
+              "median_us": 46383.7,
+              "cpu_us": 234.9
+            }
+          }
+        }
+      }
+    },
+    "rgb": {
+      "0": {
+        "prefix3": {
+          "queries": 2,
+          "before": {
+            "median_us": 3729.2999999999997,
+            "cpu_us": 3862.05
+          },
+          "after": {
+            "median_us": 2571.1000000000004,
+            "cpu_us": 2581.85
+          },
+          "speedup": {
+            "median_us": 1.4504686709968493,
+            "cpu_us": 1.495846001897864
+          },
+          "phases": {
+            "a1": {
+              "median_us": 3729.8999999999996,
+              "cpu_us": 3873.3
+            },
+            "b1": {
+              "median_us": 2578.3,
+              "cpu_us": 2591.3999999999996
+            },
+            "b2": {
+              "median_us": 2563.9,
+              "cpu_us": 2572.3
+            },
+            "a2": {
+              "median_us": 3728.7,
+              "cpu_us": 3850.8
+            }
+          }
+        },
+        "regex": {
+          "queries": 4,
+          "before": {
+            "median_us": 17844.35,
+            "cpu_us": 18417.1
+          },
+          "after": {
+            "median_us": 15815.5,
+            "cpu_us": 16113.599999999999
+          },
+          "speedup": {
+            "median_us": 1.1282823812083083,
+            "cpu_us": 1.142953778174958
+          },
+          "phases": {
+            "a1": {
+              "median_us": 17827.3,
+              "cpu_us": 18440.1
+            },
+            "b1": {
+              "median_us": 15786.2,
+              "cpu_us": 16095.3
+            },
+            "b2": {
+              "median_us": 15844.8,
+              "cpu_us": 16131.9
+            },
+            "a2": {
+              "median_us": 17861.4,
+              "cpu_us": 18394.1
+            }
+          }
+        },
+        "wildcard": {
+          "queries": 11,
+          "before": {
+            "median_us": 31208.3,
+            "cpu_us": 32274.300000000003
+          },
+          "after": {
+            "median_us": 12959.4,
+            "cpu_us": 13423.8
+          },
+          "speedup": {
+            "median_us": 2.4081593283639675,
+            "cpu_us": 2.404259598623341
+          },
+          "phases": {
+            "a1": {
+              "median_us": 31221.0,
+              "cpu_us": 32269.100000000002
+            },
+            "b1": {
+              "median_us": 12863.9,
+              "cpu_us": 13307.300000000001
+            },
+            "b2": {
+              "median_us": 13054.9,
+              "cpu_us": 13540.3
+            },
+            "a2": {
+              "median_us": 31195.6,
+              "cpu_us": 32279.5
+            }
+          }
+        },
+        "wildcard_scan": {
+          "queries": 42,
+          "before": {
+            "median_us": 86887.15,
+            "cpu_us": 94504.29999999999
+          },
+          "after": {
+            "median_us": 63916.2,
+            "cpu_us": 68031.2
+          },
+          "speedup": {
+            "median_us": 1.3593916722208141,
+            "cpu_us": 1.3891317513141028
+          },
+          "phases": {
+            "a1": {
+              "median_us": 89301.1,
+              "cpu_us": 96763.7
+            },
+            "b1": {
+              "median_us": 63989.6,
+              "cpu_us": 68054.5
+            },
+            "b2": {
+              "median_us": 63842.8,
+              "cpu_us": 68007.9
+            },
+            "a2": {
+              "median_us": 84473.2,
+              "cpu_us": 92244.9
+            }
+          }
+        }
+      },
+      "100": {
+        "prefix3": {
+          "queries": 2,
+          "before": {
+            "median_us": 174.55,
+            "cpu_us": 8.35
+          },
+          "after": {
+            "median_us": 168.5,
+            "cpu_us": 8.2
+          },
+          "speedup": {
+            "median_us": 1.035905044510386,
+            "cpu_us": 1.0182926829268293
+          },
+          "phases": {
+            "a1": {
+              "median_us": 174.3,
+              "cpu_us": 8.2
+            },
+            "b1": {
+              "median_us": 166.7,
+              "cpu_us": 8.2
+            },
+            "b2": {
+              "median_us": 170.3,
+              "cpu_us": 8.2
+            },
+            "a2": {
+              "median_us": 174.8,
+              "cpu_us": 8.5
+            }
+          }
+        },
+        "regex": {
+          "queries": 4,
+          "before": {
+            "median_us": 12107.9,
+            "cpu_us": 24.75
+          },
+          "after": {
+            "median_us": 11985.75,
+            "cpu_us": 24.65
+          },
+          "speedup": {
+            "median_us": 1.0101912687983647,
+            "cpu_us": 1.004056795131846
+          },
+          "phases": {
+            "a1": {
+              "median_us": 12136.8,
+              "cpu_us": 25.3
+            },
+            "b1": {
+              "median_us": 11991.6,
+              "cpu_us": 24.4
+            },
+            "b2": {
+              "median_us": 11979.9,
+              "cpu_us": 24.9
+            },
+            "a2": {
+              "median_us": 12079.0,
+              "cpu_us": 24.2
+            }
+          }
+        },
+        "wildcard": {
+          "queries": 11,
+          "before": {
+            "median_us": 4094.75,
+            "cpu_us": 47.699999999999996
+          },
+          "after": {
+            "median_us": 4080.6499999999996,
+            "cpu_us": 49.55
+          },
+          "speedup": {
+            "median_us": 1.003455331871148,
+            "cpu_us": 0.9626639757820383
+          },
+          "phases": {
+            "a1": {
+              "median_us": 4088.0,
+              "cpu_us": 47.699999999999996
+            },
+            "b1": {
+              "median_us": 4072.7999999999997,
+              "cpu_us": 49.5
+            },
+            "b2": {
+              "median_us": 4088.5,
+              "cpu_us": 49.6
+            },
+            "a2": {
+              "median_us": 4101.5,
+              "cpu_us": 47.699999999999996
+            }
+          }
+        },
+        "wildcard_scan": {
+          "queries": 42,
+          "before": {
+            "median_us": 51389.85,
+            "cpu_us": 229.15
+          },
+          "after": {
+            "median_us": 51070.65,
+            "cpu_us": 235.35
+          },
+          "speedup": {
+            "median_us": 1.0062501652123088,
+            "cpu_us": 0.9736562566390483
+          },
+          "phases": {
+            "a1": {
+              "median_us": 51499.299999999996,
+              "cpu_us": 232.4
+            },
+            "b1": {
+              "median_us": 50935.3,
+              "cpu_us": 237.5
+            },
+            "b2": {
+              "median_us": 51206.0,
+              "cpu_us": 233.2
+            },
+            "a2": {
+              "median_us": 51280.4,
+              "cpu_us": 225.9
+            }
+          }
+        }
+      }
+    }
+  },
+  "peak_rss_mib": {
+    "default-a1-0": 2697.33203125,
+    "default-b1-0": 2697.41796875,
+    "default-b2-0": 2697.46484375,
+    "default-a2-0": 2697.31640625,
+    "default-a1-100": 2664.0078125,
+    "default-b1-100": 2664.3828125,
+    "default-b2-100": 2664.5234375,
+    "default-a2-100": 2664.05859375,
+    "rgb-a1-0": 2475.9453125,
+    "rgb-b1-0": 2477.58984375,
+    "rgb-b2-0": 2477.5625,
+    "rgb-a2-0": 2477.21484375,
+    "rgb-a1-100": 2445.0625,
+    "rgb-b1-100": 2445.72265625,
+    "rgb-b2-100": 2445.22265625,
+    "rgb-a2-100": 2445.5390625
+  },
+  "inventory_unchanged": true,
+  "binary_sha256": {
+    "before": "32a317b050d2cd564a3a22023e92f54ccfc98f65a203e48d5e6166a1a78fce2e",
+    "after": "0e7c14c3c6364363f2d7bdb5c7864cacccdbed75366481e1af5d55d70b92be83"
+  }
+}

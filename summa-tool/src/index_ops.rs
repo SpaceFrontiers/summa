@@ -285,11 +285,13 @@ pub async fn reorder_index(
 pub fn search_config(
     term_cache_blocks: usize,
     term_cache_bytes: Option<usize>,
+    term_cache_process_bytes: usize,
     search_threads: Option<usize>,
 ) -> IndexConfig {
     let mut config = IndexConfig {
         term_cache_blocks,
         term_cache_budget_bytes: term_cache_bytes,
+        term_cache_process_bytes,
         ..Default::default()
     };
     if let Some(threads) = search_threads {
@@ -890,16 +892,22 @@ mod tests {
         }
     }
 
-    /// `summa-tool search --term-cache-blocks/--term-cache-bytes` reach the config and
+    /// `summa-tool search --term-cache-*` flags reach the config and
     /// out-of-range values fail at open with summa-core's message.
     #[tokio::test]
     async fn search_flags_reach_index_config_and_core_limits_apply() {
-        let config = search_config(1024, Some(0), Some(2));
+        let config = search_config(1024, Some(0), 0, Some(2));
         assert_eq!(config.term_cache_blocks, 1024);
         assert_eq!(config.term_cache_budget_bytes, Some(0));
+        assert_eq!(config.term_cache_process_bytes, 0);
         assert_eq!(config.num_threads, 2);
-        let defaults = search_config(256, None, None);
+        let default_process = summa_core::index::DEFAULT_TERM_CACHE_PROCESS_BYTES;
+        let defaults = search_config(256, None, default_process, None);
         assert_eq!(defaults.term_cache_budget_bytes, None);
+        assert_eq!(
+            defaults.term_cache_process_bytes,
+            IndexConfig::default().term_cache_process_bytes
+        );
         assert_eq!(defaults.num_threads, IndexConfig::default().num_threads);
 
         let root = tempfile::tempdir().unwrap();
@@ -907,7 +915,7 @@ mod tests {
         init_index_from_sdl(path.clone(), "index rows { field body: text }".into())
             .await
             .unwrap();
-        for (config, needle) in [(search_config(65_537, None, None), "term_cache_blocks")] {
+        for (config, needle) in [(search_config(65_537, None, 0, None), "term_cache_blocks")] {
             let error = search_index(path.clone(), "body:x", 10, 0, config)
                 .await
                 .expect_err("out-of-range search option must fail at open");
@@ -918,7 +926,7 @@ mod tests {
             "body:x",
             10,
             0,
-            search_config(65_536, Some(0), Some(1)),
+            search_config(65_536, Some(0), 0, Some(1)),
         )
         .await
         .unwrap();

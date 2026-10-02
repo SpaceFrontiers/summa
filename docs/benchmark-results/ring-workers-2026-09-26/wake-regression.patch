@@ -1,0 +1,116 @@
+--- a/summa-core/src/directories/payload/ring.rs
++++ b/summa-core/src/directories/payload/ring.rs
+@@ -61,6 +61,8 @@
+     counters: Arc<Counters>,
+     wake: Arc<Wake>,
+     wake_armed: bool,
++    #[cfg(test)]
++    waiting_for_test: Option<tokio::sync::oneshot::Sender<()>>,
+ }
+ 
+ /// The only submitter is this worker; SQPOLL is deliberately disabled.
+@@ -148,6 +150,8 @@
+             counters,
+             wake,
+             wake_armed: false,
++            #[cfg(test)]
++            waiting_for_test: None,
+         })
+     }
+ 
+@@ -192,6 +196,10 @@
+                 .map_err(|_| io::Error::other("wake submission queue full"))?;
+             self.wake_armed = true;
+         }
++        #[cfg(test)]
++        if let Some(waiting) = self.waiting_for_test.take() {
++            let _ = waiting.send(());
++        }
+         for _ in 0..8 {
+             match ring.submit_and_wait(1) {
+                 Ok(_) => return Ok(()),
+@@ -285,6 +293,84 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    #[tokio::test]
++    async fn queued_read_wakes_ring_while_prior_read_is_pending() {
++        use super::super::{PayloadReadBackend, PayloadReadService};
++        use std::fs::File;
++        use std::io::Write;
++        let service = PayloadReadService::new(PayloadReadBackend::Pool).unwrap();
++        let wake = Arc::new(Wake::new().unwrap());
++        let mut reactor = Reactor::with_wake(service.counters.clone(), wake.clone()).unwrap();
++        let (waiting, entered_wait) = oneshot::channel();
++        reactor.waiting_for_test = Some(waiting);
++        let (sender, receiver) = async_channel::bounded(DEPTH);
++        let worker = std::thread::spawn(move || reactor.run(receiver));
++        let mut fds = [-1; 2];
++        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
++        // SAFETY: successful pipe2 transferred two fresh descriptors.
++        let pending_file = Arc::new(unsafe { File::from_raw_fd(fds[0]) });
++        let mut release = unsafe { File::from_raw_fd(fds[1]) };
++        async fn job(
++            file: Arc<File>,
++            service: &PayloadReadService,
++        ) -> (Job, oneshot::Receiver<super::super::Reply>) {
++            let (reply, done) = oneshot::channel();
++            (
++                Job {
++                    file,
++                    range: 0..1,
++                    buffers: service.buffers.clone(),
++                    _slot: service
++                        .admission
++                        .slots
++                        .clone()
++                        .acquire_owned()
++                        .await
++                        .unwrap(),
++                    bytes: service
++                        .admission
++                        .bytes
++                        .clone()
++                        .acquire_many_owned(1)
++                        .await
++                        .unwrap(),
++                    reply,
++                    _lease: None,
++                },
++                done,
++            )
++        }
++        let (pending, pending_done) = job(pending_file, &service).await;
++        sender.send(pending).await.unwrap();
++        // The control counter is initially zero. This hook fires after queue
++        // draining and before entering the kernel, so the late request cannot
++        // be picked up by the worker's preceding try_recv loop.
++        entered_wait.await.unwrap();
++        let mut ready_file = tempfile::tempfile().unwrap();
++        ready_file.write_all(b"r").unwrap();
++        let (ready, ready_done) = job(Arc::new(ready_file), &service).await;
++        sender.send(ready).await.unwrap();
++        wake.notify().unwrap();
++        let independent = tokio::time::timeout(std::time::Duration::from_secs(5), ready_done).await;
++        // Always release the delayed read before asserting, including on timeout.
++        release.write_all(b"p").unwrap();
++        pending_done.await.unwrap().result.unwrap();
++        sender.close();
++        worker.join().unwrap().unwrap();
++        service.shutdown().await.unwrap();
++        assert_eq!(
++            independent
++                .expect("new read waited for unrelated pending I/O")
++                .unwrap()
++                .result
++                .unwrap()
++                .as_slice(),
++            b"r"
++        );
++        assert_eq!(service.stats().active, 0);
++        assert_eq!(service.stats().quarantined_bytes, 0);
++    }
++
+     use super::*;
+     use tokio::sync::{Semaphore, oneshot};
+ 

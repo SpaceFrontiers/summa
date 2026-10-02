@@ -38,3 +38,41 @@ pub(super) async fn streaming_writer_cold(
         None => ColdStreamingWriter::new(file, label),
     }))
 }
+
+/// Positional exact read that does not move the shared file cursor, so one
+/// `File` can serve concurrent range reads.
+#[cfg(unix)]
+pub(super) fn read_exact_at(
+    file: &std::fs::File,
+    buffer: &mut [u8],
+    offset: u64,
+) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(buffer, offset)
+}
+
+#[cfg(windows)]
+pub(super) fn read_exact_at(
+    file: &std::fs::File,
+    mut buffer: &mut [u8],
+    mut offset: u64,
+) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        match file.seek_read(buffer, offset) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(read) => {
+                buffer = &mut buffer[read..];
+                offset += read as u64;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}

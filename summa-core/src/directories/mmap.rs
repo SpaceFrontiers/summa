@@ -12,6 +12,13 @@ use memmap2::Mmap;
 
 use super::{Directory, DirectoryWriter, FileHandle, OwnedBytes, StreamingWriter};
 
+#[derive(Clone)]
+struct PayloadReads {
+    service: Arc<super::PayloadReadService>,
+    scope: Arc<super::payload::scope::Scope>,
+    sparse: bool,
+}
+
 /// Memory-mapped directory for efficient access to large index files
 ///
 /// Uses memory-mapped files to avoid loading entire files into memory.
@@ -28,6 +35,7 @@ use super::{Directory, DirectoryWriter, FileHandle, OwnedBytes, StreamingWriter}
 pub struct MmapDirectory {
     root: PathBuf,
     label: super::IndexLabel,
+    payload_reads: Option<PayloadReads>,
 }
 
 impl MmapDirectory {
@@ -36,7 +44,47 @@ impl MmapDirectory {
         Self {
             root: root.as_ref().to_path_buf(),
             label: super::IndexLabel::default(),
+            payload_reads: None,
         }
+    }
+
+    /// Attach a shared explicit-read service for asynchronous payloads. Metadata and
+    /// synchronous readers remain mapped. Unlink waits for accepted reads; whole
+    /// directory removal requires `retire_payload_reads` after lifecycle drain.
+    /// Opening a directory never creates an implicit worker pool.
+    pub fn with_payload_reads(mut self, service: Arc<super::PayloadReadService>) -> Self {
+        let scope = service.directory_scope(&self.root);
+        self.payload_reads = Some(PayloadReads {
+            service,
+            scope,
+            sparse: false,
+        });
+        self
+    }
+
+    /// Opt asynchronous MaxScore blocks into the same service as stored documents.
+    /// Metadata and explicit synchronous block reads retain their mapping.
+    pub fn with_sparse_payload_reads(self, service: Arc<super::PayloadReadService>) -> Self {
+        let mut directory = self.with_payload_reads(service);
+        directory.payload_reads.as_mut().unwrap().sparse = true;
+        directory
+    }
+
+    /// Stop this index's payload admission and wait for accepted reads. Other
+    /// directories attached to the shared service remain usable. Call after the
+    /// existing writer/segment-manager drain, before removing the directory.
+    pub async fn retire_payload_reads(&self) -> io::Result<()> {
+        if let Some(reads) = &self.payload_reads {
+            let mut retired = reads.scope.exclusive().await;
+            *retired = true;
+            reads.service.ensure_drained_resources()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn payload_scope_for_test(&self) -> &super::payload::scope::Scope {
+        &self.payload_reads.as_ref().unwrap().scope
     }
 
     /// Get the root directory path
@@ -63,6 +111,7 @@ impl Clone for MmapDirectory {
             root: self.root.clone(),
             // Shared, so a label set on any clone is visible on all
             label: self.label.clone(),
+            payload_reads: self.payload_reads.clone(),
         }
     }
 }
@@ -92,19 +141,7 @@ impl Directory for MmapDirectory {
     }
 
     async fn read_range(&self, path: &Path, range: Range<u64>) -> io::Result<OwnedBytes> {
-        let mmap = self.mmap_file(path)?;
-        let start = range.start as usize;
-        let end = range.end as usize;
-
-        if end > mmap.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Range {}..{} exceeds file size {}", start, end, mmap.len()),
-            ));
-        }
-
-        // Zero-copy: slice references the mmap directly
-        Ok(OwnedBytes::from_mmap_range(mmap, start..end))
+        self.open_read(path).await?.read_bytes_range(range).await
     }
 
     async fn list_files(&self, prefix: &Path) -> io::Result<Vec<PathBuf>> {
@@ -115,6 +152,34 @@ impl Directory for MmapDirectory {
         // Mmap data is always available synchronously — return Inline handle
         // This eliminates the async callback overhead entirely for mmap paths
         self.open_read(path).await
+    }
+
+    async fn open_payload(&self, path: &Path) -> io::Result<FileHandle> {
+        match &self.payload_reads {
+            Some(reads) => {
+                reads
+                    .service
+                    .open(
+                        self.resolve(path),
+                        self.label.get(),
+                        Some(reads.scope.clone()),
+                    )
+                    .await
+            }
+            None => self.open_lazy(path).await,
+        }
+    }
+
+    async fn open_sparse_payload(&self, path: &Path) -> io::Result<Option<FileHandle>> {
+        if self
+            .payload_reads
+            .as_ref()
+            .is_some_and(|reads| reads.sparse)
+        {
+            self.open_payload(path).await.map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn set_index_label(&self, label: &str) {
@@ -141,7 +206,20 @@ impl DirectoryWriter for MmapDirectory {
 
     async fn delete(&self, path: &Path) -> io::Result<()> {
         let full_path = self.resolve(path);
-        tokio::fs::remove_file(&full_path).await
+        let lease = if let Some(reads) = &self.payload_reads {
+            let lease = reads.scope.exclusive().await;
+            reads.service.ensure_drained_resources()?;
+            Some(lease)
+        } else {
+            None
+        };
+        // The blocking unlink owns its lease if the cleanup future is cancelled.
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            std::fs::remove_file(full_path)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {

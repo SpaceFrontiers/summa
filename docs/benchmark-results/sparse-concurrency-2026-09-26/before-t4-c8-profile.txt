@@ -1,0 +1,172 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 1K of event 'cpu-clock'
+# Event count (approx.): 9577888250
+#
+# Overhead  Command          Shared Object      Symbol
+# ........  ...............  .................  .......................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    19.36%  summa-search-4-  before-bin         [.] <summa_core::query::scoring::MaxScoreExecutor>::execute::{closure#0}
+    11.65%  tokio-rt-worker  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               |
+               |--10.55%--futex_do_wait
+               |          __futex_wait
+               |          futex_wait
+               |          do_futex
+               |          __x64_sys_futex
+               |          x64_sys_call
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |
+               |--0.58%--exit_to_user_mode_loop
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |
+                --0.52%--schedule_hrtimeout_range_clock
+                          schedule_hrtimeout_range
+                          ep_poll
+                          do_epoll_wait
+                          __x64_sys_epoll_wait
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     8.81%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               |
+                --7.97%--try_to_wake_up
+                          wake_up_q
+                          futex_wake
+                          do_futex
+                          __x64_sys_futex
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     4.98%  summa-search-4-  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               try_to_wake_up
+               wake_up_q
+               futex_wake
+               do_futex
+               __x64_sys_futex
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     2.94%  summa-search-4-  [kernel.kallsyms]  [k] __schedule
+            |
+            ---__schedule
+               |
+                --2.89%--schedule
+                          |
+                           --2.83%--do_sched_yield
+                                     __x64_sys_sched_yield
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+
+     2.73%  summa-search-4-  before-bin         [.] <summa_core::query::scoring::TermCursor>::seek::{closure#0}
+     2.57%  summa-search-4-  before-bin         [.] <summa_core::query::scoring::TermCursor>::advance::{closure#0}
+     1.94%  summa-search-4-  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               |
+               |--1.05%--futex_do_wait
+               |          __futex_wait
+               |          futex_wait
+               |          do_futex
+               |          __x64_sys_futex
+               |          x64_sys_call
+               |          do_syscall_64
+               |          entry_SYSCALL_64_after_hwframe
+               |
+                --0.52%--do_sched_yield
+                          __x64_sys_sched_yield
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     1.94%  tokio-rt-worker  before-bin         [.] <std::sys::sync::mutex::futex::Mutex>::lock_contended
+     1.57%  summa-search-4-  [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.57%  summa-search-4-  before-bin         [.] <summa_core::query::scoring::TermCursor>::ensure_block_loaded::{closure#0}
+     1.26%  summa-payload-u  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               futex_do_wait
+               __futex_wait
+               futex_wait
+               do_futex
+               __x64_sys_futex
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.26%  tokio-rt-worker  libc.so.6          [.] syscall
+     1.05%  summa-search-4-  before-bin         [.] <crossbeam_deque::deque::Stealer<rayon_core::job::JobRef>>::steal
+     1.05%  tokio-rt-worker  [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.94%  summa-payload-u  [kernel.kallsyms]  [k] rep_movs_alternative
+            |
+            ---rep_movs_alternative
+               copy_page_to_iter
+               filemap_read
+               generic_file_read_iter
+               ext4_file_read_iter
+               __io_read
+               io_read
+               __io_issue_sqe
+               io_issue_sqe
+               io_submit_sqe
+               io_submit_sqes
+               __do_sys_io_uring_enter
+               __x64_sys_io_uring_enter
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.94%  summa-search-4-  libc.so.6          [.] __sched_yield
+     0.73%  summa-search-4-  before-bin         [.] <rayon_core::registry::WorkerThread>::wait_until_cold
+     0.68%  summa-search-4-  before-bin         [.] <alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop
+     0.63%  summa-search-4-  before-bin         [.] <summa_core::directories::payload::PayloadReadService>::read::{closure#0}
+     0.63%  summa-search-4-  before-bin         [.] <summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into
+     0.58%  summa-payload-u  before-bin         [.] summa_core::directories::payload::prepare
+     0.58%  summa-search-4-  before-bin         [.] <futures_util::stream::stream::buffer_unordered::BufferUnordered<futures_util::stream::iter::Iter<core::iter::adapters::map::Map<core::iter::adapters::copied::Copied<core::slice::iter::Iter<usize>>, <summa_core::index::searcher::Searcher<summa_sparse_io_probe::payload_io::PayloadDirectory>>::search_internal_async_budgeted::{closure#0}::{closure#0}>>> as futures_core::stream::Stream>::poll_next
+     0.58%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_unlock_irq
+            |
+            ---_raw_spin_unlock_irq
+               eventfd_write
+               vfs_write
+               ksys_write
+               __x64_sys_write
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.52%  tokio-rt-worker  before-bin         [.] <std::sys::sync::condvar::futex::Condvar>::wait
+     0.52%  tokio-rt-worker  before-bin         [.] 0x0000000000975d29
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

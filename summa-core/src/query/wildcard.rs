@@ -90,6 +90,26 @@ impl Query for WildcardQuery {
     fn scorer<'a>(&self, reader: &'a SegmentReader, limit: usize) -> ScorerFuture<'a> {
         self.0.scorer(reader, limit)
     }
+    fn scorer_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> ScorerFuture<'a> {
+        self.0.scorer_with_options(reader, limit, options)
+    }
+    #[cfg(feature = "sync")]
+    fn scorer_sync_with_options<'a>(
+        &self,
+        reader: &'a SegmentReader,
+        limit: usize,
+        options: super::ScorerOptions,
+    ) -> Result<Box<dyn Scorer + 'a>> {
+        self.0.scorer_sync_with_options(reader, limit, options)
+    }
+    fn physical_text_field(&self, reader: &SegmentReader, complete: bool) -> Option<Field> {
+        self.0.physical_text_field(reader, complete)
+    }
     #[cfg(feature = "sync")]
     fn scorer_sync<'a>(
         &self,
@@ -98,6 +118,10 @@ impl Query for WildcardQuery {
     ) -> Result<Box<dyn Scorer + 'a>> {
         self.0.scorer_sync(reader, limit)
     }
+    fn exact_count<'a>(&self, reader: &'a SegmentReader) -> Option<CountFuture<'a>> {
+        self.0.exact_count(reader)
+    }
+
     fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a> {
         self.0.count_estimate(reader)
     }

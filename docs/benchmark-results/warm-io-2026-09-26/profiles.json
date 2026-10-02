@@ -1,0 +1,538 @@
+{
+  "cursor-uring": {
+    "entries": [
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 37.91,
+        "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::execute::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 5.53,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 4.36,
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 3.72,
+        "symbol": "<summa_core::query::scoring::TermCursor>::seek_prepare",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 2.22,
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 1.59,
+        "symbol": "__schedule",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 1.46,
+        "symbol": "<summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 1.3,
+        "symbol": "<summa_core::query::scoring::TermCursor>::ensure_block_loaded::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 1.22,
+        "symbol": "rep_movs_alternative",
+        "thread": "summa-payload-u"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 1.11,
+        "symbol": "serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 1.01,
+        "symbol": "do_syscall_64",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.96,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 0.86,
+        "symbol": "0x00000000009892a9",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "libc.so.6",
+        "self_percent": 0.85,
+        "symbol": "syscall",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 0.77,
+        "symbol": "<alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.7,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "summa-payload-u"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 0.69,
+        "symbol": "<crossbeam_deque::deque::Stealer<rayon_core::job::JobRef>>::steal",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 0.55,
+        "symbol": "summa_core::structures::simd::avx2::unpack_16bit",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.55,
+        "symbol": "_raw_spin_unlock_irq",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "libc.so.6",
+        "self_percent": 0.52,
+        "symbol": "__sched_yield",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "cursor-bin",
+        "self_percent": 0.51,
+        "symbol": "_blake3_hash_many_avx512",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.51,
+        "symbol": "do_syscall_64",
+        "thread": "tokio-rt-worker"
+      }
+    ],
+    "raw_sha256": "8bfc329422dc4ddff32f860b110c8043210966bfeba79db34798785e975c1841",
+    "report_sha256": "716d196136f383b7cebb87a17d626dfb5f8f30d3d7b9d9bd98e3684f24122590",
+    "result_sha256": "d6f5c1d3c89b35ff0598af2c43125a609bea6dc397113daafe4c709938fa5be5",
+    "verified_queries": 34493
+  },
+  "mmap": {
+    "entries": [
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 54.12,
+        "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::dispatch_sync",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 7.0,
+        "symbol": "<summa_core::query::scoring::TermCursor>::seek_sync",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 2.67,
+        "symbol": "<summa_core::query::scoring::TermCursor>::ensure_block_loaded_sync",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 2.6,
+        "symbol": "<summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 1.95,
+        "symbol": "serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 1.47,
+        "symbol": "_blake3_hash_many_avx512",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 1.2,
+        "symbol": "<alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 1.17,
+        "symbol": "0x000000000098a4a9",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.84,
+        "symbol": "<summa_core::query::scoring::ScoreCollector>::insert_with_ordinal",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.74,
+        "symbol": "<summa_core::query::scoring::TermCursor>::advance_pos",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.65,
+        "symbol": "ZSTD_decompressSequences_bmi2.constprop.0",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.62,
+        "symbol": "summa_core::structures::simd::avx2::unpack_16bit",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.58,
+        "symbol": "HUF_readDTableX1_wksp",
+        "thread": "tokio-rt-worker"
+      }
+    ],
+    "raw_sha256": "62ceffa70cb259e3f03a259fb4e46152910a747c8b132eb4857beae746cd4654",
+    "report_sha256": "9073dff809aaaced6b83cb2ee1f7d74e11ff55c4808015617a3d53a1c8780a5a",
+    "result_sha256": "468cd8a83018f881d12ebbc137ea52766b71e8ca7046bfb3b664b3ad67928b39",
+    "verified_queries": 35660
+  },
+  "pool": {
+    "entries": [
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 37.32,
+        "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::execute::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 4.91,
+        "symbol": "<summa_core::query::scoring::TermCursor>::advance::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 4.19,
+        "symbol": "<summa_core::query::scoring::TermCursor>::seek::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 3.59,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "summa-payload-p"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 3.52,
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 3.08,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 2.87,
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 2.32,
+        "symbol": "<summa_core::query::scoring::TermCursor>::ensure_block_loaded::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 1.37,
+        "symbol": "<summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 1.13,
+        "symbol": "serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 1.08,
+        "symbol": "rep_movs_alternative",
+        "thread": "summa-payload-p"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.84,
+        "symbol": "<alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.81,
+        "symbol": "<std::sys::sync::mutex::futex::Mutex>::lock_contended",
+        "thread": "summa-payload-p"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.67,
+        "symbol": "0x000000000098a4a9",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.63,
+        "symbol": "_blake3_hash_many_avx512",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.59,
+        "symbol": "__schedule",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "libc.so.6",
+        "self_percent": 0.56,
+        "symbol": "syscall",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.53,
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "thread": "summa-payload-p"
+      }
+    ],
+    "raw_sha256": "5cf428704bd18fcc82cb1deae9d4eb16168cf939f7c17a97d8d34c35e172a8e0",
+    "report_sha256": "1ffa297906c52ab76374b92d235913f8e442294a035c7f8050ce56dc571c1593",
+    "result_sha256": "6258c01c84bcd5be1c8fff5cb07555a410024b552e1c28b028265187858da445",
+    "verified_queries": 33292
+  },
+  "uring": {
+    "entries": [
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 36.67,
+        "symbol": "<summa_core::query::scoring::MaxScoreExecutor>::execute::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 4.83,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 4.82,
+        "symbol": "<summa_core::query::scoring::TermCursor>::advance::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 4.27,
+        "symbol": "<summa_core::query::scoring::TermCursor>::seek::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 3.9,
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 2.21,
+        "symbol": "<summa_core::query::scoring::TermCursor>::ensure_block_loaded::{closure#0}",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 2.21,
+        "symbol": "_raw_spin_unlock_irqrestore",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 1.32,
+        "symbol": "<summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 1.24,
+        "symbol": "__schedule",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 1.2,
+        "symbol": "rep_movs_alternative",
+        "thread": "summa-payload-u"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.98,
+        "symbol": "serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.91,
+        "symbol": "do_syscall_64",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "libc.so.6",
+        "self_percent": 0.82,
+        "symbol": "syscall",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.77,
+        "symbol": "0x000000000098a4a9",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.76,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "summa-payload-u"
+      },
+      {
+        "kind": "k",
+        "object": "[kernel.kallsyms]",
+        "self_percent": 0.74,
+        "symbol": "finish_task_switch.isra.0",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.72,
+        "symbol": "<alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop",
+        "thread": "summa-search-4-"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.55,
+        "symbol": "<std::sys::sync::mutex::futex::Mutex>::lock_contended",
+        "thread": "tokio-rt-worker"
+      },
+      {
+        "kind": ".",
+        "object": "after-bin",
+        "self_percent": 0.51,
+        "symbol": "<crossbeam_deque::deque::Stealer<rayon_core::job::JobRef>>::steal",
+        "thread": "summa-search-4-"
+      }
+    ],
+    "raw_sha256": "c253ed63a1f9542254570ddb238ff590326aff879f681ea084ad28d038b452d0",
+    "report_sha256": "cf446664df8e582a610c7edddd70810c4b6fe54550ae7edbdd912d6b4c6f4ec6",
+    "result_sha256": "ef0221e57af5b5ad7ed27e8a0efb7e76bec2ff50382cde32e3f721f88959a68d",
+    "verified_queries": 32702
+  }
+}

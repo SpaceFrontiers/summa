@@ -1,0 +1,38 @@
+{
+  "native": {
+    "command": "python3 scripts/check_search.py check",
+    "passed": 2121,
+    "ignored": 25,
+    "stages_passed": 5,
+    "evidence": "20260926T183429.458586Z-check"
+  },
+  "wasm": {
+    "command": "cd summa-wasm && bash build.sh && npm ci && npm test",
+    "build": "passed",
+    "tests_passed": 41
+  },
+  "measured_production_decoder_matches_final": true,
+  "final_decoder_with_tests_sha256": "f0d0366b70a22ecf44b27ca2cdfaf86b81e5cbf73c921af7770888f86cd4f868",
+  "additional_checks_not_run": [
+    "Full lifecycle/RPC suite: no lifecycle or RPC changes",
+    "Optional Linux io_uring suite: no payload service changes"
+  ],
+  "post_measurement_edits": "Two test functions and a code-generation rationale comment; production tokens unchanged.",
+  "benchmark_attempts_excluded": [
+    "ARM wall-clock measurements: unstable repeat times on a busy workstation",
+    "First ARM CPU-clock attempt: identical executables for both labels; clean rebuild and distinct hashes required",
+    "Initial cloud launcher: stale source path after audits/probe, before any timing phase"
+  ],
+  "report_checks": [
+    "New results/source/profile exports are byte-identical on regeneration",
+    "10 historical profile and six historical memory exports unchanged after helper extraction",
+    "ruff check and Rust formatting pass",
+    "Search ownership contracts and documentation checks pass: 210 Markdown files, 1071 links, 21 benchmark targets",
+    "git diff --check passes"
+  ],
+  "cloud_final_state": {
+    "build_vm": "TERMINATED",
+    "benchmark_vm": "TERMINATED",
+    "verified": true
+  }
+}

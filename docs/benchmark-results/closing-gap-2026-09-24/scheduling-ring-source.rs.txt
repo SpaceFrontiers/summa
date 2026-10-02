@@ -1,0 +1,122 @@
+//! Both ring policies share buffer ownership, submission and completion handling.
+use super::{Backend, CompletionGate, DEPTH, Dispatch, Read, Stats, finish, prepare};
+use io_uring::{IoUring, opcode, types};
+use std::{collections::VecDeque, io, os::fd::AsRawFd, sync::atomic::Ordering::Relaxed};
+
+fn submit(ring: &mut IoUring, wait: usize) {
+    loop {
+        match ring.submit_and_wait(wait) {
+            Ok(_) => return,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                eprintln!("fatal diagnostic submission failure: {e}");
+                std::process::abort();
+            }
+        }
+    }
+}
+fn result(actual: i32, expected: usize) -> io::Result<()> {
+    if actual == expected as i32 {
+        Ok(())
+    } else if actual < 0 {
+        Err(io::Error::from_raw_os_error(-actual))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "short payload read",
+        ))
+    }
+}
+pub(super) fn run(
+    mut ring: IoUring,
+    receiver: async_channel::Receiver<Dispatch>,
+    stats: &Stats,
+    backend: Backend,
+    gate: Option<&CompletionGate>,
+) {
+    let mut slots: [Option<Read>; DEPTH] = std::array::from_fn(|_| None);
+    let mut completed: [Option<i32>; DEPTH] = [None; DEPTH];
+    let mut tokens = [0u64; DEPTH];
+    let mut sequence = 0u64;
+    let mut pending = VecDeque::with_capacity(DEPTH);
+    let mut outstanding = 0usize;
+    loop {
+        let mut added = 0;
+        if backend == Backend::Refill || outstanding == 0 {
+            if outstanding == 0 && pending.is_empty() {
+                match receiver.recv_blocking() {
+                    Ok(dispatch) => pending.extend(dispatch.jobs()),
+                    Err(_) => break,
+                }
+            }
+            while let Ok(dispatch) = receiver.try_recv() {
+                pending.extend(dispatch.jobs());
+            }
+            assert!(pending.len() + slots.iter().filter(|r| r.is_some()).count() <= DEPTH);
+            while let Some(job) = pending.pop_front() {
+                let Some(mut read) = prepare(job, stats) else {
+                    continue;
+                };
+                let id = slots.iter().position(Option::is_none).unwrap();
+                sequence = sequence.checked_add(1).unwrap();
+                let token = sequence.checked_mul(DEPTH as u64).unwrap() + id as u64;
+                tokens[id] = token;
+                let mut entry = opcode::Read::new(
+                    types::Fd(read.job.file.as_raw_fd()),
+                    read.buffer.as_mut_ptr(),
+                    read.buffer.len() as u32,
+                )
+                .offset(read.job.range.start)
+                .build()
+                .user_data(token);
+                if gate.is_some() {
+                    entry = entry.flags(io_uring::squeue::Flags::ASYNC);
+                }
+                // This slot owns the FD, allocation and permits through its original CQE.
+                // Moving Read moves Vec's header, not the referenced allocation.
+                slots[id] = Some(read);
+                unsafe {
+                    ring.submission().push(&entry).unwrap();
+                }
+                added += 1;
+            }
+        }
+        if added > 0 {
+            stats.batches[added].fetch_add(1, Relaxed);
+            if outstanding > 0 {
+                stats.refills.fetch_add(1, Relaxed);
+            }
+            outstanding += added;
+            if let Some(gate) = gate {
+                submit(&mut ring, 0);
+                gate.wait();
+            }
+        }
+        if outstanding == 0 {
+            continue;
+        }
+        submit(&mut ring, 1);
+        for cqe in ring.completion() {
+            let id = cqe.user_data() as usize % DEPTH;
+            assert_eq!(tokens[id], cqe.user_data());
+            assert!(slots[id].is_some() && completed[id].is_none());
+            completed[id] = Some(cqe.result());
+            outstanding -= 1;
+            if backend == Backend::Refill {
+                let read = slots[id].take().unwrap();
+                let status = result(completed[id].take().unwrap(), read.buffer.len());
+                finish(read, status, stats);
+            }
+        }
+        if backend == Backend::Drain && outstanding == 0 {
+            for (slot, status) in slots.iter_mut().zip(&mut completed) {
+                if let Some(read) = slot.take() {
+                    let status = result(status.take().unwrap(), read.buffer.len());
+                    finish(read, status, stats);
+                }
+            }
+        }
+    }
+    assert_eq!(outstanding, 0);
+    assert!(pending.is_empty() && slots.iter().all(Option::is_none));
+}

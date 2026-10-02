@@ -18,6 +18,7 @@
 //!
 //! 5. **Bloom Filter**: Fast negative lookups to skip unnecessary I/O
 
+mod decoded_block;
 #[cfg(test)]
 mod dictionary_config_tests;
 
@@ -27,12 +28,15 @@ use rustc_hash::FxHashMap;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
+use super::block_cache::{BlockCacheKey, BlockCacheNamespace, SharedBlockCache};
 #[cfg(feature = "fst-index")]
 use super::sstable_index::FstBlockIndex;
 use super::sstable_index::{BlockAddr, BlockIndex, MmapBlockIndex};
-use super::vint::{read_vint, write_vint};
+use super::vint::{read_vint, read_vint_slice, skip_vint, write_vint};
 use crate::compression::{CompressionDict, CompressionLevel};
 use crate::directories::{FileHandle, OwnedBytes};
+pub(crate) use decoded_block::DecodedBlock;
+use decoded_block::SuffixFilter;
 
 /// SSTable magic number written by this build — version 5: data blocks carry
 /// restart points (every `RESTART_INTERVAL` entries a full key plus a trailer
@@ -214,6 +218,52 @@ impl BloomFilter {
             bits: BloomBits::Vec(vec![0u64; num_words]),
             num_bits,
             num_hashes: BLOOM_HASH_COUNT,
+        }
+    }
+
+    /// Smallest key count used by [`Self::for_sstable`]: `bits_per_key × 2^k`
+    /// with `k ≥ 6` is a whole number of words for any `bits_per_key`.
+    const MIN_SSTABLE_KEYS: usize = 64;
+
+    fn sstable_bits(keys: usize, bits_per_key: usize) -> usize {
+        keys.max(Self::MIN_SSTABLE_KEYS)
+            .next_power_of_two()
+            .saturating_mul(bits_per_key.max(1))
+    }
+
+    /// Canonical SSTable sizing: `bits_per_key` × the next power of two of
+    /// `keys`. A filter built for any upper bound folds exactly to the size
+    /// for the actual count ([`Self::fold_for_sstable`]), so streaming
+    /// writers produce the same bytes as writers that knew the count.
+    pub(crate) fn for_sstable(keys: usize, bits_per_key: usize) -> Self {
+        let num_bits = Self::sstable_bits(keys, bits_per_key);
+        Self {
+            bits: BloomBits::Vec(vec![0u64; num_bits / 64]),
+            num_bits,
+            num_hashes: BLOOM_HASH_COUNT,
+        }
+    }
+
+    /// Fold a filter built by [`Self::for_sstable`] for an upper bound down to
+    /// the canonical size for `keys`. Bit `p` maps to `p mod m`, which is
+    /// where `(h1 + i·h2) mod m` lands because `m` divides the built size.
+    pub(crate) fn fold_for_sstable(self, keys: usize, bits_per_key: usize) -> Self {
+        let num_bits = Self::sstable_bits(keys, bits_per_key);
+        let BloomBits::Vec(words) = &self.bits else {
+            return self;
+        };
+        if num_bits >= self.num_bits || !self.num_bits.is_multiple_of(num_bits) {
+            return self;
+        }
+        let target_words = num_bits / 64;
+        let mut folded = vec![0u64; target_words];
+        for (index, word) in words.iter().enumerate() {
+            folded[index % target_words] |= word;
+        }
+        Self {
+            bits: BloomBits::Vec(folded),
+            num_bits,
+            num_hashes: self.num_hashes,
         }
     }
 
@@ -450,6 +500,16 @@ pub trait SSTableValue: Clone + Send + Sync {
 
     /// Read one value from `reader`, leaving subsequent entry bytes untouched.
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self>;
+
+    /// Advance past one value without materializing it.
+    ///
+    /// Scans call this for entries whose key is rejected. Overrides must
+    /// consume exactly the bytes `deserialize` consumes and reject the same
+    /// malformed input; the default decodes and drops.
+    #[inline]
+    fn skip(reader: &mut &[u8]) -> io::Result<()> {
+        Self::deserialize(reader).map(drop)
+    }
 }
 
 /// u64 value implementation
@@ -809,6 +869,41 @@ impl SSTableValue for TermInfo {
         Ok(())
     }
 
+    // Called for nearly every scanned entry; parsed from the slice directly.
+    #[inline(always)]
+    fn skip(reader: &mut &[u8]) -> io::Result<()> {
+        let bytes = *reader;
+        let vints = match bytes.first() {
+            Some(0xFF) if bytes.len() >= 3 => {
+                let (doc_freq, data_len) = (bytes[1] as usize, bytes[2] as usize);
+                if doc_freq == 0 || doc_freq > MAX_INLINE_POSTINGS || data_len > 16 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid inline TermInfo lengths",
+                    ));
+                }
+                let Some(rest) = bytes.get(3 + data_len..) else {
+                    *reader = &[];
+                    return Err(truncated_term_info());
+                };
+                *reader = rest;
+                return Ok(());
+            }
+            Some(0x00) => 3,
+            Some(0x01) => 5,
+            Some(0xFF) | None => {
+                *reader = &[];
+                return Err(truncated_term_info());
+            }
+            Some(&tag) => return Err(invalid_term_info_tag(tag)),
+        };
+        *reader = &bytes[1..];
+        for _ in 0..vints {
+            skip_vint(reader)?;
+        }
+        Ok(())
+    }
+
     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
         let tag = reader.read_u8()?;
 
@@ -856,12 +951,20 @@ impl SSTableValue for TermInfo {
                 position_len,
             })
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid TermInfo tag: {}", tag),
-            ))
+            Err(invalid_term_info_tag(tag))
         }
     }
+}
+
+fn truncated_term_info() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "TermInfo truncated")
+}
+
+fn invalid_term_info_tag(tag: u8) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Invalid TermInfo tag: {}", tag),
+    )
 }
 
 /// Compute common prefix length
@@ -878,8 +981,17 @@ fn decode_block_entry<V: SSTableValue>(
     reader: &mut &[u8],
     current_key: &mut Vec<u8>,
 ) -> io::Result<V> {
-    let common_prefix_len = read_vint(reader)? as usize;
-    let suffix_len = read_vint(reader)? as usize;
+    decode_block_key(reader, current_key)?;
+    V::deserialize(reader)
+}
+
+/// Decode only the key of the next entry and return its shared-prefix length.
+/// The value follows in `reader`; the caller must `deserialize` or `skip` it
+/// before decoding another key.
+#[inline(always)]
+fn decode_block_key(reader: &mut &[u8], current_key: &mut Vec<u8>) -> io::Result<usize> {
+    let common_prefix_len = read_vint_slice(reader)? as usize;
+    let suffix_len = read_vint_slice(reader)? as usize;
 
     if suffix_len > reader.len() {
         return Err(io::Error::new(
@@ -889,10 +1001,29 @@ fn decode_block_entry<V: SSTableValue>(
     }
 
     current_key.truncate(common_prefix_len);
-    current_key.extend_from_slice(&reader[..suffix_len]);
+    append_key_suffix(current_key, reader, suffix_len);
     *reader = &reader[suffix_len..];
+    Ok(common_prefix_len)
+}
 
-    V::deserialize(reader)
+/// Append `entries[..len]` to `key`. Nearly every dictionary suffix is short,
+/// and a `memmove` call per entry dominated warm scans; a fixed-width move is
+/// inlined instead whenever both buffers have room for it.
+#[inline(always)]
+fn append_key_suffix(key: &mut Vec<u8>, entries: &[u8], len: usize) {
+    const WIDE: usize = 16;
+    if len <= WIDE && entries.len() >= WIDE {
+        key.reserve(WIDE);
+        // SAFETY: `entries` has at least WIDE readable bytes and `reserve`
+        // provides WIDE writable bytes past `key.len()`. Only the first `len`
+        // copied bytes (`len <= entries.len()`) become initialized contents.
+        unsafe {
+            std::ptr::copy_nonoverlapping(entries.as_ptr(), key.as_mut_ptr().add(key.len()), WIDE);
+            key.set_len(key.len() + len);
+        }
+    } else {
+        key.extend_from_slice(&entries[..len]);
+    }
 }
 
 /// SSTable statistics for debugging
@@ -917,6 +1048,9 @@ pub struct SSTableStats {
     /// byte budget) or the block alone exceeds the byte budget. A non-zero
     /// value on a hot table means every lookup re-decompresses.
     pub cache_insert_bypasses: u64,
+    /// Scans of shared-cache blocks too large (over 64 KiB) for entry
+    /// offsets; they keep skipping values entry by entry.
+    pub scan_index_bypasses: u64,
 }
 
 /// SSTable writer configuration
@@ -934,6 +1068,24 @@ pub struct SSTableWriterConfig {
     pub use_bloom_filter: bool,
     /// Bloom filter bits per key (default 10 = ~1% false positive rate)
     pub bloom_bits_per_key: usize,
+    /// Bloom filter size policy; see [`BloomSizing`].
+    pub bloom_sizing: BloomSizing,
+}
+
+/// How an [`SSTableWriter`] sizes its bloom filter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BloomSizing {
+    /// `keys × bits_per_key` bits: the frozen v5 sizing. The writer buffers a
+    /// 16-byte hash pair per key until `finish` (O(keys) memory).
+    #[default]
+    Exact,
+    /// `bits_per_key × next_power_of_two(keys)` bits, for writers that rewrite
+    /// existing dictionaries (merge, compaction, text reorder), so every such
+    /// pipeline writes the same bytes. With a `bound` on inserted keys the
+    /// filter is built during `insert` and folded at `finish` (no per-key
+    /// buffer); without one, hashes are buffered. Exceeding the bound keeps
+    /// lookups exact but leaves an unfolded filter, and is logged.
+    PowerOfTwo { bound: Option<usize> },
 }
 
 impl Default for SSTableWriterConfig {
@@ -954,6 +1106,7 @@ impl SSTableWriterConfig {
                 dict_size: DEFAULT_DICT_SIZE,
                 use_bloom_filter: true, // Bloom is cheap (~1.25 B/key) and avoids needless block reads
                 bloom_bits_per_key: BLOOM_BITS_PER_KEY,
+                bloom_sizing: BloomSizing::Exact,
             },
             IndexOptimization::SizeOptimized => Self {
                 block_size: SSTableBlockSize::default(),
@@ -962,6 +1115,7 @@ impl SSTableWriterConfig {
                 dict_size: DEFAULT_DICT_SIZE,
                 use_bloom_filter: true,
                 bloom_bits_per_key: BLOOM_BITS_PER_KEY,
+                bloom_sizing: BloomSizing::Exact,
             },
             IndexOptimization::PerformanceOptimized => Self {
                 block_size: SSTableBlockSize::default(),
@@ -970,6 +1124,7 @@ impl SSTableWriterConfig {
                 dict_size: DEFAULT_DICT_SIZE,
                 use_bloom_filter: true, // Bloom helps skip blocks fast
                 bloom_bits_per_key: BLOOM_BITS_PER_KEY,
+                bloom_sizing: BloomSizing::Exact,
             },
         }
     }
@@ -1001,9 +1156,7 @@ pub struct SSTableWriter<W: Write, V: SSTableValue> {
     config: SSTableWriterConfig,
     /// Pre-trained dictionary for compression (optional)
     dictionary: Option<CompressionDict>,
-    /// Bloom filter key hashes — compact (u64, u64) pairs instead of full keys.
-    /// Filter is built at finish() time with correct sizing.
-    bloom_hashes: Vec<(u64, u64)>,
+    bloom: BloomBuild,
     /// Byte offsets (within the uncompressed block) of the current block's
     /// restart entries.
     block_restarts: Vec<u32>,
@@ -1012,6 +1165,73 @@ pub struct SSTableWriter<W: Write, V: SSTableValue> {
     /// An insert failure may leave a partial entry or output write. Never finish it.
     failed: bool,
     _phantom: std::marker::PhantomData<V>,
+}
+
+/// How the writer builds its bloom filter.
+enum BloomBuild {
+    Disabled,
+    /// `BloomSizing::PowerOfTwo` with a bound: filled on insert, folded at finish.
+    Presized(BloomFilter),
+    /// Compact hash pairs, sized at `finish` by the configured policy.
+    Buffered(Vec<(u64, u64)>),
+}
+
+impl BloomBuild {
+    fn new(config: &SSTableWriterConfig) -> Self {
+        match (config.use_bloom_filter, config.bloom_sizing) {
+            (false, _) => Self::Disabled,
+            (true, BloomSizing::PowerOfTwo { bound: Some(keys) }) => {
+                Self::Presized(BloomFilter::for_sstable(keys, config.bloom_bits_per_key))
+            }
+            (true, _) => Self::Buffered(Vec::new()),
+        }
+    }
+
+    fn insert(&mut self, key: &[u8]) {
+        let (h1, h2) = bloom_hash_pair(key);
+        match self {
+            Self::Disabled => {}
+            Self::Presized(bloom) => bloom.insert_hashed(h1, h2),
+            Self::Buffered(hashes) => hashes.push((h1, h2)),
+        }
+    }
+
+    /// The filter for `entries` inserted keys; none for an empty table.
+    fn finish(self, entries: u64, config: &SSTableWriterConfig) -> Option<BloomFilter> {
+        if entries == 0 {
+            return None;
+        }
+        let bits_per_key = config.bloom_bits_per_key;
+        match self {
+            Self::Disabled => None,
+            Self::Presized(bloom) => {
+                let BloomSizing::PowerOfTwo { bound } = config.bloom_sizing else {
+                    unreachable!("only a bounded power-of-two policy presizes")
+                };
+                let bound = bound.unwrap_or(0) as u64;
+                if entries > bound {
+                    log::warn!(
+                        "SSTable bloom filter sized for {bound} keys received {entries}; \
+                         lookups stay exact but false positives rise"
+                    );
+                    return Some(bloom);
+                }
+                Some(bloom.fold_for_sstable(entries as usize, bits_per_key))
+            }
+            Self::Buffered(hashes) => {
+                let mut bloom = match config.bloom_sizing {
+                    BloomSizing::Exact => BloomFilter::new(hashes.len(), bits_per_key),
+                    BloomSizing::PowerOfTwo { .. } => {
+                        BloomFilter::for_sstable(hashes.len(), bits_per_key)
+                    }
+                };
+                for (h1, h2) in hashes {
+                    bloom.insert_hashed(h1, h2);
+                }
+                Some(bloom)
+            }
+        }
+    }
 }
 
 /// The canonical value serializer writes through this view so an oversized or
@@ -1068,9 +1288,9 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             current_offset: 0,
             num_entries: 0,
             block_first_key: None,
+            bloom: BloomBuild::new(&config),
             config,
             dictionary: None,
-            bloom_hashes: Vec::new(),
             block_restarts: Vec::new(),
             block_entry_count: 0,
             failed: false,
@@ -1085,20 +1305,8 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
         dictionary: CompressionDict,
     ) -> Self {
         Self {
-            writer,
-            block_buffer: Vec::with_capacity(config.block_size.bytes()),
-            prev_key: Vec::new(),
-            index: Vec::new(),
-            current_offset: 0,
-            num_entries: 0,
-            block_first_key: None,
-            config,
             dictionary: Some(dictionary),
-            bloom_hashes: Vec::new(),
-            block_restarts: Vec::new(),
-            block_entry_count: 0,
-            failed: false,
-            _phantom: std::marker::PhantomData,
+            ..Self::with_config(writer, config)
         }
     }
 
@@ -1127,10 +1335,7 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
             self.block_first_key = Some(key.to_vec());
         }
 
-        // Store compact hash pair for bloom filter (16 bytes vs ~48+ per key)
-        if self.config.use_bloom_filter {
-            self.bloom_hashes.push(bloom_hash_pair(key));
-        }
+        self.bloom.insert(key);
 
         // Every RESTART_INTERVAL-th entry is a restart: written with a full
         // key so a lookup can start decoding there.
@@ -1228,17 +1433,8 @@ impl<W: Write, V: SSTableValue> SSTableWriter<W, V> {
         // Flush any remaining data
         self.flush_block()?;
 
-        // Build bloom filter from collected hashes (properly sized)
-        let bloom_filter = if self.config.use_bloom_filter && !self.bloom_hashes.is_empty() {
-            let mut bloom =
-                BloomFilter::new(self.bloom_hashes.len(), self.config.bloom_bits_per_key);
-            for (h1, h2) in &self.bloom_hashes {
-                bloom.insert_hashed(*h1, *h2);
-            }
-            Some(bloom)
-        } else {
-            None
-        };
+        let bloom = std::mem::replace(&mut self.bloom, BloomBuild::Disabled);
+        let bloom_filter = bloom.finish(self.num_entries, &self.config);
 
         let data_end_offset = self.current_offset;
 
@@ -1326,8 +1522,8 @@ pub struct AsyncSSTableReader<V: SSTableValue> {
     /// Memory-efficient block index (FST or mmap)
     block_index: BlockIndex,
     num_entries: u64,
-    /// Hot cache for decompressed blocks
-    cache: RwLock<BlockCache>,
+    /// Retained decompressed blocks: private, or the process-wide cache.
+    cache: ReaderBlockCache,
     /// Bloom filter for fast negative lookups (optional)
     bloom_filter: Option<BloomFilter>,
     /// Compression dictionary (optional)
@@ -1408,13 +1604,169 @@ impl<'b> BlockParts<'b> {
     }
 }
 
+/// Where one reader retains decompressed blocks.
+enum ReaderBlockCache {
+    /// Private per-table cache: merges, maintenance, standalone and WASM readers.
+    Local(RwLock<BlockCache>),
+    /// Process-wide cache shared by search-time term dictionaries; only
+    /// native searchers construct it.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    Shared {
+        cache: Arc<SharedBlockCache<DecodedBlock>>,
+        namespace: BlockCacheNamespace,
+        /// Oversized or disabled insertions dropped without retention.
+        bypasses: std::sync::atomic::AtomicU64,
+        /// Scans of cached blocks too large for u16 entry offsets.
+        unindexed: std::sync::atomic::AtomicU64,
+    },
+}
+
+impl ReaderBlockCache {
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    fn shared(cache: Arc<SharedBlockCache<DecodedBlock>>, namespace: BlockCacheNamespace) -> Self {
+        cache.register(namespace);
+        Self::Shared {
+            cache,
+            namespace,
+            bypasses: std::sync::atomic::AtomicU64::new(0),
+            unindexed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn get(&self, offset: u64) -> Option<Arc<DecodedBlock>> {
+        match self {
+            // Read-lock peek: no LRU promotion, zero writer contention.
+            Self::Local(cache) => cache.read().peek(offset),
+            Self::Shared {
+                cache, namespace, ..
+            } => cache.get(BlockCacheKey {
+                namespace: *namespace,
+                block: offset,
+            }),
+        }
+    }
+
+    /// Retain `block` if the policy admits it; returns the canonical block.
+    fn retain(&self, offset: u64, block: Arc<DecodedBlock>) -> Arc<DecodedBlock> {
+        match self {
+            Self::Local(cache) => {
+                cache.write().insert(offset, Arc::clone(&block));
+                block
+            }
+            Self::Shared {
+                cache,
+                namespace,
+                bypasses,
+                ..
+            } => {
+                if !cache.admits(block.len()) {
+                    bypasses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let key = BlockCacheKey {
+                    namespace: *namespace,
+                    block: offset,
+                };
+                cache.insert(key, block)
+            }
+        }
+    }
+
+    /// Suffix filters are charged by the shared cache only; per-segment
+    /// caches keep their byte accounting and never build them.
+    fn builds_suffix_filters(&self) -> bool {
+        matches!(self, Self::Shared { .. })
+    }
+
+    /// Whether a scan of `hit`, a block already cached when the scan reached
+    /// it, should record entry offsets. Blocks are indexed on their second
+    /// scan, so a cache too small for the scanned range never pays for it.
+    fn indexes_scan_of(&self, hit: &DecodedBlock) -> bool {
+        let Self::Shared { unindexed, .. } = self else {
+            return false;
+        };
+        if hit.entry_starts().is_some() {
+            return false;
+        }
+        if hit.len() > usize::from(u16::MAX) {
+            if unindexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                log::warn!(
+                    "term dictionary block of {} bytes exceeds 64 KiB; prefix scans \
+                     of such blocks skip values entry by entry (see \
+                     docs/dictionary-entry-offsets.md)",
+                    hit.len()
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Swap in a copy of `block` carrying the offsets a complete scan
+    /// recorded; the shared cache re-charges its bytes.
+    fn index_scanned(&self, offset: u64, block: &DecodedBlock, starts: &[u16]) {
+        if let Self::Shared {
+            cache, namespace, ..
+        } = self
+        {
+            let key = BlockCacheKey {
+                namespace: *namespace,
+                block: offset,
+            };
+            cache.replace(key, Arc::new(block.with_entry_starts(starts)));
+        }
+    }
+
+    fn scan_index_bypasses(&self) -> u64 {
+        match self {
+            Self::Local(_) => 0,
+            Self::Shared { unindexed, .. } => unindexed.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn cached_blocks(&self) -> usize {
+        match self {
+            Self::Local(cache) => cache.read().blocks.len(),
+            Self::Shared {
+                cache, namespace, ..
+            } => cache.namespace_blocks(*namespace),
+        }
+    }
+
+    fn cached_bytes(&self) -> usize {
+        match self {
+            Self::Local(cache) => cache.read().retained_bytes,
+            Self::Shared {
+                cache, namespace, ..
+            } => cache.namespace_bytes(*namespace),
+        }
+    }
+
+    fn insert_bypasses(&self) -> u64 {
+        match self {
+            Self::Local(cache) => cache.read().insert_bypasses,
+            Self::Shared { bypasses, .. } => bypasses.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for ReaderBlockCache {
+    fn drop(&mut self) {
+        if let Self::Shared {
+            cache, namespace, ..
+        } = self
+        {
+            cache.unregister(*namespace);
+        }
+    }
+}
+
 /// Bounded block cache with a contention-free read path.
 ///
 /// Normal reads use [`BlockCache::peek`] under a shared lock and deliberately
 /// do not promote hits, so normal eviction order is insertion order.
 /// Duplicate insertions still promote entries during race resolution.
 struct BlockCache {
-    blocks: FxHashMap<u64, Arc<[u8]>>,
+    blocks: FxHashMap<u64, Arc<DecodedBlock>>,
     lru_order: std::collections::VecDeque<u64>,
     max_blocks: usize,
     max_bytes: Option<usize>,
@@ -1454,11 +1806,11 @@ impl BlockCache {
     }
 
     /// Read-only cache probe — no LRU promotion, safe behind a read lock.
-    fn peek(&self, offset: u64) -> Option<Arc<[u8]>> {
+    fn peek(&self, offset: u64) -> Option<Arc<DecodedBlock>> {
         self.blocks.get(&offset).map(Arc::clone)
     }
 
-    fn insert(&mut self, offset: u64, block: Arc<[u8]>) {
+    fn insert(&mut self, offset: u64, block: Arc<DecodedBlock>) {
         if self.max_blocks == 0 {
             self.insert_bypasses += 1;
             return;
@@ -1526,6 +1878,29 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         file_handle: FileHandle,
         cache_blocks: usize,
         cache_budget_bytes: Option<usize>,
+    ) -> io::Result<Self> {
+        let cache = ReaderBlockCache::Local(RwLock::new(BlockCache::new(
+            cache_blocks,
+            cache_budget_bytes,
+        )));
+        Self::open_with_block_cache(file_handle, cache).await
+    }
+
+    /// Open against a process-wide decoded-block cache. Readers of the same
+    /// `namespace` share entries; the last one to drop releases them.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    pub(crate) async fn open_with_shared_cache(
+        file_handle: FileHandle,
+        cache: Arc<SharedBlockCache<DecodedBlock>>,
+        namespace: BlockCacheNamespace,
+    ) -> io::Result<Self> {
+        let cache = ReaderBlockCache::shared(cache, namespace);
+        Self::open_with_block_cache(file_handle, cache).await
+    }
+
+    async fn open_with_block_cache(
+        file_handle: FileHandle,
+        cache: ReaderBlockCache,
     ) -> io::Result<Self> {
         let file_len = file_handle.len();
         if file_len < 37 {
@@ -1737,7 +2112,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             data_slice,
             block_index,
             num_entries,
-            cache: RwLock::new(BlockCache::new(cache_blocks, cache_budget_bytes)),
+            cache,
             bloom_filter,
             dictionary,
             _phantom: std::marker::PhantomData,
@@ -1763,13 +2138,14 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                 .map(|b| b.size_bytes())
                 .unwrap_or(0),
             dictionary_size: self.dictionary.as_ref().map(|d| d.len()).unwrap_or(0),
-            cache_insert_bypasses: self.cache.read().insert_bypasses,
+            cache_insert_bypasses: self.cache.insert_bypasses(),
+            scan_index_bypasses: self.cache.scan_index_bypasses(),
         }
     }
 
     /// Number of blocks currently in the cache
     pub fn cached_blocks(&self) -> usize {
-        self.cache.read().blocks.len()
+        self.cache.cached_blocks()
     }
 
     /// Heap bytes retained by decompressed cached blocks.
@@ -1778,7 +2154,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
     /// the configured writer block size: compression dictionaries and boundary
     /// blocks make the retained size variable.
     pub fn cached_bytes(&self) -> usize {
-        self.cache.read().retained_bytes
+        self.cache.cached_bytes()
     }
 
     /// Look up a key (async - may need to load block)
@@ -1816,57 +2192,51 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         self.search_block(&block_data, key)
     }
 
-    /// Batch lookup multiple keys with optimized I/O
-    ///
-    /// Groups keys by block and loads each block only once, reducing
-    /// I/O from N reads to at most N reads (often fewer if keys share blocks).
-    /// Uses bloom filter to skip keys that definitely don't exist.
+    /// Look up multiple keys, loading each distinct block once regardless of
+    /// cache retention. Results preserve input order and duplicate keys.
+    /// Scratch is O(keys), plus one ordinary bounded decompressed block.
     pub async fn get_batch(&self, keys: &[&[u8]]) -> io::Result<Vec<Option<V>>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Map each key to its block index
-        let mut key_to_block: Vec<(usize, usize)> = Vec::with_capacity(keys.len());
-        for (key_idx, key) in keys.iter().enumerate() {
-            // Check bloom filter first
-            if let Some(ref bloom) = self.bloom_filter
-                && !bloom.may_contain(key)
-            {
-                key_to_block.push((key_idx, usize::MAX)); // Definitely not present
-                continue;
-            }
-
-            match self.block_index.locate(key) {
-                Some(block_idx) => key_to_block.push((key_idx, block_idx)),
-                None => key_to_block.push((key_idx, usize::MAX)), // Mark as not found
-            }
-        }
-
-        // Group keys by block
-        let mut blocks_to_load: Vec<usize> = key_to_block
-            .iter()
-            .filter(|(_, b)| *b != usize::MAX)
-            .map(|(_, b)| *b)
-            .collect();
-        blocks_to_load.sort_unstable();
-        blocks_to_load.dedup();
-
-        // Load all needed blocks (this is where I/O happens)
-        for &block_idx in &blocks_to_load {
-            let _ = self.load_block(block_idx).await?;
-        }
-
-        // Now search each key in its block (all blocks are cached)
+        let requests = self.batch_blocks(keys);
         let mut results = vec![None; keys.len()];
-        for (key_idx, block_idx) in key_to_block {
-            if block_idx == usize::MAX {
+        for group in requests.chunk_by(|a, b| a.0 == b.0) {
+            let block = self.load_block(group[0].0).await?;
+            for &(_, position) in group {
+                results[position] = self.search_block(&block, keys[position])?;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Shared admission and block ordering for both execution modes.
+    fn batch_blocks(&self, keys: &[&[u8]]) -> Vec<(usize, usize)> {
+        let mut requests = Vec::with_capacity(keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            if self
+                .bloom_filter
+                .as_ref()
+                .is_some_and(|bloom| !bloom.may_contain(key))
+            {
                 continue;
             }
-            let block_data = self.load_block(block_idx).await?; // Will hit cache
-            results[key_idx] = self.search_block(&block_data, keys[key_idx])?;
+            if let Some(block) = self.block_index.locate(key) {
+                requests.push((block, position));
+            }
         }
+        requests.sort_unstable_by_key(|&(block, _)| block);
+        requests
+    }
 
+    /// Synchronous batch lookup with the same per-block reuse as `get_batch`.
+    #[cfg(feature = "sync")]
+    pub fn get_batch_sync(&self, keys: &[&[u8]]) -> io::Result<Vec<Option<V>>> {
+        let requests = self.batch_blocks(keys);
+        let mut results = vec![None; keys.len()];
+        for group in requests.chunk_by(|a, b| a.0 == b.0) {
+            let block = self.load_block_sync(group[0].0)?;
+            for &(_, position) in group {
+                results[position] = self.search_block(&block, keys[position])?;
+            }
+        }
         Ok(results)
     }
 
@@ -1890,9 +2260,14 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
     /// decompression is bounded by the existing 64 MiB reader limit,
     /// separately from the retained cache budget.
     pub async fn prefetch_leading_blocks(&self) -> io::Result<()> {
+        let ReaderBlockCache::Local(local) = &self.cache else {
+            // Merge-time warming must not flood the process-wide search cache.
+            log::debug!("SSTable bulk prefetch skipped: reader uses the shared cache");
+            return Ok(());
+        };
         let num_blocks = self.block_index.len();
         let max_blocks = {
-            let cache = self.cache.read();
+            let cache = local.read();
             if cache.blocks.len() >= cache.max_blocks
                 || cache
                     .max_bytes
@@ -1937,7 +2312,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         let mut inserted = 0;
         for i in 0..planned {
             let addr = self.block_index.get_addr(i).unwrap();
-            if self.cache.read().blocks.contains_key(&addr.offset) {
+            if local.read().blocks.contains_key(&addr.offset) {
                 continue;
             }
             let begin = (addr.offset - start) as usize;
@@ -1948,16 +2323,8 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
                     "SSTable prefetch range is truncated",
                 )
             })?;
-            let decompressed = if let Some(ref dict) = self.dictionary {
-                crate::compression::decompress_with_dict_limited(
-                    compressed,
-                    dict,
-                    MAX_SSTABLE_BLOCK_BYTES,
-                )?
-            } else {
-                crate::compression::decompress_limited(compressed, MAX_SSTABLE_BLOCK_BYTES)?
-            };
-            let mut cache = self.cache.write();
+            let decompressed = self.decompress_block(compressed)?;
+            let mut cache = local.write();
             if cache.blocks.contains_key(&addr.offset) {
                 continue;
             }
@@ -1968,7 +2335,7 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
             {
                 break;
             }
-            cache.insert(addr.offset, Arc::from(decompressed));
+            cache.insert(addr.offset, Arc::new(DecodedBlock::new(decompressed)));
             inserted += 1;
         }
         log::debug!(
@@ -1979,89 +2346,51 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
 
     /// Load a block (checks cache first, then loads from FileSlice)
     /// Uses dictionary decompression if dictionary is present
-    async fn load_block(&self, block_idx: usize) -> io::Result<Arc<[u8]>> {
-        let addr = self.block_index.get_addr(block_idx).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Block index out of range")
-        })?;
-
-        // Fast path: read-lock peek (no LRU promotion, zero writer contention)
-        {
-            if let Some(block) = self.cache.read().peek(addr.offset) {
-                return Ok(block);
-            }
+    async fn load_block(&self, block_idx: usize) -> io::Result<Arc<DecodedBlock>> {
+        let addr = self.block_addr(block_idx)?;
+        if let Some(block) = self.cache.get(addr.offset) {
+            return Ok(block);
         }
-
-        log::debug!(
-            "SSTable::load_block idx={} CACHE MISS, reading bytes [{}-{}]",
-            block_idx,
-            addr.offset,
-            addr.offset + addr.length as u64
-        );
-
-        // Load from FileSlice
-        let range = addr.byte_range();
-        let compressed = self.data_slice.read_bytes_range(range).await?;
-
-        // Decompress with dictionary if available
-        let decompressed = if let Some(ref dict) = self.dictionary {
-            crate::compression::decompress_with_dict_limited(
-                compressed.as_slice(),
-                dict,
-                MAX_SSTABLE_BLOCK_BYTES,
-            )?
-        } else {
-            crate::compression::decompress_limited(compressed.as_slice(), MAX_SSTABLE_BLOCK_BYTES)?
-        };
-
-        let block: Arc<[u8]> = Arc::from(decompressed);
-
-        // Insert into cache under the write lock.
-        {
-            let mut cache = self.cache.write();
-            cache.insert(addr.offset, Arc::clone(&block));
-        }
-
-        Ok(block)
+        let compressed = self.data_slice.read_bytes_range(addr.byte_range()).await?;
+        self.decode_and_retain(addr, compressed.as_slice())
     }
 
     /// Synchronous block load — only works for Inline (mmap/RAM) file handles.
     #[cfg(feature = "sync")]
-    fn load_block_sync(&self, block_idx: usize) -> io::Result<Arc<[u8]>> {
-        let addr = self.block_index.get_addr(block_idx).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Block index out of range")
-        })?;
-
-        // Fast path: read-lock peek (no LRU promotion, zero writer contention)
-        {
-            if let Some(block) = self.cache.read().peek(addr.offset) {
-                return Ok(block);
-            }
+    fn load_block_sync(&self, block_idx: usize) -> io::Result<Arc<DecodedBlock>> {
+        let addr = self.block_addr(block_idx)?;
+        if let Some(block) = self.cache.get(addr.offset) {
+            return Ok(block);
         }
+        let compressed = self.data_slice.read_bytes_range_sync(addr.byte_range())?;
+        self.decode_and_retain(addr, compressed.as_slice())
+    }
 
-        // Load from FileSlice (sync — requires Inline handle)
-        let range = addr.byte_range();
-        let compressed = self.data_slice.read_bytes_range_sync(range)?;
+    fn block_addr(&self, block_idx: usize) -> io::Result<BlockAddr> {
+        self.block_index
+            .get_addr(block_idx)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Block index out of range"))
+    }
 
-        // Decompress with dictionary if available
-        let decompressed = if let Some(ref dict) = self.dictionary {
-            crate::compression::decompress_with_dict_limited(
-                compressed.as_slice(),
+    fn decode_and_retain(
+        &self,
+        addr: BlockAddr,
+        compressed: &[u8],
+    ) -> io::Result<Arc<DecodedBlock>> {
+        let block = Arc::new(DecodedBlock::new(self.decompress_block(compressed)?));
+        Ok(self.cache.retain(addr.offset, block))
+    }
+
+    /// Bounded decompression, with the table's dictionary when present.
+    fn decompress_block(&self, compressed: &[u8]) -> io::Result<Vec<u8>> {
+        match &self.dictionary {
+            Some(dict) => crate::compression::decompress_with_dict_limited(
+                compressed,
                 dict,
                 MAX_SSTABLE_BLOCK_BYTES,
-            )?
-        } else {
-            crate::compression::decompress_limited(compressed.as_slice(), MAX_SSTABLE_BLOCK_BYTES)?
-        };
-
-        let block: Arc<[u8]> = Arc::from(decompressed);
-
-        // Insert into cache under the write lock.
-        {
-            let mut cache = self.cache.write();
-            cache.insert(addr.offset, Arc::clone(&block));
+            ),
+            None => crate::compression::decompress_limited(compressed, MAX_SSTABLE_BLOCK_BYTES),
         }
-
-        Ok(block)
     }
 
     /// Synchronous key lookup — only works for Inline (mmap/RAM) file handles.
@@ -2197,73 +2526,79 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         max_scanned: usize,
         accepts: impl FnMut(&[u8]) -> bool + Send,
     ) -> io::Result<PrefixScanResult<V>> {
-        self.prefix_scan_projected(prefix, max_results, max_scanned, accepts, |key, value| {
-            (key.to_vec(), value)
-        })
+        let project = |key: &[u8], value| (key.to_vec(), value);
+        self.prefix_scan_projected(
+            prefix,
+            None,
+            None,
+            max_results,
+            max_scanned,
+            accepts,
+            project,
+        )
         .await
     }
 
+    /// Values of accepted entries under `prefix` and before the exclusive
+    /// `end` key. `ending` promises that every accepted key ends with these
+    /// four bytes; cached blocks whose suffix filter excludes it are skipped
+    /// (`docs/dictionary-suffix-filters.md`).
     pub(crate) async fn prefix_scan_values(
         &self,
         prefix: &[u8],
+        end: Option<&[u8]>,
+        ending: Option<[u8; 4]>,
         max_results: usize,
         max_scanned: usize,
         accepts: impl FnMut(&[u8]) -> bool + Send,
     ) -> io::Result<(Vec<V>, bool)> {
-        self.prefix_scan_projected(prefix, max_results, max_scanned, accepts, |_, value| value)
-            .await
+        let project = |_: &[u8], value| value;
+        self.prefix_scan_projected(
+            prefix,
+            end,
+            ending,
+            max_results,
+            max_scanned,
+            accepts,
+            project,
+        )
+        .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn prefix_scan_projected<T: Send>(
         &self,
         prefix: &[u8],
+        end: Option<&[u8]>,
+        ending: Option<[u8; 4]>,
         max_results: usize,
         max_scanned: usize,
         mut accepts: impl FnMut(&[u8]) -> bool + Send,
         mut project: impl FnMut(&[u8], V) -> T + Send,
     ) -> io::Result<(Vec<T>, bool)> {
-        if self.block_index.is_empty() || prefix.is_empty() {
-            return Ok((Vec::new(), false));
-        }
-
-        // `locate` returns `None` when `prefix` sorts before the first key of
-        // block 0. That is a miss for a point lookup, but a prefix of the
-        // smallest key still matches entries in block 0, so scans start there.
-        let start_block = self.block_index.locate(prefix).unwrap_or(0);
-
-        let mut results = Vec::new();
-        let mut scanned = 0usize;
-
-        for block_idx in start_block..self.block_index.len() {
-            let block_data = self.load_block(block_idx).await?;
-            let mut reader = self.block_entries(&block_data)?;
-            let mut current_key = Vec::new();
-
-            while !reader.is_empty() {
-                let value = decode_block_entry(&mut reader, &mut current_key)?;
-
-                if current_key.starts_with(prefix) {
-                    if scanned == max_scanned {
-                        return Err(io::Error::other(format!(
-                            "term dictionary scan exceeds {max_scanned} terms"
-                        )));
-                    }
-                    scanned += 1;
-                    if !accepts(&current_key) {
-                        continue;
-                    }
-                    if results.len() >= max_results {
-                        return Ok((results, true));
-                    }
-                    results.push(project(&current_key, value));
-                } else if current_key.as_slice() > prefix {
-                    // Keys are sorted — past the prefix range, done
-                    return Ok((results, false));
-                }
+        let ending = ending.filter(|_| self.cache.builds_suffix_filters());
+        let mut scan = PrefixScan::new(prefix, end, ending, max_results, max_scanned);
+        for block_idx in scan.blocks(&self.block_index) {
+            let addr = self.block_addr(block_idx)?;
+            let hit = self.cache.get(addr.offset);
+            let record = hit
+                .as_deref()
+                .is_some_and(|hit| self.cache.indexes_scan_of(hit));
+            let block = match hit {
+                Some(block) => block,
+                None => self.load_block(block_idx).await?,
+            };
+            if scan.skips(&block, block_idx)? {
+                continue;
+            }
+            if let Some(more) = scan.scan_block(&block, record, &mut accepts, &mut project)? {
+                return Ok((scan.results, more));
+            }
+            if record {
+                self.cache.index_scanned(addr.offset, &block, &scan.starts);
             }
         }
-
-        Ok((results, false))
+        Ok((scan.results, false))
     }
 
     /// Synchronous prefix scan — requires Inline (mmap/RAM) file handles.
@@ -2291,78 +2626,294 @@ impl<V: SSTableValue> AsyncSSTableReader<V> {
         max_scanned: usize,
         accepts: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<PrefixScanResult<V>> {
-        self.prefix_scan_projected_sync(prefix, max_results, max_scanned, accepts, |key, value| {
-            (key.to_vec(), value)
-        })
+        let project = |key: &[u8], value| (key.to_vec(), value);
+        self.prefix_scan_projected_sync(
+            prefix,
+            None,
+            None,
+            max_results,
+            max_scanned,
+            accepts,
+            project,
+        )
     }
 
     #[cfg(feature = "sync")]
     pub(crate) fn prefix_scan_values_sync(
         &self,
         prefix: &[u8],
+        end: Option<&[u8]>,
+        ending: Option<[u8; 4]>,
         max_results: usize,
         max_scanned: usize,
         accepts: impl FnMut(&[u8]) -> bool,
     ) -> io::Result<(Vec<V>, bool)> {
-        self.prefix_scan_projected_sync(prefix, max_results, max_scanned, accepts, |_, value| value)
+        let project = |_: &[u8], value| value;
+        self.prefix_scan_projected_sync(
+            prefix,
+            end,
+            ending,
+            max_results,
+            max_scanned,
+            accepts,
+            project,
+        )
     }
 
     #[cfg(feature = "sync")]
+    #[allow(clippy::too_many_arguments)]
     fn prefix_scan_projected_sync<T>(
         &self,
         prefix: &[u8],
+        end: Option<&[u8]>,
+        ending: Option<[u8; 4]>,
         max_results: usize,
         max_scanned: usize,
         mut accepts: impl FnMut(&[u8]) -> bool,
         mut project: impl FnMut(&[u8], V) -> T,
     ) -> io::Result<(Vec<T>, bool)> {
-        if self.block_index.is_empty() || prefix.is_empty() {
-            return Ok((Vec::new(), false));
-        }
-
-        // See `prefix_scan_limited`: a prefix of the smallest key lives in block 0.
-        let start_block = self.block_index.locate(prefix).unwrap_or(0);
-
-        let mut results = Vec::new();
-        let mut scanned = 0usize;
-
-        for block_idx in start_block..self.block_index.len() {
-            let block_data = self.load_block_sync(block_idx)?;
-            let mut reader = self.block_entries(&block_data)?;
-            let mut current_key = Vec::new();
-
-            while !reader.is_empty() {
-                let value = decode_block_entry(&mut reader, &mut current_key)?;
-
-                if current_key.starts_with(prefix) {
-                    if scanned == max_scanned {
-                        return Err(io::Error::other(format!(
-                            "term dictionary scan exceeds {max_scanned} terms"
-                        )));
-                    }
-                    scanned += 1;
-                    if !accepts(&current_key) {
-                        continue;
-                    }
-                    if results.len() >= max_results {
-                        return Ok((results, true));
-                    }
-                    results.push(project(&current_key, value));
-                } else if current_key.as_slice() > prefix {
-                    return Ok((results, false));
-                }
+        let ending = ending.filter(|_| self.cache.builds_suffix_filters());
+        let mut scan = PrefixScan::new(prefix, end, ending, max_results, max_scanned);
+        for block_idx in scan.blocks(&self.block_index) {
+            let addr = self.block_addr(block_idx)?;
+            let hit = self.cache.get(addr.offset);
+            let record = hit
+                .as_deref()
+                .is_some_and(|hit| self.cache.indexes_scan_of(hit));
+            let block = match hit {
+                Some(block) => block,
+                None => self.load_block_sync(block_idx)?,
+            };
+            if scan.skips(&block, block_idx)? {
+                continue;
+            }
+            if let Some(more) = scan.scan_block(&block, record, &mut accepts, &mut project)? {
+                return Ok((scan.results, more));
+            }
+            if record {
+                self.cache.index_scanned(addr.offset, &block, &scan.starts);
             }
         }
-
-        Ok((results, false))
+        Ok((scan.results, false))
     }
+}
+
+/// Budgeted prefix-range state shared by the async and sync scans.
+///
+/// Only keys are decoded until `accepts` admits one; rejected and out-of-range
+/// entries skip their values, by parsing them or, in blocks carrying entry
+/// offsets, by jumping to the next entry. Inside the range, an entry sharing at
+/// least `prefix.len()` bytes with its in-range predecessor is in range without
+/// a comparison. With an `ending`, complete scans publish a suffix filter on
+/// the block, and later scans skip interior blocks it excludes.
+struct PrefixScan<'p, T> {
+    prefix: &'p [u8],
+    /// Exclusive upper key: the scan ends at the first key at or past it.
+    end: Option<&'p [u8]>,
+    ending: Option<[u8; 4]>,
+    max_results: usize,
+    max_scanned: usize,
+    scanned: usize,
+    /// First and last block that can hold keys under `prefix`.
+    first_block: usize,
+    last_block: usize,
+    key: Vec<u8>,
+    /// Entry offsets recorded by the last `scan_block`, complete only when it
+    /// returned `None`.
+    starts: Vec<u16>,
+    results: Vec<T>,
+}
+
+impl<'p, T> PrefixScan<'p, T> {
+    fn new(
+        prefix: &'p [u8],
+        end: Option<&'p [u8]>,
+        ending: Option<[u8; 4]>,
+        max_results: usize,
+        max_scanned: usize,
+    ) -> Self {
+        Self {
+            prefix,
+            end,
+            ending,
+            max_results,
+            max_scanned,
+            scanned: 0,
+            first_block: 0,
+            last_block: 0,
+            key: Vec::new(),
+            starts: Vec::new(),
+            results: Vec::new(),
+        }
+    }
+
+    fn blocks(&mut self, index: &BlockIndex) -> std::ops::Range<usize> {
+        if index.is_empty() || self.prefix.is_empty() {
+            return 0..0;
+        }
+        // `locate` returns `None` when `prefix` sorts before the first key of
+        // block 0. That is a miss for a point lookup, but a prefix of the
+        // smallest key still matches entries in block 0, so scans start there.
+        self.first_block = index.locate(self.prefix).unwrap_or(0);
+        // No key under `prefix` lies past the block that holds its successor.
+        self.last_block = prefix_successor(self.prefix)
+            .map_or(index.len() - 1, |end| index.locate(&end).unwrap_or(0));
+        if let Some(end) = self.end {
+            self.last_block = self.last_block.min(index.locate(end).unwrap_or(0));
+        }
+        self.last_block = self.last_block.max(self.first_block);
+        self.first_block..self.last_block + 1
+    }
+
+    /// Skip an interior block whose suffix filter excludes `ending`. Every key
+    /// of an interior block is under the prefix, so it is charged to the scan
+    /// budget exactly as a full scan would count it.
+    fn skips(&mut self, block: &DecodedBlock, block_idx: usize) -> io::Result<bool> {
+        let (Some(ending), Some(filter)) = (self.ending, block.suffix_filter()) else {
+            return Ok(false);
+        };
+        if block_idx <= self.first_block
+            || block_idx >= self.last_block
+            || filter.may_contain(ending)
+        {
+            return Ok(false);
+        }
+        if self.scanned + filter.entries() > self.max_scanned {
+            return Err(self.budget_error());
+        }
+        self.scanned += filter.entries();
+        Ok(true)
+    }
+
+    fn budget_error(&self) -> io::Error {
+        io::Error::other(format!(
+            "term dictionary scan exceeds {} terms",
+            self.max_scanned
+        ))
+    }
+
+    /// Scan one decompressed block. `Some(more)` ends the scan; `more` reports
+    /// an accepted entry beyond `max_results`. With `record` (a block of at
+    /// most 64 KiB without offsets), a complete scan leaves every entry's
+    /// offset in `self.starts`.
+    fn scan_block<V: SSTableValue>(
+        &mut self,
+        block: &DecodedBlock,
+        record: bool,
+        accepts: &mut impl FnMut(&[u8]) -> bool,
+        project: &mut impl FnMut(&[u8], V) -> T,
+    ) -> io::Result<Option<bool>> {
+        let entries = BlockParts::split(block)?.entries;
+        self.key.clear();
+        self.starts.clear();
+        // Built only from a complete pass over the block, then published.
+        let mut filter = self
+            .ending
+            .filter(|_| block.suffix_filter().is_none())
+            .map(|_| SuffixFilter::new());
+        let end = match block.entry_starts() {
+            Some(starts) => {
+                self.scan_entries::<V, true, false>(entries, starts, &mut filter, accepts, project)
+            }
+            None if record => {
+                self.scan_entries::<V, false, true>(entries, &[], &mut filter, accepts, project)
+            }
+            None => {
+                self.scan_entries::<V, false, false>(entries, &[], &mut filter, accepts, project)
+            }
+        }?;
+        if end.is_none()
+            && let Some(filter) = filter
+        {
+            block.publish_suffix_filter(filter);
+        }
+        Ok(end)
+    }
+
+    /// The entry loop of [`Self::scan_block`], specialized for blocks with
+    /// entry offsets (`INDEXED`: rejected values are jumped over, never
+    /// parsed) and for scans recording them (`RECORD`).
+    #[inline(always)]
+    fn scan_entries<V: SSTableValue, const INDEXED: bool, const RECORD: bool>(
+        &mut self,
+        entries: &[u8],
+        starts: &[u16],
+        filter: &mut Option<Box<SuffixFilter>>,
+        accepts: &mut impl FnMut(&[u8]) -> bool,
+        project: &mut impl FnMut(&[u8], V) -> T,
+    ) -> io::Result<Option<bool>> {
+        let mut reader = entries;
+        let mut next = 0;
+        let mut in_range = false;
+        loop {
+            if INDEXED {
+                // Recorded by a complete scan of these very bytes.
+                let Some(&end) = starts.get(next + 1) else {
+                    break;
+                };
+                reader = &entries[usize::from(starts[next])..usize::from(end)];
+                next += 1;
+            } else if reader.is_empty() {
+                break;
+            } else if RECORD {
+                self.starts.push((entries.len() - reader.len()) as u16);
+            }
+            let shared = decode_block_key(&mut reader, &mut self.key)?;
+            if self.end.is_some_and(|end| self.key.as_slice() >= end) {
+                return Ok(Some(false));
+            }
+            if let Some(filter) = filter.as_mut() {
+                filter.insert(&self.key);
+            }
+            if !in_range || shared < self.prefix.len() {
+                in_range = self.key.starts_with(self.prefix);
+                if !in_range {
+                    if self.key.as_slice() > self.prefix {
+                        // Keys are sorted — past the prefix range, done.
+                        return Ok(Some(false));
+                    }
+                    if !INDEXED {
+                        V::skip(&mut reader)?;
+                    }
+                    continue;
+                }
+            }
+            if self.scanned == self.max_scanned {
+                return Err(self.budget_error());
+            }
+            self.scanned += 1;
+            if !accepts(&self.key) {
+                if !INDEXED {
+                    V::skip(&mut reader)?;
+                }
+                continue;
+            }
+            if self.results.len() >= self.max_results {
+                return Ok(Some(true));
+            }
+            let value = V::deserialize(&mut reader)?;
+            self.results.push(project(&self.key, value));
+        }
+        if RECORD {
+            self.starts.push(entries.len() as u16);
+        }
+        Ok(None)
+    }
+}
+
+/// Smallest key greater than every key starting with `prefix`, if any.
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|&byte| byte != u8::MAX)?;
+    let mut successor = prefix[..=last].to_vec();
+    successor[last] += 1;
+    Some(successor)
 }
 
 /// Async iterator over SSTable entries
 pub struct AsyncSSTableIterator<'a, V: SSTableValue> {
     reader: &'a AsyncSSTableReader<V>,
     current_block: usize,
-    block_data: Option<Arc<[u8]>>,
+    block_data: Option<Arc<DecodedBlock>>,
     block_offset: usize,
     /// End of the entry stream in `block_data` (excludes the restart trailer).
     block_entries_end: usize,
@@ -2455,14 +3006,14 @@ mod tests {
                         })
                         .map_err(|error| (error.kind(), error.to_string()));
                     let actual = reader
-                        .prefix_scan_values(prefix, results, scanned, accepts)
+                        .prefix_scan_values(prefix, None, None, results, scanned, accepts)
                         .await
                         .map_err(|error| (error.kind(), error.to_string()));
                     assert_eq!(actual, expected);
                     #[cfg(feature = "sync")]
                     assert_eq!(
                         reader
-                            .prefix_scan_values_sync(prefix, results, scanned, accepts)
+                            .prefix_scan_values_sync(prefix, None, None, results, scanned, accepts)
                             .map_err(|error| (error.kind(), error.to_string())),
                         expected
                     );
@@ -2588,6 +3139,59 @@ mod tests {
             "False positive rate {} is too high",
             fp_rate
         );
+    }
+
+    #[tokio::test]
+    async fn batch_lookup_reads_each_block_once_without_cache_retention() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (bytes, keys) = keyed_table(20_000);
+        for cache_blocks in [0, 1] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let data = OwnedBytes::new(bytes.clone());
+            let handle = FileHandle::lazy(
+                data.len() as u64,
+                Arc::new({
+                    let reads = reads.clone();
+                    move |range| {
+                        reads.fetch_add(1, Ordering::Relaxed);
+                        let data = data.slice(range.start as usize..range.end as usize);
+                        Box::pin(async move { Ok(data) })
+                    }
+                }),
+            );
+            let reader = AsyncSSTableReader::<u64>::open(handle, cache_blocks)
+                .await
+                .unwrap();
+            let batch: Vec<_> = keys
+                .iter()
+                .rev()
+                .step_by(31)
+                .flat_map(|key| [key.as_slice(), key.as_slice()])
+                .chain([b"".as_slice(), b"missing"])
+                .collect();
+            let mut blocks: Vec<_> = batch
+                .iter()
+                .filter_map(|key| reader.block_index.locate(key))
+                .collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            assert!(blocks.len() > 3);
+            reads.store(0, Ordering::Relaxed);
+            let values = reader.get_batch(&batch).await.unwrap();
+            for (key, value) in batch.iter().zip(values) {
+                assert_eq!(
+                    value,
+                    keys.binary_search_by(|candidate| candidate.as_slice().cmp(key))
+                        .ok()
+                        .map(|id| id as u64)
+                );
+            }
+            assert_eq!(
+                reads.load(Ordering::Relaxed),
+                blocks.len(),
+                "cache_blocks={cache_blocks}"
+            );
+        }
     }
 
     #[test]
@@ -2866,6 +3470,25 @@ mod tests {
     }
 
     #[test]
+    fn short_and_long_key_suffixes_decode_identically_near_block_end() {
+        for suffix_len in 0..40usize {
+            let suffix: Vec<u8> = (0..suffix_len as u8).map(|b| b'a' + b % 26).collect();
+            for trailing in [0usize, 1, 15, 16, 40] {
+                let mut encoded = Vec::new();
+                write_vint(&mut encoded, 3).unwrap();
+                write_vint(&mut encoded, suffix_len as u64).unwrap();
+                encoded.extend_from_slice(&suffix);
+                encoded.extend(std::iter::repeat_n(0xEE, trailing));
+                let mut reader = encoded.as_slice();
+                let mut key = b"pre-previous".to_vec();
+                assert_eq!(decode_block_key(&mut reader, &mut key).unwrap(), 3);
+                assert_eq!(key, [&b"pre"[..], &suffix].concat());
+                assert_eq!(reader.len(), trailing);
+            }
+        }
+    }
+
+    #[test]
     fn decode_block_entry_rejects_truncated_suffix() {
         let encoded = [0, 4, b'o', b'n'];
         let mut reader = encoded.as_slice();
@@ -2875,5 +3498,439 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(error.to_string(), "SSTable block suffix truncated");
+    }
+
+    #[test]
+    fn term_info_skip_consumes_and_rejects_exactly_like_deserialize() {
+        let values = [
+            TermInfo::try_inline(&[3], &[1]).unwrap(),
+            TermInfo::try_inline(&[1, 900, 70_000], &[2, 1, 40]).unwrap(),
+            TermInfo::external(0, 1, 4),
+            TermInfo::external(u64::MAX, 1 << 40, u32::MAX),
+            TermInfo::external_with_positions(123_456, 789, 42, 1 << 35, 99),
+        ];
+        let mut inputs = vec![
+            vec![0x02],
+            vec![0xFF, 0, 0],
+            vec![0xFF, 4, 0],
+            vec![0xFF, 1, 17],
+            [&[0x00][..], &[0x80; 9], &[2, 0, 0]].concat(),
+            [&[0x01, 1, 1, 1, 1], &[0xff; 11][..]].concat(),
+        ];
+        for value in &values {
+            let mut encoded = Vec::new();
+            value.serialize(&mut encoded).unwrap();
+            for end in 0..=encoded.len() {
+                inputs.push(encoded[..end].to_vec());
+            }
+            encoded.push(0x5a);
+            inputs.push(encoded);
+        }
+        for input in inputs {
+            let (mut decoded, mut skipped) = (input.as_slice(), input.as_slice());
+            let expected = TermInfo::deserialize(&mut decoded)
+                .map(drop)
+                .map_err(|error| error.kind());
+            let actual = TermInfo::skip(&mut skipped).map_err(|error| error.kind());
+            assert_eq!(actual, expected, "{input:?}");
+            if expected.is_ok() {
+                assert_eq!(skipped, decoded, "{input:?}");
+            }
+        }
+    }
+
+    thread_local! {
+        static VALUE_CALLS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    }
+
+    /// Counts `(deserialize, skip)` calls on the current thread.
+    #[derive(Clone, Debug, PartialEq)]
+    struct CountedValue(u64);
+
+    impl SSTableValue for CountedValue {
+        fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+            write_vint(writer, self.0)
+        }
+
+        fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+            VALUE_CALLS.with(|calls| calls.set((calls.get().0 + 1, calls.get().1)));
+            read_vint(reader).map(Self)
+        }
+
+        fn skip(reader: &mut &[u8]) -> io::Result<()> {
+            VALUE_CALLS.with(|calls| calls.set((calls.get().0, calls.get().1 + 1)));
+            skip_vint(reader)
+        }
+    }
+
+    fn take_value_calls() -> (usize, usize) {
+        VALUE_CALLS.with(|calls| calls.replace((0, 0)))
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn prefix_scan_decodes_values_only_for_accepted_keys() {
+        let keys: Vec<String> = (0..5_000).map(|i| format!("k{i:05}")).collect();
+        let config = SSTableWriterConfig {
+            block_size: SSTableBlockSize::try_from(512).unwrap(),
+            ..SSTableWriterConfig::default()
+        };
+        let mut writer = SSTableWriter::<_, CountedValue>::with_config(Vec::new(), config);
+        for (i, key) in keys.iter().enumerate() {
+            writer
+                .insert(key.as_bytes(), &CountedValue(i as u64))
+                .unwrap();
+        }
+        let handle = FileHandle::from_bytes(OwnedBytes::new(writer.finish().unwrap()));
+        let reader = AsyncSSTableReader::<CountedValue>::open(handle, 64)
+            .await
+            .unwrap();
+        assert!(reader.block_index.len() > 3, "test needs several blocks");
+
+        // `k02` covers 1,000 keys spanning blocks; accept every tenth.
+        take_value_calls();
+        let (values, more) = reader
+            .prefix_scan_values(b"k02", None, None, usize::MAX, usize::MAX, |key| {
+                key.ends_with(b"0")
+            })
+            .await
+            .unwrap();
+        assert!(!more);
+        let expected: Vec<_> = (2_000..3_000).step_by(10).map(CountedValue).collect();
+        assert_eq!(values, expected);
+        let (decoded, skipped) = take_value_calls();
+        assert_eq!(decoded, expected.len());
+        // Rejected in-range keys plus the start block's keys before `k02`;
+        // the out-of-range key that ends the scan is not skipped.
+        let start_block = reader.block_index.locate(b"k02").unwrap();
+        let before = keys
+            .iter()
+            .filter(|key| key.as_str() < "k02")
+            .filter(|key| reader.block_index.locate(key.as_bytes()) == Some(start_block))
+            .count();
+        assert_eq!(skipped, 900 + before);
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn shared_cache_readers_share_blocks_and_release_them_with_the_last_reader() {
+        let (bytes, keys) = keyed_table(20_000);
+        let open_local = || {
+            AsyncSSTableReader::<u64>::open(
+                FileHandle::from_bytes(OwnedBytes::new(bytes.clone())),
+                0,
+            )
+        };
+        let cache = Arc::new(SharedBlockCache::<DecodedBlock>::new(64 << 20));
+        let namespace = BlockCacheNamespace {
+            directory: 1,
+            segment: 7,
+        };
+        let open_shared = || {
+            AsyncSSTableReader::<u64>::open_with_shared_cache(
+                FileHandle::from_bytes(OwnedBytes::new(bytes.clone())),
+                Arc::clone(&cache),
+                namespace,
+            )
+        };
+        let local = open_local().await.unwrap();
+        let first = open_shared().await.unwrap();
+        let second = open_shared().await.unwrap();
+
+        let expected = local.prefix_scan(b"field03/").await.unwrap();
+        assert!(!expected.is_empty());
+        assert_eq!(first.prefix_scan(b"field03/").await.unwrap(), expected);
+        let retained = first.cached_bytes();
+        assert!(retained > 0 && first.cached_blocks() > 0);
+        // The second generation of the segment hits the same entries.
+        assert_eq!(second.cached_bytes(), retained);
+        assert_eq!(second.prefix_scan(b"field03/").await.unwrap(), expected);
+        // Its hits swapped in blocks carrying entry offsets, charged to both.
+        assert!(cache.total_bytes() > retained);
+        assert_eq!(first.cached_bytes(), cache.total_bytes());
+        for (i, key) in keys.iter().enumerate().step_by(997) {
+            assert_eq!(second.get(key).await.unwrap(), Some(i as u64));
+        }
+        assert_eq!(second.stats().cache_insert_bypasses, 0);
+
+        drop(first);
+        assert!(
+            cache.total_bytes() >= retained,
+            "a live reader keeps entries"
+        );
+        drop(second);
+        assert_eq!(cache.total_bytes(), 0, "the last reader releases entries");
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn shared_cache_reports_blocks_it_does_not_retain() {
+        let (bytes, keys) = keyed_table(2_000);
+        let cache = Arc::new(SharedBlockCache::<DecodedBlock>::with_limits(1 << 20, 16));
+        let reader = AsyncSSTableReader::<u64>::open_with_shared_cache(
+            FileHandle::from_bytes(OwnedBytes::new(bytes)),
+            Arc::clone(&cache),
+            BlockCacheNamespace {
+                directory: 2,
+                segment: 9,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reader.get(&keys[5]).await.unwrap(), Some(5));
+        assert_eq!(cache.total_bytes(), 0);
+        assert_eq!(reader.stats().cache_insert_bypasses, 1);
+    }
+
+    #[cfg(feature = "sync")]
+    #[tokio::test]
+    async fn suffix_filters_skip_interior_blocks_without_changing_results_or_budgets() {
+        // 6,000 keys under `k`, about 60 per 512-byte block; only every 500th
+        // key ends with `band`, so most interior blocks cannot match.
+        let keys: Vec<String> = (0..6_000)
+            .map(|i| format!("k{i:05}{}", if i % 500 == 7 { "band" } else { "zzzz" }))
+            .collect();
+        let config = SSTableWriterConfig {
+            block_size: SSTableBlockSize::try_from(512).unwrap(),
+            ..SSTableWriterConfig::default()
+        };
+        let mut writer = SSTableWriter::<_, u64>::with_config(Vec::new(), config);
+        writer.insert(b"a-before", &0).unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            writer.insert(key.as_bytes(), &(i as u64 + 1)).unwrap();
+        }
+        writer.insert(b"z-after", &0).unwrap();
+        let bytes = writer.finish().unwrap();
+        let cache = Arc::new(SharedBlockCache::<DecodedBlock>::new(64 << 20));
+        let shared = AsyncSSTableReader::<u64>::open_with_shared_cache(
+            FileHandle::from_bytes(OwnedBytes::new(bytes.clone())),
+            cache,
+            BlockCacheNamespace {
+                directory: 3,
+                segment: 4,
+            },
+        )
+        .await
+        .unwrap();
+        let local = AsyncSSTableReader::<u64>::open(
+            FileHandle::from_bytes(OwnedBytes::new(bytes)),
+            1 << 16,
+        )
+        .await
+        .unwrap();
+        assert!(shared.block_index.len() > 50, "test needs many blocks");
+
+        let ending = Some(*b"band");
+        let expected: Vec<u64> = (0..6_000u64)
+            .filter(|i| i % 500 == 7)
+            .map(|i| i + 1)
+            .collect();
+        let scan = |reader: &AsyncSSTableReader<u64>, budget: usize| {
+            let mut calls = 0usize;
+            let result = reader
+                .prefix_scan_values_sync(b"k", None, ending, usize::MAX, budget, |key| {
+                    calls += 1;
+                    key.ends_with(b"band")
+                })
+                .map_err(|error| (error.kind(), error.to_string()));
+            (result, calls)
+        };
+        for reader in [&shared, &local] {
+            for pass in 0..2 {
+                let (result, calls) = scan(reader, 6_000);
+                assert_eq!(result, Ok((expected.clone(), false)), "pass {pass}");
+                let skipped = std::ptr::eq(reader, &shared) && pass == 1;
+                assert_eq!(
+                    calls < 6_000 / 2,
+                    skipped,
+                    "pass {pass} examined {calls} keys"
+                );
+                // The budget boundary is identical whether or not blocks are skipped.
+                let (over, _) = scan(reader, 5_999);
+                assert_eq!(
+                    over,
+                    Err((
+                        io::ErrorKind::Other,
+                        "term dictionary scan exceeds 5999 terms".to_string()
+                    ))
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "sync")]
+    #[tokio::test]
+    async fn indexed_prefix_scans_match_front_coded_scans_and_charge_their_offsets() {
+        let keys: Vec<String> = (0..6_000)
+            .map(|i| format!("k{i:05}{}", if i % 500 == 7 { "band" } else { "zzzz" }))
+            .collect();
+        let config = SSTableWriterConfig {
+            block_size: SSTableBlockSize::try_from(512).unwrap(),
+            ..SSTableWriterConfig::default()
+        };
+        let mut writer = SSTableWriter::<_, CountedValue>::with_config(Vec::new(), config);
+        writer.insert(b"a-before", &CountedValue(0)).unwrap();
+        for (i, key) in keys.iter().enumerate() {
+            writer
+                .insert(key.as_bytes(), &CountedValue(i as u64 + 1))
+                .unwrap();
+        }
+        writer.insert(b"z-after", &CountedValue(0)).unwrap();
+        let bytes = writer.finish().unwrap();
+        let cache = Arc::new(SharedBlockCache::<DecodedBlock>::new(64 << 20));
+        let shared = AsyncSSTableReader::<CountedValue>::open_with_shared_cache(
+            FileHandle::from_bytes(OwnedBytes::new(bytes.clone())),
+            Arc::clone(&cache),
+            BlockCacheNamespace {
+                directory: 5,
+                segment: 6,
+            },
+        )
+        .await
+        .unwrap();
+        let local = AsyncSSTableReader::<CountedValue>::open(
+            FileHandle::from_bytes(OwnedBytes::new(bytes)),
+            1 << 16,
+        )
+        .await
+        .unwrap();
+
+        type Scan = Result<(Vec<CountedValue>, bool), (io::ErrorKind, String)>;
+        let accepts = |filter: usize| {
+            move |key: &[u8]| match filter {
+                0 => true,
+                1 => key.ends_with(b"band"),
+                _ => key[..key.len() - 4].ends_with(b"3"),
+            }
+        };
+        let ending = |filter: usize| (filter == 1).then_some(*b"band");
+        // `z` completes the last block, so every block ends up indexed.
+        let prefixes: [&[u8]; 7] = [b"k", b"k01", b"k0123", b"k05999", b"a", b"q", b"z"];
+        for prefix in prefixes {
+            for filter in 0..3 {
+                for (max_results, budget) in
+                    [(usize::MAX, usize::MAX), (7, usize::MAX), (usize::MAX, 450)]
+                {
+                    let sync = |reader: &AsyncSSTableReader<CountedValue>| -> Scan {
+                        reader
+                            .prefix_scan_values_sync(
+                                prefix,
+                                None,
+                                ending(filter),
+                                max_results,
+                                budget,
+                                accepts(filter),
+                            )
+                            .map_err(|error| (error.kind(), error.to_string()))
+                    };
+                    let expected = sync(&local);
+                    let case = (String::from_utf8_lossy(prefix), filter, max_results, budget);
+                    // Miss, hit (records offsets), then indexed through both paths.
+                    for pass in 0..4 {
+                        let actual = if pass % 2 == 0 {
+                            shared
+                                .prefix_scan_values(
+                                    prefix,
+                                    None,
+                                    ending(filter),
+                                    max_results,
+                                    budget,
+                                    accepts(filter),
+                                )
+                                .await
+                                .map_err(|error| (error.kind(), error.to_string()))
+                        } else {
+                            sync(&shared)
+                        };
+                        assert_eq!(actual, expected, "{case:?} pass {pass}");
+                    }
+                }
+            }
+        }
+
+        // Every value of an indexed block is skipped without being parsed.
+        take_value_calls();
+        let (all, _) = shared
+            .prefix_scan_values_sync(b"k", None, None, usize::MAX, usize::MAX, accepts(1))
+            .unwrap();
+        assert_eq!(all.len(), 12);
+        assert_eq!(take_value_calls(), (12, 0));
+
+        // Indexed blocks are charged exactly, and their offsets locate every entry.
+        let (mut charged, mut indexed) = (0, 0);
+        for block_idx in 0..shared.block_index.len() {
+            let offset = shared.block_addr(block_idx).unwrap().offset;
+            let Some(block) = shared.cache.get(offset) else {
+                continue;
+            };
+            charged += crate::structures::block_cache::RetainedBytes::retained_bytes(&*block);
+            let Some(starts) = block.entry_starts() else {
+                continue;
+            };
+            indexed += 1;
+            let entries = BlockParts::split(&block).unwrap().entries;
+            let (mut reader, mut key) = (entries, Vec::new());
+            for &start in starts {
+                assert_eq!(usize::from(start), entries.len() - reader.len());
+                if !reader.is_empty() {
+                    decode_block_entry::<CountedValue>(&mut reader, &mut key).unwrap();
+                }
+            }
+            assert!(reader.is_empty());
+        }
+        assert_eq!(indexed, shared.block_index.len());
+        assert_eq!(cache.total_bytes(), charged);
+        assert_eq!(shared.cached_bytes(), charged);
+        assert_eq!(shared.stats().scan_index_bypasses, 0);
+    }
+
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn presized_bloom_needs_no_per_key_buffer_and_folds_to_canonical_bytes() {
+        let keys: Vec<Vec<u8>> = (0..5_000u32)
+            .map(|i| format!("key{i:06}").into_bytes())
+            .collect();
+        let write = |bloom_sizing| {
+            let config = SSTableWriterConfig {
+                bloom_sizing,
+                ..SSTableWriterConfig::default()
+            };
+            let mut writer = SSTableWriter::<_, u64>::with_config(Vec::new(), config);
+            for (i, key) in keys.iter().enumerate() {
+                writer.insert(key, &(i as u64)).unwrap();
+            }
+            assert_eq!(
+                matches!(writer.bloom, BloomBuild::Buffered(ref hashes) if !hashes.is_empty()),
+                !matches!(bloom_sizing, BloomSizing::PowerOfTwo { bound: Some(_) }),
+                "only a bounded writer avoids buffering hashes"
+            );
+            writer.finish().unwrap()
+        };
+        let power_of_two = |bound| BloomSizing::PowerOfTwo { bound };
+        // Any bound, or none, yields the same power-of-two filter: rewrite
+        // pipelines write identical bytes however their bound was derived.
+        let folded = write(power_of_two(None));
+        for bound in [keys.len(), keys.len() + 1, keys.len() * 3, keys.len() * 40] {
+            assert_eq!(write(power_of_two(Some(bound))), folded, "bound {bound}");
+        }
+        assert_ne!(
+            write(BloomSizing::Exact),
+            folded,
+            "default writers keep the exact size"
+        );
+        // An exceeded bound keeps lookups exact (a bloom only adds false
+        // positives).
+        for bound in [keys.len() * 3, keys.len() / 10] {
+            let bytes = write(power_of_two(Some(bound)));
+            let reader =
+                AsyncSSTableReader::<u64>::open(FileHandle::from_bytes(OwnedBytes::new(bytes)), 64)
+                    .await
+                    .unwrap();
+            for (i, key) in keys.iter().enumerate().step_by(37) {
+                assert_eq!(reader.get(key).await.unwrap(), Some(i as u64));
+            }
+            assert_eq!(reader.get(b"key999999x").await.unwrap(), None);
+            assert!(reader.stats().has_bloom_filter);
+        }
     }
 }

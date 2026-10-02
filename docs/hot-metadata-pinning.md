@@ -67,7 +67,8 @@ directory. Values and text dictionary bytes retain their original byte owner
 `SegmentMemoryStats.fast_field_metadata_heap_bytes` includes fast-field block
 metadata plus checkpoints, and contributes to `estimated_heap_bytes()`. Row-stat
 columns include their checkpoints in the existing row-stat heap counter. These
-estimates still exclude existing lazy text dictionary tables and ordinal maps;
+estimates include initialized lazy text dictionary offset tables, ordinal maps
+and owned merged dictionary storage. Sampling does not initialize those tables;
 they are not a complete process heap measurement. See the
 [Searchbench experiment](searchbench-comparison.md#dispatch-sparse-id-directory-and-envelope-ownership-experiment)
 for the cost model and measured evidence.
@@ -162,3 +163,35 @@ copying; other reads remain buffered/mmap-backed with advisory prefetch and
 release. This reduces cache pollution; it is not a general direct-I/O read path
 or a guarantee that bulk reads cannot evict warm pages. Revisit direct reads
 only if pinning plus the existing advice leaves measurable eviction churn.
+
+## Explicit cold payload reads
+
+The server can combine `--pin-mode mlock --pin-metadata-budget-mb <MiB>`
+with `--payload-io io-uring` (Linux build with the `io-uring` feature), or `pool`.
+Selected metadata keeps its original mapped/pinned owner. Stored-document cache
+misses use the shared bounded payload service. `--sparse-payload-reads` separately
+opts asynchronous MaxScore blocks into that same service; it is disabled by default.
+Explicit synchronous block APIs and bulk raw-dimension merge reads remain mapped.
+BMP/Seismic scoring payloads still use mapped access; their document hydration
+uses the same service. Pinning retains its existing per-segment/index-global
+budgets, default zero, and observable failures. No page-residency probing chooses
+a backend at query time. See [hybrid sparse reads](batched-payload-reads.md#hybrid-sparse-reads-september-26).
+
+## Process-wide admission follow-up (proposal, September 26)
+
+The hybrid experiment does not add a process cap. A correct cap needs ownership
+through the last retained byte view, not just the lifetime of a segment-reader
+object: old reader generations and shared ANN artifacts can outlive reload.
+Mapped locks currently live until the underlying mapping is unmapped;
+`HeapPinSet` already retains explicit ANN allocation owners. Copy mode also needs
+reservations attached to the copied allocation, shared by every clone.
+
+Introduce process admission at those existing byte/allocation owners before
+adding a server limit. Reserve rounded mapped pages (deduplicating overlapping
+ranges of the same virtual mapping), publish only after successful locking,
+roll back failure, and release only with the last owner. `mlock` is not a
+stacking lock: an independently dropped guard must not unlock a page another
+live metadata section still needs. Retain per-segment priority/budget accounting
+and report process refusal separately from OS lock failure. Test overlapping
+sections, two open generations, clones held after deletion, partial failure and
+concurrent admission before advertising a process-wide residency guarantee.

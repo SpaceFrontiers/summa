@@ -1,0 +1,136 @@
+# To display the perf.data header info, please use --header/--header-only options.
+#
+#
+# Total Lost Samples: 0
+#
+# Samples: 860  of event 'cpu-clock'
+# Event count (approx.): 4321607500
+#
+# Overhead  Command          Shared Object      Symbol
+# ........  ...............  .................  ..................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................................
+#
+    37.33%  summa-search-4-  after-bin          [.] <summa_core::query::scoring::MaxScoreExecutor>::execute::{closure#0}
+     5.12%  tokio-rt-worker  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               |
+                --4.65%--futex_do_wait
+                          __futex_wait
+                          futex_wait
+                          do_futex
+                          __x64_sys_futex
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     4.65%  summa-search-4-  after-bin          [.] <summa_core::query::scoring::TermCursor>::advance::{closure#0}
+     4.53%  summa-search-4-  after-bin          [.] <summa_core::query::scoring::TermCursor>::seek::{closure#0}
+     4.42%  tokio-rt-worker  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               |
+                --4.19%--try_to_wake_up
+                          wake_up_q
+                          |
+                           --4.07%--futex_wake
+                                     do_futex
+                                     __x64_sys_futex
+                                     x64_sys_call
+                                     do_syscall_64
+                                     entry_SYSCALL_64_after_hwframe
+
+     3.37%  summa-search-4-  after-bin          [.] <summa_core::query::scoring::TermCursor>::ensure_block_loaded::{closure#0}
+     2.56%  summa-search-4-  [kernel.kallsyms]  [k] _raw_spin_unlock_irqrestore
+            |
+            ---_raw_spin_unlock_irqrestore
+               try_to_wake_up
+               wake_up_q
+               futex_wake
+               do_futex
+               __x64_sys_futex
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.98%  summa-search-4-  [kernel.kallsyms]  [k] __schedule
+            |
+            ---__schedule
+               |
+                --1.86%--schedule
+                          do_sched_yield
+                          __x64_sys_sched_yield
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     1.63%  summa-search-4-  after-bin          [.] <summa_core::structures::postings::sparse::block::SparseBlock>::decode_doc_ids_into
+     1.51%  summa-payload-u  [kernel.kallsyms]  [k] rep_movs_alternative
+            |
+            ---rep_movs_alternative
+               copy_page_to_iter
+               filemap_read
+               generic_file_read_iter
+               ext4_file_read_iter
+               __io_read
+               io_read
+               __io_issue_sqe
+               io_issue_sqe
+               io_submit_sqe
+               io_submit_sqes
+               __do_sys_io_uring_enter
+               __x64_sys_io_uring_enter
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     1.40%  summa-search-4-  after-bin          [.] <alloc::collections::binary_heap::PeekMut<summa_core::query::scoring::HeapEntry> as core::ops::drop::Drop>::drop
+     1.28%  summa-search-4-  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               |
+                --0.81%--futex_do_wait
+                          __futex_wait
+                          futex_wait
+                          do_futex
+                          __x64_sys_futex
+                          x64_sys_call
+                          do_syscall_64
+                          entry_SYSCALL_64_after_hwframe
+
+     1.05%  after-bin        after-bin          [.] serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>
+            |
+            ---serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>
+
+     1.05%  summa-search-4-  [kernel.kallsyms]  [k] do_syscall_64
+            |
+            ---do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.81%  tokio-rt-worker  after-bin          [.] 0x0000000000975169
+     0.58%  summa-payload-u  [kernel.kallsyms]  [k] finish_task_switch.isra.0
+            |
+            ---finish_task_switch.isra.0
+               __schedule
+               schedule
+               futex_do_wait
+               __futex_wait
+               futex_wait
+               do_futex
+               __x64_sys_futex
+               x64_sys_call
+               do_syscall_64
+               entry_SYSCALL_64_after_hwframe
+
+     0.58%  summa-search-4-  after-bin          [.] <summa_core::directories::payload::PayloadReadService>::read::{closure#0}
+     0.58%  summa-search-4-  libc.so.6          [.] __sched_yield
+     0.58%  tokio-rt-worker  after-bin          [.] 0x0000000000975054
+     0.58%  tokio-rt-worker  libc.so.6          [.] syscall
+
+
+#
+# (Cannot load tips.txt file, please install perf!)
+#

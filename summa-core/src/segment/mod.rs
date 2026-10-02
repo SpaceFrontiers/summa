@@ -53,6 +53,7 @@ pub(crate) use merger::block_in_place_if_multithread;
 #[cfg(feature = "native")]
 pub use merger::{MergeStats, SegmentMerger, delete_segment};
 pub(crate) use reader::BmpIndex;
+pub(crate) use reader::TermCachePolicy;
 pub(crate) use reader::bmp::BMP_SUPERBLOCK_SIZE;
 pub(crate) use reader::combine_ordinal_results;
 #[cfg(feature = "native")]

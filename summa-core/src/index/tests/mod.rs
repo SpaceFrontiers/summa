@@ -7,6 +7,7 @@ mod format_migration;
 mod maintenance;
 mod merge;
 mod merge_bounds;
+mod physical_ties;
 mod pin;
 mod posting_codecs;
 mod primary_key;
@@ -18,6 +19,7 @@ mod seismic_lifecycle;
 mod seismic_operations;
 mod tq_bench;
 mod vector;
+mod word_pairs;
 
 #[cfg(feature = "sync")]
 #[test]
@@ -30,29 +32,76 @@ fn search_cpu_pool_is_bounded_and_reused_by_width() {
 }
 
 #[cfg(feature = "native")]
+fn per_segment(blocks: usize, budget_bytes: Option<usize>) -> crate::segment::TermCachePolicy {
+    crate::segment::TermCachePolicy::PerSegment {
+        blocks,
+        budget_bytes,
+    }
+}
+
+#[cfg(feature = "native")]
 #[test]
 fn zero_search_threads_is_rejected() {
-    assert!(super::searcher::SearcherResources::new(1, None, 1, 0, 1).is_err());
+    assert!(super::searcher::SearcherResources::new(per_segment(1, None), 1, 0, 1).is_err());
 }
 
 #[cfg(feature = "native")]
 #[test]
 fn zero_sparse_io_concurrency_is_rejected() {
-    assert!(super::searcher::SearcherResources::new(1, None, 1, 1, 0).is_err());
+    assert!(super::searcher::SearcherResources::new(per_segment(1, None), 1, 1, 0).is_err());
 }
 
 #[cfg(feature = "native")]
 #[test]
 fn oversized_term_cache_block_cap_is_rejected_at_load() {
-    let error =
-        super::searcher::SearcherResources::new(super::MAX_TERM_CACHE_BLOCKS + 1, None, 1, 1, 1)
+    for process_bytes in [0, 1 << 20] {
+        let config = super::IndexConfig {
+            term_cache_blocks: super::MAX_TERM_CACHE_BLOCKS + 1,
+            term_cache_process_bytes: process_bytes,
+            ..Default::default()
+        };
+        let error = super::searcher::SearcherResources::from_config(&config)
             .err()
             .expect("cap above MAX_TERM_CACHE_BLOCKS must fail");
-    assert!(error.to_string().contains("term_cache_blocks"), "{error}");
+        assert!(error.to_string().contains("term_cache_blocks"), "{error}");
+    }
+    let config = super::IndexConfig {
+        term_cache_blocks: super::MAX_TERM_CACHE_BLOCKS,
+        term_cache_budget_bytes: Some(0),
+        term_cache_process_bytes: 0,
+        ..Default::default()
+    };
     assert!(
-        super::searcher::SearcherResources::new(super::MAX_TERM_CACHE_BLOCKS, Some(0), 1, 1, 1)
-            .is_ok_and(|resources| resources.term_cache_budget_bytes == Some(0))
+        super::searcher::SearcherResources::from_config(&config).is_ok_and(|resources| matches!(
+            resources.term_cache,
+            crate::segment::TermCachePolicy::PerSegment {
+                budget_bytes: Some(0),
+                ..
+            }
+        ))
     );
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn indexes_with_equal_term_cache_budgets_share_one_process_cache() {
+    let config = super::IndexConfig {
+        term_cache_process_bytes: 3 << 20,
+        ..Default::default()
+    };
+    let shared = |config: &super::IndexConfig| match super::term_cache_policy(config).unwrap() {
+        crate::segment::TermCachePolicy::Shared(cache) => cache,
+        policy => panic!("expected the process-wide cache, got {policy:?}"),
+    };
+    let first = shared(&config);
+    let second = shared(&config);
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    assert_eq!(first.max_bytes(), 3 << 20);
+    let other = shared(&super::IndexConfig {
+        term_cache_process_bytes: 5 << 20,
+        ..Default::default()
+    });
+    assert!(!std::sync::Arc::ptr_eq(&first, &other));
 }
 
 #[cfg(feature = "sync")]
@@ -241,3 +290,5 @@ async fn cancelled_foreground_wait_resumes_optimizer_passes() {
     drop(second);
 }
 mod deletion;
+
+mod pattern_counts;

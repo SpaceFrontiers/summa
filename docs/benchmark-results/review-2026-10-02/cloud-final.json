@@ -1,0 +1,19 @@
+{
+  "verified_at": "2026-10-02T09:10:20.457433+00:00",
+  "instances": [
+    {
+      "lastStopTimestamp": "2026-10-02T00:05:33.357-07:00",
+      "name": "hermes-validation-moroni",
+      "status": "TERMINATED"
+    },
+    {
+      "lastStopTimestamp": "2026-10-02T02:07:30.780-07:00",
+      "name": "hermes-benchmark-32-moroni",
+      "status": "TERMINATED"
+    }
+  ],
+  "scratch_unmounted": true,
+  "benchmark_processes_stopped": true,
+  "namespace_restriction_restored": true,
+  "stop_client_note": "gcloud stop reported a connection reset; independent describe calls confirmed termination."
+}

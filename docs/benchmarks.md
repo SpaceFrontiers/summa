@@ -298,7 +298,8 @@ The adapter accepts `--indexing-threads`, `--indexing-memory-bytes`,
 `--no-background-merges` when building an index. The opt-in
 `--posting-ratio-bounds` and `--posting-impact-bounds` options write tighter,
 score-independent block bounds on new segments. Serving accepts
-`--term-cache-blocks`, `--term-cache-bytes`, `--posting-validation-cache-bytes`,
+`--term-cache-blocks`, `--term-cache-bytes`, `--term-cache-process-bytes`,
+`--posting-validation-cache-bytes`,
 and `--exhaustive`; pass serving options with
 `SUMMA_BENCH_ARGS`. Defaults and limits are documented in the
 [protocol](search-benchmark-game.md#runtime-controls).

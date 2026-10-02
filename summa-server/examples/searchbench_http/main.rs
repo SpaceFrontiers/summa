@@ -113,9 +113,10 @@ async fn search(State(app): State<Arc<App>>, Json(value): Json<Value>) -> Respon
     let submitted = std::time::Instant::now();
     #[cfg(feature = "query-diagnostics")]
     let totals = app.timings.clone();
+    let searcher = Arc::clone(&app.searcher);
     let result = app
         .dispatch
-        .run(move || {
+        .run(Some(&searcher), move || {
             let _permit = permit;
             #[cfg(feature = "query-diagnostics")]
             let mut timings = timing::Trace::start(submitted);
@@ -255,7 +256,16 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 4 {
         bail!(
-            "usage: searchbench_http index|index-rgb|index-impacts|index-unicode|index-unicode-rgb|index-unicode-impacts INDEX CORPUS.jsonl [WORKERS] | serve INDEX PORT [WORKERS] [HTTP_WORKERS] [DISPATCH] | audit|diagnose INDEX QUERIES.jsonl [WORKERS]"
+            "usage: searchbench_http index|index-rgb|index-impacts|index-unicode|index-unicode-rgb|index-unicode-impacts|index-unicode-impacts-rgb INDEX CORPUS.jsonl [WORKERS] (SEARCHBENCH_COMMON_GRAMS=WORDS.txt pairs those body words) | common-words CORPUS.jsonl N [TOKENIZER] | serve INDEX PORT [WORKERS] [HTTP_WORKERS] [DISPATCH] | audit|diagnose INDEX QUERIES.jsonl [WORKERS]"
+        );
+    }
+    if args[1] == "common-words" {
+        // The body's most document-frequent words in the first 200,000 rows.
+        return corpus::common_words(
+            Path::new(&args[2]),
+            args.get(4).map_or("unicode_word", String::as_str),
+            args[3].parse()?,
+            200_000,
         );
     }
     let workers: usize = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(6);
@@ -296,7 +306,7 @@ fn main() -> Result<()> {
     let config = IndexConfig {
         posting_impact_bounds: matches!(
             args[1].as_str(),
-            "index-impacts" | "index-unicode-impacts"
+            "index-impacts" | "index-unicode-impacts" | "index-unicode-impacts-rgb"
         ),
         num_threads: workers,
         num_indexing_threads: workers,
@@ -320,11 +330,12 @@ fn main() -> Result<()> {
         | "index-impacts"
         | "index-unicode"
         | "index-unicode-rgb"
-        | "index-unicode-impacts" => runtime.block_on(corpus::build(
+        | "index-unicode-impacts"
+        | "index-unicode-impacts-rgb" => runtime.block_on(corpus::build(
             Path::new(&args[2]),
             Path::new(&args[3]),
             config,
-            matches!(args[1].as_str(), "index-rgb" | "index-unicode-rgb"),
+            args[1].ends_with("-rgb"),
             if args[1].starts_with("index-unicode") {
                 "unicode_word"
             } else {

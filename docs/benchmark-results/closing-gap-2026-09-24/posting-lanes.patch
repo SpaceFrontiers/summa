@@ -1,0 +1,12 @@
+--- a/summa-core/src/structures/simd.rs
++++ b/summa-core/src/structures/simd.rs
+@@ -5557,8 +5557,8 @@
+                 pairs[count] = (left_pos as u8, (right_pos + lane) as u8);
+                 count += 1;
+                 left_pos += 1;
++                right_pos += lane + 1;
+                 if count == pairs.len() {
+-                    right_pos += lane + 1;
+                     break;
+                 }
+             } else {

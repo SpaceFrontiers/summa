@@ -1,7 +1,7 @@
 # Row deletion, upserts, and compaction
 
 Implemented in native/portable core, CLI, gRPC server/broker, Python/TypeScript,
-and WASM LocalIndex. Current metadata is **format 9**; formats 6–8 upgrade on
+and WASM LocalIndex. Current metadata is **format 10**; formats 6–9 upgrade on
 open without rewriting segments. Readers upgrade in memory and warn; writers
 persist the stamp, after which older builds cannot open the index. Formats 7,
 8, and 9 introduced deletion masks, content hashes, and compact text/norm flags.

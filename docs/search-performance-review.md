@@ -11322,6 +11322,1340 @@ establish a production format or new query-budget policy. Any retained format
 must account for metadata size/residency, bounded construction, native/async/WASM
 execution, corruption rejection, and compatible encoded merge behavior.
 
+### September 25 continuation: recovered corpus evidence and batched reads
+
+The [closing-gap report](benchmark-results/closing-gap-2026-09-24/README.md#recovered-concurrent-results-september-25)
+now includes the completed five-run matrix: 275 exhaustive audits, 825 HTTP
+checks, 45 error-free timing cells. The paired projected → dense/deferred
+checkpoints improve prefix COUNT 1.58×, prefix top-10 1.24× and wildcard COUNT
+1.51×, while reducing observed anonymous RSS. Prefix top-10 is 87,991 / 88,449
+QPS; broad-scan top-10 stays around 318 QPS. These are recovered pre-rename
+measurements of source carried into Summa 2, not a retiming of the renamed
+binary or of the new hydration refactor. Historical artifacts retain their
+original directory names; the exporter accepts those names and rejects empty
+cell exports instead of silently producing a successful empty matrix.
+
+The full-term forward FST is rejected: 225.7 MiB additional encoded data and
+1.95–41.24× slower scans across eight patterns. Full matching values agree.
+A reversed-term dictionary with bounded external sorting is a separate
+feasibility experiment; no production dictionary format changes yet.
+
+[The batched payload design](batched-payload-reads.md) traces Photon to a concrete
+Summa path: the server hydrates documents serially after candidate selection.
+The refactor adds whole-batch validated range reads and prepares unique lazy
+stored-block misses in 32-hit windows, with at most eight reads in flight and
+8 MiB retained compressed read-ahead across segments. Existing decoding, cache
+admission, deletion visibility, vector hydration and response charging remain
+canonical. Mapped handles keep demand reads; this does not make page faults
+asynchronous or enable io_uring. No production backend/configuration/format
+changes and no hydration latency improvement are claimed.
+
+Remaining work: directory-owned Linux reactor and explicit payload-handle
+selection; completion-owned buffers/descriptors through cancellation and
+retirement; larger-than-memory Linux measurements including merge interference;
+whole-suite count/semantics coverage and remaining Boolean/dictionary gaps.
+The Searchbench adapter does not hydrate stored fields, so the I/O refactor is
+not an explanation for the QPS improvements above.
+
+The reversed-term follow-up covers all 42 broad-wildcard patterns in the shared
+successful set. Exact values agree; 41 patterns improve, while `q*tion` regresses
+4.77×. Paired-median dictionary times sum to 1,448.80 → 45.39 ms (31.92×), with
+an additional 119.6 MiB sidecar for one field. This is a warm, one-core format
+probe on the preserved 8-vCPU Xeon host, not HTTP throughput, a production format
+or an ARM result. The regression rules out choosing a direction solely by
+literal length. [Samples, construction costs and source](benchmark-results/closing-gap-2026-09-24/README.md#reversed-term-feasibility-result)
+record the bounded external sort, RSS limitations, complete correctness checks
+and required production cost/merge/budget design.
+
+Validation finding: two parallel broker integration runs failed at discovery
+because a child broker reported `Address already in use` (macOS error 48). The
+existing test launcher probes an ephemeral port, releases it, and starts the
+child; its early-exit retry does not eliminate the race. All 14 broker
+integration tests pass with `--test-threads=1`. No test deadline or broker runtime
+was changed. The remaining harness improvement is an owned listener/readiness
+handshake, rather than treating a live child after 300 ms as ready. This is a
+separate test-launcher finding; final validation records the serialized rerun.
+
+The nine-stage `full` harness `20260925T053741.643327Z-full` passes, including
+portable compilation, API documentation and all five real-server broker tests.
+The final consuming response-loop adjustment is covered by that server build
+and real-server run, followed by `20260925T054823.459132Z-check` on the final
+code: formatting, strict Clippy, 2,083 native tests (25 ignored), native without
+sync and standalone broker compilation. The latter uses `RUST_TEST_THREADS=1`
+to avoid the observed test-launcher port race; it changes no runtime setting.
+The final WASM release build and all 41 JavaScript tests pass. New regressions
+cover whole-batch admission, cross-file concurrency, read ordering, short reads,
+error draining, cancellation, cache-disabled hydration, fields/vectors,
+deletions and reader-generation lifetimes. Documentation links and exporter
+lint/format checks pass. Linux io_uring and cold-I/O performance checks remain
+unrun because this change does not implement that backend.
+
+### September 25 continued: shared lookup and I/O experiments
+
+The dictionary batch API previously preloaded every block and then revisited
+the cache for every key. With disabled retention, a 20,000-key fixture and
+duplicated/reversed requests perform 1,302 payload reads for ten distinct
+blocks. The behavior-named regression reproduces that amplification. The repair
+groups requests by block, loads one block, and uses the existing point-search
+decoder for all its keys before releasing it. Input order, duplicates and misses
+are unchanged; scratch is O(requested keys) plus one bounded decoded block.
+There is no second decoder or persistent cache, and no format change. This API
+is also the intended value-lookup owner for reverse-dictionary experiments.
+
+The Linux I/O probe is standalone under `scripts/experiments/io_uring`; it adds
+no dependency to the production workspace. Its 96-cell screen and 32-cell
+follow-up verify every returned byte and record faults, physical reads, CPU,
+RSS and batch latency. At depth eight, cold registered-ring reads are much
+faster than serial positional reads, but an eight-worker positional pool is
+competitive and wins some passes. Registration has no consistent warm benefit;
+warm 64 KiB mmap-copy is faster than explicit reads. Default mmap readahead
+amplifies sparse cold physical reads (512 MiB for 16 MiB requested). These are
+private 2 GiB cold-advised fixtures on a 62 GiB host, not larger-than-memory
+search. [Methods, samples and limitations](benchmark-results/closing-gap-2026-09-24/README.md#september-25-continuation-io-and-shared-scoring)
+separate concurrency, API overhead and cache policy.
+
+The MaxScore fix uses the collector's conceptual length when a virtual seeded
+floor is active. Mapped batch screening now avoids losing ID translations while
+preserving the canonical collector's IDs, score bits and ties. The regression
+requires only two resolutions in a 257-hit seeded batch, including k=1000.
+A seed-heavy ARM replay improves 9.49–10.43×; it is not query throughput. BMP
+already uses conceptual length for its integer threshold screen, so it receives
+no new speedup claim. Two shared comparator alternatives were measured on ARM
+and x86 and rejected for mixed/regressing controls; there is still one collector.
+
+The final nine-stage `20260925T061755.141098Z-full` passes: formatting, strict
+Clippy, 2,084 native tests (25 ignored), native without sync, standalone broker,
+portable core, API docs, server build and five real-server broker tests. Native
+tests use `RUST_TEST_THREADS=1` for the previously documented launcher port race.
+The final WASM release build and all 41 JavaScript tests pass. Documentation,
+exporter lint/format and diff-whitespace checks pass. No production code was
+changed after this full validation. A fresh whole-suite Luxir comparison,
+production io_uring backend and larger-than-memory/merge-interference runs are
+still outstanding.
+
+The ranked reverse-dictionary experiment uses sorted ordinal values to obtain
+exact suffix cardinality from two FST range endpoints. Its calibrated selector
+routes only `q*tion` to the forward scanner: 41 patterns improve and that control
+is at parity, with 42.09× aggregate dictionary-only reduction. The sidecar grows
+from 119.6 to 141.3 MiB for one field; rebuilding from the existing sorted sidecar
+takes 14.29 seconds, excluding its construction. Peak process RSS is 247,232 KiB.
+No production format or cost cutoff is adopted. Held-out/cold/ARM/concurrent
+validation, query-budget accounting and compatible merge design remain gates.
+The seeded collector work screen also passes on x86 (12.39–13.91× for its
+seed-heavy synthetic cases); this is not a BMP or end-to-end search gain.
+
+The final standalone Linux probe passes strict release Clippy. Forced async
+submission exercises 256 cancelled ordinary reads and 256 cancelled registered
+reads. Original read CQEs and cancel CQEs are both drained before reuse;
+subsequent bytes agree, including through a reader whose opened alias filename
+was unlinked. The earlier unforced run had zero cancelled reads and only tested
+completion-before-cancel races. [Final lifecycle record](benchmark-results/closing-gap-2026-09-24/io-lifecycle.json)
+includes the source hash; it does not validate a production future-drop,
+registration-retirement or directory deletion protocol. The source VM's existing
+shutdown required a brief restart for collection and this final check; latency
+results were already complete before shutdown. No benchmark timings overlap
+the restart, compilation, or artifact collection.
+
+### September 25 continuation: explicit stored-payload opening
+
+The stored-document reader now calls `Directory::open_payload`, whose native
+and WASM defaults preserve each backend's `open_lazy` policy. This creates the
+missing boundary for a directory to choose explicit store I/O while retaining
+synchronous metadata/postings. Both core cache wrappers forward that selection;
+the slice cache reuses its cache-fill policy and retains the opened payload
+handle on misses, instead of substituting pathname-based reads. Wrapped reads
+are metered once. No production io_uring dependency, backend default, scorer or
+persisted format changes.
+
+The behavior regression failed before wiring (`store_data_slice().is_sync()`
+was still true). It passes with mixed mmap metadata/positional store reads,
+ordinary and slice-cache wrappers, canonical document equality, sync/async
+scoring, and explicit payload-open failure propagation. A Unix regression checks
+that a cached handle still reads its original file after unlink/path replacement
+and after dropping the directory. This tests read ownership, not index deletion
+or a ring worker's cancellation protocol.
+
+[The payload design](batched-payload-reads.md) now specifies admission,
+submission, cancellation and drain ownership for the proposed service. Ordinary
+owned buffers are the first proposed step: they can transfer into the existing
+`OwnedBytes` without a second pool-return protocol or a registered-buffer copy.
+The positional control remains required because the cold follow-up measurements
+did not show a repeatable ring advantage over the persistent worker pool.
+
+Validation of the explicit payload boundary: the full nine-stage harness passed
+with 2,086 native tests and 25 ignored tests, strict Clippy, native-without-sync,
+portable core, API docs and five real-server broker tests. Tests ran serially
+because of the previously recorded ephemeral-port launcher race. The WASM
+release build and all 41 JavaScript tests passed. Native evidence is retained in
+`.context/search-harness/20260925T163304.564696Z-full`; raw regression and WASM
+logs are under `.context/performance-20260925/whole-query/`.
+
+The fresh Summa 2.0 whole-query reverse-dictionary prototype completed all 165
+cells over the shared 55 queries on the immutable 10-million-document fixture.
+For the 42 broad wildcard scans, aggregate warm execution time falls 14.17× for
+COUNT, 40.05× for top-10 and 39.32× for top-100. All 16,500 timed results agree;
+counts match the previous exhaustive audit, and both modes pass top-1,000 plus
+ranked top-10/100/1,000 comparison. The 13 narrower/prefix controls remain within
+1.2% by aggregate operation. Whole-process peak RSS is 1,811,796 KiB, including
+both modes and warmed mappings; sidecar size remains 141.3 MiB. These are serial
+parser/executor measurements, not an HTTP throughput comparison with Luxir.
+[Full evidence and limitations](benchmark-results/closing-gap-2026-09-24/README.md#whole-query-reverse-dictionary-experiment-on-summa-20)
+include source, instrumentation and sample hashes. The private global-selection
+hook cannot serve concurrent requests; no sidecar format or selector default is
+shipped. Production generation/version/merge ownership, query budgets, held-out,
+cold/ARM/concurrent measurements and a fresh Luxir comparison remain open.
+
+### September 25 decision: stop the FST access-path track
+
+The reverse-FST approach is discontinued at the user's direction. Its prior
+measurements remain historical evidence, not a proposed production feature or
+an active follow-up plan. The new reader-owned/held-out prototype is not being
+advanced; no reverse sidecar, selector or format enters production. Existing
+canonical dictionary facilities are unchanged. Continue with shared payload I/O,
+MaxScore/BMP execution and same-fixture performance comparisons.
+
+### September 25: canonical hydration experiment
+
+The optional standalone Linux hydration probe now exercises Summa's actual
+writer, store planner/decoder/cache and stored vectors, with a diagnostic
+`open_payload` adapter. The pool and ring reuse one bounded admission/completion
+owner; both binaries reuse measurement helpers. No production backend,
+dependency, scorer or format is added. Both diagnostics reject non-aborting
+panic builds while kernel buffer pointers may be live.
+
+All 40 cells and 40,960 timed document/address checks pass on the four-segment,
+4,096-document fixture. Zero-cache cold hydration per 1,024 requests takes
+567.51 ms filesystem demand, 117.30 ms filesystem batch, 115.72 ms persistent
+pool and 181.79 ms io_uring; mmap takes 846.06 ms with 3.15× physical-read
+amplification. Warm mmap is fastest at 32.82 ms, compared with 48.34 ms pool and
+56.03 ms ring. Warm application-cache controls issue no timed pool/ring reads.
+Peak process RSS is 119,000 KiB; all modes and untimed oracle share this process.
+[The complete report](benchmark-results/closing-gap-2026-09-24/README.md#actual-summa-hydration-bounded-pool-and-io_uring)
+records both orders, CPU, residency, disk bytes, batch depth, samples and hashes.
+
+Retain the shared batching changes; this experiment does not justify choosing
+io_uring over the positional pool. Ring batch replenishment remains an untested
+hypothesis. Cold-advised pages on a small fixture do not establish sustained
+larger-than-memory throughput, merge interference or the Luxir HTTP gap.
+
+Lifecycle checks explicitly pause completion handling after submission, drop the
+read future, drain the original completion and verify reuse. Pool and ring pass
+short-read, unlink, oversized admission, cancellation and permit-recovery checks.
+The final Linux binaries pass strict release Clippy; local format, contracts,
+documentation and exporter checks pass. No production source changed after the
+previous full 2,086 native tests and 41 WASM tests, so those checks were not rerun
+for the standalone experiment. The discontinued FST track adds no production
+code and is excluded from this source snapshot.
+
+### September 25: completion-driven batch admission and ring scheduling
+
+A deterministic regression found that `FileHandle::read_many` held back new reads
+behind its first unfinished result even when later reads had completed. The
+shared implementation now replenishes from any completion, stores each result
+at its input position, and returns only after draining. It preserves exact bytes,
+input order/duplicates, first-input-error selection and the eight-read/32-range/
+8-MiB limits. Bounded result metadata replaces ordered-future retention; no new
+format, cache, decoder or scorer is introduced. All seven focused batch-read
+regressions pass, including the initially failing stalled-first-read case.
+
+The standalone ring now shares one worker across drain/refill policies and tests
+individual versus grouped handoff. Poll-scoped grouping is diagnostic only;
+it clears before yielding and isolates service identities. The canonical store
+planner and decoder remain unchanged. All 768 cells, 786,432 document/address
+checks and 60 lifecycle cases pass, with identical immutable store hashes.
+
+The CPU0 single-caller alternating comparison measures cold filesystem batching
+at 123.38→117.95 ms per 1,024 documents (4.4% lower), the pool at 122.57→119.22 ms,
+and grouped refill at 168.24→153.37 ms (8.8% lower). Controls move 1–2%, and
+cache-enabled/concurrent results are mixed. Retain the shared scheduling repair;
+claim no universal speedup. Even the best ring control remains slower than the
+pool in this fixture. Warm grouped ring handoff reduces its overhead but also
+fails to beat warm mmap or the pool. The
+[full comparison](benchmark-results/closing-gap-2026-09-24/README.md#scheduling-follow-up-completion-driven-admission)
+records CPU/I/O, memory, per-poll handoff and submission sizes, concurrent-budget
+limits and source hashes. These hydration results do not close the retrieval-only
+Luxir gap or establish a BMP scoring improvement.
+
+Validation: `20260925T174728.281118Z-full` passes all nine stages, 2,088 native tests
+(25 ignored), native without sync, portable core, strict Clippy, docs/server build
+and five real-server broker tests. The WASM release build and all 41 JavaScript
+tests pass. Both Linux diagnostic binaries pass strict release Clippy. Local
+docs/contracts, formatting, exporter and whitespace checks pass. The existing
+Mac linker compact-unwind-size warning recurs without failing validation. No
+backend default changes; reverse-FST development remains discontinued.
+
+### September 25: fresh Summa/Luxir baseline and CPU attribution
+
+The current Summa source now has a complete same-host Summa–Luxir–Luxir–Summa
+comparison on the immutable 10M-document index. The 228 timing cells contain
+47,207,548 requests with zero errors. All 677 admitted queries pass exhaustive
+count and top-100 ID/score-bit audits, plus 4,062 explicit Summa HTTP checks.
+640 cross-engine counts are exact; the remaining admitted differences stay within
+5%, and 149 rejected expressions remain visible budget errors. Equal ranking
+semantics between engines are not asserted.
+
+The largest repeated TOP_10 gaps are regex (0.14× Luxir QPS), broad wildcard
+scanning (0.17×), ordinary wildcard (0.37×), high/medium conjunction (0.46×),
+and high/low disjunction (0.51×). Single-term TOP_100 remains faster by
+1.15–1.61×. Peak process RSS is 3,849 versus 1,229 MiB, with anonymous RSS
+280 versus 80 MiB; the memory gap needs investigation alongside CPU. Cheap
+Luxir count requests saturate the two driver CPUs, so those cells do not
+establish unconstrained server capacity. The
+[fresh report](benchmark-results/closing-gap-2026-09-24/README.md#fresh-summa-2-baseline-same-host-abba-comparison)
+retains phase drift, CPU/request, memory, provenance and all query failures.
+
+This adapter returns IDs without stored-document hydration. Its gap therefore
+cannot be attributed to the payload I/O experiments. The
+[next payload experiment](batched-payload-reads.md#next-experiment-real-corpus-under-memory-pressure)
+uses a private hash-verified copy of the real corpus, equal global read/byte
+budgets, and controlled memory pressure. It remains proposed, with no new
+io_uring performance claim, production backend or default change. FST remains
+discontinued; BMP gains also require a separate measurement.
+
+This pass changes reporting only; all 689 packaged runtime/harness files still
+match the measured source manifest. The exporter validates baseline provenance,
+all four completed phases, exhaustive audits, HTTP results and zero-error
+repetitions. Its optional profile export additionally requires completed captures,
+raw-data hashes, zero lost samples and aggregation across worker names.
+Local contracts, documentation links, Ruff, the two campaign unit tests and
+whitespace checks pass. The full native/WASM suites were not rerun for this
+reporting pass; the preceding 2,088 native and 41 WASM results cover the unchanged
+production source.
+
+September 26 completion: all ten CPU captures and 36 native diagnostic rows are
+collected and exported. All captures have zero lost samples; all 18 instrumented
+query audits match their uninstrumented counterparts. Index and replay-source
+hashes are unchanged. Failed capture/report attempts remain in the private
+artifact with the incomplete capture excluded. The
+[profile analysis](benchmark-results/closing-gap-2026-09-24/README.md#cpu-profiles-and-the-next-optimization-targets)
+records capture scope, raw hashes and the stripped Luxir-symbol limitation.
+
+Dictionary work dominates regex/wildcard profiles: broad wildcard CPU includes
+32.29% Zstd sequence decoding, 20.16% vint decoding and 9.22% dictionary-entry
+decoding. `(www|http|https)` takes 81.64 ms native TOP_10 search time while opening
+three postings and decoding one document block. The first proposed experiment
+is bounded exact lookup for finite regex alternatives, preserving complete terms
+and constant-score union semantics in the existing owners. Infinite/truncated
+extraction keeps bounded scanning; no FST is proposed.
+
+High/medium conjunction CPU includes 24.21% posting-block intersection, 11.38%
+delta decoding and 9.46% document-window filling. `+has +please` records 22,376
+candidates, 44,752 score units and 78 heap updates. Posting traversal is the next
+measured target; another isolated collector rewrite is not justified by these
+profiles. Low-term scheduling attribution includes idle intervals and needs an
+active-request-only follow-up. Cache/decoding instrumentation and a memory
+breakdown remain open, as do real-corpus io_uring experiments and BMP validation.
+These findings identify experiments, not new production speedups.
+
+### September 26: finite alternatives, rejected posting rewrite, and memory attribution
+
+Bounded finite regex alternatives now use the existing SSTable block loader for
+exact terms, preserving complete overlapping literals before prefix subsumption.
+Sync and async share lookup planning; the existing segment expansion budget,
+posting decoder and constant-score union remain the owners. Infinite/truncated
+languages keep bounded scanning. No index format, writer, scorer, cache or
+backend default is added. A behavior regression first decoded seven irrelevant
+prefix blocks and now stays within the three exact-term blocks; IDs and score
+bits agree in both execution modes.
+
+The same-host old/new A–B–B–A comparison, with interleaved Luxir controls, records
+24,100,592 requests in 90 cells with zero errors. Regex TOP_10 rises
+17,719→70,309 QPS (3.97×), TOP_100 17,064→64,975 (3.81×), and COUNT
+3,518→4,834 (1.37×). Regex TOP_10 reaches 0.60× Luxir in this replay, with
+CPU/request falling 1,525→362 µs. Other measured families change −1.1% to +0.7%.
+All 677 exhaustive count/ID/score-bit audits pass for both candidate binaries,
+plus 8,124 Summa HTTP and 4,062 Luxir own-count/result-structure checks.
+The 826-expression probe retains 677 successful counts and 149 explicit budget
+errors. Four admitted regex expressions contribute to this family result;
+it is not a universal regex speedup or a fresh full 19-family comparison.
+
+An isolated posting kernel that consumes the matched right prefix after every
+match is rejected: dense kernel time regresses 3.62× on ARM and 3.04× on x86.
+The six-query native A–B–B–A screen shows conjunction regressions of 1.5–2.8%,
+with OR differences below 1%. Production posting traversal stays unchanged;
+no MaxScore/BMP gain is claimed. The
+[measured report](benchmark-results/closing-gap-2026-09-24/README.md#september-26-finite-regex-alternatives-and-posting-investigation)
+retains the patch, both architecture screens, source hashes and diagnostics.
+
+Equal-coverage end-of-phase snapshots put new Summa RSS at 3,802–3,804 MiB,
+including 242–244 MiB anonymous memory, versus Luxir's 1,166–1,190/57 MiB.
+Summa's large mapped components are postings (1,795.5 MiB), fast fields
+(1,056.6), positions (440.3) and terms (210.6); locked pages are zero.
+These are evictable mappings, not a fixed heap requirement. Finite lookup reduces
+observed term-file residency by 10 MiB without solving the total memory gap.
+
+Remaining memory findings: fast-field opening validates dictionary bytes despite
+comments claiming no dictionary page touches; first text access builds eight-byte
+per-entry offset tables; current fast-field metadata estimates exclude these lazy
+dictionaries. Quantify retained lazy state before treating those estimates as
+heap totals. Preserve corruption rejection and single/multi-value/global ordinal
+semantics in any revision. Broad dictionary decompression/scanning, posting
+traversal and active-request scheduling remain open performance targets.
+Reverse-FST remains discontinued, and sparse retrieval requires its own evidence.
+
+Validation: the five-stage search check `20260926T034318.139309Z-check` passes
+2,090 native tests (25 ignored), strict Clippy, native without sync, formatting
+and standalone broker checks. The WASM release build and all 41 JavaScript tests
+pass. No lifecycle/RPC production code changes in this pass; the full nine-stage
+suite was not rerun. Its preceding 2,088-test result remains historical evidence,
+not validation of the new finite-regex code. The known Mac linker warning is
+nonfatal.
+
+### September 26: real-corpus payload transport under pressure
+
+The standalone real-corpus probe completes 42 cells plus a six-cell 512-MiB
+follow-up, with 3,506,688 decoded-document checks and 360,960 retrieval
+address/score-bit checks. All 48 corrected cells pass with zero service errors
+or OOM events. Private fixture and original index/replay hashes remain unchanged.
+Both cloud machines are explicitly stopped and independently confirmed terminated.
+
+At 512 MiB, the two-pass 131,072-document trace takes 93.53 s through the
+synchronous mmap control, 10.05 s through the positional pool and 10.78 s through
+the grouped refill ring. Pool/ring read about 1,486 MiB versus mmap's 16,367 MiB,
+with substantial file-page refaults/reclaim. Ring CPU is 5.89 versus 7.51 s
+(21.6% lower), but elapsed time is 7.2% higher. At 1–8 GiB it uses 24–25% less CPU
+while remaining 3.4–4.4% slower than the pool. Explicit reads touch only 743 MiB
+when that working set fits, which motivated the 512-MiB follow-up. Warm mmap
+remains fastest; the four-future single-thread runtime cannot overlap mmap faults,
+so this is not a production RPC or equal-depth mmap comparison.
+
+The much smaller 47-query hydration control favors ring over pool by only
+1.5–2.7% in total time and about 25% in CPU; warm query sweeps still favor mmap.
+Retrieval-only controls remain close. Preserve the shared read-planning seam;
+no production ring default, universal I/O gain or BMP speedup is established.
+The [full results](benchmark-results/closing-gap-2026-09-24/README.md#real-corpus-payloads-under-memory-pressure)
+retain memory charges, per-pass behavior, latency samples and submission sizes.
+
+The excluded initial attempt exposed a large metadata read exceeding the
+diagnostic service's eight-MiB per-read budget. Its shared adapter now assembles
+bounded sequential chunks with a separate 64-MiB response cap, retaining the
+eight-read/eight-MiB in-flight limits. No production decoder, format or lifecycle
+changes. A failing-before/passing-after regression covers bytes, later short
+reads, in-flight cancellation, reuse, oversized rejection and permit recovery
+for all five service/handoff variants. Linux strict Clippy passes. Production
+service integration, queue/service latency separation, concurrent merge output
+and ARM I/O remain open.
+
+## September 26 maintenance review: payload I/O ownership
+
+This review pauses performance experiments and audits the accumulated directory,
+store preparation, searcher hydration, pattern lookup and probe changes against
+[the contract](search-system-contract.md). No new performance result is claimed;
+the earlier source snapshots and timings remain historical evidence.
+
+Fixed findings:
+
+- Single `FileHandle` reads accepted reversed ranges, and lazy callbacks could
+  return a short or overlong buffer. Batches already rejected these cases. A
+  failing regression demonstrated the callback receiving an invalid range.
+  Single/batch reads now share bounds and exact-length validation; empty lazy
+  ranges issue no I/O. Infallible file slicing rejects invalid views in release
+  builds, matching owned-byte slicing.
+- RAM, mapped and whole-file cached range readers duplicated slicing and could
+  panic on invalid ranges. A second failing regression demonstrated this. They
+  now reuse checked file handles. Filesystem direct reads reuse the retained-FD
+  positional implementation instead of a separate open/seek/read algorithm.
+- Reusing filesystem handles initially doubled directory metrics for a cache
+  miss. A regression captured five observations for four logical reads. Direct
+  filesystem reads now use the shared unmetered path; the outer handle meters
+  once for both hits and misses. Service histogram sizes derive from the same
+  concurrency bound as admission, avoiding a second hard-coded slot count.
+- Slice-cache and HTTP cached reads had the same invalid-range panic; additional
+  failing regressions demonstrated both. HTTP direct/lazy range transport now
+  shares one function, validates response length and rejects invalid requests
+  before network I/O. Its redundant whole-file cache was removed in favor of the
+  existing bounded wrapper. Diagnostic history is limited to 256 recent records,
+  with exact totals and an observable omitted count; a failing growth regression
+  precedes the fix. One lock keeps recording/reset/snapshots consistent. HTTP
+  diagnostic JSON gains `omitted_operations`; WASM debug logs report it.
+- File handles, immutable bytes and directory implementations shared one large
+  module. `file_handle` now owns validation/scheduling, `owned_bytes` owns stable
+  byte views, and their tests follow those owners. Public reexports and persisted
+  bytes are unchanged. The unused mmap-range constructor was removed.
+- The diagnostic payload service mixed thread-local poll batching, admission,
+  directory adaptation, statistics and lifecycle checks, and required abort on
+  failure. `directories::payload` is now the shared owner of admission/replies
+  and shutdown, with small `pool`, `ring`, and `stats` modules. The hydration
+  probe uses this service; its duplicate worker, drain scheduling and poll-local
+  protocol were removed. Both positional consumers share `local::read_exact_at`.
+- Pattern variants now own their lookup inputs. Exact terms are no longer stored
+  under a misleading `prefixes` field; single-star matching avoids a duplicate
+  prefix vector. The dictionary and scorer remain the only decoding/scoring
+  owners. No new query type or format was introduced.
+- Fast-field documentation incorrectly claimed opening text dictionaries did not
+  touch their pages. It now describes eager byte validation and deferred offset
+  tables/global dictionary merging accurately; validation was not removed.
+
+The optional Linux `io-uring` feature exposes `PayloadReadService` through
+`MmapDirectory::with_payload_reads`. Create one service and share it; directories
+never implicitly create their own workers. Eight requests and 8 MiB are admitted
+per service. Both backends retain completed-reply byte permits until consumption.
+The ring uses completion-driven slots and refuses unavailable capabilities. On
+exceptional exit it uses synchronous kernel cancellation before releasing live
+allocations; if that proof fails, bounded buffer/FD quarantine is reported as a
+failed service/shutdown. This does not silently authorize file deletion.
+
+The first-class core option remains explicit: the server still uses mmap. Lower
+CPU cost is a legitimate selection tradeoff even when latency trails the pool;
+there is no requirement that io_uring win every metric. The new implementation
+needs fresh measurements before attributing the historical CPU savings to it.
+
+Remaining work and review limits:
+
+- Server configuration and per-index retirement/deletion must integrate service
+  ownership before enabling it there. Library callers currently stop readers and
+  await service shutdown before deleting files. Full server lifecycle tests of
+  a selected ring backend are therefore still pending.
+- Worker-local or registered buffer reuse must return storage after the final
+  `OwnedBytes` view, with a separate residency budget. No such pool is added here.
+  Queue wakeup/coalescing and queue/service latency instrumentation are subsequent
+  measured optimizations, alongside merge interference. BMP/ANN payload consumers
+  have not opted into this service and no BMP benefit is claimed.
+- Extreme cancellation failure uses bounded quarantine; the real Linux tests
+  exercise successful exceptional cancellation/unwinding, not a kernel that
+  refuses both submission and cancellation. Windows positional reuse compiles by
+  the existing platform helper but was not executed on a Windows host.
+- Fast-field lazy dictionary offsets remain outside the current heap estimate.
+  Correcting that accounting needs owner-level allocation tracking; removing
+  dictionary integrity checks is not an acceptable memory optimization.
+- The historical evidence exporter and low-level registration/cancellation probe
+  remain useful reproducibility tools. Their saved `.rs.txt` files are evidence,
+  not parallel production implementations. This was a review of the active search
+  and I/O changes, not an assertion that the entire repository has no remaining
+  maintenance issues.
+
+Validation results are recorded after the final checks below.
+
+Validation for this maintenance pass:
+
+- The nine-stage `full` harness passed, including 2,100 native tests and five
+  real-server broker tests. After the remaining HTTP/cache cleanup, the five-stage
+  `check` harness passed with 2,103 native tests (25 intentionally ignored), strict
+  search-stack Clippy, native-without-sync and standalone broker checks.
+- The last metering correction passed 47 directory tests with metrics enabled
+  and strict core Clippy with both `metrics,http`, including all targets. Its
+  regression first failed with five observations instead of four.
+- HTTP-enabled directory tests: 50 passed, including reversed/short/overlong
+  ranges and bounded diagnostic history. WASM release build and all 41 JavaScript
+  tests passed after the HTTP ownership cleanup.
+- Local Linux ARM64 `io-uring` harness: strict all-target Clippy, 47 directory/
+  lifecycle tests and four canonical document-batch integration tests passed.
+  This exercises actual rings, including exceptional cancellation during unwind;
+  it is not a syscall mock or a skipped-backend result. The maintained hydration
+  probe also passes Linux strict Clippy against the core service.
+- Documentation links, Ruff and formatting passed. All nine most recent measured
+  export hashes are unchanged. No corpus performance campaign was rerun, and no
+  claim is made that the new service already matches the old probe's timings.
+
+Private logs and before-fix failures are under `.context/maintenance-20260926`.
+Harness evidence is under `.context/search-harness`:
+`20260926T063448.205807Z-full`, `20260926T065340.992222Z-check`, and
+`20260926T065341.838082Z-io-uring`.
+
+## September 26 follow-up: server payload lifetime and memory ownership
+
+Server selection now exposes mmap (unchanged default), pool and io-uring.
+One registry-owned service serves all indexes. Metadata and scoring remain
+mapped; stored payloads use the selected service. Directory read leases follow
+accepted jobs through completion, including cancelled receivers. The existing
+segment unlink path waits for these leases, and the existing whole-index delete
+transaction retires its directory after writer/manager shutdown. It does not
+stop other indexes. Process shutdown joins the shared workers and reports stats.
+
+Optional idle buffers have a separate eight-allocation/eight-MiB maximum. Size-class padding is charged against admission before allocation, with
+oldest-first eviction of idle storage. Caller-retained backing is bounded by
+less than twice its logical byte length when reuse is enabled.
+An immutable byte owner returns storage only after its final view drops; weak
+pool references prevent service retention. Shutdown clears and closes the pool.
+The default idle budget is zero pending measurements. Both backends share all
+admission, buffer ownership and lifecycle logic. No registered-buffer lifetime
+protocol or alternate decoder was added.
+
+Fast-field heap estimates now include initialized per-block/global dictionary
+offset capacities, ordinal-map storage and newly serialized merged dictionaries.
+Accounting observes existing owners without initializing lazy state or counting
+borrowed dictionary bytes again. The multi-block regression checks the increases
+before/after lazy construction. Dictionary validation and encoded bytes remain
+unchanged. This corrects observability; it does not reduce retained allocations.
+
+The final review additionally reproduced and fixed cancellation before registry
+publication: accepted work can survive an opening future without an `IndexHandle`.
+The service now shares weak directory gates by root; owned worker guards retain
+the gate. The existing delete lease drains it even without a cached handle.
+Recreation gets a fresh gate while stale handles remain closed. Expired gate
+entries are pruned, avoiding historical-name growth.
+
+Matched evidence: [78 corpus cells](benchmark-results/payload-service-2026-09-26/README.md),
+7,013,376 decoded documents, unchanged fixture hashes, zero service errors and
+zero OOMs. On the final no-reuse controls, ring uses 23.0–24.1% less CPU than pool;
+trace wall is 4.9–6.9% higher and query-plus-hydration wall is 2.7% lower. These
+are service/decoder measurements on Linux x86, not production RPC latency or a
+Luxir scoring-gap result. Initial integration tracks the preceding service closely;
+later campaign controls show modest timing drift, so no overall before/after
+speedup is claimed.
+
+The first recycler had zero timed reuse because a retained eight-MiB startup
+allocation blocked smaller returns. A failing regression precedes FIFO eviction
+and size classes. The final policy achieves 12.8–20.2% timed reuse, retaining
+64–88 KiB idle at cell end, but shows no consistent CPU/latency benefit. Reuse
+therefore stays opt-in with a zero default. Both backend and buffer selection are
+explicit; mmap remains the server default. Queue wakeup/coalescing, separate
+queue/service timings and merge interference remain future measurements. Sparse
+queries share stored-field hydration; no BMP scoring improvement was measured.
+
+Final validation:
+
+- Native `full` harness `20260926T075650.316785Z-full`: all nine stages pass,
+  including 2,114 tests (25 ignored), strict Clippy, portable/native-without-sync
+  compilation, API documentation and five real-server broker tests.
+- Linux ARM64 `io-uring` harness `20260926T075650.520357Z-io-uring`: strict
+  core/server Clippy, 56 directory tests, four document-batch tests and RPC
+  hydration/deletion with pool and actual io_uring pass.
+- WASM release build and 41 JavaScript tests pass for the portable heap-accounting
+  change; subsequent service/buffer edits are native-only.
+- Heap accounting and cancelled unpublished-open retirement regressions also fail
+  against their preceding implementations. Cancellation-failure injection verifies
+  quarantine and refusal to unlink/shut down successfully; real exceptional ring
+  cancellation also passes. No malfunctioning kernel or Windows host was tested.
+- Measured Rust/Cargo source hashes match the final workspace; prior measured
+  exports remain unchanged. Both cloud VMs are explicitly stopped and confirmed
+  terminated. No commit, push or branch rename.
+
+The public report retains per-cell memory/latency and source hashes. Private raw
+results, intentional failing regressions, intermediate compilation/test failures
+and final verification are under `.context/payload-followup-20260926`.
+
+## September 26 follow-up: pinned metadata and optional sparse payload reads
+
+Implemented `Directory::open_sparse_payload` as an optional role, preserving
+mapped metadata and explicit synchronous block APIs. MaxScore's existing async
+block reader can use the same directory-owned pool/ring service as stored fields;
+no scorer, decoder, cache, format or lifecycle owner is duplicated. Ordinary,
+fused and candidate-list async entry points honor the capability on both runtime
+types. Ready scoring polls reuse the existing shared CPU pool. Caching wrappers
+forward the role and share one payload-cache helper.
+
+The measured memory/CPU tradeoff requires a separate `--sparse-payload-reads`
+opt-in; ordinary `--payload-io` keeps its stored-document scope. Mmap's library
+builder `with_sparse_payload_reads(service)` enables the extra role, while
+`with_payload_reads(service)` retains mapped sparse blocks. Mmap backend plus
+sparse opt-in is rejected by server configuration. Budgeted metadata pinning
+retains its existing semantics and zero default.
+
+[The complete 124-cell evidence](benchmark-results/hybrid-sparse-io-2026-09-26/README.md)
+contains 64 final same-binary cells and 60 exploratory cells, 15,872 verified
+queries and 507,904 decoded-document checks, unchanged fixture hashes and zero
+service errors/OOM events. In the final 128 MiB MaxScore cells without pinning,
+document-only ring uses 11.6% less CPU than pool with 2.7% more elapsed time.
+Adding sparse reads reduces ring peak cgroup memory from 74.0 to 47.5 MiB, but
+increases elapsed time about 55% and CPU about 66%; keep that role opt-in.
+All enabled pin cells lock 5,615,440 logical bytes (VmLck 5,516 KiB), but neither
+campaign establishes a consistent pinning latency win. BMP scoring remains
+mapped; its improvements here come from explicit document hydration and reduced
+cache pressure. No new default or Luxir gap-closure claim follows.
+
+Validation: final native `full` passes all nine stages (2,116 tests, 25 ignored,
+plus five real-server tests); Linux real-ring harness passes strict core/server
+Clippy, 56 directory, four batch, two sparse-routing/cache and one RPC test;
+WASM release and 41 JS tests pass. The tests preserve default mapped sparse
+reads, direct synchronous APIs, raw result scores, multi-value ordinal positions,
+Boolean/fusion/candidate entry points, shared cache ownership and rejection after
+directory retirement. Existing service cancellation/quarantine tests still pass.
+
+Remaining: asynchronous BMP/Seismic payload preparation around the existing
+scorer, selective sparse candidate-probe I/O, mixed-query multithread throughput,
+concurrent merge pressure, a larger cold sparse working set, and global residency
+budgeting across overlapping index generations. The current pin budget remains
+per segment plus each index-global ANN generation. Mixed indexes with explicit
+sparse reads select async dispatch for other query types too; do not infer their
+throughput from the current-thread measurements.
+
+Both benchmark and build VMs were explicitly stopped after artifact collection
+and independently confirmed terminated.
+
+### September 26: concurrent sparse reads and bounded cursor windows
+
+The [concurrency follow-up](benchmark-results/sparse-concurrency-2026-09-26/README.md)
+retains an eight-block/16 KiB encoded window in opted-in MaxScore cursors. It
+reuses the reader's decoder and process-shared payload service. No second scorer,
+cache, format or lifecycle is introduced; synchronous, mapped and bulk merge
+reads retain their policies. At 64 terms, lookahead is bounded to 1 MiB per
+active segment scorer; old ordinal views/windows are released before refill.
+
+All 128 same-fixture cells pass: 23,552 exact query/score checks and 753,664 decoded
+documents, unchanged fixture hashes and zero I/O/OOM/quarantine failures. The
+interleaved before–after–after–before confirmation with four Tokio workers and
+eight concurrent MaxScore requests reduces ring wall/CPU by 46.6%/54.5%; pool
+improves 43.8%/52.6%. Sparse submissions fall 33,428→5,116, with only 1,908 added
+bytes on the full 128-query/hydration trace. Separate CPU profiles show a smaller
+scheduling share. Peak concurrent memory stays around 57 MiB.
+
+Ring is still slower than pool. It saves CPU for sequential requests but uses
+about 2% more than pool in the concurrent confirmation; no universal CPU saving
+is supported. Mixed MaxScore/BMP requests improve too, but BMP scoring remains
+mapped. Document-only ring remains faster and cheaper in CPU at a larger memory
+footprint; sparse opt-in stays off. Full native/Linux and WASM checks pass, with
+byte/boundary/failure/cancellation window regressions and exact query equivalence.
+
+The benchmark now supports bounded concurrent waves and runtime selection,
+separates search/hydration latency, and avoids summing overlapping process CPU
+intervals. Per-task latency excludes initial scheduling delay; this is not a
+sustained arrival-load or network latency benchmark. It does not establish Luxir
+gap closure, merge interference behavior, large cold sparse working sets, or ARM
+performance. BMP/Seismic owned preparation state and process-wide pin ownership
+requirements are reviewed in their design documents and remain unimplemented.
+
+Both benchmark and build VMs were explicitly stopped after artifact collection
+and independently confirmed terminated.
+
+### September 26: ring worker and queue-wakeup experiments
+
+The [96-cell follow-up](benchmark-results/ring-workers-2026-09-26/README.md)
+compares the retained single ring with two/four workers, cooperative task
+scheduling, and eventfd queue wakeups. It keeps one shared eight-read/eight-MiB
+budget and identical query/decoder work. Candidate patches are evidence only;
+no production backend or default changes. All 30,720 exact query and 983,040
+decoded-document checks pass, with unchanged fixture hashes and zero service,
+quarantine or OOM failures.
+
+In the three-repeat eight-request MaxScore confirmation, four rings take
+0.304 s wall / 1.273 s CPU versus pool's 0.307 / 1.292 and one ring's
+0.334 / 1.305. This closes the aggregate throughput gap on this fixture within
+measurement noise, while request p95 remains about 4.8% above pool. Four rings
+increase sequential CPU 8.8% versus one ring. Wakeups improve sequential wall
+7.8% versus one ring; against pool they use 13.9% less CPU and 5.6% less wall.
+Their main improvement is in the initial pass after cache advice. They do not
+show a concurrent CPU win over pool or a clear document-only advantage.
+
+Retain the single-ring production implementation pending wider evidence and
+hardening. Test sustained arrival load, slower storage, merge interference and
+ARM before selecting a worker policy. A production wakeup path additionally
+needs notification-failure/startup-race coverage and explicit control-event
+accounting; the experimental eventfd poll already shares buffer teardown.
+BMP scoring remains mapped, and this does not rerun or close the direct Luxir
+HTTP/full-text gap. The probe now records per-pass CPU/wall without overlapping
+process accounting; the report exporter reuses the preceding campaign parser.
+
+Validation: native `check` passes 2,118 tests (25 ignored) after an isolated
+broker discovery timeout and successful retry. Each of five candidate snapshots
+passes strict Linux Clippy and 63 real-ring/lifecycle/RPC tests after a forced
+fresh core build. Initial cross-snapshot Cargo test-cache reuse was detected;
+those runs are superseded by distinct verified test binaries. A deterministic
+pending-pipe/ready-file regression fails without queue notification and passes
+with it. Native `full`/WASM were not rerun because production Rust sources are
+unchanged; the retained Rust edit is benchmark-only per-pass instrumentation.
+Both VMs were explicitly stopped after collection and confirmed terminated.
+
+### September 26: retained single-ring wakeups and failure cleanup
+
+The [hardening follow-up](benchmark-results/ring-wakeup-2026-09-26/README.md)
+retains eventfd queue notification in the existing single reactor. The service
+still owns admission and directory leases; the reactor alone owns kernel buffer
+pointers. One control poll and separate wakeup/failure counters accompany the
+existing completion path. Failed notifications close admission and are detected
+through a 100-ms health wait; healthy slow reads continue. Backend, worker-count,
+sparse-read, buffer-reuse and pinning defaults remain unchanged.
+
+Failure tests exposed and fixed two lifecycle bugs: a closed channel retained
+queued jobs while the service held its sender, and an idle receive could hide a
+notification failure behind successful shutdown. The shared worker error/panic
+wrapper now drains queued leases and permits for both pool and ring. The reactor
+checks failure on the idle closed-queue exit. Tests cover notifications before
+and after poll registration, pending reads, cancelled callers, descriptor
+ownership, counter saturation, interruption and healthy reads across timeouts.
+
+All 72 final-source benchmark cells pass 27,648 exact query/score and 884,736
+decoded-document checks, with unchanged fixture hashes, identical logical read
+counts/bytes and zero service/notification/quarantine/OOM failures. Versus the
+original ring, MaxScore sparse wall falls 6.8% sequentially and 4.6% at eight
+requests; p95 falls 23.6% / 18.2%, at about 2.4% additional CPU in both modes.
+The gain is concentrated in the initial pass after cache advice. Sequentially,
+the hardened ring uses 12.4% less CPU than pool. Under concurrent sparse load it
+still takes 5.1% longer and uses 3.8% more CPU than pool. Mixed MaxScore/BMP wall
+improves 3.3% / 1.6% against the original ring; BMP scoring remains mapped.
+Memory is stable and document-only wakeup differences are small. These results
+support retaining queue progress, not changing production defaults.
+
+Native `full` passes all nine stages (2,118 tests plus five real-server tests),
+Linux passes strict Clippy and 73 real-ring/lifecycle/RPC tests, and WASM release
+plus 41 JavaScript tests pass. Initial failure evidence is retained; final Linux
+validation uses a clean core build and a recorded executable hash. A Linux-only
+Clippy style fix was followed by a rebuilt binary and complete benchmark rerun.
+The report reuses the previous exporter, whose original output remains
+byte-identical. Fresh CPU/disk inventory is captured for this boot.
+
+Remaining: sustained arrival load, concurrent merge pressure, slower storage,
+ARM ring measurements, larger cold sparse working sets, and owned BMP/Seismic
+payload-preparation state. This does not close or rerun the direct Luxir gap.
+
+Both benchmark and build VMs were explicitly stopped after artifact collection
+and independently confirmed terminated.
+
+### September 26: fixed-arrival sparse I/O and overload
+
+The [fixed-arrival follow-up](benchmark-results/sustained-io-2026-09-26/README.md)
+adds bounded arrival scheduling to the existing probe, reusing canonical query
+execution, hydration and oracle verification. Production search sources and
+configuration defaults are unchanged. Samples include intended arrival,
+admission, first poll, response completion and verification completion. Full
+admission rejects an offer observably; there is no unbounded request queue.
+Process CPU includes verification and cannot be compared directly to wave-mode
+CPU. On task failure the scheduler cancels and joins remaining futures.
+
+All 54 eight-second load cells complete with 259,200 offers, 221,260 verified
+queries, 37,940 admission rejections and 7,080,320 decoded documents. Three smoke
+cells verify another 192 queries. The exporter checks every offer and timing
+relation, exact per-query acceptance, fixed CPU/memory limits, unchanged fixture
+hashes and zero I/O/notification/quarantine/OOM failures. Raw per-offer data is
+retained; compact published summaries include per-query acceptance so overload
+cannot hide a changed surviving workload.
+
+At 400/800 offered MaxScore queries/s, ring uses 5.7% / 2.2% less CPU per
+completed query than pool. At 200/400/600 mixed queries/s it saves 4.8% / 5.5% /
+3.4%, with similar later-arrival p95 and zero later rejection. Each paired
+repetition shows a saving at those rates. At 1,200 MaxScore offers/s, pool
+completes about 1,067/s versus ring's 1,036/s; later rejection is 10.28% versus
+12.76%. Ring uses 0.9% more CPU per completion there. Mmap handles the later
+MaxScore offers with much less CPU/latency, but has worse cold-start rejection.
+
+The mixed mapped control reaches the 256-MiB cap, reads about 1.7–1.8 GiB and
+records 383,000–410,000 file refaults per cell, rejecting 87–96% of later offers.
+Pool/ring stay below 197 MiB, read about 140 MiB, show no file refaults and accept
+all later offers through 600/s. This strongly indicates memory-pressure
+thrashing in the mapped control. It is not a general ring speedup claim or async
+BMP support: BMP scoring remains mapped. Explicit shared payload reads benefit
+this mixed workload without duplicating the scorer. The first second still
+rejects 23–33% of explicit mixed offers; sustained acceptance does not erase the
+cold-start limitation. Generator p95 lag (1.3–2.0 ms) remains included in latency.
+
+Native `check` passes all five stages and 2,118 tests. Four new Linux scheduler
+tests, strict standalone Clippy and release compilation pass. The raw-pointer
+microdiagnostic intentionally rejects unwinding test builds; its guard was
+preserved and validation scoped to normal binaries plus the new scheduler's
+test target. Native `full`, production Linux lifecycle and WASM were not rerun:
+all production Rust/Cargo source hashes match the preceding validated version.
+
+Keep defaults unchanged. Next: warm explicit MaxScore overhead and high-rate
+ring capacity, then larger cold sets, concurrent merge pressure and ARM. This
+short repeating in-process workload does not measure HTTP or the direct Luxir
+gap. Both VMs were explicitly stopped after collection and confirmed terminated.
+
+### September 26: shared cursor execution after warm-path profiling
+
+The [warm-path comparison](benchmark-results/warm-io-2026-09-26/README.md)
+retains direct expansion of the existing cursor navigation macros in MaxScore.
+Profiles attributed about 9% of explicit-backend self samples to nested async
+advance/seek bodies, including their necessary navigation work. MaxScore and
+cursor methods now reuse the same logic without constructing those futures for
+every decoded posting. Actual I/O still suspends through the existing bounded
+service. No alternate scorer, cache, unsafe code, format or configuration was
+added; unused async wrappers are test-only. A shared encoded-block fixture now
+also verifies failure and cancellation after partial scoring, reader release,
+and exact synchronous/asynchronous score bits and ordinals.
+
+All 142 comparison/smoke cells pass 408,541 exact queries and 13,073,312 document
+checks. Four CPU profiles verify another 136,147 queries. Fixture hashes remain
+unchanged, all 24 paired explicit wave comparisons have identical read counts
+and bytes, and no service/notification/quarantine/OOM failures occur. The load
+exporter reuses the existing per-cell validator; the prior report remains
+byte-identical after extraction.
+
+At 800 MaxScore offers/s, ring CPU/query falls 5.6% and later-arrival p95 falls
+10.0%; pool improves 5.3% and 11.4%. At 1,200/s, ring completes 4.5% more queries
+with 4.9% less CPU per completion; later rejection falls from 6.77% to 2.63%.
+Pool also improves. Fixed-work waves confirm CPU savings independent of the
+surviving overload mix: ring saves roughly 5.9% sequentially and 4.4% with eight
+requests, with warmed wall about 5.5–5.7% lower. Mixed explicit CPU improves
+about 3% under fixed arrivals; BMP scoring itself remains mapped and unchanged.
+Mixed mmap still thrashes at 256 MiB; its noisy/worse wave wall time is not an
+improvement claim. Memory remains bounded, including retained measurement data.
+
+The separately built eventfd-coalescing candidate is rejected: it provides no
+CPU gain at 800/s and reduces high-rate capacity. Production ring code and all
+defaults remain unchanged. Candidate ring still takes about 7% longer than pool
+in eight-request MaxScore waves, although sequentially it uses about 13% less
+CPU. This shared scoring improvement does not establish ring/pool parity or
+close the direct Luxir gap.
+
+Final native `check` passes five stages and 2,119 tests (25 ignored). Linux strict
+Clippy plus 147 service/RPC/scoring/refill tests pass after a clean core build;
+WASM release plus 41 JavaScript tests pass. All 533 final Rust/Cargo files match
+the validated snapshot. The only post-benchmark source update adds native test
+coverage. Native `full` was not rerun: lifecycle/RPC implementation is unchanged,
+and Linux lifecycle/RPC checks were run. Initial unused-wrapper Clippy and
+isolated Git-provenance failures were resolved; root-owned perf data required
+privileged collection of the private experiment directory. Complete artifacts
+were verified before explicitly stopping both VMs and confirming termination.
+
+Next: amortize CPU-pool handoffs for already-required initial cursor blocks,
+then larger working sets and merge interference. ARM performance, slower storage,
+HTTP/direct Luxir comparisons and owned BMP/Seismic preparation remain open.
+
+### September 26: dictionary decoding in the direct Luxir comparison
+
+The [dictionary-decoder follow-up](benchmark-results/dictionary-decoding-2026-09-26/README.md)
+retains a focused inlining annotation on the existing variable-integer reader.
+The body, writer, formats, budgets and default backends are unchanged. Native
+sync, async and WASM keep the same decoder; no alternate dictionary, scorer or
+cache was introduced. Two tests pin encoded bytes and consumption across
+consecutive, truncated, non-minimal and overflowing values. The shared report
+exporter now owns profile parsing and optional executable mapping labels; ten
+historical profile exports remain identical.
+
+Fresh A1/B1/L1/B2/A2/L2 runs on the unchanged 10M-document index complete 90
+cells and 23,587,209 requests without errors. Both Summa binaries pass all 677
+count/top-100 ID/raw-score audits; 8,124 Summa and 4,062 Luxir untimed HTTP
+checks pass. The 826-query probe preserves all counts and 149 explicit budget
+errors. Whole-index and pinned replay hashes remain identical. Cross-engine
+ranking equivalence is not asserted.
+
+Wildcard TOP_10 rises from 287 to 307 QPS (+6.9%) while CPU/request falls from
+99.44 to 92.33 ms (-7.2%). TOP_100/count improve 6.9%/6.5%. Regex TOP_10 improves
+6.0%; native infinite-regex diagnosis is 5.3–5.5% faster. Boolean HTTP movements
+are smaller, and selected native Boolean cases mostly remain within 1%; no
+broad Boolean algorithmic gain is claimed. Luxir still reaches 1,767 wildcard
+QPS (5.75× candidate Summa), 8,523 conjunction TOP_10 QPS versus 4,060 and
+32,616 OR TOP_10 QPS versus 17,145.
+
+The standalone reader's 19.38% profile share becomes part of entry decoding,
+which occupies 23.32% after inlining; its work has not vanished. Zstd sequence
+decoding remains the largest symbol at 33.12%. The x86 instruction section
+grows by 13,248 bytes (0.106%). There is no memory win: total end-of-phase RSS
+moves from 3,802–3,807 to 3,809–3,815 MiB, anonymous from 242–246 to 249–254 MiB;
+this small increase is not attributed to a specific allocation. Luxir remains
+at 1,170–1,190 MiB. Locked bytes are zero and most Summa pages remain evictable.
+The next substantial targets are dictionary decompression/scan work within
+existing budgets, conjunction/OR posting work and metadata residency.
+
+Clean ARM thread-CPU ABBA on the canonical 50,000-term fixture shows 2.3–3.6%
+less wildcard CPU, 4.2–6.9% less regex CPU and 3.3–4.0% less prefix CPU. Busy-host
+wall-time measurements are excluded. An initial CPU-clock attempt accidentally
+reused one executable for both labels; it is discarded, and both variants were
+cleanly rebuilt with distinct hashes. These are local CPU controls, not a
+second large-corpus or cold-storage comparison.
+
+Forcing the surrounding entry decoder to inline was separately screened on an
+identical corpus on the build VM, including 677 exact audits. It saves only
+0.1–0.7% on the selected wildcards, regresses the infinite regex about 6% and
+Boolean probes about 1–3%, and adds another 17,344 instruction bytes. It is
+rejected. The narrower production change remains the only retained optimization.
+
+Native `check` passes all five stages and 2,121 tests (25 ignored); WASM release
+and 41 JavaScript tests pass. Full lifecycle/RPC and optional io_uring suites
+were not rerun because those implementations are unchanged. A stale launcher
+path failed after audits/probe and before timing; the failed attempt is retained,
+and the corrected complete run supplies all published timing. Source archives,
+compiler flags, binary hashes, profiles, CPU-0 diagnoses and memory snapshots
+are collected and verified. Both VMs were explicitly stopped and independently
+confirmed terminated. No production defaults changed.
+
+### September 27: dictionary scans, term cache and FST feasibility
+
+[Campaign report](benchmark-results/dict-scan-2026-09-27/README.md). No
+production code, format or default changed. On the production dictionary an
+FST merges 1.49× faster in bounded memory but enumerates subtrees 4.4× slower
+than decoded SSTable blocks, so it is not adopted ([note](fst-term-dictionary.md)).
+Value skipping alone is rejected (≈1% slower). A 16,384-block / 256 MiB term
+cache doubles broad-wildcard throughput (339 → 708 QPS; 0.18× → 0.38× Luxir)
+for +129 MiB anonymous RSS, with other families unchanged; it is per segment,
+so it is not a safe default without a process-wide budget. A tight key-only
+scan adds 12% on top of the cache (792 QPS) and 7–8% in native scans, but the
+default 16-codegen-unit build shifts unrelated conjunction code by −2.8%; with
+one codegen unit that shift disappears. It remains a measured patch.
+
+### September 27: process-wide term dictionary cache becomes the default
+
+The document store's shared cache is now a generic `SharedBlockCache<V>`, and
+search-time term dictionaries share one 256 MiB decoded-block budget
+(`IndexConfig.term_cache_process_bytes`, `summa-server --term-cache-budget-mb`;
+[design](term-dictionary-cache.md)). Merges keep private caches. Paired HTTP
+on the 10M-document index: broad-wildcard TOP_10 338 → 703 QPS (2.08×; 0.18× →
+0.38× Luxir), CPU 86.1 → 41.8 ms per request, +130 MiB anonymous RSS. Other
+families move −4% to +2%, as they already do in the new binary with per-segment
+caches. aarch64: 1.83× less CPU for rotating broad wildcards.
+[Report](benchmark-results/dict-scan-2026-09-27/README.md#process-wide-term-cache-the-new-default).
+
+### September 27: broad wildcards overtake Luxir
+
+On top of the shared term cache, three changes to dictionary scans were each
+paired against their predecessor on the 10M-document index
+([report](benchmark-results/dict-scan-2026-09-27/README.md)): the tight
+key-only block scan (703 → 792 QPS), word-sized literal checks in the
+single-star matcher (792 → 857) and [suffix filters](dictionary-suffix-filters.md)
+on cached dictionary blocks (853 → 4,712, 5.5×). Broad-wildcard TOP_10 is now
+2.58× Luxir's throughput at 6.0 vs 16.3 ms CPU per request; other families
+move within ±4%. Results, expansion limits and scan-budget errors are
+unchanged (exact audits; interior blocks skipped by a filter are charged to the
+budget).
+
+Bug fixes from the same work: dictionary merges, compaction and text
+reordering no longer buffer a 16-byte bloom hash per key (+870 MiB for the
+52M-key dictionary) when their sources' key total safely bounds the output;
+their filters are always sized to a power of two of the key count, so every
+rewrite pipeline writes identical bytes (see the follow-up fixes below). Broker integration tests bind port
+0 through the broker and read the bound address from its log, removing the
+probe-then-bind race behind intermittent "did not learn indexes" failures.
+
+A final 19-family run with stock defaults (66,953,465 requests, zero errors)
+confirms it against the September 26 binary: broad-wildcard TOP_10 326 → 4,672
+QPS (2.56× Luxir), the narrower wildcard family +43%, and all other families
+within −4.5% to +5.2%. Anonymous RSS is +116 MiB.
+
+### September 27: single-hop search dispatch
+
+Requests now reach the search pool in one handoff: `Searcher::run_on_search_pool`
+and `search_budgeted_on_pool` (used by `summa-server`'s search RPC and the
+benchmark adapter's new default `pool` dispatch) replace a blocked thread that
+then waited on the pool. One binary, 19 families, 70.7M requests: term, regex
+and prefix TOP_10 rise 42–69% and now match or beat Luxir; posting-heavy
+families gain 3–8%; and_high_low COUNT loses 5.8%.
+[Report](benchmark-results/dict-scan-2026-09-27/README.md#single-hop-search-dispatch).
+
+Indexing memory accounting fix: when a hot term's in-memory postings spilled
+to disk, the builder subtracted them from `estimated_memory_bytes` but kept
+the buffer allocated (`Vec::clear`), so each spilled term held ~128 KiB outside
+the indexing budget. Spilling now releases the buffer; a regression test with
+20 spilled terms reproduced 16,384 retained slots per term before the fix.
+Budgets remain per resource (indexing, maintenance, per-segment pinning, the
+shared term and store caches); there is no single process-wide ceiling.
+
+Review fixes to the two changes above:
+
+- Pool searches released `summa-server`'s search admission permit when the
+  RPC future was cancelled, while the pool job kept running, so cancelled
+  requests could exceed the admission limit. `search_budgeted_on_pool` now
+  takes a `hold` that the job drops only when it finishes; a test cancels a
+  gated search and checks the hold outlives the future.
+- Bloom presizing from the sources' key total could allocate more than the
+  hash buffer it replaced when many overlapping segments merge (ten
+  identical sources presize 10× the output). Rewrites now presize only when
+  total × bits per key ≤ largest source × 64 bits, and otherwise buffer hashes
+  but still size the filter to the same power of two
+  (`BloomSizing::PowerOfTwo`), so fused and copy-then-reorder pipelines stay
+  byte-identical regardless of which construction ran.
+
+### September 27: exact counts over frequent terms and regex term checks
+
+Single-thread medians on the 8-vCPU x86 validation host, one query at a time
+through `collect_segment` (the adapter's COUNT path), A/B/A/B:
+
+- **Regex term checks.** The regex matcher runs a Unicode-mode
+  `regex::bytes::Regex` (every accepted construct matches only UTF-8, so a
+  whole-term match proves validity without `from_utf8` per scanned term) and
+  first rejects terms that end with none of the pattern's extracted suffix
+  literals. `[jkqxz][a-z]*ess` 62.2 → 27.2 ms.
+- **Union materialization.** Unions sort collected IDs only below one posting
+  per 1,024 documents; wider unions use the segment bitset. The previous
+  "smaller scratch" rule sorted up to ~310k IDs in a 10M-document segment:
+  the weekday alternation 3.36 → 0.54 ms. The regex COUNT family (4 queries)
+  71.4 → 34.3 ms on the same index; wildcard and prefix families unchanged.
+- **Membership bits.** Lists with one document in eight to one in two set
+  window bits branch-free, keeping the current word in a register instead of
+  an OR into memory per document (a store-to-load forwarding chain):
+  `+as +by` 16% faster. Denser lists keep grouping a word's documents before
+  one OR (branch-free measured 10–14% slower there); sparser lists keep the
+  per-document OR.
+- **[Bitmap posting blocks](bitmap-posting-blocks.md)** (opt-in
+  `PostingCodec::RoundedBitmap`, metadata format 10): dense blocks store
+  documents as words that windows copy and probes bit-test. Exact counts
+  1.1–1.6× faster (and_high_high, or_high_high, and_high_low, wildcard,
+  regex, prefix3); term, conjunction and disjunction top-k neutral in a
+  controlled comparison (identical IDs, bit-identical results), phrases up
+  to 8% slower. In the [x86 campaign](benchmark-results/bitmap-blocks-2026-09-27/README.md)
+  frequent-term counts reach 0.85× Luxir (from ~0.55×) or better. `vpcompressd` on 512-bit registers
+  was rejected: sporadic 512-bit use downclocked query execution by 8–35%.
+  The phrase filter's AVX-512 kernel, used densely, stays: disabling it made
+  exact phrases 4–6% slower.
+
+Open: a fresh 10M build (8 indexing workers, current tree) answers
+and_high_low TOP_10 27% slower than the September 24 build with either codec,
+and its `.post`/`.pos` files are 18–19% smaller; the cause is not yet known.
+The indexing builder's memory estimate also trails process RSS badly for a
+single large builder (RSS 31 GiB at 3.3M documents under a 24 GB budget that
+never triggered a flush), so the configured indexing budget does not bound
+memory for such builds.
+
+### September 28: ranked conjunctions, disjunction windows, bitmap default
+
+Single-thread TOP_10 medians over all 677 benchmark queries on the September
+24 index (x86), A B A B, identical result digests:
+
+- **Pruned conjunction probes.** Intersection calls in ranked two-term
+  conjunctions merge a whole block of the common term (113 IDs) against ~15
+  rarer IDs for 2.4 matches. A rarer document whose bound by frequency
+  (`PreparedBounds::pair` at the block's minimum length) plus the common
+  block's bound cannot reach the threshold is now skipped, and the survivors
+  (27% on and_high_med) are probed with the in-block search instead of the
+  merge: and_high_med −24%, and_high_high −20%, and_high_low −11% (same-binary
+  control; the build's own placement read +6%). Rejected on the way: a
+  sixteen-lane advance kernel and branch-free binary searches (no faster
+  than the merge: a loop-carried dependency and a longer chain), a branch-free
+  candidate compaction and a list-maximum pre-check (both slower).
+- **Disjunction windows.** A globally non-essential cursor now starts from its
+  list maximum; windows that lose even so are skipped without bounding each
+  of its blocks across them: or_high_low −12% (block-bound computations on
+  `with fijian` 5,698 → 2,411), other families unchanged. Shrinking windows
+  to the driver's last posting did nothing: rarer terms cluster, so windows
+  were already dense.
+- **Bitmap blocks by default** (`adaptive` and `performance` modes; see the
+  [design](bitmap-posting-blocks.md)): counts 1.1–1.6× faster on x86 and
+  aarch64, ranked families within ±2% on x86 and conjunctions up to 10%
+  faster on aarch64. The earlier phrase loss tracked the build's document
+  order (the bitmap build confirmed 16% more phrase candidates).
+
+[Campaign](benchmark-results/default-2026-09-28/README.md), 113M requests:
+same index, the new code lifts and_high_med TOP_10 22% (0.57× Luxir),
+and_high_high TOP_10 19% (1.18×) and or_high_low TOP_10 15% (0.64×); the
+default bitmap build lifts frequent-term counts 9–56% over a `Rounded` build
+from the same builder (and/or_high_high 0.84–0.85×). Open: phrases (−3% to
+−6%) and prefix3 top-k (−17%) moved against the bitmap build, which also
+differs in document order; 30-worker fresh builds match the September 24
+index, so the earlier 27% and_high_low loss came from 8-worker builds.
+
+Follow-ups, single-thread A B A B on the September 24 index (x86):
+
+- **One-byte key lengths inline.** Dictionary entries read both key lengths
+  through a slice fast path for values below 128 instead of the generic
+  per-byte reader: wildcard TOP_10 −4.3%, wildcard_scan −4.9%, regex TOP_10
+  −6% and COUNT −8%; results identical.
+- **Rejected: skipping undecoded common blocks** in ranked conjunctions when
+  no rarer document in their span is competitive. The first version lost
+  winners that open the next rarer block inside the skipped common block
+  (11 of 677 queries changed; regression test
+  `pruned_conjunction_keeps_a_winner_opening_the_next_rarer_block_inside_a_common_block`).
+  Corrected, it measured −15% for and_high_med on a 1M-document aarch64 index
+  but within ±2.4% on the 10M x86 index, so it was not kept.
+- The bitmap-block probe in ranked conjunctions applies the same
+  per-frequency filter as the decoded path; without it the bitmap build
+  scored every match (aarch64 and_high_high +5%, now −5%).
+- **[Entry offsets for cached dictionary blocks](dictionary-entry-offsets.md).**
+  A shared-cache block scanned a second time gets `u16` offsets of its
+  entries, swapped in through an accounted cache replace, so rejected terms
+  jump to the next entry without parsing their `TermInfo`: wildcard TOP_10
+  0.48×, wildcard_scan 0.43×, regex TOP_10 0.45× and COUNT 0.61× of the
+  previous time; the 59-query scan rotation holds 244 MB (was 237 MB) under
+  the 256 MiB default. Materialized keys were 1.3× faster still but would
+  not fit the broad working set in the budget.
+- **Passing losing rarer blocks in ranked conjunctions.** When a rarer block
+  and the current common block cannot reach the threshold and the common
+  block ends first, the loop used to advance the common cursor one block at
+  a time, bounding each (on `+and +called`, 55,824 of 57,000 pruned steps).
+  If even the common list's maximum cannot lift the rarer block, the rarer
+  block is now skipped and the common cursor moves to its next block without
+  decoding or bounding the blocks in between. x86, 10M: and_high_low −48% on
+  the bitmap build (−31% on the September 24 index), and_high_med −8%,
+  and_high_high −5%, other families unchanged, all 677 digests identical;
+  aarch64, 1M: and_high_low −3%, and_high_med −4% to −5%, and_high_high −3%
+  to −5%. Unlike the list-maximum pre-check rejected above, it runs only on
+  steps already pruned, and the catch-up seek is shallow.
+  Bounding whole common groups (eight blocks) as well gained 1.5–4%, within
+  layout noise, and was not kept. Regression test:
+  `pruned_conjunction_passes_a_losing_rarer_block_without_bounding_the_common_blocks_it_spans`.
+- **Per-candidate bounds for dense non-essential terms in disjunction
+  windows.** On `with fijian` each window started at the next rare posting
+  and bounded every block of `with` across up to 4,096 ids (4,756 block and
+  2,012 group bounds for 1,009 windows, most holding one or two rare
+  postings). When the window's drivers are at least 64 times sparser than
+  every globally non-essential term, those terms now keep their list maxima
+  in the window, rank first (so they cannot become essential), and are
+  bounded per surviving candidate by the one block holding it. x86, 10M:
+  or_high_low −24% on the bitmap build (−9% on the September 24 index),
+  or_high_med and or_high_high within ±3.4% (untouched phrase families moved
+  +1–2% in the same runs; a same-binary sweep of the ratio put or_high_med at
+  0.98–0.99×); aarch64, 1M: or_high_low −9% to −12%, others within ±0.7%;
+  all digests identical. Ratios of 128, 256 and 1024 kept less of the gain
+  (0.76×, 0.79×, 0.93×). Without the ratio gate or_high_high lost 14%, and a
+  list maximum could outrank the window's driver and stall it; ranking those
+  cursors first rules that out by construction. Rejected on the way: a
+  16-slot bound memo (no revisits to save), an eight-slot scan before the
+  in-block binary search in conjunction probes (+6%), and merging instead of
+  probing dense common blocks (+21%). Test:
+  `windowed_maxscore_bounds_a_dense_nonessential_term_per_candidate_exactly`.
+
+[Campaign](benchmark-results/next-2026-09-29/README.md), September 29, 59M +
+111M requests on a fresh default build: wildcard top-k 1.97× (1.11× Luxir,
+was 0.56×), wildcard_scan 1.57–1.86×, and_high_low TOP_10 1.24–1.30×,
+and_high_med 1.08×, or_high_low 1.05–1.06×, prefix3 top-k 1.05–1.09×.
+Frequent-term exact counts read 3–7% slower although their code is
+unchanged: the bit-setting loop of `fill_doc_window` fused its closing
+compare and branch across a 32-byte boundary (JCC erratum on the Cascade Lake
+hosts, amplified by hyperthreading). Building with
+`-x86-branches-within-32B-boundaries` recovered them but cost ranked
+families 2–4% (geometric mean 0.996×), so it is not adopted.
+
+[RGB campaign](benchmark-results/rgb-2026-09-29/README.md), September 29, 73M
+requests: one binary on a default and an RGB build of the corpus. RGB lifts
+every ranked AND/OR family 1.6–2.2× and all but and_high_med past Luxir
+(and_high_high TOP_10 2.0×, or_high_high 1.85×, or_high_med 1.13×,
+or_high_low 1.11×, and_high_low 1.08×, and_high_med 0.97×), frequent-term
+counts 1.3–1.9×. Pattern top-k collapses (0.03–0.07×): pattern matches score
+1.0 and ties break by stable ID, which a reordered field cannot stream, so
+every match is mapped. Pattern counts now traverse physical IDs (2.3× on the
+RGB index, level with the default index); high_phrase top-k (0.48×) remains.
+
+[Common word pairs](common-word-pairs.md) ([campaign](benchmark-results/pairs-2026-09-29/README.md),
+104M requests): the body field pairs its 128 most frequent words; a two-word
+exact phrase of them reads one posting list. high_phrase top-10 44× (86.7×
+Luxir), its counts 2,168×; med_phrase top-10 21× (34.5× Luxir); low_phrase
+2.9×; other families unchanged; index +2.7% (1M) and postings +6.1% (10M),
+build +12%. On the RGB build ranked pair phrases first walked the whole pair
+list (physical opt-in); with ranked pairs on the term's logical plan,
+high_phrase top-10 on the RGB + pairs build runs 160× faster single-threaded
+(450 → 2.8 ms over 30 queries), level with the pairs build.
+
+[Physical tie order](physical-tie-order.md), September 30: constant-score
+queries (prefix, wildcard, regex, alone or as a Boolean's only scoring
+clause) break ties by physical slot on reordered fields, as Lucene does, so
+their ranked streams stop after `k` matches. On the 1M-document RGB index
+(Apple M4, single-threaded, A B A B, one source tree per binary), pattern
+top-10 runs 5.5× faster for wildcard, 5.8× for prefix3 and 1.3× for regex
+(dominated by one dictionary-bound query), from 0.17/0.11/0.68× of the
+default build to 0.93/0.66/0.89×; counts are unchanged, and 316 scored
+queries return identical IDs and score bits. On the 10M RGB + pairs build
+(x86, single core) pattern top-10 runs 33× faster for prefix3, 15× for
+wildcard, 2.2× for regex and 1.6× for wildcard_scan, within 10% of the
+default build (which is unchanged). The
+[throughput campaign](benchmark-results/ties-2026-09-30/README.md) (126M
+requests) puts RGB + pairs pattern top-10 at 0.98–1.14× Luxir (wildcard_scan
+5.0×), up from 0.02–0.05×, and ranked phrases level with the pairs build
+(high_phrase top-10 76× Luxir). RGB + pairs now matches or beats Luxir in 50
+of 57 cells; it trails on and_high_med top-k (0.93–0.95×), prefix3 top-k
+(0.91–0.98×) and pattern counts (0.68–0.85×).
+
+[Exact pattern counts](benchmark-results/pattern-count-2026-10-02/README.md),
+October 2: count a dominant expansion term from its dictionary cardinality,
+then probe only the deduplicated tail with the canonical batched posting reader.
+The 64:1 cost gate keeps probe work small; balanced expansions return the exact
+cardinality already computed by the existing materializer. Single-clause
+identity wrappers forward the optional count path. Deletions, filters,
+exclusions, scores and positions retain their ordinary collection rules; all
+expansion budgets run first. There is no format, writer, codec or index-default
+change.
+
+On the unchanged 10M-document x86 indexes (single core, A B B A), RGB + pairs
+COUNT improves 2.41× for wildcard, 1.45× for prefix3, 1.13× for regex and 1.36×
+for wildcard_scan; default + pairs improves 2.23×, 1.41×, 1.12× and 1.35×.
+On the 1M-document ARM fixture wildcard COUNT improves 2.04–2.39× across
+bitmap/RGB/rounded codecs; prefix COUNT improves 7–8%. All 59 pattern counts
+and top-100 ID/score digests match in every native phase. Index inventories on
+x86 remain byte-identical. The search harness and WASM build/tests pass.
+
+The earlier direct-bitmap accumulation experiment is rejected: default-index
+x86 wildcard counts regressed to 0.936×. The retained change leaves the posting
+reader untouched. Broad regex dictionary matching remains a bottleneck: on
+ARM `[jkqxz][a-z]*ess` improves only 1.01×. Ranked `and_high_med` and prefix
+search are separate remaining work; this count-only optimization does not
+change their plans. The focused follow-up must not be presented as a fresh
+57-cell sweep.
+
+The focused concurrent replay (56.4M requests, zero errors, A B L L B A)
+measures RGB + pairs COUNT at 2.150× baseline for wildcard (1.784× Luxir),
+1.285× for prefix (1.091× Luxir), 1.460× for regex (0.985× Luxir), and
+1.136× for broad wildcard (4.504× Luxir). Peak anonymous RSS changes from
+386.90 to 387.75 MiB; index-file mapping residency is identical. All 229
+admitted HTTP expressions preserve Summa counts and ranked IDs across phases,
+and the post-HTTP index hashes match.
+
+**Remaining regression:** broad wildcard TOP_10/TOP_100 throughput falls to
+0.918×/0.921× baseline in both candidate passes, while server CPU per request
+rises about 9%. It remains 4.856×/4.817× Luxir, but this is a real measured
+tradeoff to investigate, not noise to discard. The single-core control does
+not reproduce it and the ranking implementation is unchanged; a code-generation
+or concurrent-memory explanation is unproven. Other ranked cells are within
+0.978–1.019× baseline. Ranked `and_high_med` remains at 0.926–0.936× Luxir and
+prefix at 0.841–0.884× in this replay. Full phase, CPU, memory and correctness
+evidence is retained in the linked report.
+
+## October 2: accumulated search and I/O review
+
+The [review and complete rerun](benchmark-results/review-2026-10-02/README.md)
+traces pattern expansion, word-pair phrase execution, posting/merge ownership,
+dictionary caching, payload cancellation and RPC hydration. Two review findings
+are fixed: prefix queries now reject invalid field kinds consistently in count,
+estimate, sync/async scoring and optional bitset planning; the two AVX2 posting
+kernels check POPCNT as well as AVX2 before unsafe dispatch. A behavior-named
+regression reproduced both the direct-count and optional-predicate failures.
+Shared query expansion helpers remove repeated dictionary matcher call sites
+without introducing another decoder, cache, writer or scorer. Persisted bytes,
+expansion budgets, ranking rules and defaults are unchanged.
+
+Native `full` passes 2,165 tests (including five real-server tests), final native
+`check` passes 2,160, and WASM passes 41. Both native runs retain 25 ignored tests.
+Linux io_uring validation passes 73 tests, with additional runs passing 75 SIMD
+tests, the prefix regression and four probe scheduler tests. The Linux snapshot's
+800 source hashes match the reviewed tree. Its first harness attempt failed at
+Git provenance capture before testing; initializing the isolated snapshot fixed
+that environment issue, and the rerun passed.
+
+The ARM A B B A controls preserve all 59 counts and top-100 IDs/raw score bits
+on both ordinary and RGB 1M-document fixtures. Their timings are inconclusive:
+two attempts show large drift in different individual phases, and the shared
+desktop has concurrent application load. Both attempts are retained; no ARM
+speedup or regression is claimed from this review. Isolated ARM throughput
+remains unmeasured. The full x86 matrix and fixed-arrival payload measurements
+are recorded in the linked report with their protocol and limitations.
+
+The complete rerun validates 121,717,668 HTTP requests with zero errors and
+byte-identical inventories for all three Summa fixtures. All 677 admitted
+expressions preserve their retained same-index counts, plans, ranked IDs and
+raw score bits; 149 explicit budget exclusions remain. RGB + pairs measures
+above Luxir in 47/57 cells, default in 28/57 and pairs in 31/57. This is a
+shared-input comparison: 640/677 retained cross-engine counts agree, 37 differ.
+It does not establish cross-engine ranking equivalence.
+
+The ten RGB + pairs gaps are ranked `and_high_med` (0.929×/0.925×),
+ranked prefix (0.791×/0.783×), ranked regex (0.930×/0.940×), `low_term` TOP_10
+(0.892×), and high/medium/low single-term COUNT (0.877×/0.881×/0.869×).
+Broad wildcard remains 4.36×/4.37× Luxir ranked and 4.20× for COUNT. The large
+phrase gains are specific to the materialized word-pair workload. No default
+changes follow from this one machine. Two-pass phase differences reach 7.79%
+for RGB + pairs and 9.03% for Luxir, so marginal ratios are descriptive.
+
+Memory remains a material tradeoff: RGB + pairs peaks at 3,692.1 MiB sampled
+RSS, including up to 387.8 MiB anonymous RSS, versus 1,212.3/79.7 MiB for Luxir.
+Its end-of-phase index mapping residency is 3,290.9 MiB versus Luxir's
+1,107.5–1,109.4 MiB. Those mapped pages are distinct from heap residency and
+on-disk size. The [total CSV](benchmark-results/review-2026-10-02/total.csv)
+retains CPU/request and observed p99 ranges for all 228 variant/cell rows.
+
+The same-boot four-binary control adds 49,686,066 error-free requests. Across
+18 cells the reviewed build is 0.974–1.031× its normal baseline; peak anonymous
+RSS is 385.0 versus 385.8 MiB. Its wildcard TOP_100 mean is 0.974× (CPU/request
+1.004×), with opposite throughput directions in the two candidate passes.
+The full phase evidence is retained rather than declaring exact neutrality.
+Reviewed COUNT remains 2.131× the old baseline for wildcard, 1.241× prefix,
+1.433× regex and 1.148× broad wildcard.
+
+The retained diagnostic binary's broad-wildcard ranked regression reproduces
+at 0.875× baseline and 14.2–14.7% higher CPU/request. The normal baseline,
+with identical production Rust sources but a different diagnostic command
+and build path, already avoids it. Reviewed broad-wildcard ranking is
+0.994×/1.002× that normal baseline. This narrows the remaining finding to a
+binary/build-specific effect; it does not prove a compiler or instruction-cache
+cause, and the helper refactor must not be credited with fixing it. High-term
+COUNT is 96.6–99.6k QPS across all four arms on this control, so the much higher
+historical throughput cannot be used as evidence of a current-review regression.
+The RGB fixture remains byte-identical after every control pass has finished.
+
+The fixed-arrival I/O rerun passes all 54 load cells and three smoke cells:
+259,200 offers, 228,080 verified accepted queries, 31,120 explicit rejects and
+7,298,560 decoded documents, plus 192 smoke queries. Fixture hashes match;
+I/O, worker, notification, quarantine and OOM failures are zero. Ring saves
+5.94%/3.49% CPU per completion versus pool at MaxScore 400/800 offered/s,
+and 5.39%/5.23%/4.13% at mixed 200/400/600. All three paired repetitions agree
+at those settings. CPU includes verification and latency excludes rejects.
+
+At MaxScore 1,200/s, pool completes 1,169.5/s versus ring's 1,151.1/s, with
+1.65% versus 3.15% later rejection; CPU/completion is effectively tied. Mmap
+is cheaper for this workload but rejects 22.25% of first-second arrivals and
+uses roughly twice the cgroup memory. For mixed work, mmap reaches 256 MiB,
+rejects 82.67–94.40% of later offers and records 461k–597k file refaults;
+pool/ring remain below 198 MiB, record zero refaults and accept all later offers.
+Their 17–27% first-second rejection remains visible. The [complete I/O table](benchmark-results/review-2026-10-02/io-table.md)
+retains all rates/backends, CPU, both rejection windows, latency and memory.
+The evidence supports keeping the existing backend defaults and documenting
+the tradeoffs, not selecting a universal winner from one short workload.
+
 ### October 2: per-segment compaction cleanup
 
 Review found that row compaction already published each segment independently

@@ -1,0 +1,537 @@
+--- a/summa-core/src/structures/sstable.rs
++++ b/summa-core/src/structures/sstable.rs
+@@ -30,7 +30,7 @@
+ #[cfg(feature = "fst-index")]
+ use super::sstable_index::FstBlockIndex;
+ use super::sstable_index::{BlockAddr, BlockIndex, MmapBlockIndex};
+-use super::vint::{read_vint, write_vint};
++use super::vint::{read_vint, skip_vint, write_vint};
+ use crate::compression::{CompressionDict, CompressionLevel};
+ use crate::directories::{FileHandle, OwnedBytes};
+ 
+@@ -450,6 +450,16 @@
+ 
+     /// Read one value from `reader`, leaving subsequent entry bytes untouched.
+     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self>;
++
++    /// Advance past one value without materializing it.
++    ///
++    /// Scans call this for entries whose key is rejected. Overrides must
++    /// consume exactly the bytes `deserialize` consumes and reject the same
++    /// malformed input; the default decodes and drops.
++    #[inline]
++    fn skip(reader: &mut &[u8]) -> io::Result<()> {
++        Self::deserialize(reader).map(drop)
++    }
+ }
+ 
+ /// u64 value implementation
+@@ -809,6 +819,41 @@
+         Ok(())
+     }
+ 
++    // Called for nearly every scanned entry; parsed from the slice directly.
++    #[inline(always)]
++    fn skip(reader: &mut &[u8]) -> io::Result<()> {
++        let bytes = *reader;
++        let vints = match bytes.first() {
++            Some(0xFF) if bytes.len() >= 3 => {
++                let (doc_freq, data_len) = (bytes[1] as usize, bytes[2] as usize);
++                if doc_freq == 0 || doc_freq > MAX_INLINE_POSTINGS || data_len > 16 {
++                    return Err(io::Error::new(
++                        io::ErrorKind::InvalidData,
++                        "invalid inline TermInfo lengths",
++                    ));
++                }
++                let Some(rest) = bytes.get(3 + data_len..) else {
++                    *reader = &[];
++                    return Err(truncated_term_info());
++                };
++                *reader = rest;
++                return Ok(());
++            }
++            Some(0x00) => 3,
++            Some(0x01) => 5,
++            Some(0xFF) | None => {
++                *reader = &[];
++                return Err(truncated_term_info());
++            }
++            Some(&tag) => return Err(invalid_term_info_tag(tag)),
++        };
++        *reader = &bytes[1..];
++        for _ in 0..vints {
++            skip_vint(reader)?;
++        }
++        Ok(())
++    }
++
+     fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
+         let tag = reader.read_u8()?;
+ 
+@@ -856,14 +901,22 @@
+                 position_len,
+             })
+         } else {
+-            Err(io::Error::new(
+-                io::ErrorKind::InvalidData,
+-                format!("Invalid TermInfo tag: {}", tag),
+-            ))
++            Err(invalid_term_info_tag(tag))
+         }
+     }
+ }
+ 
++fn truncated_term_info() -> io::Error {
++    io::Error::new(io::ErrorKind::UnexpectedEof, "TermInfo truncated")
++}
++
++fn invalid_term_info_tag(tag: u8) -> io::Error {
++    io::Error::new(
++        io::ErrorKind::InvalidData,
++        format!("Invalid TermInfo tag: {}", tag),
++    )
++}
++
+ /// Compute common prefix length
+ pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+@@ -878,6 +931,15 @@
+     reader: &mut &[u8],
+     current_key: &mut Vec<u8>,
+ ) -> io::Result<V> {
++    decode_block_key(reader, current_key)?;
++    V::deserialize(reader)
++}
++
++/// Decode only the key of the next entry and return its shared-prefix length.
++/// The value follows in `reader`; the caller must `deserialize` or `skip` it
++/// before decoding another key.
++#[inline(always)]
++fn decode_block_key(reader: &mut &[u8], current_key: &mut Vec<u8>) -> io::Result<usize> {
+     let common_prefix_len = read_vint(reader)? as usize;
+     let suffix_len = read_vint(reader)? as usize;
+ 
+@@ -889,10 +951,29 @@
+     }
+ 
+     current_key.truncate(common_prefix_len);
+-    current_key.extend_from_slice(&reader[..suffix_len]);
++    append_key_suffix(current_key, reader, suffix_len);
+     *reader = &reader[suffix_len..];
++    Ok(common_prefix_len)
++}
+ 
+-    V::deserialize(reader)
++/// Append `entries[..len]` to `key`. Nearly every dictionary suffix is short,
++/// and a `memmove` call per entry dominated warm scans; a fixed-width move is
++/// inlined instead whenever both buffers have room for it.
++#[inline(always)]
++fn append_key_suffix(key: &mut Vec<u8>, entries: &[u8], len: usize) {
++    const WIDE: usize = 16;
++    if len <= WIDE && entries.len() >= WIDE {
++        key.reserve(WIDE);
++        // SAFETY: `entries` has at least WIDE readable bytes and `reserve`
++        // provides WIDE writable bytes past `key.len()`. Only the first `len`
++        // copied bytes (`len <= entries.len()`) become initialized contents.
++        unsafe {
++            std::ptr::copy_nonoverlapping(entries.as_ptr(), key.as_mut_ptr().add(key.len()), WIDE);
++            key.set_len(key.len() + len);
++        }
++    } else {
++        key.extend_from_slice(&entries[..len]);
++    }
+ }
+ 
+ /// SSTable statistics for debugging
+@@ -2216,48 +2297,14 @@
+         mut accepts: impl FnMut(&[u8]) -> bool + Send,
+         mut project: impl FnMut(&[u8], V) -> T + Send,
+     ) -> io::Result<(Vec<T>, bool)> {
+-        if self.block_index.is_empty() || prefix.is_empty() {
+-            return Ok((Vec::new(), false));
+-        }
+-
+-        // `locate` returns `None` when `prefix` sorts before the first key of
+-        // block 0. That is a miss for a point lookup, but a prefix of the
+-        // smallest key still matches entries in block 0, so scans start there.
+-        let start_block = self.block_index.locate(prefix).unwrap_or(0);
+-
+-        let mut results = Vec::new();
+-        let mut scanned = 0usize;
+-
+-        for block_idx in start_block..self.block_index.len() {
++        let mut scan = PrefixScan::new(prefix, max_results, max_scanned);
++        for block_idx in scan.blocks(&self.block_index) {
+             let block_data = self.load_block(block_idx).await?;
+-            let mut reader = self.block_entries(&block_data)?;
+-            let mut current_key = Vec::new();
+-
+-            while !reader.is_empty() {
+-                let value = decode_block_entry(&mut reader, &mut current_key)?;
+-
+-                if current_key.starts_with(prefix) {
+-                    if scanned == max_scanned {
+-                        return Err(io::Error::other(format!(
+-                            "term dictionary scan exceeds {max_scanned} terms"
+-                        )));
+-                    }
+-                    scanned += 1;
+-                    if !accepts(&current_key) {
+-                        continue;
+-                    }
+-                    if results.len() >= max_results {
+-                        return Ok((results, true));
+-                    }
+-                    results.push(project(&current_key, value));
+-                } else if current_key.as_slice() > prefix {
+-                    // Keys are sorted — past the prefix range, done
+-                    return Ok((results, false));
+-                }
++            if let Some(more) = scan.scan_block(&block_data, &mut accepts, &mut project)? {
++                return Ok((scan.results, more));
+             }
+         }
+-
+-        Ok((results, false))
++        Ok((scan.results, false))
+     }
+ 
+     /// Synchronous prefix scan — requires Inline (mmap/RAM) file handles.
+@@ -2310,45 +2357,97 @@
+         mut accepts: impl FnMut(&[u8]) -> bool,
+         mut project: impl FnMut(&[u8], V) -> T,
+     ) -> io::Result<(Vec<T>, bool)> {
+-        if self.block_index.is_empty() || prefix.is_empty() {
+-            return Ok((Vec::new(), false));
++        let mut scan = PrefixScan::new(prefix, max_results, max_scanned);
++        for block_idx in scan.blocks(&self.block_index) {
++            let block_data = self.load_block_sync(block_idx)?;
++            if let Some(more) = scan.scan_block(&block_data, &mut accepts, &mut project)? {
++                return Ok((scan.results, more));
++            }
+         }
++        Ok((scan.results, false))
++    }
++}
+ 
+-        // See `prefix_scan_limited`: a prefix of the smallest key lives in block 0.
+-        let start_block = self.block_index.locate(prefix).unwrap_or(0);
++/// Budgeted prefix-range state shared by the async and sync scans.
++///
++/// Only keys are decoded until `accepts` admits one; rejected and out-of-range
++/// entries skip their values. Inside the range, an entry sharing at least
++/// `prefix.len()` bytes with its in-range predecessor is in range without a
++/// comparison.
++struct PrefixScan<'p, T> {
++    prefix: &'p [u8],
++    max_results: usize,
++    max_scanned: usize,
++    scanned: usize,
++    key: Vec<u8>,
++    results: Vec<T>,
++}
+ 
+-        let mut results = Vec::new();
+-        let mut scanned = 0usize;
++impl<'p, T> PrefixScan<'p, T> {
++    fn new(prefix: &'p [u8], max_results: usize, max_scanned: usize) -> Self {
++        Self {
++            prefix,
++            max_results,
++            max_scanned,
++            scanned: 0,
++            key: Vec::new(),
++            results: Vec::new(),
++        }
++    }
+ 
+-        for block_idx in start_block..self.block_index.len() {
+-            let block_data = self.load_block_sync(block_idx)?;
+-            let mut reader = self.block_entries(&block_data)?;
+-            let mut current_key = Vec::new();
+-
+-            while !reader.is_empty() {
+-                let value = decode_block_entry(&mut reader, &mut current_key)?;
+-
+-                if current_key.starts_with(prefix) {
+-                    if scanned == max_scanned {
+-                        return Err(io::Error::other(format!(
+-                            "term dictionary scan exceeds {max_scanned} terms"
+-                        )));
++    fn blocks(&self, index: &BlockIndex) -> std::ops::Range<usize> {
++        if index.is_empty() || self.prefix.is_empty() {
++            return 0..0;
++        }
++        // `locate` returns `None` when `prefix` sorts before the first key of
++        // block 0. That is a miss for a point lookup, but a prefix of the
++        // smallest key still matches entries in block 0, so scans start there.
++        index.locate(self.prefix).unwrap_or(0)..index.len()
++    }
++
++    /// Scan one decompressed block. `Some(more)` ends the scan; `more` reports
++    /// an accepted entry beyond `max_results`.
++    fn scan_block<V: SSTableValue>(
++        &mut self,
++        block: &[u8],
++        accepts: &mut impl FnMut(&[u8]) -> bool,
++        project: &mut impl FnMut(&[u8], V) -> T,
++    ) -> io::Result<Option<bool>> {
++        let mut reader = BlockParts::split(block)?.entries;
++        self.key.clear();
++        let mut in_range = false;
++
++        while !reader.is_empty() {
++            let shared = decode_block_key(&mut reader, &mut self.key)?;
++            if !in_range || shared < self.prefix.len() {
++                in_range = self.key.starts_with(self.prefix);
++                if !in_range {
++                    if self.key.as_slice() > self.prefix {
++                        // Keys are sorted — past the prefix range, done.
++                        return Ok(Some(false));
+                     }
+-                    scanned += 1;
+-                    if !accepts(&current_key) {
+-                        continue;
+-                    }
+-                    if results.len() >= max_results {
+-                        return Ok((results, true));
+-                    }
+-                    results.push(project(&current_key, value));
+-                } else if current_key.as_slice() > prefix {
+-                    return Ok((results, false));
++                    V::skip(&mut reader)?;
++                    continue;
+                 }
++            }
++            if self.scanned == self.max_scanned {
++                return Err(io::Error::other(format!(
++                    "term dictionary scan exceeds {} terms",
++                    self.max_scanned
++                )));
+             }
++            self.scanned += 1;
++            if !accepts(&self.key) {
++                V::skip(&mut reader)?;
++                continue;
++            }
++            if self.results.len() >= self.max_results {
++                return Ok(Some(true));
++            }
++            let value = V::deserialize(&mut reader)?;
++            self.results.push(project(&self.key, value));
+         }
+-
+-        Ok((results, false))
++        Ok(None)
+     }
+ }
+ 
+@@ -2910,6 +3009,25 @@
+         );
+         assert_eq!(key, b"alpine");
+         assert!(reader.is_empty());
++    }
++
++    #[test]
++    fn short_and_long_key_suffixes_decode_identically_near_block_end() {
++        for suffix_len in 0..40usize {
++            let suffix: Vec<u8> = (0..suffix_len as u8).map(|b| b'a' + b % 26).collect();
++            for trailing in [0usize, 1, 15, 16, 40] {
++                let mut encoded = Vec::new();
++                write_vint(&mut encoded, 3).unwrap();
++                write_vint(&mut encoded, suffix_len as u64).unwrap();
++                encoded.extend_from_slice(&suffix);
++                encoded.extend(std::iter::repeat_n(0xEE, trailing));
++                let mut reader = encoded.as_slice();
++                let mut key = b"pre-previous".to_vec();
++                assert_eq!(decode_block_key(&mut reader, &mut key).unwrap(), 3);
++                assert_eq!(key, [&b"pre"[..], &suffix].concat());
++                assert_eq!(reader.len(), trailing);
++            }
++        }
+     }
+ 
+     #[test]
+@@ -2923,4 +3041,113 @@
+         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+         assert_eq!(error.to_string(), "SSTable block suffix truncated");
+     }
++
++    #[test]
++    fn term_info_skip_consumes_and_rejects_exactly_like_deserialize() {
++        let values = [
++            TermInfo::try_inline(&[3], &[1]).unwrap(),
++            TermInfo::try_inline(&[1, 900, 70_000], &[2, 1, 40]).unwrap(),
++            TermInfo::external(0, 1, 4),
++            TermInfo::external(u64::MAX, 1 << 40, u32::MAX),
++            TermInfo::external_with_positions(123_456, 789, 42, 1 << 35, 99),
++        ];
++        let mut inputs = vec![
++            vec![0x02],
++            vec![0xFF, 0, 0],
++            vec![0xFF, 4, 0],
++            vec![0xFF, 1, 17],
++            [&[0x00][..], &[0x80; 9], &[2, 0, 0]].concat(),
++            [&[0x01, 1, 1, 1, 1], &[0xff; 11][..]].concat(),
++        ];
++        for value in &values {
++            let mut encoded = Vec::new();
++            value.serialize(&mut encoded).unwrap();
++            for end in 0..=encoded.len() {
++                inputs.push(encoded[..end].to_vec());
++            }
++            encoded.push(0x5a);
++            inputs.push(encoded);
++        }
++        for input in inputs {
++            let (mut decoded, mut skipped) = (input.as_slice(), input.as_slice());
++            let expected = TermInfo::deserialize(&mut decoded)
++                .map(drop)
++                .map_err(|error| error.kind());
++            let actual = TermInfo::skip(&mut skipped).map_err(|error| error.kind());
++            assert_eq!(actual, expected, "{input:?}");
++            if expected.is_ok() {
++                assert_eq!(skipped, decoded, "{input:?}");
++            }
++        }
++    }
++
++    thread_local! {
++        static VALUE_CALLS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
++    }
++
++    /// Counts `(deserialize, skip)` calls on the current thread.
++    #[derive(Clone, Debug, PartialEq)]
++    struct CountedValue(u64);
++
++    impl SSTableValue for CountedValue {
++        fn serialize<W: Write>(&self, writer: &mut W) -> io::Result<()> {
++            write_vint(writer, self.0)
++        }
++
++        fn deserialize<R: Read>(reader: &mut R) -> io::Result<Self> {
++            VALUE_CALLS.with(|calls| calls.set((calls.get().0 + 1, calls.get().1)));
++            read_vint(reader).map(Self)
++        }
++
++        fn skip(reader: &mut &[u8]) -> io::Result<()> {
++            VALUE_CALLS.with(|calls| calls.set((calls.get().0, calls.get().1 + 1)));
++            skip_vint(reader)
++        }
++    }
++
++    fn take_value_calls() -> (usize, usize) {
++        VALUE_CALLS.with(|calls| calls.replace((0, 0)))
++    }
++
++    #[cfg(feature = "native")]
++    #[tokio::test]
++    async fn prefix_scan_decodes_values_only_for_accepted_keys() {
++        let keys: Vec<String> = (0..5_000).map(|i| format!("k{i:05}")).collect();
++        let config = SSTableWriterConfig {
++            block_size: SSTableBlockSize::try_from(512).unwrap(),
++            ..SSTableWriterConfig::default()
++        };
++        let mut writer = SSTableWriter::<_, CountedValue>::with_config(Vec::new(), config);
++        for (i, key) in keys.iter().enumerate() {
++            writer
++                .insert(key.as_bytes(), &CountedValue(i as u64))
++                .unwrap();
++        }
++        let handle = FileHandle::from_bytes(OwnedBytes::new(writer.finish().unwrap()));
++        let reader = AsyncSSTableReader::<CountedValue>::open(handle, 64)
++            .await
++            .unwrap();
++        assert!(reader.block_index.len() > 3, "test needs several blocks");
++
++        // `k02` covers 1,000 keys spanning blocks; accept every tenth.
++        take_value_calls();
++        let (values, more) = reader
++            .prefix_scan_values(b"k02", usize::MAX, usize::MAX, |key| key.ends_with(b"0"))
++            .await
++            .unwrap();
++        assert!(!more);
++        let expected: Vec<_> = (2_000..3_000).step_by(10).map(CountedValue).collect();
++        assert_eq!(values, expected);
++        let (decoded, skipped) = take_value_calls();
++        assert_eq!(decoded, expected.len());
++        // Rejected in-range keys plus the start block's keys before `k02`;
++        // the out-of-range key that ends the scan is not skipped.
++        let start_block = reader.block_index.locate(b"k02").unwrap();
++        let before = keys
++            .iter()
++            .filter(|key| key.as_str() < "k02")
++            .filter(|key| reader.block_index.locate(key.as_bytes()) == Some(start_block))
++            .count();
++        assert_eq!(skipped, 900 + before);
++    }
+ }
+--- a/summa-core/src/structures/vint.rs
++++ b/summa-core/src/structures/vint.rs
+@@ -49,11 +49,66 @@
+     }
+ }
+ 
++/// Advance past one integer written by [`write_vint`] without decoding it.
++///
++/// Accepts and rejects exactly the inputs [`read_vint`] does, with the same
++/// error kinds and cursor position, so value skipping cannot desynchronize a
++/// block decoder from value reading.
++#[inline(always)]
++pub fn skip_vint(reader: &mut &[u8]) -> io::Result<()> {
++    let limit = reader.len().min(10);
++    for index in 0..limit {
++        let byte = reader[index];
++        if index == 9 && byte > 1 {
++            *reader = &reader[10..];
++            return Err(io::Error::new(
++                io::ErrorKind::InvalidData,
++                "varint exceeds u64",
++            ));
++        }
++        if byte & 0x80 == 0 {
++            *reader = &reader[index + 1..];
++            return Ok(());
++        }
++    }
++    *reader = &reader[limit..];
++    Err(io::Error::new(
++        io::ErrorKind::UnexpectedEof,
++        "varint truncated",
++    ))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
++    fn skip_matches_read_acceptance_error_kind_and_position() {
++        let mut inputs: Vec<Vec<u8>> = vec![vec![], vec![0x80, 0, 42], vec![0xff; 12]];
++        for value in [0, 1, 127, 128, 16_384, u32::MAX as u64, u64::MAX] {
++            let mut encoded = Vec::new();
++            write_vint(&mut encoded, value).unwrap();
++            for end in 0..=encoded.len() {
++                inputs.push(encoded[..end].to_vec());
++            }
++            encoded.push(7);
++            inputs.push(encoded);
++        }
++        for last in [0, 1, 2, 0x7f] {
++            let mut overflow = vec![0x80; 9];
++            overflow.extend([last, 42]);
++            inputs.push(overflow);
++        }
++        for input in inputs {
++            let (mut read, mut skipped) = (input.as_slice(), input.as_slice());
++            let expected = read_vint(&mut read).map(drop).map_err(|error| error.kind());
++            let actual = skip_vint(&mut skipped).map_err(|error| error.kind());
++            assert_eq!(actual, expected, "{input:?}");
++            assert_eq!(skipped, read, "{input:?}");
++        }
++    }
++
++    #[test]
+     fn roundtrips_unsigned_boundaries() {
+         for value in [0, 1, 0x7f, 0x80, 0x3fff, 0x4000, u32::MAX as u64, u64::MAX] {
+             let mut encoded = Vec::new();

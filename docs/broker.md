@@ -156,7 +156,8 @@ Reads:
   `SearchRequest.text_stats` so every partition scores with corpus-wide
   document frequencies and lengths. Plain pointwise searches query partitions
   with `offset=0, limit=offset+limit` and merge by score descending, ties by
-  `(segment_id, doc_id)`. Top-level fusion without the legacy vector reranker
+  `segment_id` and then each shard's own order (physical for constant-score
+  queries on reordered fields, [physical tie order](physical-tie-order.md)). Top-level fusion without the legacy vector reranker
   exports the per-branch shard nomination lists and computes global RRF (or
   normalized weighted sum) using core fusion at the broker. L1 applies the same
   core model on shards and broker, retaining sufficient passage rows for the

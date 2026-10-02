@@ -429,6 +429,14 @@ macro_rules! define_query_traits {
             /// Estimated number of matching documents in a segment (async)
             fn count_estimate<'a>(&self, reader: &'a SegmentReader) -> CountFuture<'a>;
 
+            /// Exact physical document cardinality, when cheaper than streaming.
+            /// The collector uses this only without deletions, scores or positions.
+            /// Implementations must enforce ordinary query validation and budgets;
+            /// wrappers may forward it only when they preserve all membership.
+            fn exact_count<'a>(&self, _reader: &'a SegmentReader) -> Option<CountFuture<'a>> {
+                None
+            }
+
             /// Create a scorer synchronously (mmap/RAM only).
             ///
             /// Available when the `sync` feature is enabled.
@@ -549,6 +557,22 @@ macro_rules! define_query_traits {
                     QueryDecomposition::TextTerm(info) => Some(info),
                     _ => None,
                 }
+            }
+
+            /// Whether every match of this query receives the same score. On
+            /// a reordered field such a query returns its matches in the
+            /// field's physical order (`docs/physical-tie-order.md`).
+            fn constant_score(&self) -> bool {
+                self.is_filter()
+            }
+
+            /// A common word pair whose postings hold exactly this query's
+            /// matches in `reader` (`docs/common-word-pairs.md`). Count-only
+            /// collection may answer from its document frequency; unlike
+            /// [`Self::count_equivalent_term`] this holds per segment only and
+            /// never stands in for the query elsewhere.
+            fn word_pair_term(&self, _reader: &SegmentReader) -> Option<super::TermQueryInfo> {
+                None
             }
 
             /// A term-equivalent cardinality alongside an exact score-only
@@ -761,6 +785,10 @@ impl Query for Box<dyn Query> {
         (**self).count_estimate(reader)
     }
 
+    fn exact_count<'a>(&self, reader: &'a SegmentReader) -> Option<CountFuture<'a>> {
+        (**self).exact_count(reader)
+    }
+
     fn scorer_with_options<'a>(
         &self,
         reader: &'a SegmentReader,
@@ -808,6 +836,14 @@ impl Query for Box<dyn Query> {
 
     fn count_equivalent_term(&self) -> Option<super::TermQueryInfo> {
         (**self).count_equivalent_term()
+    }
+
+    fn word_pair_term(&self, reader: &SegmentReader) -> Option<super::TermQueryInfo> {
+        (**self).word_pair_term(reader)
+    }
+
+    fn constant_score(&self) -> bool {
+        (**self).constant_score()
     }
 
     fn ranked_count_equivalent_term(&self) -> Option<super::TermQueryInfo> {

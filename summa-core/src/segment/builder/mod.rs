@@ -33,7 +33,7 @@ use std::mem::size_of;
 use std::path::PathBuf;
 
 use hashbrown::HashMap;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 // String interning: lasso on native (fast arena), HashMap on WASM (no C deps)
 #[cfg(feature = "native")]
@@ -43,7 +43,7 @@ use lasso::{Rodeo, Spur};
 pub(crate) mod simple_interner {
     use hashbrown::HashMap;
 
-    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Spur(u32);
 
     /// Simple string interner for WASM (replaces lasso::Rodeo).
@@ -223,6 +223,14 @@ pub struct SegmentBuilder {
     /// String interner for terms - O(1) lookup and deduplication
     term_interner: Rodeo,
 
+    /// Interned common words per text field (`docs/common-word-pairs.md`).
+    common_grams: FxHashMap<u32, FxHashSet<Spur>>,
+    /// The current document's common-word occurrences: (field, encoded
+    /// position, word), paired when the document is complete.
+    pair_occurrences: Vec<(u32, u32, Spur)>,
+    /// Reused per-document pair frequencies: (field, first, second) -> tf.
+    pair_counts: FxHashMap<(u32, Spur, Spur), u32>,
+
     /// Inverted index: term key -> posting list
     inverted_index: HashMap<TermKey, PostingListBuilder>,
 
@@ -367,6 +375,36 @@ impl SegmentBuilder {
             }
         }
 
+        let mut term_interner = Rodeo::new();
+        let mut common_grams: FxHashMap<u32, FxHashSet<Spur>> = FxHashMap::default();
+        for (field, entry) in schema.fields() {
+            if entry.common_grams.is_empty() {
+                continue;
+            }
+            let mut words = FxHashSet::default();
+            for word in &entry.common_grams {
+                // A word the field never indexes as itself could never pair.
+                let indexed_as_itself = match tokenizers.get(&field) {
+                    Some(tokenizer) => {
+                        let tokens =
+                            tokenizer.tokenize_with(word, None, crate::tokenizer::Purpose::Exact);
+                        tokens.len() == 1 && tokens[0].text == *word
+                    }
+                    None => word
+                        .chars()
+                        .all(|c| c.is_alphanumeric() && c.to_lowercase().eq([c])),
+                };
+                if !indexed_as_itself {
+                    return Err(crate::Error::Schema(format!(
+                        "common_grams word {word:?} of field '{}' is not a single token of its tokenizer",
+                        entry.name
+                    )));
+                }
+                words.insert(term_interner.get_or_intern(word));
+            }
+            common_grams.insert(field.0, words);
+        }
+
         // Initialize fast-field writers for fields with fast=true
         use crate::structures::fast_field::{FastFieldColumnType, FastFieldWriter};
         let mut fast_fields = FxHashMap::default();
@@ -405,7 +443,10 @@ impl SegmentBuilder {
             tokenizer_hint_fields,
             tokenizer_hint_buffer: String::new(),
             unhinted_dynamic_docs: 0,
-            term_interner: Rodeo::new(),
+            term_interner,
+            common_grams,
+            pair_occurrences: Vec::new(),
+            pair_counts: FxHashMap::default(),
             inverted_index: HashMap::with_capacity(config.posting_map_capacity),
             #[cfg(feature = "native")]
             posting_spill_file: None,
@@ -898,6 +939,8 @@ impl SegmentBuilder {
             }
         }
 
+        self.index_word_pairs(doc_id)?;
+
         // Stream document to disk immediately
         self.write_document_to_store(&doc)?;
 
@@ -990,6 +1033,14 @@ impl SegmentBuilder {
                             (encoded_ordinal << 20) | self.saturate_token_position(token.position)
                         }
                     };
+                    if self
+                        .common_grams
+                        .get(&field_id)
+                        .is_some_and(|words| words.contains(&term_spur))
+                    {
+                        self.pair_occurrences
+                            .push((field_id, encoded_pos, term_spur));
+                    }
                     let positions = self.local_positions.entry(term_spur).or_default();
                     if positions.is_empty() {
                         self.local_position_terms.push(term_spur);
@@ -1033,6 +1084,14 @@ impl SegmentBuilder {
                             (encoded_ordinal << 20) | self.saturate_token_position(token_position)
                         }
                     };
+                    if self
+                        .common_grams
+                        .get(&field_id)
+                        .is_some_and(|words| words.contains(&term_spur))
+                    {
+                        self.pair_occurrences
+                            .push((field_id, encoded_pos, term_spur));
+                    }
                     let positions = self.local_positions.entry(term_spur).or_default();
                     if positions.is_empty() {
                         self.local_position_terms.push(term_spur);
@@ -1046,12 +1105,45 @@ impl SegmentBuilder {
 
         // Phase 2: Insert aggregated terms into inverted index
         // Now we only do one inverted_index lookup per unique term in doc
-        for (&term_spur, &tf) in &self.local_tf_buffer {
+        let local_tf = std::mem::take(&mut self.local_tf_buffer);
+        for (&term_spur, &tf) in &local_tf {
             let term_key = TermKey {
                 field: field_id,
                 term: term_spur,
             };
+            self.add_term_posting(term_key, doc_id, tf)?;
 
+            if position_mode.is_some()
+                && let Some(positions) = self.local_positions.get(&term_spur)
+            {
+                match self.position_index.entry(term_key) {
+                    hashbrown::hash_map::Entry::Occupied(mut o) => {
+                        for &pos in positions {
+                            o.get_mut().add_position(doc_id, pos);
+                        }
+                        self.estimated_memory += positions.len() * size_of::<u32>();
+                    }
+                    hashbrown::hash_map::Entry::Vacant(v) => {
+                        let mut pos_posting = PositionPostingListBuilder::new();
+                        for &pos in positions {
+                            pos_posting.add_position(doc_id, pos);
+                        }
+                        self.estimated_memory +=
+                            positions.len() * size_of::<u32>() + NEW_POS_TERM_OVERHEAD;
+                        v.insert(pos_posting);
+                    }
+                }
+            }
+        }
+
+        self.local_tf_buffer = local_tf;
+        Ok(token_position)
+    }
+
+    /// Append one document's frequency for `term_key`, spilling large posting
+    /// lists to disk to reduce peak memory.
+    fn add_term_posting(&mut self, term_key: TermKey, doc_id: DocId, tf: u32) -> Result<()> {
+        {
             match self.inverted_index.entry(term_key) {
                 hashbrown::hash_map::Entry::Occupied(mut o) => {
                     o.get_mut().add(doc_id, tf);
@@ -1091,7 +1183,9 @@ impl SegmentBuilder {
 
                         let freed = builder.postings.len() * size_of::<CompactPosting>();
                         builder.spilled_count += count;
-                        builder.postings.clear();
+                        // Release the buffer: `clear()` would keep ~128 KiB per
+                        // hot term allocated while the estimate drops it.
+                        builder.postings = Vec::new();
                         self.estimated_memory -= freed;
                     }
                 }
@@ -1102,31 +1196,63 @@ impl SegmentBuilder {
                     self.estimated_memory += size_of::<CompactPosting>() + NEW_TERM_OVERHEAD;
                 }
             }
+        }
+        Ok(())
+    }
 
-            if position_mode.is_some()
-                && let Some(positions) = self.local_positions.get(&term_spur)
+    /// Index the adjacent pairs of the document's common-word occurrences.
+    /// A pair's frequency is the number of first-word occurrences at `p` with
+    /// the second word at `p + 1`, which is how exact phrases count matches
+    /// (every start, overlaps included), so a two-word phrase of common words
+    /// reads the pair's postings unchanged.
+    fn index_word_pairs(&mut self, doc_id: DocId) -> Result<()> {
+        if self.pair_occurrences.is_empty() {
+            return Ok(());
+        }
+        let mut occurrences = std::mem::take(&mut self.pair_occurrences);
+        occurrences.sort_unstable();
+        let mut counts = std::mem::take(&mut self.pair_counts);
+        counts.clear();
+        for (index, &(field, position, first)) in occurrences.iter().enumerate() {
+            let Some(next) = position.checked_add(1) else {
+                continue;
+            };
+            let rest = &occurrences[index + 1..];
+            let start = rest.partition_point(|&(f, p, _)| (f, p) < (field, next));
+            let mut previous = None;
+            for &(_, _, second) in rest[start..]
+                .iter()
+                .take_while(|&&(f, p, _)| f == field && p == next)
             {
-                match self.position_index.entry(term_key) {
-                    hashbrown::hash_map::Entry::Occupied(mut o) => {
-                        for &pos in positions {
-                            o.get_mut().add_position(doc_id, pos);
-                        }
-                        self.estimated_memory += positions.len() * size_of::<u32>();
-                    }
-                    hashbrown::hash_map::Entry::Vacant(v) => {
-                        let mut pos_posting = PositionPostingListBuilder::new();
-                        for &pos in positions {
-                            pos_posting.add_position(doc_id, pos);
-                        }
-                        self.estimated_memory +=
-                            positions.len() * size_of::<u32>() + NEW_POS_TERM_OVERHEAD;
-                        v.insert(pos_posting);
-                    }
+                // Duplicate second-word occurrences confirm one start once.
+                if previous != Some(second) {
+                    *counts.entry((field, first, second)).or_insert(0) += 1;
+                    previous = Some(second);
                 }
             }
         }
-
-        Ok(token_position)
+        for (&(field, first, second), &tf) in &counts {
+            let pair = format!(
+                "{}\0{}",
+                self.term_interner.resolve(&first),
+                self.term_interner.resolve(&second)
+            );
+            let term = if let Some(spur) = self.term_interner.get(&pair) {
+                spur
+            } else {
+                self.estimated_memory += pair.len() + INTERN_OVERHEAD;
+                self.term_interner.get_or_intern(&pair)
+            };
+            let key = TermKey {
+                field: field | postings::WORD_PAIR_FIELD_FLAG,
+                term,
+            };
+            self.add_term_posting(key, doc_id, tf)?;
+        }
+        occurrences.clear();
+        self.pair_occurrences = occurrences;
+        self.pair_counts = counts;
+        Ok(())
     }
 
     /// Saturate a token position at the 20-bit packed-encoding maximum so it
@@ -1950,6 +2076,44 @@ mod tests {
                 assert_eq!(&positions[4_000..], &expected);
             }
         }
+    }
+
+    /// Spilling a hot term's postings must release their buffer (or keep it
+    /// counted): the indexing budget reads `estimated_memory_bytes`.
+    #[cfg(feature = "native")]
+    #[test]
+    fn spilled_posting_buffers_stay_within_the_memory_estimate() {
+        let mut schema = SchemaBuilder::default();
+        let body = schema.add_text_field("body", true, false);
+        let mut builder = builder_for(schema.build());
+        let text: String = (0..20).map(|term| format!("hot{term} ")).collect();
+        let docs = 2 * postings::SPILL_THRESHOLD + 100;
+        for doc in 0..docs as DocId {
+            builder
+                .index_text_field(body, doc, &text, 0, false)
+                .unwrap();
+        }
+        assert!(
+            builder
+                .inverted_index
+                .values()
+                .all(|list| list.len() == docs)
+        );
+        for list in builder.inverted_index.values() {
+            // Only ordinary growth of the in-memory tail, not the spilled run.
+            assert!(
+                list.postings.capacity() <= 2 * list.postings.len().max(4),
+                "spilled term retains {} slots for {} postings",
+                list.postings.capacity(),
+                list.postings.len()
+            );
+        }
+        let held: usize = builder
+            .inverted_index
+            .values()
+            .map(|list| list.postings.len() * std::mem::size_of::<CompactPosting>())
+            .sum();
+        assert!(builder.estimated_memory_bytes() >= held);
     }
 
     // ------------------------------------------------------------------

@@ -1,0 +1,110 @@
+{
+  "files": {
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.store": {
+      "bytes": 4455675505,
+      "sha256": "448f2774be1fa36adb32543e7193a2c4f6df9329d2052a1b5217333cbbe1d3ca"
+    },
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.terms": {
+      "bytes": 503593473,
+      "sha256": "956abb585c3e965e71e3282ad4035759f2a919fb2d1e7d6bfb7a527fe11a3ebd"
+    },
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.post": {
+      "bytes": 8700378474,
+      "sha256": "cdf8cde24b97177074eeb25be85f1b10763a3a6c2532c4822c80f764937feb08"
+    },
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.rowstats": {
+      "bytes": 10577631,
+      "sha256": "aba221cba939ff977629b445c5891c58281ba0dc0ee6f9f2a5627c9f30ddc232"
+    },
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.chunks": {
+      "bytes": 380000544,
+      "sha256": "8d0f7bc7b43ac14bd230d9f37b558586a8060eab901583c55f41936f886b734b"
+    },
+    "metadata.json": {
+      "bytes": 9763,
+      "sha256": "dabb2407c70b0dfbb87292697ff87ffc57b61175cf325ae1cc5a4c5d8898e815"
+    },
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.meta": {
+      "bytes": 328,
+      "sha256": "eb35e0de5843cfd4128c8958edc2e9bf151976fe10896b796a81fffaa305b0bf"
+    },
+    ".hermes_writer.lock": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.fast": {
+      "bytes": 1107898738,
+      "sha256": "235ac8aec32e8dc41442278d4c44ae102394ca55638364b764b4a09c948e0f9f"
+    },
+    "seg_01a0d51ecbb0761de69d68e5da1a9889.pos": {
+      "bytes": 3535576773,
+      "sha256": "b3c4b5a7245bfc83c2d6f47d2bdb8d9bcf3e6ada69d64cf49603464bf269f503"
+    }
+  },
+  "bytes": 18693711229,
+  "unchanged_after_campaign": true,
+  "searchbench": {
+    "revision": "81f67380ef2d1528b40b6770f5ea5d6b105bc88e",
+    "files": {
+      "python/test_searchbench.py": "a54a1dbc859c3cc82d8fd59bd588f7571f5c41dcb1700648a86fa2c11ff254d4",
+      "python/variants.py": "b94b56b6a9d6355392a3d8f13d321ba7e419d82b6b54f55c96cb2c47d5a9b401",
+      "python/request_capture.py": "b4543f0617b7133c4856ba47589b3a549b857e3dd853e6cfc099defb62dd080b",
+      "python/corpus_transform.py": "8b4eec2604e5cb58c539acfc84e620a1ec939be2e7e8f700bc2bd443125b1cf7",
+      "python/sampler.py": "16e303faf41ca94f776615dfb1b9362b0ab9113a2df59f5aff99faefb29d5ba7",
+      "python/results_io.py": "aea756d11f9a9b7b69c179806a5813f8f9188e95ce38072347ea0d891762af52",
+      "python/driver.py": "b49d029fc65a9854c4ed705c6f8296708bcb7214eeda8bb30e04c4e1b54bbbc1",
+      "python/feed_rest.py": "c93ce3356a44c96a3e3cd2f629d13ccc3beb8be682ba1463ee8ae0d04953256d",
+      "python/http_sync.py": "3ee0ecb2348629508672cff982a7a915fd9b25c0f0d0cd79998001209b99e02c",
+      "python/schema.py": "818297c4fdb0353259c601a16839f546c9f91313d8c909cd268c1fc5809ef5c2",
+      "python/datasets.py": "37edd94f02947b74f85024c34f88a7650f4a37d40d33b4a546f0509e44b07e15",
+      "python/report.py": "8fd24b38bcef5637a876c2ec2302f60c15a22704177f296d0aed5564a787355f",
+      "python/failure_result.py": "b37bb75b4e958a4fef2ab674ac00fa52fe73a529a7c24cc5cc30b6910fced8fe",
+      "python/feed_luxir.py": "1a3f98931e9bfb97ff4a68b3ea668b488fccf22fa076eeebecf67db0846674c6",
+      "python/cpu_layout.py": "0c6ec50c566a630cabf1cdc424f7489c26751da3b11ba1914b5c0db7a2be5143",
+      "python/controls.py": "c2e390ee4c7e93b10eb2cba22508aef0c97a9ce0f2394d6962ba673346969215",
+      "python/test_controls.py": "24737b8eac9e5dc022ade1aee02089e3b74ffdb64354412adefdf90714c1aaec",
+      "python/async_http.py": "6f68b629a2de8c5aef8c77daace81f3c7a19c16d6c00d04860b93ff4e98698d1",
+      "python/test_network_namespace.py": "d3b3d56e9eea7a21bc2d72918d374a7eae94e798a9233bee37073581fac84332",
+      "python/topology_probe.py": "4ead9a0269b7b408080455e27bdfaad54bb71d9685a29dd1e1dfd0f53ccafbd0",
+      "python/presets.py": "5e234a461fab0c4e53264613a562a23004d544583dc59e4485c80bf5b9f8e5d9",
+      "python/query_source.py": "ff01ac87d4e5e7e60b4f6c9613c6ee96add78b19e3658e7ed8afd04e9ac2fe9a",
+      "python/network_namespace.py": "295eace223fb4b3fa0e491bdd693057c6313715a23885bc9c269afd34198f248",
+      "python/verify_topology.py": "1c25345aec004b71bb33ab002984a220681015f11e0b9aa93ceb8b3314b4a0ea",
+      "python/show_request.py": "d6b082a0b81c4380d44fc3d878e9710705536c761d7a7e4c0526d82c1ec401b9",
+      "python/topologies.py": "7bcc3550ab34dfe90cc7bdb42ddf2eb7f0a68f022a6eacaefaeed0c100053068",
+      "python/adapters.py": "a02fa48faa859437f18c180201b48dfd34b99e76080ee4e89f345a51e1ed810b",
+      "python/select_queries.py": "388811435bcf7b1bf7b28f716ed65862536fa7181584b5389d4e842a2125315e",
+      "python/grid.py": "9ddbdde73c5fa58054210a88a45b4f25ff96073c7840eba46f6db2e9513b950a",
+      "python/import_luceneutil_queries.py": "2d4651eacfe137e20c7d82fff9d3b78eeeebe5ebd0b3a5c2bcb78af6160cd401",
+      "scripts/run-isolated.sh": "9d07d365f1aece87fed3feaeafd95e1d94df7ac9e6bfdff715233d4cc311532c",
+      "scripts/stop-opensearch.sh": "495e4777abd758e162ea7a3b79da1500bba88fa2328c938e60d14904ad8b311c",
+      "scripts/quick.sh": "9b07937424d53bef2326076994ed70b28ae8c061c9233dd168917952702fea48",
+      "scripts/run-aa.sh": "75da62691201ac9db49e7466aeb0fa705b08951e63618b0aa48b72d9469dd59d",
+      "scripts/select-queries.sh": "d2ea5416955df4711d2151e8d1f20d55e15172e53fbec56f4d08be18589c24ce",
+      "scripts/show.sh": "7b9183f699e8aae3ddcc6c119393551686ecd7f7dd1455626fabd80e18918480",
+      "scripts/stop-luxir.sh": "b9bd3538e704e54acb8fdf6576a1e81c101597e3a8d9dc5ed67373c800e3f6da",
+      "scripts/ingest-streams.sh": "a3d291d0a4ab340fa4317e1d7c6c5b49a9ea50b2f422ab0be6e7e9e20ca27287",
+      "scripts/sustained-ingest.sh": "252f6e100d88802a5e12217fd7f61229927b48f0fdd23a83eac43d73a6d6c8d4",
+      "scripts/smoke.sh": "444283fe4f792755e7605150f2e26f9ca60459116599445c95d49f97fdf338f9",
+      "scripts/start-luxir.sh": "ae796e6cd42a7b519c19f08a40e6fab704fc2e32cdad201cb16fa6bca2f0de62",
+      "scripts/start-opensearch.sh": "2c46d05a87da6f6ce6c7d34b7bd16dd7b87045cbbb7adbea5dc325d8510e567a",
+      "scripts/setup.sh": "a9274347019be5cd1cf46c70dd5fe1d05420181ee8813ff672f8809f3e1c3832",
+      "scripts/run-baseline.sh": "acee35c8821df5c75c8f890e0e431382165b16b1a19be16a21c41acd4f218d1f",
+      "scripts/run-driver.sh": "50296fb683378f5d619eb79af41f1480efd4c13d0039ea3740bb53293df0bdaf",
+      "scripts/stop-elasticsearch.sh": "7f14b6125fff6ac1d11bd05df700a26d50aa4126a82b10f8f68acb9aae55760c",
+      "scripts/build-driver.sh": "06b4afbd0fd3e16a879e53fdc3fc498837c3f9f7615393c416f9ae430aa2ed89",
+      "scripts/run-cache-first-multisegment.sh": "d4a15c41d2f6e023c1846deed0ede4fd882dc07923617db12f23ba11821d3690",
+      "scripts/run-benchmark-game.sh": "81a4dc767c425a5a29054ab6c99f3f5f0dce9200e31055f817edb9ca9eb1e3d4",
+      "scripts/engine-common.sh": "5e3306f6ff638da500cffadb1c57640517b4aa64f9194a90ce1e108e4596eb44",
+      "scripts/prepare-corpus.sh": "f313d4fb035594fbbd7d72b7d2eda6e90f315ffb68046091fb17b6fb09a664a0",
+      "scripts/update-luceneutil-queries.sh": "5e7f53abfad1b633f9a4172df8ecedbd27678cba88ae3f9595c9d3387269c0a3",
+      "scripts/start-elasticsearch.sh": "cb18530235ac3dfff0eb72be31eb61087fb87c9d204f3ea00fd525420f97d1b0",
+      "scripts/grid.sh": "901fb1cdb5bcd4fc3311beb2940117d376117650ce2724be8754771daa91effc",
+      "queries/luceneutil/queries.txt": "2218c7bc6491e6c1da865409a2932eb471f404a4e3f8d94bd097ada8543e2bae",
+      "queries/luceneutil/queries-all.txt": "f479ff68c52fa928373f7ae7f2e7ce2395c73796521f4bfe5fc5490317935643",
+      "queries/luceneutil/source.json": "12df3919ac421db6cd499fdb03e5ef4959001cfb9947996fe59649a624f9c44e",
+      "queries/luceneutil/selection.json": "ae66d2e5601ab957cf343d12871dde94155f6db18344eb993f38f0ed58224952",
+      "queries/luceneutil/README.md": "721ce710843f801874d94579e23431e4bf14902d8d8c69c75bc2123f0d763fad"
+    }
+  }
+}

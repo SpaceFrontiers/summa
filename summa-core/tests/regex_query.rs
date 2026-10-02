@@ -171,6 +171,8 @@ async fn benchmark_regex_language_has_exact_case_sensitive_constant_score_result
         (".*(tion|sion)", &[16, 17]),
         (".*0th", &[18]),
         (".", &[19, 20]),
+        ("(é|🦀|é)", &[19, 20]),
+        ("(www|http|https|http)", &[5, 6, 7]),
         ("COLOUR", &[22]),
         (r"a\.b", &[23]),
         ("", &[]),
@@ -327,6 +329,7 @@ async fn pattern_queries_reject_unindexed_nontext_and_unknown_fields() {
     for field in [stored, number, summa_core::Field(999)] {
         let queries: Vec<Box<dyn Query>> = vec![
             Box::new(RegexQuery::new(field, ".*").unwrap()),
+            Box::new(RegexQuery::new(field, "foo").unwrap()),
             Box::new(WildcardQuery::new(field, "*").unwrap()),
         ];
         for query in queries {

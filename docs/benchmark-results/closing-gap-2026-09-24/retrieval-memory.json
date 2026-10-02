@@ -1,0 +1,585 @@
+{
+  "snapshots": [
+    {
+      "phase": "a1",
+      "variant": "before",
+      "mapping_kib": {
+        "executable": {
+          "Size": 298864,
+          "Rss": 11796,
+          "Pss": 11796,
+          "Private_Clean": 10868,
+          "Private_Dirty": 928,
+          "Anonymous": 928,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "anonymous": {
+          "Size": 4413484,
+          "Rss": 252804,
+          "Pss": 252804,
+          "Private_Clean": 0,
+          "Private_Dirty": 252804,
+          "Anonymous": 252804,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".chunks": {
+          "Size": 371096,
+          "Rss": 19712,
+          "Pss": 19712,
+          "Private_Clean": 19712,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".fast": {
+          "Size": 1081936,
+          "Rss": 1081936,
+          "Pss": 1081936,
+          "Private_Clean": 1081936,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".store": {
+          "Size": 4351248,
+          "Rss": 11280,
+          "Pss": 11280,
+          "Private_Clean": 11280,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".post": {
+          "Size": 8496464,
+          "Rss": 1838592,
+          "Pss": 1838592,
+          "Private_Clean": 1838592,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".pos": {
+          "Size": 3452712,
+          "Rss": 450816,
+          "Pss": 450816,
+          "Private_Clean": 450816,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".terms": {
+          "Size": 491792,
+          "Rss": 225872,
+          "Pss": 225872,
+          "Private_Clean": 225872,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".rowstats": {
+          "Size": 10332,
+          "Rss": 10332,
+          "Pss": 10332,
+          "Private_Clean": 10332,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "shared libraries": {
+          "Size": 3420,
+          "Rss": 2424,
+          "Pss": 176,
+          "Private_Clean": 0,
+          "Private_Dirty": 56,
+          "Anonymous": 56,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "kernel mappings": {
+          "Size": 36,
+          "Rss": 8,
+          "Pss": 0,
+          "Private_Clean": 0,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        }
+      }
+    },
+    {
+      "phase": "b1",
+      "variant": "after",
+      "mapping_kib": {
+        "executable": {
+          "Size": 298880,
+          "Rss": 15100,
+          "Pss": 15100,
+          "Private_Clean": 14168,
+          "Private_Dirty": 932,
+          "Anonymous": 932,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "anonymous": {
+          "Size": 4413480,
+          "Rss": 249644,
+          "Pss": 249644,
+          "Private_Clean": 0,
+          "Private_Dirty": 249644,
+          "Anonymous": 249644,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".chunks": {
+          "Size": 371096,
+          "Rss": 19712,
+          "Pss": 19712,
+          "Private_Clean": 19712,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".fast": {
+          "Size": 1081936,
+          "Rss": 1081936,
+          "Pss": 1081936,
+          "Private_Clean": 1081936,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".store": {
+          "Size": 4351248,
+          "Rss": 11280,
+          "Pss": 11280,
+          "Private_Clean": 11280,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".post": {
+          "Size": 8496464,
+          "Rss": 1838592,
+          "Pss": 1838592,
+          "Private_Clean": 1838592,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".pos": {
+          "Size": 3452712,
+          "Rss": 450816,
+          "Pss": 450816,
+          "Private_Clean": 450816,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".terms": {
+          "Size": 491792,
+          "Rss": 215632,
+          "Pss": 215632,
+          "Private_Clean": 215632,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".rowstats": {
+          "Size": 10332,
+          "Rss": 10332,
+          "Pss": 10332,
+          "Private_Clean": 10332,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "shared libraries": {
+          "Size": 3420,
+          "Rss": 2496,
+          "Pss": 190,
+          "Private_Clean": 0,
+          "Private_Dirty": 56,
+          "Anonymous": 56,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "kernel mappings": {
+          "Size": 36,
+          "Rss": 8,
+          "Pss": 0,
+          "Private_Clean": 0,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        }
+      }
+    },
+    {
+      "phase": "l1",
+      "variant": "luxir",
+      "mapping_kib": {
+        "executable": {
+          "Size": 80444,
+          "Rss": 18612,
+          "Pss": 18612,
+          "Private_Clean": 18524,
+          "Private_Dirty": 88,
+          "Anonymous": 88,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "anonymous": {
+          "Size": 5899008,
+          "Rss": 57936,
+          "Pss": 57936,
+          "Private_Clean": 0,
+          "Private_Dirty": 57936,
+          "Anonymous": 57936,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "other files": {
+          "Size": 9367752,
+          "Rss": 1114804,
+          "Pss": 1114804,
+          "Private_Clean": 1114804,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "shared libraries": {
+          "Size": 3236,
+          "Rss": 2548,
+          "Pss": 145,
+          "Private_Clean": 0,
+          "Private_Dirty": 48,
+          "Anonymous": 48,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "kernel mappings": {
+          "Size": 36,
+          "Rss": 8,
+          "Pss": 0,
+          "Private_Clean": 0,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        }
+      }
+    },
+    {
+      "phase": "b2",
+      "variant": "after",
+      "mapping_kib": {
+        "executable": {
+          "Size": 298880,
+          "Rss": 15036,
+          "Pss": 15036,
+          "Private_Clean": 14104,
+          "Private_Dirty": 932,
+          "Anonymous": 932,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "anonymous": {
+          "Size": 4413480,
+          "Rss": 247380,
+          "Pss": 247380,
+          "Private_Clean": 0,
+          "Private_Dirty": 247380,
+          "Anonymous": 247380,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".chunks": {
+          "Size": 371096,
+          "Rss": 19712,
+          "Pss": 19712,
+          "Private_Clean": 19712,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".fast": {
+          "Size": 1081936,
+          "Rss": 1081936,
+          "Pss": 1081936,
+          "Private_Clean": 1081936,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".store": {
+          "Size": 4351248,
+          "Rss": 11280,
+          "Pss": 11280,
+          "Private_Clean": 11280,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".post": {
+          "Size": 8496464,
+          "Rss": 1838592,
+          "Pss": 1838592,
+          "Private_Clean": 1838592,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".pos": {
+          "Size": 3452712,
+          "Rss": 450816,
+          "Pss": 450816,
+          "Private_Clean": 450816,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".terms": {
+          "Size": 491792,
+          "Rss": 215632,
+          "Pss": 215632,
+          "Private_Clean": 215632,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".rowstats": {
+          "Size": 10332,
+          "Rss": 10332,
+          "Pss": 10332,
+          "Private_Clean": 10332,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "shared libraries": {
+          "Size": 3420,
+          "Rss": 2404,
+          "Pss": 184,
+          "Private_Clean": 0,
+          "Private_Dirty": 56,
+          "Anonymous": 56,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "kernel mappings": {
+          "Size": 36,
+          "Rss": 8,
+          "Pss": 0,
+          "Private_Clean": 0,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        }
+      }
+    },
+    {
+      "phase": "a2",
+      "variant": "before",
+      "mapping_kib": {
+        "executable": {
+          "Size": 298864,
+          "Rss": 12140,
+          "Pss": 12140,
+          "Private_Clean": 11212,
+          "Private_Dirty": 928,
+          "Anonymous": 928,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "anonymous": {
+          "Size": 4413484,
+          "Rss": 248100,
+          "Pss": 248100,
+          "Private_Clean": 0,
+          "Private_Dirty": 248100,
+          "Anonymous": 248100,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".chunks": {
+          "Size": 371096,
+          "Rss": 19712,
+          "Pss": 19712,
+          "Private_Clean": 19712,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".fast": {
+          "Size": 1081936,
+          "Rss": 1081936,
+          "Pss": 1081936,
+          "Private_Clean": 1081936,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".store": {
+          "Size": 4351248,
+          "Rss": 11280,
+          "Pss": 11280,
+          "Private_Clean": 11280,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".post": {
+          "Size": 8496464,
+          "Rss": 1838592,
+          "Pss": 1838592,
+          "Private_Clean": 1838592,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".pos": {
+          "Size": 3452712,
+          "Rss": 450816,
+          "Pss": 450816,
+          "Private_Clean": 450816,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".terms": {
+          "Size": 491792,
+          "Rss": 225872,
+          "Pss": 225872,
+          "Private_Clean": 225872,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        ".rowstats": {
+          "Size": 10332,
+          "Rss": 10332,
+          "Pss": 10332,
+          "Private_Clean": 10332,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "shared libraries": {
+          "Size": 3420,
+          "Rss": 2480,
+          "Pss": 195,
+          "Private_Clean": 0,
+          "Private_Dirty": 56,
+          "Anonymous": 56,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "kernel mappings": {
+          "Size": 36,
+          "Rss": 8,
+          "Pss": 0,
+          "Private_Clean": 0,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        }
+      }
+    },
+    {
+      "phase": "l2",
+      "variant": "luxir",
+      "mapping_kib": {
+        "executable": {
+          "Size": 80444,
+          "Rss": 21272,
+          "Pss": 21272,
+          "Private_Clean": 21184,
+          "Private_Dirty": 88,
+          "Anonymous": 88,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "anonymous": {
+          "Size": 5833472,
+          "Rss": 58160,
+          "Pss": 58160,
+          "Private_Clean": 0,
+          "Private_Dirty": 58160,
+          "Anonymous": 58160,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "other files": {
+          "Size": 9367752,
+          "Rss": 1137036,
+          "Pss": 1137036,
+          "Private_Clean": 1137036,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "shared libraries": {
+          "Size": 3236,
+          "Rss": 2556,
+          "Pss": 155,
+          "Private_Clean": 0,
+          "Private_Dirty": 48,
+          "Anonymous": 48,
+          "Swap": 0,
+          "Locked": 0
+        },
+        "kernel mappings": {
+          "Size": 36,
+          "Rss": 8,
+          "Pss": 0,
+          "Private_Clean": 0,
+          "Private_Dirty": 0,
+          "Anonymous": 0,
+          "Swap": 0,
+          "Locked": 0
+        }
+      }
+    }
+  ],
+  "limitations": [
+    "End-of-phase mapping residency, not peak or per-request allocation",
+    "Anonymous memory and canonical metadata accounting have different scope",
+    "PSS depends on shared pages; no PSS capacity comparison"
+  ]
+}

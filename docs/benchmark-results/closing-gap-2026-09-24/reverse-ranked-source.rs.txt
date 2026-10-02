@@ -1,0 +1,72 @@
+//! Private format-feasibility probe; not a production index writer.
+use fst::{IntoStreamer, Streamer};
+use hermes_core::directories::{Directory, MmapDirectory};
+use hermes_core::structures::{AsyncSSTableReader, SSTableValue, TermInfo};
+use std::{io::{BufWriter, Write}, path::Path, time::Instant};
+
+fn digest(values:&[TermInfo])->(usize,u64,u64) {
+    let mut bytes=vec![];
+    for v in values {v.serialize(&mut bytes).unwrap()}
+    // Stable checksum for diagnostics, not a file-integrity mechanism.
+    (values.len(),values.iter().map(|v|v.doc_freq() as u64).sum(),bytes.iter().fold(0xcbf29ce484222325u64,|a,&b|(a^b as u64).wrapping_mul(0x100000001b3)))
+}
+#[tokio::main(flavor="current_thread")]
+async fn main()->Result<(),Box<dyn std::error::Error>> {
+    let args:Vec<_>=std::env::args().collect();let index=Path::new(&args[1]);let out=Path::new(&args[2]);std::fs::create_dir_all(out)?;
+    let directory=MmapDirectory::new(index);
+    let name=std::fs::read_dir(index)?.map(|p|p.unwrap().path()).find(|p|p.extension().is_some_and(|s|s=="terms")).unwrap();
+    let reader=AsyncSSTableReader::<TermInfo>::open_with_cache_budget(directory.open_read(Path::new(name.file_name().unwrap())).await?,1024,Some(16*1024*1024)).await?;
+    let original_path=Path::new(&args[3]);
+    let fst_path=out.join("reverse.fst");
+    if !fst_path.exists() {
+        let start=Instant::now();
+        let file=std::fs::File::open(original_path)?;
+        let original=fst::Map::new(unsafe { memmap2::Mmap::map(&file)? })?;
+        let mut builder=fst::MapBuilder::new(BufWriter::new(std::fs::File::create(&fst_path)?))?;
+        let mut stream=original.stream(); let mut count=0u64;
+        while let Some((key,_))=stream.next() {builder.insert(key,count)?;count+=1;}
+        let mut file=builder.into_inner()?;file.flush()?;drop(file);
+        println!("{}",serde_json::json!({"ranked_terms":count,"build_ms":start.elapsed().as_secs_f64()*1000.0,"fst_bytes":std::fs::metadata(&fst_path)?.len()}));
+    }
+    let fst_file=std::fs::File::open(&fst_path)?;let mmap=unsafe{memmap2::Mmap::map(&fst_file)?};let map=fst::Map::new(mmap)?;
+    for query in ["h*band", "a*nder", "e*tive", "n*arly", "c*mics", "m*sion", "j*tice", "i*ally", "p*ture", "a*ties", "a*rded", "m*utes", "f*iend", "a*mbly", "c*date", "g*lden", "v*oria", "p*ssor", "r*ally", "b*eved", "f*rced", "r*ican", "v*tory", "m*ster", "r*rove", "m*sing", "u*nown", "c*imed", "e*cept", "q*tion", "d*ctly", "p*ical", "c*lina", "q*lity", "c*idge", "e*ence", "a*ress", "h*olds", "a*ysis", "b*ming", "g*itar", "f*nder"] {
+        let (prefix,suffix)=query.split_once('*').unwrap();let mut keyprefix=0_u32.to_le_bytes().to_vec();keyprefix.extend_from_slice(prefix.as_bytes());
+        let reversed_suffix: Vec<u8> = suffix.as_bytes().iter().rev().copied().collect();
+        let scan=||reader.prototype_pattern_values(&keyprefix,|key|key.len()>=keyprefix.len()+suffix.len() && key.ends_with(suffix.as_bytes()) && std::str::from_utf8(&key[4..]).is_ok()).unwrap();
+        let matched=|cap:bool| {
+            let mut upper=reversed_suffix.clone();
+            let has_upper=if let Some(i)=upper.iter().rposition(|&b|b!=255){upper[i]+=1;upper.truncate(i+1);true}else{false};
+            let range=map.range().ge(&reversed_suffix);
+            let range=if has_upper {range.lt(&upper)} else {range};
+            let lower=map.range().ge(&reversed_suffix).into_stream().next().map(|(_,rank)|rank).unwrap_or(map.len() as u64);
+            let end=if has_upper {map.range().ge(&upper).into_stream().next().map(|(_,rank)|rank).unwrap_or(map.len() as u64)} else {map.len() as u64};
+            let suffix_count=(end-lower) as usize;
+            if cap && suffix_count>reader.prototype_prefix_blocks(&keyprefix).saturating_mul(128) {return (scan(),0,true)}
+            let mut stream=range.into_stream(); let mut keys=vec![];
+            let reverse_prefix:Vec<_>=prefix.as_bytes().iter().rev().copied().collect();
+            let mut candidates=0usize;
+            while let Some((reversed,_))=stream.next() {
+                candidates+=1;
+                if reversed.len()<prefix.len()+suffix.len() || !reversed.ends_with(&reverse_prefix) {continue}
+                let mut key=0_u32.to_le_bytes().to_vec();key.extend(reversed.iter().rev());
+                keys.push(key);
+            }
+            keys.sort_unstable();
+            let refs:Vec<_>=keys.iter().map(Vec::as_slice).collect();
+            let values=futures::executor::block_on(reader.get_batch(&refs)).unwrap().into_iter().map(Option::unwrap).collect();
+            (values,candidates,false)
+        };
+        let expected=scan();let (actual,candidates,_) = matched(false); assert_eq!(actual,expected,"{query}"); let (adaptive,visited,fallback)=matched(true); assert_eq!(adaptive,expected,"{query}");
+        let mut rows=vec![];
+        for label in ["scan1","batch1","adaptive1","adaptive2","batch2","scan2"] {
+            let mut samples=vec![];
+            for i in 0..40 {
+                let start=Instant::now();let values=if label.starts_with("scan"){scan()}else{matched(label.starts_with("adaptive")).0};let elapsed=start.elapsed().as_nanos() as u64;
+                assert_eq!(digest(&values),digest(&expected));if i>=5 {samples.push(elapsed)}
+            }
+            rows.push(serde_json::json!({"label":label,"samples_ns":samples}));
+        }
+        println!("{}",serde_json::json!({"query":query,"terms":expected.len(),"reverse_candidates":candidates,"adaptive_visited":visited,"adaptive_fallback":fallback,"forward_blocks":reader.prototype_prefix_blocks(&keyprefix),"doc_freq_sum":digest(&expected).1,"timings":rows}));
+    }
+    Ok(())
+}

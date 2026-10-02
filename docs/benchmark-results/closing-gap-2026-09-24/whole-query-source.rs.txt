@@ -1,0 +1,75 @@
+//! Private end-to-end executor experiment; uses the current Summa source snapshot.
+use summa_core::directories::MmapDirectory;
+use summa_core::index::{Index,IndexConfig};
+use summa_core::query::{CountCollector,TopKCollector,collect_segment,Query};
+use summa_core::structures::{prototype_initialize,prototype_mode};
+use std::time::Instant;
+type E=Box<dyn std::error::Error>;
+fn hits_value(hits: &[summa_core::query::SearchResult])->serde_json::Value {
+ serde_json::Value::Array(hits.iter().map(|h|serde_json::json!({"doc_id":h.doc_id,"score_bits":h.score.to_bits(),"segment_id":format!("{:032x}",h.segment_id),"positions":h.positions})).collect())
+}
+async fn execute(searcher:&summa_core::index::Searcher<MmapDirectory>,query:&dyn Query,k:usize)->Result<serde_json::Value,E>{
+ if k==0 {
+   let mut count=CountCollector::new();
+   collect_segment(&searcher.segment_readers()[0],query,&mut count).await?;
+   Ok(serde_json::json!({"count":count.count()}))
+ } else {
+   let (hits,_)=searcher.search_with_offset_and_count_sync(query,k,0)?;
+   Ok(hits_value(&hits))
+ }
+}
+#[tokio::main(flavor="current_thread")]
+async fn main()->Result<(),E>{
+ let args:Vec<_>=std::env::args().collect();
+ prototype_initialize(std::path::Path::new(&args[2]));
+ let index=Index::open(MmapDirectory::new(&args[1]),IndexConfig{num_threads:1,num_indexing_threads:1,term_cache_blocks:1024,term_cache_budget_bytes:Some(16*1024*1024),..Default::default()}).await?;
+ let reader=index.reader().await?;let searcher=reader.searcher().await?;
+ assert_eq!(searcher.num_segments(),1);
+ eprintln!("docs={} segments={}",searcher.num_docs(),searcher.num_segments());
+ let queries:Vec<serde_json::Value>=serde_json::from_slice(&std::fs::read(&args[3])?)?;
+ let parser=searcher.query_parser();
+ for row in queries {
+  let text=row["query"].as_str().unwrap();let query=parser.parse_strict(text)?;
+  prototype_mode(None);
+  let mut count=CountCollector::new();let mut top=TopKCollector::new(1000);
+  collect_segment(&searcher.segment_readers()[0],query.as_ref(),&mut (&mut top,&mut count)).await?;
+  let exhaustive=top.into_sorted_results();
+  let expected_count=count.count();
+  for mode in [false,true] {
+   prototype_mode(mode.then_some(text));
+   let mut count=CountCollector::new();let mut top=TopKCollector::new(1000);
+   collect_segment(&searcher.segment_readers()[0],query.as_ref(),&mut (&mut top,&mut count)).await?;
+   assert_eq!(count.count(),expected_count,"{text}");
+   let hits=top.into_sorted_results();
+   assert_eq!(hits_value(&hits),hits_value(&exhaustive),"{text}");
+   for k in [10,100,1000] {
+    let (hits,_)=searcher.search_with_offset_and_count_sync(query.as_ref(),k,0)?;
+    assert_eq!(hits.len(),exhaustive.len().min(k));
+    for (a,b) in hits.iter().zip(&exhaustive) {assert_eq!((a.doc_id,a.score.to_bits()),(b.doc_id,b.score.to_bits()),"{text}");}
+   }
+  }
+  for k in [0,10,100] {
+   prototype_mode(None);let expected=execute(&searcher,query.as_ref(),k).await?;
+   let mut timings=vec![];
+   for label in ["scan1","reverse1","reverse2","scan2"] {
+    prototype_mode(label.starts_with("reverse").then_some(text));
+    let mut samples=vec![];
+    for i in 0..25 {
+     let start=Instant::now();
+     // Include the canonical parser; serialization/assertions stay outside timing below.
+     let parsed=parser.parse_strict(text)?;
+     let (hits,count)=if k==0 {
+      let mut count=CountCollector::new();collect_segment(&searcher.segment_readers()[0],parsed.as_ref(),&mut count).await?;(vec![],count.count())
+     }else{let (hits,count)=searcher.search_with_offset_and_count_sync(parsed.as_ref(),k,0)?;(hits,u64::from(count))};
+     let ns=start.elapsed().as_nanos() as u64;
+     let actual=if k==0{serde_json::json!({"count":count})}else{hits_value(&hits)};
+     assert_eq!(actual,expected,"{text} {label} k={k}");
+     if i>=5{samples.push(ns);}
+    }
+    timings.push(serde_json::json!({"label":label,"samples_ns":samples}));
+   }
+   println!("{}",serde_json::json!({"query":text,"class":row["class"],"k":k,"exact_count":expected_count,"timings":timings}));
+  }
+ }
+ Ok(())
+}

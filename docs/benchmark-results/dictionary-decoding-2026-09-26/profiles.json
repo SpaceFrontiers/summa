@@ -1,0 +1,2825 @@
+{
+  "captures": [
+    {
+      "variant": "before",
+      "samples": "222K",
+      "event": "task-clock",
+      "symbols": [
+        {
+          "self_percent": 31.23,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_decompressSequences_bmi2.constprop.0"
+        },
+        {
+          "self_percent": 19.38,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::vint::read_vint::<&[u8]>"
+        },
+        {
+          "self_percent": 8.9,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::sstable::decode_block_entry::<summa_core::structures::sstable::TermInfo>"
+        },
+        {
+          "self_percent": 4.86,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::sstable::AsyncSSTableReader<summa_core::structures::sstable::TermInfo>>::prefix_scan_values_sync::<<summa_core::segment::reader::SegmentReader>::get_matching_postings_sync<<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer_sync::{closure#0}>::{closure#0}>"
+        },
+        {
+          "self_percent": 4.18,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::Pattern>::matches"
+        },
+        {
+          "self_percent": 3.21,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_buildFSETable_body_bmi2.isra.0"
+        },
+        {
+          "self_percent": 2.28,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer::{closure#0}"
+        },
+        {
+          "self_percent": 1.5,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198680"
+        },
+        {
+          "self_percent": 1.46,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986a5"
+        },
+        {
+          "self_percent": 0.88,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198694"
+        },
+        {
+          "self_percent": 0.85,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "HUF_readDTableX1_wksp"
+        },
+        {
+          "self_percent": 0.75,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "core::slice::sort::unstable::quicksort::quicksort::<u32, <u32 as core::cmp::PartialOrd>::lt>"
+        },
+        {
+          "self_percent": 0.71,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198c40"
+        },
+        {
+          "self_percent": 0.54,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986b7"
+        },
+        {
+          "self_percent": 0.53,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "FSE_decompress_wksp_body_bmi2"
+        },
+        {
+          "self_percent": 0.51,
+          "object": "before-bin",
+          "mode": "[.]",
+          "symbol": "HUF_readStats_body_bmi2"
+        }
+      ],
+      "report_sha256": "8d2066fe40f92e30620774d4ae714f7b0d080ec30fbe9f5317391ca8284f863a"
+    },
+    {
+      "variant": "after",
+      "samples": "218K",
+      "event": "task-clock",
+      "symbols": [
+        {
+          "self_percent": 33.12,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_decompressSequences_bmi2.constprop.0"
+        },
+        {
+          "self_percent": 23.32,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "summa_core::structures::sstable::decode_block_entry::<summa_core::structures::sstable::TermInfo>"
+        },
+        {
+          "self_percent": 5.35,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::sstable::AsyncSSTableReader<summa_core::structures::sstable::TermInfo>>::prefix_scan_values_sync::<<summa_core::segment::reader::SegmentReader>::get_matching_postings_sync<<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer_sync::{closure#0}>::{closure#0}>"
+        },
+        {
+          "self_percent": 4.28,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::Pattern>::matches"
+        },
+        {
+          "self_percent": 3.41,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "ZSTD_buildFSETable_body_bmi2.isra.0"
+        },
+        {
+          "self_percent": 2.5,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::query::term_pattern::TermPatternQuery as summa_core::query::traits::Query>::scorer::{closure#0}"
+        },
+        {
+          "self_percent": 1.72,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198680"
+        },
+        {
+          "self_percent": 1.49,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986a5"
+        },
+        {
+          "self_percent": 0.91,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198694"
+        },
+        {
+          "self_percent": 0.9,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "HUF_readDTableX1_wksp"
+        },
+        {
+          "self_percent": 0.8,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "core::slice::sort::unstable::quicksort::quicksort::<u32, <u32 as core::cmp::PartialOrd>::lt>"
+        },
+        {
+          "self_percent": 0.58,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "FSE_decompress_wksp_body_bmi2"
+        },
+        {
+          "self_percent": 0.56,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x00000000001986b7"
+        },
+        {
+          "self_percent": 0.54,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "<summa_core::structures::sstable::BlockCache>::insert"
+        },
+        {
+          "self_percent": 0.54,
+          "object": "libc.so.6",
+          "mode": "[.]",
+          "symbol": "0x0000000000198c40"
+        },
+        {
+          "self_percent": 0.54,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "HUF_readStats_body_bmi2"
+        },
+        {
+          "self_percent": 0.51,
+          "object": "after-bin",
+          "mode": "[.]",
+          "symbol": "0x00000000120e45f9"
+        }
+      ],
+      "report_sha256": "3520949bc115a149ceb93ee2a02f555ad12a42fee9e28f5667704c7e59cb3b8a"
+    }
+  ],
+  "diagnostics": {
+    "a1": [
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.3295,
+          "project": 0.9835,
+          "response_drop": 0.03,
+          "search": 12.766,
+          "serialize": 0.354
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.962,
+          "project": 9.468,
+          "response_drop": 0.048,
+          "search": 16.8055,
+          "serialize": 2.1005
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 10.784,
+          "project": 1.0045,
+          "response_drop": 0.03,
+          "search": 19.1505,
+          "serialize": 0.3525
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 11.217,
+          "project": 11.397,
+          "response_drop": 0.049,
+          "search": 24.7345,
+          "serialize": 2.2485
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 3.622,
+          "project": 0.9625,
+          "response_drop": 0.03,
+          "search": 11.4335,
+          "serialize": 0.3295
+        },
+        "query": "colou?r",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 3.5875,
+          "project": 10.4705,
+          "response_drop": 0.048,
+          "search": 15.9405,
+          "serialize": 2.157
+        },
+        "query": "colou?r",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 121.7215,
+          "project": 6.6725,
+          "response_drop": 0.068,
+          "search": 107101.276,
+          "serialize": 2.152
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 121.667,
+          "project": 38.261,
+          "response_drop": 0.1005,
+          "search": 106798.7975,
+          "serialize": 5.918
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.9065,
+          "project": 5.2625,
+          "response_drop": 0.052,
+          "search": 42510.393,
+          "serialize": 2.0405
+        },
+        "query": "h*band",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.7235,
+          "project": 29.325,
+          "response_drop": 0.0925,
+          "search": 42554.7005,
+          "serialize": 5.8745
+        },
+        "query": "h*band",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.6455,
+          "project": 5.5695,
+          "response_drop": 0.048,
+          "search": 63379.6415,
+          "serialize": 2.2105
+        },
+        "query": "a*nder",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.4065,
+          "project": 30.2605,
+          "response_drop": 0.0995,
+          "search": 63028.576,
+          "serialize": 5.906
+        },
+        "query": "a*nder",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.748,
+          "project": 5.561,
+          "response_drop": 0.0565,
+          "search": 47299.068,
+          "serialize": 2.229
+        },
+        "query": "e*tive",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.7465,
+          "project": 28.629,
+          "response_drop": 0.093,
+          "search": 47465.523,
+          "serialize": 5.723
+        },
+        "query": "e*tive",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 30.927,
+          "project": 15.5295,
+          "response_drop": 0.032,
+          "search": 3772.122,
+          "serialize": 2.0955
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 31.6915,
+          "project": 95.141,
+          "response_drop": 0.079,
+          "search": 4839.711,
+          "serialize": 6.5625
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 32.2005,
+          "project": 15.0845,
+          "response_drop": 0.035,
+          "search": 4865.318,
+          "serialize": 2.422
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 32.406,
+          "project": 91.934,
+          "response_drop": 0.0875,
+          "search": 5670.0475,
+          "serialize": 6.393
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 34.427,
+          "project": 16.8885,
+          "response_drop": 0.035,
+          "search": 7405.312,
+          "serialize": 2.3025
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 34.1335,
+          "project": 98.397,
+          "response_drop": 0.0945,
+          "search": 8153.908,
+          "serialize": 6.6785
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 12.306,
+          "project": 3.5845,
+          "response_drop": 0.0295,
+          "search": 615.2555,
+          "serialize": 0.7615
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.376,
+          "project": 28.776,
+          "response_drop": 0.056,
+          "search": 1005.175,
+          "serialize": 2.978
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.3055,
+          "project": 1.645,
+          "response_drop": 0.03,
+          "search": 255.863,
+          "serialize": 0.4075
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.501,
+          "project": 18.5515,
+          "response_drop": 0.056,
+          "search": 409.095,
+          "serialize": 2.623
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.146,
+          "project": 1.805,
+          "response_drop": 0.027,
+          "search": 460.6215,
+          "serialize": 0.499
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 12.7655,
+          "project": 28.4635,
+          "response_drop": 0.073,
+          "search": 866.8245,
+          "serialize": 3.0
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.1355,
+          "project": 1.4195,
+          "response_drop": 0.027,
+          "search": 34.683,
+          "serialize": 0.338
+        },
+        "query": "husband",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.128,
+          "project": 24.735,
+          "response_drop": 0.054,
+          "search": 152.4735,
+          "serialize": 2.7385
+        },
+        "query": "husband",
+        "response_bytes": 1703,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.947,
+          "project": 1.483,
+          "response_drop": 0.03,
+          "search": 38.463,
+          "serialize": 0.325
+        },
+        "query": "file",
+        "response_bytes": 176,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.2475,
+          "project": 27.678,
+          "response_drop": 0.073,
+          "search": 213.3535,
+          "serialize": 2.816
+        },
+        "query": "file",
+        "response_bytes": 1691,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.377,
+          "project": 1.597,
+          "response_drop": 0.03,
+          "search": 36.797,
+          "serialize": 0.3155
+        },
+        "query": "alexander",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.5755,
+          "project": 28.522,
+          "response_drop": 0.073,
+          "search": 205.094,
+          "serialize": 2.8005
+        },
+        "query": "alexander",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.317,
+          "project": 0.987,
+          "response_drop": 0.03,
+          "search": 62.3735,
+          "serialize": 0.326
+        },
+        "query": "wou*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.357,
+          "project": 9.365,
+          "response_drop": 0.042,
+          "search": 68.019,
+          "serialize": 2.1505
+        },
+        "query": "wou*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.304,
+          "project": 0.9845,
+          "response_drop": 0.03,
+          "search": 115.301,
+          "serialize": 0.34
+        },
+        "query": "bef*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.3875,
+          "project": 9.794,
+          "response_drop": 0.045,
+          "search": 121.151,
+          "serialize": 2.161
+        },
+        "query": "bef*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ],
+    "b1": [
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.9225,
+          "project": 0.951,
+          "response_drop": 0.029,
+          "search": 11.974,
+          "serialize": 0.383
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.834,
+          "project": 9.509,
+          "response_drop": 0.042,
+          "search": 16.6805,
+          "serialize": 2.1385
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 10.4545,
+          "project": 0.985,
+          "response_drop": 0.029,
+          "search": 18.5195,
+          "serialize": 0.3755
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.671,
+          "project": 11.392,
+          "response_drop": 0.042,
+          "search": 23.8905,
+          "serialize": 2.179
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 3.457,
+          "project": 0.958,
+          "response_drop": 0.03,
+          "search": 11.266,
+          "serialize": 0.3625
+        },
+        "query": "colou?r",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 3.462,
+          "project": 10.397,
+          "response_drop": 0.041,
+          "search": 15.7655,
+          "serialize": 2.221
+        },
+        "query": "colou?r",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 123.2955,
+          "project": 7.0265,
+          "response_drop": 0.0685,
+          "search": 100789.972,
+          "serialize": 2.232
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 123.1535,
+          "project": 39.807,
+          "response_drop": 0.11,
+          "search": 101356.5935,
+          "serialize": 6.575
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.452,
+          "project": 5.744,
+          "response_drop": 0.0695,
+          "search": 39797.963,
+          "serialize": 2.246
+        },
+        "query": "h*band",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.244,
+          "project": 31.7215,
+          "response_drop": 0.089,
+          "search": 40116.978,
+          "serialize": 6.354
+        },
+        "query": "h*band",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.651,
+          "project": 5.851,
+          "response_drop": 0.0675,
+          "search": 58630.7565,
+          "serialize": 2.3315
+        },
+        "query": "a*nder",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.4585,
+          "project": 29.8135,
+          "response_drop": 0.096,
+          "search": 58066.6555,
+          "serialize": 6.2865
+        },
+        "query": "a*nder",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.681,
+          "project": 5.278,
+          "response_drop": 0.046,
+          "search": 43584.596,
+          "serialize": 2.1385
+        },
+        "query": "e*tive",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.2685,
+          "project": 29.4305,
+          "response_drop": 0.095,
+          "search": 44324.9435,
+          "serialize": 6.1345
+        },
+        "query": "e*tive",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 33.2795,
+          "project": 16.8765,
+          "response_drop": 0.096,
+          "search": 3809.09,
+          "serialize": 2.3985
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 34.136,
+          "project": 95.8985,
+          "response_drop": 0.094,
+          "search": 4863.375,
+          "serialize": 7.1525
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 33.732,
+          "project": 14.4065,
+          "response_drop": 0.049,
+          "search": 4864.866,
+          "serialize": 2.3355
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 34.467,
+          "project": 90.0445,
+          "response_drop": 0.098,
+          "search": 5672.6025,
+          "serialize": 7.096
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 35.0585,
+          "project": 16.1555,
+          "response_drop": 0.044,
+          "search": 7368.094,
+          "serialize": 2.4165
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 34.728,
+          "project": 96.5525,
+          "response_drop": 0.0915,
+          "search": 8141.199,
+          "serialize": 7.0985
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 12.5625,
+          "project": 4.0155,
+          "response_drop": 0.0325,
+          "search": 614.0925,
+          "serialize": 0.813
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 14.543,
+          "project": 30.0655,
+          "response_drop": 0.061,
+          "search": 1004.554,
+          "serialize": 3.1795
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.832,
+          "project": 1.702,
+          "response_drop": 0.035,
+          "search": 258.0285,
+          "serialize": 0.5435
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 11.108,
+          "project": 19.418,
+          "response_drop": 0.061,
+          "search": 408.7545,
+          "serialize": 2.816
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.564,
+          "project": 1.9895,
+          "response_drop": 0.035,
+          "search": 456.3735,
+          "serialize": 0.6385
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.5495,
+          "project": 29.778,
+          "response_drop": 0.058,
+          "search": 863.092,
+          "serialize": 3.1315
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.259,
+          "project": 1.3915,
+          "response_drop": 0.027,
+          "search": 34.405,
+          "serialize": 0.4035
+        },
+        "query": "husband",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.7855,
+          "project": 24.6025,
+          "response_drop": 0.065,
+          "search": 148.4295,
+          "serialize": 2.813
+        },
+        "query": "husband",
+        "response_bytes": 1703,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.9185,
+          "project": 1.507,
+          "response_drop": 0.036,
+          "search": 38.251,
+          "serialize": 0.3805
+        },
+        "query": "file",
+        "response_bytes": 176,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.886,
+          "project": 28.3625,
+          "response_drop": 0.063,
+          "search": 211.6295,
+          "serialize": 2.946
+        },
+        "query": "file",
+        "response_bytes": 1691,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.4765,
+          "project": 1.576,
+          "response_drop": 0.036,
+          "search": 36.2055,
+          "serialize": 0.393
+        },
+        "query": "alexander",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.256,
+          "project": 28.9165,
+          "response_drop": 0.065,
+          "search": 206.402,
+          "serialize": 2.9245
+        },
+        "query": "alexander",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.4745,
+          "project": 0.983,
+          "response_drop": 0.035,
+          "search": 56.202,
+          "serialize": 0.4205
+        },
+        "query": "wou*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.499,
+          "project": 9.109,
+          "response_drop": 0.051,
+          "search": 61.642,
+          "serialize": 2.2665
+        },
+        "query": "wou*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.9395,
+          "project": 1.0125,
+          "response_drop": 0.035,
+          "search": 102.5535,
+          "serialize": 0.44
+        },
+        "query": "bef*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.6705,
+          "project": 9.2265,
+          "response_drop": 0.053,
+          "search": 106.605,
+          "serialize": 2.2455
+        },
+        "query": "bef*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ],
+    "b2": [
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.592,
+          "project": 0.9805,
+          "response_drop": 0.03,
+          "search": 14.2295,
+          "serialize": 0.374
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.795,
+          "project": 9.4995,
+          "response_drop": 0.042,
+          "search": 16.576,
+          "serialize": 2.124
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 10.5785,
+          "project": 1.027,
+          "response_drop": 0.03,
+          "search": 19.3355,
+          "serialize": 0.37
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.5235,
+          "project": 11.3905,
+          "response_drop": 0.043,
+          "search": 23.9055,
+          "serialize": 2.161
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 3.385,
+          "project": 0.9765,
+          "response_drop": 0.03,
+          "search": 11.3185,
+          "serialize": 0.3365
+        },
+        "query": "colou?r",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 3.3265,
+          "project": 10.478,
+          "response_drop": 0.046,
+          "search": 15.832,
+          "serialize": 2.186
+        },
+        "query": "colou?r",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 123.2655,
+          "project": 6.9895,
+          "response_drop": 0.129,
+          "search": 101089.228,
+          "serialize": 2.1835
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 121.5895,
+          "project": 39.5205,
+          "response_drop": 0.156,
+          "search": 100783.153,
+          "serialize": 6.59
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.334,
+          "project": 5.4715,
+          "response_drop": 0.118,
+          "search": 39377.4505,
+          "serialize": 2.208
+        },
+        "query": "h*band",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.4305,
+          "project": 30.626,
+          "response_drop": 0.1565,
+          "search": 39459.616,
+          "serialize": 5.6865
+        },
+        "query": "h*band",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.835,
+          "project": 5.734,
+          "response_drop": 0.122,
+          "search": 58248.414,
+          "serialize": 2.294
+        },
+        "query": "a*nder",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.699,
+          "project": 29.542,
+          "response_drop": 0.1565,
+          "search": 58325.1555,
+          "serialize": 5.8675
+        },
+        "query": "a*nder",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.116,
+          "project": 5.2475,
+          "response_drop": 0.118,
+          "search": 43409.74,
+          "serialize": 2.2425
+        },
+        "query": "e*tive",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.475,
+          "project": 28.078,
+          "response_drop": 0.1555,
+          "search": 43371.8135,
+          "serialize": 5.932
+        },
+        "query": "e*tive",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 31.021,
+          "project": 16.188,
+          "response_drop": 0.1275,
+          "search": 3779.925,
+          "serialize": 2.129
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 31.518,
+          "project": 91.014,
+          "response_drop": 0.154,
+          "search": 4820.4625,
+          "serialize": 5.68
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 32.1175,
+          "project": 14.6485,
+          "response_drop": 0.114,
+          "search": 4862.3635,
+          "serialize": 2.383
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 31.8265,
+          "project": 87.8585,
+          "response_drop": 0.155,
+          "search": 5651.3165,
+          "serialize": 6.154
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 32.949,
+          "project": 15.408,
+          "response_drop": 0.1105,
+          "search": 7344.4555,
+          "serialize": 2.6685
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 32.5115,
+          "project": 91.877,
+          "response_drop": 0.157,
+          "search": 8050.6525,
+          "serialize": 6.5435
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 12.778,
+          "project": 4.036,
+          "response_drop": 0.04,
+          "search": 611.829,
+          "serialize": 0.751
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.837,
+          "project": 30.257,
+          "response_drop": 0.062,
+          "search": 1001.7305,
+          "serialize": 3.085
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.725,
+          "project": 1.725,
+          "response_drop": 0.035,
+          "search": 255.499,
+          "serialize": 0.5305
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 11.339,
+          "project": 19.0855,
+          "response_drop": 0.065,
+          "search": 404.4265,
+          "serialize": 2.7195
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.5765,
+          "project": 1.884,
+          "response_drop": 0.036,
+          "search": 455.3795,
+          "serialize": 0.574
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.2275,
+          "project": 29.8975,
+          "response_drop": 0.055,
+          "search": 862.912,
+          "serialize": 3.033
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.214,
+          "project": 1.3755,
+          "response_drop": 0.028,
+          "search": 34.372,
+          "serialize": 0.352
+        },
+        "query": "husband",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.325,
+          "project": 24.922,
+          "response_drop": 0.064,
+          "search": 147.69,
+          "serialize": 2.8055
+        },
+        "query": "husband",
+        "response_bytes": 1703,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.897,
+          "project": 1.4895,
+          "response_drop": 0.032,
+          "search": 38.4275,
+          "serialize": 0.3445
+        },
+        "query": "file",
+        "response_bytes": 176,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.3325,
+          "project": 28.244,
+          "response_drop": 0.063,
+          "search": 214.464,
+          "serialize": 2.912
+        },
+        "query": "file",
+        "response_bytes": 1691,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.415,
+          "project": 1.5695,
+          "response_drop": 0.0345,
+          "search": 36.0545,
+          "serialize": 0.322
+        },
+        "query": "alexander",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.8665,
+          "project": 28.9545,
+          "response_drop": 0.066,
+          "search": 214.2255,
+          "serialize": 2.8385
+        },
+        "query": "alexander",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.4645,
+          "project": 0.9915,
+          "response_drop": 0.03,
+          "search": 56.0,
+          "serialize": 0.3345
+        },
+        "query": "wou*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.5,
+          "project": 9.0985,
+          "response_drop": 0.041,
+          "search": 61.5025,
+          "serialize": 2.1675
+        },
+        "query": "wou*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.4825,
+          "project": 0.988,
+          "response_drop": 0.03,
+          "search": 100.795,
+          "serialize": 0.336
+        },
+        "query": "bef*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.482,
+          "project": 9.1285,
+          "response_drop": 0.0445,
+          "search": 106.0445,
+          "serialize": 2.1315
+        },
+        "query": "bef*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ],
+    "a2": [
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.2775,
+          "project": 1.0005,
+          "response_drop": 0.03,
+          "search": 12.7265,
+          "serialize": 0.4035
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.976,
+          "project": 9.65,
+          "response_drop": 0.052,
+          "search": 16.8055,
+          "serialize": 2.1695
+        },
+        "query": "(www|http|https)",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 10.6195,
+          "project": 0.9945,
+          "response_drop": 0.036,
+          "search": 18.9695,
+          "serialize": 0.3425
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.693,
+          "project": 11.4495,
+          "response_drop": 0.053,
+          "search": 24.48,
+          "serialize": 2.2385
+        },
+        "query": "(mon|tues|wednes|thurs|fri|satur|sun)day",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 3.3915,
+          "project": 0.974,
+          "response_drop": 0.035,
+          "search": 11.2845,
+          "serialize": 0.3235
+        },
+        "query": "colou?r",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 3.3705,
+          "project": 10.5465,
+          "response_drop": 0.052,
+          "search": 15.8825,
+          "serialize": 2.162
+        },
+        "query": "colou?r",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 123.548,
+          "project": 6.548,
+          "response_drop": 0.0725,
+          "search": 106478.1135,
+          "serialize": 2.2455
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "regex",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 121.883,
+          "project": 38.2385,
+          "response_drop": 0.105,
+          "search": 106592.995,
+          "serialize": 6.649
+        },
+        "query": "[jkqxz][a-z]*ess",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.217,
+          "project": 5.39,
+          "response_drop": 0.063,
+          "search": 42516.1285,
+          "serialize": 2.337
+        },
+        "query": "h*band",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.4235,
+          "project": 30.295,
+          "response_drop": 0.098,
+          "search": 42468.9275,
+          "serialize": 5.7885
+        },
+        "query": "h*band",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.331,
+          "project": 5.317,
+          "response_drop": 0.098,
+          "search": 62805.958,
+          "serialize": 2.4935
+        },
+        "query": "a*nder",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.3845,
+          "project": 30.252,
+          "response_drop": 0.101,
+          "search": 62643.6,
+          "serialize": 5.9025
+        },
+        "query": "a*nder",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.0755,
+          "project": 5.4365,
+          "response_drop": 0.058,
+          "search": 47001.3715,
+          "serialize": 2.238
+        },
+        "query": "e*tive",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "wildcard_scan",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 9.0815,
+          "project": 28.063,
+          "response_drop": 0.089,
+          "search": 46807.2155,
+          "serialize": 5.7085
+        },
+        "query": "e*tive",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 32.0995,
+          "project": 16.1135,
+          "response_drop": 0.047,
+          "search": 3795.872,
+          "serialize": 2.4175
+        },
+        "query": "+has +please",
+        "response_bytes": 178,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 32.8755,
+          "project": 93.4035,
+          "response_drop": 0.072,
+          "search": 4840.2085,
+          "serialize": 6.9225
+        },
+        "query": "+has +please",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 33.478,
+          "project": 14.37,
+          "response_drop": 0.044,
+          "search": 4880.83,
+          "serialize": 2.157
+        },
+        "query": "+he +battle",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 32.1845,
+          "project": 88.068,
+          "response_drop": 0.068,
+          "search": 5659.7485,
+          "serialize": 6.5925
+        },
+        "query": "+he +battle",
+        "response_bytes": 1694,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 33.6835,
+          "project": 15.605,
+          "response_drop": 0.044,
+          "search": 7392.7645,
+          "serialize": 2.4975
+        },
+        "query": "+be +century",
+        "response_bytes": 179,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "and_high_med",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 32.301,
+          "project": 93.458,
+          "response_drop": 0.1425,
+          "search": 8112.415,
+          "serialize": 6.6075
+        },
+        "query": "+be +century",
+        "response_bytes": 1681,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 12.3605,
+          "project": 3.81,
+          "response_drop": 0.037,
+          "search": 612.8835,
+          "serialize": 0.709
+        },
+        "query": "with fijian",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 13.1635,
+          "project": 28.627,
+          "response_drop": 0.06,
+          "search": 1002.9185,
+          "serialize": 3.038
+        },
+        "query": "with fijian",
+        "response_bytes": 1706,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 8.3895,
+          "project": 1.717,
+          "response_drop": 0.039,
+          "search": 257.452,
+          "serialize": 0.446
+        },
+        "query": "been p.n.e",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 10.567,
+          "project": 18.4645,
+          "response_drop": 0.061,
+          "search": 407.4185,
+          "serialize": 2.7155
+        },
+        "query": "been p.n.e",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 9.1105,
+          "project": 1.9185,
+          "response_drop": 0.039,
+          "search": 459.637,
+          "serialize": 0.5485
+        },
+        "query": "been 1565",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "or_high_low",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 12.4345,
+          "project": 28.266,
+          "response_drop": 0.058,
+          "search": 863.792,
+          "serialize": 3.1135
+        },
+        "query": "been 1565",
+        "response_bytes": 1696,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.11,
+          "project": 1.416,
+          "response_drop": 0.035,
+          "search": 34.633,
+          "serialize": 0.353
+        },
+        "query": "husband",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.2025,
+          "project": 24.72,
+          "response_drop": 0.059,
+          "search": 156.229,
+          "serialize": 3.015
+        },
+        "query": "husband",
+        "response_bytes": 1703,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.7995,
+          "project": 1.509,
+          "response_drop": 0.035,
+          "search": 38.449,
+          "serialize": 0.322
+        },
+        "query": "file",
+        "response_bytes": 176,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.192,
+          "project": 27.638,
+          "response_drop": 0.058,
+          "search": 208.103,
+          "serialize": 2.94
+        },
+        "query": "file",
+        "response_bytes": 1691,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 5.384,
+          "project": 1.598,
+          "response_drop": 0.035,
+          "search": 36.96,
+          "serialize": 0.329
+        },
+        "query": "alexander",
+        "response_bytes": 177,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "low_term",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 8.627,
+          "project": 28.2655,
+          "response_drop": 0.06,
+          "search": 205.692,
+          "serialize": 2.8345
+        },
+        "query": "alexander",
+        "response_bytes": 1687,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.2645,
+          "project": 1.0115,
+          "response_drop": 0.038,
+          "search": 62.9425,
+          "serialize": 0.338
+        },
+        "query": "wou*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.2615,
+          "project": 9.5245,
+          "response_drop": 0.052,
+          "search": 68.0475,
+          "serialize": 2.3075
+        },
+        "query": "wou*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 10,
+        "median_us": {
+          "parse": 4.3305,
+          "project": 1.032,
+          "response_drop": 0.037,
+          "search": 115.669,
+          "serialize": 0.3665
+        },
+        "query": "bef*",
+        "response_bytes": 180,
+        "returned": 10,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      },
+      {
+        "class": "prefix3",
+        "instrumented": false,
+        "limit": 100,
+        "median_us": {
+          "parse": 4.3165,
+          "project": 9.8475,
+          "response_drop": 0.053,
+          "search": 121.7105,
+          "serialize": 2.2
+        },
+        "query": "bef*",
+        "response_bytes": 1710,
+        "returned": 100,
+        "samples": 100,
+        "warmup": 20,
+        "work": null
+      }
+    ]
+  },
+  "limitations": [
+    "Flat self CPU attribution mixes warmup and TOP_10/TOP_100/COUNT operations.",
+    "Profile throughput is excluded from the paired comparison.",
+    "Native diagnostics run separately on CPU 0 and include 20 warmup plus 100 measured iterations per query/limit."
+  ]
+}

@@ -1,0 +1,530 @@
+{
+  "added_rust_files": ["scripts/experiments/io_uring/src/sparse/load.rs"],
+  "benchmark_environment": {
+    "cpu": {
+      "lscpu": [
+        {
+          "data": "x86_64",
+          "field": "Architecture:"
+        },
+        {
+          "data": "32-bit, 64-bit",
+          "field": "CPU op-mode(s):"
+        },
+        {
+          "data": "46 bits physical, 48 bits virtual",
+          "field": "Address sizes:"
+        },
+        {
+          "data": "Little Endian",
+          "field": "Byte Order:"
+        },
+        {
+          "data": "32",
+          "field": "CPU(s):"
+        },
+        {
+          "data": "0-31",
+          "field": "On-line CPU(s) list:"
+        },
+        {
+          "data": "GenuineIntel",
+          "field": "Vendor ID:"
+        },
+        {
+          "data": "Intel(R) Xeon(R) CPU @ 2.80GHz",
+          "field": "Model name:"
+        },
+        {
+          "data": "6",
+          "field": "CPU family:"
+        },
+        {
+          "data": "85",
+          "field": "Model:"
+        },
+        {
+          "data": "2",
+          "field": "Thread(s) per core:"
+        },
+        {
+          "data": "8",
+          "field": "Core(s) per socket:"
+        },
+        {
+          "data": "2",
+          "field": "Socket(s):"
+        },
+        {
+          "data": "7",
+          "field": "Stepping:"
+        },
+        {
+          "data": "5599.99",
+          "field": "BogoMIPS:"
+        },
+        {
+          "data": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512_vnni md_clear arch_capabilities",
+          "field": "Flags:"
+        },
+        {
+          "data": "KVM",
+          "field": "Hypervisor vendor:"
+        },
+        {
+          "data": "full",
+          "field": "Virtualization type:"
+        },
+        {
+          "data": "512 KiB (16 instances)",
+          "field": "L1d cache:"
+        },
+        {
+          "data": "512 KiB (16 instances)",
+          "field": "L1i cache:"
+        },
+        {
+          "data": "16 MiB (16 instances)",
+          "field": "L2 cache:"
+        },
+        {
+          "data": "66 MiB (2 instances)",
+          "field": "L3 cache:"
+        },
+        {
+          "data": "2",
+          "field": "NUMA node(s):"
+        },
+        {
+          "data": "0-7,16-23",
+          "field": "NUMA node0 CPU(s):"
+        },
+        {
+          "data": "8-15,24-31",
+          "field": "NUMA node1 CPU(s):"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Gather data sampling:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Ghostwrite:"
+        },
+        {
+          "data": "Mitigation; Aligned branch/return thunks",
+          "field": "Vulnerability Indirect target selection:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Itlb multihit:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability L1tf:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Mds:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Meltdown:"
+        },
+        {
+          "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+          "field": "Vulnerability Mmio stale data:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Old microcode:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Reg file data sampling:"
+        },
+        {
+          "data": "Mitigation; Enhanced IBRS",
+          "field": "Vulnerability Retbleed:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Spec rstack overflow:"
+        },
+        {
+          "data": "Mitigation; Speculative Store Bypass disabled via prctl",
+          "field": "Vulnerability Spec store bypass:"
+        },
+        {
+          "data": "Mitigation; usercopy/swapgs barriers and __user pointer sanitization",
+          "field": "Vulnerability Spectre v1:"
+        },
+        {
+          "data": "Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop",
+          "field": "Vulnerability Spectre v2:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Srbds:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Tsa:"
+        },
+        {
+          "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+          "field": "Vulnerability Tsx async abort:"
+        },
+        {
+          "data": "Not affected",
+          "field": "Vulnerability Vmscape:"
+        }
+      ]
+    },
+    "disk": "NAME    MODEL            SIZE TYPE MOUNTPOINTS\nloop0                   66.8M loop /snap/core24/2124\nloop1                  348.2M loop /snap/google-cloud-cli/499\nloop2                   50.3M loop /snap/snapd/27738\nsda     PersistentDisk   200G disk \n\u251c\u2500sda1                   199G part /\n\u251c\u2500sda14                    4M part \n\u251c\u2500sda15                  106M part /boot/efi\n\u2514\u2500sda16                  913M part /boot\n",
+    "uname": [
+      "Linux",
+      "hermes-benchmark-32-moroni.us-east1-b.c.keenable-479912.internal",
+      "7.0.0-1011-gcp",
+      "#11~24.04.1-Ubuntu SMP PREEMPT Tue Aug 11 20:14:48 UTC 2026",
+      "x86_64"
+    ]
+  },
+  "build_cpu": {
+    "lscpu": [
+      {
+        "data": "x86_64",
+        "field": "Architecture:"
+      },
+      {
+        "data": "32-bit, 64-bit",
+        "field": "CPU op-mode(s):"
+      },
+      {
+        "data": "46 bits physical, 48 bits virtual",
+        "field": "Address sizes:"
+      },
+      {
+        "data": "Little Endian",
+        "field": "Byte Order:"
+      },
+      {
+        "data": "8",
+        "field": "CPU(s):"
+      },
+      {
+        "data": "0-7",
+        "field": "On-line CPU(s) list:"
+      },
+      {
+        "data": "GenuineIntel",
+        "field": "Vendor ID:"
+      },
+      {
+        "data": "Intel(R) Xeon(R) CPU @ 2.80GHz",
+        "field": "Model name:"
+      },
+      {
+        "data": "6",
+        "field": "CPU family:"
+      },
+      {
+        "data": "85",
+        "field": "Model:"
+      },
+      {
+        "data": "2",
+        "field": "Thread(s) per core:"
+      },
+      {
+        "data": "4",
+        "field": "Core(s) per socket:"
+      },
+      {
+        "data": "1",
+        "field": "Socket(s):"
+      },
+      {
+        "data": "7",
+        "field": "Stepping:"
+      },
+      {
+        "data": "5599.99",
+        "field": "BogoMIPS:"
+      },
+      {
+        "data": "fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512_vnni md_clear arch_capabilities",
+        "field": "Flags:"
+      },
+      {
+        "data": "KVM",
+        "field": "Hypervisor vendor:"
+      },
+      {
+        "data": "full",
+        "field": "Virtualization type:"
+      },
+      {
+        "data": "128 KiB (4 instances)",
+        "field": "L1d cache:"
+      },
+      {
+        "data": "128 KiB (4 instances)",
+        "field": "L1i cache:"
+      },
+      {
+        "data": "4 MiB (4 instances)",
+        "field": "L2 cache:"
+      },
+      {
+        "data": "33 MiB (1 instance)",
+        "field": "L3 cache:"
+      },
+      {
+        "data": "1",
+        "field": "NUMA node(s):"
+      },
+      {
+        "data": "0-7",
+        "field": "NUMA node0 CPU(s):"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Gather data sampling:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Ghostwrite:"
+      },
+      {
+        "data": "Mitigation; Aligned branch/return thunks",
+        "field": "Vulnerability Indirect target selection:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Itlb multihit:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability L1tf:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Mds:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Meltdown:"
+      },
+      {
+        "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+        "field": "Vulnerability Mmio stale data:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Old microcode:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Reg file data sampling:"
+      },
+      {
+        "data": "Mitigation; Enhanced IBRS",
+        "field": "Vulnerability Retbleed:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Spec rstack overflow:"
+      },
+      {
+        "data": "Mitigation; Speculative Store Bypass disabled via prctl",
+        "field": "Vulnerability Spec store bypass:"
+      },
+      {
+        "data": "Mitigation; usercopy/swapgs barriers and __user pointer sanitization",
+        "field": "Vulnerability Spectre v1:"
+      },
+      {
+        "data": "Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop",
+        "field": "Vulnerability Spectre v2:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Srbds:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Tsa:"
+      },
+      {
+        "data": "Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown",
+        "field": "Vulnerability Tsx async abort:"
+      },
+      {
+        "data": "Not affected",
+        "field": "Vulnerability Vmscape:"
+      }
+    ]
+  },
+  "changed_rust_files": ["scripts/experiments/io_uring/src/sparse.rs"],
+  "cloud_states": {
+    "hermes-benchmark-32-moroni": {
+      "cpuPlatform": "Unknown CPU Platform",
+      "lastStartTimestamp": "2026-09-26T10:13:11.648-07:00",
+      "lastStopTimestamp": "2026-09-26T10:33:54.336-07:00",
+      "machineType": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b/machineTypes/n2-highmem-32",
+      "name": "hermes-benchmark-32-moroni",
+      "status": "TERMINATED"
+    },
+    "hermes-validation-moroni": {
+      "cpuPlatform": "Unknown CPU Platform",
+      "lastStartTimestamp": "2026-09-26T10:13:10.749-07:00",
+      "lastStopTimestamp": "2026-09-26T10:26:54.980-07:00",
+      "machineType": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b/machineTypes/n2-highmem-8",
+      "name": "hermes-validation-moroni",
+      "status": "TERMINATED"
+    }
+  },
+  "defaults_changed": false,
+  "exporter_sha256": "1415d68ea2c81e2ff6b1abd8d1e1366c10c3eb123c0210cf585fd1622c6543fc",
+  "initial_validation_failure": "All-target Clippy selected the legacy raw-pointer diagnostic unwinding test, which intentionally requires panic=abort. Guard preserved; normal binaries pass strict Clippy and the sustained scheduler passes its four specific tests.",
+  "linux_probe": {
+    "logs": {
+      "clippy.log": "2bc683fb4e4f4f21ee9ee39e2b8ecce2efe20d3b1be57bda5316aa519ab3d30a",
+      "initial-clippy.log": "82ace0258396e3e876c04b2e7999bdd79f508302c41c48231b1bbdbef6d3b9ab",
+      "release.log": "017bdc12fd4804e1ecac17aa26edcc6c34225cc33936d74a5ee93ce49a81296a",
+      "tests.log": "dfbcbbcd403c930a5f087205ae35369246e17306107cb231ff054a7c61aa477e"
+    },
+    "probe_tests": 4,
+    "test_binaries": {
+      "summa_sparse_io_probe-9d6a3d385c47f069": "2de67f66ecf27df798dcece2952b36190a63d2ebbd00dd4b39c9821fc0f456a1"
+    },
+    "verified_source_files": 533
+  },
+  "native_check": {
+    "environment": {
+      "cargo": "cargo 1.98.1 (797e8a9bc 2026-08-05)",
+      "cpu_model": "Apple M4",
+      "flags": {
+        "CARGO_BUILD_JOBS": "",
+        "CARGO_BUILD_TARGET": "",
+        "CARGO_ENCODED_RUSTFLAGS": "",
+        "CARGO_TARGET_DIR": "",
+        "CRITERION_HOME": "",
+        "RAYON_NUM_THREADS": "",
+        "RUSTFLAGS": "",
+        "SUMMA_PIN_METADATA_BUDGET_MB": "",
+        "SUMMA_PIN_MODE": ""
+      },
+      "host": "macOS-15.6.1-arm64-arm-64bit-Mach-O",
+      "logical_cpus": 10,
+      "machine": "arm64",
+      "processor": "arm",
+      "revision": "fc60c34b3241d0bbbeac19bdd1afb1b1ed337416",
+      "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8",
+      "working_diff_sha256": "89dac2010be3123653d916074ed51dfcbd2a3ec3df659bf8e007e1c62bdfc9e2"
+    },
+    "harness": "20260926T171843.602650Z-check",
+    "logs": {
+      "01-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "02-clippy.log": "2fc9b719d5248da0583a1f49f752bf61c75ba921562491e8b2cc8d4f2297befc",
+      "03-test.log": "b3bd723809762a68fc42b691fd28e8fccc49fde6e198cf1676392ec7c4a670f2",
+      "04-check.log": "64d117369e0cb76768713ec42e6a4479acd929ec55b65c59f5cbbcfd8baddcf6",
+      "05-check.log": "beed191cf5cd39a57477a6d66e9acb53f3b4efe7566a30e0ada805357a0fe6ff"
+    },
+    "mode": "check",
+    "passed": 2118,
+    "steps": [
+      {
+        "command": ["cargo", "fmt", "--all", "--", "--check"],
+        "log": "01-fmt.log",
+        "returncode": 0,
+        "seconds": 2.1097885835915804
+      },
+      {
+        "command": [
+          "cargo",
+          "clippy",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "-p",
+          "summa-broker",
+          "-p",
+          "summa-tool",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "log": "02-clippy.log",
+        "returncode": 0,
+        "seconds": 34.47613812517375
+      },
+      {
+        "command": [
+          "cargo",
+          "test",
+          "--locked",
+          "-p",
+          "summa-core",
+          "-p",
+          "summa-server",
+          "-p",
+          "summa-broker",
+          "-p",
+          "summa-tool",
+          "--features",
+          "summa-core/metrics"
+        ],
+        "log": "03-test.log",
+        "returncode": 0,
+        "seconds": 212.21497045923024
+      },
+      {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "summa-core",
+          "--no-default-features",
+          "--features",
+          "native",
+          "--all-targets"
+        ],
+        "log": "04-check.log",
+        "returncode": 0,
+        "seconds": 10.79947679117322
+      },
+      {
+        "command": [
+          "cargo",
+          "check",
+          "--locked",
+          "-p",
+          "summa-broker",
+          "--all-targets"
+        ],
+        "log": "05-check.log",
+        "returncode": 0,
+        "seconds": 0.44018387515097857
+      }
+    ],
+    "success": true
+  },
+  "production_sources_unchanged": true,
+  "raw_archives": {
+    "source-evidence/summa-sustained-io-20260926.tar.gz": "df715a954d2892b3e424132b270801aca3e001a51a0853d35816683c481708a9",
+    "summa-sustained-io-20260926.tar.gz": "6521a1cc84ae115259c99bd30529cde6175f5c99d449e93017f72ae3c3fb25ea"
+  },
+  "source_files_verified_against_workspace": 533,
+  "unrun_checks": {
+    "ARM": "Load experiment is Linux x86_64 only.",
+    "native_full": "Only standalone Linux probe code changed; production source hashes match the preceding full validation.",
+    "production_linux_io_uring": "No production changes; prior 73-test lifecycle evidence remains applicable.",
+    "wasm": "Linux-only diagnostic; portable production code unchanged."
+  }
+}

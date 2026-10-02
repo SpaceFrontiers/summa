@@ -184,7 +184,7 @@ impl ScoreCollector {
         crate::observe::search_work!(score_batches += 1);
         let (blocks, tail) = scores.as_chunks::<8>();
         for (docs, scores) in docs.chunks_exact(8).zip(blocks) {
-            let threshold = if self.heap.len() >= self.k {
+            let threshold = if self.len() >= self.k {
                 self.cached_threshold
             } else {
                 f32::NEG_INFINITY
@@ -201,7 +201,7 @@ impl ScoreCollector {
             }
         }
         for (&doc, &score) in docs[blocks.len() * 8..].iter().zip(tail) {
-            if self.heap.len() >= self.k && score < self.cached_threshold {
+            if self.len() >= self.k && score < self.cached_threshold {
                 continue;
             }
             self.insert(resolve(doc), 0.0 + score);
@@ -649,6 +649,7 @@ enum CursorVariant<'a> {
         query_weight: f32,
         skip_start: usize,
         block_data_offset: u64,
+        read_window: crate::segment::reader::SparseReadWindow,
     },
 }
 
@@ -789,7 +790,7 @@ impl CachedScoreBound {
 // ── TermCursor async/sync macros ──────────────────────────────────────────
 //
 // Parameterised on:
-//   $load_block_fn – load_block_direct | load_block_direct_sync  (sparse I/O)
+//   $load_block_fn – read_sparse_block | read_sparse_block_sync (sparse I/O)
 //   $ensure_fn     – ensure_block_loaded | ensure_block_loaded_sync
 //   $($aw)*        – .await  (present for async, absent for sync)
 
@@ -798,6 +799,14 @@ macro_rules! cursor_ensure_block {
         if $self.exhausted || $self.block_loaded {
             return Ok(!$self.exhausted);
         }
+        let sparse_block = if matches!($self.variant, CursorVariant::Sparse { .. }) {
+            // Once advancing to a new block, no lazy ordinal view of the old
+            // block is needed. Release it before refilling the encoded window.
+            $self.current_sparse_block = None;
+            $self.$load_block_fn() $($aw)* ?
+        } else {
+            None
+        };
         match &mut $self.variant {
             CursorVariant::Text {
                 list,
@@ -822,17 +831,8 @@ macro_rules! cursor_ensure_block {
                     )))
                 }
             }
-            CursorVariant::Sparse {
-                si,
-                query_weight,
-                skip_start,
-                block_data_offset,
-                ..
-            } => {
-                let block = si
-                    .$load_block_fn(*skip_start, *block_data_offset, $self.block_idx)
-                    $($aw)* ?;
-                match block {
+            CursorVariant::Sparse { query_weight, .. } => {
+                match sparse_block {
                     Some(b) => {
                         b.decode_doc_ids_into(&mut $self.doc_ids);
                         b.decode_scored_weights_into(*query_weight, &mut $self.scores);
@@ -861,28 +861,36 @@ macro_rules! cursor_ensure_block {
 }
 
 macro_rules! cursor_advance {
-    ($self:ident, $ensure_fn:ident, $($aw:tt)*) => {{
-        if $self.exhausted {
-            return Ok(u32::MAX);
+    ($cursor:expr, $ensure_fn:ident, $($aw:tt)*) => {{
+        let cursor = &mut $cursor;
+        if cursor.exhausted {
+            Ok::<_, crate::Error>(u32::MAX)
+        } else {
+            if !cursor.block_loaded {
+                cursor.$ensure_fn() $($aw)* ?;
+            }
+            if cursor.exhausted {
+                Ok(u32::MAX)
+            } else {
+                Ok(cursor.advance_pos())
+            }
         }
-        $self.$ensure_fn() $($aw)* ?;
-        if $self.exhausted {
-            return Ok(u32::MAX);
-        }
-        Ok($self.advance_pos())
     }};
 }
 
 macro_rules! cursor_seek {
-    ($self:ident, $ensure_fn:ident, $target:expr, $($aw:tt)*) => {{
-        if let Some(doc) = $self.seek_prepare($target) {
-            return Ok(doc);
+    ($cursor:expr, $ensure_fn:ident, $target:expr, $($aw:tt)*) => {{
+        let cursor = &mut $cursor;
+        let target = $target;
+        if let Some(doc) = cursor.seek_prepare(target) {
+            Ok::<_, crate::Error>(doc)
+        } else {
+            cursor.$ensure_fn() $($aw)* ?;
+            if cursor.seek_finish(target) {
+                cursor.$ensure_fn() $($aw)* ?;
+            }
+            Ok(cursor.doc())
         }
-        $self.$ensure_fn() $($aw)* ?;
-        if $self.seek_finish($target) {
-            $self.$ensure_fn() $($aw)* ?;
-        }
-        Ok($self.doc())
     }};
 }
 
@@ -987,6 +995,7 @@ impl<'a> TermCursor<'a> {
                 query_weight,
                 skip_start,
                 block_data_offset,
+                read_window: Default::default(),
             },
         }
     }
@@ -1257,6 +1266,24 @@ impl<'a> TermCursor<'a> {
             (list.block_last_doc(idx)?, self.text_block_bound(idx))
         };
         Some((first, last, bound))
+    }
+
+    /// Upper bound of this cursor's contribution to `doc`: the bound of the
+    /// only block that can hold it, or 0 when none can (a gap between blocks,
+    /// or a document the cursor has passed). Reads skip entries only.
+    fn text_bound_at(&self, doc: DocId) -> f32 {
+        if self.exhausted {
+            return 0.0;
+        }
+        let CursorVariant::Text { list, .. } = &self.variant else {
+            return self.max_score;
+        };
+        match list.seek_block(doc, self.block_idx) {
+            Some(idx) if list.block_first_doc(idx).is_some_and(|first| first <= doc) => {
+                self.text_block_bound(idx).max(0.0)
+            }
+            _ => 0.0,
+        }
     }
 
     /// Upper bound of this cursor's contribution to any id in `[from, to]`:
@@ -1610,6 +1637,14 @@ impl<'a> TermCursor<'a> {
         self.block_first_doc(self.block_idx)
     }
 
+    /// Move to the block that may hold `target` without decoding it; a
+    /// later load starts at that block's first posting.
+    fn seek_block_shallow(&mut self, target: DocId) {
+        if !self.exhausted && self.block_last_doc(self.block_idx) < target {
+            let _ = self.seek_directory(target);
+        }
+    }
+
     #[inline]
     fn advance_pos(&mut self) -> DocId {
         self.pos += 1;
@@ -1622,6 +1657,43 @@ impl<'a> TermCursor<'a> {
             }
         }
         self.doc()
+    }
+
+    /// Conservative score bounds of the current text block's documents by
+    /// term frequency 1..=16, from the block's minimum scoring length (the
+    /// same envelope as the block bound, one frequency at a time). `None`
+    /// without real-length bounds.
+    fn block_tf_bounds(&self) -> Option<[f32; 16]> {
+        let CursorVariant::Text {
+            list,
+            length_bounds: true,
+            length_floor,
+            prepared_bounds: Some(bounds),
+            ..
+        } = &self.variant
+        else {
+            return None;
+        };
+        let min_len = list.block_bounds(self.block_idx)?.1?.max(*length_floor);
+        Some(std::array::from_fn(|i| bounds.pair(i as u32 + 1, min_len)))
+    }
+
+    /// The current block when it is a bitmap block not yet decoded.
+    fn unloaded_bitmap_block(&self) -> Option<crate::structures::postings::BitmapBlock<'_>> {
+        match &self.variant {
+            CursorVariant::Text { list, .. } if !self.block_loaded && !self.exhausted => {
+                list.bitmap_block(self.block_idx)
+            }
+            _ => None,
+        }
+    }
+
+    /// Defer the frequencies of a block probed by rank without decoding IDs;
+    /// `decode_deferred_tfs` then fills `tfs` in rank order.
+    fn defer_block_tfs(&mut self, state: (usize, usize, usize)) {
+        if let CursorVariant::Text { deferred_tf, .. } = &mut self.variant {
+            *deferred_tf = Some(state);
+        }
     }
 
     /// Compute BM25 scores from deferred TF data (lazy decode for text cursors).
@@ -1666,28 +1738,64 @@ impl<'a> TermCursor<'a> {
     // Macros parameterised on sparse I/O method + optional .await to
     // stamp out both async and sync variants without duplication.
 
+    async fn read_sparse_block(&mut self) -> crate::Result<Option<crate::structures::SparseBlock>> {
+        let CursorVariant::Sparse {
+            si,
+            skip_start,
+            block_data_offset,
+            read_window,
+            ..
+        } = &mut self.variant
+        else {
+            unreachable!("sparse read requires a sparse cursor")
+        };
+        si.load_cursor_block(
+            *skip_start,
+            *block_data_offset,
+            self.block_idx,
+            self.num_blocks,
+            read_window,
+        )
+        .await
+    }
+
+    fn read_sparse_block_sync(&self) -> crate::Result<Option<crate::structures::SparseBlock>> {
+        let CursorVariant::Sparse {
+            si,
+            skip_start,
+            block_data_offset,
+            ..
+        } = &self.variant
+        else {
+            unreachable!("sparse read requires a sparse cursor")
+        };
+        si.load_block_direct_sync(*skip_start, *block_data_offset, self.block_idx)
+    }
+
     pub async fn ensure_block_loaded(&mut self) -> crate::Result<bool> {
-        cursor_ensure_block!(self, load_block_direct, .await)
+        cursor_ensure_block!(self, read_sparse_block, .await)
     }
 
     pub fn ensure_block_loaded_sync(&mut self) -> crate::Result<bool> {
-        cursor_ensure_block!(self, load_block_direct_sync,)
+        cursor_ensure_block!(self, read_sparse_block_sync,)
     }
 
-    pub async fn advance(&mut self) -> crate::Result<DocId> {
-        cursor_advance!(self, ensure_block_loaded, .await)
+    #[cfg(test)]
+    async fn advance(&mut self) -> crate::Result<DocId> {
+        cursor_advance!(*self, ensure_block_loaded, .await)
     }
 
     pub fn advance_sync(&mut self) -> crate::Result<DocId> {
-        cursor_advance!(self, ensure_block_loaded_sync,)
+        cursor_advance!(*self, ensure_block_loaded_sync,)
     }
 
-    pub async fn seek(&mut self, target: DocId) -> crate::Result<DocId> {
-        cursor_seek!(self, ensure_block_loaded, target, .await)
+    #[cfg(test)]
+    async fn seek(&mut self, target: DocId) -> crate::Result<DocId> {
+        cursor_seek!(*self, ensure_block_loaded, target, .await)
     }
 
     pub fn seek_sync(&mut self, target: DocId) -> crate::Result<DocId> {
-        cursor_seek!(self, ensure_block_loaded_sync, target,)
+        cursor_seek!(*self, ensure_block_loaded_sync, target,)
     }
 
     #[inline]
@@ -1785,10 +1893,12 @@ impl<'a> TermCursor<'a> {
 
 /// Macro to stamp out the Block-Max MaxScore loop for both async and sync paths.
 ///
-/// `$ensure`, `$advance`, `$seek` are cursor method idents (async or _sync variants).
+/// `$ensure` selects async or synchronous block loading. Cursor navigation is
+/// expanded here as well as in the cursor methods, so already-decoded
+/// postings do not construct nested advance/seek futures.
 /// `$($aw:tt)*` captures `.await` for async or nothing for sync.
 macro_rules! bms_execute_loop {
-    ($self:ident, $ensure:ident, $advance:ident, $seek:ident, $($aw:tt)*) => {{
+    ($self:ident, $ensure:ident, $($aw:tt)*) => {{
         let n = $self.cursors.len();
 
         // Load first block for each cursor (ensures doc() returns real values)
@@ -1884,7 +1994,7 @@ macro_rules! bms_execute_loop {
                     while mask != 0 {
                         let i = mask.trailing_zeros() as usize;
                         $self.cursors[i].$ensure() $($aw)* ?;
-                        $self.cursors[i].$advance() $($aw)* ?;
+                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
                         mask &= mask - 1;
                     }
                     conjunction_skipped += 1;
@@ -1947,7 +2057,7 @@ macro_rules! bms_execute_loop {
                             }
                             $self.cursors[i].$ensure() $($aw)* ?;
                         } else {
-                            $self.cursors[i].$seek(next_other) $($aw)* ?;
+                            cursor_seek!($self.cursors[i], $ensure, next_other, $($aw)*)?;
                         }
                         mask &= mask - 1;
                     }
@@ -1963,7 +2073,7 @@ macro_rules! bms_execute_loop {
                     while mask != 0 {
                         let i = mask.trailing_zeros() as usize;
                         $self.cursors[i].$ensure() $($aw)* ?;
-                        $self.cursors[i].$advance() $($aw)* ?;
+                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
                         mask &= mask - 1;
                     }
                     continue;
@@ -1982,7 +2092,7 @@ macro_rules! bms_execute_loop {
                         let ord = $self.cursors[i].ordinal_mut();
                         let sc = $self.cursors[i].score();
                         ordinal_scores.push((ord, sc));
-                        $self.cursors[i].$advance() $($aw)* ?;
+                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
                     }
                     mask &= mask - 1;
                 }
@@ -2005,7 +2115,7 @@ macro_rules! bms_execute_loop {
                     break;
                 }
 
-                let doc = $self.cursors[i].$seek(min_doc) $($aw)* ?;
+                let doc = cursor_seek!($self.cursors[i], $ensure, min_doc, $($aw)*)?;
                 if doc == min_doc {
                     $self.cursors[i].ensure_scores();
                     while $self.cursors[i].doc() == min_doc {
@@ -2013,7 +2123,7 @@ macro_rules! bms_execute_loop {
                         running_total += s;
                         let ord = $self.cursors[i].ordinal_mut();
                         ordinal_scores.push((ord, s));
-                        $self.cursors[i].$advance() $($aw)* ?;
+                        cursor_advance!($self.cursors[i], $ensure, $($aw)*)?;
                     }
                 }
             }
@@ -2382,7 +2492,7 @@ impl<'a> MaxScoreExecutor<'a> {
         let results = if self.all_text() {
             self.dispatch_sync()
         } else {
-            bms_execute_loop!(self, ensure_block_loaded, advance, seek, .await)
+            bms_execute_loop!(self, ensure_block_loaded, .await)
         };
         self.record(timer, &results);
         results
@@ -2424,7 +2534,7 @@ impl<'a> MaxScoreExecutor<'a> {
         } else if self.all_text() {
             self.execute_windowed()
         } else {
-            bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
+            bms_execute_loop!(self, ensure_block_loaded_sync,)
         }
     }
 
@@ -2469,7 +2579,7 @@ impl<'a> MaxScoreExecutor<'a> {
         if self.cursors.is_empty() {
             return Ok(Vec::new());
         }
-        bms_execute_loop!(self, ensure_block_loaded_sync, advance_sync, seek_sync,)
+        bms_execute_loop!(self, ensure_block_loaded_sync,)
     }
 
     /// A lone bounded text cursor needs no window partition or reduction.

@@ -4386,6 +4386,40 @@ pub fn batch_hamming_distances(query: &[u8], db: &[u8], byte_len: usize, out: &m
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bitmap_expansion_matches_bit_order_and_never_writes_past_its_output() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for density in [1, 3, 8, 64, 255] {
+            let bytes: Vec<u8> = (0..48)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (0..8).fold(0, |byte, bit| {
+                        byte | u8::from(((state >> (bit * 8)) & 255) < density) << bit
+                    })
+                })
+                .collect();
+            let base = u32::MAX - 400;
+            let expected: Vec<u32> = (0..bytes.len() * 8)
+                .filter(|&i| bytes[i / 8] >> (i % 8) & 1 == 1)
+                .map(|i| base + i as u32)
+                .collect();
+            let mut out = vec![0; expected.len() + BITMAP_EXPAND_SLACK];
+            assert_eq!(expand_bitmap(&bytes, base, &mut out), expected.len());
+            assert_eq!(out[..expected.len()], expected);
+            let mut portable = vec![0; expected.len() + BITMAP_EXPAND_SLACK];
+            assert_eq!(
+                expand_bitmap_lanes(&bytes, base, &mut portable),
+                expected.len()
+            );
+            assert_eq!(portable[..expected.len()], expected);
+            // Too little room: the population is still reported, nothing overflows.
+            let mut short = vec![0; expected.len() / 2];
+            assert_eq!(expand_bitmap(&bytes, base, &mut short), expected.len());
+        }
+    }
     #[test]
     fn fixed_block_seek_preserves_suffix_lower_bounds_at_unsigned_extremes() {
         for length in 0..=128 {
@@ -4455,6 +4489,66 @@ mod tests {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn posting_block_intersection_matches_merge_for_ranked_conjunction_shapes() {
+        // Shapes measured on and_high_med: a whole block of the common term
+        // against a rarer term about eight times sparser, gaps both below and
+        // above the sixteen-lane advance.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |bound: u32| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound)) as u32
+        };
+        for base in [0u32, (1 << 31) - 700, u32::MAX - 20_000] {
+            for trial in 0..200 {
+                let mut right = Vec::new();
+                let mut doc = base;
+                while right.len() < 128 {
+                    doc += 1 + next(if trial % 5 == 0 { 40 } else { 6 });
+                    right.push(doc);
+                }
+                let mut left = Vec::new();
+                let mut doc = base;
+                while left.len() < 128 {
+                    doc += 1 + next(if trial % 3 == 0 { 3 } else { 40 });
+                    left.push(if next(6) == 0 {
+                        right[next(128) as usize].max(doc)
+                    } else {
+                        doc
+                    });
+                    doc = *left.last().unwrap();
+                }
+                left.dedup();
+                let expected: Vec<u32> = left
+                    .iter()
+                    .copied()
+                    .filter(|value| right.binary_search(value).is_ok())
+                    .collect();
+                for limit in [1, 3, 128] {
+                    let (mut a, mut b) = (0, 0);
+                    let mut actual = Vec::new();
+                    let mut pairs = [(0u8, 0u8); 128];
+                    while a < left.len() && b < right.len() {
+                        let count = super::intersect_posting_blocks(
+                            &left,
+                            &mut a,
+                            &right,
+                            &mut b,
+                            &mut pairs[..limit],
+                        );
+                        for &(l, r) in &pairs[..count] {
+                            assert_eq!(left[l as usize], right[r as usize]);
+                            actual.push(left[l as usize]);
+                        }
+                    }
+                    assert_eq!(actual, expected, "base {base} trial {trial} limit {limit}");
                 }
             }
         }
@@ -5526,6 +5620,97 @@ mod tests {
 // SIMD-accelerated linear scan for sorted u32 slices (within-block seek)
 // ============================================================================
 
+/// Bit positions of every byte value, in increasing order, padded with zeros.
+static BITMAP_LANES: [[u8; 8]; 256] = {
+    let mut lanes = [[0; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let (mut bit, mut next) = (0, 0);
+        while bit < 8 {
+            if byte >> bit & 1 == 1 {
+                lanes[byte][next] = bit as u8;
+                next += 1;
+            }
+            bit += 1;
+        }
+        byte += 1;
+    }
+    lanes
+};
+
+/// Expand a bitmap posting block (bit `i` of the little-endian bytes ↔
+/// `base + i`; whole `u64` words) into document IDs and return its
+/// population. Each byte stores eight lanes and advances by its popcount, so
+/// `out` needs [`BITMAP_EXPAND_SLACK`] slots past the population. Bytes whose
+/// lanes would not fit are counted, not written, so a bitmap that disagrees
+/// with its block count cannot write past `out`.
+///
+/// 256-bit only: `vpcompressd` on 512-bit registers expands faster in
+/// isolation, but sporadic 512-bit use downclocked the surrounding decode
+/// (and the other codec's blocks) by 8–35% on Cascade Lake.
+pub(crate) fn expand_bitmap(bytes: &[u8], base: u32, out: &mut [u32]) -> usize {
+    debug_assert!(bytes.len().is_multiple_of(8));
+    #[cfg(target_arch = "x86_64")]
+    if avx2::is_available() && is_x86_feature_detected!("popcnt") {
+        // SAFETY: both required CPU features were detected at runtime.
+        return unsafe { expand_bitmap_avx2(bytes, base, out) };
+    }
+    expand_bitmap_lanes(bytes, base, out)
+}
+
+/// Output slack [`expand_bitmap`] needs past the population.
+pub(crate) const BITMAP_EXPAND_SLACK: usize = 8;
+
+/// Portable form over fixed eight-lane chunks, which vectorize on x86 and
+/// aarch64.
+fn expand_bitmap_lanes(bytes: &[u8], base: u32, out: &mut [u32]) -> usize {
+    let mut written = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if let Some(slots) = out
+            .get_mut(written..)
+            .and_then(|out| out.first_chunk_mut::<8>())
+        {
+            let at = base.wrapping_add(index as u32 * 8);
+            let lanes = &BITMAP_LANES[byte as usize];
+            for lane in 0..8 {
+                slots[lane] = at.wrapping_add(u32::from(lanes[lane]));
+            }
+        }
+        written += byte.count_ones() as usize;
+    }
+    written
+}
+
+/// Eight lanes per byte from the position table, widened in one register,
+/// with one bounds decision per 64-bit word.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn expand_bitmap_avx2(bytes: &[u8], base: u32, out: &mut [u32]) -> usize {
+    use std::arch::x86_64::*;
+    let eight = _mm256_set1_epi32(8);
+    let mut at = _mm256_set1_epi32(base as i32);
+    let mut written = 0;
+    for word in bytes.chunks_exact(8) {
+        // The last byte's lanes may start at written + 56.
+        let room = out
+            .len()
+            .checked_sub(written)
+            .is_some_and(|room| room >= 64);
+        for &byte in word {
+            if room || out.len().checked_sub(written).is_some_and(|room| room >= 8) {
+                let lanes = u64::from_le_bytes(BITMAP_LANES[byte as usize]);
+                let ids =
+                    _mm256_add_epi32(_mm256_cvtepu8_epi32(_mm_cvtsi64_si128(lanes as i64)), at);
+                // SAFETY: eight lanes from `written` are inside `out`.
+                unsafe { _mm256_storeu_si256(out.as_mut_ptr().add(written).cast(), ids) };
+            }
+            written += byte.count_ones() as usize;
+            at = _mm256_add_epi32(at, eight);
+        }
+    }
+    written
+}
+
 /// Intersect two strictly increasing decoded posting blocks. Return index pairs
 /// in document order and resume positions for the unconsumed suffixes. Each
 /// input is at most 128 IDs; no document-space scratch or allocation is needed.
@@ -5539,6 +5724,73 @@ pub(crate) fn intersect_posting_blocks(
 ) -> usize {
     assert!(left.len() <= 128 && right.len() <= 128);
     assert!(*a <= left.len() && *b <= right.len());
+    #[cfg(target_arch = "x86_64")]
+    if avx2::is_available() && is_x86_feature_detected!("popcnt") {
+        // SAFETY: both required CPU features were detected; loads are bounded.
+        let count = unsafe { intersect_posting_blocks_avx2(left, a, right, b, pairs) };
+        return count + intersect_posting_block_groups(left, a, right, b, &mut pairs[count..]);
+    }
+    intersect_posting_block_groups(left, a, right, b, pairs)
+}
+
+/// Ranked conjunctions call this with a whole block of the common term and
+/// about an eighth as many IDs of the rarer one (measured on and_high_med:
+/// 113 against 15 consumed, 2.4 matches per call). Each rarer ID is compared
+/// with the next sixteen common IDs at once, and the count of smaller ones is
+/// the exact advance, so the loop has no data-dependent branch except for
+/// gaps of sixteen or more. Stops, for the group kernel to finish, when fewer
+/// than sixteen common IDs remain.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn intersect_posting_blocks_avx2(
+    left: &[u32],
+    a: &mut usize,
+    right: &[u32],
+    b: &mut usize,
+    pairs: &mut [(u8, u8)],
+) -> usize {
+    use std::arch::x86_64::*;
+    // Signed compares order unsigned IDs once both sides flip the top bit.
+    let bias = _mm256_set1_epi32(i32::MIN);
+    let (mut left_pos, mut right_pos) = (*a, *b);
+    let mut count = 0;
+    while left_pos < left.len() && right_pos + 16 <= right.len() && count < pairs.len() {
+        let doc = left[left_pos];
+        let key = _mm256_set1_epi32((doc ^ 0x8000_0000) as i32);
+        // SAFETY: `right_pos + 16 <= right.len()`.
+        let (low, high) = unsafe {
+            (
+                _mm256_loadu_si256(right.as_ptr().add(right_pos).cast()),
+                _mm256_loadu_si256(right.as_ptr().add(right_pos + 8).cast()),
+            )
+        };
+        let below_low = _mm256_cmpgt_epi32(key, _mm256_xor_si256(low, bias));
+        let below_high = _mm256_cmpgt_epi32(key, _mm256_xor_si256(high, bias));
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(below_low)) as u32
+            | (_mm256_movemask_ps(_mm256_castsi256_ps(below_high)) as u32) << 8;
+        // Sorted IDs: the smaller ones form a prefix of the sixteen lanes.
+        let smaller = mask.count_ones() as usize;
+        right_pos += smaller;
+        if smaller == 16 {
+            continue;
+        }
+        pairs[count] = (left_pos as u8, right_pos as u8);
+        count += usize::from(right[right_pos] == doc);
+        left_pos += 1;
+    }
+    *a = left_pos;
+    *b = right_pos;
+    count
+}
+
+/// Portable kernel, and the tail of the AVX2 one.
+fn intersect_posting_block_groups(
+    left: &[u32],
+    a: &mut usize,
+    right: &[u32],
+    b: &mut usize,
+    pairs: &mut [(u8, u8)],
+) -> usize {
     let (mut left_pos, mut right_pos) = (*a, *b);
     let mut count = 0;
     while left_pos < left.len() && right_pos < right.len() && count < pairs.len() {
