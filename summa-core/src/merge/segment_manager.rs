@@ -950,6 +950,19 @@ pub struct SegmentManager<D: DirectoryWriter + 'static> {
     replacement_refresh: parking_lot::RwLock<Option<ReplacementRefresh>>,
 }
 
+/// Release scheduled-deletion protection even on panic/runtime teardown, so
+/// cleanup barriers wake and the existing orphan sweep can retry failed files.
+struct DeletionCompletionGuard {
+    tracker: Arc<SegmentTracker>,
+    segment_ids: Vec<SegmentId>,
+}
+
+impl Drop for DeletionCompletionGuard {
+    fn drop(&mut self) {
+        self.tracker.complete_deletion(&self.segment_ids);
+    }
+}
+
 struct ForceMergeActivityGuard<'a>(&'a AtomicUsize);
 
 impl Drop for ForceMergeActivityGuard<'_> {
@@ -1006,11 +1019,14 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     return;
                 };
                 let dir = Arc::clone(&dir);
-                let task_tracker = Arc::clone(&tracker);
                 let task_index_label = Arc::clone(&cleanup_index_label);
-                let cleanup_ids = segment_ids.clone();
+                let completion = DeletionCompletionGuard {
+                    tracker: Arc::clone(&tracker),
+                    segment_ids,
+                };
                 let future = async move {
-                    for &segment_id in &segment_ids {
+                    let completion = completion;
+                    for &segment_id in &completion.segment_ids {
                         log::info!(
                             "[segment_cleanup] index={} deleting deferred segment {}",
                             task_index_label,
@@ -1027,13 +1043,11 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                             );
                         }
                     }
-                    task_tracker.complete_deletion(&segment_ids);
                 };
                 if !try_spawn_lifecycle(&lifecycle_handles, &handle, future) {
                     // Spawning can fail only during runtime teardown. Release
                     // the scheduled-deletion claim so an in-process sweep can
                     // retry; crash recovery handles a process exit.
-                    tracker.complete_deletion(&cleanup_ids);
                     log::warn!(
                         "[segment_cleanup] index={} runtime rejected deferred deletion; files will be swept later",
                         cleanup_index_label
@@ -1710,9 +1724,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 .map(|replacement| replacement.source_id.clone())
                 .collect::<Vec<_>>();
             manager.retire_reorder_retries(&retired);
-            let ready_to_delete = tracker.mark_for_deletion(&retired);
+            let completion = DeletionCompletionGuard {
+                tracker: Arc::clone(&tracker),
+                segment_ids: tracker.mark_for_deletion(&retired),
+            };
             drop(st);
-            for &segment_id in &ready_to_delete {
+            for &segment_id in &completion.segment_ids {
                 if let Err(error) =
                     crate::segment::delete_segment(directory.as_ref(), segment_id).await
                 {
@@ -1723,7 +1740,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     );
                 }
             }
-            tracker.complete_deletion(&ready_to_delete);
+            drop(completion);
             refresh_replacement_topology(replacement_refresh, &index_label).await;
             Ok(())
         })
@@ -2501,9 +2518,12 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             // Keep state locked until retired sources enter the tracker. The
             // transaction itself also performs deletion, so cancellation of
             // the requesting merge cannot strand pending-deletion ownership.
-            let ready_to_delete = tracker.mark_for_deletion(&retired_ids);
+            let completion = DeletionCompletionGuard {
+                tracker: Arc::clone(&tracker),
+                segment_ids: tracker.mark_for_deletion(&retired_ids),
+            };
             drop(st);
-            for &segment_id in &ready_to_delete {
+            for &segment_id in &completion.segment_ids {
                 if let Err(error) =
                     crate::segment::delete_segment(directory.as_ref(), segment_id).await
                 {
@@ -2514,7 +2534,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     );
                 }
             }
-            tracker.complete_deletion(&ready_to_delete);
+            drop(completion);
             refresh_replacement_topology(replacement_refresh, &index_label).await;
             Ok(())
         })
@@ -2777,6 +2797,15 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
     }
 
+    /// Wait for currently scheduled filesystem deletion attempts to finish.
+    /// Call after refreshing external readers at a maintenance boundary to
+    /// reclaim eligible sources before writing another replacement. Snapshots
+    /// still held by readers are preserved; deletion failures retain the
+    /// existing warning and orphan-sweep retry behavior.
+    pub async fn wait_for_scheduled_deletions(&self) {
+        self.tracker.wait_for_scheduled_deletions().await;
+    }
+
     /// Complete the second half of shutdown after the owning `IndexWriter`
     /// has been dropped. This drains tracked merges and then waits for every
     /// remaining guard, including optimizer reorders that are intentionally
@@ -2998,6 +3027,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                         for id in dirty {
                             self.compact_segment(&id, memory_budget).await?;
                             refresh_snapshots().await?;
+                            self.wait_for_scheduled_deletions().await;
                         }
                     }
                     // Every remaining free segment is either already at the

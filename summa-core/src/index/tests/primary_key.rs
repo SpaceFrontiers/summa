@@ -7,6 +7,11 @@ use crate::index::{IndexConfig, IndexWriter};
 struct BlockingMetadataDirectory {
     inner: RamDirectory,
     store_read_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    block_next_delete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    delete_fault: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    row_stats_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    delete_sources:
+        std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<std::path::PathBuf>>>,
     block_next_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
     block_next_row_stats: std::sync::Arc<std::sync::atomic::AtomicBool>,
     fail_next_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -22,6 +27,10 @@ impl Default for BlockingMetadataDirectory {
         Self {
             inner: RamDirectory::default(),
             store_read_mode: Default::default(),
+            block_next_delete: Default::default(),
+            delete_fault: Default::default(),
+            row_stats_writes: Default::default(),
+            delete_sources: Default::default(),
             block_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             block_next_row_stats: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fail_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -153,6 +162,24 @@ impl crate::directories::DirectoryWriter for BlockingMetadataDirectory {
     }
 
     async fn delete(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if self.delete_sources.lock().contains(path) {
+            match self
+                .delete_fault
+                .swap(0, std::sync::atomic::Ordering::AcqRel)
+            {
+                1 => return Err(std::io::Error::other("injected source deletion failure")),
+                2 => panic!("injected source deletion panic"),
+                _ => {}
+            }
+        }
+        if self.delete_sources.lock().contains(path)
+            && self
+                .block_next_delete
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.rename_started.add_permits(1);
+            self.allow_rename.acquire().await.unwrap().forget();
+        }
         self.inner.delete(path).await
     }
 
@@ -195,6 +222,13 @@ impl crate::directories::DirectoryWriter for BlockingMetadataDirectory {
         &self,
         path: &std::path::Path,
     ) -> std::io::Result<Box<dyn crate::directories::StreamingWriter>> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "rowstats")
+        {
+            self.row_stats_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if path
             .extension()
             .is_some_and(|extension| extension == "rowstats")
@@ -1934,7 +1968,7 @@ async fn bytes_content_hash_compares_exact_values_including_empty_hashes() {
 async fn content_hash_resolves_global_ordinals_after_merging_independent_dictionaries() {
     let (schema, pk, hash, _) = content_hash_schema();
     let config = IndexConfig {
-        num_threads: 1,
+        num_indexing_threads: 1,
         merge_policy: Box::new(crate::NoMergePolicy),
         ..Default::default()
     };
@@ -1992,7 +2026,7 @@ async fn staged_upserts_compare_latest_hash_and_allow_replacement_and_delete() {
     let (schema, pk, hash, body) = content_hash_schema();
     let dir = RamDirectory::new();
     let config = IndexConfig {
-        num_threads: 1,
+        num_indexing_threads: 1,
         merge_policy: Box::new(crate::NoMergePolicy),
         ..Default::default()
     };
@@ -2048,7 +2082,7 @@ async fn staged_hash_noops_preserve_payload_without_reading_the_committed_store(
     let (schema, pk, hash, body) = content_hash_schema();
     let dir = BlockingMetadataDirectory::default();
     let config = IndexConfig {
-        num_threads: 1,
+        num_indexing_threads: 1,
         merge_policy: Box::new(crate::NoMergePolicy),
         ..Default::default()
     };
@@ -2203,4 +2237,321 @@ async fn flushed_staged_rows_can_be_replaced_deleted_and_retried_atomically() {
     writer.force_merge_with_compaction(true).await.unwrap();
     writer.upsert_document(doc("a", "third")).await.unwrap();
     assert!(!writer.commit().await.unwrap());
+}
+
+async fn dirty_compaction_fixture() -> (
+    BlockingMetadataDirectory,
+    IndexWriter<BlockingMetadataDirectory>,
+) {
+    let (schema, pk, title) = make_schema();
+    let dir = BlockingMetadataDirectory::default();
+    let mut writer = IndexWriter::create(
+        dir.clone(),
+        schema,
+        IndexConfig {
+            num_indexing_threads: 1,
+            merge_policy: Box::new(crate::NoMergePolicy),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for batch in 0..3 {
+        for suffix in ["dead", "live"] {
+            writer
+                .add_document(make_doc(pk, title, &format!("{batch}-{suffix}"), "present"))
+                .unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    for batch in 0..3 {
+        writer.delete_primary_key(&format!("{batch}-dead")).unwrap();
+    }
+    writer.commit().await.unwrap();
+    *dir.delete_sources.lock() = crate::index::IndexMetadata::load(&dir)
+        .await
+        .unwrap()
+        .segment_ids()
+        .iter()
+        .map(|id| std::path::PathBuf::from(format!("seg_{id}.store")))
+        .collect();
+    dir.row_stats_writes
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    dir.block_next_delete
+        .store(true, std::sync::atomic::Ordering::Release);
+    (dir, writer)
+}
+
+#[tokio::test]
+async fn compaction_commits_and_drains_each_segment_before_writing_the_next() {
+    use crate::directories::Directory;
+    let (dir, mut writer) = dirty_compaction_fixture().await;
+    let before = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let mut compact = tokio::spawn(async move {
+        let result = writer.compact(16 * 1024 * 1024).await;
+        (writer, result)
+    });
+    dir.wait_until_rename_started().await;
+    let advanced = tokio::time::timeout(std::time::Duration::from_millis(100), &mut compact).await;
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let writes = dir
+        .row_stats_writes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    dir.release_rename();
+    assert!(
+        advanced.is_err(),
+        "compaction returned before retired files were deleted"
+    );
+    assert_eq!(
+        writes, 1,
+        "next output started before previous source cleanup"
+    );
+    assert_eq!(
+        metadata
+            .segment_metas
+            .values()
+            .filter(|meta| meta.deletions.is_some())
+            .count(),
+        2
+    );
+    let (mut writer, result) = compact.await.unwrap();
+    assert_eq!(result.unwrap(), 3);
+    let files = dir.list_files(std::path::Path::new("")).await.unwrap();
+    for id in before.owned_ids() {
+        assert!(
+            !files
+                .iter()
+                .any(|path| path.to_string_lossy().starts_with(&format!("seg_{id}.")))
+        );
+    }
+    let reopened = crate::index::Index::open(dir, IndexConfig::default())
+        .await
+        .unwrap();
+    let searcher = reopened.reader().await.unwrap().searcher().await.unwrap();
+    assert_eq!(searcher.num_docs(), 3);
+    assert_eq!(searcher.segment_readers().len(), 3);
+    assert!(
+        searcher
+            .segment_readers()
+            .iter()
+            .all(|segment| segment.num_docs() == 1)
+    );
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_compaction_batch_drains_current_cleanup_without_starting_another_segment() {
+    let (dir, writer) = dirty_compaction_fixture().await;
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    let writer = std::sync::Arc::new(tokio::sync::Mutex::new(writer));
+    let compact = {
+        let writer = std::sync::Arc::clone(&writer);
+        tokio::spawn(async move { writer.lock().await.compact(16 * 1024 * 1024).await })
+    };
+    dir.wait_until_rename_started().await;
+    compact.abort();
+    assert!(compact.await.unwrap_err().is_cancelled());
+    writer.lock().await.shutdown().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            manager.wait_for_shutdown()
+        )
+        .await
+        .is_err()
+    );
+    dir.release_rename();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        manager.wait_for_shutdown(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        dir.row_stats_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let metadata = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(
+        metadata
+            .segment_metas
+            .values()
+            .filter(|meta| meta.deletions.is_some())
+            .count(),
+        2
+    );
+    assert_eq!(
+        metadata
+            .segment_metas
+            .values()
+            .map(|meta| meta.num_live_docs())
+            .sum::<u32>(),
+        3
+    );
+}
+
+#[tokio::test]
+async fn later_compaction_failure_preserves_the_previous_committed_and_cleaned_segment() {
+    use crate::directories::Directory;
+    let (dir, mut writer) = dirty_compaction_fixture().await;
+    let before = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    let compact = tokio::spawn(async move {
+        let result = writer.compact(16 * 1024 * 1024).await;
+        (writer, result)
+    });
+    dir.wait_until_rename_started().await;
+    dir.fail_next_metadata_rename();
+    dir.release_rename();
+    let (mut writer, result) = compact.await.unwrap();
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("injected metadata rename failure")
+    );
+    let after = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(
+        after
+            .segment_metas
+            .values()
+            .filter(|meta| meta.deletions.is_some())
+            .count(),
+        2
+    );
+    let retired: Vec<_> = before
+        .segment_ids()
+        .into_iter()
+        .filter(|id| !after.segment_metas.contains_key(id))
+        .collect();
+    assert_eq!(retired.len(), 1);
+    let files = dir.list_files(std::path::Path::new("")).await.unwrap();
+    assert!(!files.iter().any(|path| {
+        path.to_string_lossy()
+            .starts_with(&format!("seg_{}.", retired[0]))
+    }));
+    assert_eq!(writer.compact(16 * 1024 * 1024).await.unwrap(), 2);
+    writer.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_does_not_wait_for_held_reader_snapshots_or_delete_their_files() {
+    use crate::directories::Directory;
+    let (dir, mut writer) = dirty_compaction_fixture().await;
+    dir.block_next_delete
+        .store(false, std::sync::atomic::Ordering::Release);
+    let snapshot = writer.acquire_snapshot().await;
+    let before = crate::index::IndexMetadata::load(&dir).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            writer.compact(16 * 1024 * 1024)
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        3
+    );
+    for id in before.owned_ids() {
+        let suffix = if before.segment_metas.contains_key(&id) {
+            "meta"
+        } else {
+            "del"
+        };
+        assert!(
+            dir.exists(std::path::Path::new(&format!("seg_{id}.{suffix}")))
+                .await
+                .unwrap()
+        );
+    }
+    drop(snapshot);
+    writer.shutdown().await.unwrap();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    drop(writer);
+    manager.wait_for_shutdown().await;
+    let files = dir.list_files(std::path::Path::new("")).await.unwrap();
+    for id in before.owned_ids() {
+        assert!(
+            !files
+                .iter()
+                .any(|path| path.to_string_lossy().starts_with(&format!("seg_{id}.")))
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_cleanup_failures_and_panics_remain_retryable_without_hanging() {
+    use crate::directories::Directory;
+    for fault in [1, 2] {
+        let (dir, mut writer) = dirty_compaction_fixture().await;
+        let before = crate::index::IndexMetadata::load(&dir).await.unwrap();
+        dir.block_next_delete
+            .store(false, std::sync::atomic::Ordering::Release);
+        dir.delete_fault
+            .store(fault, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                writer.compact(16 * 1024 * 1024)
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+            3
+        );
+        assert!(writer.cleanup_orphan_segments().await.unwrap() > 0);
+        let files = dir.list_files(std::path::Path::new("")).await.unwrap();
+        for id in before.owned_ids() {
+            assert!(
+                !files
+                    .iter()
+                    .any(|path| path.to_string_lossy().starts_with(&format!("seg_{id}.")))
+            );
+        }
+        writer.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn force_merge_compaction_drains_cleanup_released_by_external_snapshot_refresh() {
+    let (dir, mut writer) = dirty_compaction_fixture().await;
+    dir.block_next_delete
+        .store(false, std::sync::atomic::Ordering::Release);
+    writer.force_merge().await.unwrap();
+    let manager = std::sync::Arc::clone(writer.segment_manager());
+    manager.wait_for_scheduled_deletions().await;
+    *dir.delete_sources.lock() = manager
+        .get_segment_ids()
+        .await
+        .iter()
+        .map(|id| std::path::PathBuf::from(format!("seg_{id}.store")))
+        .collect();
+    dir.block_next_delete
+        .store(true, std::sync::atomic::Ordering::Release);
+    let snapshot = std::sync::Arc::new(parking_lot::Mutex::new(manager.acquire_snapshot().await));
+    let mut compact = tokio::spawn(async move {
+        let result = writer
+            .force_merge_with_compaction_and_snapshot_refresh(true, move || {
+                let snapshot = std::sync::Arc::clone(&snapshot);
+                let manager = std::sync::Arc::clone(&manager);
+                async move {
+                    let next = manager.acquire_snapshot().await;
+                    *snapshot.lock() = next;
+                    Ok(())
+                }
+            })
+            .await;
+        (writer, result)
+    });
+    dir.wait_until_rename_started().await;
+    let advanced = tokio::time::timeout(std::time::Duration::from_millis(100), &mut compact).await;
+    dir.release_rename();
+    assert!(
+        advanced.is_err(),
+        "force merge returned before external snapshot cleanup"
+    );
+    let (mut writer, result) = compact.await.unwrap();
+    result.unwrap();
+    writer.shutdown().await.unwrap();
 }
