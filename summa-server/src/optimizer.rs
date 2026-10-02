@@ -434,6 +434,11 @@ async fn scan_and_optimize(
                                 sid, idx_name, error,
                             ),
                         }
+                        if is_compaction {
+                            // Reader reload may release the last source owner.
+                            // Retain the compaction slot until its deletes drain.
+                            sm.wait_for_scheduled_deletions().await;
+                        }
                         info!(
                             "[optimizer] {action} segment {} in index '{}' ({:.1}s)",
                             sid,

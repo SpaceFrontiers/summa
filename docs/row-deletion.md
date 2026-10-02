@@ -178,8 +178,29 @@ and client helpers expose the same flag; omitted/false preserves the cheap defau
 
 Compaction writes directly from each final source, without a temporary copied
 segment. A concurrent deletion invalidates captured visibility and prevents stale
-publication. Single-segment `compact` preserves segment separation. An all-deleted
-segment becomes an empty segment. Old row addresses require their original reader.
+publication. Single-segment `compact` preserves segment separation.
+
+The native compaction lifecycle commits each replacement independently, refreshes
+writer-owned primary-key snapshots, releases its source snapshot, and waits for
+scheduled source/mask deletion before completing that segment. Batch `compact`
+and the final compaction phase of force merge therefore reclaim eligible sources
+before starting the next output. Force merge also drains deletion scheduled by
+its external-reader refresh between compacted segments. The automatic optimizer
+retains its compaction slot through reader reload and the same cleanup barrier.
+Earlier replacements remain committed if a later segment fails or the batch waiter is cancelled.
+This does not wait for independently held readers: their snapshots must remain
+valid, and can retain old files until released. Deletion I/O failures remain
+observable through the existing cleanup warnings and orphan retry path.
+
+With no retained readers or cleanup failures, incremental compaction storage is
+one replacement segment (plus bounded metadata), rather than replacements for
+all dirty segments at once. A single segment can still require source plus its
+replacement, and `merge --compact` still performs its explicitly requested merge
+hierarchy first. Compaction encoding, scratch limits, and persisted formats are
+unchanged.
+
+An all-deleted segment becomes an empty segment. Old row addresses require their
+original reader.
 The physical-copy primitive rejects masked readers; the segment manager owns mask
 remapping and publication for normal merges.
 

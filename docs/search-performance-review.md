@@ -12655,3 +12655,43 @@ Their 17–27% first-second rejection remains visible. The [complete I/O table](
 retains all rates/backends, CPU, both rejection windows, latency and memory.
 The evidence supports keeping the existing backend defaults and documenting
 the tradeoffs, not selecting a universal winner from one short workload.
+
+### October 2: per-segment compaction cleanup
+
+Review found that row compaction already published each segment independently
+and refreshed the writer's PK topology, but returned before asynchronous source
+retirement finished. A three-segment/two-row-per-segment RAM fixture with one
+deleted row each and a paused source-store unlink reproduced the batch returning
+while cleanup was still blocked. This is lifecycle evidence, not a throughput or
+RSS benchmark.
+
+Compaction now releases its source/mask snapshot and drains scheduled deletions
+inside the owned lifecycle task before returning. Force-merge compaction and the
+server optimizer also drain cleanup after external-reader refresh. The barrier
+snapshots only already-scheduled IDs; held-reader retirements do not block it,
+and later unrelated deletions cannot extend the wait indefinitely. Its scratch
+is proportional to scheduled IDs, with no payload copying or encoding changes.
+
+The intended space bound, with no held readers or failed unlinks, is the current
+source plus one replacement, rather than accumulating replacements across the
+batch. Held snapshots and failed deletions can still retain old files; explicit
+force merge still builds its ordinary merge hierarchy first. Disk peak/RSS and
+throughput have not been benchmarked; no defaults, formats, or codecs changed.
+Validation: six new lifecycle regressions cover per-segment publication/deletion
+ordering, cancellation during cleanup and shutdown draining, later publication
+failure/retry, held snapshots, unlink errors/panics and orphan retry, and
+force-merge external-snapshot refresh. The focused compaction selection passed
+24 tests before the final two regressions were added. The final `check` harness
+(`20261002T055317.205792Z-check`) and `full` rerun
+(`20261002T060418.048663Z-full`) passed: 2,081 search-stack tests, strict Clippy,
+native-without-sync and portable compilation, API docs, plus five real-server
+broker tests. Runs used Rust 1.98.1 on Apple aarch64 with
+`CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0`.
+The initial debug build emitted an Apple linker unwind-table size warning;
+disabling build debug information avoided it in the strict harness runs.
+
+The first full attempt (`20261002T060032.814233Z-full`) stopped on the broker's
+`create_index_follows_placement_rules` 10-second index-discovery timeout. That
+test passed in isolation and the complete full rerun passed without a code
+change for the timeout. WASM execution was not run: the changed lifecycle code
+is native-only. Disk-peak/RSS and throughput benchmarks remain unrun.
