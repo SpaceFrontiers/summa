@@ -1,0 +1,543 @@
+#![allow(dead_code, unused_mut)]
+#[cfg(target_arch="aarch64")] mod neon { #[inline] pub fn is_available()->bool{std::arch::is_aarch64_feature_detected!("neon")} }
+#[cfg(target_arch="x86_64")] mod avx2 { #[inline] pub fn is_available()->bool{is_x86_feature_detected!("avx2")} }
+/// Intersect two strictly increasing decoded posting blocks. Return index pairs
+/// in document order and resume positions for the unconsumed suffixes. Each
+/// input is at most 128 IDs; no document-space scratch or allocation is needed.
+#[inline]
+pub(crate) fn intersect_posting_blocks(
+    left: &[u32],
+    a: &mut usize,
+    right: &[u32],
+    b: &mut usize,
+    pairs: &mut [(u8, u8)],
+) -> usize {
+    assert!(left.len() <= 128 && right.len() <= 128);
+    assert!(*a <= left.len() && *b <= right.len());
+    #[cfg(target_arch = "x86_64")]
+    if avx2::is_available() && is_x86_feature_detected!("popcnt") {
+        // SAFETY: both required CPU features were detected; loads are bounded.
+        let count = unsafe { intersect_posting_blocks_avx2(left, a, right, b, pairs) };
+        return count + intersect_posting_block_groups(left, a, right, b, &mut pairs[count..]);
+    }
+    intersect_posting_block_groups(left, a, right, b, pairs)
+}
+
+/// Ranked conjunctions call this with a whole block of the common term and
+/// about an eighth as many IDs of the rarer one (measured on and_high_med:
+/// 113 against 15 consumed, 2.4 matches per call). Each rarer ID is compared
+/// with the next sixteen common IDs at once, and the count of smaller ones is
+/// the exact advance, so the loop has no data-dependent branch except for
+/// gaps of sixteen or more. Stops, for the group kernel to finish, when fewer
+/// than sixteen common IDs remain.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,popcnt")]
+unsafe fn intersect_posting_blocks_avx2(
+    left: &[u32],
+    a: &mut usize,
+    right: &[u32],
+    b: &mut usize,
+    pairs: &mut [(u8, u8)],
+) -> usize {
+    use std::arch::x86_64::*;
+    // Signed compares order unsigned IDs once both sides flip the top bit.
+    let bias = _mm256_set1_epi32(i32::MIN);
+    let (mut left_pos, mut right_pos) = (*a, *b);
+    let mut count = 0;
+    while left_pos < left.len() && right_pos + 16 <= right.len() && count < pairs.len() {
+        let doc = left[left_pos];
+        let key = _mm256_set1_epi32((doc ^ 0x8000_0000) as i32);
+        // SAFETY: `right_pos + 16 <= right.len()`.
+        let (low, high) = unsafe {
+            (
+                _mm256_loadu_si256(right.as_ptr().add(right_pos).cast()),
+                _mm256_loadu_si256(right.as_ptr().add(right_pos + 8).cast()),
+            )
+        };
+        let below_low = _mm256_cmpgt_epi32(key, _mm256_xor_si256(low, bias));
+        let below_high = _mm256_cmpgt_epi32(key, _mm256_xor_si256(high, bias));
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(below_low)) as u32
+            | (_mm256_movemask_ps(_mm256_castsi256_ps(below_high)) as u32) << 8;
+        // Sorted IDs: the smaller ones form a prefix of the sixteen lanes.
+        let smaller = mask.count_ones() as usize;
+        right_pos += smaller;
+        if smaller == 16 {
+            continue;
+        }
+        pairs[count] = (left_pos as u8, right_pos as u8);
+        count += usize::from(right[right_pos] == doc);
+        left_pos += 1;
+    }
+    *a = left_pos;
+    *b = right_pos;
+    count
+}
+
+/// Portable kernel, and the tail of the AVX2 one.
+fn intersect_posting_block_groups(
+    left: &[u32],
+    a: &mut usize,
+    right: &[u32],
+    b: &mut usize,
+    pairs: &mut [(u8, u8)],
+) -> usize {
+    let (mut left_pos, mut right_pos) = (*a, *b);
+    let mut count = 0;
+    while left_pos < left.len() && right_pos < right.len() && count < pairs.len() {
+        let doc = left[left_pos];
+        if let Some(group) = right.get(right_pos..right_pos + 8) {
+            let group: &[u32; 8] = group.try_into().unwrap();
+            if group[7] < doc {
+                right_pos += 8;
+                continue;
+            }
+            if doc < group[0] {
+                left_pos += find_first_ge_u32(&left[left_pos..], group[0]);
+                continue;
+            }
+            if let Some(lane) = equal_lane_8(group, doc) {
+                pairs[count] = (left_pos as u8, (right_pos + lane) as u8);
+                count += 1;
+                left_pos += 1;
+                if count == pairs.len() {
+                    right_pos += lane + 1;
+                    break;
+                }
+            } else {
+                left_pos += 1;
+            }
+        } else {
+            match doc.cmp(&right[right_pos]) {
+                std::cmp::Ordering::Less => left_pos += 1,
+                std::cmp::Ordering::Greater => right_pos += 1,
+                std::cmp::Ordering::Equal => {
+                    pairs[count] = (left_pos as u8, right_pos as u8);
+                    count += 1;
+                    left_pos += 1;
+                    right_pos += 1;
+                }
+            }
+        }
+    }
+    *a = left_pos;
+    *b = right_pos;
+    count
+}
+
+#[inline]
+fn equal_lane_8(values: &[u32; 8], target: u32) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if avx2::is_available() {
+        // SAFETY: the fixed input has eight lanes and AVX2 was checked.
+        let mask = unsafe { equal_mask_8_avx2(values, target) };
+        return (mask != 0).then(|| mask.trailing_zeros() as usize);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if neon::is_available() {
+        // SAFETY: the fixed input has eight lanes and NEON was checked.
+        let mask = unsafe { equal_mask_8_neon(values, target) };
+        return (mask != 0).then(|| mask.trailing_zeros() as usize);
+    }
+    values.iter().position(|&value| value == target)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn equal_mask_8_avx2(values: &[u32; 8], target: u32) -> u32 {
+    use std::arch::x86_64::*;
+    // SAFETY: the caller supplies all eight lanes; the feature is enabled here.
+    let values = unsafe { _mm256_loadu_si256(values.as_ptr().cast()) };
+    _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
+        values,
+        _mm256_set1_epi32(target as i32),
+    ))) as u32
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn equal_mask_8_neon(values: &[u32; 8], target: u32) -> u32 {
+    use std::arch::aarch64::*;
+    // SAFETY: each load addresses four lanes of the fixed eight-lane input.
+    unsafe {
+        let target = vdupq_n_u32(target);
+        let weights = [1u32, 2, 4, 8];
+        let weights = vld1q_u32(weights.as_ptr());
+        let lo = vceqq_u32(vld1q_u32(values.as_ptr()), target);
+        let hi = vceqq_u32(vld1q_u32(values.as_ptr().add(4)), target);
+        vaddvq_u32(vandq_u32(lo, weights)) | (vaddvq_u32(vandq_u32(hi, weights)) << 4)
+    }
+}
+
+/// Lower bound at or after `from` in a decoded posting block. Full blocks
+/// expose their fixed geometry to LLVM; tails keep the existing SIMD search.
+#[inline]
+pub(crate) fn find_first_ge_block_from(docs: &[u32], from: usize, target: u32) -> usize {
+    debug_assert!(from <= docs.len());
+    if let Ok(block) = <&[u32; 128]>::try_from(docs) {
+        if block[127] < target {
+            return 128;
+        }
+        let mut base = 0;
+        let mut step = 64;
+        while step != 0 {
+            base += usize::from(block[base + step - 1] < target) * step;
+            step >>= 1;
+        }
+        base.max(from)
+    } else {
+        from + find_first_ge_u32(&docs[from..], target)
+    }
+}
+
+/// Find index of first element >= `target` in a sorted `u32` slice.
+///
+/// Equivalent to `slice.partition_point(|&d| d < target)` but uses SIMD to
+/// scan 4 elements per cycle. Faster than binary search for slices ≤ 256
+/// elements because it avoids the data-dependency chain inherent in binary
+/// search (~8-10 cycles/iteration vs ~1-2 cycles/iteration for SIMD scan).
+///
+/// Returns `slice.len()` if no element >= `target`.
+#[inline]
+pub fn find_first_ge_u32(slice: &[u32], target: u32) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if neon::is_available() {
+            // SAFETY: NEON availability checked; the kernel stays in bounds.
+            return unsafe { find_first_ge_u32_neon(slice, target) };
+        }
+        slice.partition_point(|&d| d < target)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx2::is_available() {
+            // SAFETY: AVX2 availability checked; the kernel stays in bounds.
+            return unsafe { find_first_ge_u32_avx2(slice, target) };
+        }
+        // The kernel only needs SSE2, which is part of the x86_64 baseline,
+        // so no runtime feature detection is required.
+        // SAFETY: SSE2 is always available on x86_64; the kernel stays in bounds.
+        unsafe { find_first_ge_u32_sse(slice, target) }
+    }
+
+    // Scalar fallback (WASM, other architectures)
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        slice.partition_point(|&d| d < target)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn find_first_ge_u32_neon(slice: &[u32], target: u32) -> usize {
+    use std::arch::aarch64::*;
+
+    let n = slice.len();
+    let ptr = slice.as_ptr();
+    let target_vec = vdupq_n_u32(target);
+    // Bit positions for each lane: [1, 2, 4, 8]
+    let bit_mask: uint32x4_t = core::mem::transmute([1u32, 2u32, 4u32, 8u32]);
+
+    let chunks = n / 16;
+    let mut base = 0usize;
+
+    // Process 16 elements per iteration (4 × 4-wide NEON compares)
+    for _ in 0..chunks {
+        let v0 = vld1q_u32(ptr.add(base));
+        let v1 = vld1q_u32(ptr.add(base + 4));
+        let v2 = vld1q_u32(ptr.add(base + 8));
+        let v3 = vld1q_u32(ptr.add(base + 12));
+
+        let c0 = vcgeq_u32(v0, target_vec);
+        let c1 = vcgeq_u32(v1, target_vec);
+        let c2 = vcgeq_u32(v2, target_vec);
+        let c3 = vcgeq_u32(v3, target_vec);
+
+        let m0 = vaddvq_u32(vandq_u32(c0, bit_mask));
+        if m0 != 0 {
+            return base + m0.trailing_zeros() as usize;
+        }
+        let m1 = vaddvq_u32(vandq_u32(c1, bit_mask));
+        if m1 != 0 {
+            return base + 4 + m1.trailing_zeros() as usize;
+        }
+        let m2 = vaddvq_u32(vandq_u32(c2, bit_mask));
+        if m2 != 0 {
+            return base + 8 + m2.trailing_zeros() as usize;
+        }
+        let m3 = vaddvq_u32(vandq_u32(c3, bit_mask));
+        if m3 != 0 {
+            return base + 12 + m3.trailing_zeros() as usize;
+        }
+        base += 16;
+    }
+
+    // Process remaining 4 elements at a time
+    while base + 4 <= n {
+        let vals = vld1q_u32(ptr.add(base));
+        let cmp = vcgeq_u32(vals, target_vec);
+        let mask = vaddvq_u32(vandq_u32(cmp, bit_mask));
+        if mask != 0 {
+            return base + mask.trailing_zeros() as usize;
+        }
+        base += 4;
+    }
+
+    // Scalar remainder (0-3 elements)
+    while base < n {
+        if *slice.get_unchecked(base) >= target {
+            return base;
+        }
+        base += 1;
+    }
+    n
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn find_first_ge_u32_sse(slice: &[u32], target: u32) -> usize {
+    use std::arch::x86_64::*;
+
+    let n = slice.len();
+    let ptr = slice.as_ptr();
+
+    // For unsigned >= comparison: XOR with 0x80000000 converts to signed domain
+    let sign_flip = _mm_set1_epi32(i32::MIN);
+    let target_xor = _mm_xor_si128(_mm_set1_epi32(target as i32), sign_flip);
+
+    let chunks = n / 16;
+    let mut base = 0usize;
+
+    // Process 16 elements per iteration (4 × 4-wide SSE compares)
+    for _ in 0..chunks {
+        let v0 = _mm_xor_si128(_mm_loadu_si128(ptr.add(base) as *const __m128i), sign_flip);
+        let v1 = _mm_xor_si128(
+            _mm_loadu_si128(ptr.add(base + 4) as *const __m128i),
+            sign_flip,
+        );
+        let v2 = _mm_xor_si128(
+            _mm_loadu_si128(ptr.add(base + 8) as *const __m128i),
+            sign_flip,
+        );
+        let v3 = _mm_xor_si128(
+            _mm_loadu_si128(ptr.add(base + 12) as *const __m128i),
+            sign_flip,
+        );
+
+        // ge = eq | gt (in signed domain after XOR)
+        let ge0 = _mm_or_si128(
+            _mm_cmpeq_epi32(v0, target_xor),
+            _mm_cmpgt_epi32(v0, target_xor),
+        );
+        let m0 = _mm_movemask_ps(_mm_castsi128_ps(ge0)) as u32;
+        if m0 != 0 {
+            return base + m0.trailing_zeros() as usize;
+        }
+
+        let ge1 = _mm_or_si128(
+            _mm_cmpeq_epi32(v1, target_xor),
+            _mm_cmpgt_epi32(v1, target_xor),
+        );
+        let m1 = _mm_movemask_ps(_mm_castsi128_ps(ge1)) as u32;
+        if m1 != 0 {
+            return base + 4 + m1.trailing_zeros() as usize;
+        }
+
+        let ge2 = _mm_or_si128(
+            _mm_cmpeq_epi32(v2, target_xor),
+            _mm_cmpgt_epi32(v2, target_xor),
+        );
+        let m2 = _mm_movemask_ps(_mm_castsi128_ps(ge2)) as u32;
+        if m2 != 0 {
+            return base + 8 + m2.trailing_zeros() as usize;
+        }
+
+        let ge3 = _mm_or_si128(
+            _mm_cmpeq_epi32(v3, target_xor),
+            _mm_cmpgt_epi32(v3, target_xor),
+        );
+        let m3 = _mm_movemask_ps(_mm_castsi128_ps(ge3)) as u32;
+        if m3 != 0 {
+            return base + 12 + m3.trailing_zeros() as usize;
+        }
+        base += 16;
+    }
+
+    // Process remaining 4 elements at a time
+    while base + 4 <= n {
+        let vals = _mm_xor_si128(_mm_loadu_si128(ptr.add(base) as *const __m128i), sign_flip);
+        let ge = _mm_or_si128(
+            _mm_cmpeq_epi32(vals, target_xor),
+            _mm_cmpgt_epi32(vals, target_xor),
+        );
+        let mask = _mm_movemask_ps(_mm_castsi128_ps(ge)) as u32;
+        if mask != 0 {
+            return base + mask.trailing_zeros() as usize;
+        }
+        base += 4;
+    }
+
+    // Scalar remainder (0-3 elements)
+    while base < n {
+        if *slice.get_unchecked(base) >= target {
+            return base;
+        }
+        base += 1;
+    }
+    n
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn find_first_ge_u32_avx2(slice: &[u32], target: u32) -> usize {
+    use std::arch::x86_64::*;
+    let target_vec = _mm256_set1_epi32(target as i32);
+    let mut base = 0;
+    while slice.len() - base >= 8 {
+        let values = _mm256_loadu_si256(slice.as_ptr().add(base).cast());
+        // min(value, target) equals target precisely when value >= target.
+        // Keep this unsigned comparison packed through the mask extraction.
+        let ge = _mm256_cmpeq_epi32(_mm256_min_epu32(values, target_vec), target_vec);
+        let mask = _mm256_movemask_ps(_mm256_castsi256_ps(ge)) as u32;
+        if mask != 0 {
+            return base + mask.trailing_zeros() as usize;
+        }
+        base += 8;
+    }
+    base + find_first_ge_u32_sse(&slice[base..], target)
+}
+
+// Isolated candidate screen; deliberately not production dispatch.
+use std::{hint::black_box, time::{Duration, Instant}};
+type Kernel = fn(&[u32], &mut usize, &[u32], &mut usize, &mut [(u8,u8)]) -> usize;
+fn scalar(l:&[u32], a:&mut usize, r:&[u32], b:&mut usize, out:&mut[(u8,u8)]) -> usize {
+    let (mut i,mut j,mut n)=(*a,*b,0);
+    while i<l.len() && j<r.len() && n<out.len() {
+        match l[i].cmp(&r[j]) {
+            std::cmp::Ordering::Less=>i+=1,
+            std::cmp::Ordering::Greater=>j+=1,
+            std::cmp::Ordering::Equal=>{out[n]=(i as u8,j as u8);n+=1;i+=1;j+=1;}
+        }
+    }
+    *a=i;*b=j;n
+}
+fn lower(s:&[u32], target:u32)->usize {
+    if s.is_empty() || s[0]>=target {return 0;}
+    let mut hi=1;
+    while hi<s.len() && s[hi]<target {hi*=2;}
+    let lo=hi/2;
+    lo+s[lo..s.len().min(hi+1)].partition_point(|&v|v<target)
+}
+fn gallop(l:&[u32],a:&mut usize,r:&[u32],b:&mut usize,out:&mut[(u8,u8)])->usize {
+    let (mut i,mut j,mut n)=(*a,*b,0);
+    while i<l.len() && j<r.len() && n<out.len() {
+        if l[i]<r[j] {i+=lower(&l[i..],r[j]);}
+        else if l[i]>r[j] {j+=lower(&r[j..],l[i]);}
+        else {out[n]=(i as u8,j as u8);n+=1;i+=1;j+=1;}
+    }
+    *a=i;*b=j;n
+}
+#[inline]
+fn mask4(r:&[u32],doc:u32)->u32 {
+    assert!(r.len()>=4);
+    #[cfg(target_arch="aarch64")]
+    unsafe {use std::arch::aarch64::*;
+        let eq=vceqq_u32(vld1q_u32(r.as_ptr()),vdupq_n_u32(doc));
+        let w=[1,2,4,8];return vaddvq_u32(vandq_u32(eq,vld1q_u32(w.as_ptr())));
+    }
+    #[cfg(target_arch="x86_64")]
+    unsafe {use std::arch::x86_64::*;
+        return _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_loadu_si128(r.as_ptr().cast()),_mm_set1_epi32(doc as i32)))) as u32;
+    }
+    #[cfg(not(any(target_arch="aarch64",target_arch="x86_64")))]
+    (0..4).fold(0,|m,i|m|((r[i]==doc) as u32)<<i)
+}
+fn cross4(l:&[u32],a:&mut usize,r:&[u32],b:&mut usize,out:&mut[(u8,u8)])->usize {
+    let (mut i,mut j,mut n)=(*a,*b,0);
+    while i+4<=l.len() && j+4<=r.len() && n<out.len() {
+        let lm=l[i+3];let rm=r[j+3];
+        for lane in 0..4 {
+            let mask=mask4(&r[j..j+4],l[i+lane]);
+            if mask!=0 {
+                let pos=j+mask.trailing_zeros() as usize;
+                out[n]=((i+lane) as u8,pos as u8);n+=1;
+                if n==out.len() {*a=i+lane+1;*b=pos+1;return n;}
+            }
+        }
+        i+=4*usize::from(lm<=rm);j+=4*usize::from(rm<=lm);
+    }
+    *a=i;*b=j;n+scalar(l,a,r,b,&mut out[n..])
+}
+#[cfg(target_arch="aarch64")]
+fn prefix8(l:&[u32],a:&mut usize,r:&[u32],b:&mut usize,out:&mut[(u8,u8)])->usize {
+    use std::arch::aarch64::*;
+    let (mut i,mut j,mut n)=(*a,*b,0);
+    while i<l.len() && j+8<=r.len() && n<out.len() {
+        let doc=l[i];
+        let smaller=unsafe {
+            let key=vdupq_n_u32(doc);
+            let low=vcltq_u32(vld1q_u32(r.as_ptr().add(j)),key);
+            let high=vcltq_u32(vld1q_u32(r.as_ptr().add(j+4)),key);
+            vaddvq_u32(vaddq_u32(low,high)).wrapping_neg() as usize
+        };
+        j+=smaller;
+        if smaller==8 {continue;}
+        out[n]=(i as u8,j as u8);n+=usize::from(r[j]==doc);i+=1;
+    }
+    *a=i;*b=j;n+scalar(l,a,r,b,&mut out[n..])
+}
+fn random(s:&mut u64)->u32{*s^=*s<<13;*s^=*s>>7;*s^=*s<<17;(*s>>16) as u32}
+fn fixture(seed:u64,gap_l:u32,gap_r:u32,overlap:bool)->(Vec<u32>,Vec<u32>){
+    let mut s=seed;let mut make=|gap|{let mut v=Vec::new();let mut d=0;for _ in 0..128{d+=1+random(&mut s)%gap;v.push(d);}v};
+    let l=make(gap_l);let mut r=make(gap_r);if overlap {r=l.clone();} (l,r)
+}
+fn verify(kernels:&[(&str,Kernel)]) {
+    let mut cases=0;
+    for trial in 1..=256 {
+        let (l,r)=fixture(trial,1+(trial%63) as u32,1+((trial*17)%255) as u32,trial%13==0);
+        for base in [0,0x7fff_f000,u32::MAX-100_000] {
+            let l:Vec<_>=l.iter().map(|v|v+base).collect();let r:Vec<_>=r.iter().map(|v|v+base).collect();
+            let lens=[0,1,3,4,7,8,15,16,31,63,127,128];
+            for &la in &lens {for &lb in &lens {
+                let l=&l[..la];let r=&r[..lb];
+                for (fa,fb) in [(0,0),(la/3,lb/2)] {
+                    let expected:Vec<_>=(fa..la).filter_map(|i|r[fb..].binary_search(&l[i]).ok().map(|j|(i as u8,(fb+j) as u8))).collect();
+                    for &(name,kernel) in kernels {for cap in [0,1,3,7,128] {
+                        let(mut a,mut b)=(fa,fb);let mut actual=Vec::new();let mut out=[(255,255);129];
+                        if cap==0 {assert_eq!(kernel(l,&mut a,r,&mut b,&mut out[..0]),0);assert_eq!((a,b),(fa,fb));}
+                        else {while a<la && b<lb {
+                            let prev=(a,b);let n=kernel(l,&mut a,r,&mut b,&mut out[..cap]);
+                            assert!(n<=cap && a<=la && b<=lb && a>=prev.0 && b>=prev.1,"{name}");
+                            assert!(a>prev.0 || b>prev.1,"{name}");
+                            actual.extend_from_slice(&out[..n]);
+                        }assert_eq!(actual,expected,"{name}, trial={trial}, base={base}, lengths={la},{lb}, cap={cap}");}
+                        assert_eq!(out[cap],(255,255));cases+=1;
+                    }}
+                }
+            }}
+        }
+    }
+    eprintln!("verified {cases} kernel/fixture/capacity cases");
+}
+fn main(){
+    let mut kernels:Vec<(&str,Kernel)>=vec![("production",intersect_posting_blocks),("scalar",scalar),("gallop",gallop),("cross4",cross4)];
+    #[cfg(target_arch="aarch64")] kernels.push(("prefix8",prefix8));
+    verify(&kernels);
+    if std::env::args().any(|a|a=="--verify-only"){return;}
+    println!("shape,capacity,pass,kernel,calls,elapsed_ns");
+    for (name,gl,gr,same) in [("identical",1,1,true),("balanced_dense",3,3,false),("balanced_sparse",101,101,false),("left_8x_sparse",40,5,false),("right_8x_sparse",5,40,false),("left_64x_sparse",256,4,false),("right_64x_sparse",4,256,false)] {
+        let fixtures:Vec<_>=(1..=64).map(|s|fixture(s*193,gl,gr,same)).collect();
+        for cap in [1,128] {for pass in 0..9 {for step in 0..kernels.len() {
+            let ki=if pass%2==0 {(step+pass)%kernels.len()}else{(kernels.len()-1-step+pass)%kernels.len()};
+            let (kn,k)=kernels[ki];let start=Instant::now();let mut calls=0;
+            let mut out=[(0,0);128];
+            while start.elapsed()<Duration::from_millis(20) {
+                for (l,r) in &fixtures {let(mut a,mut b)=(0,0);let n=k(black_box(l),&mut a,black_box(r),&mut b,black_box(&mut out[..cap]));black_box((n,a,b,&out[..n]));calls+=1;}
+            }
+            println!("{name},{cap},{pass},{kn},{calls},{}",start.elapsed().as_nanos());
+        }}}
+    }
+}

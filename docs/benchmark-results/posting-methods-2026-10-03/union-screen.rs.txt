@@ -1,0 +1,139 @@
+// Membership-only algorithm screen; excludes posting decoding and scoring.
+use std::{
+    cmp::Reverse,
+    collections::BinaryHeap,
+    hint::black_box,
+    time::{Duration, Instant},
+};
+type Method = fn(&[Vec<u32>], usize) -> usize;
+fn sort_union(lists: &[Vec<u32>], _: usize) -> usize {
+    let mut all = Vec::with_capacity(lists.iter().map(Vec::len).sum());
+    for l in lists {
+        all.extend_from_slice(l);
+    }
+    all.sort_unstable();
+    all.dedup();
+    all.len()
+}
+fn bitmap(lists: &[Vec<u32>], universe: usize) -> usize {
+    let mut bits = vec![0u64; universe.div_ceil(64)];
+    for l in lists {
+        for &d in l {
+            bits[d as usize / 64] |= 1u64 << (d % 64);
+        }
+    }
+    bits.iter().map(|b| b.count_ones() as usize).sum()
+}
+fn heap(lists: &[Vec<u32>], _: usize) -> usize {
+    let mut h: BinaryHeap<_> = lists
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| l.first().map(|&d| Reverse((d, i, 0usize))))
+        .collect();
+    let mut last = None;
+    let mut n = 0;
+    while let Some(Reverse((d, i, p))) = h.pop() {
+        if last != Some(d) {
+            n += 1;
+            last = Some(d);
+        }
+        if let Some(&next) = lists[i].get(p + 1) {
+            h.push(Reverse((next, i, p + 1)));
+        }
+    }
+    n
+}
+fn windows(lists: &[Vec<u32>], _: usize) -> usize {
+    let mut pos = vec![0; lists.len()];
+    let mut n = 0;
+    loop {
+        let Some(first) = lists.iter().zip(&pos).filter_map(|(l, &p)| l.get(p)).min() else {
+            return n;
+        };
+        let base = *first / 4096 * 4096;
+        let mut bits = [0u64; 64];
+        for (l, p) in lists.iter().zip(&mut pos) {
+            while *p < l.len() && l[*p] - base < 4096 {
+                let d = l[*p] - base;
+                bits[d as usize / 64] |= 1u64 << (d % 64);
+                *p += 1;
+            }
+        }
+        n += bits.iter().map(|b| b.count_ones() as usize).sum::<usize>();
+    }
+}
+fn main() {
+    let methods: [(&str, Method); 4] = [
+        ("sort", sort_union),
+        ("bitmap", bitmap),
+        ("heap", heap),
+        ("windows", windows),
+    ];
+    println!("shape,universe,postings,lists,pass,method,iterations,elapsed_ns,scratch_bound_bytes");
+    let u = 1 << 20;
+    for k in [2, 8, 32] {
+        for (label, stride, identical) in [
+            ("sparse", 16384, false),
+            ("medium", 256, false),
+            ("dense", 8, false),
+            ("overlap", 256, true),
+        ] {
+            let lists: Vec<Vec<u32>> = (0..k)
+                .map(|i| {
+                    (if identical { 0 } else { i % stride }..u)
+                        .step_by(stride)
+                        .map(|d| d as u32)
+                        .collect()
+                })
+                .collect();
+            let expected = sort_union(&lists, u);
+            for &(name, m) in &methods {
+                assert_eq!(m(&lists, u), expected, "{label} {k} {name}");
+            }
+            let p: usize = lists.iter().map(Vec::len).sum();
+            for pass in 0..7 {
+                for step in 0..4 {
+                    let j = if pass % 2 == 0 {
+                        (step + pass) % 4
+                    } else {
+                        (3 - step + pass) % 4
+                    };
+                    let (name, m) = methods[j];
+                    let start = Instant::now();
+                    let mut n = 0;
+                    while start.elapsed() < Duration::from_millis(15) {
+                        black_box(m(black_box(&lists), black_box(u)));
+                        n += 1;
+                    }
+                    let scratch = match name {
+                        "sort" => 4 * p,
+                        "bitmap" => u.div_ceil(64) * 8,
+                        "heap" => {
+                            std::mem::size_of::<Reverse<(u32, usize, usize)>>()
+                                * k.max(4).next_power_of_two()
+                        }
+                        "windows" => 512 + 8 * k,
+                        _ => unreachable!(),
+                    };
+                    println!(
+                        "{label}_{k},{u},{p},{k},{pass},{name},{n},{},{scratch}",
+                        start.elapsed().as_nanos()
+                    );
+                }
+            }
+        }
+    }
+    for lists in [
+        vec![],
+        vec![vec![]],
+        vec![vec![0], vec![0]],
+        vec![vec![63, 64], vec![64, 65]],
+        vec![vec![0, 4095, 4096], vec![4095, 4096, 8191]],
+    ] {
+        let e = sort_union(&lists, 8192);
+        for (_, m) in methods {
+            assert_eq!(m(&lists, 8192), e);
+        }
+    }
+    eprintln!("all 12 workload and 5 boundary union oracles passed");
+}

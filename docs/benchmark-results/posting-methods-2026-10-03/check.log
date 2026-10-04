@@ -1,0 +1,12 @@
+Evidence: /Users/pasha/conductor/workspaces/summa-v2/kolkata/.context/search-harness/20261003T051341.450382Z-check
+Search ownership and documentation contracts passed
+[1/5] cargo fmt --all -- --check
+Passed (2.5s); 01-fmt.log
+[2/5] cargo clippy --locked -p summa-core -p summa-server -p summa-broker -p summa-tool --all-targets -- -D warnings
+Passed (104.3s); 02-clippy.log
+[3/5] cargo test --locked -p summa-core -p summa-server -p summa-broker -p summa-tool --features summa-core/metrics
+Passed (374.6s); 03-test.log
+[4/5] cargo check --locked -p summa-core --no-default-features --features native --all-targets
+Passed (29.7s); 04-check.log
+[5/5] cargo check --locked -p summa-broker --all-targets
+Passed (11.4s); 05-check.log

@@ -1,0 +1,2830 @@
+{
+  "intersections": [
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 4.279418863402944,
+      "min_ns": 4.231069927158504,
+      "max_ns": 4.341598330763139,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 3.5476512212358235,
+      "min_ns": 3.4910178417824747,
+      "max_ns": 3.954686293833285,
+      "speedup": 1.206268202969572
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 3.6012752088735236,
+      "min_ns": 3.5918526157144006,
+      "max_ns": 3.78492835190456,
+      "speedup": 1.188306534546007
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 4.233852332001084,
+      "min_ns": 4.183331980736794,
+      "max_ns": 4.399329238463271,
+      "speedup": 1.0107624281218905
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 4.219788487766015,
+      "min_ns": 4.191142941444704,
+      "max_ns": 4.252630638905899,
+      "speedup": 1.0141311290387682
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 189.71741315230582,
+      "min_ns": 187.94042205351775,
+      "max_ns": 209.77961409395974,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 76.98102678571429,
+      "min_ns": 76.39578495477878,
+      "max_ns": 99.79895035121328,
+      "speedup": 2.4644697670817832
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 135.4217396013865,
+      "min_ns": 135.00973272138228,
+      "max_ns": 182.59398729556074,
+      "speedup": 1.40093764642766
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 98.19582057021678,
+      "min_ns": 97.62250156152405,
+      "max_ns": 99.17128509676395,
+      "speedup": 1.932031445438605
+    },
+    {
+      "host": "arm",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 661.2243657505286,
+      "min_ns": 658.8336184210526,
+      "max_ns": 666.6055770255864,
+      "speedup": 0.28691836384003394
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 5.218400371545462,
+      "min_ns": 5.192248301099924,
+      "max_ns": 5.405706733264141,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 4.03558053643607,
+      "min_ns": 3.882381556552204,
+      "max_ns": 4.225169047957059,
+      "speedup": 1.2930978144111012
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 7.051687736934741,
+      "min_ns": 7.017597993532595,
+      "max_ns": 7.3704874377933445,
+      "speedup": 0.7400214765910521
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 4.376698593156958,
+      "min_ns": 4.342346342370008,
+      "max_ns": 4.449277535344619,
+      "speedup": 1.1923143119118411
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 6.815045387634936,
+      "min_ns": 6.765060465103693,
+      "max_ns": 7.0389956302369585,
+      "speedup": 0.7657176254487768
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 231.02932141537323,
+      "min_ns": 228.46565469663742,
+      "max_ns": 236.98656652767247,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 185.46728486646884,
+      "min_ns": 183.51614797416323,
+      "max_ns": 193.50732391640867,
+      "speedup": 1.2456607729050855
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 518.9007307213931,
+      "min_ns": 509.5482746335505,
+      "max_ns": 541.0032169117648,
+      "speedup": 0.4452283601416182
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 148.69135609843082,
+      "min_ns": 146.6107967870544,
+      "max_ns": 150.35805976430976,
+      "speedup": 1.553750853293962
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 649.9615709459459,
+      "min_ns": 647.1650815217391,
+      "max_ns": 653.515364039666,
+      "speedup": 0.3554507400785804
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 57.010326409157244,
+      "min_ns": 56.44917076860549,
+      "max_ns": 58.04791105590639,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 68.91940118522602,
+      "min_ns": 68.43022635209108,
+      "max_ns": 69.77527070774727,
+      "speedup": 0.8272028692753401
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 236.37929894179894,
+      "min_ns": 235.42901684864458,
+      "max_ns": 238.5002502860412,
+      "speedup": 0.2411815529717527
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 55.838484902626405,
+      "min_ns": 55.61274466192171,
+      "max_ns": 56.244283673744825,
+      "speedup": 1.0209862697488004
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 189.58064546694968,
+      "min_ns": 189.02526073155985,
+      "max_ns": 191.20516055045871,
+      "speedup": 0.3007180731384105
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 180.3377903202539,
+      "min_ns": 176.04115639076576,
+      "max_ns": 231.93891413204747,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 203.19230534785436,
+      "min_ns": 199.96684061100447,
+      "max_ns": 382.2752712408313,
+      "speedup": 0.8875227337547318
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 729.6507502913753,
+      "min_ns": 721.9360565819861,
+      "max_ns": 791.2611946202531,
+      "speedup": 0.24715631450832973
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 167.0250701496526,
+      "min_ns": 166.07409006376196,
+      "max_ns": 169.52786062906725,
+      "speedup": 1.0797049218939003
+    },
+    {
+      "host": "arm",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 647.2270639233955,
+      "min_ns": 642.9390721252566,
+      "max_ns": 667.4315365138593,
+      "speedup": 0.2786314114046355
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 7.883598874243189,
+      "min_ns": 7.770636220658444,
+      "max_ns": 8.735919067287265,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 19.006282500608197,
+      "min_ns": 18.73807841917496,
+      "max_ns": 21.837123759695338,
+      "speedup": 0.4147891032342024
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 24.387947264710473,
+      "min_ns": 23.9918300418394,
+      "max_ns": 32.45142962828367,
+      "speedup": 0.3232579925105386
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 13.870299531756247,
+      "min_ns": 13.7888467117455,
+      "max_ns": 26.09053055601937,
+      "speedup": 0.5683798577091704
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 12.546830459308628,
+      "min_ns": 12.490610885726847,
+      "max_ns": 18.328707810392352,
+      "speedup": 0.6283338967407711
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 43.72837597943193,
+      "min_ns": 42.97564287678768,
+      "max_ns": 44.243828744337485,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 107.90992964433701,
+      "min_ns": 105.67519755747126,
+      "max_ns": 111.11681812122289,
+      "speedup": 0.4052303261021239
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 184.09410887809187,
+      "min_ns": 182.52464608873322,
+      "max_ns": 189.93093104495748,
+      "speedup": 0.2375327284828495
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 85.93857403079461,
+      "min_ns": 85.31026968477074,
+      "max_ns": 88.19428523560948,
+      "speedup": 0.5088329248256158
+    },
+    {
+      "host": "arm",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 106.07958305055989,
+      "min_ns": 105.47688153898076,
+      "max_ns": 109.23277481649772,
+      "speedup": 0.4122223591187195
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 22.23454397901103,
+      "min_ns": 22.086550948830308,
+      "max_ns": 22.692480667295964,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 16.67916839008379,
+      "min_ns": 16.57823358177285,
+      "max_ns": 17.51158347809033,
+      "speedup": 1.333072696371964
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 22.270616938070127,
+      "min_ns": 21.967095898355126,
+      "max_ns": 27.63381806930693,
+      "speedup": 0.998380244285131
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 12.182616121549977,
+      "min_ns": 12.053913662925249,
+      "max_ns": 20.54316390842756,
+      "speedup": 1.825104210554585
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 69.66436204302273,
+      "min_ns": 68.53612595942982,
+      "max_ns": 73.97343565088758,
+      "speedup": 0.31916669193467395
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 175.99826682150902,
+      "min_ns": 170.68918965046421,
+      "max_ns": 183.7900958994709,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 107.00708768401232,
+      "min_ns": 106.09459860828241,
+      "max_ns": 112.05876882395124,
+      "speedup": 1.6447346678682155
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 182.92862755847952,
+      "min_ns": 181.31888051044083,
+      "max_ns": 189.01070321946796,
+      "speedup": 0.962114400411412
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 84.8235710651289,
+      "min_ns": 84.10386252018299,
+      "max_ns": 89.26653545415596,
+      "speedup": 2.074874526166491
+    },
+    {
+      "host": "arm",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 632.7637272267207,
+      "min_ns": 630.743888608871,
+      "max_ns": 650.3026572245323,
+      "speedup": 0.27814215519728813
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 10.72792868177137,
+      "min_ns": 10.580258976030064,
+      "max_ns": 10.783321471704625,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 74.50709922526818,
+      "min_ns": 74.29939372325249,
+      "max_ns": 74.99350332893474,
+      "speedup": 0.14398532211455528
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 16.082190459036642,
+      "min_ns": 15.965971140090941,
+      "max_ns": 16.18597367535091,
+      "speedup": 0.6670688740502577
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 57.416420746830795,
+      "min_ns": 56.886987509100834,
+      "max_ns": 58.59802095050619,
+      "speedup": 0.18684426061796125
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 26.619951820698468,
+      "min_ns": 26.53280865311147,
+      "max_ns": 26.835427668298127,
+      "speedup": 0.403003309473679
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 15.91079406598442,
+      "min_ns": 15.499428873431533,
+      "max_ns": 16.19819202560514,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 113.13563155989866,
+      "min_ns": 112.87685084868184,
+      "max_ns": 115.81835865135236,
+      "speedup": 0.14063468640788548
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 27.552804289366954,
+      "min_ns": 27.43278863456812,
+      "max_ns": 27.71117995211917,
+      "speedup": 0.5774655058296421
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 85.3076043941048,
+      "min_ns": 84.34565620782726,
+      "max_ns": 86.95246417640512,
+      "speedup": 0.18651085303579265
+    },
+    {
+      "host": "arm",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 44.961493849805784,
+      "min_ns": 44.65239677096728,
+      "max_ns": 45.64194857236746,
+      "speedup": 0.35387601041759315
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 51.802003045748386,
+      "min_ns": 47.93879908728333,
+      "max_ns": 56.79835741548528,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 75.11622055996155,
+      "min_ns": 74.54077852969235,
+      "max_ns": 77.61557921529675,
+      "speedup": 0.6896247263185642
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 14.0394699896671,
+      "min_ns": 13.92495794715266,
+      "max_ns": 16.015164569773997,
+      "speedup": 3.689740644331595
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 57.433790426313855,
+      "min_ns": 56.91427449462757,
+      "max_ns": 73.18770453482936,
+      "speedup": 0.9019429618215619
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 428.70869770233196,
+      "min_ns": 423.2281799729364,
+      "max_ns": 563.893581081081,
+      "speedup": 0.12083263839381304
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 107.90902861705801,
+      "min_ns": 102.77038289214074,
+      "max_ns": 138.10685483870967,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 113.73399404112081,
+      "min_ns": 112.78480241789967,
+      "max_ns": 120.83051072671047,
+      "speedup": 0.9487843061067849
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 24.415740966796875,
+      "min_ns": 24.212122055861162,
+      "max_ns": 24.771164840282182,
+      "speedup": 4.4196499612198625
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 87.16441979224763,
+      "min_ns": 85.82577395661724,
+      "max_ns": 89.65493671113023,
+      "speedup": 1.237993998861625
+    },
+    {
+      "host": "arm",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 641.460169057377,
+      "min_ns": 634.3258747464503,
+      "max_ns": 927.6860626854599,
+      "speedup": 0.1682240516595596
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 4.258613435357926,
+      "min_ns": 4.189267646723685,
+      "max_ns": 4.494243137550633,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 3.528192670170368,
+      "min_ns": 3.508380240083976,
+      "max_ns": 4.03622443460684,
+      "speedup": 1.2070240583409773
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 3.610416955497019,
+      "min_ns": 3.5498200958731383,
+      "max_ns": 3.864529487781955,
+      "speedup": 1.1795350752699074
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 4.2174797056561,
+      "min_ns": 4.172182697827799,
+      "max_ns": 4.324457674291486,
+      "speedup": 1.0097531541519125
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 4.187160844923225,
+      "min_ns": 4.168017724005015,
+      "max_ns": 4.283809544208362,
+      "speedup": 1.0170646872859768
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 189.33680345245307,
+      "min_ns": 186.1851176295414,
+      "max_ns": 279.3166610813226,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 76.5238583496572,
+      "min_ns": 76.07884767526777,
+      "max_ns": 90.68560922083576,
+      "speedup": 2.4742192505156297
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 133.50636747116616,
+      "min_ns": 130.40823816228618,
+      "max_ns": 142.22387539808918,
+      "speedup": 1.4181855670168302
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 97.94657826700094,
+      "min_ns": 97.1251796535115,
+      "max_ns": 99.46246916772756,
+      "speedup": 1.9330619486912928
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 628.2434425200803,
+      "min_ns": 615.4240280511812,
+      "max_ns": 697.8920169821827,
+      "speedup": 0.30137489806971024
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 5.200532577673862,
+      "min_ns": 5.171978956340406,
+      "max_ns": 5.2850985768404675,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 4.100959251397601,
+      "min_ns": 4.029830900937496,
+      "max_ns": 4.136659027731816,
+      "speedup": 1.2681258844260712
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 7.020552633500325,
+      "min_ns": 6.985884482989852,
+      "max_ns": 7.74879855377024,
+      "speedup": 0.7407582919980142
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 4.361637362522331,
+      "min_ns": 4.331248440770052,
+      "max_ns": 4.437372426340078,
+      "speedup": 1.19233492962065
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 6.78211944962889,
+      "min_ns": 6.746103531646662,
+      "max_ns": 6.861525393026524,
+      "speedup": 0.7668004989146023
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 227.27079169694767,
+      "min_ns": 219.38231359649123,
+      "max_ns": 232.42574349442378,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 179.57793653072946,
+      "min_ns": 177.23539363662132,
+      "max_ns": 181.2716701711137,
+      "speedup": 1.2655830448194119
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 504.44808467741933,
+      "min_ns": 492.7052657480315,
+      "max_ns": 525.7757615546218,
+      "speedup": 0.45053356053929927
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 148.47739756532067,
+      "min_ns": 146.40936036299766,
+      "max_ns": 151.3790102905569,
+      "speedup": 1.5306760181930241
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 614.3070358546169,
+      "min_ns": 603.2421724470134,
+      "max_ns": 638.492506377551,
+      "speedup": 0.3699628661761478
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 57.93076054216868,
+      "min_ns": 56.99612723417837,
+      "max_ns": 63.351077979327115,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 68.14065906365816,
+      "min_ns": 66.78059895833333,
+      "max_ns": 72.4710685717598,
+      "speedup": 0.8501643708501377
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 228.0654517687819,
+      "min_ns": 225.86112490968208,
+      "max_ns": 243.49566783489095,
+      "speedup": 0.25400936482435854
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 55.79271353980721,
+      "min_ns": 55.286139549796566,
+      "max_ns": 58.81995518068888,
+      "speedup": 1.0383212585786137
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 184.94166974852072,
+      "min_ns": 177.31598305445263,
+      "max_ns": 195.34708984375,
+      "speedup": 0.31323800969755244
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 177.7925199089875,
+      "min_ns": 175.4778477681078,
+      "max_ns": 189.17804176755448,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 198.235791851617,
+      "min_ns": 195.64616903942428,
+      "max_ns": 201.4185325386598,
+      "speedup": 0.896873961297909
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 706.6770598194131,
+      "min_ns": 687.2009615384616,
+      "max_ns": 739.6895316193853,
+      "speedup": 0.25158948835047973
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 166.57267248268514,
+      "min_ns": 165.75741483297986,
+      "max_ns": 169.9909087819467,
+      "speedup": 1.0673570715956942
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 617.5829943293886,
+      "min_ns": 603.6211993243244,
+      "max_ns": 633.0747722672065,
+      "speedup": 0.28788441641280305
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 7.873006575466707,
+      "min_ns": 7.7401781623074255,
+      "max_ns": 16.6251662499335,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 18.91196293494705,
+      "min_ns": 18.72925000749131,
+      "max_ns": 34.82169742339833,
+      "speedup": 0.4162976948795903
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 24.082070682746398,
+      "min_ns": 23.938684890846417,
+      "max_ns": 27.107537243039292,
+      "speedup": 0.32692398752518087
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 13.890943097968618,
+      "min_ns": 13.76273492205047,
+      "max_ns": 22.36159324686941,
+      "speedup": 0.5667726460284788
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 12.597810887486899,
+      "min_ns": 12.333331483345173,
+      "max_ns": 21.867365168637605,
+      "speedup": 0.6249503700112513
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 43.640703550481774,
+      "min_ns": 43.49529184064022,
+      "max_ns": 44.39281116832387,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 105.759570642978,
+      "min_ns": 104.49904400702107,
+      "max_ns": 108.49300915480735,
+      "speedup": 0.41264070272943504
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 177.03946064552662,
+      "min_ns": 174.45955113002233,
+      "max_ns": 182.36839994165695,
+      "speedup": 0.24650269149802945
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 85.12932869109234,
+      "min_ns": 84.4466655971359,
+      "max_ns": 86.429203539823,
+      "speedup": 0.5126400527465712
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 101.14659182847896,
+      "min_ns": 99.9692598368522,
+      "max_ns": 105.5122700033761,
+      "speedup": 0.43145995096390627
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 22.205035659727155,
+      "min_ns": 22.04393890632715,
+      "max_ns": 22.535393982549756,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 16.39266500340957,
+      "min_ns": 16.25315295402538,
+      "max_ns": 16.70590485673046,
+      "speedup": 1.354571429057365
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 21.795319910378016,
+      "min_ns": 21.51974697872194,
+      "max_ns": 21.916484764008697,
+      "speedup": 1.0187983361122426
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 12.102779109058519,
+      "min_ns": 11.926007837543887,
+      "max_ns": 12.179291988191277,
+      "speedup": 1.8347055217348751
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 67.63676017095867,
+      "min_ns": 66.36449485028669,
+      "max_ns": 68.61536086717892,
+      "speedup": 0.32829833368129563
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 177.66960098067082,
+      "min_ns": 176.63937146892656,
+      "max_ns": 179.1868997276376,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 105.12494218802556,
+      "min_ns": 103.57494615639496,
+      "max_ns": 109.05629034368458,
+      "speedup": 1.6900803680147811
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 176.41906214729119,
+      "min_ns": 173.04009205426357,
+      "max_ns": 201.03371181672026,
+      "speedup": 1.00708845641825
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 83.8846031266774,
+      "min_ns": 83.60851809122525,
+      "max_ns": 85.64257758975062,
+      "speedup": 2.1180239800665808
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 601.959375,
+      "min_ns": 591.9346939981097,
+      "max_ns": 623.691421812749,
+      "speedup": 0.29515214540959817
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 10.937349612382752,
+      "min_ns": 10.647899523833862,
+      "max_ns": 12.049562841924796,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 76.39339785504767,
+      "min_ns": 74.38034715611613,
+      "max_ns": 98.93835514868712,
+      "speedup": 0.14317139856949132
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 17.206433762801453,
+      "min_ns": 16.06562146565906,
+      "max_ns": 28.63115981447549,
+      "speedup": 0.6356546489039572
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 58.21547247578241,
+      "min_ns": 57.44927906709559,
+      "max_ns": 59.379007932737984,
+      "speedup": 0.18787702215991942
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 26.896946811257422,
+      "min_ns": 26.264516713589376,
+      "max_ns": 30.061641797325894,
+      "speedup": 0.4066390765142549
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 16.2153358823682,
+      "min_ns": 15.768190404409909,
+      "max_ns": 21.510232396062776,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 116.37672770848846,
+      "min_ns": 112.32094412504492,
+      "max_ns": 185.31262040604625,
+      "speedup": 0.13933486704477482
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 28.71612405816411,
+      "min_ns": 27.419089423583085,
+      "max_ns": 41.83023315151921,
+      "speedup": 0.5646770382216021
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 89.00325224231207,
+      "min_ns": 85.73340218732858,
+      "max_ns": 101.91635759700033,
+      "speedup": 0.18218812766776002
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 46.86474968136152,
+      "min_ns": 44.86878140703518,
+      "max_ns": 52.083658854166664,
+      "speedup": 0.34600282712738284
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 51.8609878028543,
+      "min_ns": 48.23727378839327,
+      "max_ns": 77.90252290004985,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 83.40387309847878,
+      "min_ns": 74.37771448119943,
+      "max_ns": 94.18873850964437,
+      "speedup": 0.6218055094590109
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 14.655197394636913,
+      "min_ns": 13.911900012241809,
+      "max_ns": 16.08672172603727,
+      "speedup": 3.5387437239045916
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 57.84377891911901,
+      "min_ns": 56.51724400994575,
+      "max_ns": 86.45365231673583,
+      "speedup": 0.896569843325239
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "prefix8",
+      "median_ns": 433.3169148199446,
+      "min_ns": 413.58887235449737,
+      "max_ns": 638.4499681122448,
+      "speedup": 0.11968373730437917
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 99.66646902901786,
+      "min_ns": 95.60095786173142,
+      "max_ns": 106.45906420299727,
+      "speedup": 1.0
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 114.66214233308878,
+      "min_ns": 112.87896691043699,
+      "max_ns": 130.91774455383327,
+      "speedup": 0.8692186191628174
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 24.657143737672584,
+      "min_ns": 24.05962136230657,
+      "max_ns": 28.29585228815861,
+      "speedup": 4.0420930375946895
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 86.96731966471897,
+      "min_ns": 85.01831984494015,
+      "max_ns": 90.1657034405655,
+      "speedup": 1.1460220852299154
+    },
+    {
+      "host": "arm-repeat",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "prefix8",
+      "median_ns": 633.31066548583,
+      "min_ns": 615.0757612966601,
+      "max_ns": 643.4850180041152,
+      "speedup": 0.15737374160999007
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 13.541005892802982,
+      "min_ns": 13.477042274021045,
+      "max_ns": 13.632168387934042,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 11.418008997077091,
+      "min_ns": 11.388055375883681,
+      "max_ns": 11.500697498435947,
+      "speedup": 1.1859340710161779
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 11.69945785444199,
+      "min_ns": 11.684733711908768,
+      "max_ns": 11.756785862081939,
+      "speedup": 1.1574045619269275
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 11.759918646985776,
+      "min_ns": 11.69743201639467,
+      "max_ns": 11.850815320439894,
+      "speedup": 1.1514540448180501
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 870.1385416666667,
+      "min_ns": 868.2407552083333,
+      "max_ns": 872.5292914345404,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 147.73337074669186,
+      "min_ns": 147.21180228450305,
+      "max_ns": 148.35712060987186,
+      "speedup": 5.8899254600954905
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 203.25499837451235,
+      "min_ns": 202.90296479558728,
+      "max_ns": 205.24583470124753,
+      "speedup": 4.2810191563573365
+    },
+    {
+      "host": "x86",
+      "shape": "identical",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 199.1139331210191,
+      "min_ns": 198.2238031071655,
+      "max_ns": 199.32195671237244,
+      "speedup": 4.370053506691602
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 17.303049388184487,
+      "min_ns": 17.28296614036058,
+      "max_ns": 17.337123786407766,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 11.837035647323965,
+      "min_ns": 11.782625574972664,
+      "max_ns": 11.969695591389613,
+      "speedup": 1.4617721787545888
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 16.30865449848659,
+      "min_ns": 16.245444163590996,
+      "max_ns": 16.425880420499343,
+      "speedup": 1.060973447551432
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 11.772523662648332,
+      "min_ns": 11.738710582413042,
+      "max_ns": 11.886031753955576,
+      "speedup": 1.469782510871761
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 874.3808484636871,
+      "min_ns": 872.8329126044569,
+      "max_ns": 879.5977001404494,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 893.8722767857142,
+      "min_ns": 889.3465465198864,
+      "max_ns": 900.5448096264367,
+      "speedup": 0.9781943921651575
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 980.1610501567399,
+      "min_ns": 947.305634469697,
+      "max_ns": 1025.9994364754098,
+      "speedup": 0.8920787541229708
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_dense",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 290.91723837209304,
+      "min_ns": 287.01694501836545,
+      "max_ns": 295.4037689035917,
+      "speedup": 3.005599989043359
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 293.434521713615,
+      "min_ns": 292.8582192181648,
+      "max_ns": 295.5290642722117,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 223.32622767857143,
+      "min_ns": 218.01995074965131,
+      "max_ns": 237.98230593607306,
+      "speedup": 1.3139277225241495
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 309.36643793273987,
+      "min_ns": 308.51911093287265,
+      "max_ns": 312.9470095095095,
+      "speedup": 0.9485014718287293
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 99.10605084812936,
+      "min_ns": 98.6886298152826,
+      "max_ns": 100.02561,
+      "speedup": 2.960813383264314
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 867.318949099723,
+      "min_ns": 865.5047047651934,
+      "max_ns": 870.5346883704735,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 989.5084058544304,
+      "min_ns": 982.7384040880503,
+      "max_ns": 1000.6489117412141,
+      "speedup": 0.8765149886228626
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 1079.167349137931,
+      "min_ns": 1064.179474914966,
+      "max_ns": 1113.501890569395,
+      "speedup": 0.8036927264270565
+    },
+    {
+      "host": "x86",
+      "shape": "balanced_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 294.5919238925542,
+      "min_ns": 293.62803697183097,
+      "max_ns": 296.3484152843602,
+      "speedup": 2.9441368848117446
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 23.16381291231191,
+      "min_ns": 23.080132939438702,
+      "max_ns": 23.26266608977222,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 31.38110942363691,
+      "min_ns": 31.22176261238761,
+      "max_ns": 31.515959056070997,
+      "speedup": 0.7381451241766628
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 40.57736018242015,
+      "min_ns": 40.50559178548283,
+      "max_ns": 40.80335634547591,
+      "speedup": 0.5708555906095505
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 29.521980682032872,
+      "min_ns": 29.35516860792786,
+      "max_ns": 30.452409374390957,
+      "speedup": 0.7846293635172469
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 158.1759552125506,
+      "min_ns": 157.8866240530303,
+      "max_ns": 159.22125732297505,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 199.16646098726116,
+      "min_ns": 193.37953473081683,
+      "max_ns": 212.31935716711956,
+      "speedup": 0.7941897166243651
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 255.5886396156991,
+      "min_ns": 255.0944127243067,
+      "max_ns": 260.21772221065777,
+      "speedup": 0.618869271538761
+    },
+    {
+      "host": "x86",
+      "shape": "left_8x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 166.20660552897394,
+      "min_ns": 165.63522621886594,
+      "max_ns": 167.77142881105743,
+      "speedup": 0.951682724697585
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 121.67109040482678,
+      "min_ns": 121.55794194865811,
+      "max_ns": 123.55697257905139,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 37.583833122895626,
+      "min_ns": 31.325968477498247,
+      "max_ns": 48.43077589880676,
+      "speedup": 3.2373252086069475
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 37.42444018680398,
+      "min_ns": 37.15636703424087,
+      "max_ns": 68.31910519125682,
+      "speedup": 3.2511131708986403
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 26.196466366303437,
+      "min_ns": 26.041689234230482,
+      "max_ns": 28.79217915054358,
+      "speedup": 4.644561167277604
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 935.9779191616766,
+      "min_ns": 931.1194661458334,
+      "max_ns": 938.9739583333334,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 196.5145938089252,
+      "min_ns": 183.0824545987112,
+      "max_ns": 290.81861918604653,
+      "speedup": 4.762892673873093
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 256.7589029146141,
+      "min_ns": 254.29222182668838,
+      "max_ns": 362.731094112529,
+      "speedup": 3.6453572146354696
+    },
+    {
+      "host": "x86",
+      "shape": "right_8x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 167.73745138143778,
+      "min_ns": 167.2606841894061,
+      "max_ns": 168.15464463421193,
+      "speedup": 5.580017530093784
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 35.372106677985286,
+      "min_ns": 35.27265977708804,
+      "max_ns": 35.4722190692395,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 117.19495219347581,
+      "min_ns": 116.41053305400372,
+      "max_ns": 117.89922434930214,
+      "speedup": 0.3018227834556379
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 31.192596566523605,
+      "min_ns": 31.11685222294135,
+      "max_ns": 31.28189595845846,
+      "speedup": 1.1339904519506143
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 99.36476053259142,
+      "min_ns": 99.16152938610406,
+      "max_ns": 99.84263178913739,
+      "speedup": 0.3559824075295116
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 59.263607437428895,
+      "min_ns": 59.16121581014575,
+      "max_ns": 59.36259793447294,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 177.56655717329545,
+      "min_ns": 176.84911446549773,
+      "max_ns": 178.84750429061785,
+      "speedup": 0.3337543306625627
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 49.3004786835463,
+      "min_ns": 49.2213808276894,
+      "max_ns": 49.44260945657333,
+      "speedup": 1.202089898920347
+    },
+    {
+      "host": "x86",
+      "shape": "left_64x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 150.8028822961891,
+      "min_ns": 150.3589992183742,
+      "max_ns": 151.26296285091965,
+      "speedup": 0.3929872329696614
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "production",
+      "median_ns": 592.4253669507576,
+      "min_ns": 591.1892426748582,
+      "max_ns": 598.4451481835564,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "scalar",
+      "median_ns": 105.91353566587597,
+      "min_ns": 104.8960360738255,
+      "max_ns": 106.82196791695146,
+      "speedup": 5.593481165803718
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "gallop",
+      "median_ns": 28.215674656915855,
+      "min_ns": 28.203092568360255,
+      "max_ns": 28.28225537330317,
+      "speedup": 20.996321163830476
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 1,
+      "method": "cross4",
+      "median_ns": 100.34400080256822,
+      "min_ns": 99.91327325767263,
+      "max_ns": 101.17982154418905,
+      "speedup": 5.903944054576654
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "production",
+      "median_ns": 910.2950127180233,
+      "min_ns": 908.0088768115942,
+      "max_ns": 929.4699554896142,
+      "speedup": 1.0
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "scalar",
+      "median_ns": 161.4032976251936,
+      "min_ns": 160.00696487973389,
+      "max_ns": 161.8990322371828,
+      "speedup": 5.639878652491263
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "gallop",
+      "median_ns": 45.86014306676449,
+      "min_ns": 45.768718878148796,
+      "max_ns": 46.825219602187595,
+      "speedup": 19.84937141152809
+    },
+    {
+      "host": "x86",
+      "shape": "right_64x_sparse",
+      "capacity": 128,
+      "method": "cross4",
+      "median_ns": 151.0802999637506,
+      "min_ns": 150.45865430909967,
+      "max_ns": 152.94372248043052,
+      "speedup": 6.025239643662572
+    }
+  ],
+  "unions": [
+    {
+      "host": "arm",
+      "shape": "sparse_2",
+      "method": "sort",
+      "median_us": 0.5063759578705735,
+      "min_us": 0.4938003489367305,
+      "max_us": 0.6477287447644544,
+      "scratch_payload_bound_bytes": 512
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_2",
+      "method": "bitmap",
+      "median_us": 2.845480842185129,
+      "min_us": 2.7775334197370856,
+      "max_us": 3.2066146612524045,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_2",
+      "method": "heap",
+      "median_us": 0.8565304059841261,
+      "min_us": 0.7982050231469164,
+      "max_us": 0.8990774394629585,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_2",
+      "method": "windows",
+      "median_us": 0.5610117809858629,
+      "min_us": 0.5542653438273658,
+      "max_us": 0.5810366439417416,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "arm",
+      "shape": "medium_2",
+      "method": "sort",
+      "median_us": 54.44489855072464,
+      "min_us": 53.83691756272401,
+      "max_us": 54.912562043795624,
+      "scratch_payload_bound_bytes": 32768
+    },
+    {
+      "host": "arm",
+      "shape": "medium_2",
+      "method": "bitmap",
+      "median_us": 6.649804078014185,
+      "min_us": 6.562773403324584,
+      "max_us": 9.715322538860104,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "medium_2",
+      "method": "heap",
+      "median_us": 55.595218518518514,
+      "min_us": 53.13707067137809,
+      "max_us": 62.59704583333333,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "arm",
+      "shape": "medium_2",
+      "method": "windows",
+      "median_us": 5.401992437882607,
+      "min_us": 5.089764246947083,
+      "max_us": 8.104841252699783,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "arm",
+      "shape": "dense_2",
+      "method": "sort",
+      "median_us": 2382.6665714285714,
+      "min_us": 2346.6725714285712,
+      "max_us": 2451.595285714286,
+      "scratch_payload_bound_bytes": 1048576
+    },
+    {
+      "host": "arm",
+      "shape": "dense_2",
+      "method": "bitmap",
+      "median_us": 424.60186111111113,
+      "min_us": 420.6828888888889,
+      "max_us": 443.5441176470588,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "dense_2",
+      "method": "heap",
+      "median_us": 1705.3147777777779,
+      "min_us": 1628.5792,
+      "max_us": 1746.310111111111,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "arm",
+      "shape": "dense_2",
+      "method": "windows",
+      "median_us": 309.0297755102041,
+      "min_us": 303.115,
+      "max_us": 315.34375,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_2",
+      "method": "sort",
+      "median_us": 55.0187728937729,
+      "min_us": 54.40307971014493,
+      "max_us": 61.266497959183674,
+      "scratch_payload_bound_bytes": 32768
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_2",
+      "method": "bitmap",
+      "median_us": 6.708351810460438,
+      "min_us": 6.641581673306773,
+      "max_us": 8.31379180509413,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_2",
+      "method": "heap",
+      "median_us": 54.71469818181818,
+      "min_us": 53.77589285714286,
+      "max_us": 67.10844196428572,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_2",
+      "method": "windows",
+      "median_us": 5.213139680333565,
+      "min_us": 5.136440260184868,
+      "max_us": 6.099305691056911,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_8",
+      "method": "sort",
+      "median_us": 2.0888977858237014,
+      "min_us": 2.084920083391244,
+      "max_us": 2.1275173734222093,
+      "scratch_payload_bound_bytes": 2048
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_8",
+      "method": "bitmap",
+      "median_us": 3.3320097734340295,
+      "min_us": 3.2606137796131276,
+      "max_us": 3.428035648994516,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_8",
+      "method": "heap",
+      "median_us": 4.5849251222493885,
+      "min_us": 4.566387519025875,
+      "max_us": 4.625179716399507,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_8",
+      "method": "windows",
+      "median_us": 1.0520672604853416,
+      "min_us": 1.039708691433324,
+      "max_us": 1.0694405075925002,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "arm",
+      "shape": "medium_8",
+      "method": "sort",
+      "median_us": 218.36956521739128,
+      "min_us": 214.39464285714286,
+      "max_us": 223.45832352941179,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "medium_8",
+      "method": "bitmap",
+      "median_us": 18.1237922705314,
+      "min_us": 17.626271126760564,
+      "max_us": 18.344132029339853,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "medium_8",
+      "method": "heap",
+      "median_us": 293.4847884615384,
+      "min_us": 287.88049056603774,
+      "max_us": 297.8962549019608,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "arm",
+      "shape": "medium_8",
+      "method": "windows",
+      "median_us": 18.02666026410564,
+      "min_us": 17.482634458672873,
+      "max_us": 18.456539975399757,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "arm",
+      "shape": "dense_8",
+      "method": "sort",
+      "median_us": 10408.417,
+      "min_us": 10314.333,
+      "max_us": 10500.292,
+      "scratch_payload_bound_bytes": 4194304
+    },
+    {
+      "host": "arm",
+      "shape": "dense_8",
+      "method": "bitmap",
+      "median_us": 1734.2315555555556,
+      "min_us": 1719.8286666666668,
+      "max_us": 1798.2962222222222,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "dense_8",
+      "method": "heap",
+      "median_us": 9408.292,
+      "min_us": 9357.229,
+      "max_us": 9532.458,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "arm",
+      "shape": "dense_8",
+      "method": "windows",
+      "median_us": 1246.0512307692306,
+      "min_us": 1220.2628461538463,
+      "max_us": 1258.9375,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_8",
+      "method": "sort",
+      "median_us": 211.8139718309859,
+      "min_us": 210.00752777777777,
+      "max_us": 217.09582857142857,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_8",
+      "method": "bitmap",
+      "median_us": 17.961972488038278,
+      "min_us": 17.525428238039673,
+      "max_us": 18.128774154589372,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_8",
+      "method": "heap",
+      "median_us": 316.5329791666667,
+      "min_us": 315.62675,
+      "max_us": 324.6267659574468,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_8",
+      "method": "windows",
+      "median_us": 18.156338573155985,
+      "min_us": 18.095446320868515,
+      "max_us": 19.88763841059603,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_32",
+      "method": "sort",
+      "median_us": 10.330035788024775,
+      "min_us": 10.28829677861549,
+      "max_us": 10.390668282548477,
+      "scratch_payload_bound_bytes": 8192
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_32",
+      "method": "bitmap",
+      "median_us": 4.6996528822055135,
+      "min_us": 4.5971881703953414,
+      "max_us": 4.864961413748379,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_32",
+      "method": "heap",
+      "median_us": 20.571460273972605,
+      "min_us": 20.299166441136673,
+      "max_us": 20.925557880055788,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "arm",
+      "shape": "sparse_32",
+      "method": "windows",
+      "median_us": 5.150603844833505,
+      "min_us": 5.144504458161866,
+      "max_us": 5.209649652777778,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "arm",
+      "shape": "medium_32",
+      "method": "sort",
+      "median_us": 1092.4672142857144,
+      "min_us": 1040.3638666666668,
+      "max_us": 1228.391,
+      "scratch_payload_bound_bytes": 524288
+    },
+    {
+      "host": "arm",
+      "shape": "medium_32",
+      "method": "bitmap",
+      "median_us": 64.0124085106383,
+      "min_us": 62.38053112033195,
+      "max_us": 72.03289473684211,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "medium_32",
+      "method": "heap",
+      "median_us": 1305.7708333333333,
+      "min_us": 1296.1735833333332,
+      "max_us": 2056.026125,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "arm",
+      "shape": "medium_32",
+      "method": "windows",
+      "median_us": 85.87714285714286,
+      "min_us": 83.71527777777779,
+      "max_us": 101.18791946308725,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "arm",
+      "shape": "dense_32",
+      "method": "sort",
+      "median_us": 44543.083,
+      "min_us": 43987.459,
+      "max_us": 45542.083,
+      "scratch_payload_bound_bytes": 16777216
+    },
+    {
+      "host": "arm",
+      "shape": "dense_32",
+      "method": "bitmap",
+      "median_us": 3218.0832,
+      "min_us": 3004.8334,
+      "max_us": 3512.7084,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "dense_32",
+      "method": "heap",
+      "median_us": 63955.166,
+      "min_us": 63232.042,
+      "max_us": 65362.75,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "arm",
+      "shape": "dense_32",
+      "method": "windows",
+      "median_us": 4936.427,
+      "min_us": 4825.58325,
+      "max_us": 5149.402666666667,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_32",
+      "method": "sort",
+      "median_us": 928.3161764705882,
+      "min_us": 925.2352941176471,
+      "max_us": 946.234375,
+      "scratch_payload_bound_bytes": 524288
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_32",
+      "method": "bitmap",
+      "median_us": 63.10364285714285,
+      "min_us": 62.17613636363636,
+      "max_us": 63.94734042553192,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_32",
+      "method": "heap",
+      "median_us": 1963.9635,
+      "min_us": 1944.765625,
+      "max_us": 2041.21875,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "arm",
+      "shape": "overlap_32",
+      "method": "windows",
+      "median_us": 88.61372941176471,
+      "min_us": 86.06309714285713,
+      "max_us": 89.89396407185629,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_2",
+      "method": "sort",
+      "median_us": 0.9618528374479001,
+      "min_us": 0.9448607331821618,
+      "max_us": 0.9712641802641803,
+      "scratch_payload_bound_bytes": 512
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_2",
+      "method": "bitmap",
+      "median_us": 5.74249674703406,
+      "min_us": 5.684135657446002,
+      "max_us": 5.7804003853564545,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_2",
+      "method": "heap",
+      "median_us": 1.6710995878355797,
+      "min_us": 1.6669028780975663,
+      "max_us": 1.672982156797145,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_2",
+      "method": "windows",
+      "median_us": 2.1884910284463897,
+      "min_us": 2.1801281790437437,
+      "max_us": 2.213239156093243,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "x86",
+      "shape": "medium_2",
+      "method": "sort",
+      "median_us": 98.5769477124183,
+      "min_us": 97.68231818181818,
+      "max_us": 99.89858940397352,
+      "scratch_payload_bound_bytes": 32768
+    },
+    {
+      "host": "x86",
+      "shape": "medium_2",
+      "method": "bitmap",
+      "median_us": 11.390722854973424,
+      "min_us": 11.356482967448903,
+      "max_us": 11.453357251908397,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "medium_2",
+      "method": "heap",
+      "median_us": 103.6565172413793,
+      "min_us": 103.40650684931508,
+      "max_us": 103.90729655172414,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "x86",
+      "shape": "medium_2",
+      "method": "windows",
+      "median_us": 13.96940223463687,
+      "min_us": 13.917111317254173,
+      "max_us": 14.02981308411215,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "x86",
+      "shape": "dense_2",
+      "method": "sort",
+      "median_us": 4498.89025,
+      "min_us": 4472.582,
+      "max_us": 4542.7415,
+      "scratch_payload_bound_bytes": 1048576
+    },
+    {
+      "host": "x86",
+      "shape": "dense_2",
+      "method": "bitmap",
+      "median_us": 238.86515873015873,
+      "min_us": 238.62525396825396,
+      "max_us": 246.18329508196723,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "dense_2",
+      "method": "heap",
+      "median_us": 3338.8214,
+      "min_us": 3330.9892,
+      "max_us": 3348.8192000000004,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "x86",
+      "shape": "dense_2",
+      "method": "windows",
+      "median_us": 334.81031111111116,
+      "min_us": 334.2312888888889,
+      "max_us": 336.4741555555555,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_2",
+      "method": "sort",
+      "median_us": 96.00957324840765,
+      "min_us": 95.22256962025317,
+      "max_us": 96.81794193548387,
+      "scratch_payload_bound_bytes": 32768
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_2",
+      "method": "bitmap",
+      "median_us": 11.275510142749813,
+      "min_us": 11.21290284005979,
+      "max_us": 11.385911987860394,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_2",
+      "method": "heap",
+      "median_us": 104.30965277777779,
+      "min_us": 103.74980689655173,
+      "max_us": 104.50295833333332,
+      "scratch_payload_bound_bytes": 96
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_2",
+      "method": "windows",
+      "median_us": 13.973864059590316,
+      "min_us": 13.916683673469388,
+      "max_us": 14.071541275797374,
+      "scratch_payload_bound_bytes": 528
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_8",
+      "method": "sort",
+      "median_us": 4.194742170022371,
+      "min_us": 4.164804275402553,
+      "max_us": 4.249538243626063,
+      "scratch_payload_bound_bytes": 2048
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_8",
+      "method": "bitmap",
+      "median_us": 6.97923488372093,
+      "min_us": 6.873092991296381,
+      "max_us": 7.4481792452830184,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_8",
+      "method": "heap",
+      "median_us": 7.299057879377432,
+      "min_us": 7.2651578692493946,
+      "max_us": 7.480048354935195,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_8",
+      "method": "windows",
+      "median_us": 2.739349707815924,
+      "min_us": 2.7223032117583017,
+      "max_us": 2.7463178322958623,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "x86",
+      "shape": "medium_8",
+      "method": "sort",
+      "median_us": 445.8646764705883,
+      "min_us": 443.7156176470588,
+      "max_us": 447.43585294117645,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "medium_8",
+      "method": "bitmap",
+      "median_us": 28.947082851637767,
+      "min_us": 28.62677099236641,
+      "max_us": 29.916480079681275,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "medium_8",
+      "method": "heap",
+      "median_us": 482.95846875,
+      "min_us": 481.7050625,
+      "max_us": 488.25822580645166,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "x86",
+      "shape": "medium_8",
+      "method": "windows",
+      "median_us": 43.727098837209304,
+      "min_us": 43.64641860465116,
+      "max_us": 43.84039067055394,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "x86",
+      "shape": "dense_8",
+      "method": "sort",
+      "median_us": 18747.415,
+      "min_us": 18713.575,
+      "max_us": 18915.324,
+      "scratch_payload_bound_bytes": 4194304
+    },
+    {
+      "host": "x86",
+      "shape": "dense_8",
+      "method": "bitmap",
+      "median_us": 964.282875,
+      "min_us": 959.9606875,
+      "max_us": 966.8898125,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "dense_8",
+      "method": "heap",
+      "median_us": 15404.913,
+      "min_us": 15066.538,
+      "max_us": 15449.962,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "x86",
+      "shape": "dense_8",
+      "method": "windows",
+      "median_us": 1371.3251818181818,
+      "min_us": 1363.821181818182,
+      "max_us": 1384.837181818182,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_8",
+      "method": "sort",
+      "median_us": 396.72957894736845,
+      "min_us": 395.3708947368421,
+      "max_us": 402.00415789473686,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_8",
+      "method": "bitmap",
+      "median_us": 29.995165668662676,
+      "min_us": 29.446460784313725,
+      "max_us": 31.409939330543935,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_8",
+      "method": "heap",
+      "median_us": 522.5812068965517,
+      "min_us": 521.4206206896552,
+      "max_us": 525.3532413793104,
+      "scratch_payload_bound_bytes": 192
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_8",
+      "method": "windows",
+      "median_us": 43.716302325581395,
+      "min_us": 43.66857848837209,
+      "max_us": 43.92988011695907,
+      "scratch_payload_bound_bytes": 576
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_32",
+      "method": "sort",
+      "median_us": 18.535823456790123,
+      "min_us": 18.510038224414306,
+      "max_us": 18.56377255871446,
+      "scratch_payload_bound_bytes": 8192
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_32",
+      "method": "bitmap",
+      "median_us": 11.24340149812734,
+      "min_us": 11.191419090231172,
+      "max_us": 11.509446319018405,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_32",
+      "method": "heap",
+      "median_us": 30.65502244897959,
+      "min_us": 30.494589430894308,
+      "max_us": 30.808562628336755,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "sparse_32",
+      "method": "windows",
+      "median_us": 7.649306476287609,
+      "min_us": 7.592339574898785,
+      "max_us": 7.696923550538738,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "medium_32",
+      "method": "sort",
+      "median_us": 2109.68875,
+      "min_us": 2097.438625,
+      "max_us": 2138.832625,
+      "scratch_payload_bound_bytes": 524288
+    },
+    {
+      "host": "x86",
+      "shape": "medium_32",
+      "method": "bitmap",
+      "median_us": 101.44574324324324,
+      "min_us": 99.6644238410596,
+      "max_us": 104.57797222222221,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "medium_32",
+      "method": "heap",
+      "median_us": 1986.468625,
+      "min_us": 1983.526875,
+      "max_us": 1998.859,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "medium_32",
+      "method": "windows",
+      "median_us": 188.44154999999998,
+      "min_us": 188.0952,
+      "max_us": 189.36283749999998,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "dense_32",
+      "method": "sort",
+      "median_us": 80668.079,
+      "min_us": 80200.107,
+      "max_us": 81671.937,
+      "scratch_payload_bound_bytes": 16777216
+    },
+    {
+      "host": "x86",
+      "shape": "dense_32",
+      "method": "bitmap",
+      "median_us": 4093.69475,
+      "min_us": 4056.9475,
+      "max_us": 4125.67,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "dense_32",
+      "method": "heap",
+      "median_us": 70426.386,
+      "min_us": 69661.245,
+      "max_us": 70700.165,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "dense_32",
+      "method": "windows",
+      "median_us": 5681.025666666667,
+      "min_us": 5658.042333333333,
+      "max_us": 5732.363333333333,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_32",
+      "method": "sort",
+      "median_us": 1630.1188,
+      "min_us": 1595.2147,
+      "max_us": 1646.3001000000002,
+      "scratch_payload_bound_bytes": 524288
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_32",
+      "method": "bitmap",
+      "median_us": 100.96470469798658,
+      "min_us": 99.89488741721854,
+      "max_us": 104.20406944444444,
+      "scratch_payload_bound_bytes": 131072
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_32",
+      "method": "heap",
+      "median_us": 2588.3363333333336,
+      "min_us": 2575.858,
+      "max_us": 2617.558,
+      "scratch_payload_bound_bytes": 768
+    },
+    {
+      "host": "x86",
+      "shape": "overlap_32",
+      "method": "windows",
+      "median_us": 189.09611249999998,
+      "min_us": 188.7595,
+      "max_us": 190.99017721518987,
+      "scratch_payload_bound_bytes": 768
+    }
+  ]
+}

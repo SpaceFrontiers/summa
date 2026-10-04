@@ -1,0 +1,47 @@
+{
+  "baseline": "8f9c3f667928216a52037d16cfa906c593ef0c7a",
+  "simd_source_sha256": "3fa92783b970e4a07ed5cdc36311e80599d4d2bfba7ddef4bcecb0396aad3506",
+  "extracted_sha256": "908ac34ef395c079e7477a3ee65756b1156cad4549ac28af6b70e814a75fb924",
+  "screen_sha256": "0abd2d3f68ff94f2cf5cf74b7a538454e99fb1f7d6a8b03f951f917a2a49455d",
+  "compiler": "rustc 1.98.1, LLVM 22.1.8",
+  "flags": "--edition 2024 -O -C target-cpu=native",
+  "x86_affinity": "CPU 2; 32-vCPU Cascade Lake n2 VM",
+  "arm_affinity": "OS scheduled; Apple M4 desktop; no builds during timing",
+  "intersection_correctness": {
+    "arm_cases": 5529600,
+    "x86_cases": 4423680
+  },
+  "union_correctness": {
+    "workload_oracles_per_host": 12,
+    "boundary_oracles_per_host": 5
+  },
+  "native_validation": {
+    "passed": 2166,
+    "ignored": 25,
+    "failed": 0,
+    "run": "20261003T051341.450382Z-check"
+  },
+  "production_source_changed": false,
+  "files": {
+    "arm.csv": "d74ec7c9e0d40ab0d829b47953a94bed449b4584f3966cdb84eebc4e0648449e",
+    "arm-repeat.csv": "f4f016bc1f6b15e74c68f1ecefe018d51a5369206d0a7866a22c03a5f2734b98",
+    "x86.csv": "2263c3c85acdb266a09abc85a60b85fd55e1bc0421b726ab1fc402511db78602",
+    "arm-union.csv": "8429090b58fa8bbe47f7e3483ba5d597e40c576e4eb0ca2b71ee487de328f3e5",
+    "x86-union.csv": "493a48028d22a036d7878fa2cfb1c70bd615f60b33fdebe29853434a21b94f66",
+    "arm.log": "78d35fe7106103627a72a71a55cd42059391da0193d39168dbca4a5b96be6321",
+    "arm-repeat.log": "c1ac353708bb2e50d8537ae319dba8ccb5dac08c38f76c9bbfbde0b28f6406e2",
+    "x86.log": "c7435a52e3e15c2fbf74d4ac4288a0a2324d196a157ce7ad34fd76ebcb6a3a0e",
+    "arm-union.log": "ee3d9171b57e2fcce755bc94cdd021c77e0f52a9d5d18272d5e22b186e68f296",
+    "x86-union.log": "1851251d593b679efc045f0f893ec0d9123fa8af660abee79fcb1749b198e1b7",
+    "intersection-screen.rs.txt": "0abd2d3f68ff94f2cf5cf74b7a538454e99fb1f7d6a8b03f951f917a2a49455d",
+    "union-screen.rs.txt": "563dad1422355de9bd6f9db387008c6b12db24fa86631a9a54c5cee993736fb4",
+    "arm-host.txt": "23d6f15bdae3271820204748ea5238fb81c268248bebd5ae70c118e8fea1998d",
+    "x86-host.txt": "529d38ea9c615bba5cd9c556506f37fb18fd143004338201c570bc1f875e2b06",
+    "check.log": "4ab0e26ac4946d23feea0076fdf9c8ba938d8b0278b02d4b41301fa53be78b70",
+    "summarize.py": "71cfba60fff551e5940916d87076249d573c929bda95db8fcb4a08ec4ba9cd5c",
+    "results.json": "a4990cb414acde8a5a0095ffb5db270a64baa3f56555b4d27d072ecba0548282",
+    "table.md": "192d46a7a2731ecbb8f4cabc2170647e09d75e7c94807855bbaa6d2520aad572",
+    "sources.json": "41bd26023d527d7bb1b647336a050308630c1c9903cc2cdaa8259113aeeb2bec",
+    "cloud-final.json": "2a10467b91c6f4c6dea004b1a475731cd4c4ff14d3e2ec466d83504270ba7f52"
+  }
+}

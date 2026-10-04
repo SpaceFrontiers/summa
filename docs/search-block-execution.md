@@ -32,6 +32,24 @@ The counted-result handoff is explicit: arbitrary wrappers cannot request a
 truncated child stream and lose its omitted count. Budgeted plans do not promise
 an exact count. Tests cover wrappers, filters, deadlines, duplicates and codecs.
 
+## Adaptive x86 intersection (October 3)
+
+The [conditional-dispatch experiment](benchmark-results/posting-dispatch-2026-10-03/README.md)
+selects a format-preserving x86 AVX2 hybrid. At least 16 remaining IDs per side
+and local mean gaps within a factor of two select 4×4 comparisons; other suffixes
+use exponential/binary search over eight-ID group maxima and SIMD equality.
+The bulk loops run inside one AVX2 target-feature function, avoiding repeated
+feature checks there. Both paths preserve original TF/position ordinals,
+bounded output and resumable cursors, with the existing portable tail.
+
+ARM, WASM and non-AVX2 execution keep their existing kernel. There is no heap
+allocation, persisted-byte change, second scorer or additional public capability.
+Unpruned multi-term AND is the main beneficiary; bitmap and frequency-pruned
+conjunction probes retain their existing policies. Matched generic-release
+measurements reduce multi-term AND latency 5.9–7.4% on the default and RGB x86
+indexes. The complete table retains smaller exact-phrase regressions rather
+than promising a gain for every query family.
+
 ## Final confirmation
 
 **Summa beats Tantivy on all four commands of the official 962-query workload
@@ -189,3 +207,43 @@ x86 top-10 by 9.6% and ARM by 2.6%. The retained use is confined to candidate-ba
 membership. Intermediate stage numbers are experiments, not multiplicative gains.
 
 See the [verified evidence archive](benchmark-results/block-execution-2026-09-16/README.md) for exact source/binary/index hashes, raw samples, profiles, memory mappings and reproduction scripts.
+
+## Density-gated later-clause intersection (October 3–4)
+
+The [follow-up experiment](benchmark-results/posting-opportunities-2026-10-03/README.md)
+adds batched membership checks on x86 and aarch64 for later ranked-conjunction clauses when at least
+16 candidates remain and their local density predicts at least 32 candidates per
+current posting-block span. The gate uses bounded `u64` arithmetic on existing
+block endpoints. It is only a cost hint; membership remains exact. Sparse and
+short batches use the existing cursor seeks. WASM retains those seeks. The initial
+shared-Mac ARM measurement was inconclusive; a dedicated Ampere Altra follow-up
+on both 10M-document layouts establishes an ARM benefit (18–21% lower latency
+for the 26 targeted multi-term queries), so aarch64 now uses the same gate.
+
+The implementation stays in `query/scoring/conjunction.rs` and reuses the shared
+decoded-block ordinal-pair primitive. In-place compaction preserves original TF
+row identities and canonical score reduction. Deferred TFs are decoded only for
+matching blocks; cursor advancement and budget checks use the existing protocol.
+One 256-byte stack pair array bounds additional scratch, with no new allocation,
+persisted metadata, format or public API. The multi-term branch is excluded from
+the pruned specialization, whose admission already requires exactly two terms.
+
+Adaptive clause order, transient BSR, input swapping and AVX-512 mask emulation
+remain experiments in the evidence archive. The complete table records their
+costs and the selected path's per-family tradeoffs. Isolated primitive gains do
+not establish an application gain; union and count-only policies are unchanged.
+
+The decoded-block primitive's resume contract spans calls: when one input ends,
+the other input must retain unmatched IDs that can match the next supplied
+block. A new cross-block regression covers this explicitly after experimental
+BSR conversion violated it by consuming a complete terminal state group. That
+prototype was rejected by integrated correctness checks before adoption.
+
+Resume positions may conservatively retain IDs that have already matched. Before
+compacting a candidate array in place, the caller must advance its candidate
+position past the last emitted pair. Otherwise, compaction can leave duplicate
+or decreasing IDs in the remaining suffix, violating the next primitive call's
+strict ordering requirement. This is safe because every ID through the last
+match has already been resolved against the monotonically advancing other input.
+The adjustment is one bounded index maximum per nonempty intersection, with no
+additional allocation or decoding.

@@ -1,0 +1,24 @@
+[
+  {
+    "title": "Speeding Up Set Intersections in Graph Algorithms using SIMD Instructions",
+    "source_uri": "https://doi.org/10.1145/3183713.3196924",
+    "issued_date": "2018-05-27",
+    "read_characters": 45000,
+    "content_truncated": true
+  },
+  {
+    "title": "Software Optimizations of Multiple Sets Intersection via SIMD Instructions",
+    "source_uri": "https://doi.org/10.1109/apsec.2017.65",
+    "issued_date": "2017-12-01",
+    "read_characters": 25505,
+    "content_truncated": false
+  },
+  {
+    "title": "Faster-Than-Native Alternatives for x86 VP2INTERSECT Instructions",
+    "source_uri": "https://doi.org/10.48550/arxiv.2112.06342",
+    "issued_date": "2022-04-19",
+    "library_full_text": false,
+    "full_text_fallback": "https://arxiv.org/html/2112.06342v2",
+    "sections_read": "1–3.3; six-permutation emulation and ordinal recovery implications"
+  }
+]

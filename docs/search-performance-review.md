@@ -12695,3 +12695,190 @@ The first full attempt (`20261002T060032.814233Z-full`) stopped on the broker's
 test passed in isolation and the complete full rerun passed without a code
 change for the timeout. WASM execution was not run: the changed lifecycle code
 is native-only. Disk-peak/RSS and throughput benchmarks remain unrun.
+
+## October 3: Machine Library posting-methods audit
+
+The [methods review](benchmark-results/posting-methods-2026-10-03/README.md)
+maps nine primary papers to the actual intersection, union, posting-reader and
+ranked-window owners. Eight were read through Machine Library MCP; one used a
+primary arXiv fallback. The table distinguishes retained mechanisms, rejected
+candidates, fresh isolated screens and unmeasured representation changes.
+
+Fresh matched ARM/x86 screens cover scalar merge, exponential search, balanced
+4×4 SIMD and ARM prefix-count advancement against the extracted current kernel,
+plus sorting, bitmap, heap and bounded-window exact unions with scratch costs.
+The [complete table](benchmark-results/posting-methods-2026-10-03/table.md)
+and raw samples are reproducible. Intersection correctness passes 5,529,600 ARM
+and 4,423,680 x86 kernel/fixture/capacity cases; a second ARM run confirms the
+main performance directions. All four union methods pass workload and boundary
+membership oracles.
+
+Balanced 4×4 SIMD improves full balanced blocks 2.94–3.01× on x86 and
+1.08–1.55× on ARM, but loses on the rarer-left skewed shapes. It is not selected
+as an unconditional replacement. The conditional-dispatch follow-up below
+now supplies integrated conjunction/phrase measurements and unchanged-index
+score/count oracles. ARM prefix-count advancement is rejected
+as implemented. Small union windows save memory but regress many medium/dense
+x86 cases; these decoded-ID screens do not measure the production encoded-word
+or dominant-cardinality shortcuts. Existing successful production mechanisms
+remain unchanged.
+
+The initial methods audit passed strict Clippy, 2,166 tests (25 ignored), native
+without default features, and the broker check. It changed no production Rust
+and did not rerun WASM or extended lifecycle/RPC checks; the follow-up below
+records the implementation and its newer validation. This is not a new full
+service campaign and does not establish that all worthwhile algorithms have
+been tested or adopted. QFilter/BSR, variable impact partitions, run/complement
+formats and newer-ISA kernels retain explicit evidence gaps in the review.
+
+### Conditional-dispatch follow-up
+
+The [follow-up experiment](benchmark-results/posting-dispatch-2026-10-03/README.md)
+now implements the balanced suffix-density gate and compares matched binaries
+through real conjunction/phrase callers, top-10, top-100 and exact counts.
+The 170-query broad suite runs on ARM 1M and x86 10M immutable indexes, with
+normal and RGB layouts. The original gate is essentially flat for ranked suite
+totals and regresses several count totals; isolated balanced-block gains do not
+justify a production dispatch change.
+
+Additional screens cover grouped SIMD galloping, exact byte-prefiltered 4×4,
+and AVX-512F 16×16 where available. Real-block replay and untimed call counters
+show why the distinction matters: ordinary ranked two-term AND usually bypasses
+the shared kernel through bitmap/frequency-bound probes, while multi-term AND
+uses it. Assembly shows that introducing dispatch can also change inlining at
+the actual caller. Full QFilter/BSR, encoded run/complement layouts and native
+VP2INTERSECT remain separate unmeasured methods, rather than being relabeled as
+these simpler prototypes.
+
+The follow-up retains the cleaned **x86 AVX2 balanced/galloping dispatcher**;
+ARM, WASM and non-AVX2 kernels remain unchanged. The 199-query generic-release
+comparison lowers multi-term AND latency 5.9–7.4% and ranked suite latency about
+3–6% across default/RGB layouts, with essentially unchanged RSS. Some exact
+phrase cases regress, including default low-frequency phrase top-100 by 3.5%;
+[the complete table](benchmark-results/posting-dispatch-2026-10-03/table.md)
+retains both directions, paired rounds, CPU and residency evidence.
+
+All 2,516 exhaustive audits, recorded ID/score/count comparisons and immutable
+file inventories pass. The cleaned primitive passes 11,059,200 boundary/shape
+cases per tested configuration, including forced feature-disabled dispatch.
+The final native harness passes strict Clippy and 2,167 tests (25 ignored),
+native without sync and broker checks. Linux adds 247 posting tests and strict
+core Clippy; the WASM release build and all 41 JavaScript tests pass. Extended
+lifecycle/RPC checks were not rerun for this primitive-only change. Full
+QFilter/BSR and representation-changing methods remain explicitly unmeasured.
+
+### Remaining-opportunities follow-up
+
+The [next experiment](benchmark-results/posting-opportunities-2026-10-03/README.md)
+tests adaptive later-clause order, size-only and density-gated membership batches,
+transient packed/streaming BSR with hardware POPCNT, local input swapping and
+AVX-512 intersection-mask emulation. The [complete table](benchmark-results/posting-opportunities-2026-10-03/table.md)
+retains successful and rejected screens, exact query checks, paired rounds,
+process CPU and RSS. The baseline is the previously retained dispatcher.
+
+Retain **x86 density-gated batching for later conjunction clauses**. Batches need
+at least 16 candidates and a local density of 32 candidates per current block
+span. It reuses the existing ordinal-pair primitive, preserves TF row identity
+and canonical scoring, and adds one 256-byte fixed pair buffer without query
+allocation. Sparse batches keep seeks. ARM/WASM keep scalar membership because
+the ARM confirmation drifts substantially even on unchanged count controls;
+the local timing evidence does not establish an ARM speedup.
+
+The exact final-source x86 comparison lowers latency for the 26 three- to
+six-term queries by **10.8–14.4%** and the full 199-query ranked suite by
+**7.3–13.4%**, across default/RGB layouts and top-10/100. Four
+duplicate/missing-term controls are excluded from that 26-query summary and
+reported separately. This is a warm query benchmark, not a production traffic
+mix or an HTTP/concurrent-throughput result. Per-family regressions and both
+rounds remain visible; count-only movement is not an algorithmic count gain.
+
+Adaptive order and input swapping do not justify their costs. AVX-512's
+12–14% trace improvement regresses the integrated caller. Initial BSR prototypes
+pass the narrower single-block oracle but lose cross-block tails; those timing
+rows are explicitly invalid adoption evidence. A new regression covers this
+resume contract. The tail-corrected POPCNT stream passes primitive/conjunction
+unit tests, but still fails the corpus oracle on `+the +of +in +and`, replacing
+one top-100 document. Its campaign stops before timings. This unresolved
+prototype interaction and its reproducer are preserved; no BSR implementation
+is retained and no valid BSR query speedup is claimed.
+
+Validation of completed campaigns: **5,654 exhaustive audits** and
+**260,508 recorded query executions**, exact ID/score-bit/count/plan comparisons
+and immutable index inventories. The rejected BSR audit is recorded separately.
+The final native harness passes strict Clippy and **2,169 tests (25 ignored)**,
+native without sync and broker checks. Linux adds focused conjunction/primitive
+checks; the WASM release build and **41 JavaScript tests** pass. Extended
+lifecycle/RPC checks were not rerun because those boundaries are unchanged.
+Both cloud VMs were verified stopped after collection. Full QFilter/persistent
+BSR, fused decoding, run/complement/trie formats, variable impact partitions,
+other CPU families and cold/concurrent workloads remain unmeasured.
+
+### Dedicated-host and resume-contract follow-up (October 4)
+
+The [follow-up report](benchmark-results/posting-followup-2026-10-04/README.md)
+and [complete table](benchmark-results/posting-followup-2026-10-04/table.md)
+supersede the unresolved BSR diagnosis and inconclusive ARM result above;
+October 3 measurements remain historical evidence with their original sources.
+
+The unmerged BSR/batching prototype failure reduces to a **caller compaction
+invariant**; baseline `main` uses scalar later-clause filtering. The balanced
+kernel can conservatively resume before its last emitted candidate. Compacting
+in place without first consuming that prefix creates duplicate/decreasing IDs
+in the next suffix. State-mask ordinal recovery then attributes TFs to the wrong
+rows. Document 4,502,871 genuinely matches the failing query, but its first two
+TFs became 13/8 instead of 3/4. This is distinct from the earlier BSR terminal-group
+tail bug. The conjunction caller now advances through the last emitted pair
+before compaction; its fixed cost is one index maximum per nonempty result.
+
+A 259-document, three-term regression checks all 127 hits, score bits and counts
+through sync, async and counted execution, with rounded and bitmap codecs. The
+old native x86 caller fails the strict-suffix invariant; the fixed caller passes.
+A portable model of x86 resume semantics reproduces incorrect results before the
+fix and passes the reduced case plus 160 random/clustered corpora afterward.
+The actual BSR and corrected batching binaries both pass the independent corpus
+oracle on both 10M-document layouts.
+
+**Enable the same density gate on aarch64.** Dedicated Ampere Altra ABBA runs lower
+latency for the 26 targeted multi-term queries by 18.2–21.2% and the full ranked
+suite by 12.2–19.7%. Ranked process CPU drops 12.0–19.1%, with less than 0.1 MiB
+mean peak-RSS change. This replaces the noisy shared-Mac evidence; WASM retains
+cursor seeks. The x86 rebuild after this architecture-gate extension has an
+identical code section to the measured corrected-batching binary.
+
+The focused OR/phrase repeat does not consistently reproduce the original 3–6%
+family regressions, but some smaller regressions remain. Restoring unreachable
+multi-term code in the pruned two-term specialization does not consistently
+recover them and is rejected. Normalized hot-function instruction comparisons
+and CPU-clock profiles do not establish a cause; hardware counters are unavailable.
+**Remaining finding:** causal attribution of those small OR/phrase differences
+is unresolved. The complete table retains every family and paired round; no
+speculative cache explanation or regression-free claim is made.
+
+The same-run x86 comparison against main `8f9c3f6` lowers latency for the 26
+multi-term queries by **15.1–19.5%**, and the full ranked suite by **10.1–18.2%**.
+Process CPU drops 9.8–17.7%; mean peak RSS differs by less than 0.3 MiB. Count-only
+movement is an unchanged-path control. These totals are suite-weighted, not a
+production traffic distribution. Default medium-frequency OR top-100 remains
+4.7% slower against main. Default high-frequency phrase top-10 and high/low OR
+top-100 regress 6.3% and 11.3% in pooled totals, with substantially divergent
+paired rounds; their cause remains unresolved and their measurements are retained.
+
+**Reject corrected BSR on performance grounds.** Its complete integrated audit
+now passes, but 0.9–2.1% lower targeted-query latency does not improve overall
+ranked latency, and boundary controls regress 8.1–9.3%. The additional state-mask
+conversion/dispatch code remains archived, not in production. The shipped code
+keeps the simpler dispatcher and corrected batching.
+
+The four completed follow-up campaigns pass **2,598 exhaustive audits** and
+**121,464 recorded query executions**, with exact result comparisons and immutable
+inventories on both layouts. Selected-source validation passes **2,170 native
+tests (25 ignored)**, strict focused and workspace-wide Clippy, native without
+sync, broker compilation, the WASM release build and **41 JavaScript tests**.
+Linux separately passes **1,913 core library tests (15 ignored)** and strict
+release Clippy for both corrected G and corrected BSR. Extended lifecycle/RPC
+checks were not rerun because those boundaries are unchanged. The earlier list
+of unmeasured cold/concurrent workloads, CPU families and format-changing methods
+still applies; the transient BSR investigation is now complete.
+
+Both original x86 VMs were verified stopped after collection; the temporary ARM
+VM, cloned disk and snapshot were removed. Original data disks were preserved.
