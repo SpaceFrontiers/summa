@@ -1,0 +1,83 @@
+{
+  "retrieved": "2026-10-03",
+  "provider": "Machine Library MCP",
+  "documents": [
+    {
+      "id": "2r4fyqsra2lxp5iu4g3y003f2",
+      "title": "Software Optimizations of Multiple Sets Intersection via SIMD Instructions",
+      "source_uri": "https://doi.org/10.1109/apsec.2017.65",
+      "authors": ["Xingshen Song", "Yuexiang Yang", "Yu Jiang"],
+      "issued_date": "2017-12-01",
+      "read": "targeted passages"
+    },
+    {
+      "id": "31vpqx61m5zx3g6uonuzw0k0k",
+      "title": "Faster set intersection with SIMD instructions by reducing branch mispredictions",
+      "source_uri": "https://doi.org/10.14778/2735508.2735518",
+      "authors": ["Hiroshi Inoue", "Moriyoshi Ohara", "Kenjiro Taura"],
+      "issued_date": "2014-01-01",
+      "read": "bounded full text and/or targeted passages"
+    },
+    {
+      "id": "7j0hodvx9gnu4kd4wa0ckgaq7",
+      "title": "Fast and Compact Set Intersection through Recursive Universe Partitioning",
+      "source_uri": "https://doi.org/10.1109/dcc50243.2021.00037",
+      "authors": ["Giulio Ermanno Pibiri"],
+      "issued_date": "2021-03-01",
+      "read": "bounded full text and/or targeted passages"
+    },
+    {
+      "id": "da8rtobc4easqbgytl25sd355",
+      "title": "Consistently faster and smaller compressed bitmaps with Roaring",
+      "source_uri": "https://doi.org/10.1002/spe.2402",
+      "authors": ["Daniel Lemire", "Gregory Ssi‐Yan‐Kai", "Owen Kaser"],
+      "issued_date": "2018-03-05",
+      "read": "bounded full text and/or targeted passages"
+    },
+    {
+      "id": "4h6wlidjq71w3fd12dujcpoo9",
+      "title": "Speeding Up Set Intersections in Graph Algorithms using SIMD Instructions",
+      "source_uri": "https://doi.org/10.1145/3183713.3196924",
+      "authors": ["Shuo Han", "Lei Zou", "Jeffrey Xu Yu"],
+      "issued_date": "2018-05-27",
+      "read": "bounded full text and/or targeted passages"
+    },
+    {
+      "id": "9ebgtkkcuad8jri6uw0m549wt",
+      "title": "Many are Better than One: Algorithm Selection for Faster Top-K Retrieval",
+      "source_uri": "https://doi.org/10.1016/j.ipm.2023.103359",
+      "authors": ["Gabriel Tolosa", "Antonio Mallia"],
+      "issued_date": "2023-07-01",
+      "read": "targeted passages"
+    },
+    {
+      "id": "6bhb7lfoo7hehwnyxcg549fp",
+      "title": "Faster BlockMax WAND with Variable-sized Blocks",
+      "source_uri": "https://doi.org/10.1145/3077136.3080780",
+      "authors": [
+        "Antonio Mallia",
+        "Giuseppe Ottaviano",
+        "Elia Porciani",
+        "Nicola Tonellotto",
+        "Rossano Venturini"
+      ],
+      "issued_date": "2017-08-07",
+      "read": "targeted passages"
+    },
+    {
+      "id": "y88elle3sd2fcv2cmue6h7x6by842zfohyzes19i4y3jaedtf",
+      "title": "RISE: A Rust Library for Inverted Index Search Engines",
+      "source_uri": "https://doi.org/10.48550/arxiv.2606.07187",
+      "authors": ["Angelo Savino", "Rossano Venturini"],
+      "issued_date": "2026-06-08",
+      "read": "bounded full text and/or targeted passages"
+    }
+  ],
+  "fallback": [
+    {
+      "title": "SIMD Compression and the Intersection of Sorted Integers",
+      "source_uri": "https://arxiv.org/html/1401.6399v13",
+      "reason": "Machine Library exact-title and author/topic searches did not return this paper; read the authors' primary text directly."
+    }
+  ]
+}

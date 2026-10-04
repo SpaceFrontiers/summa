@@ -1,6 +1,196 @@
 use super::*;
 
 #[test]
+fn later_conjunction_filters_preserve_unconsumed_tails_after_partial_simd_groups() {
+    use crate::structures::{BlockPostingList, PostingCodec, PostingList};
+    let lengths = crate::segment::chunk_map::DocLengths::from_lengths(&[100; 259]);
+    let params = super::super::Bm25Params::default();
+    // The common cursor seeks to slot 100 of a 128-posting block ending at
+    // document 130. A four-lane kernel can emit candidates through slot 26
+    // while retaining slot 24 as its conservative resume position.
+    let mut rare = PostingList::new();
+    let mut common = PostingList::new();
+    for doc in 0..259 {
+        if (100..232).contains(&doc) && ![102, 103, 105, 109].contains(&doc) {
+            rare.push(doc, doc % 7 + 1);
+        }
+        if ![101, 105, 109].contains(&doc) {
+            common.push(doc, doc % 11 + 1);
+        }
+    }
+    for codec in [PostingCodec::Rounded, PostingCodec::RoundedBitmap] {
+        let encode = |list: &PostingList| {
+            BlockPostingList::from_posting_list_with_options(
+                list,
+                false,
+                Some(&|doc| lengths.length(doc)),
+                codec,
+            )
+            .unwrap()
+        };
+        let lists = vec![
+            (encode(&rare), 1.0),
+            (encode(&rare), 2.0),
+            (encode(&common), 3.0),
+        ];
+        let mut expected: Vec<_> = (100..232)
+            .filter(|doc| ![101, 102, 103, 105, 109].contains(doc))
+            .map(|doc| {
+                let tf = (doc % 7 + 1) as f32;
+                (
+                    doc,
+                    (params.score(tf, 1.0, 100.0, 100.0)
+                        + params.score(tf, 2.0, 100.0, 100.0)
+                        + params.score((doc % 11 + 1) as f32, 3.0, 100.0, 100.0))
+                    .to_bits(),
+                )
+            })
+            .collect();
+        expected.sort_by(|a, b| {
+            f32::from_bits(b.1)
+                .total_cmp(&f32::from_bits(a.1))
+                .then(a.0.cmp(&b.0))
+        });
+        let make = || {
+            MaxScoreExecutor::text_with_lengths(
+                lists.clone(),
+                100.0,
+                128,
+                Some(LengthSource::Docs(&lengths)),
+                params,
+                1.0,
+            )
+            .require_all_terms()
+        };
+        let (counted, count) = make().execute_counted_conjunction().unwrap();
+        assert_eq!(count, 127);
+        for hits in [
+            counted,
+            make().execute_sync().unwrap(),
+            futures::executor::block_on(make().execute()).unwrap(),
+        ] {
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                expected,
+                "{codec:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn later_conjunction_clauses_preserve_frequency_rows_across_block_and_batch_boundaries() {
+    use crate::structures::{BlockPostingList, PostingCodec, PostingList};
+    let n_docs = 4099;
+    let params = super::super::Bm25Params::default();
+    let terms: Vec<Vec<(u32, u32)>> = (0..4)
+        .map(|term| {
+            (0..n_docs)
+                .filter(|&doc| match term {
+                    0 => doc % 3 != 0,
+                    1 => doc % 5 != 0,
+                    2 => !(1024..2048).contains(&doc) || doc % 127 == 0,
+                    _ => !(2048..3072).contains(&doc) || doc % 131 == 0,
+                })
+                .map(|doc| (doc, 1 + (doc * (term + 1) + term) % 23))
+                .collect()
+        })
+        .collect();
+    for order in [vec![0, 1, 2, 3], vec![3, 2, 1, 0], vec![2, 0, 3, 1, 2, 0]] {
+        let corpus = Corpus {
+            postings: order.iter().map(|&i| terms[i].clone()).collect(),
+            lengths: (0..n_docs).map(|doc| (100 + doc % 71) as u16).collect(),
+            n_docs,
+        };
+        let lengths = crate::segment::chunk_map::DocLengths::from_lengths(&corpus.lengths);
+        for codec in [
+            PostingCodec::Rounded,
+            PostingCodec::Packed,
+            PostingCodec::Pfor,
+            PostingCodec::Simd4x,
+            PostingCodec::RoundedBitmap,
+        ] {
+            let lists: Vec<_> = corpus
+                .postings
+                .iter()
+                .zip(&order)
+                .map(|(postings, &term)| {
+                    let mut list = PostingList::new();
+                    for &(doc, tf) in postings {
+                        list.push(doc, tf);
+                    }
+                    (
+                        BlockPostingList::from_posting_list_with_options(
+                            &list,
+                            false,
+                            Some(&|doc| lengths.length(doc)),
+                            codec,
+                        )
+                        .unwrap(),
+                        (term + 1) as f32 * 0.37,
+                    )
+                })
+                .collect();
+            let truth = exhaustive(&corpus, &lists, true, 135.0, params);
+            for predicate in [false, true] {
+                let mut expected: Vec<_> = truth
+                    .iter()
+                    .filter(|(doc, _)| {
+                        (!predicate || **doc % 7 != 0)
+                            && corpus.postings.iter().all(|postings| {
+                                postings.binary_search_by_key(*doc, |&(id, _)| id).is_ok()
+                            })
+                    })
+                    .map(|(&doc, &score)| (doc, score.to_bits()))
+                    .collect();
+                expected.sort_by(|a, b| {
+                    f32::from_bits(b.1)
+                        .total_cmp(&f32::from_bits(a.1))
+                        .then(a.0.cmp(&b.0))
+                });
+                for k in [1, 17, 128, 1000] {
+                    let make = || {
+                        let executor = MaxScoreExecutor::text_with_lengths(
+                            lists.clone(),
+                            135.0,
+                            k,
+                            Some(LengthSource::Docs(&lengths)),
+                            params,
+                            1.0,
+                        )
+                        .require_all_terms();
+                        if predicate {
+                            executor.with_predicate(Box::new(|doc| doc % 7 != 0))
+                        } else {
+                            executor
+                        }
+                    };
+                    let (counted, seen) = make().execute_counted_conjunction().unwrap();
+                    assert_eq!(seen, expected.len() as u64);
+                    for hits in [
+                        counted,
+                        make().execute_sync().unwrap(),
+                        futures::executor::block_on(make().execute()).unwrap(),
+                    ] {
+                        let actual: Vec<_> = hits
+                            .iter()
+                            .map(|hit| (hit.doc_id, hit.score.to_bits()))
+                            .collect();
+                        assert_eq!(
+                            actual,
+                            expected[..expected.len().min(k)],
+                            "{codec:?} {order:?} k={k} predicate={predicate}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn skewed_conjunction_preserves_frequency_rows_across_seeks_and_partial_batches() {
     use crate::structures::{BlockPostingList, PostingCodec, PostingList};
     let params = super::super::Bm25Params::default();

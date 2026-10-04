@@ -1,0 +1,12 @@
+[
+  {
+    "name": "hermes-benchmark-32-moroni",
+    "status": "TERMINATED",
+    "lastStopTimestamp": "2026-10-02T22:34:57.424-07:00"
+  },
+  {
+    "name": "hermes-validation-moroni",
+    "status": "TERMINATED",
+    "lastStopTimestamp": "2026-10-02T00:05:33.357-07:00"
+  }
+]

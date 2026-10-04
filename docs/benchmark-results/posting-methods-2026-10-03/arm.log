@@ -1,0 +1,19 @@
+verified 5529600 kernel/fixture/capacity cases
+       12.77 real        12.61 user         0.08 sys
+             2572288  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+                 337  page reclaims
+                  15  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               13031  involuntary context switches
+        249481826356  instructions retired
+         50475041116  cycles elapsed
+             2179360  peak memory footprint

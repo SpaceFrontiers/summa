@@ -1,0 +1,56 @@
+{
+  "baseline_revision": "8f9c3f667928216a52037d16cfa906c593ef0c7a",
+  "branch": "summa-io-uring-performance",
+  "selected_sources": {
+    "selected-source/summa-core/src/structures/simd.rs": "92b94da8c8e233b6c2e045c67541bb8b911949b53f0b8a67a5aa33ef7ae3fa8a",
+    "selected-source/summa-core/src/query/scoring/conjunction.rs": "f16f6997e2073e340991ab5a55f2728356fdfede157e8d35101f8020adf8f3c9",
+    "selected-source/summa-core/src/query/scoring/tests.rs": "6d88d3a08a8eaadc414bdaa9fe4e4bbf1f933dff3be5449b128630998bcf38c0"
+  },
+  "source_variants": {
+    "trace-conjunction.rs": "39fe9f11149a084d7b81047079bbc0089f092ad86fa563c77956376abbb3aa54",
+    "corrected-preserved-conjunction.rs": "57924ca180c351bb6140c3ae0fa18243ee24a86d3bedc7dc6ca8a446cb2dca5c",
+    "corrected-tests.rs": "6d88d3a08a8eaadc414bdaa9fe4e4bbf1f933dff3be5449b128630998bcf38c0",
+    "clustered-conjunction.rs": "7db8f1e7a42f4abfc47b9df4892e53cb6a4cfbe48b96ee1f2f7cb78168119530",
+    "minimal-regression.rs": "dfa6acac1e1439ad1a95ce89247e1ebd1d14d2c6453ced4ae01b04954c8ca9fb",
+    "corrected-simd.rs": "92b94da8c8e233b6c2e045c67541bb8b911949b53f0b8a67a5aa33ef7ae3fa8a",
+    "final-tests.rs": "6d88d3a08a8eaadc414bdaa9fe4e4bbf1f933dff3be5449b128630998bcf38c0",
+    "x86-gated-conjunction.rs": "48716d9efcbce1de9bd28764b84247787425281a17840ebe16875779bb5b0a76",
+    "before-contract-conjunction.rs": "a5fb78893ce4766cdce11c552179fdb850a57f533b3698430add32da4e9ba59e",
+    "head-simd.rs": "3fa92783b970e4a07ed5cdc36311e80599d4d2bfba7ddef4bcecb0396aad3506",
+    "final-conjunction.rs": "f16f6997e2073e340991ab5a55f2728356fdfede157e8d35101f8020adf8f3c9",
+    "diagnostic-conjunction.rs": "ab1d25912e374ef3de468b0697164863568dd51fb8c3dcdb905a161ed9356a4a",
+    "corrected-conjunction.rs": "136701d17fb4347937a84601f08fbc31b75a7a3f437f0fcbb1ded35da775e76c",
+    "final-simd.rs": "92b94da8c8e233b6c2e045c67541bb8b911949b53f0b8a67a5aa33ef7ae3fa8a",
+    "random-conjunction.rs": "63d56e4c4004ee33a5509a819156cd864710b40db2f751bb8891fb5742657d49",
+    "probe.rs": "024c27d8fc5a92bbb30248e9a5e6f78e589359cb57714879713ab19837603e52",
+    "baseline-conjunction.rs": "c405f1ebb9b6e244a8bcd6de686d0b72c6518b66d6e9f7030b99a5f2e2303584",
+    "bsr-popcnt-simd.rs": "43dcc1fb78688efd576fcf39e50b3c34f8113f7f7bea1d45599e69d2469e0e23",
+    "retained-simd.rs": "eef51d9de8d864b16084ef490d0985dc3c67a20686bdcc1477c503050b8cac9e",
+    "corrected-arm-conjunction.rs": "7e0a0a719cb12bfdef086c2055624d9f56adb3aa80009b70df7516b43e46a303"
+  },
+  "compiler": "rustc 1.98.1 / LLVM 22.1.8",
+  "flags": "generic release; RUSTFLAGS empty",
+  "x86_binaries": {
+    "head": "453ed8efec98f76027cd1a1a6bfce203eb764512f6bec09927404874b05b0256",
+    "baseline": "09bf57dc1d329bb139fde72755843a783107527b55b21436fa2184019faf8f76",
+    "gated": "eb51930aac5e34436e17005efea497aee7c64e73793449726c1167ae37831dad",
+    "bsr": "aec77cce066d72a0633f1a00d8796be1593022d0ed92344f7ce2e6a7bf4ebdaa"
+  },
+  "arm_binaries": {
+    "baseline": "3a5ed0d2bf69b47dfdc0e0867f2718e77eb9af06e9b877e21ca92727732c2928",
+    "gated": "f352b685124640e40e7e1d91e611140837a31855934dc4cac79a8a7a002f84c2"
+  },
+  "selection": {
+    "selected_x86_variant": "gated",
+    "retained": [
+      "AVX2 balanced/galloping dispatcher",
+      "density-gated later-clause batching on x86_64 and aarch64",
+      "advance conservative candidate resume before in-place compaction"
+    ],
+    "bsr": "Rejected: correct after caller fix, but only 0.9\u20132.1% ratio gain for targeted queries, approximately flat full-suite totals and 8\u20139% boundary-control latency regression; conversion/dispatch complexity not justified.",
+    "pruned_body": "Rejected: restoring unreachable multi-term code does not consistently recover OR/phrase timing."
+  },
+  "scope": "Warm single-worker queries; no HTTP, hydration, cold storage or concurrent throughput claim",
+  "fixture": "Both 10M-document default/RGB layouts; byte inventories match across architectures",
+  "method": "Sum per-query medians pooling two rounds; show paired ratios; process CPU includes startup/warmups; RSS includes mmap"
+}

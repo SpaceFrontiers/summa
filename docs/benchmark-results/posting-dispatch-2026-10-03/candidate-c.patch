@@ -1,0 +1,129 @@
+--- a/summa-core/src/structures/simd.rs
++++ b/summa-core/src/structures/simd.rs
+@@ -5724,6 +5724,19 @@
+ ) -> usize {
+     assert!(left.len() <= 128 && right.len() <= 128);
+     assert!(*a <= left.len() && *b <= right.len());
++    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++    if !pairs.is_empty() && balanced_posting_suffixes(left, *a, right, *b) {
++        #[cfg(target_arch = "x86_64")]
++        return intersect_posting_blocks_balanced(left, a, right, b, pairs);
++        #[cfg(target_arch = "aarch64")]
++        if neon::is_available() {
++            return intersect_posting_blocks_balanced(left, a, right, b, pairs);
++        }
++    }
++    #[cfg(target_arch = "x86_64")]
++    if avx2::is_available() {
++        return intersect_posting_blocks_galloping(left, a, right, b, pairs);
++    }
+     #[cfg(target_arch = "x86_64")]
+     if avx2::is_available() && is_x86_feature_detected!("popcnt") {
+         // SAFETY: both required CPU features were detected; loads are bounded.
+@@ -5731,6 +5744,80 @@
+         return count + intersect_posting_block_groups(left, a, right, b, &mut pairs[count..]);
+     }
+     intersect_posting_block_groups(left, a, right, b, pairs)
++}
++
++/// Estimate the suffixes' mean-gap ratio without floating point. This is a
++/// cost hint only; both kernels preserve the same ordinal-pair contract.
++#[inline]
++#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++fn balanced_posting_suffixes(left: &[u32], a: usize, right: &[u32], b: usize) -> bool {
++    let (nl, nr) = (left.len() - a, right.len() - b);
++    if nl < 16 || nr < 16 {
++        return false;
++    }
++    let ls = (u64::from(left[left.len() - 1] - left[a]) + 1) * nr as u64;
++    let rs = (u64::from(right[right.len() - 1] - right[b]) + 1) * nl as u64;
++    ls <= rs * 2 && rs <= ls * 2
++}
++
++/// Compare four IDs on each side, advancing every exhausted group. The
++/// caller has established SIMD availability; no load exceeds its four lanes.
++#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++#[inline(always)]
++fn intersect_posting_blocks_balanced(
++    left: &[u32], a: &mut usize, right: &[u32], b: &mut usize,
++    pairs: &mut [(u8, u8)],
++) -> usize {
++    let (mut i, mut j, mut count) = (*a, *b, 0);
++    while i + 4 <= left.len() && j + 4 <= right.len() && count < pairs.len() {
++        let (lm, rm) = (left[i + 3], right[j + 3]);
++        for lane in 0..4 {
++            let group: &[u32; 4] = right[j..j + 4].try_into().unwrap();
++            let mask = equal_mask_4(group, left[i + lane]);
++            if mask != 0 {
++                let matched = j + mask.trailing_zeros() as usize;
++                pairs[count] = ((i + lane) as u8, matched as u8);
++                count += 1;
++                if count == pairs.len() {
++                    *a = i + lane + 1;
++                    *b = matched + 1;
++                    return count;
++                }
++            }
++        }
++        i += 4 * usize::from(lm <= rm);
++        j += 4 * usize::from(rm <= lm);
++    }
++    *a = i;
++    *b = j;
++    count + intersect_posting_block_groups(left, a, right, b, &mut pairs[count..])
++}
++
++#[inline]
++#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
++fn equal_mask_4(values: &[u32; 4], doc: u32) -> u32 {
++    #[cfg(target_arch = "x86_64")]
++    {
++        use std::arch::x86_64::*;
++        // SAFETY: SSE2 is an x86_64 baseline feature; the input has four lanes.
++        unsafe {
++            return _mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(
++                _mm_loadu_si128(values.as_ptr().cast()), _mm_set1_epi32(doc as i32),
++            ))) as u32;
++        }
++    }
++    #[cfg(target_arch = "aarch64")]
++    {
++        use std::arch::aarch64::*;
++        // SAFETY: the dispatcher checked NEON and both arrays have four lanes.
++        unsafe {
++            let mask = vceqq_u32(vld1q_u32(values.as_ptr()), vdupq_n_u32(doc));
++            let weights = [1, 2, 4, 8];
++            return vaddvq_u32(vandq_u32(mask, vld1q_u32(weights.as_ptr())));
++        }
++    }
++    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
++    values.iter().enumerate().fold(0, |bits, (i, &v)| bits | (u32::from(v == doc) << i))
+ }
+ 
+ /// Ranked conjunctions call this with a whole block of the common term and
+@@ -6393,3 +6480,25 @@
+         assert!(dot_product_f32_scalar(&with_inf, &finite).is_infinite());
+     }
+ }
++
++// Additional format-preserving candidates; exact matches always verify full IDs.
++#[cfg(target_arch="x86_64")]
++#[inline]
++fn intersect_posting_blocks_galloping(l:&[u32],a:&mut usize,r:&[u32],b:&mut usize,out:&mut[(u8,u8)])->usize {
++    let(mut i,mut j,mut n)=(*a,*b,0);
++    while i<l.len() && j+8<=r.len() && n<out.len() {
++        let key=l[i];let groups=(r.len()-j)/8;
++        if r[j+7]<key {
++            let(mut lo,mut hi)=(0,1);
++            while hi<groups && r[j+hi*8+7]<key {lo=hi+1;hi=hi*2+1;}
++            let mut upper=(hi+1).min(groups);
++            while lo<upper {let mid=(lo+upper)/2;if r[j+mid*8+7]<key{lo=mid+1;}else{upper=mid;}}
++            j+=lo*8;
++            if j+8>r.len(){break;}
++        }
++        let group:&[u32;8]=r[j..j+8].try_into().unwrap();
++        if let Some(lane)=equal_lane_8(group,key){out[n]=(i as u8,(j+lane) as u8);n+=1;if n==out.len(){i+=1;j+=lane+1;break;}}
++        i+=1;
++    }
++    *a=i;*b=j;n+intersect_posting_block_groups(l,a,r,b,&mut out[n..])
++}

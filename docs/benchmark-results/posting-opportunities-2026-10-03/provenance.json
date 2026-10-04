@@ -1,0 +1,175 @@
+{
+  "revision": "8f9c3f667928216a52037d16cfa906c593ef0c7a",
+  "branch": "summa-io-uring-performance",
+  "baseline": "current retained dispatcher, including uncommitted D; not HEAD prefix kernel",
+  "sources": {
+    "baseline-simd.rs": "f4794542315ac3d30875aadc0345322a5113698064fda69388d6d4caf4b2b962",
+    "baseline-conjunction.rs": "c405f1ebb9b6e244a8bcd6de686d0b72c6518b66d6e9f7030b99a5f2e2303584",
+    "selected-conjunction.rs": "6a9f5aaea484a09edd0ac7442bb6b20db10d7bd0a357536bbfb59cc80bd07055",
+    "selected-tests.rs": "a401375c6a757c86cb4a13b959aca7e6f26e90901d38591c40ed52436be8838e",
+    "screen.rs": "a798d76cd001d0ef9e11c90eb6c29d45f502b1469d01736444be4ea55c7f3e0e",
+    "kernels.rs": "63962c1e2faa15a031b90cd03a95eef4d42558058f22d3eaccacac13565d0608",
+    "edge-check.rs": "5407a9eef6f69ee70aa2b1e5064c4b205f183db82d616285573ed2e9789e729e",
+    "orientation-screen.rs": "42bcdaca49cd66cb7be252ba7712b44bd1b2a7f84b1c6f8acecd5dc8b5a375b9",
+    "gated-conjunction.rs": "38c234fdba35381b1e948d9163bb25bbc51f4491b21a2ad4aa62a9f5a212cac3",
+    "popcnt-screen.rs": "12639520aaa4ac6211659adcb2f3878eb64dad4d5e81d4558b9cd06ba7a0434e",
+    "retained-simd.rs": "eef51d9de8d864b16084ef490d0985dc3c67a20686bdcc1477c503050b8cac9e",
+    "x86-gated-conjunction.rs": "48716d9efcbce1de9bd28764b84247787425281a17840ebe16875779bb5b0a76",
+    "bsr-popcnt-simd.rs": "43dcc1fb78688efd576fcf39e50b3c34f8113f7f7bea1d45599e69d2469e0e23",
+    "cross-block-test.rs": "60a5c5632cc6939829b815d2b26c74e839b3180e739309a1d0c099289178a919"
+  },
+  "experimental_sources": {
+    "adaptive": "ebf810339e0aaaf5d5679b5f1da7484784d1b295288fc83f33e1a54fff7425d3",
+    "batched": "8bf63560be9fb620efb8577f69181411bec638cfac34b8f381c029f83f25e116",
+    "wide": "4375dda30bc2d83d9f6f842b3652b73e5018a67ffe3bf13333793d6568be6a90"
+  },
+  "compiler": "rustc 1.98.1 / LLVM 22.1.8",
+  "flags": {
+    "arm": "",
+    "x86": "",
+    "standalone": "rustc --edition 2024 -O"
+  },
+  "hosts": {
+    "arm": "Apple M4, macOS 15.6.1; OS scheduled, 1M documents per index",
+    "x86": "Intel Cascade Lake, 32 vCPUs, Linux; CPU 2 for timings, 10M documents per index; separate build VM"
+  },
+  "query_protocol": {
+    "integrated": {
+      "queries": 30,
+      "phases": "ABBA",
+      "repetitions": 15,
+      "warmups": 5
+    },
+    "broad_and_final": {
+      "queries": 199,
+      "phases": "ABBA on ARM, ABCCBA final on x86",
+      "repetitions": 7,
+      "warmups": 5
+    },
+    "bsr_final": {
+      "queries": 199,
+      "phases": "ABCCBA",
+      "variants": ["baseline", "gated", "bsr"],
+      "repetitions": 7,
+      "warmups": 5,
+      "status": "aborted during correctness audit before any timing"
+    },
+    "selected_final": {
+      "queries": 199,
+      "phases": "ABBA",
+      "variants": ["baseline", "gated"],
+      "repetitions": 7,
+      "warmups": 5
+    }
+  },
+  "scope": "warm canonical query execution, no HTTP/hydration/cold/concurrent throughput",
+  "validation": {
+    "native_harness": ".context/search-harness/20261003T155111.368738Z-check",
+    "native_passed": 2169,
+    "native_ignored": 25,
+    "wasm_build": "final x86-only source passed",
+    "wasm_js_tests": 41,
+    "linux_selected_conjunction_tests": 17,
+    "linux_wide_conjunction_tests": 17,
+    "linux_wide_dispatch_regressions": 1,
+    "randomized_cases": {
+      "arm": 4423680,
+      "x86": 6635520
+    },
+    "full_u32_domain_cases": {
+      "arm": 204800,
+      "x86": 307200
+    },
+    "real_trace_calls": 7118,
+    "full_lifecycle_rpc": "not rerun; no lifecycle/RPC changes",
+    "linux_selected_clippy": "passed",
+    "orientation_cases_per_architecture": 2211840,
+    "preliminary_native_harness": ".context/search-harness/20261003T135425.577456Z-check",
+    "linux_wide_gated_conjunction_tests": 17,
+    "linux_gated_clippy": "passed",
+    "popcnt_screen_cases": 6635520,
+    "cross_block_regression_cases_per_run": 1800,
+    "initial_bsr_cross_block_status": "invalid; single-block oracle missed terminal state-group tail loss; two integrated conjunction regressions failed",
+    "linux_corrected_bsr_conjunction_tests": 17,
+    "linux_corrected_bsr_primitive_tests": 3,
+    "linux_final_scope_cross_block_test": 1,
+    "corrected_bsr_corpus_audit": {
+      "status": "failed",
+      "query": "+the +of +in +and",
+      "completed_candidate_audits": 185,
+      "issue": "ranked top-100 differs from exhaustive oracle; one different ID, shared ID scores unchanged",
+      "retained": false
+    }
+  },
+  "binary_archives": {
+    "all-binaries.tar.gz": "810d750b25200c93a42b78d1e587476af239bcfff6e9d594d4653347c4dbba3b",
+    "final-binaries.tar.gz": "dbf5b844df4e47c179a01dcce9b6f0798af1bd4d75336a28b414c44c3b81f31b",
+    "gated-binaries.tar.gz": "00940cf472ee782457b641622592878c49deee4c0cfc0c8cdcb931c2435d4da6",
+    "popcnt.tar.gz": "a1b556e4d595175d6de7907e4cf684881cf39340a9bad0d891d8ceb3b8ddac75",
+    "bsr-binaries.tar.gz": "f73f30b6d78612d384d4f002ef8a3456027d23d9e7be29f2ad9bed60d0eebb42"
+  },
+  "compiled_unpruned_conjunction_bytes": {
+    "current": 8041,
+    "batched": 9514,
+    "batched_plus_avx512": 8972,
+    "gated": 9768,
+    "wide-gated": 9238
+  },
+  "preliminary_binaries": {
+    "x86-selected-bin": "cece8ce7e804f32671bdde27dbd0a6f0eaf5232dba242c3f3cc6246d8a0421e1",
+    "x86-wide-bin": "1ee6e4ad82e879a511374be97bece08de6f9198b1562918979d51eefd8cc8be3",
+    "arm-baseline-bin": "740f9b44f1f09c765f6c4d23729e330fdd524d03228994b06a9e31d18d4d2656",
+    "arm-selected-bin": "59180e9268ccbffde1872247b721aece021a92ca8fff9e29bbf1cb935dde8b7a"
+  },
+  "candidate_labels": {
+    "selected": "size-only batched conjunctions, formatted",
+    "gated": "local density gate (32 candidates per block span), minimum 16 candidates, multi-term branch excluded from PRUNE specialization",
+    "wide-gated": "gated conjunctions plus AVX-512 mask emulation"
+  },
+  "final_binaries": {
+    "x86-gated-bin": "2bb40dd74710725ac7017d58c42011fd90ab1552c1573984966cfc04bff4184c",
+    "x86-wide-gated-bin": "f90c2660313fd3d87dcd80b0885a9d2315ddd70a07007a566e55e2b2dbc7000e",
+    "arm-baseline-bin": "740f9b44f1f09c765f6c4d23729e330fdd524d03228994b06a9e31d18d4d2656",
+    "arm-gated-bin": "51736c4e29c48f284c93285b028357014ab217a5a61c0317e85c42c09f2a5ae5",
+    "x86-baseline-bin": "09bf57dc1d329bb139fde72755843a783107527b55b21436fa2184019faf8f76"
+  },
+  "source_verification": {
+    "summa-core/src/structures/simd.rs": "retained-simd.rs",
+    "summa-core/src/query/scoring/conjunction.rs": "x86-gated-conjunction.rs",
+    "summa-core/src/query/scoring/tests.rs": "selected-tests.rs"
+  },
+  "architecture_scope": "Final later-clause batching is x86-only. ARM prototype timings are inconclusive under interactive host load; ARM/WASM keep scalar membership.",
+  "bsr_binaries": {
+    "x86-baseline-bin": "09bf57dc1d329bb139fde72755843a783107527b55b21436fa2184019faf8f76",
+    "x86-gated-bin": "c0d4e18aef701a1131eb916ce1f24d24bc33eca0d360fea3a004c3f44f2ba42b",
+    "x86-bsr-bin": "8ceee57d606827e94a096eb4dfb8b898010a3b14ee4a9c308a2a75908d651eb2"
+  },
+  "executable_text_equivalence": {
+    "gated_original_and_final": "e737ba4de28fc2fd51c6de6846f82827f3ebaeef5b91e2ea62db9c483de0334b",
+    "corrected_bsr_original_and_final": "f8c7b186337233af8ffd178f93c4a19f492569b083b332af68197f9bc10f63ab",
+    "meaning": "Adding x86 scope and the test-only regression preserves each x86 .text section byte for byte; exact final-scope binaries are nevertheless measured again."
+  },
+  "selected_binaries": {
+    "x86-baseline-bin": "09bf57dc1d329bb139fde72755843a783107527b55b21436fa2184019faf8f76",
+    "x86-gated-bin": "c0d4e18aef701a1131eb916ce1f24d24bc33eca0d360fea3a004c3f44f2ba42b"
+  },
+  "cloud_final_state": [
+    {
+      "name": "hermes-validation-moroni",
+      "status": "TERMINATED",
+      "zone": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b"
+    },
+    {
+      "name": "hermes-benchmark-32-moroni",
+      "status": "TERMINATED",
+      "zone": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b"
+    }
+  ],
+  "completed_utc": "2026-10-03T16:58:35.542949+00:00",
+  "result_archives": {
+    "initial-results.tar.gz": "b825ee26f4fd2d249a35fe563cb3b228eaaf6907c41ad9464bcdd7178a341af4",
+    "final-results.tar.gz": "98316ded9a75d8f2bcfeb731ea438efb58759c4b2a7689bfc87ae0359765a33c",
+    "bsr-rejected.tar.gz": "318e3c9ec5f279be8cfa95b426dfcbdf59fdea29628395d58bb8608879a95694",
+    "selected-results.tar.gz": "f30f09f8c66e724cc1ff0466d2d7eba56f7fb08fa725cad9523cea3b96a0c989"
+  }
+}

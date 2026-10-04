@@ -1,0 +1,73 @@
+{
+  "baseline_commit": "8f9c3f667928216a52037d16cfa906c593ef0c7a",
+  "arm": {
+    "compiler": "rustc 1.98.1 / LLVM 22.1.8",
+    "flags": "RUSTFLAGS empty; cargo release; standalone rustc --edition 2024 -O",
+    "indexes": ["/tmp/summa-arm/index-bitmap", "/tmp/summa-arm/index-rgb"],
+    "binaries": {
+      "baseline": "74d380ae356228434817434e12e3f2dc5d9e947fdeb96949f55a11cf52baeba6",
+      "candidate": "aa124761624088830977d63ba585586ef6108eaf2200a663e15ba8f4ec117d2a",
+      "refined": "7c22e99eae23909b03cd5a57ffb598c59270fc9e360fb2abe17a1e0faa4f15db"
+    },
+    "host": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8\nApple M4\nDarwin Pashas-MacBook-Air.local 24.6.0 Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:40 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T8132 arm64\n"
+  },
+  "x86": {
+    "compiler": "rustc 1.98.1 / LLVM 22.1.8",
+    "flags": "-C target-cpu=native; cargo release; standalone rustc --edition 2024 -O -C target-cpu=native",
+    "pinning": "taskset -c 2",
+    "indexes": [
+      "/mnt/scratch/fresh-default-index",
+      "/mnt/scratch/fresh-rgb-pairs-index"
+    ],
+    "binaries": {
+      "baseline": "335f4f4257b2a09f9115ae1d1aa20650b5a51f3e177a551debf507ace0969c84",
+      "candidate": "2a805b30049be9207ead534405b9c9a5a65be919e44af5f160b6241172d2b18a",
+      "refined": "c0a128bd39eb54e9221012ac0760ab94645b8abee01dfa0cf73b8e580e1d67c5"
+    },
+    "build_host": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  8\nOn-line CPU(s) list:                     0-7\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Xeon(R) CPU @ 2.80GHz\nCPU family:                              6\nModel:                                   85\nThread(s) per core:                      2\nCore(s) per socket:                      4\nSocket(s):                               1\nStepping:                                7\nBogoMIPS:                                5599.99\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512_vnni md_clear arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               128 KiB (4 instances)\nL1i cache:                               128 KiB (4 instances)\nL2 cache:                                4 MiB (4 instances)\nL3 cache:                                33 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-7\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown\nVulnerability Vmscape:                   Not affected\n",
+    "measurement_host": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  32\nOn-line CPU(s) list:                     0-31\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Xeon(R) CPU @ 2.80GHz\nCPU family:                              6\nModel:                                   85\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               2\nStepping:                                7\nBogoMIPS:                                5599.99\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512_vnni md_clear arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               512 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                66 MiB (2 instances)\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-7,16-23\nNUMA node1 CPU(s):                       8-15,24-31\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown\nVulnerability Vmscape:                   Not affected\n"
+  },
+  "trace_sampling": {
+    "stride": 127,
+    "maximum_rows_per_process": 20000,
+    "actual_rows": {
+      "trace-multi-rgb.txt": 1729,
+      "trace-bitmap.txt": 1810,
+      "trace-rgb.txt": 1777,
+      "trace-multi-bitmap.txt": 1802
+    }
+  },
+  "production_source_changed": true,
+  "audit_counts": {
+    "broad_per_architecture": 680,
+    "multi_per_architecture": 180
+  },
+  "candidate_patch_sha256": {
+    "candidate-b.patch": "77a543cff08afc714158fa76d09b124597d56530bf64c367b66bc9b16b2d3a45",
+    "candidate-c.patch": "8549c1f4655387296722cdd6a4ce94c09f34381b17e45dc32f6020749390cae5",
+    "candidate-d.patch": "575d63c4ba065ec06a070637b1dd263cc4a696e27dc1144b13ddac003bb7356b"
+  },
+  "x86_generic": {
+    "flags": "RUSTFLAGS empty; cargo release",
+    "baseline_sha256": "453ed8efec98f76027cd1a1a6bfce203eb764512f6bec09927404874b05b0256",
+    "selected_sha256": "09bf57dc1d329bb139fde72755843a783107527b55b21436fa2184019faf8f76",
+    "selected_simd_sha256": "f4794542315ac3d30875aadc0345322a5113698064fda69388d6d4caf4b2b962"
+  },
+  "selected_validation": {
+    "native_check": "20261003T082005.948596Z-check",
+    "passed": 2167,
+    "ignored": 25,
+    "wasm_tests": 41,
+    "linux_posting_tests": 247
+  },
+  "selection_status": "D retained: x86 AVX2 hybrid; ARM/WASM/non-AVX2 unchanged",
+  "evidence_zip_sha256": "78cf2e39b82c932faaca7a32b502200dc63b4e60550fe4742cd1f114c0e7d69b",
+  "evidence_members": 448,
+  "recorded_query_executions": 201192,
+  "exhaustive_audits": 2516,
+  "initial_native_validation": {
+    "run": "20261003T051341.450382Z-check",
+    "passed": 2166,
+    "ignored": 25
+  }
+}

@@ -1,0 +1,12 @@
+[
+  {
+    "name": "hermes-benchmark-32-moroni",
+    "status": "TERMINATED",
+    "zone": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b"
+  },
+  {
+    "name": "hermes-validation-moroni",
+    "status": "TERMINATED",
+    "zone": "https://www.googleapis.com/compute/v1/projects/keenable-479912/zones/us-east1-b"
+  }
+]
