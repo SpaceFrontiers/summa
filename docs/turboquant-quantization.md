@@ -78,9 +78,9 @@ the latter with the `sqrt(π/2)/sqrt(P)` constant folded in), quantized to i8
 with one global scale each. Kernels score 16 lanes per dimension with in-
 register table lookups (`vqtbl1q_u8` on NEON, `_mm_shuffle_epi8` on
 x86_64/SSSE3+), accumulate i16 in chunks of ≤ 128 dims, widen to i32, and
-finish per lane as `base_sum·s_base + gamma·qjl_sum·s_qjl`. A scalar fallback
-(f32 LUTs, no i8 quantization) ships alongside and is the WASM path; a test
-pins SIMD ≈ scalar agreement.
+finish per lane as `base_sum·s_base + gamma·qjl_sum·s_qjl`. A scalar fallback over the same quantized integer LUTs is the WASM path;
+tests pin exact integer agreement with SIMD. Full-precision f32 tables are
+retained only by the test reference estimator.
 
 `code_size` in the ANN header is the logical `P/2` bytes/vector; the container
 validates the block-padded column length for `TqFlat` specifically.

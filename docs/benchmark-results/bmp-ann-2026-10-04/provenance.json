@@ -1,0 +1,54 @@
+{
+  "baseline_commit": "9ea50c169ec7c2b9782f99e9533e8ccf8e463c72",
+  "rustc": "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-apple-darwin\nrelease: 1.98.1\nLLVM version: 22.1.8\n",
+  "uname": "Darwin Pashas-MacBook-Air.local 24.6.0 Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:40 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T8132 arm64",
+  "cpu": "Apple M4",
+  "memory_bytes": 34359738368,
+  "rustflags": "",
+  "binaries": {
+    "baseline/bmp-controls": "7851ac0cc514caa3022a92cfa9e5025e23a86b9cf1dc95d49cb1e8c2f0ea3856",
+    "baseline/dense_ann": "e5abe7a0f6c1bf86f91650d08d5260ceae7aa77d4726f9bc72f5c5b40b7dd9e0",
+    "baseline/binary_vectors": "a475d5e746414446b14484b859c35b5e807cad77116afe25e7c459be002df39c",
+    "baseline/scann_vectors": "f074f6a3e9de51ec41f4190e6c74ce61e0a78d8a33951a306102b27046adae43",
+    "baseline/core-tests": "0c924bcc46d2a213a2db3c16ea984c4680235dcbb8f7936268c8cbacb93e0a86",
+    "baseline/bmp_hot_path": "3dc13e705c203e910c8a8e49e6f3b3bf8c92546ef98d8c3100d6354546b040b2",
+    "baseline/vector_indexing": "50e5a1244e8927e41a0ad2dd8ceb60c71d19f6fddbb2b9b69fcffcccb6464e61",
+    "candidate-a/binary_vectors": "214f115372ed348d6e1a48052effac9c4febf9e9a21821c4c82bca3f6c30d3b7",
+    "candidate-a/scann_vectors": "017e092a725b988733f97daed35128a4174bfea7c5a852504cae636092417a47",
+    "candidate-a/bmp_hot_path": "da7ed84c6db3dab1c6017c695b839b06f3b1df2afd5a633bbf3e04c23a557ee7",
+    "candidate-a/vector_indexing": "755c79535c5c1eca7a69acada9d21716a7690e7c4f737392efb5bba794a8927b",
+    "candidate-b/core-tests": "a02e67170608abef35e0c4a9af78e76b41105e522d6717890a045feaf6a05a1e",
+    "candidate-b/bmp_hot_path": "77123a2ade6a4249f09c35d4d670c46bfe5b91d14de795760576e16d9dc99c84",
+    "candidate-c/bmp_hot_path": "237dc768aab2427ae4e8c391269a24b33ef6466d3d3c1404d2cdd40eb6f5ff26",
+    "candidate-d/bmp_hot_path": "cc11ca76d9a229ecfcb5ef424c3e8924c86fed8d8ecaf5c92d9fd8e98abd7432",
+    "candidate-e/bmp_hot_path": "085a55fa42ea4c06863ebdf02c1c7b429046b118c579dbc34f9904368e6e3e7b",
+    "final/core-tests": "618b4fd1ee8cfab8605518f85b5d64ca07da1779fd696ffe84d03620c9449aa9"
+  },
+  "x86_machine": "Linux hermes-benchmark-32-moroni.us-east1-b.c.keenable-479912.internal 7.0.0-1013-gcp #13~24.04.1-Ubuntu SMP PREEMPT Tue Sep 15 18:10:25 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux\nArchitecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           46 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  32\nOn-line CPU(s) list:                     0-31\nVendor ID:                               GenuineIntel\nModel name:                              Intel(R) Xeon(R) CPU @ 2.80GHz\nCPU family:                              6\nModel:                                   85\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               2\nStepping:                                7\nBogoMIPS:                                5599.99\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht syscall nx pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid tsc_known_freq pni pclmulqdq ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand hypervisor lahf_lm abm 3dnowprefetch ssbd ibrs ibpb stibp ibrs_enhanced fsgsbase tsc_adjust bmi1 hle avx2 smep bmi2 erms invpcid rtm avx512f avx512dq rdseed adx smap clflushopt clwb avx512cd avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves arat avx512_vnni md_clear arch_capabilities\nHypervisor vendor:                       KVM\nVirtualization type:                     full\nL1d cache:                               512 KiB (16 instances)\nL1i cache:                               512 KiB (16 instances)\nL2 cache:                                16 MiB (16 instances)\nL3 cache:                                66 MiB (2 instances)\nNUMA node(s):                            2\nNUMA node0 CPU(s):                       0-7,16-23\nNUMA node1 CPU(s):                       8-15,24-31\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Mitigation; Aligned branch/return thunks\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Mitigation; Enhanced IBRS\nVulnerability Spec rstack overflow:      Not affected\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS SW sequence; BHI SW loop, KVM SW loop\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Vulnerable: Clear CPU buffers attempted, no microcode; SMT Host state unknown\nVulnerability Vmscape:                   Not affected\n",
+  "x86_binary_hashes": "23b962eed98ce8beec755f5f22424de095b231c25396e318a5bcfd1fd74560e6  baseline/bmp_hot_path\n7f1609dfb56c4c36775191cecbfdf23898c557d4811f1d3c6726c2a9c28dd125  baseline/bmp_replay\n866c0af9d54ba831ef6c3a03d26f5a52efa19c2e815bf1ecd4748ac56c9a7e98  baseline/core-tests\n1d0d4727bbc50ea97c28506b9f70d090cc92b95f14730d7e9f8180aecba719a7  baseline/scann_vectors\ndb4326fe47d110bb52f89fb6c92f4dab5886a1cd4b52d546470c5a56206adfe7  baseline/vector_indexing\n562b58af401e1b6200acc794da1fdc0c0cbb94bb41ca52a3344bde577a8acb87  candidate-c/bmp_hot_path\n4e50e5e1d7fd8099ba20dda4336d4d61cfb116d2c54eeda65ed9365f81bc3846  candidate-c/bmp_replay\nccad86e50b9287fa757078ecf287fcfa63fa2f65b22f5d313450e7b4aee1d29d  candidate-c/core-tests\nd0a0128432e2b871541bf2b3b1d2a1d96734696b982b99cad128d52ef76b402e  candidate-c/scann_vectors\n\nac39e82a2f6ffa4adbfb1d90b89ab374e5525daba959ac2c62e8634573653447  /mnt/hermes-copy/searchbench-20260922/investigation/bmp-ann-20261004/candidate-e/bmp_hot_path\ncee816bc270c27d2924fbbb6124f85cbe990bfc68494d16013bff28ee42fda1d  /mnt/hermes-copy/searchbench-20260922/investigation/bmp-ann-20261004/candidate-e/core-tests\n",
+  "real_fixture": {
+    "gap-index/seg_01a0b8cf0c21b23c61522d759a78396c.rowstats": "070636d937fe717230158c828f4a5f985bbe4c8a101628de90ad0e04e269d89f",
+    "gap-index/metadata.json": "1adf4989b3c4fb1b269868f19ab9af859ceab893732ddfae5f518cb0a67a4622",
+    "gap-index/seg_01a0b8cf0c21b23c61522d759a78396c.terms": "b935046b7f972bc56dad54d032a7978c6bcb0e0764fcefefe13866f8a5b81011",
+    "gap-index/seg_01a0b8cf0c21b23c61522d759a78396c.sparse": "acee2505950ceaed76c259ab196e02c2b81c8a10a7a1a34ed09efd531eb3caf9",
+    "gap-index/seg_01a0b8cf0c21b23c61522d759a78396c.store": "51a827b766096b2ce6f23abf6a5e45134196dfd541739155036e3e6f34b12056",
+    "gap-index/seg_01a0b8cf0c21b23c61522d759a78396c.meta": "d1181059ca6756c7317288fd3c55ca17e0aceb40e6f1e3d0b79d2120e889c4de",
+    "gap-index/.hermes_writer.lock": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "gap-index/seg_01a0b8cf0c21b23c61522d759a78396c.post": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "exclusions": [
+    "The first x86 C control matrix overlapped a partial-result tar/lscpu command on the same host. Do not use any of its control timings for retention; rerun controls after all packaging completes. Earlier completed binary/ScaNN/real-fixture phases did not overlap this command.\n",
+    "Discard build-baseline-tests.log and build-baseline-controls.log: shared Cargo target reused candidate artifacts. Forced rebuild logs and saved baseline hashes identify the actual measured baseline. Initial one-off binary smoke timings are excluded from the paired tables."
+  ],
+  "x86_rustc": "rustc 1.98.1 (48a229cea 2026-09-01)",
+  "x86_rustflags": "",
+  "retained_source_sha256": {
+    "summa-core/src/segment/ann_disk.rs": "7277534579c713300dafa49d0e5d2245d2e588c33bed1a23388508a1ea831f20",
+    "summa-core/src/segment/ann_disk/scan_measurement.rs": "6790c406f2825076e6aebb14c70f2380b76315f0a49d17776a590b704fa5bf4f",
+    "summa-core/src/query/bmp.rs": "d2d77efb57a0887482aaef3208b4cbf42dce5d9e76f49858a2266c0c66974225",
+    "summa-core/src/structures/vector/quantization/tq.rs": "6b27751ab9347c403a764473ce3fa53e07d196e814e20a75e12a4473328700f1",
+    "summa-core/src/structures/vector/scann/fast_scan.rs": "6d4e60023d4ec47b3da48de1f3425826e09551cce941a9631d035dc90f62a76c",
+    "summa-core/benches/bmp_hot_path.rs": "a6b429b24ad72d193211fe7723e7a2472d7efdfd0def84cebc40fd3d9215253a",
+    "summa-core/examples/bmp_replay.rs": "131df467212ce4d4fca2cbb65b0cb9133a78f42febe125268c12cc6c12f116af"
+  }
+}

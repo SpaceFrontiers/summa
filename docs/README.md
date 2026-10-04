@@ -89,6 +89,7 @@ status and fixture before treating a result as current behavior or performance.
 
 - [Full-text comparison](search-benchmark-current.md)
 - [Search review ledger](search-performance-review.md)
+- [BMP and quantized ANN review](bmp-ann-optimization-review.md) and [complete measurements](benchmark-results/bmp-ann-2026-10-04/README.md)
 - [Yonik Searchbench comparison](searchbench-comparison.md)
 - [Collector selection benchmark](collector-benchmark.md)
 - [IResearch optimization and Linux I/O audit](iresearch-optimization-audit.md)

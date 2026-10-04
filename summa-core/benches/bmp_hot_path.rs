@@ -13,6 +13,8 @@
 //! ```
 //!
 //! `BMP_BENCH_WIDE_DOCS` overrides the corpus size (default 200_000).
+//! `BMP_BENCH_BLOCK_SIZE` (256) and `BMP_BENCH_QUERY_DIMS` (60) add controls.
+//! `BMP_BENCH_AUDIT=1` hashes every query's IDs and score bits before timing.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,7 +28,11 @@ use summa_core::query::SparseVectorQuery;
 use summa_core::structures::SparseVectorConfig;
 
 const VOCAB: u32 = 30_000;
-const QUERY_DIMS: usize = 60;
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).map_or(default, |value| {
+        value.parse().expect("integer benchmark option")
+    })
+}
 const NUM_QUERIES: usize = 200;
 
 /// Deterministic LCG (same constants as `bmp_vs_maxscore.rs`).
@@ -83,17 +89,22 @@ fn generate_docs(num_docs: usize, seed: u64) -> Vec<Vec<(u32, f32)>> {
         .collect()
 }
 
-/// Exactly `QUERY_DIMS` distinct dimensions per query, drawn with the corpus
+/// Exactly `query_dims` distinct dimensions per query, drawn with the corpus
 /// skew (`uniform == false`, most terms are dense in every block) or
 /// uniformly over the vocabulary (`uniform == true`, most terms are rare, so
 /// grid presence, per-block term masks and threshold pruning do real work).
-fn generate_queries(num_queries: usize, seed: u64, uniform: bool) -> Vec<Vec<(u32, f32)>> {
+fn generate_queries(
+    num_queries: usize,
+    query_dims: usize,
+    seed: u64,
+    uniform: bool,
+) -> Vec<Vec<(u32, f32)>> {
     let mut rng = Rng(seed);
     (0..num_queries)
         .map(|_| {
-            let mut entries: Vec<(u32, f32)> = Vec::with_capacity(QUERY_DIMS);
-            while entries.len() < QUERY_DIMS {
-                let need = QUERY_DIMS - entries.len();
+            let mut entries: Vec<(u32, f32)> = Vec::with_capacity(query_dims);
+            while entries.len() < query_dims {
+                let need = query_dims - entries.len();
                 for _ in 0..need {
                     let dim = if uniform {
                         rng.next_u32() % VOCAB
@@ -116,7 +127,7 @@ struct BuiltIndex {
 
 fn build_single_segment(rt: &tokio::runtime::Runtime, docs: &[Vec<(u32, f32)>]) -> BuiltIndex {
     let config = SparseVectorConfig {
-        bmp_block_size: 256,
+        bmp_block_size: env_usize("BMP_BENCH_BLOCK_SIZE", 256) as u32,
         ..SparseVectorConfig::splade_bmp()
     };
     let mut sb = SchemaBuilder::default();
@@ -171,10 +182,12 @@ fn bench_wide_query_single_segment(c: &mut Criterion) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(200_000);
 
-    eprintln!("\n=== BMP hot path: {QUERY_DIMS}-dim queries, {num_docs} docs, block_size=256 ===");
+    let query_dims = env_usize("BMP_BENCH_QUERY_DIMS", 60);
+    assert!((1..=64).contains(&query_dims));
+    eprintln!("\n=== BMP hot path: {query_dims}-dim queries, {num_docs} docs ===");
     let docs = generate_docs(num_docs, 0x5eed_1234);
-    let queries = generate_queries(NUM_QUERIES, 0x0badcafe, false);
-    let uniform_queries = generate_queries(NUM_QUERIES, 0x0badcafe, true);
+    let queries = generate_queries(NUM_QUERIES, query_dims, 0x0badcafe, false);
+    let uniform_queries = generate_queries(NUM_QUERIES, query_dims, 0x0badcafe, true);
     let built = build_single_segment(&rt, &docs);
 
     let reader = rt.block_on(built.index.reader()).unwrap();
@@ -202,11 +215,36 @@ fn bench_wide_query_single_segment(c: &mut Criterion) {
         .unwrap();
     assert_eq!(probe.len(), 10, "probe query returned {} hits", probe.len());
 
+    // Optional cross-build audit, outside timed work. Ignore generated segment
+    // UUIDs; this is one deterministic, non-reordered single-value segment.
+    if std::env::var_os("BMP_BENCH_AUDIT").is_some() {
+        for (distribution, stream) in [("skewed", &queries), ("uniform", &uniform_queries)] {
+            for k in [10, 100] {
+                for gamma in [0, (bmp.num_superblocks as usize / 4).max(1)] {
+                    let mut hash = 0xcbf29ce484222325u64;
+                    for entries in stream {
+                        let query = SparseVectorQuery::new(built.field, entries.clone())
+                            .with_lsp_gamma(gamma);
+                        for hit in rt.block_on(searcher.search(&query, k)).unwrap() {
+                            for value in [hit.doc_id, hit.score.to_bits()] {
+                                hash = (hash ^ u64::from(value)).wrapping_mul(0x100000001b3);
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "BMP_AUDIT dims={query_dims} block={} distribution={distribution} k={k} gamma={gamma} hash={hash:016x}",
+                        bmp.bmp_block_size
+                    );
+                }
+            }
+        }
+    }
+
     // Exhaustive local traversal (gamma=0): compute_grid_ubs_int +
     // sort_sb_desc_into + every surviving superblock through the D pass.
     for (k, group_name) in [
-        (10usize, "wide_q60_exhaustive_top10"),
-        (100, "wide_q60_exhaustive_top100"),
+        (10usize, format!("wide_q{query_dims}_exhaustive_top10")),
+        (100, format!("wide_q{query_dims}_exhaustive_top100")),
     ] {
         let mut group = c.benchmark_group(group_name);
         group.sample_size(30);
@@ -228,7 +266,7 @@ fn bench_wide_query_single_segment(c: &mut Criterion) {
     // path but with a positive visit cap, exercising the same executor
     // branch production single-segment queries take).
     {
-        let mut group = c.benchmark_group("wide_q60_default_gamma_top10");
+        let mut group = c.benchmark_group(format!("wide_q{query_dims}_default_gamma_top10"));
         group.sample_size(30);
         group.bench_function(BenchmarkId::new("BMP", num_docs), |b| {
             let mut qi = 0;
@@ -247,8 +285,8 @@ fn bench_wide_query_single_segment(c: &mut Criterion) {
     // blocks, so the D-grid presence, per-block term masks, block pruning and
     // the threshold compare dominate instead of dense-row accumulation.
     for (k, group_name) in [
-        (10usize, "wide_q60_uniform_top10"),
-        (100, "wide_q60_uniform_top100"),
+        (10usize, format!("wide_q{query_dims}_uniform_top10")),
+        (100, format!("wide_q{query_dims}_uniform_top100")),
     ] {
         let mut group = c.benchmark_group(group_name);
         group.sample_size(30);
@@ -272,7 +310,7 @@ fn bench_wide_query_single_segment(c: &mut Criterion) {
     // `selection`, i.e. the H/E-grid path plus the same per-block scoring.
     {
         let gamma = (bmp.num_superblocks as usize / 4).max(1);
-        let mut group = c.benchmark_group("wide_q60_gamma_quarter_top10");
+        let mut group = c.benchmark_group(format!("wide_q{query_dims}_gamma_quarter_top10"));
         group.sample_size(30);
         group.bench_function(BenchmarkId::new("BMP", num_docs), |b| {
             let mut qi = 0;
