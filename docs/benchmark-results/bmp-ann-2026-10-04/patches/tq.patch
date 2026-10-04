@@ -1,0 +1,11 @@
+--- a/summa-core/src/structures/vector/quantization/tq.rs
++++ b/summa-core/src/structures/vector/quantization/tq.rs
+@@ -34,7 +34,7 @@
+ /// i16 lane accumulators are widened to i32 at least every this many
+ /// dimensions: 128 * 127 = 16256 stays far from i16 saturation.
+ #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+-const TQ_ACCUMULATE_CHUNK_DIMS: usize = 128;
++const TQ_ACCUMULATE_CHUNK_DIMS: usize = 256;
+ 
+ /// Code-layout dimension: the input dimension rounded up to an even count
+ /// (two 4-bit coordinates per byte), floored at `TQ_MIN_PADDED_DIM`. Since

@@ -1,0 +1,109 @@
+--- a/summa-core/src/query/bmp.rs
++++ b/summa-core/src/query/bmp.rs
+@@ -1411,18 +1411,20 @@
+ ) -> BlockScoreFaults {
+     let mut faults = BlockScoreFaults::default();
+     let mut remaining = term_mask;
++    let mut term_start = 0;
+     while remaining != 0 {
+         let q = remaining.trailing_zeros() as usize;
+         remaining &= remaining - 1;
+         let (dim_id, w) = query_by_dim_u16[q];
+         let local_term = if narrow_query {
+-            block.find_dimension_branching(dim_id)
++            block.find_dimension_branching_from(dim_id, term_start)
+         } else {
+-            block.find_dimension(dim_id)
++            block.find_dimension_from(dim_id, term_start)
+         };
+         let Some(local_term) = local_term else {
+             continue;
+         };
++        term_start = local_term + 1;
+         let Some(postings) = block.postings(local_term) else {
+             // The term table names this dimension but its posting range is
+             // invalid: corrupt block, counted rather than skipped silently.
+--- a/summa-core/src/segment/bmp_adaptive.rs
++++ b/summa-core/src/segment/bmp_adaptive.rs
+@@ -339,11 +339,19 @@
+ 
+     #[inline(always)]
+     pub(crate) fn find_dimension(&self, dimension: u32) -> Option<usize> {
++        self.find_dimension_from(dimension, 0)
++    }
++
++    #[inline(always)]
++    pub(crate) fn find_dimension_from(&self, dimension: u32, start: usize) -> Option<usize> {
++        if start >= self.num_terms {
++            return None;
++        }
+         // Match the standard library's branch-minimized binary search. Term
+         // lookups dominate wide sparse queries, and a three-way branch at
+         // every level is measurably slower on mmap-backed headers.
+-        let mut size = self.num_terms;
+-        let mut base = 0usize;
++        let mut size = self.num_terms - start;
++        let mut base = start;
+         while size > 1 {
+             let half = size / 2;
+             let middle = base + half;
+@@ -366,8 +374,18 @@
+     /// are present, returning at the matching level avoids enough header loads
+     /// to beat the fixed-depth branch-minimized search.
+     #[inline(always)]
++    #[cfg(test)]
+     pub(crate) fn find_dimension_branching(&self, dimension: u32) -> Option<usize> {
+-        let mut low = 0usize;
++        self.find_dimension_branching_from(dimension, 0)
++    }
++
++    #[inline(always)]
++    pub(crate) fn find_dimension_branching_from(
++        &self,
++        dimension: u32,
++        start: usize,
++    ) -> Option<usize> {
++        let mut low = start;
+         let mut high = self.num_terms;
+         while low < high {
+             let middle = low + (high - low) / 2;
+@@ -833,6 +851,39 @@
+     }
+ 
+     #[test]
++    fn suffix_dimension_search_preserves_missing_terms_and_independent_phases() {
++        for len in [1, 2, 31, 32, 127, 256, 513] {
++            let dimensions: Vec<u32> = (0..len as u32).map(|value| value * 3 + 1).collect();
++            let bytes = encode(
++                32,
++                &dimensions,
++                &vec![1; len],
++                &vec![1; len],
++                &[0, 1].repeat(len),
++            );
++            let block = AdaptiveBlock::parse(&bytes, 32).unwrap();
++            // Each mask is an independent scoring phase over increasing terms.
++            for step in [1, 2, 7, 64] {
++                for branching in [false, true] {
++                    let mut start = 0;
++                    for target in (0..len as u32 * 3 + 3).step_by(step) {
++                        let actual = if branching {
++                            block.find_dimension_branching_from(target, start)
++                        } else {
++                            block.find_dimension_from(target, start)
++                        };
++                        assert_eq!(actual, dimensions.binary_search(&target).ok());
++                        if let Some(term) = actual {
++                            start = term + 1;
++                        }
++                    }
++                    assert_eq!(block.find_dimension_from(u32::MAX, len), None);
++                }
++            }
++        }
++    }
++
++    #[test]
+     fn branch_minimized_dimension_search_matches_slice_binary_search() {
+         for len in 1..=300usize {
+             let dimensions: Vec<u32> = (0..len as u32).map(|value| value * 3 + 1).collect();

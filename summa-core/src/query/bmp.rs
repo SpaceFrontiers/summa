@@ -2149,6 +2149,62 @@ mod tests {
         bit_width, pack_group,
     };
 
+    #[test]
+    fn sparse_block_scoring_preserves_touched_slots_across_phases_and_word_boundaries() {
+        use crate::segment::bmp_adaptive::{AdaptiveBlock, AdaptiveEncodeScratch};
+        for block_size in [8, 32, 64, 128, 256] {
+            let slots = [0, block_size / 2, block_size - 1, 0];
+            let impacts = [3u8, 255, 7, 11];
+            let postings: Vec<u8> = (0..2)
+                .flat_map(|_| {
+                    slots
+                        .iter()
+                        .zip(&impacts)
+                        .flat_map(|(&slot, &impact)| [slot as u8, impact])
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            AdaptiveEncodeScratch::default()
+                .encode(
+                    block_size,
+                    false,
+                    &[3, 9001],
+                    &[4, 4],
+                    &[255, 255],
+                    &postings,
+                    &mut bytes,
+                )
+                .unwrap();
+            let block = AdaptiveBlock::parse(&bytes, block_size).unwrap();
+            let query = [(3, u16::MAX), (9001, 42)];
+            for narrow in [false, true] {
+                let mut acc = [0; 256];
+                let mut touched = [0; 4];
+                let mut expected = [0; 256];
+                let mut expected_touched = [0; 4];
+                for (phase, &(_, weight)) in query.iter().enumerate() {
+                    let faults = super::score_block_bsearch_int(
+                        block,
+                        &query,
+                        1 << phase,
+                        narrow,
+                        &mut acc,
+                        &mut touched,
+                        block_size,
+                    );
+                    assert_eq!(faults.dropped_postings, 0);
+                    assert_eq!(faults.corrupt_terms, 0);
+                    for (&slot, &impact) in slots.iter().zip(&impacts) {
+                        expected[slot] += u32::from(weight) * u32::from(impact);
+                        expected_touched[slot / 64] |= 1 << (slot % 64);
+                    }
+                    assert_eq!(acc, expected, "block={block_size}, phase={phase}");
+                    assert_eq!(touched, expected_touched);
+                }
+            }
+        }
+    }
+
     fn forward_score(entries: &[(u32, u8)], query: &[(u32, u16)]) -> crate::Result<u32> {
         use crate::segment::bmp_forward::{BmpForward, RowWriter, write_directory};
         use crate::segment::logical_address::LogicalUnit;

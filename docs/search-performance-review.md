@@ -1,3 +1,26 @@
+# BMP and quantized ANN review — 2026-10-04
+
+The [BMP/ANN investigation](bmp-ann-optimization-review.md) and
+[149-cell table](benchmark-results/bmp-ann-2026-10-04/tables.md) retain a small
+binary IVF score-window rejection improvement. Final ARM leaf-scan medians
+improve 6.0–26.7% for 256-bit codes and 3.1–11.4% for 2,560-bit codes. x86
+256-bit cases mostly improve 3.3–14.3%, with one 2.1% regression; wide-code
+results range from 3.6% faster to 4.0% slower. No scratch, format, training,
+routing, probe or candidate-budget change is introduced; no rebuild is needed.
+
+Five BMP candidates and longer TQ/ScaNN accumulation windows were rejected
+after mixed or negligible gains. The production-derived BMP replay agrees on
+all 864 unique result cases; 12 binary byte/result hash keys and 48 synthetic
+BMP audit keys also match. Boundary tests and replay/benchmark tooling remain.
+The current quantized implementations are IVF-TQ and ScaNN AH, not retired
+IVF-PQ. Research sources, exclusions, raw evidence and
+[validation](benchmark-results/bmp-ann-2026-10-04/validation.md) are recorded.
+
+Remaining review priorities: representative complete ANN recall/latency with
+trained routing and reranking, then profile the dominant stage. Cold I/O,
+concurrent ingest, service tail latency and WASM performance were not measured
+in this campaign. Small kernel effects do not justify new defaults.
+
 # Summa 2 namespace release — 2026-09-25
 
 The [migration guide](summa-2-migration.md) records the breaking package, RPC,

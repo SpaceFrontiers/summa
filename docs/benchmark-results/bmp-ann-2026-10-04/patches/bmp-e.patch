@@ -1,0 +1,131 @@
+--- a/summa-core/src/query/bmp.rs
++++ b/summa-core/src/query/bmp.rs
+@@ -1409,6 +1409,39 @@
+     touched: &mut [u64; 4],
+     block_size: usize,
+ ) -> BlockScoreFaults {
++    if query_by_dim_u16.len() <= 8 && block_size <= 64 {
++        score_block_inner::<true>(
++            block,
++            query_by_dim_u16,
++            term_mask,
++            narrow_query,
++            acc,
++            touched,
++            block_size,
++        )
++    } else {
++        score_block_inner::<false>(
++            block,
++            query_by_dim_u16,
++            term_mask,
++            narrow_query,
++            acc,
++            touched,
++            block_size,
++        )
++    }
++}
++
++#[inline(always)]
++fn score_block_inner<const SINGLE_WORD: bool>(
++    block: AdaptiveBlock<'_>,
++    query_by_dim_u16: &[(u32, u16)],
++    term_mask: u64,
++    narrow_query: bool,
++    acc: &mut [u32; 256],
++    touched: &mut [u64; 4],
++    block_size: usize,
++) -> BlockScoreFaults {
+     let mut faults = BlockScoreFaults::default();
+     let mut remaining = term_mask;
+     while remaining != 0 {
+@@ -1431,6 +1464,9 @@
+         };
+         match postings {
+             AdaptivePostings::Sparse(postings) => {
++                // Small blocks only touch the first word. Keep it in a local
++                // accumulator instead of scattering mask writes per posting.
++                let mut word0 = touched[0];
+                 for p in postings {
+                     let slot = usize::from(p.local_slot);
+                     if slot >= block_size {
+@@ -1443,7 +1479,14 @@
+                     // vector/scalar friendly without changing overflow
+                     // semantics for any valid query.
+                     acc[slot] += w as u32 * p.impact as u32;
+-                    touched[slot / 64] |= 1u64 << (slot % 64);
++                    if SINGLE_WORD {
++                        word0 |= 1u64 << slot;
++                    } else {
++                        touched[slot / 64] |= 1u64 << (slot % 64);
++                    }
++                }
++                if SINGLE_WORD {
++                    touched[0] = word0;
+                 }
+             }
+             AdaptivePostings::Dense(impacts) => {
+@@ -2149,6 +2192,62 @@
+         bit_width, pack_group,
+     };
+ 
++    #[test]
++    fn sparse_block_scoring_preserves_touched_slots_across_phases_and_word_boundaries() {
++        use crate::segment::bmp_adaptive::{AdaptiveBlock, AdaptiveEncodeScratch};
++        for block_size in [8, 32, 64, 128, 256] {
++            let slots = [0, block_size / 2, block_size - 1, 0];
++            let impacts = [3u8, 255, 7, 11];
++            let postings: Vec<u8> = (0..2)
++                .flat_map(|_| {
++                    slots
++                        .iter()
++                        .zip(&impacts)
++                        .flat_map(|(&slot, &impact)| [slot as u8, impact])
++                })
++                .collect();
++            let mut bytes = Vec::new();
++            AdaptiveEncodeScratch::default()
++                .encode(
++                    block_size,
++                    false,
++                    &[3, 9001],
++                    &[4, 4],
++                    &[255, 255],
++                    &postings,
++                    &mut bytes,
++                )
++                .unwrap();
++            let block = AdaptiveBlock::parse(&bytes, block_size).unwrap();
++            let query = [(3, u16::MAX), (9001, 42)];
++            for narrow in [false, true] {
++                let mut acc = [0; 256];
++                let mut touched = [0; 4];
++                let mut expected = [0; 256];
++                let mut expected_touched = [0; 4];
++                for (phase, &(_, weight)) in query.iter().enumerate() {
++                    let faults = super::score_block_bsearch_int(
++                        block,
++                        &query,
++                        1 << phase,
++                        narrow,
++                        &mut acc,
++                        &mut touched,
++                        block_size,
++                    );
++                    assert_eq!(faults.dropped_postings, 0);
++                    assert_eq!(faults.corrupt_terms, 0);
++                    for (&slot, &impact) in slots.iter().zip(&impacts) {
++                        expected[slot] += u32::from(weight) * u32::from(impact);
++                        expected_touched[slot / 64] |= 1 << (slot % 64);
++                    }
++                    assert_eq!(acc, expected, "block={block_size}, phase={phase}");
++                    assert_eq!(touched, expected_touched);
++                }
++            }
++        }
++    }
++
+     fn forward_score(entries: &[(u32, u8)], query: &[(u32, u16)]) -> crate::Result<u32> {
+         use crate::segment::bmp_forward::{BmpForward, RowWriter, write_directory};
+         use crate::segment::logical_address::LogicalUnit;

@@ -1,0 +1,11 @@
+--- a/summa-core/src/structures/vector/scann/fast_scan.rs
++++ b/summa-core/src/structures/vector/scann/fast_scan.rs
+@@ -113,7 +113,7 @@
+     not(any(target_arch = "aarch64", target_arch = "x86_64")),
+     allow(dead_code)
+ )]
+-const U16_FLUSH_WORDS: usize = 64;
++const U16_FLUSH_WORDS: usize = 128;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+ pub struct FastScanQuery {

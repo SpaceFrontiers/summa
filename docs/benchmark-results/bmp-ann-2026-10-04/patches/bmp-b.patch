@@ -1,0 +1,69 @@
+--- a/summa-core/src/query/bmp.rs
++++ b/summa-core/src/query/bmp.rs
+@@ -1344,6 +1344,13 @@
+     let mut max_val = 0u32;
+     for word in 0..4 {
+         let mut bits = touched[word];
++        if bits & bits.wrapping_add(1) == 0 {
++            // A contiguous prefix includes dense rows for every block size.
++            // Scan only touched slots, allowing a vectorized max reduction.
++            let end = word * 64 + bits.count_ones() as usize;
++            max_val = max_val.max(acc[word * 64..end].iter().copied().max().unwrap_or(0));
++            continue;
++        }
+         while bits != 0 {
+             let bit = bits.trailing_zeros() as usize;
+             bits &= bits - 1;
+@@ -1358,6 +1365,11 @@
+ fn zero_touched_acc(acc: &mut [u32; 256], touched: &[u64; 4]) {
+     for word in 0..4 {
+         let mut bits = touched[word];
++        if bits & bits.wrapping_add(1) == 0 {
++            let end = word * 64 + bits.count_ones() as usize;
++            acc[word * 64..end].fill(0);
++            continue;
++        }
+         while bits != 0 {
+             let bit = bits.trailing_zeros() as usize;
+             bits &= bits - 1;
+@@ -2138,6 +2150,40 @@
+ mod tests {
+     use std::io::Write;
+ 
++    #[test]
++    fn contiguous_accumulator_masks_preserve_unmarked_slots() {
++        for mask in [
++            0,
++            1,
++            0xff,
++            0xffff,
++            0xffff_ffff,
++            u64::MAX,
++            0x5555_5555_5555_5555,
++            0x8000_0000_0000_0001,
++            0xffff_ffff_ffff_fffe,
++        ] {
++            for word in 0..4 {
++                let mut acc = [u32::MAX; 256];
++                let mut touched = [0; 4];
++                touched[word] = mask;
++                let mut expected_max = 0;
++                for bit in 0..64 {
++                    if mask & (1 << bit) != 0 {
++                        acc[word * 64 + bit] = bit as u32 * 11;
++                        expected_max = expected_max.max(bit as u32 * 11);
++                    }
++                }
++                assert_eq!(super::max_touched_acc(&acc, &touched), expected_max);
++                super::zero_touched_acc(&mut acc, &touched);
++                for (slot, &value) in acc.iter().enumerate() {
++                    let marked = slot / 64 == word && mask & (1 << (slot % 64)) != 0;
++                    assert_eq!(value, if marked { 0 } else { u32::MAX });
++                }
++            }
++        }
++    }
++
+     use super::{
+         BmpGridWeight, compute_block_ubs_and_presence, min_units_reaching, recommended_lsp_gamma,
+         sort_sb_desc_into, two_phase_upper_bound_units,
