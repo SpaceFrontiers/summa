@@ -92,6 +92,8 @@ pub struct FieldDef {
     pub bm25_b: Option<f32>,
     /// Chunked text field (`indexed<chunked>`): each value is its own BM25 unit
     pub chunked: bool,
+    /// Common words whose adjacent pairs are indexed (`indexed<common_grams: [...]>`)
+    pub common_grams: Vec<String>,
 }
 
 /// Parsed index definition
@@ -185,6 +187,9 @@ impl IndexDef {
             }
             if field.chunked {
                 builder.set_chunked(f, true);
+            }
+            if !field.common_grams.is_empty() {
+                builder.set_common_grams(f, field.common_grams.clone());
             }
             if field.bm25_k1.is_some() || field.bm25_b.is_some() {
                 builder.set_bm25_params(f, field.bm25_k1, field.bm25_b);
@@ -329,6 +334,8 @@ struct IndexConfig {
     positions: Option<super::schema::PositionMode>,
     // Chunked text field: every value is its own BM25 unit
     chunked: bool,
+    // Common words whose adjacent pairs are indexed
+    common_grams: Vec<String>,
     // BM25 parameters of a text field
     bm25_k1: Option<f32>,
     bm25_b: Option<f32>,
@@ -687,6 +694,9 @@ fn parse_single_index_config_param(
         Rule::chunked_kwarg => {
             config.chunked = true;
         }
+        Rule::common_grams_kwarg => {
+            config.common_grams = p.into_inner().map(parse_string_value).collect();
+        }
         Rule::bm25_k1_kwarg => {
             if let Some(v) = p.into_inner().next() {
                 config.bm25_k1 = Some(v.as_str().parse().map_err(|_| {
@@ -935,11 +945,19 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     // Merge index config into vector configs if both exist
     let mut positions = None;
     let mut chunked = false;
+    let mut common_grams = Vec::new();
     let mut bm25_k1 = None;
     let mut bm25_b = None;
     if let Some(idx_cfg) = index_config {
         positions = idx_cfg.positions;
         chunked = idx_cfg.chunked;
+        common_grams = idx_cfg.common_grams.clone();
+        // Schema admission validates the field shape and the words.
+        if !common_grams.is_empty() && field_type != FieldType::Text {
+            return Err(Error::Schema(format!(
+                "field '{name}': `common_grams` requires a text field, got {field_type:?}"
+            )));
+        }
         bm25_k1 = idx_cfg.bm25_k1;
         bm25_b = idx_cfg.bm25_b;
         if (bm25_k1.is_some() || bm25_b.is_some()) && field_type != FieldType::Text {
@@ -1000,6 +1018,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         content_hash,
         reorder,
         chunked,
+        common_grams,
         bm25_k1,
         bm25_b,
     })
