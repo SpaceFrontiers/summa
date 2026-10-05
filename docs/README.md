@@ -17,6 +17,7 @@
 
 ## Operations
 
+- [Publishing packages](publishing.md)
 - [Summa 2 migration](summa-2-migration.md)
 - [Server](../summa-server/README.md) and [broker](broker.md)
 - [Segment lifecycle and recovery](segment-lifecycle.md)

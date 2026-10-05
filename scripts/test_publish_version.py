@@ -1,109 +1,92 @@
-"""Release tags must follow a protected-branch PR merge, never a direct push."""
+"""Publishing consumes reviewed versions and cannot change protected main."""
 
 import json
-import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
-from publish_version import publish
+from publish_version import publish, release_version
 
 HEAD = "a" * 40
-MERGE = "b" * 40
 
 
-class GitHub:
-    def __init__(self, state="MERGED", merge_error=False):
+class Git:
+    def __init__(self, existing="", dirty=False):
         self.commands = []
-        self.state = state
-        self.merge_error = merge_error
-        self.head = HEAD
-        self.changed = "Cargo.toml\nCargo.lock"
+        self.existing = existing
+        self.dirty = dirty
 
-    def run(self, *args, **kwargs):
+    def run(self, *args):
         self.commands.append(args)
-        if args == ("git", "diff", "--name-only", "HEAD"):
-            return self.changed
-        if args[:2] == ("git", "push") and (
-            len(args) == 2 or any(arg.endswith(":refs/heads/main") for arg in args)
+        if args[:2] == ("git", "push") and args != (
+            "git",
+            "push",
+            "origin",
+            "refs/tags/v2.0.1",
         ):
-            raise subprocess.CalledProcessError(1, args, stderr="GH006: PR required")
-        if args[:3] == ("git", "rev-parse", "HEAD"):
+            raise AssertionError("GH006: direct branch updates require a PR")
+        if args == ("git", "status", "--porcelain"):
+            return " M Cargo.toml" if self.dirty else ""
+        if args == ("git", "rev-parse", "HEAD"):
             return HEAD
-        if args[:3] == ("gh", "pr", "create"):
-            return "https://github.com/test/repo/pull/1"
-        if args[:3] == ("gh", "pr", "merge") and self.merge_error:
-            raise subprocess.CalledProcessError(1, args, stderr="Review required")
-        if args[:3] == ("gh", "pr", "view"):
-            return json.dumps(
-                {
-                    "state": self.state,
-                    "headRefOid": self.head,
-                    "mergeCommit": {"oid": MERGE},
-                }
-            )
+        if args[:2] == ("git", "ls-remote"):
+            return self.existing
+        if args[:2] == ("git", "rev-parse"):
+            return self.existing
         return ""
 
 
 class PublishVersionTests(unittest.TestCase):
-    def publish(self, github):
-        return publish("2.0.1", "release/v2.0.1-123-1", "main", "test/repo", github.run)
+    def test_protected_main_never_receives_a_direct_push(self):
+        git = Git()
+        self.assertEqual(publish("2.0.1", git.run), HEAD)
+        self.assertIn(("git", "tag", "v2.0.1", HEAD), git.commands)
+        self.assertIn(("git", "push", "origin", "refs/tags/v2.0.1"), git.commands)
 
-    def test_protected_main_is_updated_only_through_pr_and_tag_uses_merge_commit(self):
-        github = GitHub()
-        self.assertEqual(self.publish(github), MERGE)
-        self.assertIn(
-            ("git", "push", "origin", "HEAD:refs/heads/release/v2.0.1-123-1"),
-            github.commands,
-        )
-        merge = next(c for c in github.commands if c[:3] == ("gh", "pr", "merge"))
-        self.assertIn("--match-head-commit", merge)
-        self.assertIn(HEAD, merge)
-        self.assertNotIn("--admin", merge)
-        self.assertIn(("git", "tag", "v2.0.1", MERGE), github.commands)
-        self.assertLess(
-            github.commands.index(merge),
-            github.commands.index(("git", "tag", "v2.0.1", MERGE)),
-        )
+    def test_retry_reuses_tag_at_the_same_commit(self):
+        git = Git(existing=HEAD)
+        self.assertEqual(publish("2.0.1", git.run), HEAD)
+        self.assertFalse(any(c[:2] == ("git", "push") for c in git.commands))
 
-    def test_required_review_blocks_tagging_and_publication(self):
-        github = GitHub(merge_error=True)
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.publish(github)
-        self.assertFalse(any(c[:2] == ("git", "tag") for c in github.commands))
+    def test_existing_tag_cannot_be_moved_to_another_commit(self):
+        git = Git(existing="b" * 40)
+        with self.assertRaisesRegex(ValueError, "another commit"):
+            publish("2.0.1", git.run)
+        self.assertFalse(any(c[:2] == ("git", "push") for c in git.commands))
 
-    def test_queued_merge_does_not_create_a_release_tag(self):
-        github = GitHub(state="OPEN")
-        with self.assertRaisesRegex(ValueError, "not merged"):
-            self.publish(github)
-        self.assertFalse(any(c[:2] == ("git", "tag") for c in github.commands))
+    def test_uncommitted_release_changes_cannot_be_published(self):
+        git = Git(dirty=True)
+        with self.assertRaisesRegex(ValueError, "clean, committed"):
+            publish("2.0.1", git.run)
+        self.assertFalse(any(c[:2] == ("git", "tag") for c in git.commands))
 
-    def test_changed_pr_head_cannot_be_published(self):
-        github = GitHub()
-        github.head = "c" * 40
-        with self.assertRaisesRegex(ValueError, "head changed"):
-            self.publish(github)
-        self.assertFalse(any(c[:2] == ("git", "tag") for c in github.commands))
-
-    def test_unrelated_changes_are_not_pushed_with_release(self):
-        github = GitHub()
-        github.changed = "Cargo.toml\nsumma-core/src/lib.rs"
-        with self.assertRaisesRegex(ValueError, "Unexpected release changes"):
-            self.publish(github)
-        self.assertFalse(any(c[:2] == ("git", "push") for c in github.commands))
-
-    def test_release_files_changed_during_merge_prevent_tagging(self):
-        github = GitHub()
-        run = github.run
-
-        def changed_version(*args, **kwargs):
-            if args[:3] == ("git", "diff", "--exit-code"):
-                raise subprocess.CalledProcessError(1, args)
-            return run(*args, **kwargs)
-
-        with self.assertRaises(subprocess.CalledProcessError):
-            publish(
-                "2.0.1", "release/v2.0.1-123-1", "main", "test/repo", changed_version
-            )
-        self.assertFalse(any(c[:2] == ("git", "tag") for c in github.commands))
+    def test_release_requires_matching_manifests_and_lockfiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = {
+                "Cargo.toml": '[workspace.package]\nversion = "2.0.1"\n[workspace.dependencies]\nsumma-core = {path = "summa-core", version = "2.0.1"}\n',
+                "Cargo.lock": '[[package]]\nname = "summa-core"\nversion = "2.0.1"\n',
+                "summa-client-python/pyproject.toml": '[project]\nversion = "2.0.1"\n',
+                "summa-mal-python/pyproject.toml": '[project]\nversion = "2.0.1"\n',
+                "summa-client-typescript/package.json": json.dumps(
+                    {"version": "2.0.1"}
+                ),
+                "summa-client-python/uv.lock": '[[package]]\nname = "summa-client-python"\nversion = "2.0.1"\n',
+            }
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text)
+            self.assertEqual(release_version(root, "2.0.1"), "2.0.1")
+            with self.assertRaisesRegex(ValueError, "Requested"):
+                release_version(root, "2.0.2")
+            for name, text in files.items():
+                if name == "Cargo.toml":
+                    continue
+                with self.subTest(file=name):
+                    (root / name).write_text(text.replace("2.0.1", "2.0.0"))
+                    with self.assertRaisesRegex(ValueError, "must all match"):
+                        release_version(root)
+                    (root / name).write_text(text)
 
 
 if __name__ == "__main__":
