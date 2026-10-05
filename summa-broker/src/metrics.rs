@@ -3,7 +3,7 @@
 //! Naming follows docs/metrics.md conventions: seconds histograms, `_total`
 //! counters, and an `index` label wherever a request is index-scoped. Every
 //! fallback path the broker can take (ambiguous routing, stale-topology
-//! serving, admission rejection, write refusal) has a counter so it is
+//! serving, partial partition reads, admission rejection, write refusal) has a counter so it is
 //! observable rather than silent.
 
 /// Full broker-side Search RPC duration. Labels: `index`, `status`.
@@ -35,3 +35,6 @@ pub const STALE_TOPOLOGY_SERVES: &str = "summa_broker_stale_topology_serves_tota
 pub const WRITE_REJECTED: &str = "summa_broker_write_rejected_total";
 /// Streaming IndexDocuments flushes forwarded as BatchIndexDocuments. Labels: `index`.
 pub const STREAM_FLUSHES: &str = "summa_broker_stream_flushes_total";
+/// Partitions a partial read (`--partial-partition-reads`) left out, one
+/// increment per missing partition. Labels: `index`, `rpc`, `shard`.
+pub const PARTIAL_READS: &str = "summa_broker_partial_reads_total";

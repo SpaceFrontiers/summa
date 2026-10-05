@@ -17,7 +17,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use support::proto::*;
-use support::{broker_index_client, broker_search_client, spawn_broker, wait_for_indexes};
+use support::{
+    broker_index_client, broker_search_client, spawn_broker, wait_for_backends, wait_for_indexes,
+};
 
 const SCHEMA: &str = r#"
 index e2e {
@@ -148,7 +150,7 @@ async fn broker_routes_real_summa_servers() {
     );
     // Broker is up and has published its first topology snapshot (both
     // servers start with zero indexes, so wait for an empty-but-served list).
-    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    wait_for_backends(&broker, Duration::from_secs(10)).await;
 
     // Placement lands each new index on its ruled shard.
     let mut index = broker_index_client(&broker).await;
@@ -379,7 +381,7 @@ async fn broker_ranks_and_exports_long_phrase_features_without_dropping_terms() 
         ],
         &["--placement", "docs*=0,1"],
     );
-    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    wait_for_backends(&broker, Duration::from_secs(10)).await;
     let mut index = broker_index_client(&broker).await;
     let invalid = index
         .create_index(CreateIndexRequest {
@@ -593,7 +595,7 @@ async fn partitioned_fusion_uses_global_text_stats_and_exclusion_filters() {
         ],
         &["--placement", "docs*=0,1"],
     );
-    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    wait_for_backends(&broker, Duration::from_secs(10)).await;
 
     let index_name = "docs_fusion_e2e";
     let schema = SCHEMA
@@ -996,7 +998,7 @@ async fn partitioned_mutations_route_exact_keys_and_remove_all_document_chunks()
         ],
         &["--placement", "docs*=0,1"],
     );
-    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    wait_for_backends(&broker, Duration::from_secs(10)).await;
     let mut index = broker_index_client(&broker).await;
     let mut search = broker_search_client(&broker).await;
     let oversized = index
@@ -1209,7 +1211,7 @@ async fn broker_forwards_large_singleton_upserts_but_rejects_oversized_batches()
         &[format!("id=a,addr={},shard=0", server.addr)],
         &["--placement", "docs*=0"],
     );
-    wait_for_indexes(&broker, &[], Duration::from_secs(10)).await;
+    wait_for_backends(&broker, Duration::from_secs(10)).await;
     let mut index = broker_index_client(&broker)
         .await
         .max_encoding_message_size(200 * 1024 * 1024);
@@ -1264,4 +1266,108 @@ async fn broker_forwards_large_singleton_upserts_but_rejects_oversized_batches()
         .unwrap()
         .into_inner();
     assert_eq!(info.num_docs, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the summa-server binary; see module docs"]
+async fn partial_partition_reads_survive_a_stopped_partition() {
+    let servers: Vec<ServerProc> = (0..3).map(|_| spawn_server()).collect();
+    for server in &servers {
+        wait_server_ready(&server.addr).await;
+    }
+    let specs: Vec<String> = servers
+        .iter()
+        .enumerate()
+        .map(|(i, server)| format!("id=s{i},addr={},shard={i}", server.addr))
+        .collect();
+    let broker = spawn_broker(
+        &specs,
+        &[
+            "--placement",
+            "docs*=0,1,2",
+            "--partial-partition-reads",
+            "--backend-unreachable-grace-secs",
+            "2",
+        ],
+    );
+    wait_for_backends(&broker, Duration::from_secs(10)).await;
+    let index_name = "docs_partial_e2e";
+    let mut index = broker_index_client(&broker).await;
+    index
+        .create_index(CreateIndexRequest {
+            index_name: index_name.to_string(),
+            schema: SCHEMA.replace("index e2e", &format!("index {index_name}")),
+        })
+        .await
+        .unwrap();
+    wait_for_indexes(&broker, &[index_name], Duration::from_secs(10)).await;
+    let documents = (0..60)
+        .map(|i| doc(&format!("doc-{i}"), &format!("quantum note {i}")))
+        .collect();
+    index
+        .batch_index_documents(BatchIndexDocumentsRequest {
+            index_name: index_name.to_string(),
+            documents,
+        })
+        .await
+        .unwrap();
+    index
+        .commit(CommitRequest {
+            index_name: index_name.to_string(),
+        })
+        .await
+        .unwrap();
+
+    let request = || SearchRequest {
+        index_name: index_name.to_string(),
+        query: Some(Query {
+            query: Some(query::Query::Match(MatchQuery {
+                field: "title".to_string(),
+                text: "quantum".to_string(),
+                ..Default::default()
+            })),
+        }),
+        limit: 100,
+        fields_to_load: vec!["id".to_string()],
+        ..Default::default()
+    };
+    let ids = |response: &SearchResponse| -> std::collections::BTreeSet<String> {
+        response
+            .hits
+            .iter()
+            .map(|hit| match &hit.fields["id"].values[0].value {
+                Some(field_value::Value::Text(id)) => id.clone(),
+                other => panic!("unexpected id {other:?}"),
+            })
+            .collect()
+    };
+    let mut search = broker_search_client(&broker).await;
+    let full = search.search(request()).await.unwrap().into_inner();
+    assert_eq!(full.missing_partitions, 0);
+    assert_eq!(ids(&full).len(), 60);
+
+    // Stop one partition: first refused connections (UNAVAILABLE), then
+    // eviction. Reads keep answering from the other two partitions.
+    let mut servers = servers;
+    drop(servers.remove(1));
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut answered = 0;
+    while std::time::Instant::now() < deadline {
+        let partial = search.search(request()).await.unwrap().into_inner();
+        assert_eq!(partial.missing_partitions, 1);
+        let partial_ids = ids(&partial);
+        assert!(!partial_ids.is_empty() && partial_ids.len() < 60);
+        assert!(partial_ids.is_subset(&ids(&full)));
+        answered += 1;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(answered > 10);
+    // Counts stay strict.
+    let info = search
+        .get_index_info(GetIndexInfoRequest {
+            index_name: index_name.to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(info.code(), tonic::Code::Unavailable);
 }

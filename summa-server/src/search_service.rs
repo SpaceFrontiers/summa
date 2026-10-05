@@ -536,6 +536,9 @@ impl SearchService for SearchServiceImpl {
             seeded_document_passages: req.score_export.as_ref().is_some_and(|export| export.seed_document_passages),
             fusion_candidates,
             trace,
+            // A server always answers for its whole index; only the broker
+            // leaves partitions out.
+            missing_partitions: 0,
         };
         response_budget.check_response(&response)?;
         Ok(Response::new(response))
@@ -636,6 +639,7 @@ impl SearchService for SearchServiceImpl {
         let stats = searcher.global_stats().text_stats_for(&terms);
         Ok(Response::new(GetTextStatsResponse {
             stats: Some(text_stats_to_proto(&stats, searcher.schema())),
+            missing_partitions: 0,
         }))
     }
 

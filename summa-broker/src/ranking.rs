@@ -393,6 +393,16 @@ impl CoordinatorPlan {
         })
     }
 
+    /// Partitions that dropped out of a partial read: finish with the rest.
+    pub fn lose_shards(&mut self, lost: usize) -> Result<(), Status> {
+        self.shards = self
+            .shards
+            .checked_sub(lost)
+            .filter(|&remaining| remaining > 0)
+            .ok_or_else(|| Status::unavailable("no partition answered the coordinated search"))?;
+        Ok(())
+    }
+
     pub fn finish(
         &self,
         mut responses: Vec<proto::SearchResponse>,

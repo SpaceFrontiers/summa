@@ -33,6 +33,9 @@ pub struct BrokerContext {
     /// Primary-key field per partitioned index, resolved from its schema on
     /// the first write (`routes::primary_key_field`).
     pub primary_keys: RwLock<HashMap<String, String>>,
+    /// Serve searches and text statistics of a partitioned index from the
+    /// partitions that are up (`--partial-partition-reads`).
+    pub partial_partition_reads: bool,
 }
 
 impl BrokerContext {

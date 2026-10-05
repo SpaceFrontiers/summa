@@ -120,6 +120,7 @@ silently.
 | `summa_broker_ambiguous_index_total`            | counter   | `index`                  | reads routed to a deterministically-picked shard because the index exists on several shards with no rule |
 | `summa_broker_stale_topology_serves_total`      | counter   | `backend`                | reads served by a Suspect backend off its last-known index map                                           |
 | `summa_broker_write_rejected_total`             | counter   | `index`, `reason`        | write RPCs the broker itself refused (reason = gRPC code label)                                          |
+| `summa_broker_partial_reads_total`              | counter   | `index`, `rpc`, `shard`  | partitions a partial read (`--partial-partition-reads`) left out, one per missing partition              |
 | `summa_broker_stream_flushes_total`             | counter   | `index`                  | streaming IndexDocuments runs forwarded as BatchIndexDocuments                                           |
 
 ### Pre-existing indexes and `index="unknown"`
