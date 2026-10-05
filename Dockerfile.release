@@ -11,6 +11,7 @@ RUN rustup toolchain install 1.98.1 --profile minimal \
 RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     pkg-config \
+    make \
     libssl-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
