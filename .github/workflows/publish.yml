@@ -47,11 +47,25 @@ jobs:
   bump-version:
     name: Bump Version
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       new_version: ${{ steps.bump.outputs.new_version }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
+      - name: Require the default branch
+        env:
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/$BASE_BRANCH" ]]; then
+            echo "::error::Publish must run from $BASE_BRANCH"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.repository.default_branch }}
           token: ${{ secrets.GITHUB_TOKEN }}
           persist-credentials: true
 
@@ -120,20 +134,15 @@ jobs:
       - name: Update Cargo.lock
         run: cargo generate-lockfile
 
-      - name: Commit and push
-        run: |
-          git add Cargo.toml Cargo.lock \
-            summa-client-python/pyproject.toml \
-            summa-client-python/uv.lock \
-            summa-mal-python/pyproject.toml \
-            summa-client-typescript/package.json
-          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }}"
-          git push
-
-      - name: Create git tag
-        run: |
-          git tag "v${{ steps.bump.outputs.new_version }}"
-          git push origin "v${{ steps.bump.outputs.new_version }}"
+      # Repository settings must allow GitHub Actions to create pull requests.
+      # Merge through normal branch protection; never push directly to main.
+      - name: Merge release PR and tag its merge commit
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_VERSION: ${{ steps.bump.outputs.new_version }}
+        run: python3 scripts/publish_version.py "$RELEASE_VERSION"
 
   publish-crates:
     name: Publish to crates.io
@@ -143,7 +152,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.bump-version.outputs.new_version }}
+          ref: ${{ needs.bump-version.outputs.release_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -197,7 +206,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.bump-version.outputs.new_version }}
+          ref: ${{ needs.bump-version.outputs.release_sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -233,7 +242,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.bump-version.outputs.new_version }}
+          ref: ${{ needs.bump-version.outputs.release_sha }}
 
       - name: Install pnpm
         uses: pnpm/action-setup@v4
@@ -268,7 +277,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.bump-version.outputs.new_version }}
+          ref: ${{ needs.bump-version.outputs.release_sha }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
@@ -302,7 +311,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.bump-version.outputs.new_version }}
+          ref: ${{ needs.bump-version.outputs.release_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.1
@@ -322,7 +331,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: v${{ needs.bump-version.outputs.new_version }}
+          ref: ${{ needs.bump-version.outputs.release_sha }}
 
       - name: Set up Docker Buildx
         id: buildx
