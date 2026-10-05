@@ -46,7 +46,7 @@ pub use vector_builder::{AlterVectorIndexOutcome, AlterVectorIndexState};
 #[cfg(all(feature = "wasm", not(feature = "native")))]
 pub use wasm_writer::IndexWriter as WasmIndexWriter;
 #[cfg(feature = "native")]
-pub use writer::{IndexWriter, PreparedCommit, WRITER_LOCK_FILENAME};
+pub use writer::{IndexWriter, PreparedCommit, WRITER_LOCK_FILENAME, WriterMemoryProbe};
 
 mod metadata;
 pub use metadata::{
@@ -356,6 +356,11 @@ pub struct IndexConfig {
     /// `num_threads`; this separate cap protects the page cache and storage
     /// queue from segment/query fan-out.
     pub sparse_io_concurrency: usize,
+    /// Segment readers opened concurrently when a searcher loads or reloads
+    /// (each open validates and pins its hot metadata). Every concurrent open
+    /// holds its own validation scratch, so raise this only with memory to
+    /// spare. Zero is invalid.
+    pub segment_open_concurrency: usize,
     /// Number of parallel segment builders (documents distributed round-robin)
     pub num_indexing_threads: usize,
     /// Width of the document-store compression pool. Concurrent segment
@@ -420,6 +425,10 @@ pub struct IndexConfig {
     pub posting_impact_bounds: bool,
     /// Reload interval in milliseconds for IndexReader (how often to check for new segments)
     pub reload_interval_ms: u64,
+    /// The owner refreshes the reader in the background
+    /// (`IndexReader::refresh`) instead of searches checking for new
+    /// segments inline, so no search waits for new segments to open and pin.
+    pub background_reload: bool,
     /// Maximum number of concurrent background merges per index (default: 4)
     pub max_concurrent_merges: usize,
     /// Application-wide background merge gate shared by clones of this
@@ -633,6 +642,7 @@ impl Default for IndexConfig {
         Self {
             num_threads: search_threads,
             sparse_io_concurrency: 4,
+            segment_open_concurrency: DEFAULT_SEGMENT_OPEN_CONCURRENCY,
             num_indexing_threads: 1, // Increase to 2+ for production to avoid stalls during segment build
             num_compression_threads: compression_threads,
             term_cache_blocks: DEFAULT_TERM_CACHE_BLOCKS,
@@ -664,6 +674,7 @@ impl Default for IndexConfig {
             posting_ratio_bounds: false,
             posting_impact_bounds: false,
             reload_interval_ms: 1000, // 1 second default
+            background_reload: false,
             max_concurrent_merges: 4,
             #[cfg(feature = "native")]
             background_merge_permits: Arc::new(tokio::sync::Semaphore::new(4)),
@@ -697,6 +708,9 @@ pub const DEFAULT_TERM_CACHE_BLOCKS: usize = 256;
 /// wildcards retain 207 MB); WASM and 32-bit targets keep per-segment caches.
 #[cfg(all(feature = "native", target_pointer_width = "64"))]
 pub const DEFAULT_TERM_CACHE_PROCESS_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default [`IndexConfig::segment_open_concurrency`].
+pub const DEFAULT_SEGMENT_OPEN_CONCURRENCY: usize = 2;
 /// Default process-wide dictionary cache budget (disabled on this target).
 #[cfg(not(all(feature = "native", target_pointer_width = "64")))]
 pub const DEFAULT_TERM_CACHE_PROCESS_BYTES: usize = 0;
@@ -1031,10 +1045,16 @@ impl<D: crate::directories::DirectoryWriter + 'static> Index<D> {
                     Arc::clone(&self.segment_manager),
                     self.config.reload_interval_ms,
                     self.search_resources.clone(),
+                    !self.config.background_reload,
                 )
                 .await
             })
             .await
+    }
+
+    /// The reader if one was already created; never opens segments.
+    pub fn loaded_reader(&self) -> Option<&IndexReader<D>> {
+        self.cached_reader.get()
     }
 
     /// Get the config

@@ -122,6 +122,14 @@ struct Args {
     #[arg(long)]
     partial_partition_reads: bool,
 
+    /// With --partial-partition-reads: once one partition has answered a
+    /// Search or GetTextStats, leave out partitions that take longer than
+    /// this many more milliseconds (reported like unavailable ones), so a
+    /// slow or still-loading partition degrades results instead of stalling
+    /// the request. 0 waits for every partition.
+    #[arg(long, default_value = "0")]
+    partition_straggler_ms: u64,
+
     /// Steady-state seconds between ListIndexes polls of a healthy backend
     #[arg(long, default_value = "15")]
     index_poll_interval_secs: u64,
@@ -313,6 +321,11 @@ async fn async_main(args: Args) -> Result<()> {
             "--backend-max-searches must be greater than zero"
         ));
     }
+    if args.partition_straggler_ms > 0 && !args.partial_partition_reads {
+        return Err(anyhow::anyhow!(
+            "--partition-straggler-ms requires --partial-partition-reads"
+        ));
+    }
     if args.max_concurrent_searches == Some(0) {
         return Err(anyhow::anyhow!(
             "--max-concurrent-searches must be greater than zero when set"
@@ -447,6 +460,8 @@ async fn async_main(args: Args) -> Result<()> {
         shutting_down: Arc::clone(&shutting_down),
         primary_keys: parking_lot::RwLock::new(std::collections::HashMap::new()),
         partial_partition_reads: args.partial_partition_reads,
+        partition_straggler: (args.partition_straggler_ms > 0)
+            .then(|| Duration::from_millis(args.partition_straggler_ms)),
     });
 
     let search_service = search_service::BrokerSearchService {
@@ -479,6 +494,12 @@ async fn async_main(args: Args) -> Result<()> {
             "strict (every partition must answer)"
         }
     );
+    if args.partition_straggler_ms > 0 {
+        info!(
+            "Partition straggler budget: {} ms after the first partition answers",
+            args.partition_straggler_ms
+        );
+    }
     info!(
         "Per-backend search admission: {}",
         args.backend_max_searches

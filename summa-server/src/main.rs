@@ -3,6 +3,7 @@
 mod converters;
 mod error;
 mod index_service;
+mod memory;
 mod optimizer;
 mod registry;
 mod search_service;
@@ -20,6 +21,14 @@ use tonic::{codec::CompressionEncoding, transport::Server};
 use summa_core::IndexConfig;
 use summa_core::directories::{PayloadReadBackend, PayloadReadService};
 use summa_core::segment::pin::{PinMode, PinPolicy, set_pin_policy};
+
+// jemalloc: search, merge, reorder and indexing threads allocate and free
+// large buffers concurrently; glibc's per-thread arenas left tens of GiB of
+// fragmented anonymous memory on a shared node. Its statistics also feed the
+// allocator gauges (`memory`).
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 pub mod proto {
     tonic::include_proto!("summa");
@@ -146,6 +155,17 @@ struct Args {
     /// across all indexes and queries.
     #[arg(long, default_value = "4")]
     sparse_io_concurrency: usize,
+
+    /// Segment readers opened (validated and pinned) concurrently when an
+    /// index loads at startup or picks up new segments. Each open holds its
+    /// own validation scratch.
+    #[arg(long, default_value_t = summa_core::index::DEFAULT_SEGMENT_OPEN_CONCURRENCY)]
+    segment_open_concurrency: usize,
+
+    /// Seconds between samples of the memory gauges
+    /// (summa_memory_*_bytes, summa_index_memory_bytes).
+    #[arg(long, default_value = "15")]
+    memory_metrics_interval_secs: u64,
 
     /// Validate all indexes on startup, remove corrupt segments
     #[arg(long)]
@@ -635,6 +655,16 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             "--sparse-io-concurrency must be greater than zero"
         ));
     }
+    if args.segment_open_concurrency == 0 {
+        return Err(anyhow::anyhow!(
+            "--segment-open-concurrency must be greater than zero"
+        ));
+    }
+    if args.memory_metrics_interval_secs == 0 {
+        return Err(anyhow::anyhow!(
+            "--memory-metrics-interval-secs must be greater than zero"
+        ));
+    }
 
     let max_indexing_memory_bytes = args
         .max_indexing_memory_mb
@@ -737,6 +767,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let config = IndexConfig {
         num_threads: search_threads,
         sparse_io_concurrency: args.sparse_io_concurrency,
+        segment_open_concurrency: args.segment_open_concurrency,
         store_cache_budget_bytes,
         term_cache_process_bytes,
         max_indexing_memory_bytes,
@@ -744,6 +775,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         vector_training_memory_bytes,
         num_indexing_threads,
         reload_interval_ms: args.reload_interval_ms,
+        // Searches never reload inline; `refresh_readers` below does.
+        background_reload: true,
         merge_policy: Box::new(merge_policy),
         max_concurrent_merges: args.max_concurrent_merges,
         background_merge_permits: Arc::new(tokio::sync::Semaphore::new(args.max_concurrent_merges)),
@@ -814,7 +847,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
             compaction_cooldown: Duration::from_secs(args.optimizer_compaction_cooldown_secs),
             compaction_memory_budget: compaction_memory_budget_bytes,
         },
-        shutdown_rx,
+        shutdown_rx.clone(),
     );
 
     info!("Summa server v{}", env!("CARGO_PKG_VERSION"));
@@ -841,7 +874,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         args.sparse_io_concurrency
     );
     info!("Maximum concurrent searches: {}", max_concurrent_searches);
-    info!("Reload interval: {} ms", args.reload_interval_ms);
+    info!(
+        "Reload interval: {} ms (background); segment open concurrency: {}",
+        args.reload_interval_ms, args.segment_open_concurrency
+    );
     info!(
         "Merge: {} concurrent, tiered(segments_per_tier={}, max_merge_at_once={}, max_merged_docs={}, max_segment_docs={})",
         args.max_concurrent_merges,
@@ -907,6 +943,23 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let startup = tokio::spawn(async move {
         open_indexes_then_serve(&startup_registry, &startup_health).await;
     });
+    let refresh_registry = Arc::clone(&registry);
+    let refresh_interval = Duration::from_millis(args.reload_interval_ms.max(1));
+    let mut refresh_shutdown = shutdown_rx.clone();
+    let refresher = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(refresh_interval) => {}
+                _ = refresh_shutdown.changed() => return,
+            }
+            refresh_registry.refresh_readers().await;
+        }
+    });
+    let memory_gauges = memory::spawn(
+        Arc::clone(&registry),
+        Duration::from_secs(args.memory_metrics_interval_secs),
+        shutdown_rx.clone(),
+    );
 
     let signal_registry = Arc::clone(&registry);
     let signal_shutdown = shutdown_tx.clone();
@@ -957,6 +1010,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let _ = shutdown_tx.send(true);
     // Opening stops at the next index once admission is closed.
     let _ = startup.await;
+    let _ = refresher.await;
+    let _ = memory_gauges.await;
 
     info!("[shutdown] gRPC server drained; waiting for background work");
     // Stop managers only after accepted commits release their writer guards.

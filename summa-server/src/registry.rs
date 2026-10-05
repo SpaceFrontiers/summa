@@ -19,6 +19,8 @@ use summa_core::{Index, IndexConfig, IndexMetadata, IndexWriter, MmapDirectory, 
 pub struct IndexHandle {
     pub index: Arc<Index<MmapDirectory>>,
     pub writer: Arc<tokio::sync::RwLock<IndexWriter<MmapDirectory>>>,
+    /// Lock-free memory view of the writer for the memory gauges.
+    pub memory: summa_core::index::WriterMemoryProbe,
 }
 
 /// Exclusive per-name lease held for the complete delete transaction. It
@@ -338,6 +340,7 @@ impl IndexRegistry {
             .await
             .map_err(crate::error::summa_error_to_status)?;
         let index = Arc::new(index);
+        let memory = w.memory_probe();
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         Self::precache_idf_files(&index);
@@ -350,6 +353,7 @@ impl IndexRegistry {
                     IndexHandle {
                         index: Arc::clone(&index),
                         writer,
+                        memory,
                     },
                 );
                 return Ok(index);
@@ -398,6 +402,7 @@ impl IndexRegistry {
         w.init_primary_key_dedup()
             .await
             .map_err(crate::error::summa_error_to_status)?;
+        let memory = w.memory_probe();
         let writer = Arc::new(tokio::sync::RwLock::new(w));
 
         Self::precache_idf_files(&index);
@@ -410,6 +415,7 @@ impl IndexRegistry {
                     IndexHandle {
                         index: Arc::clone(&index),
                         writer,
+                        memory,
                     },
                 );
                 return Ok(());
@@ -691,8 +697,19 @@ impl IndexRegistry {
         let (mut opened, mut failed) = (0, 0);
         for name in &names {
             let started = std::time::Instant::now();
-            match self.get_or_open_index(name).await {
-                Ok(_) => {
+            // Ready means searchable: building the searcher opens every
+            // segment reader and pins its hot metadata now, not on the first
+            // search after the server reports SERVING.
+            let searchable = async {
+                let index = self.get_or_open_index(name).await?;
+                index
+                    .reader()
+                    .await
+                    .map_err(crate::error::summa_error_to_status)?;
+                Ok::<_, Status>(())
+            };
+            match searchable.await {
+                Ok(()) => {
                     opened += 1;
                     info!(
                         "[startup] opened index '{}' in {:.1?} ({}/{})",
@@ -716,6 +733,50 @@ impl IndexRegistry {
             }
         }
         Ok((opened, failed))
+    }
+
+    /// Every open index with its writer memory probe, for the memory gauges.
+    pub fn memory_snapshot(
+        &self,
+    ) -> Vec<(
+        String,
+        Arc<Index<MmapDirectory>>,
+        summa_core::index::WriterMemoryProbe,
+    )> {
+        self.handles
+            .read()
+            .iter()
+            .map(|(name, handle)| {
+                (
+                    name.clone(),
+                    Arc::clone(&handle.index),
+                    handle.memory.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// Swap in searchers that include segments published since the last
+    /// refresh (merges, commits). With `IndexConfig::background_reload` this
+    /// is the only reload path besides an explicit commit, so no search
+    /// waits for new segments to open.
+    pub async fn refresh_readers(&self) {
+        let indexes: Vec<_> = self
+            .handles
+            .read()
+            .iter()
+            .map(|(name, handle)| (name.clone(), Arc::clone(&handle.index)))
+            .collect();
+        for (name, index) in indexes {
+            if !self.is_running() {
+                return;
+            }
+            if let Some(reader) = index.loaded_reader()
+                && let Err(error) = reader.refresh().await
+            {
+                warn!("[reader_refresh] index '{}': {}", name, error);
+            }
+        }
     }
 
     pub fn is_running(&self) -> bool {
@@ -959,8 +1020,12 @@ mod tests {
 
         let registry = IndexRegistry::new(root.clone(), config);
         assert_eq!(registry.open_all_indexes().await.unwrap(), (2, 1));
-        assert!(registry.handles.read().contains_key("first"));
-        assert!(registry.handles.read().contains_key("second"));
+        for name in ["first", "second"] {
+            let handles = registry.handles.read();
+            let handle = handles.get(name).expect("opened at startup");
+            // Ready means searchable: the reader exists before any search.
+            assert!(handle.index.loaded_reader().is_some(), "{name}");
+        }
         assert!(!registry.handles.read().contains_key("broken"));
 
         registry.shutdown().await.unwrap();
@@ -969,6 +1034,51 @@ mod tests {
             registry.open_all_indexes().await.unwrap_err().code(),
             tonic::Code::Unavailable,
         );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn background_reload_keeps_searches_off_the_reload_path() {
+        let root = std::env::temp_dir().join(format!(
+            "summa_registry_background_reload_{}",
+            SegmentId::new().to_hex()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = IndexRegistry::new(
+            root.clone(),
+            IndexConfig {
+                num_indexing_threads: 1,
+                background_reload: true,
+                reload_interval_ms: 0,
+                ..Default::default()
+            },
+        );
+        let mut schema = summa_core::SchemaBuilder::default();
+        let id = schema.add_text_field("id", true, true);
+        schema.set_primary_key(id);
+        registry
+            .create_index("social", schema.build())
+            .await
+            .unwrap();
+        let index = registry.get_or_open_index("social").await.unwrap();
+        let reader = index.reader().await.unwrap();
+        assert_eq!(reader.searcher().await.unwrap().num_docs(), 0);
+        {
+            let writer = registry.get_writer("social").await.unwrap();
+            let mut writer = writer.write().await;
+            let mut doc = summa_core::Document::new();
+            doc.add_text(id, "a");
+            writer.add_document(doc).unwrap();
+            writer.commit().await.unwrap();
+        }
+        // A search does not pick up the published segment itself...
+        assert_eq!(reader.searcher().await.unwrap().num_docs(), 0);
+        // ...the background refresh does.
+        registry.refresh_readers().await;
+        assert_eq!(reader.searcher().await.unwrap().num_docs(), 1);
+        drop(index);
+        registry.shutdown().await.unwrap();
         drop(registry);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -122,8 +122,11 @@ object) in `--namespace` with a label-existence selector on the shard label.
 Readiness = PodReady ∧ has IP ∧ not terminating; unready pods are visible in
 the admin surface but never routed or polled. summa-server serves
 `grpc.health.v1`: `NOT_SERVING` until every index in its data directory is
-open (opening a large index pins its metadata and takes minutes), `SERVING`
-until shutdown begins. Use a gRPC readiness probe so a restarting shard is
+open and its searcher built (every segment reader opened and its hot metadata
+pinned, which takes minutes for a large index), `SERVING` until shutdown
+begins. Searches never reload inline: a background task picks up new segments,
+so no search waits for them to open. `--segment-open-concurrency` (default 2)
+sets how many segments open at once. Use a gRPC readiness probe so a restarting shard is
 not routed while it loads; keep liveness on TCP, because loading is not a
 hang. RBAC: `get/list/watch pods` in
 the summa namespace. Static mode (`--discovery static --backend
@@ -148,6 +151,12 @@ complete answer must check that field. Any other partition error, or losing
 every partition, still fails. `GetIndexInfo`, writes and commits stay strict,
 and `GetDocument` returns `UNAVAILABLE` instead of `NOT_FOUND` when the
 document may live on a missing partition.
+
+`--partition-straggler-ms` (with partial reads) bounds slow partitions: once
+one partition answers a `Search` or `GetTextStats`, the others get that many
+more milliseconds before they are left out and reported like unavailable
+ones. A cold, overloaded or still-loading partition then degrades results
+instead of holding every request until the client deadline.
 
 Writes:
 

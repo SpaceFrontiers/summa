@@ -100,6 +100,18 @@ Dense L1 `kind` labels follow the active reader path: `tq_flat`, `ivf_tq`,
 binary-specific entry points. IVF-PQ has been removed. The source of truth is
 [`dense_ann_kind_label` and its call sites](../summa-core/src/segment/reader/mod.rs).
 
+### Server memory (`summa-server`)
+
+Sampled every `--memory-metrics-interval-secs` (15 s) without taking writer
+locks or loading readers, so RSS can be attributed before the OOM killer acts.
+summa-server uses jemalloc.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `summa_memory_allocator_bytes` | gauge | `kind` | jemalloc `allocated` (live objects), `active`, `resident`, `retained`, `metadata` |
+| `summa_memory_process_bytes` | gauge | `kind` | `/proc/self/status` `rss_anon`, `rss_file`, `locked` (mlock-pinned metadata) |
+| `summa_index_memory_bytes` | gauge | `index`, `kind` | `indexing_buffer` (open segment builders), `primary_key` (dedup index), `reader_heap` (estimated segment-reader heap), `pinned_metadata` |
+
 ### Broker metrics (`summa-broker`)
 
 Emitted by the broker process (see [broker.md](broker.md)), same conventions.

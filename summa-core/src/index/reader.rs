@@ -53,6 +53,10 @@ pub struct IndexReader<D: DirectoryWriter + 'static> {
     reload_check_interval: std::time::Duration,
     /// Guard against concurrent reloads
     reloading: AtomicBool,
+    /// Whether `searcher()` itself checks for new segments. Off when the
+    /// owner refreshes in the background (`IndexConfig::background_reload`),
+    /// so no search waits for a reload to open and pin new segments.
+    inline_reload: bool,
 }
 
 impl<D: DirectoryWriter + 'static> IndexReader<D> {
@@ -82,6 +86,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             segment_manager,
             reload_interval_ms,
             resources,
+            true,
         )
         .await
     }
@@ -93,6 +98,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
         segment_manager: Arc<crate::merge::SegmentManager<D>>,
         reload_interval_ms: u64,
         resources: SearcherResources,
+        inline_reload: bool,
     ) -> Result<Self> {
         // Get initial segment IDs
         let initial_segment_ids = segment_manager.get_segment_ids().await;
@@ -112,6 +118,7 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
             last_reload_check: RwLock::new(std::time::Instant::now()),
             reload_check_interval: std::time::Duration::from_millis(reload_interval_ms),
             reloading: AtomicBool::new(false),
+            inline_reload,
         })
     }
 
@@ -158,6 +165,9 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
     /// Wait-free read path via ArcSwap::load(). Reload checks are guarded
     /// by an AtomicBool to prevent concurrent reloads.
     pub async fn searcher(&self) -> Result<Arc<Searcher<D>>> {
+        if !self.inline_reload {
+            return Ok(self.current_searcher());
+        }
         // Check if we should check for segment changes
         let should_check = {
             let last = self.last_reload_check.read();
@@ -180,6 +190,26 @@ impl<D: DirectoryWriter + 'static> IndexReader<D> {
 
         // Wait-free load (no lock contention with reloads)
         Ok(Arc::clone(&self.state.load().searcher))
+    }
+
+    /// The current searcher, without checking for new segments (wait-free).
+    pub fn current_searcher(&self) -> Arc<Searcher<D>> {
+        Arc::clone(&self.state.load().searcher)
+    }
+
+    /// Check for new segments now and swap in a searcher that includes them;
+    /// a no-op when another reload is in progress. Background owners call
+    /// this instead of letting searches reload inline.
+    pub async fn refresh(&self) -> Result<()> {
+        if self
+            .reloading
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(());
+        }
+        let _reload_guard = ReloadGuard(&self.reloading);
+        self.do_reload_check().await
     }
 
     /// Actual reload check (called under the `reloading` guard)

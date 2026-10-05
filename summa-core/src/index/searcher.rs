@@ -29,6 +29,7 @@ pub(crate) struct SearcherResources {
     pub(crate) store_cache: Arc<crate::segment::SharedStoreCache>,
     pub(crate) sparse_io_gate: Arc<super::SparseIoGate>,
     pub(crate) sparse_io_concurrency: usize,
+    pub(crate) segment_open_concurrency: usize,
     #[cfg(feature = "sync")]
     pub(crate) search_pool: Arc<rayon::ThreadPool>,
 }
@@ -37,12 +38,19 @@ pub(crate) struct SearcherResources {
 impl SearcherResources {
     /// Cache and CPU policy of an `Index` opened with `config`.
     pub(crate) fn from_config(config: &super::IndexConfig) -> Result<Self> {
-        Self::new(
+        if config.segment_open_concurrency == 0 {
+            return Err(crate::Error::Internal(
+                "IndexConfig.segment_open_concurrency must be greater than zero".into(),
+            ));
+        }
+        let mut resources = Self::new(
             super::term_cache_policy(config)?,
             config.store_cache_budget_bytes,
             config.num_threads,
             config.sparse_io_concurrency,
-        )
+        )?;
+        resources.segment_open_concurrency = config.segment_open_concurrency;
+        Ok(resources)
     }
 
     /// Validates every load-time limit once, before any segment or file is
@@ -73,6 +81,7 @@ impl SearcherResources {
             store_cache: super::shared_store_cache(store_cache_budget_bytes),
             sparse_io_gate: super::shared_sparse_io_gate(sparse_io_concurrency),
             sparse_io_concurrency,
+            segment_open_concurrency: super::DEFAULT_SEGMENT_OPEN_CONCURRENCY,
             #[cfg(feature = "sync")]
             search_pool,
         })
@@ -162,6 +171,7 @@ impl<D: Directory + 'static> Searcher<D> {
             Arc::clone(&resources.store_cache),
             &[],
             snapshot.deletions(),
+            resources.segment_open_concurrency,
         )
         .await?;
 
@@ -204,6 +214,7 @@ impl<D: Directory + 'static> Searcher<D> {
             Arc::clone(&resources.store_cache),
             existing_segments,
             snapshot.deletions(),
+            resources.segment_open_concurrency,
         )
         .await?;
 
@@ -264,6 +275,7 @@ impl<D: Directory + 'static> Searcher<D> {
             store_cache,
             &[],
             &deletions,
+            super::DEFAULT_SEGMENT_OPEN_CONCURRENCY,
         )
         .await?;
 
@@ -313,6 +325,7 @@ impl<D: Directory + 'static> Searcher<D> {
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
+        open_concurrency: usize,
     ) -> Result<(
         Vec<Arc<SegmentReader>>,
         Vec<crate::Field>,
@@ -329,6 +342,7 @@ impl<D: Directory + 'static> Searcher<D> {
             store_cache,
             existing_segments,
             deletions,
+            open_concurrency,
         )
         .await?;
         let default_fields = Self::build_default_fields(schema);
@@ -356,6 +370,7 @@ impl<D: Directory + 'static> Searcher<D> {
         store_cache: Arc<crate::segment::SharedStoreCache>,
         existing_segments: &[Arc<SegmentReader>],
         deletions: &std::collections::HashMap<String, (u32, crate::segment::DeletionMeta)>,
+        open_concurrency: usize,
     ) -> Result<Vec<Arc<SegmentReader>>> {
         // Build lookup from existing segment readers for reuse
         let existing_map: FxHashMap<u128, Arc<SegmentReader>> = existing_segments
@@ -412,8 +427,8 @@ impl<D: Directory + 'static> Searcher<D> {
         }
 
         // Segment opens retain their completed payloads, but validation/copy
-        // scratch must not multiply by every new segment during reload.
-        const MAX_CONCURRENT_SEGMENT_OPENS: usize = 2;
+        // scratch must not multiply by every new segment during reload; the
+        // width is IndexConfig::segment_open_concurrency.
         use futures::{StreamExt, TryStreamExt};
         // Separate independent copied indexes' shared cache keys.
         let cache_directory_namespace = Arc::as_ptr(directory) as usize;
@@ -464,7 +479,7 @@ impl<D: Directory + 'static> Searcher<D> {
                     Ok((idx, Arc::new(reader)))
                 }
             }))
-            .buffer_unordered(MAX_CONCURRENT_SEGMENT_OPENS)
+            .buffer_unordered(open_concurrency.max(1))
             .try_collect()
             .await?;
         loaded.extend(results);
