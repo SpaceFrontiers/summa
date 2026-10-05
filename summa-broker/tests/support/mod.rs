@@ -60,6 +60,9 @@ pub struct MockState {
     pub schema: String,
     /// When set, GetDocument answers NOT_FOUND.
     pub document_missing: bool,
+    /// Delay before answering Search and GetTextStats (a slow or still-
+    /// loading partition).
+    pub read_delay: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -75,6 +78,13 @@ impl MockBackend {
                 schema: "index mock {}".to_string(),
                 ..Default::default()
             })),
+        }
+    }
+
+    async fn read_delay(&self) {
+        let delay = self.state.lock().read_delay;
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
     }
 
@@ -127,6 +137,7 @@ impl SearchService for MockBackend {
         request: Request<SearchRequest>,
     ) -> Result<Response<SearchResponse>, Status> {
         self.check_available()?;
+        self.read_delay().await;
         let timeout = recorded_timeout(request.metadata());
         let req = request.into_inner();
         let mut state = self.state.lock();
@@ -154,6 +165,7 @@ impl SearchService for MockBackend {
         request: Request<GetTextStatsRequest>,
     ) -> Result<Response<GetTextStatsResponse>, Status> {
         self.check_available()?;
+        self.read_delay().await;
         self.state
             .lock()
             .text_stats_requests

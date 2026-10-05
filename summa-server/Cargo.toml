@@ -46,6 +46,8 @@ parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 num_cpus = { workspace = true }
 rayon = { workspace = true }
+tikv-jemallocator = { version = "0.7", features = ["stats", "background_threads"] }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 
 [build-dependencies]
 summa-proto = { workspace = true }

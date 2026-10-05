@@ -39,6 +39,59 @@ pub struct BrokerSearchService {
     pub ctx: Arc<BrokerContext>,
 }
 
+/// Await every partition call in order. With a straggler budget, the calls
+/// still running `budget` after the first success are cancelled and replaced
+/// by `straggled(i)`, so a partial read answers from the partitions that kept
+/// up instead of waiting out the client deadline for a slow one.
+async fn gather<R, F>(
+    calls: Vec<F>,
+    straggler: Option<std::time::Duration>,
+    succeeded: impl Fn(&R) -> bool,
+    straggled: impl Fn(usize) -> R,
+) -> Vec<R>
+where
+    F: std::future::Future<Output = R>,
+{
+    use futures::StreamExt;
+    let Some(budget) = straggler else {
+        return futures::future::join_all(calls).await;
+    };
+    let total = calls.len();
+    let mut pending: futures::stream::FuturesUnordered<_> = calls
+        .into_iter()
+        .enumerate()
+        .map(|(i, call)| async move { (i, call.await) })
+        .collect();
+    let mut results: Vec<Option<R>> = (0..total).map(|_| None).collect();
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let next = match deadline {
+            Some(at) => match tokio::time::timeout_at(at, pending.next()).await {
+                Ok(next) => next,
+                Err(_) => break,
+            },
+            None => pending.next().await,
+        };
+        let Some((i, result)) = next else { break };
+        if deadline.is_none() && succeeded(&result) {
+            deadline = Some(tokio::time::Instant::now() + budget);
+        }
+        results[i] = Some(result);
+    }
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(i, result)| result.unwrap_or_else(|| straggled(i)))
+        .collect()
+}
+
+fn straggled_status(budget: Option<std::time::Duration>) -> Status {
+    Status::unavailable(format!(
+        "partition did not answer within {} ms of the first partition",
+        budget.map_or(0, |budget| budget.as_millis())
+    ))
+}
+
 /// Whether a failed partition may be left out of a partial read.
 fn partition_droppable(partial: bool, route: &Route, status: &Status) -> bool {
     partial && route.is_partitioned() && status.code() == tonic::Code::Unavailable
@@ -52,23 +105,45 @@ macro_rules! forward_read {
         let req = $req;
         let index_name = req.index_name.clone();
         let route: &Route = $route;
-        let calls = route.targets().iter().map(|target| {
-            let mut outbound = Request::new(req.clone());
-            if let Some(t) = $timeout {
-                outbound.set_timeout(t);
-            }
-            let mut client = target.channels.search.clone();
-            let target: Target = target.clone();
-            async move {
-                let started = Instant::now();
-                let result = client.$method(outbound).await;
-                (target, started, result)
-            }
-        });
+        let calls: Vec<_> = route
+            .targets()
+            .iter()
+            .map(|target| {
+                let mut outbound = Request::new(req.clone());
+                if let Some(t) = $timeout {
+                    outbound.set_timeout(t);
+                }
+                let mut client = target.channels.search.clone();
+                let target: Target = target.clone();
+                async move {
+                    let started = Instant::now();
+                    let result = client.$method(outbound).await;
+                    (target, started, result)
+                }
+            })
+            .collect();
+        let straggler = if $partial {
+            $self.ctx.partition_straggler
+        } else {
+            None
+        };
+        let gathered = gather(
+            calls,
+            straggler,
+            |(_, _, result)| result.is_ok(),
+            |i| {
+                (
+                    route.targets()[i].clone(),
+                    Instant::now(),
+                    Err(straggled_status(straggler)),
+                )
+            },
+        )
+        .await;
         let mut responses = Vec::with_capacity(route.targets().len());
         let mut lost: Vec<String> = Vec::new();
         let mut last_failure = None;
-        for (target, started, result) in futures::future::join_all(calls).await {
+        for (target, started, result) in gathered {
             let code = result
                 .as_ref()
                 .map(|_| tonic::Code::Ok)
@@ -217,51 +292,77 @@ impl BrokerSearchService {
         // transports. No unbounded per-shard allowance is multiplied by fan-out.
         let decode_limit = self.ctx.coordinator_max_transfer / route.targets().len();
         let tracing = plan.shard_request.tracing;
-        let calls = route.targets().iter().map(|target| {
-            let mut outbound = Request::new(plan.shard_request.clone());
-            let index_name = plan.shard_request.index_name.clone();
-            if let Some(timeout) = rpc_timeout {
-                outbound.set_timeout(timeout);
-            }
-            let mut client = target
-                .channels
-                .search
-                .clone()
-                .max_decoding_message_size(decode_limit);
-            async move {
-                let call_started = Instant::now();
-                let result = client.search(outbound).await;
-                let code = result
-                    .as_ref()
-                    .map(|_| tonic::Code::Ok)
-                    .unwrap_or_else(|status| status.code());
-                record_backend(&target.backend_id, "search", call_started, code);
-                let shard = target.shard.clone();
-                let result = result
-                    .and_then(|response| {
-                        let mut response = response.into_inner();
-                        crate::ranking::stamp_trace(
-                            &mut response,
-                            &target.shard,
-                            &target.backend_id,
-                            tracing,
-                        )?;
-                        Ok(response)
-                    })
-                    .map_err(|status| {
-                        if route.is_partitioned() {
-                            partition::partition_failure(&index_name, &target.shard, status)
-                        } else {
-                            status
-                        }
-                    });
-                (shard, result)
-            }
-        });
+        let calls: Vec<_> = route
+            .targets()
+            .iter()
+            .map(|target| {
+                let mut outbound = Request::new(plan.shard_request.clone());
+                let index_name = plan.shard_request.index_name.clone();
+                if let Some(timeout) = rpc_timeout {
+                    outbound.set_timeout(timeout);
+                }
+                let mut client = target
+                    .channels
+                    .search
+                    .clone()
+                    .max_decoding_message_size(decode_limit);
+                async move {
+                    let call_started = Instant::now();
+                    let result = client.search(outbound).await;
+                    let code = result
+                        .as_ref()
+                        .map(|_| tonic::Code::Ok)
+                        .unwrap_or_else(|status| status.code());
+                    record_backend(&target.backend_id, "search", call_started, code);
+                    let shard = target.shard.clone();
+                    let result = result
+                        .and_then(|response| {
+                            let mut response = response.into_inner();
+                            crate::ranking::stamp_trace(
+                                &mut response,
+                                &target.shard,
+                                &target.backend_id,
+                                tracing,
+                            )?;
+                            Ok(response)
+                        })
+                        .map_err(|status| {
+                            if route.is_partitioned() {
+                                partition::partition_failure(&index_name, &target.shard, status)
+                            } else {
+                                status
+                            }
+                        });
+                    (shard, result)
+                }
+            })
+            .collect();
+        let straggler = if partial {
+            self.ctx.partition_straggler
+        } else {
+            None
+        };
+        let gathered = gather(
+            calls,
+            straggler,
+            |(_, result)| result.is_ok(),
+            |i| {
+                let shard = &route.targets()[i].shard;
+                (
+                    shard.clone(),
+                    Err(partition::partition_failure(
+                        &plan.shard_request.index_name,
+                        shard,
+                        straggled_status(straggler),
+                    )),
+                )
+            },
+        )
+        .await;
         let mut responses = Vec::with_capacity(route.targets().len());
         let mut lost = Vec::new();
         let mut last_failure = None;
-        for (shard, result) in futures::future::join_all(calls).await {
+        for (shard, result) in gathered {
             match result {
                 Ok(response) => responses.push(response),
                 Err(status) if partition_droppable(partial, route, &status) => {
