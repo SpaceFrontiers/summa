@@ -173,11 +173,25 @@ impl IndexRegistry {
 
         for (name, handle) in handles {
             let manager = Arc::clone(handle.index.segment_manager());
-            if let Err(error) = handle.writer.write().await.shutdown().await
+            let mut writer = handle.writer.write().await;
+            // Clients cannot abandon admitted documents, so a graceful stop
+            // publishes them rather than discarding the generation (writers
+            // that commit on a schedule would otherwise lose everything since
+            // their last commit on every restart). A crash still loses it.
+            if let Err(error) = Self::commit_admitted(&name, &mut writer).await {
+                log::error!(
+                    "[shutdown] index '{}': commit of admitted documents failed; they are discarded: {}",
+                    name,
+                    error
+                );
+                first_error.get_or_insert_with(|| crate::error::summa_error_to_status(error));
+            }
+            if let Err(error) = writer.shutdown().await
                 && first_error.is_none()
             {
                 first_error = Some(crate::error::summa_error_to_status(error));
             }
+            drop(writer);
             drop(handle);
             managers.push((name, manager));
         }
@@ -198,6 +212,31 @@ impl IndexRegistry {
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
+        }
+    }
+
+    /// Commit before shutdown. A flush timeout keeps the generation intact,
+    /// so one bounded retry lets a slow final segment build finish.
+    async fn commit_admitted(
+        name: &str,
+        writer: &mut IndexWriter<MmapDirectory>,
+    ) -> summa_core::Result<()> {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match writer.commit().await {
+                Ok(changed) => {
+                    info!(
+                        "[shutdown] index '{}' committed (changed={})",
+                        name, changed
+                    );
+                    return Ok(());
+                }
+                Err(error @ summa_core::Error::CommitFlushTimeout { .. }) if attempts < 2 => {
+                    warn!("[shutdown] index '{}': {}; retrying commit", name, error);
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -639,6 +678,50 @@ impl IndexRegistry {
         );
     }
 
+    /// Open every index on disk before the server reports readiness.
+    ///
+    /// Opening loads and pins segment metadata, which takes minutes for large
+    /// indexes; without this the first request after a restart pays that cost
+    /// while the process already looks healthy. Indexes are opened one at a
+    /// time so startup does not multiply the transient open memory. A failed
+    /// index is logged and skipped: it stays absent from the serving set, as
+    /// it would on its first request. Returns (opened, failed).
+    pub async fn open_all_indexes(&self) -> Result<(usize, usize), Status> {
+        let names = self.list_indexes().await?;
+        let (mut opened, mut failed) = (0, 0);
+        for name in &names {
+            let started = std::time::Instant::now();
+            match self.get_or_open_index(name).await {
+                Ok(_) => {
+                    opened += 1;
+                    info!(
+                        "[startup] opened index '{}' in {:.1?} ({}/{})",
+                        name,
+                        started.elapsed(),
+                        opened + failed,
+                        names.len()
+                    );
+                }
+                // Errors map I/O failures to UNAVAILABLE too; only closed
+                // admission ends startup.
+                Err(status) if !self.is_running() => return Err(status),
+                Err(status) => {
+                    failed += 1;
+                    log::error!(
+                        "[startup] index '{}' failed to open and is not served: {}",
+                        name,
+                        status.message()
+                    );
+                }
+            }
+        }
+        Ok((opened, failed))
+    }
+
+    pub fn is_running(&self) -> bool {
+        !self.shutting_down.load(Ordering::Acquire)
+    }
+
     /// List all indexes on disk.
     ///
     /// Filesystem I/O is done inside `spawn_blocking` to avoid stalling
@@ -848,6 +931,89 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!root.join("held").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_opens_every_index_and_skips_unopenable_ones() {
+        let root = std::env::temp_dir().join(format!(
+            "summa_registry_open_all_{}",
+            SegmentId::new().to_hex()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = IndexConfig {
+            num_indexing_threads: 1,
+            ..Default::default()
+        };
+        let creator = IndexRegistry::new(root.clone(), config.clone());
+        for name in ["first", "second"] {
+            creator
+                .create_index(name, summa_core::SchemaBuilder::default().build())
+                .await
+                .unwrap();
+        }
+        creator.shutdown().await.unwrap();
+        drop(creator);
+        // A directory without metadata cannot be opened.
+        std::fs::create_dir_all(root.join("broken")).unwrap();
+
+        let registry = IndexRegistry::new(root.clone(), config);
+        assert_eq!(registry.open_all_indexes().await.unwrap(), (2, 1));
+        assert!(registry.handles.read().contains_key("first"));
+        assert!(registry.handles.read().contains_key("second"));
+        assert!(!registry.handles.read().contains_key("broken"));
+
+        registry.shutdown().await.unwrap();
+        assert!(!registry.is_running());
+        assert_eq!(
+            registry.open_all_indexes().await.unwrap_err().code(),
+            tonic::Code::Unavailable,
+        );
+        drop(registry);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_commits_admitted_documents() {
+        let root = std::env::temp_dir().join(format!(
+            "summa_registry_shutdown_commit_{}",
+            SegmentId::new().to_hex()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = IndexConfig {
+            num_indexing_threads: 1,
+            ..Default::default()
+        };
+        let registry = IndexRegistry::new(root.clone(), config.clone());
+        let mut schema = summa_core::SchemaBuilder::default();
+        let id = schema.add_text_field("id", true, true);
+        schema.set_primary_key(id);
+        registry
+            .create_index("social", schema.build())
+            .await
+            .unwrap();
+        {
+            let writer = registry.get_writer("social").await.unwrap();
+            let mut writer = writer.write().await;
+            writer.init_primary_key_dedup().await.unwrap();
+            for key in ["committed", "admitted"] {
+                let mut doc = summa_core::Document::new();
+                doc.add_text(id, key);
+                writer.add_document(doc).unwrap();
+                if key == "committed" {
+                    writer.commit().await.unwrap();
+                }
+            }
+        }
+        registry.shutdown().await.unwrap();
+        drop(registry);
+
+        let reopened = IndexRegistry::new(root.clone(), config);
+        let index = reopened.get_or_open_index("social").await.unwrap();
+        assert_eq!(index.num_docs().await.unwrap(), 2);
+        drop(index);
+        reopened.shutdown().await.unwrap();
+        drop(reopened);
         std::fs::remove_dir_all(root).unwrap();
     }
 

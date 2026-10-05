@@ -35,6 +35,7 @@ summa-core = { workspace = true, features = ["native", "sync", "metrics", "cjk-d
 tokio = { workspace = true, features = ["macros", "signal"] }
 tonic = { workspace = true, features = ["gzip", "zstd"] }
 tonic-prost = "0.14"
+tonic-health = "0.14"
 prost = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
