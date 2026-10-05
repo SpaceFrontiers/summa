@@ -20,6 +20,10 @@ pub mod proto {
     tonic::include_proto!("summa");
 }
 
+pub mod broker_proto {
+    tonic::include_proto!("summa.broker");
+}
+
 use proto::index_service_client::IndexServiceClient;
 use proto::index_service_server::{IndexService, IndexServiceServer};
 use proto::search_service_client::SearchServiceClient;
@@ -159,6 +163,7 @@ impl SearchService for MockBackend {
                 total_docs: 42,
                 fields: vec![],
             }),
+            missing_partitions: 0,
         }))
     }
 
@@ -411,6 +416,33 @@ pub async fn broker_index_client(
 pub async fn direct_search_client(addr: &str) -> SearchServiceClient<tonic::transport::Channel> {
     let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{addr}")).unwrap();
     SearchServiceClient::new(endpoint.connect_lazy())
+}
+
+/// Wait until the broker reports every configured backend healthy. Backends
+/// without indexes are invisible to ListIndexes, so placement-dependent calls
+/// (CreateIndex) must wait for discovery this way.
+pub async fn wait_for_backends(broker: &BrokerProc, timeout: Duration) {
+    use broker_proto::broker_service_client::BrokerServiceClient;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{}", broker.addr)).unwrap();
+    let mut client = BrokerServiceClient::new(endpoint.connect_lazy());
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(response) = client
+            .get_backends(broker_proto::GetBackendsRequest {})
+            .await
+        {
+            let backends = response.into_inner().backends;
+            if !backends.is_empty() && backends.iter().all(|b| b.health == "healthy") {
+                return;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "broker backends did not become healthy in {timeout:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Wait until the broker's cached ListIndexes contains every expected name.

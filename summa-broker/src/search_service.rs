@@ -8,6 +8,12 @@
 //! partitions), then uses `ranking` for global fusion/L1 selection or
 //! `partition::merge_search_responses` for comparable pointwise scores. `GetDocument` asks every
 //! partition, `GetIndexInfo` and `GetTextStats` aggregate.
+//!
+//! With `--partial-partition-reads`, `Search` and `GetTextStats` skip
+//! partitions without a routable replica or answering UNAVAILABLE and report
+//! them in `missing_partitions`; statistics and hits then come from the same
+//! remaining partitions. Any other failure, or losing every partition, still
+//! fails the read.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,7 +29,7 @@ use crate::proto::summa::{
     GetDocumentRequest, GetDocumentResponse, GetIndexInfoRequest, GetIndexInfoResponse,
     GetTextStatsRequest, GetTextStatsResponse, SearchRequest, SearchResponse,
 };
-use crate::routes::{Route, Target, record_backend};
+use crate::routes::{Route, Target, record_backend, record_partial};
 
 /// summa-server refuses result windows above this; a partitioned search
 /// widens every partition's window to `offset + limit`, which must fit.
@@ -33,10 +39,16 @@ pub struct BrokerSearchService {
     pub ctx: Arc<BrokerContext>,
 }
 
-/// One unary read RPC sent whole to every target of the route; all must
-/// succeed (a partitioned read with a missing partition is a wrong answer).
+/// Whether a failed partition may be left out of a partial read.
+fn partition_droppable(partial: bool, route: &Route, status: &Status) -> bool {
+    partial && route.is_partitioned() && status.code() == tonic::Code::Unavailable
+}
+
+/// One unary read RPC sent whole to every target of the route. All must
+/// succeed, except that a partial read (`$partial`) drops partitions that
+/// answer UNAVAILABLE and returns their shards; it fails if none answers.
 macro_rules! forward_read {
-    ($self:ident, $req:expr, $timeout:expr, $route:expr, $method:ident, $rpc_name:literal) => {{
+    ($self:ident, $req:expr, $timeout:expr, $route:expr, $method:ident, $rpc_name:literal, $partial:expr) => {{
         let req = $req;
         let index_name = req.index_name.clone();
         let route: &Route = $route;
@@ -54,6 +66,8 @@ macro_rules! forward_read {
             }
         });
         let mut responses = Vec::with_capacity(route.targets().len());
+        let mut lost: Vec<String> = Vec::new();
+        let mut last_failure = None;
         for (target, started, result) in futures::future::join_all(calls).await {
             let code = result
                 .as_ref()
@@ -62,6 +76,14 @@ macro_rules! forward_read {
             record_backend(&target.backend_id, $rpc_name, started, code);
             match result {
                 Ok(response) => responses.push(response.into_inner()),
+                Err(status) if partition_droppable($partial, route, &status) => {
+                    lost.push(target.shard.clone());
+                    last_failure = Some(partition::partition_failure(
+                        &index_name,
+                        &target.shard,
+                        status,
+                    ));
+                }
                 Err(status) if route.is_partitioned() => {
                     return Err(partition::partition_failure(
                         &index_name,
@@ -72,7 +94,10 @@ macro_rules! forward_read {
                 Err(status) => return Err(status),
             }
         }
-        Ok::<_, Status>(responses)
+        match last_failure {
+            Some(failure) if responses.is_empty() => Err(failure),
+            _ => Ok::<_, Status>((responses, lost)),
+        }
     }};
 }
 
@@ -116,17 +141,19 @@ impl BrokerSearchService {
         Ok(permits)
     }
 
+    /// Returns the route narrowed to the partitions that supplied statistics,
+    /// so a partial read scores and searches the same partitions.
     async fn attach_text_stats(
         &self,
         req: &mut SearchRequest,
         timeout: Option<std::time::Duration>,
         route: &Route,
-    ) -> Result<(), Status> {
+    ) -> Result<Route, Status> {
         // Shared BM25 statistics: every partition scores with the sum.
         if req.text_stats.is_none()
             && let Some(query) = req.query.as_ref().and_then(partition::text_stats_query)
         {
-            let stats = forward_read!(
+            let (stats, lost) = forward_read!(
                 self,
                 GetTextStatsRequest {
                     index_name: req.index_name.clone(),
@@ -135,7 +162,8 @@ impl BrokerSearchService {
                 timeout,
                 route,
                 get_text_stats,
-                "get_text_stats"
+                "get_text_stats",
+                self.ctx.partial_partition_reads
             )?;
             let stats = stats
                 .into_iter()
@@ -146,8 +174,9 @@ impl BrokerSearchService {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             req.text_stats = Some(partition::merge_text_stats(stats));
+            return Ok(route.without(&lost));
         }
-        Ok(())
+        Ok(route.clone())
     }
 
     async fn search_coordinated(
@@ -163,8 +192,14 @@ impl BrokerSearchService {
             route.targets().len(),
             self.ctx.coordinator_max_transfer,
         )?;
-        self.attach_text_stats(&mut plan.shard_request, timeout, route)
+        let planned = route.targets().len();
+        let route = &self
+            .attach_text_stats(&mut plan.shard_request, timeout, route)
             .await?;
+        // The plan counts the routed targets; partitions unroutable before the
+        // statistics round were never part of it.
+        plan.lose_shards(planned - route.targets().len())?;
+        let partial = self.ctx.partial_partition_reads;
         let remaining = || {
             timeout
                 .map(|budget| {
@@ -201,7 +236,8 @@ impl BrokerSearchService {
                     .map(|_| tonic::Code::Ok)
                     .unwrap_or_else(|status| status.code());
                 record_backend(&target.backend_id, "search", call_started, code);
-                result
+                let shard = target.shard.clone();
+                let result = result
                     .and_then(|response| {
                         let mut response = response.into_inner();
                         crate::ranking::stamp_trace(
@@ -218,16 +254,38 @@ impl BrokerSearchService {
                         } else {
                             status
                         }
-                    })
+                    });
+                (shard, result)
             }
         });
-        let responses = futures::future::try_join_all(calls).await?;
+        let mut responses = Vec::with_capacity(route.targets().len());
+        let mut lost = Vec::new();
+        let mut last_failure = None;
+        for (shard, result) in futures::future::join_all(calls).await {
+            match result {
+                Ok(response) => responses.push(response),
+                Err(status) if partition_droppable(partial, route, &status) => {
+                    lost.push(shard);
+                    last_failure = Some(status);
+                }
+                Err(status) => return Err(status),
+            }
+        }
+        if responses.is_empty()
+            && let Some(failure) = last_failure
+        {
+            return Err(failure);
+        }
+        plan.lose_shards(lost.len())?;
+        let missing: Vec<String> = route.missing().iter().chain(&lost).cloned().collect();
+        record_partial(&plan.shard_request.index_name, "search", &missing);
         let timeout = remaining()?;
         let selection = tokio::task::spawn_blocking(move || {
             // Cancellation must not release admission while ranking still runs.
             let _permits = permits;
             let scoring_started = Instant::now();
             let mut response = plan.finish(responses)?;
+            response.missing_partitions = missing.len() as u32;
             let timings = response.timings.get_or_insert_with(Default::default);
             timings.candidate_scoring_us = timings
                 .candidate_scoring_us
@@ -260,11 +318,22 @@ impl BrokerSearchService {
                 "offset + limit = {window} exceeds the {MAX_PARTITION_WINDOW} window a partitioned index can merge"
             )));
         }
-        self.attach_text_stats(&mut req, timeout, route).await?;
+        let route = &self.attach_text_stats(&mut req, timeout, route).await?;
         req.offset = 0;
         req.limit = window;
+        let index_name = req.index_name.clone();
         let expected_method = crate::ranking::expected_export_method(&req);
-        let responses = forward_read!(self, req, timeout, route, search, "search")?;
+        let (responses, lost) = forward_read!(
+            self,
+            req,
+            timeout,
+            route,
+            search,
+            "search",
+            self.ctx.partial_partition_reads
+        )?;
+        let missing: Vec<String> = route.missing().iter().chain(&lost).cloned().collect();
+        record_partial(&index_name, "search", &missing);
         if expected_method.is_some_and(|expected| {
             responses
                 .iter()
@@ -274,7 +343,10 @@ impl BrokerSearchService {
                 "a shard does not support the requested candidate scoring contract; complete the Summa rollout",
             ));
         }
-        partition::merge_search_responses(responses, offset as usize, limit as usize)
+        let mut response =
+            partition::merge_search_responses(responses, offset as usize, limit as usize)?;
+        response.missing_partitions = missing.len() as u32;
+        Ok(response)
     }
 }
 
@@ -323,7 +395,7 @@ impl SearchService for BrokerSearchService {
                         Ok(response)
                     })
                 }
-                Route::Partitioned(_) => self.search_partitioned(req, timeout, &route).await,
+                Route::Partitioned { .. } => self.search_partitioned(req, timeout, &route).await,
             }
         }
         .await;
@@ -391,6 +463,14 @@ impl SearchService for BrokerSearchService {
                 }
             }
         }
+        if failure.is_none() && !route.missing().is_empty() {
+            // The document may live on a partition this read could not reach.
+            return Err(Status::unavailable(format!(
+                "index '{}': document not found on the reachable partitions; partition(s) [{}] are unavailable",
+                req.index_name,
+                route.missing().join(", ")
+            )));
+        }
         Err(failure
             .or(not_found)
             .unwrap_or_else(|| Status::not_found("document not found")))
@@ -404,8 +484,18 @@ impl SearchService for BrokerSearchService {
         let timeout = forward_timeout(request.metadata());
         let req = request.into_inner();
         let route = self.ctx.read_route(&req.index_name)?;
-        let responses =
-            forward_read!(self, req, timeout, &route, get_text_stats, "get_text_stats")?;
+        let index_name = req.index_name.clone();
+        let (responses, lost) = forward_read!(
+            self,
+            req,
+            timeout,
+            &route,
+            get_text_stats,
+            "get_text_stats",
+            self.ctx.partial_partition_reads
+        )?;
+        let missing: Vec<String> = route.missing().iter().chain(&lost).cloned().collect();
+        record_partial(&index_name, "get_text_stats", &missing);
         let stats = if route.is_partitioned() {
             Some(partition::merge_text_stats(
                 responses.into_iter().filter_map(|r| r.stats).collect(),
@@ -413,7 +503,10 @@ impl SearchService for BrokerSearchService {
         } else {
             responses.into_iter().next().and_then(|r| r.stats)
         };
-        Ok(Response::new(GetTextStatsResponse { stats }))
+        Ok(Response::new(GetTextStatsResponse {
+            stats,
+            missing_partitions: missing.len() as u32,
+        }))
     }
 
     async fn get_index_info(
@@ -424,8 +517,23 @@ impl SearchService for BrokerSearchService {
         let timeout = forward_timeout(request.metadata());
         let req = request.into_inner();
         let route = self.ctx.read_route(&req.index_name)?;
-        let responses =
-            forward_read!(self, req, timeout, &route, get_index_info, "get_index_info")?;
+        // Counts and schema must describe the whole index: never partial.
+        if let Some(shard) = route.missing().first() {
+            return Err(partition::partition_failure(
+                &req.index_name,
+                shard,
+                Status::unavailable("no routable replica"),
+            ));
+        }
+        let (responses, _) = forward_read!(
+            self,
+            req,
+            timeout,
+            &route,
+            get_index_info,
+            "get_index_info",
+            false
+        )?;
         Ok(Response::new(partition::merge_index_info(responses)))
     }
 }

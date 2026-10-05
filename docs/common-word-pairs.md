@@ -51,8 +51,8 @@ A text field may declare `common_grams`: an explicit list of words, stored in
 `SchemaBuilder::set_common_grams`. Schema admission rejects non-text,
 unindexed and chunked fields, fields without token positions, duplicate or
 empty words and more than 4,096 words; the segment builder rejects a word the
-field's tokenizer does not produce as itself (`Purpose::Exact`). SDL syntax is
-left for later. The list is fixed for the life of
+field's tokenizer does not produce as itself (`Purpose::Exact`). In SDL it is
+`indexed<token_position, common_grams: ["of", "the"]>`. The list is fixed for the life of
 the index: segments never disagree about which pairs exist. The benchmark
 harness derives the list from the corpus (the top 128 by document frequency);
 choosing it automatically at index time is left open (below).
@@ -172,4 +172,3 @@ takes 15% longer (37.7 → 43.5 s).
 - The QL phrase parser tokenizes with `Purpose::Index`, which emits variants
   at repeated positions (`dsl/ql/mod.rs:760`); unrelated to pairs, but found
   while reviewing phrase construction.
-- SDL syntax for `common_grams`.

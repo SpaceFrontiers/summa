@@ -288,6 +288,8 @@ pub fn merge_search_responses(
         truncated,
         ranking_method: ranking_method.unwrap_or_default(),
         seeded_document_passages,
+        // The caller reports partitions a partial read left out.
+        missing_partitions: 0,
         trace,
         fusion_candidates: fusion_candidates
             .into_iter()

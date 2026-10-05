@@ -21,22 +21,66 @@ pub struct Target {
 }
 
 /// Where a request for an index goes.
+#[derive(Clone)]
 pub enum Route {
     Single(Box<Target>),
-    /// One target per partition, in placement-rule order.
-    Partitioned(Vec<Target>),
+    /// One target per partition, in placement-rule order. A partial read
+    /// (`--partial-partition-reads`) lists the shards of the partitions it
+    /// leaves out in `missing`; every other route has all of them.
+    Partitioned {
+        targets: Vec<Target>,
+        missing: Vec<String>,
+    },
 }
 
 impl Route {
     pub fn targets(&self) -> &[Target] {
         match self {
             Route::Single(target) => std::slice::from_ref(target.as_ref()),
-            Route::Partitioned(targets) => targets,
+            Route::Partitioned { targets, .. } => targets,
         }
     }
 
     pub fn is_partitioned(&self) -> bool {
-        matches!(self, Route::Partitioned(_))
+        matches!(self, Route::Partitioned { .. })
+    }
+
+    /// Shards of the partitions this read leaves out.
+    pub fn missing(&self) -> &[String] {
+        match self {
+            Route::Single(_) => &[],
+            Route::Partitioned { missing, .. } => missing,
+        }
+    }
+
+    /// The same read without the partitions on `lost` shards, which then
+    /// count as missing.
+    pub fn without(&self, lost: &[String]) -> Route {
+        match self {
+            Route::Partitioned { targets, missing } if !lost.is_empty() => Route::Partitioned {
+                targets: targets
+                    .iter()
+                    .filter(|target| !lost.contains(&target.shard))
+                    .cloned()
+                    .collect(),
+                missing: missing.iter().chain(lost).cloned().collect(),
+            },
+            route => route.clone(),
+        }
+    }
+}
+
+/// Count each partition a partial read left out (bounded labels: index
+/// families and shard ids).
+pub fn record_partial(index_name: &str, rpc: &'static str, missing: &[String]) {
+    for shard in missing {
+        metrics::counter!(
+            m::PARTIAL_READS,
+            "index" => index_name.to_string(),
+            "rpc" => rpc,
+            "shard" => shard.clone(),
+        )
+        .increment(1);
     }
 }
 
@@ -60,11 +104,33 @@ impl BrokerContext {
     /// Backend(s) serving a read for `index_name`.
     pub fn read_route(&self, index_name: &str) -> Result<Route, Status> {
         let snapshot = self.snapshot.load();
-        if let Some(partitions) = snapshot.partitions(index_name)? {
+        if let Some((partitions, unavailable)) = snapshot.partition_availability(index_name)? {
+            if !self.partial_partition_reads {
+                // Strict: every partition must be routable.
+                snapshot.partitions(index_name)?;
+            }
             let mut targets = Vec::with_capacity(partitions.len());
+            let mut missing = Vec::new();
             for shard in partitions {
-                let selection =
-                    snapshot.select_read_backend_on(index_name, shard, self.next_rotation())?;
+                if unavailable.contains(&shard) {
+                    missing.push(shard.0.clone());
+                    continue;
+                }
+                let selection = match snapshot.select_read_backend_on(
+                    index_name,
+                    shard,
+                    self.next_rotation(),
+                ) {
+                    Ok(selection) => selection,
+                    Err(status)
+                        if self.partial_partition_reads
+                            && status.code() == tonic::Code::Unavailable =>
+                    {
+                        missing.push(shard.0.clone());
+                        continue;
+                    }
+                    Err(status) => return Err(status),
+                };
                 if selection.stale {
                     metrics::counter!(
                         m::STALE_TOPOLOGY_SERVES,
@@ -78,7 +144,13 @@ impl BrokerContext {
                     channels: self.pool.get(&selection.backend.endpoint.addr)?,
                 });
             }
-            return Ok(Route::Partitioned(targets));
+            if targets.is_empty() {
+                return Err(Status::unavailable(format!(
+                    "index '{index_name}': none of its {} partitions has a routable replica",
+                    partitions.len()
+                )));
+            }
+            return Ok(Route::Partitioned { targets, missing });
         }
         let selection = snapshot.select_read_backend(index_name, self.next_rotation())?;
         if selection.ambiguous {
@@ -122,7 +194,10 @@ impl BrokerContext {
                     channels: self.pool.get(&master.endpoint.addr)?,
                 });
             }
-            return Ok(Route::Partitioned(targets));
+            return Ok(Route::Partitioned {
+                targets,
+                missing: Vec::new(),
+            });
         }
         let master = snapshot.select_write_backend(index_name).map_err(reject)?;
         Ok(Route::Single(Box::new(Target {
