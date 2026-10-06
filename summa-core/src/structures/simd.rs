@@ -4001,41 +4001,167 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 
 /// AVX-512 Hamming distance using `VPOPCNTDQ`.
 ///
-/// Processes 64 bytes per iteration with a single hardware popcount per lane
-/// group, which removes the nibble-lookup shuffles the AVX2 path needs.
+/// Full 64-byte chunks use one hardware popcount per lane group; the final
+/// partial chunk is a masked load, so no width falls back to a scalar tail.
+/// Codes of at most 32 bytes use the 256-bit (AVX-512VL) form, which avoids
+/// the wider register's reduction cost.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq")]
 #[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
 unsafe fn hamming_distance_avx512(a: &[u8], b: &[u8]) -> u32 {
     use std::arch::x86_64::*;
 
     let len = a.len();
+    if len <= 32 {
+        let mask = if len == 32 {
+            u32::MAX
+        } else {
+            (1u32 << len) - 1
+        };
+        let va = _mm256_maskz_loadu_epi8(mask, a.as_ptr() as *const i8);
+        let vb = _mm256_maskz_loadu_epi8(mask, b.as_ptr() as *const i8);
+        let counts = _mm256_popcnt_epi64(_mm256_xor_si256(va, vb));
+        let sum = _mm_add_epi64(
+            _mm256_castsi256_si128(counts),
+            _mm256_extracti128_si256(counts, 1),
+        );
+        return (_mm_cvtsi128_si64(sum) + _mm_extract_epi64(sum, 1)) as u32;
+    }
+
     let chunks64 = len / 64;
     let mut acc = _mm512_setzero_si512();
-
     for c in 0..chunks64 {
         let off = c * 64;
         let va = _mm512_loadu_si512(a.as_ptr().add(off) as *const __m512i);
         let vb = _mm512_loadu_si512(b.as_ptr().add(off) as *const __m512i);
         acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(_mm512_xor_si512(va, vb)));
     }
+    let remainder = len % 64;
+    if remainder != 0 {
+        let off = chunks64 * 64;
+        let mask = (1u64 << remainder) - 1;
+        let va = _mm512_maskz_loadu_epi8(mask, a.as_ptr().add(off) as *const i8);
+        let vb = _mm512_maskz_loadu_epi8(mask, b.as_ptr().add(off) as *const i8);
+        acc = _mm512_add_epi64(acc, _mm512_popcnt_epi64(_mm512_xor_si512(va, vb)));
+    }
+    _mm512_reduce_add_epi64(acc) as u32
+}
 
-    let base = chunks64 * 64;
-    _mm512_reduce_add_epi64(acc) as u32 + hamming_distance_scalar(&a[base..], &b[base..])
+/// Sum each of four `u64x8` accumulators with one shared shuffle tree instead
+/// of four independent horizontal reductions.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+unsafe fn reduce4_u64x8(acc: [std::arch::x86_64::__m512i; 4]) -> [u32; 4] {
+    use std::arch::x86_64::*;
+
+    let pairs01 = _mm512_add_epi64(
+        _mm512_unpacklo_epi64(acc[0], acc[1]),
+        _mm512_unpackhi_epi64(acc[0], acc[1]),
+    );
+    let pairs23 = _mm512_add_epi64(
+        _mm512_unpacklo_epi64(acc[2], acc[3]),
+        _mm512_unpackhi_epi64(acc[2], acc[3]),
+    );
+    // Each 128-bit lane now holds partial (row a, row b) sums; fold the four
+    // lanes of both pair vectors at once.
+    let folded = _mm512_add_epi64(
+        _mm512_shuffle_i64x2(pairs01, pairs23, 0b10_00_10_00),
+        _mm512_shuffle_i64x2(pairs01, pairs23, 0b11_01_11_01),
+    );
+    let low = _mm512_castsi512_si256(folded);
+    let high = _mm512_extracti64x4_epi64(folded, 1);
+    reduce4_pairs(
+        _mm_add_epi64(
+            _mm256_castsi256_si128(low),
+            _mm256_extracti128_si256(low, 1),
+        ),
+        _mm_add_epi64(
+            _mm256_castsi256_si128(high),
+            _mm256_extracti128_si256(high, 1),
+        ),
+    )
+}
+
+/// [`reduce4_u64x8`] for 256-bit accumulators.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+unsafe fn reduce4_u64x4(acc: [std::arch::x86_64::__m256i; 4]) -> [u32; 4] {
+    use std::arch::x86_64::*;
+
+    let pairs01 = _mm256_add_epi64(
+        _mm256_unpacklo_epi64(acc[0], acc[1]),
+        _mm256_unpackhi_epi64(acc[0], acc[1]),
+    );
+    let pairs23 = _mm256_add_epi64(
+        _mm256_unpacklo_epi64(acc[2], acc[3]),
+        _mm256_unpackhi_epi64(acc[2], acc[3]),
+    );
+    reduce4_pairs(
+        _mm_add_epi64(
+            _mm256_castsi256_si128(pairs01),
+            _mm256_extracti128_si256(pairs01, 1),
+        ),
+        _mm_add_epi64(
+            _mm256_castsi256_si128(pairs23),
+            _mm256_extracti128_si256(pairs23, 1),
+        ),
+    )
+}
+
+/// `[r0, r1]` and `[r2, r3]` `u64` totals into four `u32` distances. Every
+/// total is at most the code width in bits, so the low halves are exact.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline]
+unsafe fn reduce4_pairs(
+    rows01: std::arch::x86_64::__m128i,
+    rows23: std::arch::x86_64::__m128i,
+) -> [u32; 4] {
+    use std::arch::x86_64::*;
+
+    let mut out = [0u32; 4];
+    _mm_storeu_si128(
+        out.as_mut_ptr() as *mut __m128i,
+        _mm_unpacklo_epi64(
+            _mm_shuffle_epi32(rows01, 0b10_00_10_00),
+            _mm_shuffle_epi32(rows23, 0b10_00_10_00),
+        ),
+    );
+    out
 }
 
 /// Four-row AVX-512 Hamming distance sharing the query load across rows.
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq")]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
 unsafe fn hamming_distance_x4_avx512(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4] {
     use std::arch::x86_64::*;
 
     let len = query.len();
+    if len <= 32 {
+        let mask = if len == 32 {
+            u32::MAX
+        } else {
+            (1u32 << len) - 1
+        };
+        let vq = _mm256_maskz_loadu_epi8(mask, query.as_ptr() as *const i8);
+        let mut acc = [_mm256_setzero_si256(); 4];
+        for r in 0..4 {
+            let vr = _mm256_maskz_loadu_epi8(mask, rows[r].as_ptr() as *const i8);
+            acc[r] = _mm256_popcnt_epi64(_mm256_xor_si256(vq, vr));
+        }
+        return reduce4_u64x4(acc);
+    }
+
     let chunks64 = len / 64;
     let mut acc = [_mm512_setzero_si512(); 4];
-
     for c in 0..chunks64 {
         let off = c * 64;
         let vq = _mm512_loadu_si512(query.as_ptr().add(off) as *const __m512i);
@@ -4044,15 +4170,52 @@ unsafe fn hamming_distance_x4_avx512(query: &[u8], rows: [&[u8]; 4]) -> [u32; 4]
             acc[r] = _mm512_add_epi64(acc[r], _mm512_popcnt_epi64(_mm512_xor_si512(vq, vr)));
         }
     }
+    let remainder = len % 64;
+    if remainder != 0 {
+        let off = chunks64 * 64;
+        let mask = (1u64 << remainder) - 1;
+        let vq = _mm512_maskz_loadu_epi8(mask, query.as_ptr().add(off) as *const i8);
+        for r in 0..4 {
+            let vr = _mm512_maskz_loadu_epi8(mask, rows[r].as_ptr().add(off) as *const i8);
+            acc[r] = _mm512_add_epi64(acc[r], _mm512_popcnt_epi64(_mm512_xor_si512(vq, vr)));
+        }
+    }
+    reduce4_u64x8(acc)
+}
 
-    let base = chunks64 * 64;
-    let tail = &query[base..];
-    [
-        _mm512_reduce_add_epi64(acc[0]) as u32 + hamming_distance_scalar(tail, &rows[0][base..]),
-        _mm512_reduce_add_epi64(acc[1]) as u32 + hamming_distance_scalar(tail, &rows[1][base..]),
-        _mm512_reduce_add_epi64(acc[2]) as u32 + hamming_distance_scalar(tail, &rows[2][base..]),
-        _mm512_reduce_add_epi64(acc[3]) as u32 + hamming_distance_scalar(tail, &rows[3][base..]),
-    ]
+/// Row loop for the AVX-512 kernel, compiled with the same features so the
+/// four-row kernel inlines instead of crossing a `#[target_feature]` call
+/// boundary per quad.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vpopcntdq")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn score_rows_avx512(
+    query: &[u8],
+    db: &[u8],
+    byte_len: usize,
+    out: &mut [u32],
+    index_of: impl Fn(usize) -> usize,
+) {
+    let row = |index: usize| -> &[u8] {
+        let start = index * byte_len;
+        &db[start..start + byte_len]
+    };
+    let mut i = 0;
+    while i + HAMMING_ROWS_PER_KERNEL <= out.len() {
+        let quad = [
+            row(index_of(i)),
+            row(index_of(i + 1)),
+            row(index_of(i + 2)),
+            row(index_of(i + 3)),
+        ];
+        out[i..i + HAMMING_ROWS_PER_KERNEL]
+            .copy_from_slice(&hamming_distance_x4_avx512(query, quad));
+        i += HAMMING_ROWS_PER_KERNEL;
+    }
+    while i < out.len() {
+        out[i] = hamming_distance_avx512(query, row(index_of(i)));
+        i += 1;
+    }
 }
 
 /// Four-row scalar Hamming distance sharing the query load across rows.
@@ -4110,7 +4273,11 @@ impl HammingKernel {
     pub fn resolve() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vpopcntdq") {
+            if is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw")
+                && is_x86_feature_detected!("avx512vl")
+                && is_x86_feature_detected!("avx512vpopcntdq")
+            {
                 return Self::Avx512;
             }
             if avx2::is_available() {
@@ -4135,8 +4302,10 @@ impl HammingKernel {
     #[inline]
     fn vector_bytes(self) -> usize {
         match self {
+            // Masked loads cover every width, including codes narrower than
+            // one register, so this kernel never defers to the scalar loop.
             #[cfg(target_arch = "x86_64")]
-            Self::Avx512 => 64,
+            Self::Avx512 => 1,
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => 32,
             #[cfg(target_arch = "aarch64")]
@@ -4248,10 +4417,7 @@ impl HammingKernel {
         }
         match kernel {
             #[cfg(target_arch = "x86_64")]
-            Self::Avx512 => score_with!(
-                |query, row| unsafe { hamming_distance_avx512(query, row) },
-                |query, rows| unsafe { hamming_distance_x4_avx512(query, rows) }
-            ),
+            Self::Avx512 => unsafe { score_rows_avx512(query, db, byte_len, out, index_of) },
             #[cfg(target_arch = "x86_64")]
             Self::Avx2 => score_with!(
                 |query, row| unsafe { avx2::hamming_distance(query, row) },
