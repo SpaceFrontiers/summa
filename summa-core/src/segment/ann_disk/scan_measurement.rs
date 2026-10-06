@@ -33,6 +33,7 @@ fn measure_persisted_binary_leaf_scans() {
                     doc_ids: &docs[start..end],
                     ordinals: &ordinals[start..end],
                     codes: &codes[start * width..end * width],
+                    prefix_only: false,
                 }
             })
             .collect();
@@ -67,6 +68,7 @@ fn measure_persisted_binary_leaf_scans() {
                             k,
                             &leaves,
                             0,
+                            None,
                             usize::MAX,
                         )
                         .unwrap();
@@ -103,6 +105,7 @@ fn measure_persisted_binary_leaf_scans() {
                                 k,
                                 &leaves,
                                 0,
+                                None,
                                 usize::MAX,
                             )
                             .unwrap(),

@@ -1,3 +1,20 @@
+# Binary IVF prefix scan and SOAR storage layout — 2026-10-06
+
+Binary IVF `prefix_bits` now stores codes split into prefix and suffix rows
+instead of duplicating the prefix, and `soar: full` with a prefix stores
+secondary postings as prefix-only runs rescored from the primary copy. A
+prototype benchmark comparing the layouts (1.5M synthetic 2,560-bit codes,
+128 probes, 1,024-bit prefix, `M` = 1,000, one x86 core, mmap files, cold runs
+after dropping the page cache) returned identical top-10 results. The split
+plus prefix-only layout stores 470 bytes per vector against 918 for duplicated
+prefixes with full secondary copies (340 for the plain index). Warm p50 is
+2.17–2.25 ms against 2.07–2.08 ms, and cold p50 44–48 ms against 52–59 ms. On
+404,086 production `pplx-embed-v1-4b` codes with 2,358 real queries, SOAR plus a
+1,024-bit prefix reads 3.1–3.3× fewer bytes per query than plain 4·sqrt(N) at
+equal recall. See [binary IVF SOAR](binary-ivf-soar.md) and the
+[prefix-first scan](binary-prefix-scan.md); production-scale latency remains
+unmeasured.
+
 # Binary IVF default geometry — 2026-10-06
 
 Automatic binary IVF now trains 4·sqrt(N) leaves and probes 128 by default
