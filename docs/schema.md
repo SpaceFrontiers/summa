@@ -498,10 +498,12 @@ brute-force SIMD Hamming scan. Binary `scann` uses hierarchical Hamming
 partitioning and exact XOR-popcount leaf scoring; it does not expand packed
 bits to floats or apply a float AH codec. It accepts the same `num_clusters`,
 `tree_levels`, and `nprobe` parameters as float ScaNN. Float-only options such
-as `soar` are rejected:
+as `soar` are rejected. Automatic binary IVF trains 4×sqrt(N) leaves and probes
+128 of them by default; binary ScaNN keeps a default of 64 probes
+([geometry](binary-ivf-geometry.md)):
 
 ```
-field hash: binary_dense_vector<512> [indexed<ivf, routing: hnsw, nprobe: 64>]
+field hash: binary_dense_vector<512> [indexed<ivf, routing: hnsw, nprobe: 128>]
 field hash: binary_dense_vector<1024> [indexed<scann, num_clusters: 10000000, tree_levels: 2, nprobe: 1024>]
 field hash: binary_dense_vector<512> [indexed<flat>]
 ```
