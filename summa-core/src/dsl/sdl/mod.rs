@@ -1054,6 +1054,8 @@ fn apply_index_config_to_binary_dense_vector(
     }
     if let Some(index_type) = idx_cfg.binary_index_type {
         config.index_type = index_type;
+        // The default probe count belongs to the index type's geometry.
+        config.nprobe = index_type.default_nprobe();
     }
     if idx_cfg.target_vectors.is_some() && config.index_type == super::schema::BinaryIndexType::Flat
     {
@@ -2772,6 +2774,32 @@ mod tests {
             config.index_type,
             super::super::schema::BinaryIndexType::Ivf
         );
+        assert_eq!(
+            config.nprobe,
+            super::super::schema::DEFAULT_BINARY_IVF_NPROBE
+        );
+    }
+
+    /// The default probe count follows the index type's leaf geometry: binary
+    /// IVF's 4·sqrt(N) leaves need 128 probes, ScaNN keeps 64, and an explicit
+    /// `nprobe` always wins regardless of argument order.
+    #[test]
+    fn test_binary_default_nprobe_follows_index_type() {
+        let nprobe = |spec: &str| {
+            let sdl =
+                format!("index documents {{ field hash: binary_dense_vector<512> [{spec}] }}");
+            parse_sdl(&sdl).unwrap()[0].fields[0]
+                .binary_dense_vector_config
+                .as_ref()
+                .unwrap()
+                .nprobe
+        };
+        assert_eq!(nprobe("indexed<ivf>"), 128);
+        assert_eq!(nprobe("indexed<ivf, target_vectors: 3000000000>"), 128);
+        assert_eq!(nprobe("indexed<scann>"), 64);
+        assert_eq!(nprobe("indexed<ivf, nprobe: 64>"), 64);
+        assert_eq!(nprobe("indexed<nprobe: 32, ivf>"), 32);
+        assert_eq!(nprobe("indexed<scann, nprobe: 256>"), 256);
     }
 
     #[test]

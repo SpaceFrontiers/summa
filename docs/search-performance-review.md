@@ -1,3 +1,14 @@
+# Binary IVF default geometry — 2026-10-06
+
+Automatic binary IVF now trains 4·sqrt(N) leaves and probes 128 by default
+(binary ScaNN keeps 64). On 1M real 1,024-bit embeddings this scans 1.72–1.78×
+fewer postings at equal recall@10 (1.5–1.6× including centroid routing), and at
+the new defaults it matches the old float recall (0.654 vs 0.657) with half the
+postings. These are work counts, not latency; see
+[binary IVF geometry](binary-ivf-geometry.md) for the data, the hierarchical
+training gap (1.23–1.26×) and the options that were rejected. Retraining an
+automatic field with a persisted `nprobe` below 128 logs a warning.
+
 # Binary ANN merge coalescing — 2026-10-06
 
 Normal binary IVF/ScaNN merges now coalesce overlapping clusters to one run each
