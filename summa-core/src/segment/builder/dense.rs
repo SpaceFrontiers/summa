@@ -357,6 +357,7 @@ pub(super) fn build_vectors_streaming(
                 let index = crate::structures::BinaryIvfIndex::build(
                     quantizer,
                     cfg.ivf_routing,
+                    cfg.soar.is_some(),
                     &builder.vectors,
                     &builder.doc_ids,
                 )

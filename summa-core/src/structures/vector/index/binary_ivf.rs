@@ -483,6 +483,57 @@ impl BinaryCoarseQuantizer {
         }
     }
 
+    /// SOAR secondary leaf for a code already assigned to `primary`.
+    ///
+    /// Candidates are the [`BINARY_SOAR_CANDIDATES`] leaves nearest to the
+    /// code under this field's routing; the winner minimises the Hamming
+    /// form of the SOAR loss `h(x, c') + λ · |(x ⊕ c) & (x ⊕ c')|² / h(x, c)`
+    /// with λ = [`BINARY_SOAR_LAMBDA`] (ties: lower leaf ID). A code equal to
+    /// its primary centroid is not spilled (docs/binary-ivf-soar.md).
+    pub fn soar_secondary(
+        &self,
+        code: &[u8],
+        primary: u32,
+        mode: IvfRoutingMode,
+    ) -> io::Result<Option<u32>> {
+        self.check_code_len(code, "SOAR assign")?;
+        if self.num_clusters < 2 || primary >= self.num_clusters {
+            return Ok(None);
+        }
+        let byte_len = self.byte_len();
+        let centroid = |leaf: u32| &self.centroids[leaf as usize * byte_len..][..byte_len];
+        let primary_centroid = centroid(primary);
+        let primary_distance = HammingKernel::resolve().distance(code, primary_centroid);
+        if primary_distance == 0 {
+            return Ok(None);
+        }
+        let take = (BINARY_SOAR_CANDIDATES + 1).min(self.num_clusters as usize);
+        let parent_beam_oversample =
+            adaptive_binary_parent_beam_oversample(self.num_clusters as usize);
+        let candidates = match effective_binary_routing_mode(mode, self.num_clusters as usize) {
+            IvfRoutingMode::Hnsw => self.find_k_nearest_hnsw(code, take)?,
+            IvfRoutingMode::TwoLevel => {
+                self.find_k_nearest_two_level_for_build(code, take, parent_beam_oversample)?
+            }
+            IvfRoutingMode::Flat | IvfRoutingMode::Auto => self.find_k_nearest(code, take)?,
+        };
+        let mut best: Option<(f64, u32)> = None;
+        for leaf in candidates {
+            if leaf == primary {
+                continue;
+            }
+            let (distance, overlap) = soar_hamming_terms(code, primary_centroid, centroid(leaf));
+            let loss = f64::from(distance)
+                + BINARY_SOAR_LAMBDA * f64::from(overlap).powi(2) / f64::from(primary_distance);
+            if best.is_none_or(|(best_loss, best_leaf)| {
+                loss < best_loss || (loss == best_loss && leaf < best_leaf)
+            }) {
+                best = Some((loss, leaf));
+            }
+        }
+        Ok(best.map(|(_, leaf)| leaf))
+    }
+
     fn check_code_len(&self, code: &[u8], operation: &str) -> io::Result<()> {
         if code.len() != self.byte_len() {
             return Err(io::Error::new(
@@ -694,6 +745,43 @@ impl BinaryCoarseQuantizer {
     }
 }
 
+/// Leaves considered for a binary IVF SOAR secondary assignment. On 404K
+/// production codes (2,543 leaves) the 16 nearest leaves already matched the
+/// recall of minimising the loss over every leaf to within 0.0004; 32 keeps
+/// margin at one routed probe per vector (docs/binary-ivf-soar.md).
+pub const BINARY_SOAR_CANDIDATES: usize = 32;
+/// Weight of the residual-overlap term in the binary SOAR loss.
+pub const BINARY_SOAR_LAMBDA: f64 = 1.0;
+
+/// `(h(x, s), popcount((x ⊕ p) & (x ⊕ s)))` over whole 64-bit words where
+/// possible: the secondary distance and the residual overlap of the loss.
+#[inline]
+fn soar_hamming_terms(code: &[u8], primary: &[u8], secondary: &[u8]) -> (u32, u32) {
+    let word = |bytes: &[u8]| u64::from_le_bytes(bytes.try_into().expect("8-byte chunk"));
+    let (mut distance, mut overlap) = (0u32, 0u32);
+    let mut code_words = code.chunks_exact(8);
+    let mut primary_words = primary.chunks_exact(8);
+    let mut secondary_words = secondary.chunks_exact(8);
+    for ((x, p), s) in (&mut code_words)
+        .zip(&mut primary_words)
+        .zip(&mut secondary_words)
+    {
+        let (x, p, s) = (word(x), word(p), word(s));
+        distance += (x ^ s).count_ones();
+        overlap += ((x ^ p) & (x ^ s)).count_ones();
+    }
+    for ((&x, &p), &s) in code_words
+        .remainder()
+        .iter()
+        .zip(primary_words.remainder())
+        .zip(secondary_words.remainder())
+    {
+        distance += (x ^ s).count_ones();
+        overlap += ((x ^ p) & (x ^ s)).count_ones();
+    }
+    (distance, overlap)
+}
+
 /// Centroid rows scored per stack block during a flat scan.
 const BINARY_CENTROID_SCAN_BLOCK: usize = 64;
 
@@ -875,6 +963,8 @@ pub struct BinaryIvfIndex {
     zero_codes: usize,
     /// Indexed codes that carry no information (all bits set).
     ones_codes: usize,
+    /// Each vector may also be stored in a SOAR secondary leaf.
+    spilled: bool,
 }
 
 /// Streaming build state used by vector-generation rewrites. Only the exact
@@ -889,12 +979,16 @@ pub(crate) struct BinaryIvfBuilder {
     len: usize,
     zero_codes: usize,
     ones_codes: usize,
+    soar: bool,
 }
 
 impl BinaryIvfBuilder {
+    /// `soar` adds one SOAR secondary posting per vector
+    /// ([`BinaryCoarseQuantizer::soar_secondary`]).
     pub(crate) fn new(
         quantizer: &BinaryCoarseQuantizer,
         routing: IvfRoutingMode,
+        soar: bool,
     ) -> io::Result<Self> {
         quantizer
             .validate_routing(routing)
@@ -908,6 +1002,7 @@ impl BinaryIvfBuilder {
             len: 0,
             zero_codes: 0,
             ones_codes: 0,
+            soar,
         })
     }
 
@@ -936,23 +1031,34 @@ impl BinaryIvfBuilder {
                 "binary IVF code/label batch is inconsistent",
             ));
         }
+        let soar = self.soar;
+        let routing = self.routing;
+        let assign = |code: &[u8]| -> io::Result<(u32, Option<u32>)> {
+            let primary = quantizer.assign(code, routing)?;
+            let secondary = if soar {
+                quantizer.soar_secondary(code, primary, routing)?
+            } else {
+                None
+            };
+            Ok((primary, secondary))
+        };
         #[cfg(feature = "native")]
-        let assignments: Vec<u32> = {
+        let assignments: Vec<(u32, Option<u32>)> = {
             use rayon::prelude::*;
             codes
                 .par_chunks_exact(byte_len)
-                .map(|code| quantizer.assign(code, self.routing))
-                .collect::<io::Result<Vec<u32>>>()?
+                .map(assign)
+                .collect::<io::Result<Vec<_>>>()?
         };
         #[cfg(not(feature = "native"))]
-        let assignments: Vec<u32> = codes
+        let assignments: Vec<(u32, Option<u32>)> = codes
             .chunks_exact(byte_len)
-            .map(|code| quantizer.assign(code, self.routing))
-            .collect::<io::Result<Vec<u32>>>()?;
+            .map(assign)
+            .collect::<io::Result<Vec<_>>>()?;
 
         // Insert grouped by leaf: one map lookup and one reservation per
-        // distinct leaf in the batch instead of per code. Sorting by
-        // `(cluster, index)` keeps each leaf's entries in ascending batch order,
+        // distinct leaf in the batch instead of per code. Sorting postings by
+        // `(cluster, row)` keeps each leaf's entries in ascending batch order,
         // so the serialized payload is byte-identical to per-code insertion.
         for code in codes.chunks_exact(byte_len) {
             if is_zero_code(code) {
@@ -961,13 +1067,20 @@ impl BinaryIvfBuilder {
                 self.ones_codes += 1;
             }
         }
-        let mut order: Vec<u32> = (0..assignments.len() as u32).collect();
-        order.sort_unstable_by_key(|&index| (assignments[index as usize], index));
+        let mut order: Vec<(u32, u32)> =
+            Vec::with_capacity(assignments.len() + if soar { assignments.len() } else { 0 });
+        for (row, &(primary, secondary)) in assignments.iter().enumerate() {
+            order.push((primary, row as u32));
+            if let Some(secondary) = secondary {
+                order.push((secondary, row as u32));
+            }
+        }
+        order.sort_unstable();
         let mut run_start = 0usize;
         while run_start < order.len() {
-            let cluster_id = assignments[order[run_start] as usize];
+            let cluster_id = order[run_start].0;
             let mut run_end = run_start + 1;
-            while run_end < order.len() && assignments[order[run_end] as usize] == cluster_id {
+            while run_end < order.len() && order[run_end].0 == cluster_id {
                 run_end += 1;
             }
             let run = &order[run_start..run_end];
@@ -975,7 +1088,7 @@ impl BinaryIvfBuilder {
             cluster.doc_ids.reserve(run.len());
             cluster.ordinals.reserve(run.len());
             cluster.codes.reserve(run.len() * byte_len);
-            for &index in run {
+            for &(_, index) in run {
                 let index = index as usize;
                 let (doc_id, ordinal) = doc_id_ordinals[index];
                 cluster.doc_ids.push(doc_id);
@@ -1003,6 +1116,7 @@ impl BinaryIvfBuilder {
             len: self.len,
             zero_codes: self.zero_codes,
             ones_codes: self.ones_codes,
+            spilled: self.soar,
         };
         index
             .validate()
@@ -1015,10 +1129,11 @@ impl BinaryIvfIndex {
     pub fn build(
         quantizer: &BinaryCoarseQuantizer,
         routing: IvfRoutingMode,
+        soar: bool,
         codes: &[u8],
         doc_id_ordinals: &[(u32, u16)],
     ) -> io::Result<Self> {
-        let mut builder = BinaryIvfBuilder::new(quantizer, routing)?;
+        let mut builder = BinaryIvfBuilder::new(quantizer, routing, soar)?;
         builder.add_batch(quantizer, codes, doc_id_ordinals)?;
         builder.finish()
     }
@@ -1091,6 +1206,12 @@ impl BinaryIvfIndex {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Whether vectors may also be stored in a SOAR secondary leaf, making
+    /// [`Self::len`] a physical posting count.
+    pub fn is_spilled(&self) -> bool {
+        self.spilled
     }
 
     /// Indexed codes that were all-zero.
@@ -1817,8 +1938,82 @@ mod tests {
         config.train_iters = 4;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, codes, labels.len(), "test").unwrap();
-        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, codes, labels).unwrap();
+        let index =
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, codes, labels).unwrap();
         (quantizer, index)
+    }
+
+    /// The SOAR secondary is the argmin of the Hamming SOAR loss over every
+    /// non-primary leaf when the codebook fits in the candidate pool, and a
+    /// spilled build stores each vector in exactly its primary and secondary
+    /// leaves (no spill for codes equal to their primary centroid).
+    #[test]
+    fn soar_secondary_matches_oracle_and_spilled_build_stores_both_postings() {
+        let (dim, byte_len, n) = (64, 8, 600);
+        let codes = clustered_binary_codes(byte_len, 12, n / 12, 6, 23);
+        let labels: Vec<_> = (0..n as u32).map(|doc| (doc, 0u16)).collect();
+        let (quantizer, _) = trained_index(dim, 16, &codes, &labels);
+        assert!(quantizer.num_clusters as usize <= BINARY_SOAR_CANDIDATES);
+        let centroid = |leaf: usize| &quantizer.centroids[leaf * byte_len..(leaf + 1) * byte_len];
+        let ham = |a: &[u8], b: &[u8]| -> u32 {
+            a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+        };
+        let mut expected = Vec::new();
+        for code in codes.chunks_exact(byte_len) {
+            let primary = quantizer.assign(code, IvfRoutingMode::Flat).unwrap();
+            let p = centroid(primary as usize);
+            let d1 = ham(code, p);
+            let oracle = (d1 > 0)
+                .then(|| {
+                    (0..quantizer.num_clusters as usize)
+                        .filter(|&leaf| leaf != primary as usize)
+                        .map(|leaf| {
+                            let c = centroid(leaf);
+                            let overlap: u32 = code
+                                .iter()
+                                .zip(p)
+                                .zip(c)
+                                .map(|((x, p), c)| ((x ^ p) & (x ^ c)).count_ones())
+                                .sum();
+                            let loss = f64::from(ham(code, c))
+                                + f64::from(overlap).powi(2) / f64::from(d1);
+                            (loss, leaf as u32)
+                        })
+                        .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
+                        .map(|(_, leaf)| leaf)
+                })
+                .flatten();
+            assert_eq!(
+                quantizer
+                    .soar_secondary(code, primary, IvfRoutingMode::Flat)
+                    .unwrap(),
+                oracle
+            );
+            expected.push((primary, oracle));
+        }
+
+        let spilled =
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, true, &codes, &labels).unwrap();
+        assert!(spilled.is_spilled());
+        let secondaries = expected.iter().filter(|(_, s)| s.is_some()).count();
+        assert!(secondaries > n / 2, "most clustered codes spill");
+        assert_eq!(spilled.len(), n + secondaries);
+        for (doc, &(primary, secondary)) in expected.iter().enumerate() {
+            let holders: Vec<u32> = spilled
+                .clusters
+                .iter()
+                .filter(|(_, cluster)| cluster.doc_ids.contains(&(doc as u32)))
+                .map(|(id, _)| *id)
+                .collect();
+            let mut want = vec![primary];
+            want.extend(secondary);
+            want.sort_unstable();
+            assert_eq!(holders, want, "doc {doc}");
+        }
+        let plain = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
+            .unwrap();
+        assert!(!plain.is_spilled());
+        assert_eq!(plain.len(), n);
     }
 
     #[test]
@@ -2302,7 +2497,7 @@ mod tests {
         let labels = [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0), (5, 0)];
         let config = BinaryIvfConfig::new(8, 2);
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, codes.len(), "test").unwrap();
-        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat).unwrap();
+        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat, false).unwrap();
         builder
             .add_batch(&quantizer, &codes[..3], &labels[..3])
             .unwrap();
@@ -2321,7 +2516,8 @@ mod tests {
         // must produce the same columns as two, and each leaf must keep its
         // entries in ascending input order.
         let single =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
+                .unwrap();
         assert_eq!(index.clusters.len(), single.clusters.len());
         for ((left_id, left), (right_id, right)) in index.clusters.iter().zip(&single.clusters) {
             assert_eq!(left_id, right_id);
@@ -2347,8 +2543,8 @@ mod tests {
         config.train_iters = 2;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
+            .unwrap();
 
         assert_eq!(index.zero_codes(), 4, "four zero codes must be counted");
         assert_eq!(index.len(), labels.len(), "every vector stays indexed");
@@ -2373,8 +2569,8 @@ mod tests {
         config.train_iters = 2;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
+            .unwrap();
 
         assert_eq!(
             index.ones_codes(),
@@ -2403,8 +2599,8 @@ mod tests {
         config.train_iters = 1;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
+            .unwrap();
         assert!(!index.is_empty(), "payload must cover every flat vector");
         assert_eq!(index.len(), labels.len());
         assert_eq!(index.zero_codes(), 4);
@@ -2418,8 +2614,8 @@ mod tests {
         config.train_iters = 4;
         config.max_train_samples = labels.len();
         let quantizer = BinaryCoarseQuantizer::train(config, &codes, labels.len(), "test").unwrap();
-        let index =
-            BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, &codes, &labels).unwrap();
+        let index = BinaryIvfIndex::build(&quantizer, IvfRoutingMode::Flat, false, &codes, &labels)
+            .unwrap();
         let (_, count) = index.largest_cluster().expect("a populated leaf");
         assert_eq!(count, 6, "the dominant leaf holds every near-duplicate");
     }
@@ -2505,7 +2701,7 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{mode:?}");
             assert!(error.to_string().contains("expects 1"), "{error}");
         }
-        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat).unwrap();
+        let mut builder = BinaryIvfBuilder::new(&quantizer, IvfRoutingMode::Flat, false).unwrap();
         assert!(
             builder
                 .add_batch(&quantizer, &codes[..4], &[(0, 0), (1, 0)])
