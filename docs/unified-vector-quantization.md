@@ -42,8 +42,9 @@ retaining their optimal metric kernels.
 
 ## Billion-scale defaults
 
-Automatic float IVF training targets 8×sqrt(N) leaves. Binary IVF uses the
-measured balanced sqrt(N) geometry. ScaNN uses sqrt(N) below 100M rows,
+Automatic float IVF training targets 8×sqrt(N) leaves. Binary IVF targets
+4×sqrt(N) leaves with a default of 128 probes
+([measurements](binary-ivf-geometry.md)). ScaNN uses sqrt(N) below 100M rows,
 N^(2/3) through 1B, and min(30M, N^(3/4)) above 1B, matching AlloyDB's
 balanced depth-specific guidance within Summa's format limit. ScaNN never
 changes the selected shared topology to fit a transient sampling ceiling. Large
