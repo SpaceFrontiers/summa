@@ -1811,6 +1811,7 @@ fn validate_binary_ann(
         || header.quantizer_version != quantizer.version
         || header.codebook_version != 0
         || header.routing != config.ivf_routing
+        || header.prefix_bytes != config.prefix_bytes()
         || quantizer.dim_bits != dim
     {
         return Err(Error::Corruption(format!(
@@ -3587,7 +3588,7 @@ impl SegmentReader {
                 checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
             let (documents, ordinal_scores) = lazy
                 .get()
-                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
+                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner, 0)
                 .map_err(|error| {
                     Error::Corruption(format!(
                         "invalid binary ScaNN payload for field {}: {error}",
@@ -3659,7 +3660,13 @@ impl SegmentReader {
                 let candidate_limit =
                     checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
                 let (candidate_documents, probed_ordinal_scores) = ivf
-                    .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
+                    .search_binary_combined_documents(
+                        candidate_limit,
+                        query,
+                        &clusters,
+                        combiner,
+                        config.effective_prefix_rerank(),
+                    )
                     .map_err(|error| {
                         Error::Corruption(format!(
                             "invalid binary IVF payload for field {}: {error}",
@@ -3691,9 +3698,19 @@ impl SegmentReader {
                 }
                 .min(flat.num_docs_with_vectors());
                 let ann_results = if single_valued {
-                    ivf.search_binary_clusters::<false>(query, candidate_docs, &clusters)
+                    ivf.search_binary_clusters::<false>(
+                        query,
+                        candidate_docs,
+                        &clusters,
+                        config.effective_prefix_rerank(),
+                    )
                 } else {
-                    ivf.search_binary_clusters::<true>(query, candidate_docs, &clusters)
+                    ivf.search_binary_clusters::<true>(
+                        query,
+                        candidate_docs,
+                        &clusters,
+                        config.effective_prefix_rerank(),
+                    )
                 }
                 .map_err(|error| {
                     Error::Corruption(format!(
@@ -4264,7 +4281,7 @@ impl SegmentReader {
                 checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
             let (documents, ordinal_scores) = lazy
                 .get()
-                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
+                .search_binary_combined_documents(candidate_limit, query, &clusters, combiner, 0)
                 .map_err(|error| {
                     Error::Corruption(format!(
                         "invalid binary ScaNN payload for field {}: {error}",
@@ -4335,7 +4352,13 @@ impl SegmentReader {
                 let candidate_limit =
                     checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
                 let (candidate_documents, probed_ordinal_scores) = ivf
-                    .search_binary_combined_documents(candidate_limit, query, &clusters, combiner)
+                    .search_binary_combined_documents(
+                        candidate_limit,
+                        query,
+                        &clusters,
+                        combiner,
+                        config.effective_prefix_rerank(),
+                    )
                     .map_err(|error| {
                         Error::Corruption(format!(
                             "invalid binary IVF payload for field {}: {error}",
@@ -4362,9 +4385,19 @@ impl SegmentReader {
                 }
                 .min(flat.num_docs_with_vectors());
                 let ann_results = if single_valued {
-                    ivf.search_binary_clusters::<false>(query, candidate_docs, &clusters)
+                    ivf.search_binary_clusters::<false>(
+                        query,
+                        candidate_docs,
+                        &clusters,
+                        config.effective_prefix_rerank(),
+                    )
                 } else {
-                    ivf.search_binary_clusters::<true>(query, candidate_docs, &clusters)
+                    ivf.search_binary_clusters::<true>(
+                        query,
+                        candidate_docs,
+                        &clusters,
+                        config.effective_prefix_rerank(),
+                    )
                 }
                 .map_err(|error| {
                     Error::Corruption(format!(

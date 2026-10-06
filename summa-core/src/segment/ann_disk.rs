@@ -8,7 +8,6 @@
 
 #[cfg(feature = "native")]
 use std::cmp::Reverse;
-#[cfg(feature = "native")]
 use std::collections::BinaryHeap;
 use std::io;
 #[cfg(feature = "native")]
@@ -216,6 +215,10 @@ pub(crate) struct AnnDiskHeader {
     pub quantizer_version: u64,
     pub codebook_version: u64,
     pub vector_count: usize,
+    /// Bytes of the per-code leading-bit prefix stored before each binary IVF
+    /// run's codes (0: no prefix column). Encoded as layout revision 1 with the
+    /// byte count in the header tail, which earlier readers reject.
+    pub prefix_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -226,6 +229,9 @@ struct AnnRun {
     count: usize,
     doc_ids: Range<usize>,
     ordinals: Range<usize>,
+    /// Leading-bit prefixes of this run's codes, `count * prefix_bytes` bytes
+    /// between the ordinals and the codes (empty without a prefix layout).
+    prefix: Range<usize>,
     codes: Range<usize>,
 }
 
@@ -467,14 +473,22 @@ impl AnnDiskIndex {
         let dim = header_cursor.read_u32::<LittleEndian>()? as usize;
         let code_size = header_cursor.read_u32::<LittleEndian>()? as usize;
         let num_clusters = header_cursor.read_u32::<LittleEndian>()?;
-        check_layout_revision(kind, header_cursor.read_u32::<LittleEndian>()?)?;
+        let layout_revision = header_cursor.read_u32::<LittleEndian>()?;
         let quantizer_version = header_cursor.read_u64::<LittleEndian>()?;
         let codebook_version = header_cursor.read_u64::<LittleEndian>()?;
         let vector_count = usize::try_from(header_cursor.read_u64::<LittleEndian>()?)
             .map_err(|_| invalid_data("ANN vector count exceeds usize"))?;
-        if header_cursor.read_u64::<LittleEndian>()? != 0 {
-            return Err(invalid_data("ANN header tail is non-zero"));
-        }
+        let tail = header_cursor.read_u64::<LittleEndian>()?;
+        let prefix_bytes =
+            if kind == AnnKind::BinaryIvf && layout_revision == BINARY_PREFIX_LAYOUT_REVISION {
+                usize::try_from(tail).map_err(|_| invalid_data("ANN prefix width exceeds usize"))?
+            } else {
+                check_layout_revision(kind, layout_revision)?;
+                if tail != 0 {
+                    return Err(invalid_data("ANN header tail is non-zero"));
+                }
+                0
+            };
         let header = AnnDiskHeader {
             kind,
             routing,
@@ -484,6 +498,7 @@ impl AnnDiskIndex {
             quantizer_version,
             codebook_version,
             vector_count,
+            prefix_bytes,
         };
         validate_header(&header)?;
 
@@ -544,6 +559,9 @@ impl AnnDiskIndex {
                 .checked_mul(std::mem::size_of::<u16>())
                 .ok_or_else(|| invalid_data("ANN ordinal column size overflows usize"))?;
             let expected_codes_len = expected_codes_column_len(kind, count, dim, code_size)?;
+            let prefix_len = count
+                .checked_mul(prefix_bytes)
+                .ok_or_else(|| invalid_data("ANN prefix column size overflows usize"))?;
             let doc_ids_end = doc_ids_offset
                 .checked_add(doc_ids_len)
                 .ok_or_else(|| invalid_data("ANN doc-ID range overflows usize"))?;
@@ -555,7 +573,7 @@ impl AnnDiskIndex {
                 .ok_or_else(|| invalid_data("ANN code range overflows usize"))?;
             if doc_ids_offset < ANN_HEADER_SIZE
                 || ordinals_offset != doc_ids_end
-                || codes_offset != ordinals_end
+                || ordinals_end.checked_add(prefix_len) != Some(codes_offset)
                 || codes_len != expected_codes_len
                 || codes_end > directory_offset
             {
@@ -568,6 +586,7 @@ impl AnnDiskIndex {
                 count,
                 doc_ids: doc_ids_offset..doc_ids_end,
                 ordinals: ordinals_offset..ordinals_end,
+                prefix: ordinals_end..codes_offset,
                 codes: codes_offset..codes_end,
             });
             counted_vectors = counted_vectors
@@ -1182,12 +1201,14 @@ impl AnnDiskIndex {
         query: &[u8],
         cluster_ids: &[u32],
         combiner: crate::query::MultiValueCombiner,
+        prefix_rerank: usize,
     ) -> io::Result<CombinedBinaryCandidates> {
         self.search_binary_combined_documents_with_tuning(
             k,
             query,
             cluster_ids,
             combiner,
+            prefix_rerank,
             IVF_PARALLEL_SCAN_MIN_POSTINGS,
         )
     }
@@ -1385,6 +1406,7 @@ impl AnnDiskIndex {
         query: &[u8],
         cluster_ids: &[u32],
         combiner: crate::query::MultiValueCombiner,
+        prefix_rerank: usize,
         parallel_min_postings: usize,
     ) -> io::Result<CombinedBinaryCandidates> {
         validate_combined_search(combiner)?;
@@ -1404,6 +1426,21 @@ impl AnnDiskIndex {
 
         let bytes = self.raw.as_slice();
         let posting_count = probed_posting_count(self, cluster_ids)?;
+        if let Some(candidates) = self.binary_prefix_candidates(
+            query,
+            cluster_ids,
+            posting_count,
+            prefix_rerank,
+            parallel_min_postings,
+        )? {
+            let mut ordinal_scores = Vec::with_capacity(candidates.len());
+            self.score_prefix_candidates(query, &candidates, &mut ordinal_scores);
+            return Ok(combine_scored_ordinals_retaining(
+                ordinal_scores,
+                k,
+                combiner,
+            ));
+        }
         #[cfg(feature = "native")]
         if rayon::current_num_threads() > 1 && posting_count >= parallel_min_postings {
             use rayon::prelude::*;
@@ -1813,16 +1850,21 @@ impl AnnDiskIndex {
         Ok(())
     }
 
+    /// Exact Hamming top-`k` over the probed binary leaves. With a prefix
+    /// layout and `prefix_rerank > 0`, only the best `prefix_rerank` postings
+    /// by prefix distance are scored on full codes (docs/binary-prefix-scan.md).
     pub(crate) fn search_binary_clusters<const BY_DOCUMENT: bool>(
         &self,
         query: &[u8],
         k: usize,
         cluster_ids: &[u32],
+        prefix_rerank: usize,
     ) -> io::Result<Vec<(u32, u16, f32)>> {
         self.search_binary_clusters_with_tuning::<BY_DOCUMENT>(
             query,
             k,
             cluster_ids,
+            prefix_rerank,
             IVF_PARALLEL_SCAN_MIN_POSTINGS,
         )
     }
@@ -1832,6 +1874,7 @@ impl AnnDiskIndex {
         query: &[u8],
         k: usize,
         cluster_ids: &[u32],
+        prefix_rerank: usize,
         parallel_min_postings: usize,
     ) -> io::Result<Vec<(u32, u16, f32)>> {
         #[cfg(not(feature = "native"))]
@@ -1844,6 +1887,17 @@ impl AnnDiskIndex {
         }
         if k == 0 {
             return Ok(Vec::new());
+        }
+        if let Some(candidates) = self.binary_prefix_candidates(
+            query,
+            cluster_ids,
+            probed_posting_count(self, cluster_ids)?,
+            prefix_rerank,
+            parallel_min_postings,
+        )? {
+            let mut collector = BoundedAnnCollector::<BY_DOCUMENT, true>::new(k);
+            self.score_prefix_candidates(query, &candidates, &mut collector);
+            return Ok(collector.into_sorted_results());
         }
         #[cfg(feature = "native")]
         self.prefetch_cluster_runs(cluster_ids);
@@ -1918,6 +1972,209 @@ impl AnnDiskIndex {
         let mut collector = BoundedUniqueAnnCollector::<true>::new(k);
         score_binary_cluster_runs(self, bytes, query, cluster_ids, &mut scores, &mut collector)?;
         Ok(collector.into_sorted_results())
+    }
+}
+
+impl AnnDiskIndex {
+    /// Prefix stage of a binary prefix-first scan: the best `rerank` visible
+    /// postings of the probed leaves by Hamming distance on the stored code
+    /// prefix, in ascending `(distance, doc, ordinal, code offset)` order.
+    ///
+    /// Returns `None` (scan full codes instead) without a prefix layout, with
+    /// `rerank == 0`, or when the probe holds no more postings than `rerank`.
+    /// Selection keeps at most `rerank` candidates per worker, and the total
+    /// order makes the result independent of parallel chunking.
+    fn binary_prefix_candidates(
+        &self,
+        query: &[u8],
+        cluster_ids: &[u32],
+        posting_count: usize,
+        rerank: usize,
+        parallel_min_postings: usize,
+    ) -> io::Result<Option<Vec<PrefixCandidate>>> {
+        let prefix_bytes = self.header.prefix_bytes;
+        if prefix_bytes == 0 || rerank == 0 || posting_count <= rerank {
+            #[cfg(not(feature = "native"))]
+            let _ = parallel_min_postings;
+            return Ok(None);
+        }
+        let query_prefix = &query[..prefix_bytes];
+        let kernel = crate::structures::simd::HammingKernel::resolve();
+        let bytes = self.raw.as_slice();
+        let visibility = self.alive_docs.as_deref();
+        #[cfg(feature = "native")]
+        self.prefetch_prefix_runs(cluster_ids);
+        #[cfg(feature = "native")]
+        if rayon::current_num_threads() > 1 && posting_count >= parallel_min_postings {
+            use rayon::prelude::*;
+            let tasks = self.binary_scan_tasks(cluster_ids);
+            let heap = tasks
+                .par_iter()
+                .fold(BinaryHeap::new, |mut heap, task| {
+                    scan_prefix_task(
+                        kernel,
+                        visibility,
+                        bytes,
+                        query_prefix,
+                        prefix_bytes,
+                        self.header.code_size,
+                        *task,
+                        rerank,
+                        &mut heap,
+                    );
+                    heap
+                })
+                .reduce(BinaryHeap::new, |mut left, right| {
+                    for candidate in right {
+                        push_prefix_candidate(&mut left, candidate, rerank);
+                    }
+                    left
+                });
+            return Ok(Some(heap.into_sorted_vec()));
+        }
+        let mut heap = BinaryHeap::with_capacity(rerank + 1);
+        for &cluster_id in cluster_ids {
+            for run in self.cluster_runs(cluster_id) {
+                scan_prefix_task(
+                    kernel,
+                    visibility,
+                    bytes,
+                    query_prefix,
+                    prefix_bytes,
+                    self.header.code_size,
+                    BinaryScanTask {
+                        run,
+                        first_index: 0,
+                        count: run.count,
+                    },
+                    rerank,
+                    &mut heap,
+                );
+            }
+        }
+        Ok(Some(heap.into_sorted_vec()))
+    }
+
+    /// Full-code stage: exact Hamming scores for the prefix candidates.
+    fn score_prefix_candidates(
+        &self,
+        query: &[u8],
+        candidates: &[PrefixCandidate],
+        sink: &mut impl AnnScoreSink,
+    ) {
+        let kernel = crate::structures::simd::HammingKernel::resolve();
+        let bytes = self.raw.as_slice();
+        let code_size = self.header.code_size;
+        let inv_dim = 1.0 / self.header.dim as f32;
+        for candidate in candidates {
+            let code = &bytes[candidate.code_offset..candidate.code_offset + code_size];
+            let distance = kernel.distance(query, code);
+            sink.insert_score(
+                candidate.doc_id,
+                candidate.ordinal,
+                1.0 - distance as f32 * inv_dim,
+            );
+        }
+    }
+
+    /// Prefetch only the prefix columns of the probed leaves; the full-code
+    /// stage reads its few candidates on demand.
+    #[cfg(feature = "native")]
+    fn prefetch_prefix_runs(&self, cluster_ids: &[u32]) {
+        if cluster_ids.is_empty() || !self.raw.is_mmap() {
+            return;
+        }
+        let mut ranges = Vec::with_capacity(cluster_ids.len());
+        for &cluster_id in cluster_ids {
+            ranges.extend(
+                self.cluster_runs(cluster_id)
+                    .iter()
+                    .map(|run| run.doc_ids.start..run.prefix.end),
+            );
+        }
+        coalesce_prefetch_ranges(&mut ranges);
+        for range in ranges {
+            self.raw.madvise_range(range, libc::MADV_WILLNEED);
+        }
+    }
+}
+
+/// One posting selected by its code prefix. Ordered by `(distance, doc,
+/// ordinal, code offset)`, a total order, so selection is deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PrefixCandidate {
+    distance: u32,
+    doc_id: u32,
+    ordinal: u16,
+    code_offset: usize,
+}
+
+/// Keep the `limit` smallest candidates in a max-heap.
+#[inline]
+fn push_prefix_candidate(
+    heap: &mut BinaryHeap<PrefixCandidate>,
+    candidate: PrefixCandidate,
+    limit: usize,
+) {
+    if heap.len() < limit {
+        heap.push(candidate);
+    } else if heap.peek().is_some_and(|worst| candidate < *worst) {
+        heap.pop();
+        heap.push(candidate);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_prefix_task(
+    kernel: crate::structures::simd::HammingKernel,
+    visibility: Option<&crate::query::DocBitset>,
+    bytes: &[u8],
+    query_prefix: &[u8],
+    prefix_bytes: usize,
+    code_size: usize,
+    task: BinaryScanTask<'_>,
+    limit: usize,
+    heap: &mut BinaryHeap<PrefixCandidate>,
+) {
+    const BLOCK: usize = 64;
+    let run = task.run;
+    let mut distances = [0u32; BLOCK];
+    let end = task.first_index + task.count;
+    for block_start in (task.first_index..end).step_by(BLOCK) {
+        let rows = BLOCK.min(end - block_start);
+        let start = run.prefix.start + block_start * prefix_bytes;
+        kernel.distances(
+            query_prefix,
+            &bytes[start..start + rows * prefix_bytes],
+            prefix_bytes,
+            &mut distances[..rows],
+        );
+        // Only distances that can enter the heap touch the label columns.
+        let worst = if heap.len() < limit {
+            u32::MAX
+        } else {
+            heap.peek().map_or(u32::MAX, |worst| worst.distance)
+        };
+        for (lane, &distance) in distances[..rows].iter().enumerate() {
+            if distance > worst {
+                continue;
+            }
+            let index = block_start + lane;
+            let doc_id = run_doc_id_validated(bytes, run, index);
+            if visibility.is_some_and(|bits| !bits.contains(doc_id)) {
+                continue;
+            }
+            push_prefix_candidate(
+                heap,
+                PrefixCandidate {
+                    distance,
+                    doc_id,
+                    ordinal: read_u16(bytes, run.ordinals.start + index * 2),
+                    code_offset: run.codes.start + index * code_size,
+                },
+                limit,
+            );
+        }
     }
 }
 
@@ -2509,6 +2766,7 @@ fn record_exact_locations(
 pub(crate) fn write_built_binary_ivf(
     index: &BinaryIvfIndex,
     routing: IvfRoutingMode,
+    prefix_bytes: usize,
     writer: &mut (impl Write + ?Sized),
     locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
 ) -> io::Result<u64> {
@@ -2532,6 +2790,7 @@ pub(crate) fn write_built_binary_ivf(
             quantizer_version: index.quantizer_version,
             codebook_version: 0,
             vector_count: index.len(),
+            prefix_bytes,
         },
         &runs,
         writer,
@@ -2586,6 +2845,7 @@ pub(crate) fn write_built_scann(
         quantizer_version: payload.generation,
         codebook_version: payload.artifact_id,
         vector_count,
+        prefix_bytes: 0,
     };
     validate_header(&header)?;
     write_header(writer, &header)?;
@@ -2757,6 +3017,7 @@ pub(crate) fn write_built_ivf_tq(
             quantizer_version: index.centroids_version,
             codebook_version: codec.fingerprint(),
             vector_count: index.len(),
+            prefix_bytes: 0,
         },
         &runs,
         writer,
@@ -2798,6 +3059,7 @@ pub(crate) fn write_built_tq_flat(
             quantizer_version: codec.fingerprint(),
             codebook_version: 0,
             vector_count: builder.len(),
+            prefix_bytes: 0,
         },
         &runs,
         writer,
@@ -2877,6 +3139,16 @@ fn write_built_runs(
                     .ok_or_else(|| invalid_data("ANN ordinal output size overflows u64"))?,
             )
             .ok_or_else(|| invalid_data("ANN output offset overflow"))?;
+        if header.prefix_bytes > 0 {
+            write_prefix_column(
+                writer,
+                run.codes,
+                header.code_size,
+                header.prefix_bytes,
+                &mut scratch,
+            )?;
+            offset = checked_advance(offset, count * header.prefix_bytes)?;
+        }
         let codes_offset = offset;
         record_exact_locations(
             &mut locations,
@@ -3131,6 +3403,23 @@ pub(crate) fn write_compacted_ann_cancellable(
                 copy_range(writer, &source.raw, run.ordinals.clone(), cancellation)?;
                 offset = checked_advance(offset, run.ordinals.len())?;
                 cursor += 1;
+            }
+        }
+
+        // Pass 2b: binary prefix rows, verbatim and in the same run order as
+        // the codes below, so row `i` of both columns is the same vector.
+        if header.prefix_bytes > 0 {
+            for (source_index, &(source, _)) in sources.iter().enumerate() {
+                let mut cursor = cursors[source_index];
+                while let Some(run) = source
+                    .runs
+                    .get(cursor)
+                    .filter(|run| run.cluster_id == cluster_id)
+                {
+                    copy_range(writer, &source.raw, run.prefix.clone(), cancellation)?;
+                    offset = checked_advance(offset, run.prefix.len())?;
+                    cursor += 1;
+                }
             }
         }
 
@@ -3412,6 +3701,11 @@ fn write_merged_ann_impl(
             .checked_add(source.header.vector_count)
             .ok_or_else(|| invalid_data("merged ANN vector count overflows usize"))?;
     }
+    if header.prefix_bytes > 0 && !extra.is_empty() {
+        return Err(invalid_data(
+            "extra ANN merge runs cannot carry binary prefix columns",
+        ));
+    }
     for run in extra {
         if run.doc_ids.is_empty()
             || run.cluster_id >= header.num_clusters
@@ -3563,7 +3857,8 @@ fn relocate_payload_offset(output_payload_start: u64, source_offset: usize) -> i
 
 #[cfg(feature = "native")]
 fn headers_compatible(left: &AnnDiskHeader, right: &AnnDiskHeader) -> bool {
-    left.kind == right.kind
+    left.prefix_bytes == right.prefix_bytes
+        && left.kind == right.kind
         && left.routing == right.routing
         && left.dim == right.dim
         && left.code_size == right.code_size
@@ -3626,6 +3921,11 @@ fn finish_footer(
 /// length for even block counts, so nothing else in the container would
 /// notice a stale generation (docs/fast-scan-layout-v2.md). Every other kind
 /// keeps the field at zero, preserving the old "reserved must be zero" check.
+/// Binary IVF layout with a per-run leading-bit prefix column between the
+/// ordinals and the codes. The header tail holds the prefix byte width.
+/// Earlier readers reject both the revision and the non-zero tail.
+const BINARY_PREFIX_LAYOUT_REVISION: u32 = 1;
+
 fn expected_layout_revision(kind: AnnKind) -> u32 {
     match kind {
         AnnKind::ScannAh => u32::from(crate::structures::vector::scann::FAST_SCAN_LAYOUT_VERSION),
@@ -3661,14 +3961,18 @@ fn write_header(writer: &mut (impl Write + ?Sized), header: &AnnDiskHeader) -> i
         u32::try_from(header.code_size).map_err(|_| invalid_data("ANN code size exceeds u32"))?,
     )?;
     writer.write_u32::<LittleEndian>(header.num_clusters)?;
-    writer.write_u32::<LittleEndian>(expected_layout_revision(header.kind))?;
+    writer.write_u32::<LittleEndian>(if header.prefix_bytes > 0 {
+        BINARY_PREFIX_LAYOUT_REVISION
+    } else {
+        expected_layout_revision(header.kind)
+    })?;
     writer.write_u64::<LittleEndian>(header.quantizer_version)?;
     writer.write_u64::<LittleEndian>(header.codebook_version)?;
     writer.write_u64::<LittleEndian>(
         u64::try_from(header.vector_count)
             .map_err(|_| invalid_data("ANN vector count exceeds u64"))?,
     )?;
-    writer.write_u64::<LittleEndian>(0)?;
+    writer.write_u64::<LittleEndian>(header.prefix_bytes as u64)?;
     Ok(())
 }
 
@@ -3700,6 +4004,26 @@ fn write_u16_column(
         scratch.reserve(chunk.len() * 2);
         for value in chunk {
             scratch.extend_from_slice(&value.to_le_bytes());
+        }
+        writer.write_all(scratch)?;
+    }
+    Ok(())
+}
+
+/// Leading `prefix_bytes` of every `code_size`-byte row, contiguous.
+#[cfg(feature = "native")]
+fn write_prefix_column(
+    writer: &mut (impl Write + ?Sized),
+    codes: &[u8],
+    code_size: usize,
+    prefix_bytes: usize,
+    scratch: &mut Vec<u8>,
+) -> io::Result<()> {
+    for rows in codes.chunks(64 * 1024 * code_size) {
+        scratch.clear();
+        scratch.reserve(rows.len() / code_size * prefix_bytes);
+        for row in rows.chunks_exact(code_size) {
+            scratch.extend_from_slice(&row[..prefix_bytes]);
         }
         writer.write_all(scratch)?;
     }
@@ -3764,6 +4088,8 @@ fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
         || header.num_clusters == 0
         || header.quantizer_version == 0
         || header.vector_count == 0
+        || (header.prefix_bytes != 0
+            && (header.kind != AnnKind::BinaryIvf || header.prefix_bytes >= header.code_size))
         || (header.kind == AnnKind::BinaryIvf
             && (header.codebook_version != 0
                 || !header.dim.is_multiple_of(8)
@@ -4009,10 +4335,10 @@ mod tests {
         for cluster in 0..8u32 {
             let query = [0x5Au8];
             let from_copy = copied
-                .search_binary_clusters::<false>(&query, 16, &[cluster])
+                .search_binary_clusters::<false>(&query, 16, &[cluster], 0)
                 .unwrap();
             let from_compact = compacted
-                .search_binary_clusters::<false>(&query, 16, &[cluster])
+                .search_binary_clusters::<false>(&query, 16, &[cluster], 0)
                 .unwrap();
             assert_eq!(from_copy, from_compact, "cluster {cluster} diverged");
         }
@@ -4029,7 +4355,7 @@ mod tests {
         assert_eq!(generation3.health().vectors, 16);
         // And the third A copy's docs landed at offset 8.
         let all: Vec<(u32, u16, f32)> = compacted
-            .search_binary_clusters::<false>(&[0x5A], 32, &[0, 2, 5])
+            .search_binary_clusters::<false>(&[0x5A], 32, &[0, 2, 5], 0)
             .unwrap();
         let mut docs: Vec<u32> = all.iter().map(|&(doc, _, _)| doc).collect();
         docs.sort_unstable();
@@ -4085,6 +4411,7 @@ mod tests {
                 quantizer_version: 41,
                 codebook_version: 73,
                 vector_count: count,
+                prefix_bytes: 0,
             };
             let mut bytes = Vec::new();
             write_built_runs(header, &[run], &mut bytes, None).unwrap();
@@ -4170,6 +4497,7 @@ mod tests {
                 quantizer_version: 42,
                 codebook_version: 0,
                 vector_count: vectors_per_source,
+                prefix_bytes: 0,
             };
             let mut bytes = Vec::new();
             write_built_runs(header, &runs, &mut bytes, None).unwrap();
@@ -4730,11 +5058,232 @@ mod tests {
             quantizer_version: 42,
             codebook_version: 0,
             vector_count,
+            prefix_bytes: 0,
         }
     }
 
     fn payload_end(index: &AnnDiskIndex) -> usize {
         index.runs.iter().map(|run| run.codes.end).max().unwrap()
+    }
+
+    /// Every run's prefix column holds exactly the leading bytes of its codes.
+    fn assert_prefix_aligned(index: &AnnDiskIndex) {
+        let bytes = index.raw.as_slice();
+        let (code_size, prefix) = (index.header.code_size, index.header.prefix_bytes);
+        assert!(prefix > 0);
+        for run in index.runs.iter() {
+            assert_eq!(run.prefix.len(), run.count * prefix);
+            for row in 0..run.count {
+                let code = &bytes[run.codes.start + row * code_size..][..prefix];
+                let stored = &bytes[run.prefix.start + row * prefix..][..prefix];
+                assert_eq!(code, stored, "cluster {} row {row}", run.cluster_id);
+            }
+        }
+    }
+
+    /// Deterministic multi-cluster binary payload with 64-bit codes and an
+    /// optional 16-bit prefix column.
+    fn prefixed_binary_payload(prefix_bytes: usize, seed: u64) -> (Vec<u8>, usize) {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        let clusters = 4u32;
+        let per = 40usize;
+        let mut owned = Vec::new();
+        for cluster in 0..clusters {
+            let docs: Vec<u32> = (0..per as u32).map(|i| i * clusters + cluster).collect();
+            let ordinals = vec![0u16; per];
+            let codes: Vec<u8> = (0..per * 8).map(|_| rng.random()).collect();
+            owned.push((cluster, docs, ordinals, codes));
+        }
+        let runs: Vec<_> = owned
+            .iter()
+            .map(|(cluster, docs, ordinals, codes)| BuildRun {
+                cluster_id: *cluster,
+                doc_ids: docs,
+                ordinals,
+                codes,
+            })
+            .collect();
+        let vectors = clusters as usize * per;
+        let mut bytes = Vec::new();
+        write_built_runs(
+            AnnDiskHeader {
+                kind: AnnKind::BinaryIvf,
+                routing: IvfRoutingMode::Flat,
+                dim: 64,
+                code_size: 8,
+                num_clusters: clusters,
+                quantizer_version: 7,
+                codebook_version: 0,
+                vector_count: vectors,
+                prefix_bytes,
+            },
+            &runs,
+            &mut bytes,
+            None,
+        )
+        .unwrap();
+        (bytes, vectors)
+    }
+
+    #[test]
+    fn binary_prefix_layout_round_trips_and_rejects_invalid_headers() {
+        let (bytes, docs) = prefixed_binary_payload(2, 1);
+        let index = AnnDiskIndex::open(
+            OwnedBytes::new(bytes.clone()),
+            AnnKind::BinaryIvf,
+            docs as u32,
+        )
+        .unwrap();
+        assert_eq!(index.header.prefix_bytes, 2);
+        assert_prefix_aligned(&index);
+        // Layout revision 1 with the width in the header tail.
+        assert_eq!(&bytes[20..24], &1u32.to_le_bytes());
+        assert_eq!(&bytes[48..56], &2u64.to_le_bytes());
+
+        // A prefix as wide as the code, a prefix on a revision-0 header, and
+        // a revision-1 header with no width are all corrupt.
+        for (revision, tail) in [(1u32, 8u64), (0, 2), (1, 0)] {
+            let mut bad = bytes.clone();
+            bad[20..24].copy_from_slice(&revision.to_le_bytes());
+            bad[48..56].copy_from_slice(&tail.to_le_bytes());
+            assert!(
+                AnnDiskIndex::open(OwnedBytes::new(bad), AnnKind::BinaryIvf, docs as u32).is_err(),
+                "revision {revision} tail {tail}"
+            );
+        }
+        // Payloads without a prefix are unchanged: revision 0, zero tail.
+        let (plain, _) = prefixed_binary_payload(0, 1);
+        assert_eq!(&plain[20..24], &0u32.to_le_bytes());
+        assert_eq!(&plain[48..56], &0u64.to_le_bytes());
+        assert_eq!(plain.len() + 4 * 40 * 2, bytes.len());
+    }
+
+    #[test]
+    fn binary_prefix_columns_survive_copy_coalescing_and_deletion() {
+        let (left_bytes, left_docs) = prefixed_binary_payload(2, 2);
+        let (right_bytes, right_docs) = prefixed_binary_payload(2, 3);
+        let left = AnnDiskIndex::open(
+            OwnedBytes::new(left_bytes),
+            AnnKind::BinaryIvf,
+            left_docs as u32,
+        )
+        .unwrap();
+        let right = AnnDiskIndex::open(
+            OwnedBytes::new(right_bytes),
+            AnnKind::BinaryIvf,
+            right_docs as u32,
+        )
+        .unwrap();
+        let total = (left_docs + right_docs) as u32;
+        let sources = [(&left, 0u32), (&right, left_docs as u32)];
+
+        let mut copied = Vec::new();
+        write_merged_ann(&sources, &mut copied).unwrap();
+        let copied =
+            AnnDiskIndex::open(OwnedBytes::new(copied), AnnKind::BinaryIvf, total).unwrap();
+        assert_prefix_aligned(&copied);
+
+        let mut coalesced = Vec::new();
+        let mut relocations = CodeRelocations::default();
+        write_compacted_ann_cancellable(&sources, &mut coalesced, None, Some(&mut relocations))
+            .unwrap();
+        let coalesced =
+            AnnDiskIndex::open(OwnedBytes::new(coalesced), AnnKind::BinaryIvf, total).unwrap();
+        assert_eq!(coalesced.health().fragmentation(), 1.0);
+        assert_prefix_aligned(&coalesced);
+
+        // Drop every third document; survivors keep aligned prefixes.
+        let rows = crate::segment::row_map::RowMap::new(
+            total,
+            total - total.div_ceil(3),
+            |doc| doc % 3 != 0,
+            1 << 20,
+        )
+        .unwrap();
+        let mut live = Vec::new();
+        write_live_ann(&coalesced, &rows, &mut live, 1 << 20, None, None).unwrap();
+        let live =
+            AnnDiskIndex::open(OwnedBytes::new(live), AnnKind::BinaryIvf, rows.len()).unwrap();
+        assert_prefix_aligned(&live);
+        assert_eq!(live.header.vector_count, rows.len() as usize);
+
+        // Mixed prefix widths are incompatible generations.
+        let (plain_bytes, plain_docs) = prefixed_binary_payload(0, 4);
+        let plain = AnnDiskIndex::open(
+            OwnedBytes::new(plain_bytes),
+            AnnKind::BinaryIvf,
+            plain_docs as u32,
+        )
+        .unwrap();
+        assert!(
+            write_merged_ann(&[(&left, 0), (&plain, left_docs as u32)], &mut Vec::new()).is_err()
+        );
+    }
+
+    /// The two-stage scan equals an independent oracle: rank every probed
+    /// posting by prefix distance with the documented tie order, keep the
+    /// best `rerank`, rescore those on full codes. Serial and parallel
+    /// selection agree, and a rerank depth covering every posting is exactly
+    /// the full scan.
+    #[test]
+    fn binary_prefix_scan_matches_oracle_and_full_scan() {
+        let (bytes, docs) = prefixed_binary_payload(2, 5);
+        let index =
+            AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, docs as u32).unwrap();
+        let raw = index.raw.as_slice();
+        let query = [0x5au8, 0xc3, 0x0f, 0xf0, 0x33, 0xcc, 0x99, 0x66];
+        let clusters = [0u32, 2, 3];
+        let ham = |a: &[u8], b: &[u8]| -> u32 {
+            a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+        };
+        let mut postings = Vec::new();
+        for &cluster in &clusters {
+            for run in index.cluster_runs(cluster) {
+                for row in 0..run.count {
+                    let doc = run.doc_base + read_u32(raw, run.doc_ids.start + row * 4);
+                    let code = &raw[run.codes.start + row * 8..][..8];
+                    postings.push((ham(&query[..2], &code[..2]), doc, ham(&query, code)));
+                }
+            }
+        }
+        postings.sort_unstable();
+        for rerank in [1usize, 7, 30] {
+            let mut expected: Vec<(u32, u16, f32)> = postings[..rerank]
+                .iter()
+                .map(|&(_, doc, full)| (doc, 0, 1.0 - full as f32 / 64.0))
+                .collect();
+            expected.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+            expected.truncate(5);
+            for parallel_min in [usize::MAX, 1] {
+                let actual = index
+                    .search_binary_clusters_with_tuning::<false>(
+                        &query,
+                        5,
+                        &clusters,
+                        rerank,
+                        parallel_min,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "rerank {rerank} parallel_min {parallel_min}"
+                );
+            }
+        }
+        let full = index
+            .search_binary_clusters_with_tuning::<false>(&query, 5, &clusters, 0, usize::MAX)
+            .unwrap();
+        let covering = index
+            .search_binary_clusters_with_tuning::<false>(
+                &query,
+                5,
+                &clusters,
+                postings.len(),
+                usize::MAX,
+            )
+            .unwrap();
+        assert_eq!(full, covering);
     }
 
     #[test]
@@ -4823,6 +5372,7 @@ mod tests {
                                     &query,
                                     k,
                                     &[0, 1],
+                                    0,
                                     parallel_threshold,
                                 )
                             })
@@ -4833,6 +5383,7 @@ mod tests {
                                     &query,
                                     k,
                                     &[0, 1],
+                                    0,
                                     parallel_threshold,
                                 )
                             })
@@ -4915,7 +5466,7 @@ mod tests {
         );
 
         let mut docs: Vec<u32> = merged
-            .search_binary_clusters::<false>(&[0], 4, &[0, 1])
+            .search_binary_clusters::<false>(&[0], 4, &[0, 1], 0)
             .unwrap()
             .into_iter()
             .map(|result| result.0)
@@ -4923,13 +5474,13 @@ mod tests {
         docs.sort_unstable();
         assert_eq!(docs, [0, 1, 2, 3]);
         let serial = merged
-            .search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], usize::MAX)
+            .search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], 0, usize::MAX)
             .unwrap();
         let parallel = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| merged.search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], 1))
+            .install(|| merged.search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], 0, 1))
             .unwrap();
         assert_eq!(parallel, serial, "parallel binary top-k changed results");
 
@@ -4953,7 +5504,7 @@ mod tests {
             expected_second_payload.as_slice(),
         );
         let mut docs: Vec<u32> = second_merge
-            .search_binary_clusters::<false>(&[0], 6, &[0, 1])
+            .search_binary_clusters::<false>(&[0], 6, &[0, 1], 0)
             .unwrap()
             .into_iter()
             .map(|result| result.0)
@@ -5025,10 +5576,10 @@ mod tests {
             .build()
             .unwrap();
         let serial_documents = disk
-            .search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], usize::MAX)
+            .search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], 0, usize::MAX)
             .unwrap();
         let parallel_documents = parallel_pool
-            .install(|| disk.search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], 1))
+            .install(|| disk.search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], 0, 1))
             .unwrap();
         assert_eq!(parallel_documents, serial_documents);
 
@@ -5037,10 +5588,12 @@ mod tests {
         // deduplicated, doc 1 wins.
         let sum = crate::query::MultiValueCombiner::Sum;
         let (result, probed) = disk
-            .search_binary_combined_documents(1, &[0], &[0, 1], sum)
+            .search_binary_combined_documents(1, &[0], &[0, 1], sum, 0)
             .unwrap();
         let parallel_sum = parallel_pool
-            .install(|| disk.search_binary_combined_documents_with_tuning(1, &[0], &[0, 1], sum, 1))
+            .install(|| {
+                disk.search_binary_combined_documents_with_tuning(1, &[0], &[0, 1], sum, 0, 1)
+            })
             .unwrap();
         assert_eq!(parallel_sum, (result.clone(), probed.clone()));
         assert_eq!(result.len(), 1, "combined search must honor k");
@@ -5066,11 +5619,18 @@ mod tests {
         // inflate it.
         let smooth_max = crate::query::MultiValueCombiner::default();
         let (result, probed) = disk
-            .search_binary_combined_documents(1, &[0], &[0, 1], smooth_max)
+            .search_binary_combined_documents(1, &[0], &[0, 1], smooth_max, 0)
             .unwrap();
         let parallel_smooth_max = parallel_pool
             .install(|| {
-                disk.search_binary_combined_documents_with_tuning(1, &[0], &[0, 1], smooth_max, 1)
+                disk.search_binary_combined_documents_with_tuning(
+                    1,
+                    &[0],
+                    &[0, 1],
+                    smooth_max,
+                    0,
+                    1,
+                )
             })
             .unwrap();
         assert_eq!(parallel_smooth_max, (result.clone(), probed.clone()));
@@ -5097,6 +5657,7 @@ mod tests {
                 &[0],
                 &[0, 1],
                 crate::query::MultiValueCombiner::Sum,
+                0,
             )
             .unwrap();
         assert_eq!(
@@ -5322,6 +5883,7 @@ mod tests {
             quantizer_version: 1,
             codebook_version: 1,
             vector_count: count,
+            prefix_bytes: 0,
         };
         let mut bytes = Vec::new();
         write_built_runs(header, &[run], &mut bytes, None).unwrap();
@@ -5848,6 +6410,7 @@ mod tests {
             quantizer_version: 0xb1a4,
             codebook_version: 0,
             vector_count: count,
+            prefix_bytes: 0,
         };
         let mut unique_bytes = Vec::new();
         write_built_runs(
@@ -5902,13 +6465,14 @@ mod tests {
                     &query,
                     20,
                     &[0],
+                    0,
                     usize::MAX,
                 )
             })
             .unwrap();
         let parallel = pool
             .install(|| {
-                unique_disk.search_binary_clusters_with_tuning::<false>(&query, 20, &[0], 1)
+                unique_disk.search_binary_clusters_with_tuning::<false>(&query, 20, &[0], 0, 1)
             })
             .unwrap();
         assert_eq!(parallel, serial);
@@ -5922,6 +6486,7 @@ mod tests {
                         &query,
                         20,
                         &[0],
+                        0,
                         usize::MAX,
                     )
                 })
@@ -5932,7 +6497,7 @@ mod tests {
             let start = std::time::Instant::now();
             std::hint::black_box(
                 pool.install(|| {
-                    unique_disk.search_binary_clusters_with_tuning::<false>(&query, 20, &[0], 1)
+                    unique_disk.search_binary_clusters_with_tuning::<false>(&query, 20, &[0], 0, 1)
                 })
                 .unwrap(),
             );
@@ -5954,6 +6519,7 @@ mod tests {
                     &query,
                     &[0],
                     combiner,
+                    0,
                     1,
                 )
             })
@@ -5965,6 +6531,7 @@ mod tests {
                     &query,
                     &[0],
                     combiner,
+                    0,
                     1,
                 )
             })
@@ -5982,6 +6549,7 @@ mod tests {
                             &query,
                             &[0],
                             combiner,
+                            0,
                             1,
                         )
                     })
@@ -5997,6 +6565,7 @@ mod tests {
                         &query,
                         &[0],
                         combiner,
+                        0,
                         1,
                     )
                 })
@@ -6206,14 +6775,14 @@ mod tests {
         );
 
         let serial = disk
-            .search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], usize::MAX)
+            .search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], 0, usize::MAX)
             .unwrap();
         let parallel = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .build()
             .unwrap()
             .install(|| {
-                disk.search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], 1)
+                disk.search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], 0, 1)
             })
             .unwrap();
         assert_eq!(parallel, serial);
@@ -6346,7 +6915,7 @@ mod tests {
         );
         assert_eq!(
             merged
-                .search_binary_clusters::<false>(&[0, 0], 4, &[0, 1])
+                .search_binary_clusters::<false>(&[0, 0], 4, &[0, 1], 0)
                 .unwrap()
                 .len(),
             4,
@@ -6491,6 +7060,16 @@ pub(crate) fn write_live_ann(
         let ordinals_offset = offset;
         copy_selected_column(writer, &raw[run.ordinals.clone()], 2, kept(), &check)?;
         offset = checked_advance(offset, count * 2)?;
+        if header.prefix_bytes > 0 {
+            copy_selected_column(
+                writer,
+                &raw[run.prefix.clone()],
+                header.prefix_bytes,
+                kept(),
+                &check,
+            )?;
+            offset = checked_advance(offset, count * header.prefix_bytes)?;
+        }
         let codes_offset = offset;
         if let Some(map) = locations.as_deref_mut() {
             let span = map.span(codes_offset, count)?;
@@ -6683,6 +7262,7 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
                 _ => 73,
             },
             vector_count: indexes.len(),
+            prefix_bytes: 0,
         };
         let mut source_bytes = Vec::new();
         write_built_runs(
@@ -6802,6 +7382,7 @@ async fn compacted_aligned_scann_groups_preserve_odd_block_padding() {
         quantizer_version: 42,
         codebook_version: 73,
         vector_count: 96,
+        prefix_bytes: 0,
     };
     let docs: Vec<_> = (0..96).collect();
     let ordinals = vec![0; 96];
