@@ -4,7 +4,10 @@ Automatic binary IVF now trains 4·sqrt(N) leaves and probes 128 by default
 (binary ScaNN keeps 64). On 1M real 1,024-bit embeddings this scans 1.72–1.78×
 fewer postings at equal recall@10 (1.5–1.6× including centroid routing), and at
 the new defaults it matches the old float recall (0.654 vs 0.657) with half the
-postings. These are work counts, not latency; see
+postings. End-to-end p50 latency on the same data confirms it: 0.586 ms at
+recall@10 0.936 (4,000 leaves, 128 probes) versus 1.082 ms at 0.935 (1,000
+leaves, 64 probes), 1.74–1.86× faster across recall levels. The scan is memory
+bandwidth bound. See
 [binary IVF geometry](binary-ivf-geometry.md) for the data, the hierarchical
 training gap (1.23–1.26×) and the options that were rejected. Retraining an
 automatic field with a persisted `nprobe` below 128 logs a warning.
