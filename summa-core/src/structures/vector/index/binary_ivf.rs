@@ -485,10 +485,10 @@ impl BinaryCoarseQuantizer {
 
     /// SOAR secondary leaf for a code already assigned to `primary`.
     ///
-    /// Candidates are the [`BINARY_SOAR_CANDIDATES`] leaves nearest to the
+    /// Candidates are the `BINARY_SOAR_CANDIDATES` leaves nearest to the
     /// code under this field's routing; the winner minimises the Hamming
     /// form of the SOAR loss `h(x, c') + λ · |(x ⊕ c) & (x ⊕ c')|² / h(x, c)`
-    /// with λ = [`BINARY_SOAR_LAMBDA`] (ties: lower leaf ID). A code equal to
+    /// with λ = `BINARY_SOAR_LAMBDA` (ties: lower leaf ID). A code equal to
     /// its primary centroid is not spilled (docs/binary-ivf-soar.md).
     pub fn soar_secondary(
         &self,

@@ -2083,7 +2083,7 @@ impl AnnDiskIndex {
 /// Exact-code locator for SOAR candidates found only in prefix-only runs:
 /// `(doc, ordinal)` to the row-major code address of the vector's primary
 /// copy, from the segment's exact-vector lookup.
-pub(crate) type ExactCodeLocator<'a> = &'a (dyn Fn(u32, u16) -> Option<u64> + Sync);
+pub(crate) type ExactCodeLocator<'a> = &'a dyn Fn(u32, u16) -> Option<u64>;
 
 impl AnnDiskIndex {
     /// Prefix stage of a binary prefix-first scan: the best `rerank` visible
