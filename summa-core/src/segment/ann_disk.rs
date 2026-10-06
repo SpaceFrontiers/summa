@@ -219,6 +219,10 @@ pub(crate) struct AnnDiskHeader {
     /// run's codes (0: no prefix column). Encoded as layout revision 1 with the
     /// byte count in the header tail, which earlier readers reject.
     pub prefix_bytes: usize,
+    /// Binary IVF payload with SOAR secondary postings: a vector may appear
+    /// in two leaves, so `vector_count` counts physical postings and queries
+    /// must deduplicate `(doc, ordinal)`. Bit 32 of the revision-1 tail.
+    pub spilled: bool,
 }
 
 #[derive(Debug)]
@@ -479,15 +483,23 @@ impl AnnDiskIndex {
         let vector_count = usize::try_from(header_cursor.read_u64::<LittleEndian>()?)
             .map_err(|_| invalid_data("ANN vector count exceeds usize"))?;
         let tail = header_cursor.read_u64::<LittleEndian>()?;
-        let prefix_bytes =
+        let (prefix_bytes, spilled) =
             if kind == AnnKind::BinaryIvf && layout_revision == BINARY_PREFIX_LAYOUT_REVISION {
-                usize::try_from(tail).map_err(|_| invalid_data("ANN prefix width exceeds usize"))?
+                if tail == 0 || tail >> 33 != 0 {
+                    return Err(invalid_data(
+                        "binary IVF layout revision 1 header tail is invalid",
+                    ));
+                }
+                (
+                    (tail & u64::from(u32::MAX)) as usize,
+                    tail & BINARY_SPILL_TAIL_FLAG != 0,
+                )
             } else {
                 check_layout_revision(kind, layout_revision)?;
                 if tail != 0 {
                     return Err(invalid_data("ANN header tail is non-zero"));
                 }
-                0
+                (0, false)
             };
         let header = AnnDiskHeader {
             kind,
@@ -499,6 +511,7 @@ impl AnnDiskIndex {
             codebook_version,
             vector_count,
             prefix_bytes,
+            spilled,
         };
         validate_header(&header)?;
 
@@ -1955,7 +1968,7 @@ impl AnnDiskIndex {
         }
 
         let mut scores = vec![0.0f32; BINARY_SCORE_BATCH.min(self.header.vector_count)];
-        if BY_DOCUMENT || self.header.kind == AnnKind::ScannBinary {
+        if BY_DOCUMENT || self.header.kind == AnnKind::ScannBinary || self.header.spilled {
             let mut collector = BoundedAnnCollector::<BY_DOCUMENT, true>::new(k);
             score_binary_cluster_runs(
                 self,
@@ -2030,7 +2043,7 @@ impl AnnDiskIndex {
                     }
                     left
                 });
-            return Ok(Some(heap.into_sorted_vec()));
+            return Ok(Some(self.unique_prefix_candidates(heap)));
         }
         let mut heap = BinaryHeap::with_capacity(rerank + 1);
         for &cluster_id in cluster_ids {
@@ -2052,7 +2065,18 @@ impl AnnDiskIndex {
                 );
             }
         }
-        Ok(Some(heap.into_sorted_vec()))
+        Ok(Some(self.unique_prefix_candidates(heap)))
+    }
+
+    /// Sorted candidates with SOAR duplicates removed. Both postings of a
+    /// spilled vector hold the same code, so they share a prefix distance and
+    /// sort next to each other; the full-code stage needs only one.
+    fn unique_prefix_candidates(&self, heap: BinaryHeap<PrefixCandidate>) -> Vec<PrefixCandidate> {
+        let mut candidates = heap.into_sorted_vec();
+        if self.header.spilled {
+            candidates.dedup_by_key(|candidate| (candidate.doc_id, candidate.ordinal));
+        }
+        candidates
     }
 
     /// Full-code stage: exact Hamming scores for the prefix candidates.
@@ -2791,6 +2815,7 @@ pub(crate) fn write_built_binary_ivf(
             codebook_version: 0,
             vector_count: index.len(),
             prefix_bytes,
+            spilled: index.is_spilled(),
         },
         &runs,
         writer,
@@ -2846,6 +2871,7 @@ pub(crate) fn write_built_scann(
         codebook_version: payload.artifact_id,
         vector_count,
         prefix_bytes: 0,
+        spilled: false,
     };
     validate_header(&header)?;
     write_header(writer, &header)?;
@@ -3018,6 +3044,7 @@ pub(crate) fn write_built_ivf_tq(
             codebook_version: codec.fingerprint(),
             vector_count: index.len(),
             prefix_bytes: 0,
+            spilled: false,
         },
         &runs,
         writer,
@@ -3060,6 +3087,7 @@ pub(crate) fn write_built_tq_flat(
             codebook_version: 0,
             vector_count: builder.len(),
             prefix_bytes: 0,
+            spilled: false,
         },
         &runs,
         writer,
@@ -3858,6 +3886,7 @@ fn relocate_payload_offset(output_payload_start: u64, source_offset: usize) -> i
 #[cfg(feature = "native")]
 fn headers_compatible(left: &AnnDiskHeader, right: &AnnDiskHeader) -> bool {
     left.prefix_bytes == right.prefix_bytes
+        && left.spilled == right.spilled
         && left.kind == right.kind
         && left.routing == right.routing
         && left.dim == right.dim
@@ -3925,6 +3954,8 @@ fn finish_footer(
 /// ordinals and the codes. The header tail holds the prefix byte width.
 /// Earlier readers reject both the revision and the non-zero tail.
 const BINARY_PREFIX_LAYOUT_REVISION: u32 = 1;
+/// Revision-1 tail bit marking SOAR secondary postings (docs/binary-ivf-soar.md).
+const BINARY_SPILL_TAIL_FLAG: u64 = 1 << 32;
 
 fn expected_layout_revision(kind: AnnKind) -> u32 {
     match kind {
@@ -3961,7 +3992,7 @@ fn write_header(writer: &mut (impl Write + ?Sized), header: &AnnDiskHeader) -> i
         u32::try_from(header.code_size).map_err(|_| invalid_data("ANN code size exceeds u32"))?,
     )?;
     writer.write_u32::<LittleEndian>(header.num_clusters)?;
-    writer.write_u32::<LittleEndian>(if header.prefix_bytes > 0 {
+    writer.write_u32::<LittleEndian>(if header.prefix_bytes > 0 || header.spilled {
         BINARY_PREFIX_LAYOUT_REVISION
     } else {
         expected_layout_revision(header.kind)
@@ -3972,7 +4003,12 @@ fn write_header(writer: &mut (impl Write + ?Sized), header: &AnnDiskHeader) -> i
         u64::try_from(header.vector_count)
             .map_err(|_| invalid_data("ANN vector count exceeds u64"))?,
     )?;
-    writer.write_u64::<LittleEndian>(header.prefix_bytes as u64)?;
+    let spill_flag = if header.spilled {
+        BINARY_SPILL_TAIL_FLAG
+    } else {
+        0
+    };
+    writer.write_u64::<LittleEndian>(header.prefix_bytes as u64 | spill_flag)?;
     Ok(())
 }
 
@@ -4090,6 +4126,7 @@ fn validate_header(header: &AnnDiskHeader) -> io::Result<()> {
         || header.vector_count == 0
         || (header.prefix_bytes != 0
             && (header.kind != AnnKind::BinaryIvf || header.prefix_bytes >= header.code_size))
+        || (header.spilled && header.kind != AnnKind::BinaryIvf)
         || (header.kind == AnnKind::BinaryIvf
             && (header.codebook_version != 0
                 || !header.dim.is_multiple_of(8)
@@ -4412,6 +4449,7 @@ mod tests {
                 codebook_version: 73,
                 vector_count: count,
                 prefix_bytes: 0,
+                spilled: false,
             };
             let mut bytes = Vec::new();
             write_built_runs(header, &[run], &mut bytes, None).unwrap();
@@ -4498,6 +4536,7 @@ mod tests {
                 codebook_version: 0,
                 vector_count: vectors_per_source,
                 prefix_bytes: 0,
+                spilled: false,
             };
             let mut bytes = Vec::new();
             write_built_runs(header, &runs, &mut bytes, None).unwrap();
@@ -5059,6 +5098,7 @@ mod tests {
             codebook_version: 0,
             vector_count,
             prefix_bytes: 0,
+            spilled: false,
         }
     }
 
@@ -5117,6 +5157,7 @@ mod tests {
                 codebook_version: 0,
                 vector_count: vectors,
                 prefix_bytes,
+                spilled: false,
             },
             &runs,
             &mut bytes,
@@ -5157,6 +5198,88 @@ mod tests {
         assert_eq!(&plain[20..24], &0u32.to_le_bytes());
         assert_eq!(&plain[48..56], &0u64.to_le_bytes());
         assert_eq!(plain.len() + 4 * 40 * 2, bytes.len());
+    }
+
+    /// SOAR payloads repeat a vector in two leaves. The spill flag round
+    /// trips and is rejected elsewhere, and every scan path (serial,
+    /// parallel, prefix) returns each `(doc, ordinal)` once with its exact
+    /// score.
+    #[test]
+    fn binary_soar_flag_round_trips_and_scans_deduplicate() {
+        // Docs 0..60 in cluster 0; docs 0..30 repeated in cluster 1.
+        let codes0: Vec<u8> = (0..60u32).flat_map(|doc| [doc as u8, 0xa5]).collect();
+        let docs0: Vec<u32> = (0..60).collect();
+        let codes1: Vec<u8> = (0..30u32).flat_map(|doc| [doc as u8, 0xa5]).collect();
+        let docs1: Vec<u32> = (0..30).collect();
+        let ordinals0 = vec![0u16; 60];
+        let ordinals1 = vec![0u16; 30];
+        for prefix_bytes in [0usize, 1] {
+            let mut header = binary_header(90);
+            header.dim = 16;
+            header.code_size = 2;
+            header.prefix_bytes = prefix_bytes;
+            header.spilled = true;
+            let mut bytes = Vec::new();
+            write_built_runs(
+                header,
+                &[
+                    BuildRun {
+                        cluster_id: 0,
+                        doc_ids: &docs0,
+                        ordinals: &ordinals0,
+                        codes: &codes0,
+                    },
+                    BuildRun {
+                        cluster_id: 1,
+                        doc_ids: &docs1,
+                        ordinals: &ordinals1,
+                        codes: &codes1,
+                    },
+                ],
+                &mut bytes,
+                None,
+            )
+            .unwrap();
+            assert_eq!(&bytes[20..24], &1u32.to_le_bytes());
+            let tail = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
+            assert_eq!(tail, (1 << 32) | prefix_bytes as u64);
+            let index =
+                AnnDiskIndex::open(OwnedBytes::new(bytes.clone()), AnnKind::BinaryIvf, 60).unwrap();
+            assert!(index.header.spilled);
+            let query = [7u8, 0xa5];
+            for (rerank, parallel_min) in [(0, usize::MAX), (0, 1), (20, usize::MAX), (20, 1)] {
+                if rerank > 0 && prefix_bytes == 0 {
+                    continue;
+                }
+                let hits = index
+                    .search_binary_clusters_with_tuning::<false>(
+                        &query,
+                        50,
+                        &[0, 1],
+                        rerank,
+                        parallel_min,
+                    )
+                    .unwrap();
+                let mut docs: Vec<u32> = hits.iter().map(|hit| hit.0).collect();
+                docs.sort_unstable();
+                docs.dedup();
+                assert_eq!(
+                    docs.len(),
+                    hits.len(),
+                    "rerank {rerank} parallel {parallel_min}"
+                );
+                assert_eq!(hits[0], (7, 0, 1.0));
+            }
+            // Unknown tail bits are corrupt.
+            let mut bad = bytes.clone();
+            bad[48..56].copy_from_slice(&((1u64 << 33) | prefix_bytes as u64).to_le_bytes());
+            assert!(AnnDiskIndex::open(OwnedBytes::new(bad), AnnKind::BinaryIvf, 60).is_err());
+        }
+        // The spill flag is binary IVF only.
+        let mut header = binary_header(1);
+        header.kind = AnnKind::ScannBinary;
+        header.spilled = true;
+        assert!(validate_header(&header).is_err());
     }
 
     #[test]
@@ -5884,6 +6007,7 @@ mod tests {
             codebook_version: 1,
             vector_count: count,
             prefix_bytes: 0,
+            spilled: false,
         };
         let mut bytes = Vec::new();
         write_built_runs(header, &[run], &mut bytes, None).unwrap();
@@ -6411,6 +6535,7 @@ mod tests {
             codebook_version: 0,
             vector_count: count,
             prefix_bytes: 0,
+            spilled: false,
         };
         let mut unique_bytes = Vec::new();
         write_built_runs(
@@ -7263,6 +7388,7 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
             },
             vector_count: indexes.len(),
             prefix_bytes: 0,
+            spilled: false,
         };
         let mut source_bytes = Vec::new();
         write_built_runs(
@@ -7383,6 +7509,7 @@ async fn compacted_aligned_scann_groups_preserve_odd_block_padding() {
         codebook_version: 73,
         vector_count: 96,
         prefix_bytes: 0,
+        spilled: false,
     };
     let docs: Vec<_> = (0..96).collect();
     let ordinals = vec![0; 96];
