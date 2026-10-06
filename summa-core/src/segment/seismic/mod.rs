@@ -209,6 +209,25 @@ impl SeismicIndex {
             r.row_directory[at + 6],
         )
     }
+    /// Hint the CPU to load a nominated row's directory entry.
+    #[inline(always)]
+    pub(crate) fn prefetch_entry(&self, row: u32) {
+        let (r, at) = self.locate(row);
+        prefetch_read(r.row_directory[at..].as_ptr());
+    }
+    /// Hint the CPU to load the first bytes of a nominated row's vector.
+    #[inline(always)]
+    pub(crate) fn prefetch_vector(&self, row: u32) {
+        let (r, at) = self.locate(row);
+        let start = u64_at(&r.row_directory, at + 8) as usize;
+        let len = (u32_at(&r.row_directory, at + 16) as usize).min(256);
+        let bytes = &r.bytes[start..start + len];
+        let mut line = 0;
+        while line < len {
+            prefetch_read(bytes[line..].as_ptr());
+            line += 64;
+        }
+    }
     pub(crate) fn rows_for_document(&self, doc: u32) -> impl Iterator<Item = u32> + '_ {
         let mut lo = 0;
         let mut hi = self.rows;
@@ -526,4 +545,18 @@ fn write_component_sources<W: Write + ?Sized>(
         partition,
     )?;
     Ok(offset + entries.len() as u64 * RUN_ENTRY as u64 + FOOTER as u64)
+}
+
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = ptr;
 }

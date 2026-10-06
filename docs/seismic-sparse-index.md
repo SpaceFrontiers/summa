@@ -17,7 +17,8 @@ an explicit rebuild. BMP/MaxScore
 configuration and dispatch remain available. No benchmark
 artifacts are production code.
 See the [performance review](search-performance-review.md) for measured evidence
-and remaining costs. The version-3 storage change below separates forward values
+and remaining costs, and the [October 2026 BMP comparison](benchmark-results/seismic-bmp-2026-10-06/README.md)
+for current memory, merge and memory-pressure measurements. The version-3 storage change below separates forward values
 from independently replaceable nomination partitions.
 
 Version 6 adds opt-in U16/U24/DotVByte forward dimension compression, with U32
@@ -381,7 +382,8 @@ this optimization does not turn initial construction into a bounded-memory
 streaming build.
 
 Each segment query prepares its scoring weights once. Unique dimensions below
-65,536 use a query-local Float32 lookup table, capped at 256 KiB; exact forward
+131,072 use a query-local Float32 lookup table, capped at 512 KiB, so
+105,879-token vocabularies avoid the slower sorted walk; exact forward
 scoring reuses that table; summary proxies use the coordinate-transposed lists. Wider U32 dimensions
 and duplicate query dimensions retain the sorted sparse walk. Duplicate terms
 are not folded together because changing multiplication/addition order can
