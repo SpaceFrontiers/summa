@@ -66,6 +66,7 @@
 - [ScaNN](scann-streaming-index.md) and [FastScan layout](fast-scan-layout-v2.md)
 - [Single-copy binary storage](binary-vector-storage.md)
 - [Binary IVF geometry](binary-ivf-geometry.md)
+- [Binary IVF prefix-first scan (proposal)](binary-prefix-scan.md)
 - [BMP grid compression](bmp-grid-compression.md) and [forward storage](bmp-forward-index.md)
 - [Seismic](seismic-sparse-index.md), [compact summaries](seismic-compact-summaries.md), and [forward compression](seismic-forward-compression.md)
 - [Algebraic float reductions](algebraic-float-reductions.md)
