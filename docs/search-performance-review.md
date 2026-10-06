@@ -1,3 +1,33 @@
+# Binary ANN merge coalescing — 2026-10-06
+
+Normal binary IVF/ScaNN merges now coalesce overlapping clusters to one run each
+instead of copying every source run. Codes, ordinals and exact-vector lookup rows
+are copied verbatim; document labels are rebased, and lookup span offsets follow
+their copied runs through a per-run relocation map, so no lookup sort is needed.
+The format is unchanged, and segments merged by earlier versions are coalesced by
+their next merge or reorder. See [exact binary storage](binary-vector-storage.md).
+
+Measurements: end-to-end `force_merge` of N-segment binary IVF indexes on
+`MmapDirectory`, before (`85ea2d4`) and after, using the same release build flags
+on an Intel Xeon @ 2.9 GHz (AVX-512 VPOPCNTDQ) sandbox. The benchmark was pinned to
+6 of 8 vCPUs while an unrelated two-core job ran, with old/new alternating twice per
+shape. Corpus: clustered random codes, K = √N, nprobe 64, top-10, 200 queries × 3 on
+the warm merged segment. Result checksums are identical between layouts.
+
+| Shape                      | Runs old → new | Merge old / new               | Query p50 old → new          | Query p95 old → new          |
+| -------------------------- | -------------- | ----------------------------- | ---------------------------- | ---------------------------- |
+| 2M × 256-bit, 10 segments  | 14,124 → 1,414 | 0.20 / 0.20 s → 0.26 / 0.23 s | 0.65 / 0.77 → 0.48 / 0.50 ms | 0.69 / 0.83 → 0.52 / 0.55 ms |
+| 8M × 256-bit, 20 segments  | 56,520 → 2,828 | 0.81 / 0.85 s → 1.10 / 1.06 s | 1.68 / 1.72 → 0.91 / 0.91 ms | 1.79 / 1.83 → 0.98 / 0.99 ms |
+| 2M × 2560-bit, 10 segments | 13,340 → 1,414 | 0.96 / 0.97 s → 0.48 / 0.55 s | 3.73 / 3.80 → 3.01 / 3.12 ms | 4.22 / 4.40 → 3.45 / 3.61 ms |
+
+Merged queries are 1.2–1.9× faster at p50, and the gain grows with the source
+count. Merge wall-clock is +15–30% for narrow codes (document-label rewrite) and
+lower for wide codes in this run. The latter is not claimed as a general speedup.
+The vector file shrinks by the removed run directory entries (48 bytes per run).
+Not measured: cold-cache I/O, multi-generation tiered merging, ScaNN binary
+end-to-end, ARM, and deletion compaction, which still writes one run per source
+run.
+
 # BMP and quantized ANN review — 2026-10-04
 
 The [BMP/ANN investigation](bmp-ann-optimization-review.md) and

@@ -100,12 +100,13 @@ ANN-backed exact vectors; `flat_vectors` remains the logical vector count for
 both layouts. `payload_bytes` counts ANN codes, including SOAR secondary
 assignments. These are storage sizes, not claims about heap or page residency.
 
-Normal binary merge copies existing ANN payloads and lookup rows without
-coalescing clusters or rewriting vector labels. Fragmentation can grow with
-merge generations, and the existing ≥8 warning remains meaningful. Rebuild
-restores newly assigned runs; deletion compaction rewrites surviving metadata.
-Standalone reorder coalesces binary runs to one per occupied cluster, copying
-codes unchanged and rebuilding the lookup without retraining. It also works on
+Normal binary merge coalesces runs to one per occupied cluster whenever its
+sources overlap, copying codes and lookup rows unchanged; only document labels
+and span offsets are remapped. New binary merge outputs therefore report
+fragmentation 1.0. Segments merged by earlier versions can remain fragmented
+until their next merge or a standalone reorder, which uses the same writer; the
+≥8 warning remains meaningful for them. Rebuild restores newly assigned runs;
+deletion compaction rewrites surviving metadata. Reorder also works on
 binary-only indexes. See [exact binary storage](binary-vector-storage.md) for the
 format; duplicate flat-plus-binary-ANN layouts are rejected. Float AH keeps its existing leaf-wise
 packing policy.

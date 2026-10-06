@@ -1373,16 +1373,17 @@ async fn test_binary_ivf_end_to_end() {
     );
 }
 
-/// Ordinary binary merges preserve immutable extents and lookup blocks.
-/// Standalone reorder coalesces runs while preserving exact codes and scores.
+/// Ordinary binary merges coalesce each cluster into one run while keeping
+/// exact codes, document labels, lookup rows and scores; a later standalone
+/// reorder then has nothing to coalesce and keeps the vector file verbatim.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_copy_merge_fragments_binary_ann_and_reorder_coalesces_without_reencoding() {
+async fn test_binary_merge_coalesces_ann_runs_without_reencoding() {
     for with_sparse in [false, true] {
-        binary_reorder_preserves_exact_vectors(with_sparse).await;
+        binary_merge_coalesces_exact_vectors(with_sparse).await;
     }
 }
 
-async fn binary_reorder_preserves_exact_vectors(with_sparse: bool) {
+async fn binary_merge_coalesces_exact_vectors(with_sparse: bool) {
     use crate::directories::Directory;
     use crate::dsl::BinaryDenseVectorConfig;
     use crate::query::BinaryDenseVectorQuery;
@@ -1390,12 +1391,12 @@ async fn binary_reorder_preserves_exact_vectors(with_sparse: bool) {
     let dim_bits = 64;
     let byte_len = dim_bits / 8;
     let mut sb = SchemaBuilder::default();
-    sb.set_index_name("reorder-compaction");
+    sb.set_index_name("merge-coalescing");
     let title = sb.add_text_field("title", true, true);
     let cfg = BinaryDenseVectorConfig::new(dim_bits).with_ivf(Some(8), 8);
     let bvec = sb.add_binary_dense_vector_field_with_config("bvec", true, true, cfg);
-    // Sparse maintenance shares the pass with ANN coalescing and does not
-    // require a text reorder flag.
+    // Sparse maintenance shares the reorder pass; it must not disturb the
+    // already coalesced vector file.
     let sparse = with_sparse.then(|| {
         sb.add_sparse_vector_field_with_config(
             "sparse",
@@ -1431,8 +1432,6 @@ async fn binary_reorder_preserves_exact_vectors(with_sparse: bool) {
     writer.build_vector_index().await.unwrap();
     add_batch(&mut writer, 100);
     writer.commit().await.unwrap();
-    // Merge preserves each source extent; directories carry the new bases.
-    writer.force_merge().await.unwrap();
 
     let fragmentation_of = |segments: &[std::sync::Arc<crate::segment::SegmentReader>]| {
         segments
@@ -1441,34 +1440,92 @@ async fn binary_reorder_preserves_exact_vectors(with_sparse: bool) {
             .map(|health| health.fragmentation())
             .fold(0.0f64, f64::max)
     };
-    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
-    let old_segments = index.segment_readers().await.unwrap();
-    let old_exact = old_segments[0].flat_vectors().get(&bvec.0).unwrap();
-    let old_codes = old_exact
-        .read_vectors_batch(0, old_exact.num_vectors)
-        .await
-        .unwrap();
-    let before = fragmentation_of(&old_segments);
-    assert!(
-        before > 1.0,
-        "copy merge must retain source extents, got {before}"
-    );
     let needle = vec![0x0f_u8 | 0x01; byte_len];
-    let reader = index.reader().await.unwrap();
-    let searcher = reader.searcher().await.unwrap();
-    let before_results = searcher
-        .search(&BinaryDenseVectorQuery::new(bvec, needle.clone()), 10)
-        .await
-        .unwrap();
-    drop(searcher);
+    let search_scores = |index: Index<RamDirectory>| {
+        let needle = needle.clone();
+        async move {
+            let reader = index.reader().await.unwrap();
+            let searcher = reader.searcher().await.unwrap();
+            searcher
+                .search(&BinaryDenseVectorQuery::new(bvec, needle), 10)
+                .await
+                .unwrap()
+                .iter()
+                .map(|hit| hit.score)
+                .collect::<Vec<_>>()
+        }
+    };
 
-    // The external reorder API coalesces binary runs alongside sparse BP.
-    writer.reorder().await.unwrap();
-    // A second pass must retain the already contiguous vector file verbatim.
-    let first_pass = Index::open(dir.clone(), config.clone()).await.unwrap();
-    let first_segments = first_pass.segment_readers().await.unwrap();
-    let vector_file = crate::segment::SegmentFiles::new(first_segments[0].meta().id).vectors;
-    let first_bytes = dir
+    // Two segments, both laid out as built: one run per populated cluster.
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let mut old_segments = index.segment_readers().await.unwrap();
+    assert_eq!(old_segments.len(), 2);
+    old_segments.sort_by_key(|segment| segment.meta().id);
+    let mut old_codes = Vec::new();
+    let mut old_labels = Vec::new();
+    for segment in &old_segments {
+        let exact = segment.flat_vectors().get(&bvec.0).unwrap();
+        old_codes.push(
+            exact
+                .read_vectors_batch(0, exact.num_vectors)
+                .await
+                .unwrap()
+                .as_slice()
+                .to_vec(),
+        );
+        old_labels.push(
+            (0..exact.num_vectors)
+                .map(|row| exact.get_doc_id(row))
+                .collect::<Vec<_>>(),
+        );
+    }
+    let before_scores = search_scores(index).await;
+    assert!(!before_scores.is_empty());
+
+    writer.force_merge().await.unwrap();
+    let index = Index::open(dir.clone(), config.clone()).await.unwrap();
+    let segments = index.segment_readers().await.unwrap();
+    assert_eq!(segments.len(), 1);
+    let after = fragmentation_of(&segments);
+    assert!(
+        (after - 1.0).abs() < 1e-9,
+        "merge must coalesce binary ANN runs, got fragmentation {after}"
+    );
+    // Exact codes and labels are the merge-order concatenation of the
+    // sources, whichever order the merge visited them in.
+    let exact = segments[0].flat_vectors().get(&bvec.0).unwrap();
+    let merged_codes = exact
+        .read_vectors_batch(0, exact.num_vectors)
+        .await
+        .unwrap()
+        .as_slice()
+        .to_vec();
+    let first_len = old_codes[0].len();
+    let (first, second) = if merged_codes[..first_len] == old_codes[0][..] {
+        (0, 1)
+    } else {
+        (1, 0)
+    };
+    assert_eq!(
+        merged_codes,
+        [old_codes[first].clone(), old_codes[second].clone()].concat()
+    );
+    let first_docs = old_segments[first].num_docs();
+    for row in 0..exact.num_vectors {
+        let (source, source_row, base) = if row < old_labels[first].len() {
+            (first, row, 0)
+        } else {
+            (second, row - old_labels[first].len(), first_docs)
+        };
+        let (doc, ordinal) = old_labels[source][source_row];
+        assert_eq!(exact.get_doc_id(row), (doc + base, ordinal));
+    }
+    let merged_scores = search_scores(index).await;
+    assert_eq!(before_scores, merged_scores, "merge must not change scores");
+
+    // Nothing is left to coalesce: reorder keeps the vector file verbatim.
+    let vector_file = crate::segment::SegmentFiles::new(segments[0].meta().id).vectors;
+    let merged_bytes = dir
         .open_read(&vector_file)
         .await
         .unwrap()
@@ -1477,33 +1534,11 @@ async fn binary_reorder_preserves_exact_vectors(with_sparse: bool) {
         .unwrap();
     writer.reorder().await.unwrap();
     drop(writer);
-
     let index = Index::open(dir.clone(), config).await.unwrap();
     let segments = index.segment_readers().await.unwrap();
-    let after = fragmentation_of(&segments);
-    let exact = segments[0].flat_vectors().get(&bvec.0).unwrap();
-    assert_eq!(
-        old_codes.as_slice(),
-        exact
-            .read_vectors_batch(0, exact.num_vectors)
-            .await
-            .unwrap()
-            .as_slice()
-    );
-    assert_eq!(
-        old_codes.as_slice(),
-        old_exact
-            .read_vectors_batch(0, old_exact.num_vectors)
-            .await
-            .unwrap()
-            .as_slice()
-    );
-    for row in 0..exact.num_vectors {
-        assert_eq!(old_exact.get_doc_id(row), exact.get_doc_id(row));
-    }
     let vector_file = crate::segment::SegmentFiles::new(segments[0].meta().id).vectors;
     assert_eq!(
-        first_bytes.as_slice(),
+        merged_bytes.as_slice(),
         dir.open_read(&vector_file)
             .await
             .unwrap()
@@ -1512,23 +1547,7 @@ async fn binary_reorder_preserves_exact_vectors(with_sparse: bool) {
             .unwrap()
             .as_slice()
     );
-    assert!(
-        (after - 1.0).abs() < 1e-9,
-        "reorder must coalesce ANN runs: {before} -> {after}"
-    );
-    let reader = index.reader().await.unwrap();
-    let searcher = reader.searcher().await.unwrap();
-    let after_results = searcher
-        .search(&BinaryDenseVectorQuery::new(bvec, needle), 10)
-        .await
-        .unwrap();
-    assert_eq!(before_results.len(), after_results.len());
-    for (before_hit, after_hit) in before_results.iter().zip(&after_results) {
-        assert!(
-            (before_hit.score - after_hit.score).abs() < 1e-6,
-            "scores must be identical after compaction"
-        );
-    }
+    assert_eq!(merged_scores, search_scores(index).await);
 }
 
 /// Partial probing with a non-`Max` combiner: reusing the probe's exact scores
