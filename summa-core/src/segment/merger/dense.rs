@@ -301,26 +301,17 @@ impl SegmentMerger {
             let entry = self.schema.get_field_entry(field).unwrap();
             let config = entry.dense_vector_config.as_ref();
             let binary = entry.field_type == FieldType::BinaryDenseVector;
-            let reorder_binary = binary
-                && ann_mode == AnnWriteMode::Reorder
-                && segments.iter().any(|segment| {
-                    segment
-                        .ann_health(field)
-                        .is_some_and(|health| health.fragmentation() > 1.0)
-                });
-            let mut lookup_budget = if reorder_binary {
-                self.bp_memory_budget
-            } else {
-                2 * 1024 * 1024
-            };
-            if reorder_binary {
+            if binary && ann_mode == AnnWriteMode::Reorder {
+                // Standalone reorder is an explicitly budgeted pass; keep its
+                // coalescing directories inside that budget.
+                let mut budget = self.bp_memory_budget;
                 for segment in segments {
                     if let Some(
                         crate::segment::VectorIndex::BinaryIvf(index)
                         | crate::segment::VectorIndex::ScannBinary(index),
                     ) = segment.vector_indexes().get(&field.0)
                     {
-                        lookup_budget = lookup_budget
+                        budget = budget
                             .checked_sub(index.get().binary_compaction_scratch_bytes()?)
                             .ok_or_else(|| {
                                 crate::Error::Schema("binary reorder exceeds scratch budget".into())
@@ -328,15 +319,14 @@ impl SegmentMerger {
                     }
                 }
             }
-            let copy_exact = binary && ann_mode != AnnWriteMode::Rebuild && !reorder_binary;
+            // Copy and reorder keep source lookup rows verbatim (relocating
+            // span offsets when clusters are coalesced). Only a generation
+            // rebuild writes new codes and therefore sorts a fresh lookup.
+            let copy_exact = binary && ann_mode != AnnWriteMode::Rebuild;
             let mut locations = (binary && !copy_exact)
-                .then(|| {
-                    ExactLocations::with_budget(
-                        lookup_budget.min(2 * 1024 * 1024),
-                        self.cancellation.clone(),
-                    )
-                })
+                .then(|| ExactLocations::with_budget(2 * 1024 * 1024, self.cancellation.clone()))
                 .transpose()?;
+            let mut relocations = None;
 
             // ── ANN entry (written first, index_type != FLAT_TYPE) ───────
             let tq_config = config.filter(|config| {
@@ -358,7 +348,7 @@ impl SegmentMerger {
                         &doc_offs,
                         trained,
                         &mut writer,
-                        locations.as_mut(),
+                        &mut relocations,
                     )?,
                     AnnWriteMode::Rebuild
                         if entry.field_type == FieldType::DenseVector
@@ -489,6 +479,7 @@ impl SegmentMerger {
             let index_type = if binary && let Some((_, _, ann_len)) = ann_entry {
                 if copy_exact {
                     let mut sources = Vec::new();
+                    let mut biases = Vec::new();
                     let mut bias = 0u64;
                     for (segment, &doc_base) in segments.iter().zip(&doc_offs) {
                         let Some(flat) = segment.flat_vectors().get(&field.0) else {
@@ -505,19 +496,27 @@ impl SegmentMerger {
                                 ));
                             }
                         };
-                        sources.push((flat, doc_base, bias));
+                        sources.push((flat, doc_base));
+                        biases.push(bias);
                         bias = bias
                             .checked_add(ann.copied_payload_bytes() as u64)
                             .ok_or_else(|| {
                                 crate::Error::Corruption("ANN relocation overflow".into())
                             })?;
                     }
+                    let relocations = relocations.as_ref();
                     super::block_in_place_if_multithread(|| {
                         write_copied_locations(
                             &sources,
                             fi.dim,
                             fi.total_vectors,
                             ann_len,
+                            |source, offset, bytes| match relocations {
+                                Some(relocations) => relocations.relocate(source, offset, bytes),
+                                None => offset.checked_add(biases[source]).ok_or_else(|| {
+                                    std::io::Error::other("vector span relocation overflow")
+                                }),
+                            },
                             &mut writer,
                             self.cancellation.as_deref(),
                         )
@@ -579,8 +578,10 @@ impl SegmentMerger {
         Ok(output_size)
     }
 
-    /// Copy compatible ANN columns; only standalone binary reorder supplies
-    /// a location builder to request cluster coalescing.
+    /// Copy compatible ANN columns. Binary payloads whose merged clusters
+    /// would span several runs are coalesced to one run per cluster instead;
+    /// `relocations` then records where each source run's codes landed so
+    /// the exact-vector lookup can be copied with translated span offsets.
     fn write_compatible_ann(
         &self,
         field: crate::dsl::Field,
@@ -588,7 +589,7 @@ impl SegmentMerger {
         doc_offs: &[u32],
         trained: Option<&TrainedVectorStructures>,
         writer: &mut OffsetWriter,
-        locations: Option<&mut ExactLocations>,
+        relocations: &mut Option<crate::segment::ann_disk::CodeRelocations>,
     ) -> Result<Option<(u8, u64, u64)>> {
         let entry = self
             .schema
@@ -626,7 +627,7 @@ impl SegmentMerger {
                     .as_ref()
                     .is_some_and(|config| config.index_type == crate::dsl::BinaryIndexType::Scann))
         {
-            return self.copy_scann_runs(field, segments, doc_offs, trained, writer, locations);
+            return self.copy_scann_runs(field, segments, doc_offs, trained, writer, relocations);
         }
 
         let mut sources = Vec::new();
@@ -710,18 +711,15 @@ impl SegmentMerger {
         let predicted_fragmentation =
             crate::segment::ann_disk::predicted_merge_fragmentation(&sources);
         let data_offset = writer.offset();
-        let action = if locations.is_some() {
-            "coalesced"
-        } else {
-            "copied"
-        };
+        let coalesce = predicted_fragmentation > 1.0 + 1e-9;
+        let action = if coalesce { "coalesced" } else { "copied" };
         let result = super::block_in_place_if_multithread(|| {
-            if let Some(locations) = locations {
+            if coalesce {
                 crate::segment::ann_disk::write_compacted_ann_cancellable(
                     &sources,
                     writer,
                     self.cancellation.as_deref(),
-                    Some(locations),
+                    Some(relocations.insert(Default::default())),
                 )
             } else {
                 crate::segment::ann_disk::write_merged_ann_cancellable(
@@ -755,7 +753,7 @@ impl SegmentMerger {
         doc_offs: &[u32],
         trained: &TrainedVectorStructures,
         writer: &mut OffsetWriter,
-        locations: Option<&mut ExactLocations>,
+        relocations: &mut Option<crate::segment::ann_disk::CodeRelocations>,
     ) -> Result<Option<(u8, u64, u64)>> {
         let entry = self
             .schema
@@ -828,19 +826,16 @@ impl SegmentMerger {
 
         let data_offset = writer.offset();
         let result = super::block_in_place_if_multithread(|| {
-            // Binary runs and their lookup rows remain immutable through
-            // merge. Float AH retains leaf-wise compaction with its existing
-            // FastScan packer; neither path reassigns or retrains vectors.
-            if locations.is_some()
-                || (index_type != crate::segment::ann_build::SCANN_BINARY_TYPE
-                    && crate::segment::ann_disk::predicted_merge_fragmentation(&sources)
-                        > 1.0 + 1e-9)
-            {
+            // Fragmented leaves are coalesced; neither path reassigns or
+            // retrains vectors. Float AH repacks FastScan blocks. Binary codes
+            // move as whole source runs, whose new positions let the lookup
+            // rows be copied verbatim.
+            if crate::segment::ann_disk::predicted_merge_fragmentation(&sources) > 1.0 + 1e-9 {
                 crate::segment::ann_disk::write_compacted_ann_cancellable(
                     &sources,
                     writer,
                     self.cancellation.as_deref(),
-                    locations,
+                    binary.then(|| relocations.insert(Default::default())),
                 )
             } else {
                 crate::segment::ann_disk::write_merged_ann_cancellable(

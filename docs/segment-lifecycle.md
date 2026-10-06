@@ -239,8 +239,9 @@ runtime, on both successful and failed maintenance. See
 ## Background maintenance eligibility
 
 The background optimizer must consider binary IVF/ScaNN fields independently of
-the `reorder` schema attribute. Their ordinary merges preserve encoded runs, and
-standalone maintenance coalesces those runs through the existing dense writer.
+the `reorder` schema attribute. Ordinary merges coalesce overlapping encoded runs
+themselves; segments that are still fragmented (for example, from earlier
+versions) are coalesced by standalone maintenance through the same dense writer.
 The same optimizer slots, source/output claims, replacement publication and
 reader retirement apply; no separate ANN scheduler is introduced. BP-specific
 `has_reorder_fields` remains a schema query for BP, while background maintenance
