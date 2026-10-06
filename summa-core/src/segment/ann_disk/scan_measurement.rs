@@ -45,6 +45,7 @@ fn measure_persisted_binary_leaf_scans() {
             quantizer_version: 42,
             codebook_version: 0,
             vector_count: ROWS,
+            prefix_bytes: 0,
         };
         let mut bytes = Vec::new();
         write_built_runs(header, &runs, &mut bytes, None).unwrap();
@@ -60,7 +61,13 @@ fn measure_persisted_binary_leaf_scans() {
                 let mut hash = 0xcbf29ce484222325u64;
                 for query in &queries {
                     let actual = disk
-                        .search_binary_clusters_with_tuning::<false>(query, k, &leaves, usize::MAX)
+                        .search_binary_clusters_with_tuning::<false>(
+                            query,
+                            k,
+                            &leaves,
+                            0,
+                            usize::MAX,
+                        )
                         .unwrap();
                     // Independent exact Hamming oracle for the same probed rows.
                     let inv_dim = 1.0 / (width * 8) as f32;
@@ -94,6 +101,7 @@ fn measure_persisted_binary_leaf_scans() {
                                 std::hint::black_box(query),
                                 k,
                                 &leaves,
+                                0,
                                 usize::MAX,
                             )
                             .unwrap(),

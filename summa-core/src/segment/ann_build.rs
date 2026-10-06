@@ -602,13 +602,13 @@ mod tests {
             .probe(&[0], 2, 2, &mut scratch)
             .unwrap();
         let hits = disk
-            .search_binary_clusters::<false>(&[0], 1, &plan.leaf_ids)
+            .search_binary_clusters::<false>(&[0], 1, &plan.leaf_ids, 0)
             .unwrap();
         assert_eq!(hits[0].0, 0);
         assert_eq!(hits[0].2, 1.0);
 
         let all_hits = disk
-            .search_binary_clusters::<false>(&[0], 64, &plan.leaf_ids)
+            .search_binary_clusters::<false>(&[0], 64, &plan.leaf_ids, 0)
             .unwrap();
         assert_eq!(
             all_hits.len(),

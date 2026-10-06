@@ -508,6 +508,17 @@ field hash: binary_dense_vector<1024> [indexed<scann, num_clusters: 10000000, tr
 field hash: binary_dense_vector<512> [indexed<flat>]
 ```
 
+Binary IVF can also store a leading-bit prefix of every code and scan it first.
+Queries then rescore only the best `prefix_rerank` probed postings (default
+1,000) on the full codes, so returned scores stay exact. Use it for
+Matryoshka-trained embeddings, whose leading dimensions carry the most
+information. `prefix_bits` must be a positive multiple of 8 below the dimension;
+storage grows by `prefix_bits / dim` ([prefix-first scan](binary-prefix-scan.md)):
+
+```
+field hash: binary_dense_vector<2560> [indexed<ivf, prefix_bits: 1024, prefix_rerank: 1000>]
+```
+
 An existing IVF or ScaNN field can be changed atomically through the
 `AlterVectorIndex` gRPC method. Pass the index name, field name, and the field's
 replacement SDL type/options, for example
