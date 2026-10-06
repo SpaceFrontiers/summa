@@ -46,6 +46,7 @@ fn measure_persisted_binary_leaf_scans() {
             codebook_version: 0,
             vector_count: ROWS,
             prefix_bytes: 0,
+            spilled: false,
         };
         let mut bytes = Vec::new();
         write_built_runs(header, &runs, &mut bytes, None).unwrap();

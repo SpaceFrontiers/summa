@@ -519,6 +519,15 @@ storage grows by `prefix_bits / dim` ([prefix-first scan](binary-prefix-scan.md)
 field hash: binary_dense_vector<2560> [indexed<ivf, prefix_bits: 1024, prefix_rerank: 1000>]
 ```
 
+`soar: full` on binary IVF stores each vector in a second leaf chosen by the
+Hamming form of the SOAR loss, roughly doubling ANN payload storage in exchange
+for higher recall at the same number of probes. Queries deduplicate the copies.
+Selective presets are rejected on binary IVF ([binary IVF SOAR](binary-ivf-soar.md)):
+
+```
+field hash: binary_dense_vector<2560> [indexed<ivf, soar: full, prefix_bits: 1024>]
+```
+
 An existing IVF or ScaNN field can be changed atomically through the
 `AlterVectorIndex` gRPC method. Pass the index name, field name, and the field's
 replacement SDL type/options, for example

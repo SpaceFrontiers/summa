@@ -272,11 +272,23 @@ pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), S
                 config.target_vectors,
                 config.index_type != BinaryIndexType::Flat,
             )?;
-            if config.soar.is_some() && config.index_type != BinaryIndexType::Scann {
-                return Err(format!(
-                    "binary dense field '{}' enables binary SOAR spilling, but it requires the ScaNN index",
-                    entry.name,
-                ));
+            if let Some(soar) = config.soar.as_ref() {
+                match config.index_type {
+                    BinaryIndexType::Scann => {}
+                    BinaryIndexType::Ivf if !soar.selective && soar.num_secondary > 0 => {}
+                    BinaryIndexType::Ivf => {
+                        return Err(format!(
+                            "binary dense field '{}' enables selective SOAR on binary IVF; binary IVF supports only full one-secondary spilling (`soar: full`)",
+                            entry.name,
+                        ));
+                    }
+                    BinaryIndexType::Flat => {
+                        return Err(format!(
+                            "binary dense field '{}' enables binary SOAR spilling, but it requires the IVF or ScaNN index",
+                            entry.name,
+                        ));
+                    }
+                }
             }
             validate_binary_prefix(&entry.name, config)?;
             if config.index_type == BinaryIndexType::Scann && !config.dim.is_multiple_of(8) {
@@ -781,9 +793,10 @@ pub struct BinaryDenseVectorConfig {
     /// see [`BinaryIndexType::default_nprobe`])
     #[serde(default = "default_nprobe")]
     pub nprobe: usize,
-    /// Optional one-secondary selective spilling for binary ScaNN. The
-    /// alternate leaf is chosen by exact centroid Hamming distance. Unlike
-    /// float SOAR, packed bits have no continuous residual geometry.
+    /// Optional one-secondary spilling. Binary ScaNN chooses the nearest
+    /// alternate leaf (selective presets allowed). Binary IVF accepts only
+    /// full spilling and chooses the secondary leaf by the Hamming form of
+    /// the SOAR loss (docs/binary-ivf-soar.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub soar: Option<crate::structures::SoarConfig>,
     /// Leading bits of every code also stored contiguously per IVF leaf run.
