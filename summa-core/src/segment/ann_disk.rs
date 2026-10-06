@@ -233,9 +233,17 @@ struct AnnRun {
     count: usize,
     doc_ids: Range<usize>,
     ordinals: Range<usize>,
-    /// Leading-bit prefixes of this run's codes, `count * prefix_bytes` bytes
-    /// between the ordinals and the codes (empty without a prefix layout).
+    /// With a prefix layout the codes column is split: all rows' leading
+    /// `prefix_bytes` first (`prefix`), then all rows' remaining bytes
+    /// (`suffix`). Exact lookups still address codes row-major ("virtual"
+    /// `codes.start + row * code_size`), translated by the readers. Both are
+    /// empty without a prefix layout.
     prefix: Range<usize>,
+    suffix: Range<usize>,
+    /// SOAR secondary run holding only prefixes: `codes` == `prefix`, no
+    /// suffix, never referenced by exact lookups. Rescoring reads the
+    /// vector's primary copy.
+    prefix_only: bool,
     codes: Range<usize>,
 }
 
@@ -265,6 +273,13 @@ pub(crate) struct AnnDiskIndex {
     raw: OwnedBytes,
     header: AnnDiskHeader,
     runs: std::sync::Arc<Vec<AnnRun>>,
+    /// Full (non-prefix-only) runs sorted by code offset, for translating a
+    /// row-major ("virtual") code address of a split prefix layout into its
+    /// prefix and suffix rows. Empty without a prefix layout.
+    split_runs: std::sync::Arc<Vec<u32>>,
+    /// The payload holds prefix-only SOAR runs, so every query uses the
+    /// prefix stage and rescoring may need the exact-vector lookup.
+    has_prefix_only_runs: bool,
 }
 
 /// Cheap structural health of one ANN payload, computed from the in-memory
@@ -284,6 +299,10 @@ pub struct AnnHealth {
     pub clusters_total: u32,
     /// Run-directory entries; each is one physical extent on disk.
     pub runs: u32,
+    /// Distinct `(cluster, run kind)` groups: a coalesced payload has one run
+    /// per group. A binary IVF SOAR payload with a prefix layout keeps full
+    /// and prefix-only runs separately (docs/binary-ivf-soar.md).
+    pub run_groups: u32,
     /// Vectors in the most populated cluster, with its ID.
     pub largest_cluster: u32,
     pub largest_cluster_vectors: u64,
@@ -301,10 +320,10 @@ impl AnnHealth {
     /// byte-copy merge multiplies it, and every extent is a potential seek
     /// when the index is cold.
     pub fn fragmentation(&self) -> f64 {
-        if self.clusters_nonempty == 0 {
+        if self.run_groups == 0 {
             return 0.0;
         }
-        f64::from(self.runs) / f64::from(self.clusters_nonempty)
+        f64::from(self.runs) / f64::from(self.run_groups)
     }
 
     /// Share of all vectors held by the single largest cluster.
@@ -415,7 +434,8 @@ impl AnnDiskIndex {
                     .ok_or_else(|| invalid_data("vector location precedes ANN codes"))?;
                 let relative = offset - run.codes.start;
                 let bytes = (count as usize).checked_mul(width);
-                if !relative.is_multiple_of(width)
+                if run.prefix_only
+                    || !relative.is_multiple_of(width)
                     || bytes
                         .and_then(|bytes| offset.checked_add(bytes))
                         .is_none_or(|end| end > run.codes.end)
@@ -575,6 +595,7 @@ impl AnnDiskIndex {
             let prefix_len = count
                 .checked_mul(prefix_bytes)
                 .ok_or_else(|| invalid_data("ANN prefix column size overflows usize"))?;
+            let prefix_only = spilled && prefix_bytes > 0 && codes_len == prefix_len;
             let doc_ids_end = doc_ids_offset
                 .checked_add(doc_ids_len)
                 .ok_or_else(|| invalid_data("ANN doc-ID range overflows usize"))?;
@@ -586,8 +607,8 @@ impl AnnDiskIndex {
                 .ok_or_else(|| invalid_data("ANN code range overflows usize"))?;
             if doc_ids_offset < ANN_HEADER_SIZE
                 || ordinals_offset != doc_ids_end
-                || ordinals_end.checked_add(prefix_len) != Some(codes_offset)
-                || codes_len != expected_codes_len
+                || codes_offset != ordinals_end
+                || (codes_len != expected_codes_len && !prefix_only)
                 || codes_end > directory_offset
             {
                 return Err(invalid_data("ANN run columns are not contiguous/in bounds"));
@@ -599,7 +620,13 @@ impl AnnDiskIndex {
                 count,
                 doc_ids: doc_ids_offset..doc_ids_end,
                 ordinals: ordinals_offset..ordinals_end,
-                prefix: ordinals_end..codes_offset,
+                prefix: codes_offset..codes_offset + prefix_len,
+                suffix: if prefix_bytes > 0 && !prefix_only {
+                    codes_offset + prefix_len..codes_end
+                } else {
+                    codes_end..codes_end
+                },
+                prefix_only,
                 codes: codes_offset..codes_end,
             });
             counted_vectors = counted_vectors
@@ -659,9 +686,58 @@ impl AnnDiskIndex {
             alive_docs: None,
             #[cfg(feature = "native")]
             heap_pins: Default::default(),
+            split_runs: std::sync::Arc::new(if header.prefix_bytes > 0 {
+                let mut full: Vec<u32> = (0..runs.len() as u32)
+                    .filter(|&index| !runs[index as usize].prefix_only)
+                    .collect();
+                full.sort_unstable_by_key(|&index| runs[index as usize].codes.start);
+                full
+            } else {
+                Vec::new()
+            }),
+            has_prefix_only_runs: runs.iter().any(|run| run.prefix_only),
             raw,
             header,
             runs: std::sync::Arc::new(runs),
+        })
+    }
+
+    /// Physical `(prefix row, suffix row)` offsets of the vector whose
+    /// row-major ("virtual") code address is `virtual_offset`, in a split
+    /// prefix layout. `None` if the address is not a row of a full run.
+    pub(crate) fn split_code_parts(&self, virtual_offset: usize) -> Option<(usize, usize)> {
+        let prefix = self.header.prefix_bytes;
+        let width = self.header.code_size;
+        if prefix == 0 {
+            return None;
+        }
+        let at = self
+            .split_runs
+            .partition_point(|&index| self.runs[index as usize].codes.start <= virtual_offset);
+        let run = &self.runs[*self.split_runs.get(at.checked_sub(1)?)? as usize];
+        let relative = virtual_offset - run.codes.start;
+        let row = relative / width;
+        (relative.is_multiple_of(width) && row < run.count).then(|| {
+            (
+                run.prefix.start + row * prefix,
+                run.suffix.start + row * (width - prefix),
+            )
+        })
+    }
+
+    /// Full runs of a split prefix layout for the exact-vector reader:
+    /// `(codes start, rows)` sorted by code offset. `None` without a prefix.
+    pub(crate) fn split_code_runs(&self) -> Option<crate::segment::vector_data::SplitCodes> {
+        (self.header.prefix_bytes > 0).then(|| crate::segment::vector_data::SplitCodes {
+            prefix: self.header.prefix_bytes,
+            runs: self
+                .split_runs
+                .iter()
+                .map(|&index| {
+                    let run = &self.runs[index as usize];
+                    (run.codes.start as u64, run.count as u64)
+                })
+                .collect(),
         })
     }
 
@@ -673,17 +749,25 @@ impl AnnDiskIndex {
         let mut payload_bytes = 0u64;
         let mut largest = (0u32, 0u64);
         let mut sum_squares = 0f64;
+        let mut run_groups = 0u32;
         // Runs are sorted by cluster ID, so one pass groups them.
         let mut index = 0usize;
         while index < self.runs.len() {
             let cluster_id = self.runs[index].cluster_id;
             let mut cluster_vectors = 0u64;
+            let (mut full, mut prefix_only) = (false, false);
             while index < self.runs.len() && self.runs[index].cluster_id == cluster_id {
                 let run = &self.runs[index];
                 cluster_vectors += run.count as u64;
                 payload_bytes += (run.codes.end - run.codes.start) as u64;
+                if run.prefix_only {
+                    prefix_only = true;
+                } else {
+                    full = true;
+                }
                 index += 1;
             }
+            run_groups += u32::from(full) + u32::from(prefix_only);
             vectors += cluster_vectors;
             clusters_nonempty += 1;
             sum_squares += (cluster_vectors as f64) * (cluster_vectors as f64);
@@ -701,6 +785,7 @@ impl AnnDiskIndex {
             clusters_nonempty,
             clusters_total: self.header.num_clusters,
             runs: self.runs.len() as u32,
+            run_groups,
             largest_cluster: largest.0,
             largest_cluster_vectors: largest.1,
             imbalance,
@@ -1215,6 +1300,7 @@ impl AnnDiskIndex {
         cluster_ids: &[u32],
         combiner: crate::query::MultiValueCombiner,
         prefix_rerank: usize,
+        locator: Option<ExactCodeLocator<'_>>,
     ) -> io::Result<CombinedBinaryCandidates> {
         self.search_binary_combined_documents_with_tuning(
             k,
@@ -1222,6 +1308,7 @@ impl AnnDiskIndex {
             cluster_ids,
             combiner,
             prefix_rerank,
+            locator,
             IVF_PARALLEL_SCAN_MIN_POSTINGS,
         )
     }
@@ -1413,6 +1500,7 @@ impl AnnDiskIndex {
         tasks
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search_binary_combined_documents_with_tuning(
         &self,
         k: usize,
@@ -1420,6 +1508,7 @@ impl AnnDiskIndex {
         cluster_ids: &[u32],
         combiner: crate::query::MultiValueCombiner,
         prefix_rerank: usize,
+        locator: Option<ExactCodeLocator<'_>>,
         parallel_min_postings: usize,
     ) -> io::Result<CombinedBinaryCandidates> {
         validate_combined_search(combiner)?;
@@ -1447,7 +1536,7 @@ impl AnnDiskIndex {
             parallel_min_postings,
         )? {
             let mut ordinal_scores = Vec::with_capacity(candidates.len());
-            self.score_prefix_candidates(query, &candidates, &mut ordinal_scores);
+            self.score_prefix_candidates(query, &candidates, locator, &mut ordinal_scores)?;
             return Ok(combine_scored_ordinals_retaining(
                 ordinal_scores,
                 k,
@@ -1872,12 +1961,14 @@ impl AnnDiskIndex {
         k: usize,
         cluster_ids: &[u32],
         prefix_rerank: usize,
+        locator: Option<ExactCodeLocator<'_>>,
     ) -> io::Result<Vec<(u32, u16, f32)>> {
         self.search_binary_clusters_with_tuning::<BY_DOCUMENT>(
             query,
             k,
             cluster_ids,
             prefix_rerank,
+            locator,
             IVF_PARALLEL_SCAN_MIN_POSTINGS,
         )
     }
@@ -1888,6 +1979,7 @@ impl AnnDiskIndex {
         k: usize,
         cluster_ids: &[u32],
         prefix_rerank: usize,
+        locator: Option<ExactCodeLocator<'_>>,
         parallel_min_postings: usize,
     ) -> io::Result<Vec<(u32, u16, f32)>> {
         #[cfg(not(feature = "native"))]
@@ -1909,7 +2001,7 @@ impl AnnDiskIndex {
             parallel_min_postings,
         )? {
             let mut collector = BoundedAnnCollector::<BY_DOCUMENT, true>::new(k);
-            self.score_prefix_candidates(query, &candidates, &mut collector);
+            self.score_prefix_candidates(query, &candidates, locator, &mut collector)?;
             return Ok(collector.into_sorted_results());
         }
         #[cfg(feature = "native")]
@@ -1988,15 +2080,23 @@ impl AnnDiskIndex {
     }
 }
 
+/// Exact-code locator for SOAR candidates found only in prefix-only runs:
+/// `(doc, ordinal)` to the row-major code address of the vector's primary
+/// copy, from the segment's exact-vector lookup.
+pub(crate) type ExactCodeLocator<'a> = &'a (dyn Fn(u32, u16) -> Option<u64> + Sync);
+
 impl AnnDiskIndex {
     /// Prefix stage of a binary prefix-first scan: the best `rerank` visible
     /// postings of the probed leaves by Hamming distance on the stored code
-    /// prefix, in ascending `(distance, doc, ordinal, code offset)` order.
+    /// prefix, in ascending `(distance, doc, ordinal, kind, offset)` order with
+    /// SOAR duplicates removed (full-run copies preferred).
     ///
     /// Returns `None` (scan full codes instead) without a prefix layout, with
     /// `rerank == 0`, or when the probe holds no more postings than `rerank`.
-    /// Selection keeps at most `rerank` candidates per worker, and the total
-    /// order makes the result independent of parallel chunking.
+    /// Payloads with prefix-only SOAR runs always use the prefix stage, with
+    /// every probed posting as a candidate in those cases. Selection keeps at
+    /// most `rerank` candidates per worker, and the total order makes the
+    /// result independent of parallel chunking.
     fn binary_prefix_candidates(
         &self,
         query: &[u8],
@@ -2006,11 +2106,19 @@ impl AnnDiskIndex {
         parallel_min_postings: usize,
     ) -> io::Result<Option<Vec<PrefixCandidate>>> {
         let prefix_bytes = self.header.prefix_bytes;
-        if prefix_bytes == 0 || rerank == 0 || posting_count <= rerank {
-            #[cfg(not(feature = "native"))]
-            let _ = parallel_min_postings;
+        #[cfg(not(feature = "native"))]
+        let _ = parallel_min_postings;
+        if prefix_bytes == 0 {
             return Ok(None);
         }
+        let rerank = if rerank == 0 || posting_count <= rerank {
+            if !self.has_prefix_only_runs {
+                return Ok(None);
+            }
+            posting_count.max(1)
+        } else {
+            rerank
+        };
         let query_prefix = &query[..prefix_bytes];
         let kernel = crate::structures::simd::HammingKernel::resolve();
         let bytes = self.raw.as_slice();
@@ -2045,7 +2153,7 @@ impl AnnDiskIndex {
                 });
             return Ok(Some(self.unique_prefix_candidates(heap)));
         }
-        let mut heap = BinaryHeap::with_capacity(rerank + 1);
+        let mut heap = BinaryHeap::with_capacity(rerank.min(posting_count) + 1);
         for &cluster_id in cluster_ids {
             for run in self.cluster_runs(cluster_id) {
                 scan_prefix_task(
@@ -2069,8 +2177,8 @@ impl AnnDiskIndex {
     }
 
     /// Sorted candidates with SOAR duplicates removed. Both postings of a
-    /// spilled vector hold the same code, so they share a prefix distance and
-    /// sort next to each other; the full-code stage needs only one.
+    /// spilled vector share a prefix distance and sort next to each other,
+    /// the full-run copy first; the full-code stage needs only one.
     fn unique_prefix_candidates(&self, heap: BinaryHeap<PrefixCandidate>) -> Vec<PrefixCandidate> {
         let mut candidates = heap.into_sorted_vec();
         if self.header.spilled {
@@ -2079,30 +2187,51 @@ impl AnnDiskIndex {
         candidates
     }
 
-    /// Full-code stage: exact Hamming scores for the prefix candidates.
+    /// Full-code stage: exact Hamming scores for the prefix candidates. The
+    /// prefix distance is already known, so only the code suffix is read;
+    /// prefix-only candidates read their primary copy through `locator`.
     fn score_prefix_candidates(
         &self,
         query: &[u8],
         candidates: &[PrefixCandidate],
+        locator: Option<ExactCodeLocator<'_>>,
         sink: &mut impl AnnScoreSink,
-    ) {
+    ) -> io::Result<()> {
         let kernel = crate::structures::simd::HammingKernel::resolve();
         let bytes = self.raw.as_slice();
-        let code_size = self.header.code_size;
+        let prefix = self.header.prefix_bytes;
+        let suffix_len = self.header.code_size - prefix;
+        let query_suffix = &query[prefix..];
         let inv_dim = 1.0 / self.header.dim as f32;
         for candidate in candidates {
-            let code = &bytes[candidate.code_offset..candidate.code_offset + code_size];
-            let distance = kernel.distance(query, code);
+            let suffix_at = if candidate.prefix_only {
+                let virtual_offset = locator.ok_or_else(|| {
+                    invalid_data("prefix-only SOAR candidates need the exact-vector lookup")
+                })?(candidate.doc_id, candidate.ordinal)
+                .ok_or_else(|| invalid_data("SOAR candidate has no exact-vector location"))?;
+                let virtual_offset = usize::try_from(virtual_offset)
+                    .map_err(|_| invalid_data("vector location exceeds address space"))?;
+                self.split_code_parts(virtual_offset)
+                    .ok_or_else(|| invalid_data("SOAR candidate location is not a code row"))?
+                    .1
+            } else {
+                candidate.suffix_offset
+            };
+            let suffix = bytes
+                .get(suffix_at..suffix_at + suffix_len)
+                .ok_or_else(|| invalid_data("vector suffix outside ANN payload"))?;
+            let distance = candidate.distance + kernel.distance(query_suffix, suffix);
             sink.insert_score(
                 candidate.doc_id,
                 candidate.ordinal,
                 1.0 - distance as f32 * inv_dim,
             );
         }
+        Ok(())
     }
 
-    /// Prefetch only the prefix columns of the probed leaves; the full-code
-    /// stage reads its few candidates on demand.
+    /// Prefetch labels and prefix rows of the probed leaves, not suffixes;
+    /// the full-code stage reads its few candidates on demand.
     #[cfg(feature = "native")]
     fn prefetch_prefix_runs(&self, cluster_ids: &[u32]) {
         if cluster_ids.is_empty() || !self.raw.is_mmap() {
@@ -2124,13 +2253,16 @@ impl AnnDiskIndex {
 }
 
 /// One posting selected by its code prefix. Ordered by `(distance, doc,
-/// ordinal, code offset)`, a total order, so selection is deterministic.
+/// ordinal, prefix_only, suffix offset)`, a total order, so selection is
+/// deterministic and a vector's full-run copy sorts before its prefix-only
+/// SOAR copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PrefixCandidate {
     distance: u32,
     doc_id: u32,
     ordinal: u16,
-    code_offset: usize,
+    prefix_only: bool,
+    suffix_offset: usize,
 }
 
 /// Keep the `limit` smallest candidates in a max-heap.
@@ -2162,6 +2294,7 @@ fn scan_prefix_task(
 ) {
     const BLOCK: usize = 64;
     let run = task.run;
+    let suffix_len = code_size - prefix_bytes;
     let mut distances = [0u32; BLOCK];
     let end = task.first_index + task.count;
     for block_start in (task.first_index..end).step_by(BLOCK) {
@@ -2194,7 +2327,12 @@ fn scan_prefix_task(
                     distance,
                     doc_id,
                     ordinal: read_u16(bytes, run.ordinals.start + index * 2),
-                    code_offset: run.codes.start + index * code_size,
+                    prefix_only: run.prefix_only,
+                    suffix_offset: if run.prefix_only {
+                        0
+                    } else {
+                        run.suffix.start + index * suffix_len
+                    },
                 },
                 limit,
             );
@@ -2452,15 +2590,53 @@ fn score_binary_task(
     scores: &mut [f32],
     collector: &mut impl AnnScoreSink,
 ) -> io::Result<()> {
-    let code_start = task.run.codes.start + task.first_index * code_size;
-    let code_end = code_start + task.count * code_size;
-    crate::structures::simd::batch_hamming_scores(
-        query,
-        &bytes[code_start..code_end],
-        code_size,
-        dim_bits,
-        &mut scores[..task.count],
-    );
+    if task.run.prefix_only {
+        return Err(invalid_data(
+            "prefix-only SOAR runs can only be scanned through the prefix stage",
+        ));
+    }
+    if task.run.suffix.is_empty() {
+        let code_start = task.run.codes.start + task.first_index * code_size;
+        let code_end = code_start + task.count * code_size;
+        crate::structures::simd::batch_hamming_scores(
+            query,
+            &bytes[code_start..code_end],
+            code_size,
+            dim_bits,
+            &mut scores[..task.count],
+        );
+    } else {
+        // Split prefix layout: Hamming distance is additive over the prefix
+        // and suffix rows, so score both blocks and sum.
+        let prefix = task.run.prefix.len() / task.run.count;
+        let suffix = code_size - prefix;
+        let kernel = crate::structures::simd::HammingKernel::resolve();
+        let inv_dim = 1.0 / dim_bits as f32;
+        let mut prefix_distances = [0u32; 64];
+        let mut suffix_distances = [0u32; 64];
+        for block_start in (0..task.count).step_by(64) {
+            let rows = 64.min(task.count - block_start);
+            let row = task.first_index + block_start;
+            let at = task.run.prefix.start + row * prefix;
+            kernel.distances(
+                &query[..prefix],
+                &bytes[at..at + rows * prefix],
+                prefix,
+                &mut prefix_distances[..rows],
+            );
+            let at = task.run.suffix.start + row * suffix;
+            kernel.distances(
+                &query[prefix..],
+                &bytes[at..at + rows * suffix],
+                suffix,
+                &mut suffix_distances[..rows],
+            );
+            for lane in 0..rows {
+                scores[block_start + lane] =
+                    1.0 - (prefix_distances[lane] + suffix_distances[lane]) as f32 * inv_dim;
+            }
+        }
+    }
     const THRESHOLD_REFRESH_ROWS: usize = 64;
 
     // Refresh once per small block. The threshold can only improve while
@@ -2794,16 +2970,22 @@ pub(crate) fn write_built_binary_ivf(
     writer: &mut (impl Write + ?Sized),
     locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
 ) -> io::Result<u64> {
-    let runs: Vec<_> = index
+    // Directory order is `(cluster, prefix_only)`: a cluster's full run, then
+    // its prefix-only SOAR run.
+    let mut runs: Vec<_> = index
         .clusters
         .iter()
-        .map(|(cluster_id, cluster)| BuildRun {
+        .map(|cluster| (cluster, false))
+        .chain(index.secondary.iter().map(|cluster| (cluster, true)))
+        .map(|((cluster_id, cluster), prefix_only)| BuildRun {
             cluster_id: *cluster_id,
             doc_ids: &cluster.doc_ids,
             ordinals: &cluster.ordinals,
             codes: &cluster.codes,
+            prefix_only,
         })
         .collect();
+    runs.sort_by_key(|run| (run.cluster_id, run.prefix_only));
     write_built_runs(
         AnnDiskHeader {
             kind: AnnKind::BinaryIvf,
@@ -3031,6 +3213,7 @@ pub(crate) fn write_built_ivf_tq(
             doc_ids: &cluster.doc_ids,
             ordinals: &cluster.ordinals,
             codes: &cluster.codes,
+            prefix_only: false,
         })
         .collect();
     write_built_runs(
@@ -3060,6 +3243,7 @@ pub(crate) fn tq_builder_extra_run(builder: &crate::structures::TqFlatBuilder) -
         doc_ids: &builder.doc_ids,
         ordinals: &builder.ordinals,
         codes: &builder.codes,
+        prefix_only: false,
     }
 }
 
@@ -3075,6 +3259,7 @@ pub(crate) fn write_built_tq_flat(
         doc_ids: &builder.doc_ids,
         ordinals: &builder.ordinals,
         codes: &builder.codes,
+        prefix_only: false,
     }];
     write_built_runs(
         AnnDiskHeader {
@@ -3100,7 +3285,11 @@ pub(crate) struct BuildRun<'a> {
     cluster_id: u32,
     doc_ids: &'a [u32],
     ordinals: &'a [u16],
+    /// Full codes of the rows; with a prefix layout they are written split
+    /// (all prefix rows, then all suffix rows).
     codes: &'a [u8],
+    /// Write only the prefix rows: a binary IVF SOAR secondary run.
+    prefix_only: bool,
 }
 
 #[cfg(feature = "native")]
@@ -3131,19 +3320,20 @@ fn write_built_runs(
     let mut records = Vec::with_capacity(runs.len());
     let mut counted = 0usize;
     let mut scratch = Vec::new();
-    let mut previous_cluster = None;
+    let mut previous_run: Option<(u32, bool)> = None;
     for run in runs {
         let count = run.doc_ids.len();
         if count == 0
             || run.cluster_id >= header.num_clusters
-            || previous_cluster.is_some_and(|cluster| cluster >= run.cluster_id)
+            || previous_run.is_some_and(|previous| previous >= (run.cluster_id, run.prefix_only))
+            || (run.prefix_only && (header.prefix_bytes == 0 || !header.spilled))
             || run.ordinals.len() != count
             || run.codes.len()
                 != expected_codes_column_len(header.kind, count, header.dim, header.code_size)?
         {
             return Err(invalid_data("ANN build run columns are inconsistent"));
         }
-        previous_cluster = Some(run.cluster_id);
+        previous_run = Some((run.cluster_id, run.prefix_only));
         let count_u32 = u32::try_from(count)
             .map_err(|_| invalid_data("ANN cluster run exceeds u32 vectors"))?;
         let max_doc_id = run.doc_ids.iter().copied().max().unwrap_or(0);
@@ -3167,31 +3357,47 @@ fn write_built_runs(
                     .ok_or_else(|| invalid_data("ANN ordinal output size overflows u64"))?,
             )
             .ok_or_else(|| invalid_data("ANN output offset overflow"))?;
-        if header.prefix_bytes > 0 {
-            write_prefix_column(
+        let codes_offset = offset;
+        let codes_len = if run.prefix_only {
+            // Never referenced by exact lookups: the primary copy is.
+            write_code_slices(
                 writer,
                 run.codes,
                 header.code_size,
-                header.prefix_bytes,
+                0..header.prefix_bytes,
                 &mut scratch,
             )?;
-            offset = checked_advance(offset, count * header.prefix_bytes)?;
-        }
-        let codes_offset = offset;
-        record_exact_locations(
-            &mut locations,
-            codes_offset,
-            count,
-            |row| Ok((run.doc_ids[row], run.ordinals[row])),
-            None,
-        )?;
-        writer.write_all(run.codes)?;
-        offset = offset
-            .checked_add(
-                u64::try_from(run.codes.len())
-                    .map_err(|_| invalid_data("ANN code output size exceeds u64"))?,
-            )
-            .ok_or_else(|| invalid_data("ANN output offset overflow"))?;
+            count * header.prefix_bytes
+        } else {
+            // Exact lookups address rows row-major ("virtual" offsets).
+            record_exact_locations(
+                &mut locations,
+                codes_offset,
+                count,
+                |row| Ok((run.doc_ids[row], run.ordinals[row])),
+                None,
+            )?;
+            if header.prefix_bytes > 0 {
+                write_code_slices(
+                    writer,
+                    run.codes,
+                    header.code_size,
+                    0..header.prefix_bytes,
+                    &mut scratch,
+                )?;
+                write_code_slices(
+                    writer,
+                    run.codes,
+                    header.code_size,
+                    header.prefix_bytes..header.code_size,
+                    &mut scratch,
+                )?;
+            } else {
+                writer.write_all(run.codes)?;
+            }
+            run.codes.len()
+        };
+        offset = checked_advance(offset, codes_len)?;
         records.push(RunRecord {
             cluster_id: run.cluster_id,
             doc_base: 0,
@@ -3200,7 +3406,7 @@ fn write_built_runs(
             doc_ids_offset,
             ordinals_offset,
             codes_offset,
-            codes_len: u64::try_from(run.codes.len())
+            codes_len: u64::try_from(codes_len)
                 .map_err(|_| invalid_data("ANN code output size exceeds u64"))?,
         });
         counted = counted
@@ -3257,12 +3463,17 @@ pub(crate) fn predicted_merge_fragmentation(sources: &[(&AnnDiskIndex, u32)]) ->
         .filter_map(|cursor| cursor.peek().map(|run| run.cluster_id))
         .min()
     {
-        distinct += 1;
+        let (mut full, mut prefix_only) = (false, false);
         for cursor in &mut cursors {
-            while cursor.peek().is_some_and(|run| run.cluster_id == cluster) {
-                cursor.next();
+            while let Some(run) = cursor.next_if(|run| run.cluster_id == cluster) {
+                if run.prefix_only {
+                    prefix_only = true;
+                } else {
+                    full = true;
+                }
             }
         }
+        distinct += usize::from(full) + usize::from(prefix_only);
     }
     if distinct == 0 {
         0.0
@@ -3274,6 +3485,21 @@ pub(crate) fn predicted_merge_fragmentation(sources: &[(&AnnDiskIndex, u32)]) ->
 /// Doc IDs rewritten per scratch flush during compaction (256 KiB of u32s).
 #[cfg(feature = "native")]
 const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
+
+/// A cluster's runs of one kind (full or prefix-only), from `cursor`, in
+/// directory order.
+#[cfg(feature = "native")]
+fn matching_runs(
+    source: &AnnDiskIndex,
+    cursor: usize,
+    cluster_id: u32,
+    prefix_only: bool,
+) -> impl Iterator<Item = &AnnRun> {
+    source.runs[cursor.min(source.runs.len())..]
+        .iter()
+        .take_while(move |run| run.cluster_id == cluster_id)
+        .filter(move |run| run.prefix_only == prefix_only)
+}
 
 /// Cluster-major compacting merge for exact-binary and ScaNN-AH payloads.
 ///
@@ -3369,163 +3595,172 @@ pub(crate) fn write_compacted_ann_cancellable(
             break;
         };
 
-        // Pass 1: doc IDs, rewritten absolute. Sources are visited in
-        // segment order and each source's same-cluster runs in directory
-        // order, which is ascending document ranges — so the output column
-        // stays sorted like a built segment's.
-        let mut count = 0usize;
-        let mut max_doc_id = 0u32;
-        let doc_ids_offset = offset;
-        for (source_index, &(source, segment_base)) in sources.iter().enumerate() {
-            let mut cursor = cursors[source_index];
-            while let Some(run) = source
-                .runs
-                .get(cursor)
-                .filter(|run| run.cluster_id == cluster_id)
+        // A cluster coalesces into at most two runs: its full runs, then its
+        // prefix-only SOAR runs (only binary IVF prefix layouts have those).
+        for prefix_only in [false, true] {
+            let matching = |source, cursor| matching_runs(source, cursor, cluster_id, prefix_only);
+            if sources
+                .iter()
+                .zip(&cursors)
+                .all(|(&(source, _), &cursor)| matching(source, cursor).next().is_none())
             {
-                let base = run
-                    .doc_base
-                    .checked_add(segment_base)
-                    .ok_or_else(|| invalid_data("compacted ANN document base overflows u32"))?;
-                let bytes = source.raw.as_slice();
-                // Chunked rewrite: peak scratch stays at 256 KiB no matter how
-                // large the run — the production incident had a single run of
-                // 20M postings, and buffering it whole would be an 80 MB spike
-                // in the middle of a merge.
-                for chunk_start in (0..run.count).step_by(DOC_ID_REWRITE_CHUNK) {
-                    let chunk_end = (chunk_start + DOC_ID_REWRITE_CHUNK).min(run.count);
-                    scratch.clear();
-                    scratch.reserve((chunk_end - chunk_start) * 4);
-                    for index in chunk_start..chunk_end {
-                        let doc_id = run_doc_id_with_base(bytes, run, index, base)?;
-                        max_doc_id = max_doc_id.max(doc_id);
-                        scratch.extend_from_slice(&doc_id.to_le_bytes());
-                    }
-                    writer.write_all(&scratch)?;
-                    if cancellation
-                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Interrupted,
-                            "ANN compaction cancelled",
-                        ));
-                    }
-                }
-                offset = checked_advance(offset, run.count * 4)?;
-                count = count
-                    .checked_add(run.count)
-                    .ok_or_else(|| invalid_data("compacted ANN run count overflows usize"))?;
-                cursor += 1;
+                continue;
             }
-        }
 
-        // Pass 2: ordinals, verbatim.
-        let ordinals_offset = offset;
-        for (source_index, &(source, _)) in sources.iter().enumerate() {
-            let mut cursor = cursors[source_index];
-            while let Some(run) = source
-                .runs
-                .get(cursor)
-                .filter(|run| run.cluster_id == cluster_id)
-            {
-                copy_range(writer, &source.raw, run.ordinals.clone(), cancellation)?;
-                offset = checked_advance(offset, run.ordinals.len())?;
-                cursor += 1;
-            }
-        }
-
-        // Pass 2b: binary prefix rows, verbatim and in the same run order as
-        // the codes below, so row `i` of both columns is the same vector.
-        if header.prefix_bytes > 0 {
-            for (source_index, &(source, _)) in sources.iter().enumerate() {
-                let mut cursor = cursors[source_index];
-                while let Some(run) = source
-                    .runs
-                    .get(cursor)
-                    .filter(|run| run.cluster_id == cluster_id)
-                {
-                    copy_range(writer, &source.raw, run.prefix.clone(), cancellation)?;
-                    offset = checked_advance(offset, run.prefix.len())?;
-                    cursor += 1;
+            // Pass 1: doc IDs, rewritten absolute. Sources are visited in
+            // segment order and each source's same-cluster runs in directory
+            // order, which is ascending document ranges — so the output column
+            // stays sorted like a built segment's.
+            let mut count = 0usize;
+            let mut max_doc_id = 0u32;
+            let doc_ids_offset = offset;
+            for (source_index, &(source, segment_base)) in sources.iter().enumerate() {
+                for run in matching(source, cursors[source_index]) {
+                    let base = run
+                        .doc_base
+                        .checked_add(segment_base)
+                        .ok_or_else(|| invalid_data("compacted ANN document base overflows u32"))?;
+                    let bytes = source.raw.as_slice();
+                    // Chunked rewrite: peak scratch stays at 256 KiB no matter
+                    // how large the run — the production incident had a single
+                    // run of 20M postings, and buffering it whole would be an
+                    // 80 MB spike in the middle of a merge.
+                    for chunk_start in (0..run.count).step_by(DOC_ID_REWRITE_CHUNK) {
+                        let chunk_end = (chunk_start + DOC_ID_REWRITE_CHUNK).min(run.count);
+                        scratch.clear();
+                        scratch.reserve((chunk_end - chunk_start) * 4);
+                        for index in chunk_start..chunk_end {
+                            let doc_id = run_doc_id_with_base(bytes, run, index, base)?;
+                            max_doc_id = max_doc_id.max(doc_id);
+                            scratch.extend_from_slice(&doc_id.to_le_bytes());
+                        }
+                        writer.write_all(&scratch)?;
+                        if cancellation
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "ANN compaction cancelled",
+                            ));
+                        }
+                    }
+                    offset = checked_advance(offset, run.count * 4)?;
+                    count = count
+                        .checked_add(run.count)
+                        .ok_or_else(|| invalid_data("compacted ANN run count overflows usize"))?;
                 }
             }
-        }
 
-        // Pass 3: codes. Exact binary rows concatenate directly. ScaNN AH
-        // blocks are run-relative, so repack a continuous output stream.
-        let codes_offset = offset;
-        if header.kind == AnnKind::ScannAh {
-            let blocks = header.dim.div_ceil(code_size);
-            let lanes = crate::structures::vector::scann::FAST_SCAN_LANES;
-            let mut unpacked = Vec::with_capacity(lanes * blocks);
-            let mut packed = Vec::with_capacity(blocks * lanes / 2);
+            // Pass 2: ordinals, verbatim.
+            let ordinals_offset = offset;
             for (source_index, &(source, _)) in sources.iter().enumerate() {
-                let mut cursor = cursors[source_index];
-                while let Some(run) = source
-                    .runs
-                    .get(cursor)
-                    .filter(|run| run.cluster_id == cluster_id)
-                {
-                    let bytes = &source.raw.as_slice()[run.codes.clone()];
-                    for row in 0..run.count {
-                        unpack_scann_ah_row(bytes, run.count, blocks, row, &mut unpacked)?;
-                        if unpacked.len() == lanes * blocks {
-                            packed.clear();
-                            crate::structures::vector::scann::pack_fast_scan_block(
-                                &unpacked,
-                                blocks,
-                                &mut packed,
-                            )
-                            .map_err(|error| invalid_data(error.to_string()))?;
-                            writer.write_all(&packed)?;
-                            offset = checked_advance(offset, packed.len())?;
-                            unpacked.clear();
-                            if cancellation
-                                .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
-                            {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Interrupted,
-                                    "ANN compaction cancelled",
-                                ));
+                for run in matching(source, cursors[source_index]) {
+                    copy_range(writer, &source.raw, run.ordinals.clone(), cancellation)?;
+                    offset = checked_advance(offset, run.ordinals.len())?;
+                }
+            }
+
+            // Pass 3: codes. Exact binary rows concatenate directly; a split
+            // prefix layout concatenates all prefix blocks, then all suffix
+            // blocks. ScaNN AH blocks are run-relative, so repack a continuous
+            // output stream.
+            let codes_offset = offset;
+            if header.kind == AnnKind::ScannAh {
+                let blocks = header.dim.div_ceil(code_size);
+                let lanes = crate::structures::vector::scann::FAST_SCAN_LANES;
+                let mut unpacked = Vec::with_capacity(lanes * blocks);
+                let mut packed = Vec::with_capacity(blocks * lanes / 2);
+                for (source_index, &(source, _)) in sources.iter().enumerate() {
+                    for run in matching(source, cursors[source_index]) {
+                        let bytes = &source.raw.as_slice()[run.codes.clone()];
+                        for row in 0..run.count {
+                            unpack_scann_ah_row(bytes, run.count, blocks, row, &mut unpacked)?;
+                            if unpacked.len() == lanes * blocks {
+                                packed.clear();
+                                crate::structures::vector::scann::pack_fast_scan_block(
+                                    &unpacked,
+                                    blocks,
+                                    &mut packed,
+                                )
+                                .map_err(|error| invalid_data(error.to_string()))?;
+                                writer.write_all(&packed)?;
+                                offset = checked_advance(offset, packed.len())?;
+                                unpacked.clear();
+                                if cancellation.is_some_and(|flag| {
+                                    flag.load(std::sync::atomic::Ordering::Relaxed)
+                                }) {
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::Interrupted,
+                                        "ANN compaction cancelled",
+                                    ));
+                                }
                             }
                         }
                     }
-                    cursor += 1;
                 }
-            }
-            // One compacted run has one row-major tail, not one tail per
-            // source run. Pack each remaining row's adjacent block nibbles.
-            if !unpacked.is_empty() {
-                packed.clear();
-                for row in unpacked.chunks_exact(blocks) {
-                    for pair in row.chunks(2) {
-                        packed.push(pair[0] | (pair.get(1).copied().unwrap_or(0) << 4));
+                // One compacted run has one row-major tail, not one tail per
+                // source run. Pack each remaining row's adjacent block nibbles.
+                if !unpacked.is_empty() {
+                    packed.clear();
+                    for row in unpacked.chunks_exact(blocks) {
+                        for pair in row.chunks(2) {
+                            packed.push(pair[0] | (pair.get(1).copied().unwrap_or(0) << 4));
+                        }
+                    }
+                    writer.write_all(&packed)?;
+                    offset = checked_advance(offset, packed.len())?;
+                }
+            } else {
+                // Exact lookups address full runs row-major ("virtual"): a
+                // source run's rows land at `codes_offset + rows_before *
+                // code_size` whatever the physical split.
+                let mut rows_before = 0usize;
+                let blocks: &[fn(&AnnRun) -> Range<usize>] = if prefix_only {
+                    &[|run| run.prefix.clone()]
+                } else if header.prefix_bytes > 0 {
+                    &[|run| run.prefix.clone(), |run| run.suffix.clone()]
+                } else {
+                    &[|run| run.codes.clone()]
+                };
+                for (block_index, block) in blocks.iter().enumerate() {
+                    for (source_index, &(source, _)) in sources.iter().enumerate() {
+                        for run in matching(source, cursors[source_index]) {
+                            if block_index == 0 && !prefix_only {
+                                if let Some(relocations) = relocations.as_deref_mut() {
+                                    relocations.record(
+                                        source_index,
+                                        run.codes.clone(),
+                                        codes_offset + (rows_before * code_size) as u64,
+                                    );
+                                }
+                                rows_before += run.count;
+                            }
+                            copy_range(writer, &source.raw, block(run), cancellation)?;
+                            offset = checked_advance(offset, block(run).len())?;
+                        }
                     }
                 }
-                writer.write_all(&packed)?;
-                offset = checked_advance(offset, packed.len())?;
             }
-        } else {
-            for (source_index, &(source, _)) in sources.iter().enumerate() {
-                let mut cursor = cursors[source_index];
-                while let Some(run) = source
-                    .runs
-                    .get(cursor)
-                    .filter(|run| run.cluster_id == cluster_id)
-                {
-                    if let Some(relocations) = relocations.as_deref_mut() {
-                        relocations.record(source_index, run.codes.clone(), offset);
-                    }
-                    copy_range(writer, &source.raw, run.codes.clone(), cancellation)?;
-                    offset = checked_advance(offset, run.codes.len())?;
-                    cursor += 1;
-                }
+            let codes_len = if prefix_only {
+                count * header.prefix_bytes
+            } else {
+                expected_codes_column_len(header.kind, count, header.dim, header.code_size)?
+            };
+            if offset - codes_offset != codes_len as u64 {
+                return Err(invalid_data("compacted ANN code column length mismatch"));
             }
-        }
-        let expected_codes_len =
-            expected_codes_column_len(header.kind, count, header.dim, header.code_size)?;
-        if offset - codes_offset != expected_codes_len as u64 {
-            return Err(invalid_data("compacted ANN code column length mismatch"));
+            records.push(RunRecord {
+                cluster_id,
+                doc_base: 0,
+                count: u32::try_from(count)
+                    .map_err(|_| invalid_data("compacted ANN run exceeds u32 vectors"))?,
+                max_doc_id,
+                doc_ids_offset,
+                ordinals_offset,
+                codes_offset,
+                codes_len: u64::try_from(codes_len)
+                    .map_err(|_| invalid_data("compacted ANN code length exceeds u64"))?,
+            });
         }
 
         // Consume this cluster's runs from every cursor.
@@ -3538,24 +3773,6 @@ pub(crate) fn write_compacted_ann_cancellable(
                 cursors[source_index] += 1;
             }
         }
-
-        records.push(RunRecord {
-            cluster_id,
-            doc_base: 0,
-            count: u32::try_from(count)
-                .map_err(|_| invalid_data("compacted ANN run exceeds u32 vectors"))?,
-            max_doc_id,
-            doc_ids_offset,
-            ordinals_offset,
-            codes_offset,
-            codes_len: u64::try_from(expected_codes_column_len(
-                header.kind,
-                count,
-                header.dim,
-                code_size,
-            )?)
-            .map_err(|_| invalid_data("compacted ANN code length exceeds u64"))?,
-        });
     }
 
     if records.is_empty() {
@@ -4046,20 +4263,21 @@ fn write_u16_column(
     Ok(())
 }
 
-/// Leading `prefix_bytes` of every `code_size`-byte row, contiguous.
+/// The `bytes` slice of every `code_size`-byte row, contiguous: the prefix
+/// or suffix block of a split prefix layout.
 #[cfg(feature = "native")]
-fn write_prefix_column(
+fn write_code_slices(
     writer: &mut (impl Write + ?Sized),
     codes: &[u8],
     code_size: usize,
-    prefix_bytes: usize,
+    bytes: Range<usize>,
     scratch: &mut Vec<u8>,
 ) -> io::Result<()> {
     for rows in codes.chunks(64 * 1024 * code_size) {
         scratch.clear();
-        scratch.reserve(rows.len() / code_size * prefix_bytes);
+        scratch.reserve(rows.len() / code_size * bytes.len());
         for row in rows.chunks_exact(code_size) {
-            scratch.extend_from_slice(&row[..prefix_bytes]);
+            scratch.extend_from_slice(&row[bytes.clone()]);
         }
         writer.write_all(scratch)?;
     }
@@ -4244,6 +4462,7 @@ mod tests {
             doc_ids: &[0, 1],
             ordinals: &[0, 0],
             codes: &[0, 255],
+            prefix_only: false,
         }];
         let mut bytes = Vec::new();
         write_built_runs(binary_header(2), &runs, &mut bytes, None).unwrap();
@@ -4295,12 +4514,14 @@ mod tests {
                 doc_ids: &a0_docs,
                 ordinals: &a0_ords,
                 codes: &a0_codes,
+                prefix_only: false,
             },
             BuildRun {
                 cluster_id: 5,
                 doc_ids: &a5_docs,
                 ordinals: &a5_ords,
                 codes: &a5_codes,
+                prefix_only: false,
             },
         ];
         let mut header = binary_header(5);
@@ -4321,12 +4542,14 @@ mod tests {
                 doc_ids: &b0_docs,
                 ordinals: &b0_ords,
                 codes: &b0_codes,
+                prefix_only: false,
             },
             BuildRun {
                 cluster_id: 2,
                 doc_ids: &b2_docs,
                 ordinals: &b2_ords,
                 codes: &b2_codes,
+                prefix_only: false,
             },
         ];
         let mut header_b = binary_header(3);
@@ -4372,10 +4595,10 @@ mod tests {
         for cluster in 0..8u32 {
             let query = [0x5Au8];
             let from_copy = copied
-                .search_binary_clusters::<false>(&query, 16, &[cluster], 0)
+                .search_binary_clusters::<false>(&query, 16, &[cluster], 0, None)
                 .unwrap();
             let from_compact = compacted
-                .search_binary_clusters::<false>(&query, 16, &[cluster], 0)
+                .search_binary_clusters::<false>(&query, 16, &[cluster], 0, None)
                 .unwrap();
             assert_eq!(from_copy, from_compact, "cluster {cluster} diverged");
         }
@@ -4392,7 +4615,7 @@ mod tests {
         assert_eq!(generation3.health().vectors, 16);
         // And the third A copy's docs landed at offset 8.
         let all: Vec<(u32, u16, f32)> = compacted
-            .search_binary_clusters::<false>(&[0x5A], 32, &[0, 2, 5], 0)
+            .search_binary_clusters::<false>(&[0x5A], 32, &[0, 2, 5], 0, None)
             .unwrap();
         let mut docs: Vec<u32> = all.iter().map(|&(doc, _, _)| doc).collect();
         docs.sort_unstable();
@@ -4438,6 +4661,7 @@ mod tests {
                 doc_ids: &docs,
                 ordinals: &ordinals,
                 codes: &codes,
+                prefix_only: false,
             };
             let header = AnnDiskHeader {
                 kind: AnnKind::ScannAh,
@@ -4524,6 +4748,7 @@ mod tests {
                     doc_ids: docs,
                     ordinals: ords,
                     codes,
+                    prefix_only: false,
                 })
                 .collect();
             let header = AnnDiskHeader {
@@ -4654,12 +4879,14 @@ mod tests {
                 doc_ids: &a0_docs,
                 ordinals: &a0_ords,
                 codes: &a0_codes,
+                prefix_only: false,
             },
             BuildRun {
                 cluster_id: 3,
                 doc_ids: &a3_docs,
                 ordinals: &a3_ords,
                 codes: &a3_codes,
+                prefix_only: false,
             },
         ];
         let mut header = binary_header(8);
@@ -4676,6 +4903,7 @@ mod tests {
             doc_ids: &b0_docs,
             ordinals: &b0_ords,
             codes: &b0_codes,
+            prefix_only: false,
         }];
         let mut header_b = binary_header(2);
         header_b.num_clusters = 8;
@@ -4721,6 +4949,7 @@ mod tests {
                 doc_ids,
                 ordinals: &ords,
                 codes: &codes,
+                prefix_only: false,
             })
             .collect();
         let mut header = binary_header(8);
@@ -4773,18 +5002,21 @@ mod tests {
                     doc_ids: &[4, 1],
                     ordinals: &[1, 0],
                     codes: &[41, 10],
+                    prefix_only: false,
                 },
                 BuildRun {
                     cluster_id: 1,
                     doc_ids: &[4, 0],
                     ordinals: &[0, 0],
                     codes: &[40, 0],
+                    prefix_only: false,
                 },
                 BuildRun {
                     cluster_id: 2,
                     doc_ids: &[4],
                     ordinals: &[1],
                     codes: &[41],
+                    prefix_only: false,
                 },
             ];
             let mut locations = ExactLocations::default();
@@ -5010,12 +5242,14 @@ mod tests {
                     doc_ids: &[0, 1],
                     ordinals: &[0, 0],
                     codes: &[10, 11],
+                    prefix_only: false,
                 },
                 BuildRun {
                     cluster_id: 1,
                     doc_ids: &[2, 3],
                     ordinals: &[0, 0],
                     codes: &[12, 13],
+                    prefix_only: false,
                 },
             ],
             &mut bytes,
@@ -5060,6 +5294,7 @@ mod tests {
                 doc_ids: &[0],
                 ordinals: &[0],
                 codes: &[42],
+                prefix_only: false,
             }],
             &mut bytes,
             Some(&mut locations),
@@ -5107,18 +5342,58 @@ mod tests {
     }
 
     /// Every run's prefix column holds exactly the leading bytes of its codes.
-    fn assert_prefix_aligned(index: &AnnDiskIndex) {
+    /// Exact code of one row, reassembled from prefix and suffix rows in a
+    /// split layout (row-major otherwise).
+    fn row_code(index: &AnnDiskIndex, run: &AnnRun, row: usize) -> Vec<u8> {
+        let bytes = index.raw.as_slice();
+        let (width, prefix) = (index.header.code_size, index.header.prefix_bytes);
+        if prefix == 0 {
+            return bytes[run.codes.start + row * width..][..width].to_vec();
+        }
+        let mut code = bytes[run.prefix.start + row * prefix..][..prefix].to_vec();
+        code.extend_from_slice(
+            &bytes[run.suffix.start + row * (width - prefix)..][..width - prefix],
+        );
+        code
+    }
+
+    /// `(doc, ordinal) -> code` over full runs, after checking the split
+    /// layout shape of every run.
+    fn assert_prefix_aligned(
+        index: &AnnDiskIndex,
+    ) -> std::collections::BTreeMap<(u32, u16), Vec<u8>> {
         let bytes = index.raw.as_slice();
         let (code_size, prefix) = (index.header.code_size, index.header.prefix_bytes);
         assert!(prefix > 0);
+        let mut codes = std::collections::BTreeMap::new();
         for run in index.runs.iter() {
+            assert_eq!(run.prefix.start, run.codes.start);
             assert_eq!(run.prefix.len(), run.count * prefix);
+            if run.prefix_only {
+                assert!(run.suffix.is_empty());
+                continue;
+            }
+            assert_eq!(run.suffix.len(), run.count * (code_size - prefix));
             for row in 0..run.count {
-                let code = &bytes[run.codes.start + row * code_size..][..prefix];
-                let stored = &bytes[run.prefix.start + row * prefix..][..prefix];
-                assert_eq!(code, stored, "cluster {} row {row}", run.cluster_id);
+                let doc = run.doc_base + read_u32(bytes, run.doc_ids.start + row * 4);
+                let ordinal = read_u16(bytes, run.ordinals.start + row * 2);
+                codes.insert((doc, ordinal), row_code(index, run, row));
             }
         }
+        codes
+    }
+
+    fn plain_codes(index: &AnnDiskIndex) -> std::collections::BTreeMap<(u32, u16), Vec<u8>> {
+        let bytes = index.raw.as_slice();
+        let mut codes = std::collections::BTreeMap::new();
+        for run in index.runs.iter() {
+            for row in 0..run.count {
+                let doc = run.doc_base + read_u32(bytes, run.doc_ids.start + row * 4);
+                let ordinal = read_u16(bytes, run.ordinals.start + row * 2);
+                codes.insert((doc, ordinal), row_code(index, run, row));
+            }
+        }
+        codes
     }
 
     /// Deterministic multi-cluster binary payload with 64-bit codes and an
@@ -5142,6 +5417,7 @@ mod tests {
                 doc_ids: docs,
                 ordinals,
                 codes,
+                prefix_only: false,
             })
             .collect();
         let vectors = clusters as usize * per;
@@ -5177,7 +5453,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(index.header.prefix_bytes, 2);
-        assert_prefix_aligned(&index);
+        let split = assert_prefix_aligned(&index);
         // Layout revision 1 with the width in the header tail.
         assert_eq!(&bytes[20..24], &1u32.to_le_bytes());
         assert_eq!(&bytes[48..56], &2u64.to_le_bytes());
@@ -5197,7 +5473,11 @@ mod tests {
         let (plain, _) = prefixed_binary_payload(0, 1);
         assert_eq!(&plain[20..24], &0u32.to_le_bytes());
         assert_eq!(&plain[48..56], &0u64.to_le_bytes());
-        assert_eq!(plain.len() + 4 * 40 * 2, bytes.len());
+        // The split layout stores exactly the plain codes, in the same space.
+        assert_eq!(plain.len(), bytes.len());
+        let plain =
+            AnnDiskIndex::open(OwnedBytes::new(plain), AnnKind::BinaryIvf, docs as u32).unwrap();
+        assert_eq!(split, plain_codes(&plain));
     }
 
     /// SOAR payloads repeat a vector in two leaves. The spill flag round
@@ -5228,12 +5508,14 @@ mod tests {
                         doc_ids: &docs0,
                         ordinals: &ordinals0,
                         codes: &codes0,
+                        prefix_only: false,
                     },
                     BuildRun {
                         cluster_id: 1,
                         doc_ids: &docs1,
                         ordinals: &ordinals1,
                         codes: &codes1,
+                        prefix_only: false,
                     },
                 ],
                 &mut bytes,
@@ -5257,6 +5539,7 @@ mod tests {
                         50,
                         &[0, 1],
                         rerank,
+                        None,
                         parallel_min,
                     )
                     .unwrap();
@@ -5282,6 +5565,96 @@ mod tests {
         assert!(validate_header(&header).is_err());
     }
 
+    /// Prefix-only SOAR runs store no suffixes: their candidates are rescored
+    /// from the vector's primary copy found through the exact-vector locator,
+    /// and a payload with full and prefix-only runs is not fragmented.
+    #[test]
+    fn prefix_only_soar_runs_rescore_through_the_locator() {
+        let codes: Vec<u8> = (0..40u32).flat_map(|doc| [doc as u8, 0x3c]).collect();
+        let (docs0, docs1): (Vec<u32>, Vec<u32>) = ((0..20).collect(), (20..40).collect());
+        let zeros = vec![0u16; 20];
+        let spill_docs: Vec<u32> = (0..10).collect();
+        let spill_ordinals = vec![0u16; 10];
+        let mut header = binary_header(50);
+        header.dim = 16;
+        header.code_size = 2;
+        header.prefix_bytes = 1;
+        header.spilled = true;
+        let mut bytes = Vec::new();
+        write_built_runs(
+            header,
+            &[
+                BuildRun {
+                    cluster_id: 0,
+                    doc_ids: &docs0,
+                    ordinals: &zeros,
+                    codes: &codes[..40],
+                    prefix_only: false,
+                },
+                BuildRun {
+                    cluster_id: 1,
+                    doc_ids: &docs1,
+                    ordinals: &zeros,
+                    codes: &codes[40..],
+                    prefix_only: false,
+                },
+                BuildRun {
+                    cluster_id: 1,
+                    doc_ids: &spill_docs,
+                    ordinals: &spill_ordinals,
+                    codes: &codes[..20],
+                    prefix_only: true,
+                },
+            ],
+            &mut bytes,
+            None,
+        )
+        .unwrap();
+        let index = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 40).unwrap();
+        assert!(index.has_prefix_only_runs);
+        let health = index.health();
+        assert_eq!((health.runs, health.run_groups), (3, 3));
+        assert_eq!(health.fragmentation(), 1.0);
+        // Exact lookups may not point into the prefix-only run.
+        let spill_run = index.runs.iter().find(|run| run.prefix_only).unwrap();
+        assert!(
+            index
+                .exact_location_spans([(spill_run.codes.start as u64, 1)].into_iter())
+                .is_err()
+        );
+
+        let raw = index.raw.as_slice();
+        let mut locations = std::collections::HashMap::new();
+        for run in index.runs.iter().filter(|run| !run.prefix_only) {
+            for row in 0..run.count {
+                let doc = run.doc_base + read_u32(raw, run.doc_ids.start + row * 4);
+                locations.insert(doc, (run.codes.start + row * 2) as u64);
+            }
+        }
+        let locator = |doc: u32, _ordinal: u16| locations.get(&doc).copied();
+        let query = [5u8, 0x3c];
+        // Probing only cluster 1 finds doc 5 through its prefix-only copy.
+        for (rerank, parallel_min) in [(0, usize::MAX), (4, usize::MAX), (4, 1)] {
+            let hits = index
+                .search_binary_clusters_with_tuning::<false>(
+                    &query,
+                    3,
+                    &[1],
+                    rerank,
+                    Some(&locator),
+                    parallel_min,
+                )
+                .unwrap();
+            assert_eq!(hits[0], (5, 0, 1.0), "rerank {rerank}");
+        }
+        assert!(
+            index
+                .search_binary_clusters_with_tuning::<false>(&query, 3, &[1], 4, None, usize::MAX)
+                .is_err(),
+            "prefix-only candidates without a locator must fail loudly"
+        );
+    }
+
     #[test]
     fn binary_prefix_columns_survive_copy_coalescing_and_deletion() {
         let (left_bytes, left_docs) = prefixed_binary_payload(2, 2);
@@ -5300,12 +5673,18 @@ mod tests {
         .unwrap();
         let total = (left_docs + right_docs) as u32;
         let sources = [(&left, 0u32), (&right, left_docs as u32)];
+        let mut expected = assert_prefix_aligned(&left);
+        expected.extend(
+            assert_prefix_aligned(&right)
+                .into_iter()
+                .map(|((doc, ordinal), code)| ((doc + left_docs as u32, ordinal), code)),
+        );
 
         let mut copied = Vec::new();
         write_merged_ann(&sources, &mut copied).unwrap();
         let copied =
             AnnDiskIndex::open(OwnedBytes::new(copied), AnnKind::BinaryIvf, total).unwrap();
-        assert_prefix_aligned(&copied);
+        assert_eq!(assert_prefix_aligned(&copied), expected);
 
         let mut coalesced = Vec::new();
         let mut relocations = CodeRelocations::default();
@@ -5314,7 +5693,7 @@ mod tests {
         let coalesced =
             AnnDiskIndex::open(OwnedBytes::new(coalesced), AnnKind::BinaryIvf, total).unwrap();
         assert_eq!(coalesced.health().fragmentation(), 1.0);
-        assert_prefix_aligned(&coalesced);
+        assert_eq!(assert_prefix_aligned(&coalesced), expected);
 
         // Drop every third document; survivors keep aligned prefixes.
         let rows = crate::segment::row_map::RowMap::new(
@@ -5328,7 +5707,12 @@ mod tests {
         write_live_ann(&coalesced, &rows, &mut live, 1 << 20, None, None).unwrap();
         let live =
             AnnDiskIndex::open(OwnedBytes::new(live), AnnKind::BinaryIvf, rows.len()).unwrap();
-        assert_prefix_aligned(&live);
+        let survivors: std::collections::BTreeMap<_, _> = expected
+            .iter()
+            .filter(|((doc, _), _)| doc % 3 != 0)
+            .map(|(&(doc, ordinal), code)| ((rows.get(doc).unwrap(), ordinal), code.clone()))
+            .collect();
+        assert_eq!(assert_prefix_aligned(&live), survivors);
         assert_eq!(live.header.vector_count, rows.len() as usize);
 
         // Mixed prefix widths are incompatible generations.
@@ -5365,8 +5749,8 @@ mod tests {
             for run in index.cluster_runs(cluster) {
                 for row in 0..run.count {
                     let doc = run.doc_base + read_u32(raw, run.doc_ids.start + row * 4);
-                    let code = &raw[run.codes.start + row * 8..][..8];
-                    postings.push((ham(&query[..2], &code[..2]), doc, ham(&query, code)));
+                    let code = row_code(&index, run, row);
+                    postings.push((ham(&query[..2], &code[..2]), doc, ham(&query, &code)));
                 }
             }
         }
@@ -5385,6 +5769,7 @@ mod tests {
                         5,
                         &clusters,
                         rerank,
+                        None,
                         parallel_min,
                     )
                     .unwrap();
@@ -5395,7 +5780,7 @@ mod tests {
             }
         }
         let full = index
-            .search_binary_clusters_with_tuning::<false>(&query, 5, &clusters, 0, usize::MAX)
+            .search_binary_clusters_with_tuning::<false>(&query, 5, &clusters, 0, None, usize::MAX)
             .unwrap();
         let covering = index
             .search_binary_clusters_with_tuning::<false>(
@@ -5403,6 +5788,7 @@ mod tests {
                 5,
                 &clusters,
                 postings.len(),
+                None,
                 usize::MAX,
             )
             .unwrap();
@@ -5426,12 +5812,14 @@ mod tests {
                     doc_ids: &docs[..count - 73],
                     ordinals: &ordinals[..count - 73],
                     codes: &codes[..count - 73],
+                    prefix_only: false,
                 },
                 BuildRun {
                     cluster_id: 1,
                     doc_ids: &docs[count - 73..],
                     ordinals: &ordinals[count - 73..],
                     codes: &codes[count - 73..],
+                    prefix_only: false,
                 },
             ],
             &mut bytes,
@@ -5496,6 +5884,7 @@ mod tests {
                                     k,
                                     &[0, 1],
                                     0,
+                                    None,
                                     parallel_threshold,
                                 )
                             })
@@ -5507,6 +5896,7 @@ mod tests {
                                     k,
                                     &[0, 1],
                                     0,
+                                    None,
                                     parallel_threshold,
                                 )
                             })
@@ -5546,12 +5936,14 @@ mod tests {
                 doc_ids: &first_doc_0,
                 ordinals: &first_ord_0,
                 codes: &first_code_0,
+                prefix_only: false,
             },
             BuildRun {
                 cluster_id: 1,
                 doc_ids: &first_doc_1,
                 ordinals: &first_ord_1,
                 codes: &first_code_1,
+                prefix_only: false,
             },
         ];
         let mut first_bytes = Vec::new();
@@ -5567,6 +5959,7 @@ mod tests {
             doc_ids: &second_docs,
             ordinals: &second_ords,
             codes: &second_codes,
+            prefix_only: false,
         }];
         let mut second_bytes = Vec::new();
         write_built_runs(binary_header(2), &second_runs, &mut second_bytes, None).unwrap();
@@ -5589,7 +5982,7 @@ mod tests {
         );
 
         let mut docs: Vec<u32> = merged
-            .search_binary_clusters::<false>(&[0], 4, &[0, 1], 0)
+            .search_binary_clusters::<false>(&[0], 4, &[0, 1], 0, None)
             .unwrap()
             .into_iter()
             .map(|result| result.0)
@@ -5597,13 +5990,15 @@ mod tests {
         docs.sort_unstable();
         assert_eq!(docs, [0, 1, 2, 3]);
         let serial = merged
-            .search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], 0, usize::MAX)
+            .search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], 0, None, usize::MAX)
             .unwrap();
         let parallel = rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .build()
             .unwrap()
-            .install(|| merged.search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], 0, 1))
+            .install(|| {
+                merged.search_binary_clusters_with_tuning::<false>(&[0], 4, &[0, 1], 0, None, 1)
+            })
             .unwrap();
         assert_eq!(parallel, serial, "parallel binary top-k changed results");
 
@@ -5627,7 +6022,7 @@ mod tests {
             expected_second_payload.as_slice(),
         );
         let mut docs: Vec<u32> = second_merge
-            .search_binary_clusters::<false>(&[0], 6, &[0, 1], 0)
+            .search_binary_clusters::<false>(&[0], 6, &[0, 1], 0, None)
             .unwrap()
             .into_iter()
             .map(|result| result.0)
@@ -5683,12 +6078,14 @@ mod tests {
                 doc_ids: &cluster_0_docs,
                 ordinals: &cluster_0_ordinals,
                 codes: &cluster_0_codes,
+                prefix_only: false,
             },
             BuildRun {
                 cluster_id: 1,
                 doc_ids: &cluster_1_docs,
                 ordinals: &cluster_1_ordinals,
                 codes: &cluster_1_codes,
+                prefix_only: false,
             },
         ];
         let mut bytes = Vec::new();
@@ -5699,10 +6096,12 @@ mod tests {
             .build()
             .unwrap();
         let serial_documents = disk
-            .search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], 0, usize::MAX)
+            .search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], 0, None, usize::MAX)
             .unwrap();
         let parallel_documents = parallel_pool
-            .install(|| disk.search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], 0, 1))
+            .install(|| {
+                disk.search_binary_clusters_with_tuning::<true>(&[0], 3, &[0, 1], 0, None, 1)
+            })
             .unwrap();
         assert_eq!(parallel_documents, serial_documents);
 
@@ -5711,11 +6110,11 @@ mod tests {
         // deduplicated, doc 1 wins.
         let sum = crate::query::MultiValueCombiner::Sum;
         let (result, probed) = disk
-            .search_binary_combined_documents(1, &[0], &[0, 1], sum, 0)
+            .search_binary_combined_documents(1, &[0], &[0, 1], sum, 0, None)
             .unwrap();
         let parallel_sum = parallel_pool
             .install(|| {
-                disk.search_binary_combined_documents_with_tuning(1, &[0], &[0, 1], sum, 0, 1)
+                disk.search_binary_combined_documents_with_tuning(1, &[0], &[0, 1], sum, 0, None, 1)
             })
             .unwrap();
         assert_eq!(parallel_sum, (result.clone(), probed.clone()));
@@ -5742,7 +6141,7 @@ mod tests {
         // inflate it.
         let smooth_max = crate::query::MultiValueCombiner::default();
         let (result, probed) = disk
-            .search_binary_combined_documents(1, &[0], &[0, 1], smooth_max, 0)
+            .search_binary_combined_documents(1, &[0], &[0, 1], smooth_max, 0, None)
             .unwrap();
         let parallel_smooth_max = parallel_pool
             .install(|| {
@@ -5752,6 +6151,7 @@ mod tests {
                     &[0, 1],
                     smooth_max,
                     0,
+                    None,
                     1,
                 )
             })
@@ -5781,6 +6181,7 @@ mod tests {
                 &[0, 1],
                 crate::query::MultiValueCombiner::Sum,
                 0,
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -5996,6 +6397,7 @@ mod tests {
             doc_ids: &docs,
             ordinals: &ordinals,
             codes: &codes,
+            prefix_only: false,
         };
         let header = AnnDiskHeader {
             kind: AnnKind::ScannAh,
@@ -6545,6 +6947,7 @@ mod tests {
                 doc_ids: &unique_docs,
                 ordinals: &unique_ordinals,
                 codes: &codes,
+                prefix_only: false,
             }],
             &mut unique_bytes,
             None,
@@ -6564,6 +6967,7 @@ mod tests {
                 doc_ids: &multi_docs,
                 ordinals: &multi_ordinals,
                 codes: &codes,
+                prefix_only: false,
             }],
             &mut multi_bytes,
             None,
@@ -6591,13 +6995,21 @@ mod tests {
                     20,
                     &[0],
                     0,
+                    None,
                     usize::MAX,
                 )
             })
             .unwrap();
         let parallel = pool
             .install(|| {
-                unique_disk.search_binary_clusters_with_tuning::<false>(&query, 20, &[0], 0, 1)
+                unique_disk.search_binary_clusters_with_tuning::<false>(
+                    &query,
+                    20,
+                    &[0],
+                    0,
+                    None,
+                    1,
+                )
             })
             .unwrap();
         assert_eq!(parallel, serial);
@@ -6612,6 +7024,7 @@ mod tests {
                         20,
                         &[0],
                         0,
+                        None,
                         usize::MAX,
                     )
                 })
@@ -6622,7 +7035,14 @@ mod tests {
             let start = std::time::Instant::now();
             std::hint::black_box(
                 pool.install(|| {
-                    unique_disk.search_binary_clusters_with_tuning::<false>(&query, 20, &[0], 0, 1)
+                    unique_disk.search_binary_clusters_with_tuning::<false>(
+                        &query,
+                        20,
+                        &[0],
+                        0,
+                        None,
+                        1,
+                    )
                 })
                 .unwrap(),
             );
@@ -6645,6 +7065,7 @@ mod tests {
                     &[0],
                     combiner,
                     0,
+                    None,
                     1,
                 )
             })
@@ -6657,6 +7078,7 @@ mod tests {
                     &[0],
                     combiner,
                     0,
+                    None,
                     1,
                 )
             })
@@ -6675,6 +7097,7 @@ mod tests {
                             &[0],
                             combiner,
                             0,
+                            None,
                             1,
                         )
                     })
@@ -6691,6 +7114,7 @@ mod tests {
                         &[0],
                         combiner,
                         0,
+                        None,
                         1,
                     )
                 })
@@ -6757,6 +7181,7 @@ mod tests {
             doc_ids: &docs,
             ordinals: &ordinals,
             codes: &codes,
+            prefix_only: false,
         }];
         let mut bytes = Vec::new();
         write_built_runs(binary_header(1), &runs, &mut bytes, None).unwrap();
@@ -6900,14 +7325,28 @@ mod tests {
         );
 
         let serial = disk
-            .search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], 0, usize::MAX)
+            .search_binary_clusters_with_tuning::<false>(
+                &[0x12, 0x34],
+                2,
+                &[0, 1],
+                0,
+                None,
+                usize::MAX,
+            )
             .unwrap();
         let parallel = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .build()
             .unwrap()
             .install(|| {
-                disk.search_binary_clusters_with_tuning::<false>(&[0x12, 0x34], 2, &[0, 1], 0, 1)
+                disk.search_binary_clusters_with_tuning::<false>(
+                    &[0x12, 0x34],
+                    2,
+                    &[0, 1],
+                    0,
+                    None,
+                    1,
+                )
             })
             .unwrap();
         assert_eq!(parallel, serial);
@@ -7040,7 +7479,7 @@ mod tests {
         );
         assert_eq!(
             merged
-                .search_binary_clusters::<false>(&[0, 0], 4, &[0, 1], 0)
+                .search_binary_clusters::<false>(&[0, 0], 4, &[0, 1], 0, None)
                 .unwrap()
                 .len(),
             4,
@@ -7185,18 +7624,9 @@ pub(crate) fn write_live_ann(
         let ordinals_offset = offset;
         copy_selected_column(writer, &raw[run.ordinals.clone()], 2, kept(), &check)?;
         offset = checked_advance(offset, count * 2)?;
-        if header.prefix_bytes > 0 {
-            copy_selected_column(
-                writer,
-                &raw[run.prefix.clone()],
-                header.prefix_bytes,
-                kept(),
-                &check,
-            )?;
-            offset = checked_advance(offset, count * header.prefix_bytes)?;
-        }
         let codes_offset = offset;
-        if let Some(map) = locations.as_deref_mut() {
+        // Prefix-only SOAR runs are never exact-lookup targets.
+        if let Some(map) = locations.as_deref_mut().filter(|_| !run.prefix_only) {
             let span = map.span(codes_offset, count)?;
             for (new_row, old) in kept().enumerate() {
                 let doc = rows
@@ -7218,6 +7648,26 @@ pub(crate) fn write_live_ann(
             }
         } else {
             match header.kind {
+                AnnKind::BinaryIvf if header.prefix_bytes > 0 => {
+                    // Split layout: surviving prefix rows, then (full runs
+                    // only) surviving suffix rows.
+                    copy_selected_column(
+                        writer,
+                        &raw[run.prefix.clone()],
+                        header.prefix_bytes,
+                        kept(),
+                        &check,
+                    )?;
+                    if !run.prefix_only {
+                        copy_selected_column(
+                            writer,
+                            &raw[run.suffix.clone()],
+                            header.code_size - header.prefix_bytes,
+                            kept(),
+                            &check,
+                        )?;
+                    }
+                }
                 AnnKind::BinaryIvf | AnnKind::ScannBinary => {
                     copy_selected_column(writer, codes, header.code_size, kept(), &check)?
                 }
@@ -7289,8 +7739,11 @@ pub(crate) fn write_live_ann(
                 }
             }
         }
-        let codes_len =
-            expected_codes_column_len(header.kind, count, header.dim, header.code_size)?;
+        let codes_len = if run.prefix_only {
+            count * header.prefix_bytes
+        } else {
+            expected_codes_column_len(header.kind, count, header.dim, header.code_size)?
+        };
         offset = checked_advance(offset, codes_len)?;
         records.push(RunRecord {
             cluster_id: run.cluster_id,
@@ -7398,6 +7851,7 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
                 doc_ids: &docs,
                 ordinals: &ords,
                 codes: &codes,
+                prefix_only: false,
             }],
             &mut source_bytes,
             None,
@@ -7441,6 +7895,7 @@ fn deleting_ann_rows_preserves_all_code_formats_generations_and_ordinals() {
                     doc_ids: &kept_docs,
                     ordinals: &kept_ords,
                     codes: &kept_codes,
+                    prefix_only: false,
                 }],
                 &mut expected,
                 None,
@@ -7522,6 +7977,7 @@ async fn compacted_aligned_scann_groups_preserve_odd_block_padding() {
             doc_ids: &docs,
             ordinals: &ordinals,
             codes: &codes,
+            prefix_only: false,
         }],
         &mut bytes,
         None,
@@ -7542,6 +7998,7 @@ async fn compacted_aligned_scann_groups_preserve_odd_block_padding() {
             doc_ids: &docs[..64],
             ordinals: &ordinals[..64],
             codes: &encode(32),
+            prefix_only: false,
         }],
         &mut expected,
         None,
