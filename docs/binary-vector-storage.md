@@ -103,31 +103,42 @@ run writers report actual code positions; a bounded external metadata sort puts
 rows in document order and deduplicates SOAR secondary assignments. Temporary
 sort files are anonymous RAII-owned files, with bounded runs and merge fan-in.
 
-**Normal merge copies both ANN payloads and lookup rows verbatim.** It adjusts
-only ANN run directories, span byte bases, and block document bases. It does not
-read or rewrite per-vector labels/addresses, reconstruct vectors, reassign leaves,
-or retrain models. Copy scratch is bounded independently of corpus size; directory
-memory scales with runs and source blocks, as in the ANN reader. A repeated merge
-retains source extents and lookup blocks. Consequently binary fragmentation can
-grow; diagnostics report it. This deliberately replaces automatic binary run
-coalescing, which rewrote document labels and would require rebuilding lookups.
-Float AH merge retains its existing packing/compaction policy.
+**Normal merge keeps lookup rows verbatim and coalesces clusters.** When the
+merged output would hold more than one run for some cluster (predicted exactly
+from the source directories), the encoded-run compactor writes one run per
+cluster: codes and ordinals are copied verbatim, and document IDs are rewritten
+absolute with one `u32` add per posting, as float AH merge already does. Merges
+whose sources cannot share a cluster keep the byte-copy writer. Neither path
+reconstructs vectors, reassigns leaves, or retrains models.
 
-Standalone reorder coalesces fragmented binary ANN clusters through the existing
-encoded-run compactor. Each cluster becomes one run; codes and ordinals are copied
-verbatim, document labels are rebased, and a bounded external sort constructs the
-replacement lookup. Logical IDs and shared training artifacts are unchanged.
-Already contiguous fields keep the copy path. This uses the existing reorder
-budget, cancellation, cold writer, output claim, and atomic publication lifecycle;
-it also works on binary-only indexes. Normal merge never requests this work,
-even when text/BMP merge-time reordering is enabled. Deletion compaction and
-explicit training/rebuild also construct new lookups when required.
+The lookup is not rebuilt. Every lookup span lies inside one ANN run: builds and
+rebuilds emit one span per run, compaction and deletion compaction one span per
+copied or filtered run, and the reader rejects any other span at admission.
+Coalescing moves each source run's codes as one contiguous range, so the
+compactor records `(source code range → output offset)` per source run and the
+lookup writer translates each span offset through that map. Rows, whose
+addresses are `(span, row)` pairs, are copied verbatim; block document bases are
+rebased as before. A span not wholly inside one copied run aborts the merge as
+corrupt data rather than shifting an address. Relocation memory is one entry
+per source run, the same order as the source directories the merge already
+holds; there is no lookup sort and no per-row lookup rewrite. The span directory
+keeps the sum of the source spans, exactly as a byte-copy merge does.
 
-The normal binary merge writer has no location-building callback: it cannot sort
-lookup rows or coalesce clusters. Its cost is payload I/O plus run/span/block
-metadata, with bounded copy scratch. End-to-end merge also includes opening and
-validating readers and publishing the output; those costs must be measured rather
-than inferred from the writer alone.
+This replaces the earlier policy of copying binary extents unchanged, which let
+runs per cluster multiply with every merge tier. That earlier policy existed
+because coalescing was thought to require rebuilding the lookup with the external
+sort (about 240 ns per row). Measured merge and query costs are in the
+[performance review](search-performance-review.md).
+
+Standalone reorder uses the same coalescing writer for segments that are still
+fragmented, such as outputs of earlier versions. It keeps its reorder budget,
+cancellation, cold writer, output claim, and atomic publication lifecycle, and
+it also works on binary-only indexes. Already contiguous fields keep the copy
+path. Deletion compaction and explicit training/rebuild construct new lookups
+with the bounded external sort, because they write new rows.
+
+End-to-end merge also includes opening and validating readers and publishing the
+output; those costs must be measured rather than inferred from the writer alone.
 
 The exact-vector reader shares the ANN reader's immutable byte owner, including
 for remote readers, so it neither duplicates the payload in memory nor fetches

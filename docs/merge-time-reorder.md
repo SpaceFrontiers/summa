@@ -122,14 +122,15 @@ filtering changes block membership. See [row deletion](row-deletion.md).
 
 ## Standalone binary ANN coalescing
 
-Standalone reorder also joins fragmented binary IVF/ScaNN runs by cluster, using
-the existing encoded-run compactor and exact-location writer. This requires no
+Ordinary merges coalesce overlapping binary IVF/ScaNN runs by cluster themselves,
+independently of `reorder_on_merge`: codes, ordinals and lookup rows are copied
+verbatim, and only document labels and lookup span offsets are remapped. No BP
+pass, lookup sort or retraining is involved.
+
+Standalone reorder uses the same encoded-run compactor for segments that are
+still fragmented (for example, merged by an earlier version). This requires no
 `reorder` field attribute and works on binary-only indexes. It preserves exact
 codes, ordinals, logical IDs, and global training artifacts. It uses the same
 output ownership, cancellation, memory budget, and publication as text/BMP
-reorder; already contiguous vector files are linked/copied unchanged.
-
-This work is deliberately outside merge-time BP: ordinary binary merges always
-copy ANN payloads and exact lookup rows, even when `reorder_on_merge` is enabled.
-Cluster coalescing rewrites labels and sorts lookup metadata, so it belongs in
-the separate maintenance pass. See [binary vector storage](binary-vector-storage.md).
+reorder; already contiguous vector files are linked/copied unchanged. See
+[binary vector storage](binary-vector-storage.md).

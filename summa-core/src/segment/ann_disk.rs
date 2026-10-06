@@ -2996,8 +2996,9 @@ const DOC_ID_REWRITE_CHUNK: usize = 64 * 1024;
 /// representation is intentionally outside this ScaNN compactor; TQ merges
 /// stay byte-copy.
 ///
-/// Normal float-AH merges use this when fragmented. Binary normal merges
-/// retain source runs so their exact-vector lookup rows remain copyable.
+/// Normal merges use this whenever the output would be fragmented. Binary
+/// codes move as whole source runs; `relocations` records where, so the
+/// exact-vector lookup rows stay copyable with translated span offsets.
 /// Measured (interleaved best-of-3, pre-faulted buffers, aarch64): byte-copy
 /// 38.0 GiB/s vs compaction 32.4 GiB/s — ~17% more CPU on a stage that is a
 /// rounding error of merge wall-clock (a production dense stage is ~0.7s of
@@ -3008,7 +3009,7 @@ pub(crate) fn write_compacted_ann_cancellable(
     sources: &[(&AnnDiskIndex, u32)],
     writer: &mut (impl Write + ?Sized),
     cancellation: Option<&std::sync::atomic::AtomicBool>,
-    mut locations: Option<&mut crate::segment::vector_locations::ExactLocations>,
+    mut relocations: Option<&mut CodeRelocations>,
 ) -> io::Result<u64> {
     let Some((first, _)) = sources.first() else {
         return Err(invalid_data("cannot compact an empty ANN source list"));
@@ -3034,8 +3035,16 @@ pub(crate) fn write_compacted_ann_cancellable(
             .checked_add(source.header.vector_count)
             .ok_or_else(|| invalid_data("compacted ANN vector count overflows usize"))?;
     }
+    if relocations.is_some() && header.kind == AnnKind::ScannAh {
+        return Err(invalid_data(
+            "ScaNN AH codes are repacked, so their positions cannot be relocated",
+        ));
+    }
     validate_header(&header)?;
     write_header(writer, &header)?;
+    if let Some(relocations) = relocations.as_deref_mut() {
+        relocations.reset(sources)?;
+    }
 
     let code_size = header.code_size;
     let mut offset = ANN_HEADER_SIZE as u64;
@@ -3187,22 +3196,9 @@ pub(crate) fn write_compacted_ann_cancellable(
                     .get(cursor)
                     .filter(|run| run.cluster_id == cluster_id)
                 {
-                    let base = run
-                        .doc_base
-                        .checked_add(sources[source_index].1)
-                        .ok_or_else(|| invalid_data("ANN document base overflow"))?;
-                    record_exact_locations(
-                        &mut locations,
-                        offset,
-                        run.count,
-                        |row| {
-                            Ok((
-                                run_doc_id_with_base(source.raw.as_slice(), run, row, base)?,
-                                read_u16(source.raw.as_slice(), run.ordinals.start + row * 2),
-                            ))
-                        },
-                        cancellation,
-                    )?;
+                    if let Some(relocations) = relocations.as_deref_mut() {
+                        relocations.record(source_index, run.codes.clone(), offset);
+                    }
                     copy_range(writer, &source.raw, run.codes.clone(), cancellation)?;
                     offset = checked_advance(offset, run.codes.len())?;
                     cursor += 1;
@@ -3248,7 +3244,76 @@ pub(crate) fn write_compacted_ann_cancellable(
     if records.is_empty() {
         return Err(invalid_data("cannot compact an ANN payload with no runs"));
     }
+    if let Some(relocations) = relocations {
+        relocations.finish();
+    }
     finish_layout(writer, offset, &records)
+}
+
+/// Where a coalescing merge placed each source run's exact codes.
+///
+/// Exact binary codes are copied as whole source runs, so a byte inside a
+/// source run moves by that run's displacement. Every exact-vector lookup
+/// span lies inside one run (all writers emit spans per run or sub-run, and
+/// [`AnnDiskIndex::exact_location_spans`] rejects anything else), which lets
+/// the lookup writer keep its rows verbatim and translate only span offsets.
+/// Memory is one entry per source run, the same order as the source
+/// directories the merge already holds.
+#[cfg(feature = "native")]
+#[derive(Debug, Default)]
+pub(crate) struct CodeRelocations {
+    /// Per source: `(source code range, output code offset)`, sorted by the
+    /// source range once the writer finishes.
+    runs: Vec<Vec<(Range<usize>, u64)>>,
+}
+
+#[cfg(feature = "native")]
+impl CodeRelocations {
+    fn reset(&mut self, sources: &[(&AnnDiskIndex, u32)]) -> io::Result<()> {
+        self.runs.clear();
+        for (source, _) in sources {
+            let mut runs = Vec::new();
+            runs.try_reserve_exact(source.runs.len())
+                .map_err(|_| invalid_data("ANN relocation directory allocation failed"))?;
+            self.runs.push(runs);
+        }
+        Ok(())
+    }
+
+    fn record(&mut self, source: usize, codes: Range<usize>, output: u64) {
+        self.runs[source].push((codes, output));
+    }
+
+    fn finish(&mut self) {
+        for runs in &mut self.runs {
+            runs.sort_unstable_by_key(|(codes, _)| codes.start);
+        }
+    }
+
+    /// Output offset of a `bytes`-long code range that started at `offset`
+    /// in source `source`. A range that is not wholly inside one copied run
+    /// is corruption, never a silently shifted address.
+    pub(crate) fn relocate(&self, source: usize, offset: u64, bytes: u64) -> io::Result<u64> {
+        let runs = self
+            .runs
+            .get(source)
+            .ok_or_else(|| invalid_data("relocated vector span names an unknown source"))?;
+        let start = usize::try_from(offset)
+            .map_err(|_| invalid_data("vector location exceeds address space"))?;
+        let end = usize::try_from(bytes)
+            .ok()
+            .and_then(|bytes| start.checked_add(bytes))
+            .ok_or_else(|| invalid_data("vector location span overflows"))?;
+        let at = runs.partition_point(|(codes, _)| codes.start <= start);
+        let (codes, output) = at
+            .checked_sub(1)
+            .and_then(|at| runs.get(at))
+            .filter(|(codes, _)| end <= codes.end)
+            .ok_or_else(|| invalid_data("vector location span is not within one copied ANN run"))?;
+        output
+            .checked_add((start - codes.start) as u64)
+            .ok_or_else(|| invalid_data("relocated vector location overflows"))
+    }
 }
 
 /// Append one ScaNN-AH row as unpacked 4-bit block codes. Complete 32-row
@@ -4429,14 +4494,13 @@ mod tests {
                     expected_payload
                 );
                 let mut map = Vec::new();
+                let biases = [0, left_ann.copied_payload_bytes() as u64];
                 write_copied_locations(
-                    &[
-                        (left_exact, 0, 0),
-                        (&exact, left_docs, left_ann.copied_payload_bytes() as u64),
-                    ],
+                    &[(left_exact, 0), (&exact, left_docs)],
                     8,
                     (generation as usize + 1) * 4,
                     bytes.len() as u64,
+                    |source, offset, _| Ok(offset + biases[source]),
                     &mut map,
                     None,
                 )
@@ -4475,57 +4539,144 @@ mod tests {
                 merged = Some((next_ann, next_exact));
             }
             let (merged_ann, merged_exact) = merged.unwrap();
-            let mut coalesced = Vec::new();
-            let mut locations = ExactLocations::with_budget(128 * 1024, None).unwrap();
-            write_compacted_ann_cancellable(
-                &[(&merged_ann, 0)],
-                &mut coalesced,
-                None,
-                Some(&mut locations),
-            )
-            .unwrap();
-            let mut map = Vec::new();
-            locations
-                .write(
+            // Coalesce the fragmented generation alone (standalone reorder)
+            // and together with another source (a coalescing merge). Lookup
+            // rows stay verbatim; only span offsets follow their runs.
+            for coalesce_sources in [
+                vec![(&merged_ann, &merged_exact, 0u32)],
+                vec![(&merged_ann, &merged_exact, 0), (&source, &exact, 24)],
+            ] {
+                let ann_sources: Vec<_> = coalesce_sources
+                    .iter()
+                    .map(|&(ann, _, base)| (ann, base))
+                    .collect();
+                let mut coalesced = Vec::new();
+                let mut relocations = CodeRelocations::default();
+                write_compacted_ann_cancellable(
+                    &ann_sources,
+                    &mut coalesced,
+                    None,
+                    Some(&mut relocations),
+                )
+                .unwrap();
+                let lookup_sources: Vec<_> = coalesce_sources
+                    .iter()
+                    .map(|&(_, exact, base)| (exact, base))
+                    .collect();
+                let vectors = lookup_sources
+                    .iter()
+                    .map(|(exact, _)| exact.num_vectors)
+                    .sum();
+                let mut map = Vec::new();
+                write_copied_locations(
+                    &lookup_sources,
                     8,
-                    merged_exact.num_vectors,
+                    vectors,
                     coalesced.len() as u64,
+                    |source, offset, bytes| relocations.relocate(source, offset, bytes),
                     &mut map,
                     None,
                 )
                 .unwrap();
-            let (ann, exact) = open(coalesced, map, kind, 24).await;
-            assert_eq!(ann.health().fragmentation(), 1.0);
-            assert_eq!(
-                ann.header.quantizer_version,
-                merged_ann.header.quantizer_version
-            );
-            assert_eq!(
-                ann.header.codebook_version,
-                merged_ann.header.codebook_version
-            );
-            assert_eq!(exact.num_vectors, merged_exact.num_vectors);
-            for row in 0..exact.num_vectors {
-                assert_eq!(exact.get_doc_id(row), merged_exact.get_doc_id(row));
+                let docs = 24 + 6 * (coalesce_sources.len() as u32 - 1);
+                let (ann, coalesced_exact) = open(coalesced, map, kind, docs).await;
+                assert_eq!(ann.health().fragmentation(), 1.0);
                 assert_eq!(
-                    exact.read_vectors_batch(row, 1).await.unwrap().as_slice(),
-                    merged_exact
-                        .read_vectors_batch(row, 1)
-                        .await
-                        .unwrap()
-                        .as_slice()
+                    ann.header.quantizer_version,
+                    merged_ann.header.quantizer_version
                 );
+                assert_eq!(
+                    ann.header.codebook_version,
+                    merged_ann.header.codebook_version
+                );
+                let expected_rows: Vec<u8> = lookup_sources
+                    .iter()
+                    .flat_map(|(exact, _)| exact.location_rows().to_vec())
+                    .collect();
+                assert_eq!(coalesced_exact.location_rows(), expected_rows);
+                assert_eq!(coalesced_exact.num_vectors, vectors);
+                let mut row = 0;
+                for &(_, source_exact, base) in &coalesce_sources {
+                    for source_row in 0..source_exact.num_vectors {
+                        let (doc, ordinal) = source_exact.get_doc_id(source_row);
+                        assert_eq!(coalesced_exact.get_doc_id(row), (doc + base, ordinal));
+                        assert_eq!(
+                            coalesced_exact
+                                .read_vectors_batch(row, 1)
+                                .await
+                                .unwrap()
+                                .as_slice(),
+                            source_exact
+                                .read_vectors_batch(source_row, 1)
+                                .await
+                                .unwrap()
+                                .as_slice()
+                        );
+                        row += 1;
+                    }
+                }
             }
             let cancelled = std::sync::atomic::AtomicBool::new(true);
             let error = write_compacted_ann_cancellable(
                 &[(&merged_ann, 0)],
                 &mut Vec::new(),
                 Some(&cancelled),
-                Some(&mut ExactLocations::default()),
+                Some(&mut CodeRelocations::default()),
             )
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         }
+    }
+
+    /// A lookup span must move with exactly one copied run. Anything else is
+    /// corruption: shifting it by a neighbouring run would read another vector.
+    #[test]
+    fn code_relocation_rejects_spans_outside_one_copied_run() {
+        let mut header = binary_header(4);
+        header.num_clusters = 2;
+        let mut bytes = Vec::new();
+        write_built_runs(
+            header,
+            &[
+                BuildRun {
+                    cluster_id: 0,
+                    doc_ids: &[0, 1],
+                    ordinals: &[0, 0],
+                    codes: &[10, 11],
+                },
+                BuildRun {
+                    cluster_id: 1,
+                    doc_ids: &[2, 3],
+                    ordinals: &[0, 0],
+                    codes: &[12, 13],
+                },
+            ],
+            &mut bytes,
+            None,
+        )
+        .unwrap();
+        let source = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 4).unwrap();
+        let mut relocations = CodeRelocations::default();
+        let mut out = Vec::new();
+        write_compacted_ann_cancellable(&[(&source, 0)], &mut out, None, Some(&mut relocations))
+            .unwrap();
+        let first = &source.runs[0].codes;
+        let second = &source.runs[1].codes;
+        let compacted = AnnDiskIndex::open(OwnedBytes::new(out), AnnKind::BinaryIvf, 4).unwrap();
+        // Sub-run spans keep their in-run displacement.
+        assert_eq!(
+            relocations.relocate(0, second.start as u64 + 1, 1).unwrap(),
+            compacted.runs[1].codes.start as u64 + 1
+        );
+        assert_eq!(
+            relocations.relocate(0, first.start as u64, 2).unwrap(),
+            compacted.runs[0].codes.start as u64
+        );
+        // Crossing into the next run, preceding every run, or naming an
+        // unknown source are all rejected.
+        assert!(relocations.relocate(0, first.start as u64 + 1, 2).is_err());
+        assert!(relocations.relocate(0, 0, 1).is_err());
+        assert!(relocations.relocate(1, first.start as u64, 1).is_err());
     }
 
     #[tokio::test]
