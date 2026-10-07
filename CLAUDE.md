@@ -124,7 +124,7 @@ Key modules:
 ### CLI Tool (summa-tool)
 
 `main.rs` owns clap dispatch; `index_ops.rs`, `data_processing.rs`, and
-`vector_ops.rs` own the corresponding command implementations:
+`diagnose.rs` own the corresponding command implementations:
 
 - `create` - Create index from SDL schema
 - `index` - Index documents from JSONL/stdin
@@ -169,8 +169,7 @@ Key constraint: WASM has no threads, no filesystem, no `SystemTime`. All native-
   `summa-wasm` but must not contain LLM trace or Model Lab code.
 - `summa-model-lab` is a standalone, dependency-light LLM trace UI served by
   `summa-llm lab`. It must not depend on Vue, `summa-web`, or `summa-wasm`.
-- The historical `pnpm lab:*` commands in `summa-web` are forwarding aliases
-  only. `/model-lab.html` remains the stable Lab entry route.
+- `/model-lab.html` remains the stable Lab entry route.
 
 ### summa-core Feature Flags
 

@@ -19,6 +19,7 @@
 
 - [Publishing packages](publishing.md)
 - [Summa 2 migration](summa-2-migration.md)
+- [Index compatibility (2.1)](compatibility.md)
 - [Server](../summa-server/README.md) and [broker](broker.md)
 - [Segment lifecycle and recovery](segment-lifecycle.md)
 - [Deletion, upserts, and compaction](row-deletion.md)

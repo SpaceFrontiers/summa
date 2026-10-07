@@ -81,17 +81,6 @@ impl SoarConfig {
         }
     }
 
-    /// Compatibility alias for full one-secondary spilling. The generalized
-    /// multi-secondary objective is intentionally not exposed until it is
-    /// implemented and validated.
-    pub fn aggressive() -> Self {
-        Self {
-            num_secondary: 1,
-            selective: false,
-            spill_threshold: 0.0,
-        }
-    }
-
     pub(crate) fn calibration_target(&self) -> Option<f32> {
         (self.selective && self.spill_threshold.is_sign_negative())
             .then(|| (-self.spill_threshold).clamp(0.0, 1.0))

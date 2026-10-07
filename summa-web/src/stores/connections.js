@@ -38,13 +38,7 @@ export const useConnectionsStore = defineStore('connections', () => {
       const stored = localStorage.getItem(STORAGE_KEY)
       if (stored) {
         const data = JSON.parse(stored)
-        // Support both old format (recentUrls array of strings) and new format
-        if (data.recentConnections) {
-          recentConnections.value = data.recentConnections
-        } else if (data.recentUrls) {
-          // Migrate from old format
-          recentConnections.value = data.recentUrls.map(url => ({ url }))
-        }
+        recentConnections.value = data.recentConnections || []
         currentUrl.value = data.currentUrl || null
         currentLabel.value = data.currentLabel || null
       }

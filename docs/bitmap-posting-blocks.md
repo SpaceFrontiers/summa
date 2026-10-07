@@ -61,9 +61,8 @@ delta width.
   Sparser bitmaps expand into IDs slower than their deltas decode (below).
   `Packed`, `Pfor` and `Simd4x` are unchanged; a list may mix block forms.
 
-Compatibility: `INDEX_META_FORMAT_VERSION` 9 → 10 with the metadata-only
-upgrade on open. Builds that predate the change refuse the index at open.
-Old blocks are never converted. On the 10M index the posting file shrinks
+Compatibility: introduced by `INDEX_META_FORMAT_VERSION` 10; builds that
+predate the change refuse the index at open ([compatibility](compatibility.md)). On the 10M index the posting file shrinks
 by 2% (7.17 → 7.05 GB): frequencies and positions dominate its size.
 
 ## Readers

@@ -63,7 +63,6 @@ struct TrainedFieldUpdate {
     vector_count: usize,
     num_clusters: usize,
     centroids_file: String,
-    codebook_file: Option<String>,
     scann_generation: Option<u64>,
     scann_artifact_id: Option<u64>,
 }
@@ -849,7 +848,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         field_metadata.index_type = target_config.index_type();
         field_metadata.state = super::VectorIndexState::Flat;
         field_metadata.centroids_file = None;
-        field_metadata.codebook_file = None;
         field_metadata.artifact_generation = None;
         field_metadata.artifact_id = None;
         candidate_metadata.refresh_total_vectors();
@@ -882,7 +880,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                     update.vector_count,
                     update.num_clusters,
                     update.centroids_file.clone(),
-                    update.codebook_file.clone(),
                 );
             }
         }
@@ -1044,7 +1041,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                         update.vector_count,
                         update.num_clusters,
                         update.centroids_file.clone(),
-                        update.codebook_file.clone(),
                     );
                 }
             }
@@ -1289,13 +1285,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 metadata
                     .vector_fields
                     .values()
-                    .flat_map(|field| {
-                        field
-                            .centroids_file
-                            .iter()
-                            .chain(field.codebook_file.iter())
-                    })
-                    .cloned()
+                    .filter_map(|field| field.centroids_file.clone())
                     .collect::<std::collections::HashSet<_>>()
             })
             .await;
@@ -2014,7 +2004,6 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
                 vector_count: corpus_count,
                 num_clusters: actual_num_clusters,
                 centroids_file: centroids_filename,
-                codebook_file: None,
                 scann_generation,
                 scann_artifact_id,
             },
@@ -2856,9 +2845,9 @@ mod tests {
                 .segment_manager
                 .read_metadata(|metadata| metadata
                     .get_field_meta(embedding.0)
-                    .map(|field| (field.centroids_file.clone(), field.codebook_file.clone())))
+                    .map(|field| field.centroids_file.clone()))
                 .await,
-            Some((old_meta.centroids_file, old_meta.codebook_file)),
+            Some(old_meta.centroids_file),
         );
         assert_eq!(
             writer.segment_manager.trained().unwrap().centroids[&embedding.0].version,

@@ -69,9 +69,6 @@ pnpm check
 Vite production build. The build retains `model-lab.html` and writes to
 `summa-model-lab/dist/`.
 
-For command compatibility, the historical `pnpm lab:*` scripts in
-`summa-web` forward to this project.
-
 ## Project boundary
 
 ```text

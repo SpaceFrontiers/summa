@@ -26,7 +26,6 @@
 //! - `simhash` - Calculate SimHash for a text field and add it to each JSON object
 //! - `sort` - Sort JSON objects by a specified field
 //! - `term-stats` - Compute term statistics for WAND optimization
-//! - `train-centroids` - Train IVF coarse centroids from JSONL vectors
 //!
 //! # Examples
 //!
@@ -48,7 +47,6 @@
 mod data_processing;
 mod diagnose;
 mod index_ops;
-mod vector_ops;
 
 // Use jemalloc for better memory management (returns memory to OS)
 #[cfg(not(target_env = "msvc"))]
@@ -488,67 +486,6 @@ enum Commands {
         #[arg(long, default_value = "0.75")]
         bm25_b: f32,
     },
-
-    // === Vector Index Commands ===
-    /// Train a global IVF coarse codebook from sample vectors
-    #[command(name = "train-centroids")]
-    TrainCentroids {
-        /// Path to input file with vectors (JSONL with field containing float arrays)
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Field name containing the vector
-        #[arg(short, long)]
-        field: String,
-
-        /// Output path for centroids file
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Number of clusters (default: sqrt of sample size, max 65536)
-        #[arg(short = 'k', long)]
-        clusters: Option<usize>,
-
-        /// Maximum number of k-means iterations (default: 20)
-        #[arg(short = 'n', long, default_value = "20")]
-        max_iters: usize,
-
-        /// Maximum number of vectors to sample (default: all)
-        #[arg(short = 's', long)]
-        sample_size: Option<usize>,
-
-        /// Random seed for reproducibility
-        #[arg(long, default_value = "42")]
-        seed: u64,
-    },
-
-    /// Retrain centroids from an existing index and rebuild vector indexes
-    #[command(name = "retrain-centroids")]
-    RetrainCentroids {
-        /// Path to the index directory
-        #[arg(short, long)]
-        index: PathBuf,
-
-        /// Dense vector field name to retrain
-        #[arg(short, long)]
-        field: String,
-
-        /// Number of clusters (default: sqrt of vector count, max 65536)
-        #[arg(short = 'k', long)]
-        clusters: Option<usize>,
-
-        /// Maximum number of k-means iterations (default: 20)
-        #[arg(short = 'n', long, default_value = "20")]
-        max_iters: usize,
-
-        /// Sample size for training (default: min(1M, all vectors))
-        #[arg(short = 's', long)]
-        sample_size: Option<usize>,
-
-        /// Random seed for reproducibility
-        #[arg(long, default_value = "42")]
-        seed: u64,
-    },
 }
 
 #[tokio::main]
@@ -728,40 +665,6 @@ async fn main() -> Result<()> {
         } => {
             data_processing::run_term_stats(&field, &format, min_df, bm25_k1, bm25_b)
                 .context("Failed to compute term statistics")?;
-        }
-
-        // Vector index commands
-        Commands::TrainCentroids {
-            input,
-            field,
-            output,
-            clusters,
-            max_iters,
-            sample_size,
-            seed,
-        } => {
-            vector_ops::train_centroids(
-                input,
-                field,
-                output,
-                clusters,
-                max_iters,
-                sample_size,
-                seed,
-            )
-            .context("Failed to train centroids")?;
-        }
-        Commands::RetrainCentroids {
-            index,
-            field,
-            clusters,
-            max_iters,
-            sample_size,
-            seed,
-        } => {
-            vector_ops::retrain_centroids(index, field, clusters, max_iters, sample_size, seed)
-                .await
-                .context("Failed to retrain centroids")?;
         }
     }
 

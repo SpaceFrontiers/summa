@@ -29,7 +29,7 @@ pub enum FieldType {
     /// Sparse vector field - indexed as inverted posting lists with quantized weights
     #[serde(rename = "sparse_vector")]
     SparseVector,
-    /// Dense vector field indexed with the global IVF-PQ ANN implementation.
+    /// Dense vector field indexed with a flat or ANN vector index.
     #[serde(rename = "dense_vector")]
     DenseVector,
     /// JSON field - arbitrary JSON data, stored but not indexed
@@ -217,11 +217,6 @@ impl PositionMode {
 pub enum VectorIndexType {
     /// Flat - brute-force search over raw vectors (accumulating state)
     Flat,
-    /// Removed: global IVF with residual product quantization. The variant is
-    /// kept only so schemas from older indexes deserialize into an actionable
-    /// error instead of an unknown-variant failure. See
-    /// `docs/turboquant-quantization.md` for the IVF-TQ replacement.
-    IvfPq,
     /// TurboQuant: training-free per-segment compressed flat scan
     /// (`docs/turboquant-quantization.md`). Available from the first segment
     /// build with no global artifacts.
@@ -237,10 +232,10 @@ pub enum VectorIndexType {
     Scann,
 }
 
-/// Reject schemas that reference removed index types. Called on every schema
-/// entry point (index create, metadata load), so SDL/JSON/programmatic
+/// Validate persisted vector/sparse options. Called on every schema entry
+/// point (index create, metadata load), so SDL/JSON/programmatic
 /// construction all fail loudly with the same actionable message.
-pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), String> {
+pub(crate) fn validate_persisted_schema(schema: &Schema) -> Result<(), String> {
     for (_, entry) in schema.fields() {
         if let Some(config) = &entry.sparse_vector_config
             && config.format == crate::structures::SparseFormat::Seismic
@@ -270,14 +265,6 @@ pub(crate) fn reject_removed_vector_index_types(schema: &Schema) -> Result<(), S
                     VectorIndexType::Flat | VectorIndexType::Tq
                 ),
             )?;
-            if config.index_type == VectorIndexType::IvfPq {
-                return Err(format!(
-                    "dense field '{}' uses index_type `ivf_pq`, which was removed; \
-                     recreate the index with `ivf_tq` (trained router, training-free \
-                     TurboQuant leaves) and reindex — see docs/turboquant-quantization.md",
-                    entry.name,
-                ));
-            }
             if config.index_type == VectorIndexType::Scann && config.soar.is_some() {
                 return Err(format!(
                     "dense field '{}' enables SOAR for ScaNN, but ScaNN SOAR secondary assignments are not implemented; set soar to null/off",
@@ -509,21 +496,21 @@ impl DenseVectorQuantization {
     }
 }
 
-/// Configuration for dense vector fields using exact Flat accumulation or the
-/// single production IVF-PQ ANN format.
+/// Configuration for dense vector fields: exact Flat accumulation, TQ, IVF-TQ
+/// or ScaNN.
 ///
 /// Indexes operate in two states:
 /// - **Flat (accumulating)**: Brute-force search over raw vectors before
 ///   `build_vector_index` is called.
 /// - **Built (ANN)**: Fast approximate nearest neighbor search using trained structures.
-///   Centroids and codebooks are trained from index-wide data and shared by
-///   every segment; segment payloads contain only assignments and PQ codes.
+///   Routers are trained from index-wide data and shared by every segment;
+///   segment payloads contain only assignments and leaf codes.
 #[derive(Debug, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DenseVectorConfig {
     /// Dimensionality of vectors
     pub dim: usize,
-    /// Target vector index algorithm (Flat or IVF-PQ).
+    /// Target vector index algorithm.
     /// When in accumulating state, search uses brute-force regardless of this setting.
     #[serde(default)]
     pub index_type: VectorIndexType,
@@ -1088,7 +1075,7 @@ impl Schema {
                 entry.binary_dense_vector_config = Some(config);
             }
         }
-        reject_removed_vector_index_types(&next)?;
+        validate_persisted_schema(&next)?;
         Ok(next)
     }
 
@@ -1378,8 +1365,8 @@ impl SchemaBuilder {
 
     /// Add a dense vector field with default configuration
     ///
-    /// Dense vectors use the global IVF-PQ ANN implementation. The dimension
-    /// determines both the stored vector shape and PQ structure.
+    /// Dense vectors use the default IVF-TQ ANN implementation. The dimension
+    /// determines the stored vector shape and the derived TQ leaf codec.
     pub fn add_dense_vector_field(
         &mut self,
         name: &str,
@@ -2170,7 +2157,7 @@ mod tests {
         zero.target_vectors = Some(0);
         let mut builder = Schema::builder();
         builder.add_binary_dense_vector_field_with_config("hash", true, false, zero);
-        let error = reject_removed_vector_index_types(&builder.build()).unwrap_err();
+        let error = validate_persisted_schema(&builder.build()).unwrap_err();
         assert!(error.contains("positive steady-state"), "{error}");
 
         let hinted = DenseVectorConfig::ivf_tq(128, None, 64).with_target_vectors(1_000_000_000);
@@ -2199,7 +2186,7 @@ mod tests {
         let flat = DenseVectorConfig::flat(128).with_target_vectors(1_000_000);
         let mut builder = Schema::builder();
         builder.add_dense_vector_field_with_config("embedding", true, false, flat);
-        let error = reject_removed_vector_index_types(&builder.build()).unwrap_err();
+        let error = validate_persisted_schema(&builder.build()).unwrap_err();
         assert!(error.contains("flat/training-free"), "{error}");
 
         let mut binary_flat = BinaryDenseVectorConfig::new(256);
@@ -2207,7 +2194,7 @@ mod tests {
         binary_flat.target_vectors = Some(1_000_000);
         let mut builder = Schema::builder();
         builder.add_binary_dense_vector_field_with_config("hash", true, false, binary_flat);
-        let error = reject_removed_vector_index_types(&builder.build()).unwrap_err();
+        let error = validate_persisted_schema(&builder.build()).unwrap_err();
         assert!(error.contains("flat/training-free"), "{error}");
     }
 
@@ -2284,7 +2271,7 @@ mod tests {
         invalid_levels.soar = None;
         let mut builder = Schema::builder();
         builder.add_dense_vector_field_with_config("embedding", true, false, invalid_levels);
-        let error = reject_removed_vector_index_types(&builder.build())
+        let error = validate_persisted_schema(&builder.build())
             .expect_err("invalid persisted ScaNN levels must fail at the schema gate");
         assert!(error.contains("1..=3"), "{error}");
 
@@ -2292,7 +2279,7 @@ mod tests {
         wrong_algorithm.tree_levels = Some(2);
         let mut builder = Schema::builder();
         builder.add_binary_dense_vector_field_with_config("hash", true, false, wrong_algorithm);
-        let error = reject_removed_vector_index_types(&builder.build())
+        let error = validate_persisted_schema(&builder.build())
             .expect_err("ScaNN-only persisted options must fail on IVF");
         assert!(error.contains("does not use the ScaNN index"), "{error}");
 
@@ -2302,7 +2289,7 @@ mod tests {
         invalid_soar.soar = Some(crate::structures::SoarConfig::default());
         let mut builder = Schema::builder();
         builder.add_dense_vector_field_with_config("embedding", true, false, invalid_soar);
-        let error = reject_removed_vector_index_types(&builder.build())
+        let error = validate_persisted_schema(&builder.build())
             .expect_err("persisted ScaNN SOAR must fail until assignments exist");
         assert!(error.contains("not implemented"), "{error}");
 
@@ -2312,7 +2299,7 @@ mod tests {
         one_leaf.nprobe = 1;
         let mut builder = Schema::builder();
         builder.add_dense_vector_field_with_config("embedding", true, false, one_leaf);
-        let error = reject_removed_vector_index_types(&builder.build())
+        let error = validate_persisted_schema(&builder.build())
             .expect_err("one-leaf ScaNN geometry must fail at schema load");
         assert!(error.contains("2..=30000000"), "{error}");
 
@@ -2330,7 +2317,7 @@ mod tests {
         };
         let mut builder = Schema::builder();
         builder.add_binary_dense_vector_field_with_config("hash", true, false, binary);
-        let error = reject_removed_vector_index_types(&builder.build())
+        let error = validate_persisted_schema(&builder.build())
             .expect_err("binary ScaNN dimensions must be byte-aligned");
         assert!(error.contains("multiple of 8"), "{error}");
     }

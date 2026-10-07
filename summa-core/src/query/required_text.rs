@@ -33,12 +33,6 @@ pub(super) fn scorer<'a>(
     let map = reader.chunk_map(field).ok_or_else(|| {
         crate::Error::Corruption("required chunked text lacks a chunk map".into())
     })?;
-    if !map.has_logical_addressing() {
-        return Err(crate::Error::Query(
-            "legacy reordered text needs explicit Reorder to upgrade its chunk map for required matching"
-                .into(),
-        ));
-    }
     let mut matches = DocBitset::new(reader.num_docs());
     for (posting, _) in &postings {
         let mut cursor = posting.iterator();

@@ -65,7 +65,7 @@ async fn test_scann_training_defers_below_geometry_floor_and_keeps_flat_search()
 async fn test_vector_index_threshold_switch() {
     use crate::dsl::{DenseVectorConfig, DenseVectorQuantization, VectorIndexType};
 
-    // Create schema with a dense vector field configured for IVF-PQ.
+    // Create schema with a dense vector field configured for IVF-TQ.
     let mut schema_builder = SchemaBuilder::default();
     let title = schema_builder.add_text_field("title", true, true);
     let embedding = schema_builder.add_dense_vector_field_with_config(

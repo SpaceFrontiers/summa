@@ -287,7 +287,7 @@ pub struct SegmentBuilder {
     numeric_buffer: String,
 
     /// Dense vector storage per field: field -> (doc_ids, vectors)
-    /// Vectors are stored as flat f32 arrays for global IVF-PQ indexing.
+    /// Vectors are stored as flat f32 arrays for global ANN indexing.
     dense_vectors: FxHashMap<u32, DenseVectorBuilder>,
 
     /// Binary dense vector storage per field: field -> packed-bit vectors

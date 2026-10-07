@@ -27,7 +27,7 @@ fn unaddressed_posting_trailers_are_rejected_before_read_or_merge() {
         PostingCodec::RoundedBitmap,
     ] {
         let mut bytes = encoded(codec);
-        bytes.insert(bytes.len() - FOOTER_V2_SIZE, 0);
+        bytes.insert(bytes.len() - FOOTER_SIZE, 0);
         assert!(BlockPostingList::deserialize(&bytes).is_err());
         let mut output = vec![0xab];
         assert!(BlockPostingList::concatenate_streaming(&[(&bytes, 0)], &mut output).is_err());
@@ -132,7 +132,7 @@ fn checked_streaming_merge_matches_encoded_copy_and_materialized_output() {
 #[test]
 fn concatenation_checks_position_cursor_sum_before_output() {
     let mut bytes = encoded(PostingCodec::Rounded);
-    let at = bytes.len() - FOOTER_V2_SIZE + 24;
+    let at = bytes.len() - FOOTER_SIZE + 24;
     bytes[at..at + 8].copy_from_slice(&(1u64 << 63).to_le_bytes());
     let list = BlockPostingList::deserialize(&bytes).unwrap();
     let mut output = vec![0xab];

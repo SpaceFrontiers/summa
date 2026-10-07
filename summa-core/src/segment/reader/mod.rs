@@ -1488,8 +1488,8 @@ struct ScannPlanCacheEntry {
 
 /// Search one segment's TQ payload, reusing the per-query plan across
 /// segments: the codec is a pure function of the schema dimension, so the
-/// LUTs are identical for every segment of the field (mirrors the IVF-PQ
-/// `probe_cache` hot-path rule — no repeated per-segment plan allocation).
+/// LUTs are identical for every segment of the field (no repeated
+/// per-segment plan allocation).
 #[allow(clippy::too_many_arguments)]
 fn search_tq_segment(
     index: &crate::segment::ann_disk::AnnDiskIndex,
@@ -1771,16 +1771,6 @@ fn validate_ivf_tq_ann(
     field: Field,
 ) -> Result<()> {
     let header = index.header();
-    if !crate::structures::is_ivf_tq_cosine_generation(centroids.version)
-        || !crate::structures::is_ivf_tq_cosine_generation(header.quantizer_version)
-    {
-        return Err(Error::Corruption(format!(
-            "IVF-TQ field {} uses a legacy unmarked raw-vector generation that cannot \
-             preserve cosine candidate semantics; rebuild the index with a current \
-             Summa version",
-            field.0,
-        )));
-    }
     if header.dim != dim
         || codec.dim() != dim
         || header.code_size != codec.code_size()
@@ -2122,6 +2112,22 @@ impl SegmentReader {
                 ));
             }
         }
+        for (field, entry) in schema.fields() {
+            if entry.indexed
+                && entry.field_type == crate::dsl::FieldType::Text
+                && meta
+                    .field_stats
+                    .get(&field.0)
+                    .is_some_and(|stats| stats.total_tokens > 0)
+                && !chunk_maps.contains_key(&field.0)
+                && !doc_lengths.contains_key(&field.0)
+            {
+                return Err(Error::Corruption(format!(
+                    "text field '{}' lacks persisted lengths; rebuild the index",
+                    entry.name
+                )));
+            }
+        }
 
         // Log segment loading stats
         {
@@ -2170,6 +2176,18 @@ impl SegmentReader {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => FxHashMap::default(),
             Err(error) => return Err(error.into()),
         };
+        for (field, entry) in schema.fields() {
+            if meta.num_docs > 0
+                && ((entry.indexed && entry.field_type == crate::dsl::FieldType::Text)
+                    || entry.field_type == crate::dsl::FieldType::SparseVector)
+                && !row_stats.contains_key(&field.0)
+            {
+                return Err(Error::Corruption(format!(
+                    "field '{}' lacks row statistics; rebuild the index",
+                    entry.name
+                )));
+            }
+        }
         for column in row_stats.values() {
             if column.num_docs != meta.num_docs
                 || column.multi
@@ -3204,7 +3222,7 @@ impl SegmentReader {
         Ok(())
     }
 
-    /// Search dense vectors through the production IVF-PQ index.
+    /// Search dense vectors through the field's ANN index.
     ///
     /// Returns VectorSearchResult with ordinal tracking for multi-value fields.
     /// Doc IDs are segment-local.
