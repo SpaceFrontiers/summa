@@ -1844,7 +1844,8 @@ fn reorder_bmp_field_blockwise(
 ) -> Result<(OffsetWriter, Vec<SparseFieldToc>, bool)> {
     use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::builder::graph_bisection::{
-        BpProgressLabel, build_forward_index_from_blocks, graph_bisection_with_progress,
+        BpProgressLabel, SplitAlignment, build_forward_index_from_blocks,
+        graph_bisection_with_progress,
     };
     use crate::segment::reader::bmp::BMP_SUPERBLOCK_SIZE;
 
@@ -1927,6 +1928,7 @@ fn reorder_bmp_field_blockwise(
             Ok(graph_bisection_with_progress(
                 &fwd,
                 sb,
+                SplitAlignment::NONE,
                 20,
                 block_budget,
                 cancellation,
@@ -2348,7 +2350,7 @@ pub(crate) fn rewrite_bmp_field(
     }
     use crate::segment::builder::bmp::write_bmp_footer;
     use crate::segment::builder::graph_bisection::{
-        BpProgressLabel, build_forward_index_from_bmps_with_maps, build_vid_maps,
+        BpProgressLabel, SplitAlignment, build_forward_index_from_bmps_with_maps, build_vid_maps,
         graph_bisection_with_progress,
     };
 
@@ -2671,6 +2673,7 @@ pub(crate) fn rewrite_bmp_field(
                 graph_bisection_with_progress(
                     &fwd,
                     effective_block_size,
+                    SplitAlignment::bmp_records(effective_block_size),
                     20,
                     graph_budget,
                     cancellation.as_deref(),

@@ -209,6 +209,46 @@ impl OwnedBytes {
         }
     }
 
+    /// Whether the leading pages of a sub-range are in the page cache.
+    ///
+    /// Samples at most [`Self::RESIDENCY_SAMPLE_PAGES`] pages from the start
+    /// of the range with one `mincore` call. Heap bytes and empty ranges are
+    /// resident. A failed call reports `false`, so callers that use this to
+    /// skip prefetch keep prefetching.
+    #[cfg(feature = "native")]
+    pub fn range_resident(&self, range: Range<usize>) -> bool {
+        if !self.is_mmap() {
+            return true;
+        }
+        let slice = &self.as_slice()[range];
+        if slice.is_empty() {
+            return true;
+        }
+        let page_size = system_page_size();
+        let ptr = slice.as_ptr() as usize;
+        let aligned_ptr = ptr & !(page_size - 1);
+        let aligned_len =
+            (slice.len() + (ptr - aligned_ptr)).min(Self::RESIDENCY_SAMPLE_PAGES * page_size);
+        let mut pages = [0u8; Self::RESIDENCY_SAMPLE_PAGES];
+        // SAFETY: the range lies inside this live mapping and `pages` holds
+        // one byte for each of the at most RESIDENCY_SAMPLE_PAGES queried pages.
+        let result = unsafe {
+            libc::mincore(
+                aligned_ptr as *mut libc::c_void,
+                aligned_len,
+                pages.as_mut_ptr().cast(),
+            )
+        };
+        result == 0
+            && pages[..aligned_len.div_ceil(page_size)]
+                .iter()
+                .all(|&page| page & 1 != 0)
+    }
+
+    /// Upper bound on pages sampled by [`Self::range_resident`].
+    #[cfg(feature = "native")]
+    pub const RESIDENCY_SAMPLE_PAGES: usize = 64;
+
     pub fn to_vec(&self) -> Vec<u8> {
         self.as_slice().to_vec()
     }
@@ -226,6 +266,20 @@ impl std::ops::Deref for OwnedBytes {
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
+}
+
+/// The OS page size (`mincore` requires page-aligned addresses; Apple
+/// silicon uses 16 KiB pages).
+#[cfg(feature = "native")]
+fn system_page_size() -> usize {
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        // SAFETY: sysconf has no preconditions.
+        usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|size| size.is_power_of_two())
+            .unwrap_or(4096)
+    })
 }
 
 #[cfg(test)]

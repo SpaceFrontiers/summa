@@ -24,8 +24,8 @@ use crate::Result;
 use crate::directories::{Directory, DirectoryWriter};
 use crate::dsl::{Field, FieldType, Schema};
 use crate::segment::builder::graph_bisection::{
-    BpProgressLabel, ForwardIndex, fit_candidates_to_budget, graph_bisection_with_progress,
-    select_frequency_candidates,
+    BpProgressLabel, ForwardIndex, SplitAlignment, fit_candidates_to_budget,
+    graph_bisection_with_progress, select_frequency_candidates,
 };
 use crate::segment::chunk_map::{ChunkMapBuilder, write_chunk_maps_with_copied_norms};
 use crate::segment::reader::SegmentReader;
@@ -345,6 +345,7 @@ async fn plan_field(
         graph_bisection_with_progress(
             &fwd,
             MIN_PARTITION,
+            SplitAlignment::NONE,
             BP_ITERATIONS,
             bp_budget,
             cancellation,

@@ -190,6 +190,7 @@ fn bench_bp_gain_review() {
                 graph_bisection_with_progress(
                     &fwd,
                     min_partition,
+                    SplitAlignment::NONE,
                     12,
                     BpBudget::full(),
                     None,

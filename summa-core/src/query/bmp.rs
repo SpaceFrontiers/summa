@@ -802,6 +802,8 @@ fn execute_bmp_inner(
             prepare_secs,
             ..Default::default()
         };
+        #[cfg(feature = "native")]
+        let withheld_start = crate::segment::prefetch_gate::withheld_stages();
         let mut collector = ScoreCollector::new(collector_k);
         let initial_threshold = threshold_source
             .shared
@@ -968,7 +970,14 @@ fn execute_bmp_inner(
                     &mut scratch.grid_prefetch_ranges,
                 )?;
 
-                let (block_bytes, block_calls) = if index.block_data_resident() {
+                let block_action = if index.block_data_resident() {
+                    crate::segment::prefetch_gate::PrefetchAction::Skip
+                } else {
+                    index.block_prefetch_gate().action()
+                };
+                let (block_bytes, block_calls) = if block_action
+                    == crate::segment::prefetch_gate::PrefetchAction::Skip
+                {
                     (0, 0)
                 } else {
                     scratch.block_prefetch_ranges.clear();
@@ -990,7 +999,7 @@ fn execute_bmp_inner(
                             }
                         }
                     }
-                    index.prefetch_block_data_ranges(&mut scratch.block_prefetch_ranges)
+                    index.prefetch_block_data_ranges(&mut scratch.block_prefetch_ranges, block_action)
                 };
                 phases.prefetch_secs += prefetch_start.secs();
                 phases.prefetched_bytes = phases
@@ -1055,6 +1064,11 @@ fn execute_bmp_inner(
             }
         }
 
+        #[cfg(feature = "native")]
+        {
+            phases.prefetch_gated =
+                crate::segment::prefetch_gate::withheld_stages().wrapping_sub(withheld_start);
+        }
         let elapsed_ms = total_start.secs() * 1000.0;
         let threshold = collector.threshold();
         let returned = collector.real_len();
@@ -1714,6 +1728,10 @@ fn prefetch_grid_metadata_window(
     if start >= limit || grid.rows_resident() {
         return Ok((0, 0));
     }
+    let action = grid.prefetch_gate().action();
+    if action == crate::segment::prefetch_gate::PrefetchAction::Skip {
+        return Ok((0, 0));
+    }
     collect_grid_group_ids(sb_order, start, limit, groups);
     ranges.clear();
     for weight in weights {
@@ -1721,7 +1739,7 @@ fn prefetch_grid_metadata_window(
             ranges.push(grid.group_metadata_range(weight.dimension, group)?);
         }
     }
-    Ok(grid.prefetch_ranges(ranges))
+    Ok(grid.prefetch_ranges(ranges, action))
 }
 
 /// Advise the payload pages of every resolved group in the current window.
@@ -1734,9 +1752,13 @@ fn prefetch_resolved_grid_payloads(
     if grid.rows_resident() {
         return (0, 0);
     }
+    let action = grid.prefetch_gate().action();
+    if action == crate::segment::prefetch_gate::PrefetchAction::Skip {
+        return (0, 0);
+    }
     ranges.clear();
     ranges.extend(resolved.iter().filter_map(|group| group.payload_range()));
-    grid.prefetch_ranges(ranges)
+    grid.prefetch_ranges(ranges, action)
 }
 
 /// Resolve every `(candidate dimension, D-grid group)` pair covered by one
@@ -1984,12 +2006,10 @@ fn compute_block_ubs_and_presence(
         blocks_with_query_terms |= presence;
         // Transpose the per-dimension presence bitset into per-block term
         // masks so block scoring iterates only the terms a block contains.
-        let term_bit = 1u64 << query_index;
-        let mut bits = presence;
-        while bits != 0 {
-            let local = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            block_terms[local] |= term_bit;
+        // A fixed eight-lane loop (presence has no bits at or above `count`)
+        // is branch-free and vectorizes, unlike a data-dependent bit walk.
+        for (local, terms) in block_terms.iter_mut().enumerate() {
+            *terms |= ((presence >> local) & 1) << query_index;
         }
     }
     for (bound, &integer_units) in out[..count].iter_mut().zip(&units[..count]) {

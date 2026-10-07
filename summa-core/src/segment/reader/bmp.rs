@@ -167,6 +167,9 @@ pub struct BmpIndex {
     /// `copy_file_range` without faulting their mmap pages into userspace.
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     doc_map_offset: u64,
+    /// Residency-sampled WILLNEED gate for `block_data_bytes`, shared by clones.
+    #[cfg(feature = "native")]
+    block_prefetch_gate: std::sync::Arc<crate::segment::prefetch_gate::PrefetchGate>,
 }
 
 // SAFETY: All raw pointer access is derived from OwnedBytes which are Send+Sync
@@ -308,6 +311,8 @@ impl BmpIndex {
                 blob_offset,
                 blob_len,
                 doc_map_offset,
+                #[cfg(feature = "native")]
+                block_prefetch_gate: Default::default(),
             });
         }
 
@@ -570,6 +575,8 @@ impl BmpIndex {
             blob_offset,
             blob_len,
             doc_map_offset,
+            #[cfg(feature = "native")]
+            block_prefetch_gate: Default::default(),
         })
     }
 
@@ -735,52 +742,62 @@ impl BmpIndex {
         !self.block_data_bytes.is_mmap()
     }
 
-    /// Page-level prefetch (`MADV_WILLNEED`) of a block-data byte range.
-    ///
-    /// Used by the BMP executor to batch-prefetch the surviving blocks of a
-    /// superblock before scoring: on memory-bound hosts the kernel clusters
-    /// the page-ins into large sequential reads instead of taking one
-    /// synchronous major fault per scored block (~265µs each on cold NVMe).
-    /// No-op for non-mmap (RAM/HTTP) backing.
+    /// The block payload's residency-sampled prefetch gate.
     #[cfg(feature = "native")]
-    #[inline]
-    pub(crate) fn prefetch_block_data(&self, byte_start: u64, byte_end: u64) {
-        self.block_data_bytes
-            .madvise_range(byte_start as usize..byte_end as usize, libc::MADV_WILLNEED);
+    pub(crate) fn block_prefetch_gate(&self) -> &crate::segment::prefetch_gate::PrefetchGate {
+        &self.block_prefetch_gate
     }
 
-    /// Coalesce page-near block payload ranges before issuing WILLNEED.
+    /// Coalesce page-near block payload ranges and issue `MADV_WILLNEED`,
+    /// subject to `action` from [`Self::block_prefetch_gate`].
     ///
-    /// Selected LSP superblocks are score-ordered rather than file-ordered, so
-    /// one giant min..max advice span can pull gigabytes of unvisited data.
-    /// This keeps distant extents independent while collapsing ranges that the
-    /// kernel would round onto the same/adjacent pages anyway.
+    /// Used by the BMP executor to batch-prefetch the surviving blocks of a
+    /// window before scoring: on memory-bound hosts the kernel clusters the
+    /// page-ins into large sequential reads instead of taking one synchronous
+    /// major fault per scored block (~265µs each on cold NVMe). Selected LSP
+    /// superblocks are score-ordered rather than file-ordered, so one giant
+    /// min..max advice span could pull gigabytes of unvisited data; distant
+    /// extents stay independent while ranges that the kernel would round onto
+    /// the same/adjacent pages collapse. Returns advised `(bytes, calls)`;
+    /// `(0, 0)` when residency sampling withheld the hints. No-op for
+    /// non-mmap (RAM/HTTP) backing.
     #[cfg(feature = "native")]
     pub(crate) fn prefetch_block_data_ranges(
         &self,
         ranges: &mut Vec<std::ops::Range<u64>>,
+        action: crate::segment::prefetch_gate::PrefetchAction,
     ) -> (usize, usize) {
         if ranges.is_empty() {
             return (0, 0);
         }
         const PAGE_NEAR_BYTES: u64 = 4096;
         ranges.sort_unstable_by_key(|range| (range.start, range.end));
-        let mut advised_bytes = 0usize;
-        let mut calls = 0usize;
-        let mut current = ranges[0].clone();
-        for range in &ranges[1..] {
+        // Coalesce in place so residency probes and hints see the same ranges.
+        let mut coalesced = 0usize;
+        for index in 1..ranges.len() {
+            let range = ranges[index].clone();
+            let current = &mut ranges[coalesced];
             if range.start <= current.end.saturating_add(PAGE_NEAR_BYTES) {
                 current.end = current.end.max(range.end);
-                continue;
+            } else {
+                coalesced += 1;
+                ranges[coalesced] = range;
             }
-            advised_bytes = advised_bytes.saturating_add((current.end - current.start) as usize);
-            calls += 1;
-            self.prefetch_block_data(current.start, current.end);
-            current = range.clone();
         }
-        advised_bytes = advised_bytes.saturating_add((current.end - current.start) as usize);
-        calls += 1;
-        self.prefetch_block_data(current.start, current.end);
+        ranges.truncate(coalesced + 1);
+        let as_usize = |range: &std::ops::Range<u64>| range.start as usize..range.end as usize;
+        let mut advised_bytes = 0usize;
+        let mut calls = 0usize;
+        if self.block_prefetch_gate.admit(action, ranges, |range| {
+            self.block_data_bytes.range_resident(as_usize(range))
+        }) {
+            for range in ranges.iter() {
+                advised_bytes = advised_bytes.saturating_add((range.end - range.start) as usize);
+                calls += 1;
+                self.block_data_bytes
+                    .madvise_range(as_usize(range), libc::MADV_WILLNEED);
+            }
+        }
         ranges.clear();
         (advised_bytes, calls)
     }
