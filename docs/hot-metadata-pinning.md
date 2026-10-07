@@ -52,7 +52,14 @@ D and E are meta-shaped but data-sized, so their payloads stay evictable.
 Global LSP scans the small H level, then touches only selected independently
 addressable E groups; block traversal does the same for D. Both mappings use
 `MADV_RANDOM` plus bounded `MADV_WILLNEED` ranges to avoid readahead
-amplification. The sizes above are dense four-bit upper bounds; the
+amplification. Those hints cost one syscall per coalesced range even when
+the pages are cached (48–55% of warm SPLADE-1M BMP query time on x86, 2.9–3.5x QPS at 4 concurrent queries), so each
+evictable BMP mapping (D grid rows, block payload) has a residency gate:
+one prefetch stage in 32 per thread samples the ranges with `mincore`, and
+after 256 consecutive fully resident samples the hints are withheld. Any
+sampled miss reopens the gate immediately, so cold and partially resident
+segments keep prefetching (`summa_bmp_prefetch_gated_total` counts withheld
+stages). The sizes above are dense four-bit upper bounds; the
 row-local variable-width codec is smaller whenever groups need fewer bits.
 
 ### Fast-field header checkpoints

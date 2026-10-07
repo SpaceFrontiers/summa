@@ -18,6 +18,9 @@ pub(crate) struct BmpQueryPhases {
     pub docmap_secs: f64,
     pub prefetched_bytes: usize,
     pub prefetch_ranges: usize,
+    /// Prefetch stages withheld because residency sampling found the
+    /// mapping cached (`segment::prefetch_gate`).
+    pub prefetch_gated: usize,
 }
 
 /// Wall-clock timer for diagnostics that must also compile on platforms where
@@ -109,6 +112,8 @@ mod imp {
             .increment(phases.prefetched_bytes as u64);
         metrics::counter!("summa_bmp_prefetch_ranges_total", "index" => index.clone(), "field" => field.clone())
             .increment(phases.prefetch_ranges as u64);
+        metrics::counter!("summa_bmp_prefetch_gated_total", "index" => index.clone(), "field" => field.clone())
+            .increment(phases.prefetch_gated as u64);
         metrics::counter!("summa_bmp_superblocks_visited_total", "index" => index.clone(), "field" => field.clone())
             .increment(sbs_scored as u64);
         metrics::counter!("summa_bmp_superblocks_skipped_total", "index" => index.clone(), "field" => field.clone())

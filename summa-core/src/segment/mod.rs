@@ -16,6 +16,8 @@ mod builder;
 pub mod chunk_map;
 pub(crate) mod deletion;
 pub(crate) mod norms;
+#[cfg(feature = "native")]
+pub(crate) mod prefetch_gate;
 pub use deletion::DeletionMeta;
 pub(crate) mod format;
 pub(crate) mod logical_address;
