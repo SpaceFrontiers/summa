@@ -737,7 +737,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
         schema.validate()?;
-        crate::dsl::reject_removed_vector_index_types(&schema).map_err(Error::Schema)?;
+        crate::dsl::validate_persisted_schema(&schema).map_err(Error::Schema)?;
         let directory = Arc::new(directory);
         let schema = Arc::new(schema);
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
@@ -816,7 +816,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
             return Err(Error::Internal(reason.clone()));
         }
 
-        let metadata = super::IndexMetadata::load_persisting_migration(directory.as_ref()).await?;
+        let metadata = super::IndexMetadata::load(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
         // Directory-layer metrics (cold writes, lazy reads) carry the index label
         directory.set_index_label(schema.index_label());

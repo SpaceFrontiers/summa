@@ -3,7 +3,6 @@ mod bmp;
 mod boolean;
 mod chunked;
 mod config_policy;
-mod format_migration;
 mod maintenance;
 mod merge;
 mod merge_bounds;

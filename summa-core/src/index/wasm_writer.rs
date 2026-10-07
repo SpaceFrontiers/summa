@@ -91,8 +91,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         config: IndexConfig,
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
-        crate::dsl::reject_removed_vector_index_types(&schema)
-            .map_err(crate::error::Error::Schema)?;
+        crate::dsl::validate_persisted_schema(&schema).map_err(crate::error::Error::Schema)?;
         let directory = Arc::new(directory);
         schema.validate()?;
         let schema = Arc::new(schema);
@@ -115,7 +114,7 @@ impl<D: DirectoryWriter + 'static> IndexWriter<D> {
         builder_config: SegmentBuilderConfig,
     ) -> Result<Self> {
         let directory = Arc::new(directory);
-        let metadata = IndexMetadata::load_persisting_migration(directory.as_ref()).await?;
+        let metadata = IndexMetadata::load(directory.as_ref()).await?;
         let schema = Arc::new(metadata.schema.clone());
 
         let mut writer =

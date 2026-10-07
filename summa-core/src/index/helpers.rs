@@ -4,115 +4,18 @@
 //! and indexing documents, used by `summa-tool` and `summa-server`.
 
 use std::io::BufRead;
-use std::num::NonZeroU32;
 use std::path::Path;
 
 use crate::directories::{Directory, DirectoryWriter, FsDirectory};
-use crate::dsl::{Document, Schema, SchemaBuilder, parse_single_index};
+use crate::dsl::{Document, Schema, parse_single_index};
 use crate::error::{Error, Result};
 use crate::index::{IndexConfig, IndexWriter};
 
-/// Schema configuration from JSON format
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct SchemaFieldConfig {
-    /// Field name
-    pub name: String,
-    /// Field type: text, u64, i64, f64, bytes, json, sparse_vector, dense_vector
-    #[serde(rename = "type")]
-    pub field_type: String,
-    /// Whether field is indexed (default: true)
-    #[serde(default = "default_true")]
-    pub indexed: bool,
-    /// Whether field is stored (default: true)
-    #[serde(default = "default_true")]
-    pub stored: bool,
-    /// Dimension for dense_vector fields
-    #[serde(default)]
-    pub dimension: usize,
-    /// Text primary key, matching the SDL `primary` attribute.
-    #[serde(default, alias = "primary", skip_serializing_if = "std::ops::Not::not")]
-    pub primary_key: bool,
-    /// Stored content fingerprint for unchanged upserts.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub content_hash: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// JSON schema configuration
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct SchemaConfig {
-    /// List of field definitions
-    pub fields: Vec<SchemaFieldConfig>,
-    /// Creation-time cap on retained tokens per L1 phrase (default: 64).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_l1_phrase_terms: Option<NonZeroU32>,
-}
-
-impl SchemaConfig {
-    /// Build a Schema from this configuration
-    pub fn build(&self) -> Result<Schema> {
-        let mut builder = SchemaBuilder::default();
-        if let Some(limit) = self.max_l1_phrase_terms {
-            builder.set_max_l1_phrase_terms(limit);
-        }
-
-        if self.fields.iter().filter(|field| field.primary_key).count() > 1 {
-            return Err(Error::Schema("at most one primary key is allowed".into()));
-        }
-        for field in &self.fields {
-            if field.primary_key && field.field_type != "text" {
-                return Err(Error::Schema("primary key must be text".into()));
-            }
-            let id = match field.field_type.as_str() {
-                "text" => builder.add_text_field(&field.name, field.indexed, field.stored),
-                "u64" => builder.add_u64_field(&field.name, field.indexed, field.stored),
-                "i64" => builder.add_i64_field(&field.name, field.indexed, field.stored),
-                "f64" => builder.add_f64_field(&field.name, field.indexed, field.stored),
-                "bytes" => builder.add_bytes_field(&field.name, field.stored),
-                "json" => builder.add_json_field(&field.name, field.stored),
-                "sparse_vector" => {
-                    builder.add_sparse_vector_field(&field.name, field.indexed, field.stored)
-                }
-                "dense_vector" => builder.add_dense_vector_field(
-                    &field.name,
-                    field.dimension,
-                    field.indexed,
-                    field.stored,
-                ),
-                other => return Err(Error::Schema(format!("Unknown field type: {}", other))),
-            };
-            if field.primary_key {
-                builder.set_primary_key(id);
-            }
-            if field.content_hash {
-                builder.set_content_hash(id);
-            }
-        }
-
-        let schema = builder.build();
-        schema.validate()?;
-        Ok(schema)
-    }
-}
-
-/// Parse schema from a string (auto-detects JSON or SDL format)
+/// Parse a schema from SDL.
 pub fn parse_schema(content: &str) -> Result<Schema> {
-    let trimmed = content.trim();
-
-    // Detect SDL format (starts with "index " or "#" for comments)
-    if trimmed.starts_with("index ") || trimmed.starts_with('#') {
-        let index_def = parse_single_index(content)
-            .map_err(|e| Error::Schema(format!("Failed to parse SDL: {}", e)))?;
-        Ok(index_def.to_schema())
-    } else {
-        // Try JSON format
-        let config: SchemaConfig = serde_json::from_str(content)
-            .map_err(|e| Error::Schema(format!("Failed to parse JSON schema: {}", e)))?;
-        config.build()
-    }
+    let index_def = parse_single_index(content)
+        .map_err(|e| Error::Schema(format!("Failed to parse SDL: {}", e)))?;
+    Ok(index_def.to_schema())
 }
 
 /// Create a new index at the given path with the provided schema
@@ -235,51 +138,7 @@ where
 mod tests {
     use super::*;
     use crate::directories::RamDirectory;
-
-    #[test]
-    fn test_schema_config_json() {
-        let json = r#"{
-            "fields": [
-                {"name": "title", "type": "text", "indexed": true, "stored": true},
-                {"name": "body", "type": "text"},
-                {"name": "score", "type": "f64", "indexed": false}
-            ]
-        }"#;
-
-        let config: SchemaConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.fields.len(), 3);
-
-        let schema = config.build().unwrap();
-        assert!(schema.get_field("title").is_some());
-        assert!(schema.get_field("body").is_some());
-        assert!(schema.get_field("score").is_some());
-    }
-
-    #[test]
-    fn test_parse_schema_json() {
-        let json = r#"{"fields": [{"name": "text", "type": "text"}]}"#;
-        let schema = parse_schema(json).unwrap();
-        assert!(schema.get_field("text").is_some());
-    }
-
-    #[test]
-    fn json_schema_configures_content_hash_and_rejects_invalid_combinations() {
-        let json = r#"{"fields":[{"name":"id","type":"text","primary_key":true},{"name":"digest","type":"bytes","stored":true,"content_hash":true}]}"#;
-        let schema = parse_schema(json).unwrap();
-        assert_eq!(schema.primary_field(), schema.get_field("id"));
-        assert_eq!(schema.content_hash_field(), schema.get_field("digest"));
-        let config: SchemaConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            parse_schema(&serde_json::to_string(&config).unwrap())
-                .unwrap()
-                .content_hash_field(),
-            schema.content_hash_field()
-        );
-        assert!(
-            parse_schema(&json.replace("\"primary_key\":true", "\"primary_key\":false")).is_err()
-        );
-        assert!(parse_schema(&json.replace("\"stored\":true", "\"stored\":false")).is_err());
-    }
+    use crate::dsl::SchemaBuilder;
 
     #[test]
     fn test_parse_schema_sdl() {
@@ -300,32 +159,21 @@ mod tests {
             let option = value
                 .map(|value| format!("max_l1_phrase_terms: {value}"))
                 .unwrap_or_default();
-            let mut json = serde_json::json!({"fields": [{"name": "body", "type": "text"}]});
-            if let Some(value) = value {
-                json["max_l1_phrase_terms"] = value.into();
-            }
-            for input in [
-                format!("index documents {{ {option} field body: text }}"),
-                json.to_string(),
-            ] {
-                let schema = parse_schema(&input).unwrap();
-                assert_eq!(schema.max_l1_phrase_terms(), value.unwrap_or(64) as usize);
-                let serialized = serde_json::to_value(&schema).unwrap();
-                assert_eq!(
-                    serialized.get("max_l1_phrase_terms").is_some(),
-                    value.is_some()
-                );
-                let restored: Schema = serde_json::from_value(serialized).unwrap();
-                assert_eq!(restored.max_l1_phrase_terms(), schema.max_l1_phrase_terms());
-            }
+            let schema =
+                parse_schema(&format!("index documents {{ {option} field body: text }}")).unwrap();
+            assert_eq!(schema.max_l1_phrase_terms(), value.unwrap_or(64) as usize);
+            let serialized = serde_json::to_value(&schema).unwrap();
+            assert_eq!(
+                serialized.get("max_l1_phrase_terms").is_some(),
+                value.is_some()
+            );
+            let restored: Schema = serde_json::from_value(serialized).unwrap();
+            assert_eq!(restored.max_l1_phrase_terms(), schema.max_l1_phrase_terms());
         }
         for invalid in ["0", "-1", "1.5", "4294967296", "\"64\"", "true"] {
-            for input in [
-                format!("index documents {{ max_l1_phrase_terms: {invalid} field body: text }}"),
-                format!(r#"{{"max_l1_phrase_terms": {invalid}, "fields": []}}"#),
-            ] {
-                assert!(parse_schema(&input).is_err(), "accepted {input}");
-            }
+            let input =
+                format!("index documents {{ max_l1_phrase_terms: {invalid} field body: text }}");
+            assert!(parse_schema(&input).is_err(), "accepted {input}");
         }
         assert!(
             parse_schema("index documents { max_l1_phrase_terms: 64 max_l1_phrase_terms: 256 }")

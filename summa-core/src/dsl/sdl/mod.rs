@@ -28,7 +28,7 @@
 //!     # Raw content hash (not indexed, just stored)
 //!     field content_hash: bytes [stored]
 //!
-//!     # Dense vector with the production IVF-PQ index
+//!     # Dense vector with the default IVF-TQ index
 //!     field embedding: dense_vector<768> [indexed<ivf_tq, routing: hnsw, nprobe: 64>]
 //!
 //! }
@@ -290,7 +290,7 @@ enum SoarDirective {
     Unspecified,
     /// `soar: off` was explicitly requested.
     Disabled,
-    /// An explicit selective/full/aggressive preset.
+    /// An explicit selective/full preset.
     Enabled(crate::structures::SoarConfig),
 }
 
@@ -416,7 +416,6 @@ fn parse_index_config(pair: pest::iterators::Pair<Rule>) -> Result<IndexConfig> 
 
     // indexed_with_config = { "indexed" ~ "<" ~ index_config_params ~ ">" }
     // index_config_params = { index_config_param ~ ("," ~ index_config_param)* }
-    // index_config_param = { index_type_kwarg | centroids_kwarg | codebook_kwarg | nprobe_kwarg | index_type_spec }
 
     for inner in pair.into_inner() {
         if inner.as_rule() == Rule::index_config_params {
@@ -433,47 +432,37 @@ fn parse_index_config(pair: pest::iterators::Pair<Rule>) -> Result<IndexConfig> 
     Ok(config)
 }
 
+/// Apply an `index_type_spec` to both dense and binary index settings.
+fn set_index_type(config: &mut IndexConfig, spec: &str) {
+    use super::schema::{BinaryIndexType, VectorIndexType};
+
+    match spec {
+        "flat" => {
+            config.index_type = Some(VectorIndexType::Flat);
+            config.binary_index_type = Some(BinaryIndexType::Flat);
+        }
+        "ivf" => config.binary_index_type = Some(BinaryIndexType::Ivf),
+        "ivf_tq" => config.index_type = Some(VectorIndexType::IvfTq),
+        "scann" => {
+            config.index_type = Some(VectorIndexType::Scann);
+            config.binary_index_type = Some(BinaryIndexType::Scann);
+        }
+        "tq" => config.index_type = Some(VectorIndexType::Tq),
+        _ => {}
+    }
+}
+
 /// Parse a single index config parameter
 fn parse_single_index_config_param(
     config: &mut IndexConfig,
     p: pest::iterators::Pair<Rule>,
 ) -> Result<()> {
-    use super::schema::VectorIndexType;
-
     match p.as_rule() {
-        Rule::index_type_spec => match p.as_str() {
-            "flat" => {
-                config.index_type = Some(VectorIndexType::Flat);
-                config.binary_index_type = Some(super::schema::BinaryIndexType::Flat);
-            }
-            "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
-            "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
-            "ivf_tq" => config.index_type = Some(VectorIndexType::IvfTq),
-            "scann" => {
-                config.index_type = Some(VectorIndexType::Scann);
-                config.binary_index_type = Some(super::schema::BinaryIndexType::Scann);
-            }
-            "tq" => config.index_type = Some(VectorIndexType::Tq),
-            _ => {}
-        },
+        Rule::index_type_spec => set_index_type(config, p.as_str()),
         Rule::index_type_kwarg => {
             // index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
             if let Some(t) = p.into_inner().next() {
-                match t.as_str() {
-                    "flat" => {
-                        config.index_type = Some(VectorIndexType::Flat);
-                        config.binary_index_type = Some(super::schema::BinaryIndexType::Flat);
-                    }
-                    "ivf" => config.binary_index_type = Some(super::schema::BinaryIndexType::Ivf),
-                    "ivf_pq" => config.index_type = Some(VectorIndexType::IvfPq),
-                    "ivf_tq" => config.index_type = Some(VectorIndexType::IvfTq),
-                    "scann" => {
-                        config.index_type = Some(VectorIndexType::Scann);
-                        config.binary_index_type = Some(super::schema::BinaryIndexType::Scann);
-                    }
-                    "tq" => config.index_type = Some(VectorIndexType::Tq),
-                    _ => {}
-                }
+                set_index_type(config, t.as_str());
             }
         }
         Rule::num_clusters_kwarg => {
@@ -551,7 +540,6 @@ fn parse_single_index_config_param(
                 config.soar = match s.as_str() {
                     "selective" => SoarDirective::Enabled(SoarConfig::new()),
                     "full" => SoarDirective::Enabled(SoarConfig::full()),
-                    "aggressive" => SoarDirective::Enabled(SoarConfig::aggressive()),
                     _ => SoarDirective::Disabled, // "off"
                 };
             }
@@ -2680,9 +2668,7 @@ mod tests {
             .as_ref()
             .expect("binary IVF retains full spilling");
         assert!(!soar.selective);
-        assert!(
-            crate::dsl::schema::reject_removed_vector_index_types(&indexes[0].to_schema()).is_ok()
-        );
+        assert!(crate::dsl::schema::validate_persisted_schema(&indexes[0].to_schema()).is_ok());
         let error = parse_sdl(
             "index invalid { field hash: binary_dense_vector<256> [indexed<flat, soar: full>] }",
         )
@@ -2721,18 +2707,6 @@ mod tests {
         let soar = config.soar.as_ref().expect("soar should be enabled");
         assert_eq!(soar.num_secondary, 1);
         assert!(soar.selective);
-
-        // aggressive is a compatibility alias for full one-secondary spilling
-        let sdl = r#"
-            index documents {
-                field embedding: dense_vector<768> [indexed<ivf_tq, soar: aggressive>]
-            }
-        "#;
-        let indexes = parse_sdl(sdl).unwrap();
-        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
-        let soar = config.soar.as_ref().expect("soar should be enabled");
-        assert_eq!(soar.num_secondary, 1);
-        assert!(!soar.selective);
 
         // off keeps soar disabled
         let sdl = r#"
@@ -2910,7 +2884,7 @@ mod tests {
         let validate = |spec: &str| {
             let index = &parse(spec).unwrap()[0];
             let schema = index.to_schema();
-            crate::dsl::schema::reject_removed_vector_index_types(&schema)
+            crate::dsl::schema::validate_persisted_schema(&schema)
         };
         assert!(validate("indexed<ivf, prefix_bits: 1024>").is_ok());
         for invalid in [
@@ -3051,30 +3025,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_ivf_pq_still_parses_to_the_reserved_variant() {
-        use crate::dsl::schema::VectorIndexType;
-
-        // The SDL keeps accepting `ivf_pq` purely so index create/open can
-        // reject it with an actionable message instead of a grammar error.
-        let sdl = r#"
-            index test {
-                field embedding: dense_vector<8> [indexed<ivf_pq>]
-            }
-        "#;
-        let indexes = parse_sdl(sdl).unwrap();
-        let config = indexes[0].fields[0].dense_vector_config.as_ref().unwrap();
-        assert_eq!(config.index_type, VectorIndexType::IvfPq);
-
-        let mut builder = crate::dsl::SchemaBuilder::default();
-        builder.add_dense_vector_field_with_config("embedding", true, true, config.clone());
-        let schema = builder.build();
-        let error = crate::dsl::schema::reject_removed_vector_index_types(&schema)
-            .expect_err("removed index types must be rejected at the index gate");
-        assert!(error.contains("ivf_tq"), "{error}");
-        assert!(error.contains("removed"), "{error}");
-    }
-
-    #[test]
     fn test_dense_vector_flat_index() {
         use crate::dsl::schema::VectorIndexType;
 
@@ -3095,7 +3045,7 @@ mod tests {
     fn test_dense_vector_default_index_type() {
         use crate::dsl::schema::VectorIndexType;
 
-        // Omitting an index type selects the production IVF-PQ path.
+        // Omitting an index type selects the default IVF-TQ path.
         let sdl = r#"
             index documents {
                 field embedding: dense_vector<dims: 768> [indexed]

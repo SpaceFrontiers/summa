@@ -228,8 +228,7 @@ impl BmpIndex {
 
         if magic != BMP_BLOB_MAGIC {
             return Err(crate::Error::Corruption(format!(
-                "Unsupported BMP blob magic: {:#x} (expected BMPB {:#x}); migrate or rebuild \
-                 the index with a compatible Summa release.",
+                "Unsupported BMP blob magic: {:#x} (expected BMPB {:#x}); rebuild the index.",
                 magic, BMP_BLOB_MAGIC
             )));
         }

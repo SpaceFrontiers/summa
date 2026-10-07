@@ -328,15 +328,9 @@ const L0_SIZE: usize = 16;
 /// Level-1 skip entry — 4 bytes (just `last_doc`).
 const L1_SIZE: usize = 4;
 
-/// Legacy footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) + max_tf(4) = 24 bytes.
-const FOOTER_SIZE: usize = 24;
-
-/// Current footer: the legacy footer followed by `total_positions(8) +
-/// flags(4) + min_len(4) + magic(4)`. A list ends with the magic iff it has
-/// the extended footer; a legacy footer ends with `max_tf`, which the u16
-/// term frequency of the builder keeps far below the magic, so both forms
-/// remain readable.
-const FOOTER_V2_SIZE: usize = FOOTER_SIZE + 20;
+/// Footer: stream_len(8) + l0_count(4) + l1_count(4) + doc_count(4) +
+/// max_tf(4) + total_positions(8) + flags(4) + min_len(4) + magic(4).
+const FOOTER_SIZE: usize = 44;
 
 /// "BPL2" little-endian.
 const FOOTER_MAGIC: u32 = 0x324C_5042;
@@ -345,8 +339,7 @@ const FOOTER_MAGIC: u32 = 0x324C_5042;
 const FLAG_POS_CURSORS: u32 = 1;
 
 /// Footer flag: the fourth L0 word packs `max_tf` (low 16 bits) and the
-/// block's minimum scoring-unit length (high 16 bits) instead of an `f32`
-/// max tf, so a block bound can use real length normalisation.
+/// block's minimum scoring-unit length (high 16 bits). Required.
 const FLAG_LEN_BOUNDS: u32 = 2;
 
 /// Footer flag: a packed `(max_tf, min_len)` word per L1 group follows the
@@ -412,9 +405,9 @@ fn group_bounds_from_l0(l0: &[u8], l0_count: usize) -> Vec<u32> {
         let mut min_len = u32::MAX;
         for block in idx..end {
             let (_, _, _, word) = read_l0(l0, block);
-            let (tf, len) = unpack_bounds(word, true);
+            let (tf, len) = unpack_bounds(word);
             max_tf = max_tf.max(tf);
-            min_len = min_len.min(len.unwrap_or(1));
+            min_len = min_len.min(len);
         }
         groups.push(pack_bounds(max_tf, min_len));
         idx = end;
@@ -428,22 +421,17 @@ fn pack_bounds(max_tf: u32, min_len: u32) -> u32 {
     max_tf.min(u16::MAX as u32) | (min_len.min(u16::MAX as u32) << 16)
 }
 
-/// Unpack the fourth L0 word: `(max_tf, min_len)`; `min_len` is `None` for
-/// legacy lists whose word is an `f32` max tf.
+/// Unpack the fourth L0 word: `(max_tf, min_len)`.
 #[inline]
-fn unpack_bounds(word: u32, packed: bool) -> (u32, Option<u32>) {
-    if packed {
-        (word & 0xFFFF, Some(word >> 16))
-    } else {
-        (f32::from_bits(word) as u32, None)
-    }
+fn unpack_bounds(word: u32) -> (u32, u32) {
+    (word & 0xFFFF, word >> 16)
 }
 
 /// Size of one position cursor (`u64`: values before the block in the
 /// term's position stream).
 const CURSOR_SIZE: usize = 8;
 
-/// Parsed footer of either format plus the derived section layout.
+/// Parsed footer plus the derived section layout.
 #[derive(Debug, Clone, Copy)]
 struct Footer {
     compact_headers: bool,
@@ -455,7 +443,6 @@ struct Footer {
     max_tf: u32,
     total_positions: u64,
     has_cursors: bool,
-    len_bounds: bool,
     l1_bounds: bool,
     ratio_bounds: bool,
     impact_bounds: bool,
@@ -475,14 +462,13 @@ impl Footer {
                 "posting data too short",
             ));
         }
-        let extended = raw.len() >= FOOTER_V2_SIZE
-            && u32::from_le_bytes(raw[raw.len() - 4..].try_into().unwrap()) == FOOTER_MAGIC;
-        let f = raw.len()
-            - if extended {
-                FOOTER_V2_SIZE
-            } else {
-                FOOTER_SIZE
-            };
+        if u32::from_le_bytes(raw[raw.len() - 4..].try_into().unwrap()) != FOOTER_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "posting list footer magic mismatch; rebuild the index",
+            ));
+        }
+        let f = raw.len() - FOOTER_SIZE;
         let stream_len = usize::try_from(u64::from_le_bytes(raw[f..f + 8].try_into().unwrap()))
             .map_err(|_| {
                 io::Error::new(
@@ -494,14 +480,15 @@ impl Footer {
         let l1_count = u32::from_le_bytes(raw[f + 12..f + 16].try_into().unwrap()) as usize;
         let doc_count = u32::from_le_bytes(raw[f + 16..f + 20].try_into().unwrap());
         let max_tf = u32::from_le_bytes(raw[f + 20..f + 24].try_into().unwrap());
-        let (total_positions, flags, min_len) = if extended {
-            let total = u64::from_le_bytes(raw[f + 24..f + 32].try_into().unwrap());
-            let flags = u32::from_le_bytes(raw[f + 32..f + 36].try_into().unwrap());
-            let min_len = u32::from_le_bytes(raw[f + 36..f + 40].try_into().unwrap());
-            (total, flags, min_len)
-        } else {
-            (0, 0, 0)
-        };
+        let total_positions = u64::from_le_bytes(raw[f + 24..f + 32].try_into().unwrap());
+        let flags = u32::from_le_bytes(raw[f + 32..f + 36].try_into().unwrap());
+        let min_len = u32::from_le_bytes(raw[f + 36..f + 40].try_into().unwrap());
+        if flags & FLAG_LEN_BOUNDS == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "posting list lacks length bounds; rebuild the index",
+            ));
+        }
         if flags
             & !(FLAG_POS_CURSORS
                 | FLAG_LEN_BOUNDS
@@ -528,7 +515,6 @@ impl Footer {
             max_tf,
             total_positions,
             has_cursors: flags & FLAG_POS_CURSORS != 0,
-            len_bounds: flags & FLAG_LEN_BOUNDS != 0,
             l1_bounds: flags & FLAG_L1_BOUNDS != 0,
             ratio_bounds: flags & FLAG_RATIO_BOUNDS != 0,
             impact_bounds: flags & FLAG_IMPACT_BOUNDS != 0,
@@ -578,8 +564,7 @@ impl Footer {
         let footer_offset = total_len.saturating_sub(raw.len() - f);
         if end.is_none_or(|end| {
             if footer.impact_bounds {
-                !footer.len_bounds
-                    || !footer.ratio_bounds
+                !footer.ratio_bounds
                     || l0_count
                         .checked_add(if footer.group_impact_bounds {
                             l1_count
@@ -761,8 +746,7 @@ fn or_bitmap_words(bits: &mut [u64], offset: u32, words: &[u8]) {
 
 /// Read a compact L0 entry from raw bytes at the given index: `(first_doc,
 /// last_doc, offset, bounds word)`. The bounds word is packed `(max_tf,
-/// min_len)` for current lists and an `f32` max tf for legacy ones; see
-/// [`unpack_bounds`].
+/// min_len)`; see [`unpack_bounds`].
 ///
 /// Uses a single bounds check (`[..L0_SIZE]`) instead of 4× `try_into().unwrap()`.
 #[inline]
@@ -967,8 +951,7 @@ pub struct BlockPostingList {
     /// Level-1 skip `last_doc` values — one per `L1_INTERVAL` blocks.
     /// Borrowed little-endian words; opening does not copy the group directory.
     l1_docs: GroupWords,
-    /// Packed `(max_tf, min_len)` per L1 group (superblock bounds); empty
-    /// for legacy lists.
+    /// Packed `(max_tf, min_len)` per L1 group (superblock bounds).
     l1_bounds: GroupWords,
     /// Optional L0 then L1 length/TF ratio minima, borrowed from index bytes.
     ratios: Option<OwnedBytes>,
@@ -980,14 +963,12 @@ pub struct BlockPostingList {
     max_tf: u32,
     /// Per-block position cursors (`u64` × `l0_count`): number of values in
     /// the term's position stream before the block. `None` for terms
-    /// without positions and for legacy lists.
+    /// without positions.
     pos_cursors: Option<OwnedBytes>,
     /// Sum of term frequencies (= values in the position stream) when
     /// cursors are present.
     total_positions: u64,
-    /// Whether L0 bounds words are packed `(max_tf, min_len)`.
-    len_bounds: bool,
-    /// Minimum scoring-unit length over the whole list (with `len_bounds`).
+    /// Minimum scoring-unit length over the whole list.
     min_len: u32,
 }
 
@@ -1247,7 +1228,6 @@ impl BlockPostingList {
             max_tf,
             pos_cursors: with_positions.then(|| OwnedBytes::new(cursors)),
             total_positions: positions_so_far,
-            len_bounds: true,
             min_len: if list_min_len == u32::MAX {
                 1
             } else {
@@ -1348,7 +1328,7 @@ impl BlockPostingList {
             self.max_tf,
             self.total_positions,
             self.pos_cursors.is_some(),
-            self.len_bounds.then_some(self.min_len),
+            self.min_len,
             !self.l1_bounds.is_empty(),
             self.ratios.is_some(),
             self.impacts.is_some(),
@@ -1368,7 +1348,7 @@ impl BlockPostingList {
         max_tf: u32,
         total_positions: u64,
         has_cursors: bool,
-        min_len: Option<u32>,
+        min_len: u32,
         l1_bounds: bool,
         ratio_bounds: bool,
         impact_bounds: bool,
@@ -1381,12 +1361,9 @@ impl BlockPostingList {
         writer.write_u32::<LittleEndian>(doc_count)?;
         writer.write_u32::<LittleEndian>(max_tf)?;
         writer.write_u64::<LittleEndian>(total_positions)?;
-        let mut flags = layout_flags;
+        let mut flags = layout_flags | FLAG_LEN_BOUNDS;
         if has_cursors {
             flags |= FLAG_POS_CURSORS;
-        }
-        if min_len.is_some() {
-            flags |= FLAG_LEN_BOUNDS;
         }
         if l1_bounds {
             flags |= FLAG_L1_BOUNDS;
@@ -1401,12 +1378,12 @@ impl BlockPostingList {
             flags |= FLAG_GROUP_IMPACT_BOUNDS;
         }
         writer.write_u32::<LittleEndian>(flags)?;
-        writer.write_u32::<LittleEndian>(min_len.unwrap_or(0))?;
+        writer.write_u32::<LittleEndian>(min_len)?;
         writer.write_u32::<LittleEndian>(FOOTER_MAGIC)?;
         Ok(())
     }
 
-    /// Deserialize from a byte slice (either footer format).
+    /// Deserialize from a byte slice.
     pub fn deserialize(raw: &[u8]) -> io::Result<Self> {
         Self::deserialize_zero_copy(OwnedBytes::new(raw.to_vec()))
     }
@@ -1426,7 +1403,7 @@ impl BlockPostingList {
         }
         if footer.impact_bounds {
             ImpactTable::validate(
-                &raw[footer.ratios_end()..raw.len() - FOOTER_V2_SIZE],
+                &raw[footer.ratios_end()..raw.len() - FOOTER_SIZE],
                 footer.impact_record_count(),
             )?;
         }
@@ -1458,7 +1435,7 @@ impl BlockPostingList {
             ratios,
             impacts: footer.impact_bounds.then(|| {
                 ImpactTable::from_validated(
-                    raw.slice(footer.ratios_end()..raw.len() - FOOTER_V2_SIZE),
+                    raw.slice(footer.ratios_end()..raw.len() - FOOTER_SIZE),
                     footer.impact_record_count(),
                 )
             }),
@@ -1466,15 +1443,13 @@ impl BlockPostingList {
             max_tf: footer.max_tf,
             pos_cursors,
             total_positions: footer.total_positions,
-            len_bounds: footer.len_bounds,
             min_len: footer.min_len,
         }
     }
 
-    /// Minimum scoring-unit length over the list, when the list stores
-    /// length bounds (`None` for legacy lists).
-    pub fn min_len(&self) -> Option<u32> {
-        self.len_bounds.then_some(self.min_len)
+    /// Minimum scoring-unit length over the list.
+    pub fn min_len(&self) -> u32 {
+        self.min_len
     }
 
     /// Whether optional ratio bounds are present (zero entries mean unknown).
@@ -1557,17 +1532,17 @@ impl BlockPostingList {
         })
     }
 
-    /// `(max_tf, min_len)` of a block; `min_len` is `None` for legacy lists.
+    /// `(max_tf, min_len)` of a block.
     #[inline]
-    pub fn block_bounds(&self, block_idx: usize) -> Option<(u32, Option<u32>)> {
+    pub fn block_bounds(&self, block_idx: usize) -> Option<(u32, u32)> {
         if block_idx >= self.l0_count {
             return None;
         }
         let (_, _, _, word) = self.read_l0_entry(block_idx);
-        let (max_tf, min_len) = unpack_bounds(word, self.len_bounds);
+        let (max_tf, min_len) = unpack_bounds(word);
         // A packed maximum can saturate; the full-width list maximum remains
         // a conservative bound. Never interpret saturation as an actual TF.
-        let max_tf = if self.len_bounds && max_tf == u16::MAX as u32 {
+        let max_tf = if max_tf == u16::MAX as u32 {
             max_tf.max(self.max_tf)
         } else {
             max_tf
@@ -1576,20 +1551,20 @@ impl BlockPostingList {
     }
 
     /// `(max_tf, min_len)` over the L1 group (`L1_INTERVAL` blocks) that
-    /// contains `block_idx`; `None` for legacy lists without group bounds.
+    /// contains `block_idx`; `None` for lists without group bounds.
     #[inline]
     pub fn group_bounds(&self, block_idx: usize) -> Option<(u32, u32)> {
         if block_idx >= self.l0_count {
             return None;
         }
         let word = self.l1_bounds.get(block_idx / L1_INTERVAL)?;
-        let (max_tf, min_len) = unpack_bounds(word, true);
+        let (max_tf, min_len) = unpack_bounds(word);
         let max_tf = if max_tf == u16::MAX as u32 {
             max_tf.max(self.max_tf)
         } else {
             max_tf
         };
-        Some((max_tf, min_len.unwrap_or(1)))
+        Some((max_tf, min_len))
     }
 
     /// Last doc of the L1 group containing `block_idx`.
@@ -1744,7 +1719,7 @@ impl BlockPostingList {
 
         for (source, doc_offset) in sources {
             max_tf = max_tf.max(source.max_tf);
-            min_len = min_len.min(source.min_len().unwrap_or(1));
+            min_len = min_len.min(source.min_len);
             for block_idx in 0..source.num_blocks() {
                 if let Some(impacts) = &mut impacts {
                     impacts.append(
@@ -1762,9 +1737,7 @@ impl BlockPostingList {
                     let cursor = source.pos_cursor(block_idx).unwrap_or(0) + positions_before;
                     cursors.extend_from_slice(&cursor.to_le_bytes());
                 }
-                let (first_doc, last_doc, _, word) = source.read_l0_entry(block_idx);
-                let (block_max_tf, block_min_len) = unpack_bounds(word, source.len_bounds);
-                let bounds = pack_bounds(block_max_tf, block_min_len.unwrap_or(1));
+                let (first_doc, last_doc, _, bounds) = source.read_l0_entry(block_idx);
                 let header = source.block_header(block_idx);
                 let count = u16::from_le_bytes(header[..2].try_into().unwrap());
                 if stream.len() > u32::MAX as usize {
@@ -1848,7 +1821,6 @@ impl BlockPostingList {
             max_tf,
             pos_cursors: all_cursors.then(|| OwnedBytes::new(cursors)),
             total_positions: if all_cursors { total_positions } else { 0 },
-            len_bounds: true,
             min_len: if min_len == u32::MAX { 1 } else { min_len },
         })
     }
@@ -1903,7 +1875,7 @@ impl BlockPostingList {
                     crate::Error::Corruption("merged position cursor overflow".into())
                 })?;
             merged_max_tf = merged_max_tf.max(footer.max_tf);
-            merged_min_len = merged_min_len.min(if footer.len_bounds { footer.min_len } else { 1 });
+            merged_min_len = merged_min_len.min(footer.min_len);
             metas.push(footer);
         }
 
@@ -1954,7 +1926,7 @@ impl BlockPostingList {
                 if let Some(impacts) = &mut out_impacts {
                     let record = if meta.impact_bounds {
                         ImpactTable::record_from_validated(
-                            &raw[meta.ratios_end()..raw.len() - FOOTER_V2_SIZE],
+                            &raw[meta.ratios_end()..raw.len() - FOOTER_SIZE],
                             meta.impact_record_count(),
                             i,
                         )
@@ -1972,9 +1944,7 @@ impl BlockPostingList {
                     ratios.extend_from_slice(&ratio.to_le_bytes());
                 }
                 // Read source L0 entry directly from raw bytes
-                let (first_doc, last_doc, offset, word) = read_l0(&raw[l0_base..], i);
-                let (block_max_tf, block_min_len) = unpack_bounds(word, meta.len_bounds);
-                let bounds = pack_bounds(block_max_tf, block_min_len.unwrap_or(1));
+                let (first_doc, last_doc, offset, bounds) = read_l0(&raw[l0_base..], i);
                 if all_cursors {
                     let size = meta.cursor_size();
                     let p = cursors_base + i * size;
@@ -2079,7 +2049,7 @@ impl BlockPostingList {
                 {
                     let raw = sources[source].0;
                     Some(ImpactTable::record_from_validated(
-                        &raw[meta.ratios_end()..raw.len() - FOOTER_V2_SIZE],
+                        &raw[meta.ratios_end()..raw.len() - FOOTER_SIZE],
                         meta.impact_record_count(),
                         meta.l0_count + local / L1_INTERVAL,
                     ))
@@ -2104,11 +2074,11 @@ impl BlockPostingList {
             merged_max_tf,
             if all_cursors { total_positions } else { 0 },
             all_cursors,
-            Some(if merged_min_len == u32::MAX {
+            if merged_min_len == u32::MAX {
                 1
             } else {
                 merged_min_len
-            }),
+            },
             true,
             out_ratios.is_some(),
             out_impacts.is_some(),
@@ -2132,7 +2102,7 @@ impl BlockPostingList {
             + out_cursors.len()
             + out_ratios.as_ref().map_or(0, Vec::len)
             + out_impacts.as_ref().map_or(0, |t| t.bytes().len())
-            + FOOTER_V2_SIZE;
+            + FOOTER_SIZE;
         Ok((total_docs, total_bytes))
     }
 
@@ -5061,7 +5031,7 @@ mod tests {
         let expected = bpl.stream.len()
             + bpl.l0_count * L0_SIZE
             + bpl.l1_docs.len() * (L1_SIZE + 4)
-            + FOOTER_V2_SIZE;
+            + FOOTER_SIZE;
         assert_eq!(bytes.len(), expected);
     }
 
@@ -5118,7 +5088,7 @@ mod tests {
             bpl.stream.len()
                 + bpl.l0_count * (L0_SIZE + CURSOR_SIZE)
                 + bpl.l1_docs.len() * (L1_SIZE + 4)
-                + FOOTER_V2_SIZE
+                + FOOTER_SIZE
         );
         assert!(BlockPostingList::has_cursors_bytes(&bytes));
         let decoded =
@@ -5154,16 +5124,16 @@ mod tests {
             list.push(doc, tf);
         }
         let bpl = BlockPostingList::from_posting_list_with(&list, true, Some(&length_of)).unwrap();
-        assert_eq!(bpl.min_len(), Some(10));
-        assert_eq!(bpl.block_bounds(0), Some((3, Some(10))));
+        assert_eq!(bpl.min_len(), 10);
+        assert_eq!(bpl.block_bounds(0), Some((3, 10)));
         // Block 2 covers docs 256..300: min length there is doc 256 (256 % 50 = 6 → 52).
-        assert_eq!(bpl.block_bounds(2), Some((3, Some(52))));
+        assert_eq!(bpl.block_bounds(2), Some((3, 52)));
         assert_eq!(bpl.block_max_tf(2), Some(3));
 
         let bytes = serialize_bpl(&bpl);
         let decoded = BlockPostingList::deserialize(&bytes).unwrap();
-        assert_eq!(decoded.min_len(), Some(10));
-        assert_eq!(decoded.block_bounds(2), Some((3, Some(52))));
+        assert_eq!(decoded.min_len(), 10);
+        assert_eq!(decoded.block_bounds(2), Some((3, 52)));
         // Superblock bounds: one group of three blocks here, max tf 3 and
         // the smallest length of the whole list.
         assert_eq!(decoded.group_bounds(0), Some((3, 10)));
@@ -5174,59 +5144,22 @@ mod tests {
 
         // Without lengths the minimum is 1, which every real unit satisfies.
         let plain = build_bpl(&docs);
-        assert_eq!(plain.min_len(), Some(1));
-        assert_eq!(plain.block_bounds(0), Some((3, Some(1))));
+        assert_eq!(plain.min_len(), 1);
+        assert_eq!(plain.block_bounds(0), Some((3, 1)));
 
         // Streaming merge keeps per-block bounds and takes the list minimum.
         let mut out = Vec::new();
         BlockPostingList::concatenate_streaming(&[(&bytes, 0), (&bytes, 1000)], &mut out).unwrap();
         let merged = BlockPostingList::deserialize(&out).unwrap();
-        assert_eq!(merged.min_len(), Some(10));
-        assert_eq!(merged.block_bounds(2), Some((3, Some(52))));
-        assert_eq!(merged.block_bounds(3), Some((3, Some(10))));
+        assert_eq!(merged.min_len(), 10);
+        assert_eq!(merged.block_bounds(2), Some((3, 52)));
+        assert_eq!(merged.block_bounds(3), Some((3, 10)));
         assert_eq!(merged.block_max_tf(5), Some(3));
         // Six blocks: one full group of eight would need more; here both
         // lists' blocks share group 0.
         assert_eq!(merged.group_bounds(5), Some((3, 10)));
         assert_eq!(merged.group_last_doc(5), Some(1299));
         assert_eq!(merged.next_group_block(5), 6);
-    }
-
-    #[test]
-    fn legacy_footer_without_magic_still_deserializes() {
-        let docs: Vec<(u32, u32)> = (0..300u32).map(|i| (i * 2, 1 + i % 3)).collect();
-        let bpl = build_bpl(&docs);
-        let bytes = serialize_bpl(&bpl);
-        // A real pre-magic layout has no L1 bounds or footer extension, and
-        // stores f32 maxima rather than packed TF/length L0 words.
-        let footer = Footer::parse(&bytes).unwrap();
-        let mut legacy = bytes[..footer.l1_end()].to_vec();
-        for block in 0..bpl.num_blocks() {
-            let at = footer.l0_start() + block * L0_SIZE + 12;
-            legacy[at..at + 4]
-                .copy_from_slice(&(bpl.block_max_tf(block).unwrap() as f32).to_le_bytes());
-        }
-        legacy.extend_from_slice(
-            &bytes[bytes.len() - FOOTER_V2_SIZE..bytes.len() - (FOOTER_V2_SIZE - FOOTER_SIZE)],
-        );
-        assert!(!BlockPostingList::has_cursors_bytes(&legacy));
-        // Legacy lists carry an f32 max tf per block and no lengths.
-        let decoded = BlockPostingList::deserialize(&legacy).unwrap();
-        assert_eq!(collect_postings(&decoded), docs);
-        assert_eq!(decoded.max_tf(), 3);
-        assert!(!decoded.has_position_cursors());
-        assert_eq!(decoded.min_len(), None);
-        assert_eq!(decoded.group_bounds(0), None);
-        // And the legacy bytes concatenate into a current-format list.
-        let mut out = Vec::new();
-        let (count, written) =
-            BlockPostingList::concatenate_streaming(&[(&legacy, 0), (&legacy, 1000)], &mut out)
-                .unwrap();
-        assert_eq!(count, 600);
-        assert_eq!(written, out.len());
-        let merged = BlockPostingList::deserialize(&out).unwrap();
-        assert_eq!(merged.doc_count(), 600);
-        assert!(!merged.has_position_cursors());
     }
 
     #[test]
@@ -5575,7 +5508,7 @@ mod tests {
             max_tf,
             0,
             false,
-            Some(1),
+            1,
             true,
             false,
             false,
@@ -5632,46 +5565,22 @@ mod tests {
         }
     }
 
-    /// A legacy 24-byte footer ending in a `max_tf` equal to the extended
-    /// footer magic is ambiguous; it must be rejected, never parsed as the
-    /// extended layout.
     #[test]
-    fn legacy_footer_whose_max_tf_equals_the_magic_is_rejected_not_misread() {
-        for count in [1u32, 2, 130, 700] {
-            let mut postings = PostingList::new();
-            for i in 0..count {
-                postings.push(i * 2, if i == 0 { FOOTER_MAGIC } else { 1 });
-            }
-            let bpl = BlockPostingList::from_posting_list(&postings).unwrap();
-            assert_eq!(bpl.max_tf(), FOOTER_MAGIC);
-            let bytes = serialize_bpl(&bpl);
-            let footer = Footer::parse(&bytes).unwrap();
-            let mut legacy = bytes[..footer.l1_end()].to_vec();
-            for block in 0..bpl.num_blocks() {
-                let at = footer.l0_start() + block * L0_SIZE + 12;
-                legacy[at..at + 4]
-                    .copy_from_slice(&(bpl.block_max_tf(block).unwrap() as f32).to_le_bytes());
-            }
-            legacy.extend_from_slice(
-                &bytes[bytes.len() - FOOTER_V2_SIZE..bytes.len() - (FOOTER_V2_SIZE - FOOTER_SIZE)],
-            );
-            assert_eq!(
-                u32::from_le_bytes(legacy[legacy.len() - 4..].try_into().unwrap()),
-                FOOTER_MAGIC
-            );
-            assert!(
-                BlockPostingList::deserialize(&legacy).is_err(),
-                "count={count}: ambiguous footer must not be read as either layout"
-            );
-            assert!(!BlockPostingList::has_cursors_bytes(&legacy));
-            let mut out = vec![0xab];
-            assert!(BlockPostingList::concatenate_streaming(&[(&legacy, 0)], &mut out).is_err());
-            assert_eq!(out, [0xab]);
-            // The same postings with the extended footer read back exactly.
-            assert_eq!(
-                BlockPostingList::deserialize(&bytes).unwrap().max_tf(),
-                FOOTER_MAGIC
-            );
+    fn posting_lists_without_current_footer_or_length_bounds_are_rejected() {
+        let docs: Vec<(u32, u32)> = (0..300u32).map(|i| (i * 2, 1 + i % 3)).collect();
+        let bytes = serialize_bpl(&build_bpl(&docs));
+        let mut no_magic = bytes.clone();
+        let end = no_magic.len();
+        no_magic[end - 4..].copy_from_slice(&0u32.to_le_bytes());
+        let mut no_len_bounds = bytes.clone();
+        let flags = end - 12;
+        let value = u32::from_le_bytes(no_len_bounds[flags..flags + 4].try_into().unwrap());
+        no_len_bounds[flags..flags + 4].copy_from_slice(&(value & !FLAG_LEN_BOUNDS).to_le_bytes());
+        for corrupt in [no_magic, no_len_bounds] {
+            let error = BlockPostingList::deserialize(&corrupt).unwrap_err();
+            assert!(error.to_string().contains("rebuild"), "{error}");
+            let mut out = Vec::new();
+            assert!(BlockPostingList::concatenate_streaming(&[(&corrupt, 0)], &mut out).is_err());
         }
     }
 

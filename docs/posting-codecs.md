@@ -61,12 +61,11 @@ Rejected; do not re-add:
 | cursors              | `l0_count × 8` (`u64` positions before)   | flag 1                                                                |
 | ratios               | `(l0_count + l1_count) × 4` (`f32`)       | flag 8                                                                |
 | impact dir + records | `(records + 1) × 4` offsets, then records | flag 16 (`records = l0_count`), flag 32 adds `l1_count` group records |
-| footer               | 24 (legacy) or 44 (extended)              | always                                                                |
+| footer               | 44                                        | always                                                                |
 
-L0 entry: `first_doc u32, last_doc u32, offset u32, bounds u32`. With flag 2
-the bounds word packs `max_tf` (low 16 bits, saturating; readers fall back to
-the list `max_tf` at 65,535) and `min_len` (high 16 bits); legacy lists store an
-`f32` max tf there. Block byte lengths are derived from neighbouring L0
+L0 entry: `first_doc u32, last_doc u32, offset u32, bounds u32`. Flag 2 is
+required: the bounds word packs `max_tf` (low 16 bits, saturating; readers
+fall back to the list `max_tf` at 65,535) and `min_len` (high 16 bits). Block byte lengths are derived from neighbouring L0
 offsets, never from the block header, so payloads may carry variable-length
 exception tables.
 
@@ -180,8 +179,8 @@ gates as the rounded control
 
 ## Format gates
 
-Metadata format **10** is required; formats 6–9 are upgraded on open (see
-[row deletion](row-deletion.md)), older indexes must be rebuilt. See
+Metadata format **11** is required; indexes with any other stamp must be
+rebuilt ([compatibility](compatibility.md)). See
 [`INDEX_META_FORMAT_VERSION`](../summa-core/src/index/metadata.rs) and the
 [SSTable format gates](../summa-core/src/structures/sstable.rs). The gate is
 what protects older readers from the position codec tag; individual block
@@ -305,9 +304,10 @@ opt-in experiment, not a default.
 ## Validation
 
 - `posting::tests`: round trip, seek/advance equality and byte-identical
-  `Rounded` output for every codec; mixed-codec concatenation; legacy footer
-  reads; cursor, window and run accounting; content-corruption regressions;
-  codec-3 tail fixture; footer ambiguity; mixed-cursor rejection.
+  `Rounded` output for every codec; mixed-codec concatenation; rejection of
+  footers without the magic or length bounds; cursor, window and run
+  accounting; content-corruption regressions; codec-3 tail fixture;
+  mixed-cursor rejection.
 - `posting::validation::tests`, `posting/merge_admission_tests.rs`: malformed
   headers, directories, exception tables and trailers rejected before output.
 - `horizontal_bp128::tests`: every width and tail against a bit oracle, with

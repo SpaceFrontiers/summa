@@ -164,9 +164,7 @@ fn can_rank_term(
     if complete || collect_positions {
         return false;
     }
-    let has_block_bounds = postings.min_len().is_some() && postings.num_blocks() > 1;
-    let needs_top_k = limit < postings.doc_count() as usize;
-    has_block_bounds && needs_top_k
+    postings.num_blocks() > 1 && limit < postings.doc_count() as usize
 }
 
 // ── Unified term scorer macro ────────────────────────────────────────────
@@ -956,9 +954,8 @@ impl Scorer for TermScorer {
                 self.field_boost,
             );
         }
-        // Persisted field length when the segment has norms; otherwise `tf`
         crate::observe::search_work!(exact_score_units += 1);
-        // stands in for the length (legacy segments).
+        // Persisted field length; `tf` stands in for a zero or absent length.
         let doc_len = self
             .chunk_lengths
             .as_ref()

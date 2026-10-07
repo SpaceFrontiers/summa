@@ -908,19 +908,20 @@ impl<'a> TermCursor<'a> {
         let posting_max_tf = posting_list.max_tf();
         let max_tf = posting_max_tf as f32;
         let safe_avg = avg_field_len.max(1.0);
-        let length_bounds = lengths.is_some() && posting_list.min_len().is_some();
+        let length_bounds = lengths.is_some();
         let length_floor = match lengths {
             Some(LengthSource::Chunks(map)) => map.length_floor(),
             _ => 0,
         };
-        let max_score = match posting_list.min_len() {
-            Some(min_len) if length_bounds => params.upper_bound_with_len(
+        let max_score = if length_bounds {
+            params.upper_bound_with_len(
                 max_tf.max(1.0),
                 idf,
-                min_len.max(length_floor) as f32,
+                posting_list.min_len().max(length_floor) as f32,
                 safe_avg,
-            ),
-            _ => params.upper_bound(max_tf.max(1.0), idf),
+            )
+        } else {
+            params.upper_bound(max_tf.max(1.0), idf)
         };
         let num_blocks = posting_list.num_blocks();
         let buffers = CursorBuffers::take();
@@ -1166,7 +1167,9 @@ impl<'a> TermCursor<'a> {
                 params,
                 ..
             } => block_bound.get_or_compute(idx, || {
-                let (max_tf, min_len) = list.block_bounds(idx).unwrap_or((0, None));
+                let (max_tf, min_len) = list
+                    .block_bounds(idx)
+                    .map_or((0, None), |(max_tf, min_len)| (max_tf, Some(min_len)));
                 let bound = match min_len {
                     Some(min_len) if *length_bounds => params.upper_bound_with_len(
                         (max_tf as f32).max(1.0),
@@ -1674,7 +1677,7 @@ impl<'a> TermCursor<'a> {
         else {
             return None;
         };
-        let min_len = list.block_bounds(self.block_idx)?.1?.max(*length_floor);
+        let min_len = list.block_bounds(self.block_idx)?.1.max(*length_floor);
         Some(std::array::from_fn(|i| bounds.pair(i as u32 + 1, min_len)))
     }
 

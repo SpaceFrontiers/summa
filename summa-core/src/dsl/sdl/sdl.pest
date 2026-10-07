@@ -169,7 +169,7 @@ bm25_k1_kwarg = { "k1" ~ ":" ~ bm25_param_spec }
 bm25_b_kwarg = { "b" ~ ":" ~ bm25_param_spec }
 bm25_param_spec = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
 index_type_kwarg = { "index" ~ ":" ~ index_type_spec }
-index_type_spec = { "flat" | "ivf_pq" | "ivf_tq" | "ivf" | "scann" | "tq" }
+index_type_spec = { "flat" | "ivf_tq" | "ivf" | "scann" | "tq" }
 num_clusters_kwarg = { "num_clusters" ~ ":" ~ num_clusters_spec }
 num_clusters_spec = @{ ASCII_DIGIT+ }
 target_vectors_kwarg = { "target_vectors" ~ ":" ~ target_vectors_spec }
@@ -200,10 +200,9 @@ doc_mass_kwarg = { "doc_mass" ~ ":" ~ pruning_spec }
 // SOAR spilled secondary cluster assignments for IVF-based dense indexes:
 //   soar: selective  # spill only vectors near cluster boundaries (recommended)
 //   soar: full       # spill every vector to 1 secondary cluster
-//   soar: aggressive # compatibility alias for full one-secondary spilling
 //   soar: off        # explicitly disable default selective spilling
 soar_kwarg = { "soar" ~ ":" ~ soar_spec }
-soar_spec = { "selective" | "full" | "aggressive" | "off" }
+soar_spec = { "selective" | "full" | "off" }
 nprobe_spec = @{ ASCII_DIGIT+ }
 path_chars = @{ (!("\"" ) ~ ANY)* }
 

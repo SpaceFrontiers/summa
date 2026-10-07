@@ -136,8 +136,7 @@ const IVF_TQ_PARALLEL_SCAN_CHUNK_BLOCKS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AnnKind {
-    // Discriminant 1 was IVF-PQ, removed after IVF-TQ superseded it
-    // (docs/turboquant-quantization.md). Never reuse it.
+    // Discriminant 1 belonged to the removed IVF-PQ format; never reuse it.
     BinaryIvf = 2,
     /// TurboQuant flat scan: single logical cluster, block-packed codes.
     TqFlat = 3,
@@ -152,10 +151,6 @@ pub(crate) enum AnnKind {
 impl AnnKind {
     fn from_u8(value: u8) -> io::Result<Self> {
         match value {
-            1 => Err(invalid_data(
-                "ANN kind 1 (IVF-PQ) is no longer supported; recreate the index \
-                 with `ivf_tq` and reindex",
-            )),
             2 => Ok(Self::BinaryIvf),
             3 => Ok(Self::TqFlat),
             4 => Ok(Self::IvfTq),
@@ -1933,12 +1928,8 @@ impl AnnDiskIndex {
         &self,
         plan: &crate::structures::TqIvfQueryPlan,
     ) -> io::Result<()> {
-        if self.header.kind != AnnKind::IvfTq
-            || !crate::structures::is_ivf_tq_cosine_generation(self.header.quantizer_version)
-        {
-            return Err(invalid_data(
-                "legacy raw IVF-TQ payloads cannot be searched; rebuild the index",
-            ));
+        if self.header.kind != AnnKind::IvfTq {
+            return Err(invalid_data("IVF-TQ search requires an IVF-TQ payload"));
         }
         if plan.tq_plan().padded_dim() != self.header.code_size * 2
             || plan.quantizer_version != self.header.quantizer_version
@@ -3145,11 +3136,6 @@ pub(crate) fn write_built_ivf_tq(
 ) -> io::Result<u64> {
     use crate::structures::vector::quantization::{TQ_BLOCK_LANES, tq_pack_ivf_block};
 
-    if !crate::structures::is_ivf_tq_cosine_generation(index.centroids_version) {
-        return Err(invalid_data(
-            "legacy raw IVF-TQ generations cannot be serialized; rebuild the index",
-        ));
-    }
     let codec = index.codec();
     let padded_dim = codec.padded_dim();
     let mut clusters: Vec<_> = index.clusters.iter().collect();
@@ -3926,13 +3912,6 @@ fn write_merged_ann_impl(
     let Some((first, _)) = sources.first() else {
         return Err(invalid_data("cannot merge an empty ANN source list"));
     };
-    if first.header.kind == AnnKind::IvfTq
-        && !crate::structures::is_ivf_tq_cosine_generation(first.header.quantizer_version)
-    {
-        return Err(invalid_data(
-            "legacy raw IVF-TQ generations cannot be merged; rebuild the index",
-        ));
-    }
     let mut header = first.header.clone();
     header.vector_count = 0;
     for &(source, _) in sources {
@@ -7152,18 +7131,6 @@ mod tests {
             "TQ block-padded columns must not validate under another kind"
         );
 
-        // The retired IVF-PQ discriminant must be refused loudly.
-        let (legacy_bytes, _) = build_tq_payload(20, 4, 9);
-        let mut legacy_kind = legacy_bytes.clone();
-        legacy_kind[4] = 1;
-        let Err(error) = AnnDiskIndex::open(OwnedBytes::new(legacy_kind), AnnKind::TqFlat, 4)
-        else {
-            panic!("retired IVF-PQ payloads must not open");
-        };
-        assert!(
-            error.to_string().contains("IVF-PQ"),
-            "error must name the retired format: {error}"
-        );
         assert!(AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::TqFlat, 4).is_ok());
     }
 

@@ -829,8 +829,8 @@ fn phrase_block_bound(
     block: usize,
     singletons: Option<&[Score; 1024]>,
 ) -> Score {
-    let (tf, length) = list.block_bounds(block).unwrap_or((0, None));
-    let length = length.unwrap_or(1).max(1);
+    let (tf, length) = list.block_bounds(block).unwrap_or((0, 1));
+    let length = length.max(1);
     let mut score = if tf == 1 {
         singletons
             .and_then(|table| table.get(length as usize))

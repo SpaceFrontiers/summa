@@ -57,8 +57,8 @@ pub use metadata::{
 mod helpers;
 #[cfg(feature = "native")]
 pub use helpers::{
-    IndexingStats, SchemaConfig, SchemaFieldConfig, create_index_at_path, create_index_from_sdl,
-    index_documents_from_reader, index_json_document, parse_schema,
+    IndexingStats, create_index_at_path, create_index_from_sdl, index_documents_from_reader,
+    index_json_document, parse_schema,
 };
 
 /// Default file name for the slice cache

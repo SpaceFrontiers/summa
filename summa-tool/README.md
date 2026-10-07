@@ -80,27 +80,6 @@ The external sorter writes bounded chunks to a temporary directory. Use
 `--chunk-size` to control memory and `--temp-dir` to choose a volume with
 sufficient free space.
 
-## Vector utilities
-
-Train IVF coarse centroids from a numeric array field in JSONL:
-
-```bash
-summa-tool train-centroids \
-  --input ./vectors.jsonl \
-  --field embedding \
-  --output ./coarse-centroids.bin \
-  --clusters 4096 \
-  --max-iters 20 \
-  --seed 42
-```
-
-All accepted vectors should have the same dimension. `--sample-size` limits
-the number read.
-
-`retrain-centroids` is currently a diagnostic placeholder: it opens the index
-and prints the manual JSONL workflow, but does not extract vectors or rebuild
-the index. Use `train-centroids` until the end-to-end operation is implemented.
-
 ## Development
 
 From the repository root:
@@ -130,6 +109,6 @@ summa-tool compact -i ./my_index --segment SEGMENT_HEX_ID --memory-budget-mb 256
 `compact` removes deleted rows from each dirty segment, including a singleton.
 `merge` combines segments and retains deletion masks; `merge --compact`
 physically removes deleted rows after merging. Indexed-only fields are
-preserved. Metadata formats 6–8 upgrade to 9 on open; older segment formats may
-require rebuilding. See [row deletion](../docs/row-deletion.md) for compatibility
+preserved. Only the current metadata format opens; older indexes must be rebuilt
+([compatibility](../docs/compatibility.md)). See [row deletion](../docs/row-deletion.md) for compatibility
 and [diagnostics](../docs/diagnostics.md) for health checks.

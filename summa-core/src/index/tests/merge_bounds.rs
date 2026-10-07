@@ -293,5 +293,5 @@ async fn compaction_rebuilt_bounds_remain_conservative_when_chunk_length_floor_f
         "compaction must not encode the deleted source's length floor as a surviving block bound: {}",
         postings.block_length_ratio(0)
     );
-    assert_eq!(postings.min_len(), Some(1));
+    assert_eq!(postings.min_len(), 1);
 }

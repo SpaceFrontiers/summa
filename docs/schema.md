@@ -417,8 +417,7 @@ trained generations and ANN payloads are rejected while opening the index;
 rebuild the index with a current Summa version.
 
 `ivf_pq` (residual product quantization) was removed after IVF-TQ superseded
-it on recall, latency, and training cost; indexes created with it must be
-recreated with `ivf_tq` and reindexed.
+it on recall, latency, and training cost; Summa 2.1 no longer parses it.
 
 ```
 field e: dense_vector<768, f16> [indexed]                                      # global IVF-TQ
@@ -482,7 +481,6 @@ one secondary assignment for at most 30% of the calibration sample. Use
 field e: dense_vector<768, f16> [indexed<ivf_tq>]                   # default: selective, at most 30% spill
 field e: dense_vector<768, f16> [indexed<ivf_tq, soar: selective>]  # calibrate to at most a 30% spill budget
 field e: dense_vector<768, f16> [indexed<ivf_tq, soar: full>]       # spill every vector once
-field e: dense_vector<768, f16> [indexed<ivf_tq, soar: aggressive>] # full one-secondary spill
 field e: dense_vector<768, f16> [indexed<ivf_tq, soar: off>]        # explicitly disable spilling
 ```
 

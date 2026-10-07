@@ -39,19 +39,6 @@ impl SegmentMerger {
             || self.ensure_not_cancelled(),
         )?;
         let budget = memory_budget.saturating_sub(rows.memory_bytes());
-        // Validate complete statistics before output: old standalone segments
-        // without this column cannot distinguish missing and empty text.
-        for (field, entry) in self.schema.fields() {
-            if ((entry.indexed && entry.field_type == FieldType::Text)
-                || entry.field_type == FieldType::SparseVector)
-                && !source.row_stats().contains_key(&field.0)
-            {
-                return Err(crate::Error::Schema(format!(
-                    "field '{}' lacks lossless row statistics; rebuild this pre-deletion-format segment before compaction",
-                    entry.name
-                )));
-            }
-        }
         let files = SegmentFiles::new(output.0);
         let mut stats = MergeStats::default();
         let (field_stats, chunk_maps) = self

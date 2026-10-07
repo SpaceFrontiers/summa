@@ -2325,7 +2325,7 @@ fn chunk_bounds_use_the_same_length_floor_as_scoring() {
     let list =
         BlockPostingList::from_posting_list_with(&postings, false, Some(&|id| map.length(id)))
             .unwrap();
-    assert_eq!(list.min_len(), Some(1));
+    assert_eq!(list.min_len(), 1);
     let params = super::super::Bm25Params::default();
     let cursor = TermCursor::text_with_params(
         list,

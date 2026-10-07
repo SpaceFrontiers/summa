@@ -3,8 +3,8 @@
 Status: implemented (v1 `AnnKind::TqFlat`, v1.1 adds `AnnKind::IvfTq`).
 v1.2 removes IVF-PQ entirely: IVF-TQ beat it on every measured axis (see
 Benchmark), so residual-PQ/OPQ, its trained codebooks, and `AnnKind 1` /
-TOC type 2 are retired. Legacy `ivf_pq` schemas, trained generations, and
-payloads fail loudly with a recreate-as-`ivf_tq` message; the discriminants
+TOC type 2 are retired. Summa 2.1 no longer parses `ivf_pq` schemas; old
+trained generations and payloads fail as unknown formats. The discriminants
 are reserved and never reused.
 
 ## Motivation

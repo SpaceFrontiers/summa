@@ -1,7 +1,7 @@
 //! IVF-TQ: inverted-file search with TurboQuant-coded centroid residuals.
 //!
 //! Two-level index (design: `docs/turboquant-quantization.md`):
-//! - Level 1: the trained global coarse quantizer (same router as IVF-PQ).
+//! - Level 1: the trained global coarse quantizer (shared by every segment).
 //! - Level 2: per-leaf TQ codes of `normalized(vector) − centroid` residuals
 //!   plus a per-vector residual scale, so
 //!   `⟨q̂, x̂⟩ = ⟨q̂, c⟩ + scale · ⟨q̂, r̂⟩`.
@@ -100,10 +100,6 @@ impl TqIvfQueryPlan {
         nprobe: usize,
         routing: IvfRoutingMode,
     ) -> Self {
-        assert!(
-            is_ivf_tq_cosine_generation(coarse_centroids.version),
-            "legacy raw IVF-TQ generations cannot build a query plan; rebuild the index"
-        );
         let normalized_query = normalized_cosine_query(query);
         let route: IvfProbePlan = coarse_centroids.probe(&normalized_query, nprobe, routing);
         let effective_nprobe = nprobe.clamp(1, coarse_centroids.num_clusters as usize);
@@ -147,10 +143,6 @@ impl TqIvfQueryPlan {
         nprobe: usize,
         routing: IvfRoutingMode,
     ) -> u64 {
-        assert!(
-            is_ivf_tq_cosine_generation(coarse_centroids.version),
-            "legacy raw IVF-TQ generations cannot build a query fingerprint; rebuild the index"
-        );
         let effective_nprobe = nprobe.clamp(1, coarse_centroids.num_clusters as usize);
         cosine_probe_fingerprint(query, effective_nprobe, routing)
     }
@@ -188,10 +180,6 @@ impl IvfTqIndex {
         codec: std::sync::Arc<TqCodec>,
     ) -> Self {
         assert_eq!(codec.dim(), dim, "IVF-TQ codec/config dimension mismatch");
-        assert!(
-            is_ivf_tq_cosine_generation(centroids_version),
-            "legacy raw IVF-TQ generations cannot encode vectors; rebuild the index"
-        );
         Self {
             dim,
             routing,
@@ -550,32 +538,6 @@ mod tests {
         assert_eq!(
             &cluster.rows[..index.codec.padded_dim()],
             &cluster.rows[index.codec.padded_dim()..]
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "legacy raw IVF-TQ generations cannot build a query plan")]
-    fn query_plan_rejects_legacy_generation() {
-        let centroids = CoarseCentroids {
-            num_clusters: 1,
-            dim: 2,
-            centroids: vec![1.0, 0.0],
-            version: 7,
-            soar_config: None,
-            routing_index: None,
-        };
-        let codec = TqCodec::new(2);
-        let _ = TqIvfQueryPlan::build(&centroids, &codec, &[1.0, 0.0], 1, IvfRoutingMode::Flat);
-    }
-
-    #[test]
-    #[should_panic(expected = "legacy raw IVF-TQ generations cannot encode vectors")]
-    fn index_builder_rejects_legacy_generation() {
-        let _ = IvfTqIndex::new(
-            2,
-            IvfRoutingMode::Flat,
-            7,
-            std::sync::Arc::new(TqCodec::new(2)),
         );
     }
 

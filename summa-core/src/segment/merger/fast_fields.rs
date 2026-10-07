@@ -242,15 +242,10 @@ impl SegmentMerger {
             super::OffsetWriter::new(dir.streaming_writer_cold(&files.row_stats).await?);
         let mut toc = Vec::new();
         for field in fields {
-            if segments.iter().any(|s| !s.row_stats().contains_key(&field)) {
-                log::warn!(
-                    "[merge] field {field} has a source without lossless row statistics; output cannot compact that field until rebuilt"
-                );
-                continue;
-            }
             let blocks: Vec<_> = segments
                 .iter()
-                .flat_map(|s| s.row_stats()[&field].blocks())
+                .filter_map(|s| s.row_stats().get(&field))
+                .flat_map(|column| column.blocks())
                 .map(|block| SourceBlock::Raw {
                     num_docs: block.num_docs,
                     data: block.data.as_slice(),
@@ -372,73 +367,6 @@ mod tests {
                 bytes.len(),
                 4 + BLOCK_INDEX_ENTRY_SIZE + if multi { 23 } else { 9 }
             );
-        }
-    }
-
-    #[tokio::test]
-    async fn merge_reopens_with_missing_columns_around_present_values() {
-        use crate::segment::{SegmentBuilder, SegmentBuilderConfig, SegmentId};
-        use crate::{Document, RamDirectory, SchemaBuilder};
-        use std::sync::Arc;
-
-        let schema_with_fast = |fast| {
-            let mut builder = SchemaBuilder::default();
-            let scalar = builder.add_u64_field("scalar", false, false);
-            let labels = builder.add_text_field("labels", false, false);
-            builder.set_fast(scalar, fast);
-            builder.set_fast(labels, fast);
-            builder.set_multi(labels, true);
-            Arc::new(builder.build())
-        };
-        let schema = schema_with_fast(true);
-        let scalar = schema.get_field("scalar").unwrap();
-        let labels = schema.get_field("labels").unwrap();
-        let dir = RamDirectory::new();
-        let mut sources = Vec::new();
-        for present in [false, true, false] {
-            let mut builder =
-                SegmentBuilder::new(schema_with_fast(present), SegmentBuilderConfig::default())
-                    .unwrap();
-            for id in 0..3 {
-                let mut doc = Document::new();
-                if present {
-                    doc.add_u64(scalar, 100 + id);
-                    doc.add_text(labels, "zebra");
-                    doc.add_text(labels, "apple");
-                }
-                builder.add_document(doc).unwrap();
-            }
-            let id = SegmentId::new();
-            builder.build(&dir, id, None).await.unwrap();
-            sources.push(
-                SegmentReader::open(&dir, id, Arc::clone(&schema), 0)
-                    .await
-                    .unwrap(),
-            );
-        }
-        let output = SegmentId::new();
-        SegmentMerger::new(Arc::clone(&schema))
-            .merge(&dir, &sources, output, None)
-            .await
-            .unwrap();
-        let reader = SegmentReader::open(&dir, output, schema, 0).await.unwrap();
-        assert_eq!(reader.num_docs(), 9);
-        let numeric = reader.fast_field(scalar.0).unwrap();
-        let text = reader.fast_field(labels.0).unwrap();
-        for id in 0..9 {
-            if (3..6).contains(&id) {
-                assert_eq!(numeric.get_u64(id), u64::from(100 + id - 3));
-                let values = text.get_multi_values(id);
-                let dict = text.text_dict().unwrap();
-                let decoded: Vec<_> = values
-                    .iter()
-                    .map(|&value| dict.get(value as u32).unwrap())
-                    .collect();
-                assert_eq!(decoded, ["zebra", "apple"]);
-            } else {
-                assert!(!numeric.has_value(id));
-                assert!(text.get_multi_values(id).is_empty());
-            }
         }
     }
 }
