@@ -4,6 +4,12 @@
 /// Queries exceeding this limit are trimmed to the top-weighted terms.
 pub const MAX_QUERY_TERMS: usize = 64;
 
+/// Distinct tokens a text match query keeps when neither the request nor
+/// the field's `query<max_terms>` sets a cap: its rarest ones. Long text
+/// queries spend most MaxScore work on common terms that barely move the
+/// ranking.
+pub const DEFAULT_TEXT_MAX_TERMS: usize = 20;
+
 /// Mark the `cap` rarest terms of a long query from their document
 /// frequencies; `None` entries are not ranked and stay unmarked. Absent
 /// terms (frequency 0) match nothing, so they rank last; ties keep the

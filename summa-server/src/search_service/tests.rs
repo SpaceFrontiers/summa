@@ -1688,25 +1688,31 @@ async fn schema_max_terms_caps_match_queries_unless_the_request_overrides_it() {
             None
         )
         .await,
-        converted_match(&registry, &match_query("capped", "mid rare", 0), None).await
+        // The expected side needs an explicit cap too, or the schema's 1 applies.
+        converted_match(&registry, &match_query("capped", "mid rare", 2), None).await
     );
     registry.shutdown().await.unwrap();
 }
 
-/// A match query over more than `MAX_QUERY_TERMS` distinct tokens keeps the
-/// rarest 64, not the first 64: the discriminating token at the end survives.
+/// Without a request or schema cap a long match query keeps its
+/// `DEFAULT_TEXT_MAX_TERMS` rarest tokens; an explicit cap may reach the
+/// engine's `MAX_QUERY_TERMS`. Either way the discriminating token at the end
+/// survives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn long_match_queries_keep_the_rarest_tokens_up_to_the_engine_limit() {
+async fn long_match_queries_keep_the_rarest_tokens_by_default_and_up_to_the_engine_limit() {
     let (_temp, registry, service) = match_cap_fixture().await;
     let mut words = match_cap_fillers();
     words.push("rare".into());
-    let long = match_query("body", &words.join(" "), 0);
-    let converted = converted_match(&registry, &long, None).await;
-    assert_eq!(
-        converted.matches("Term(").count(),
-        summa_core::query::MAX_QUERY_TERMS
-    );
-    assert!(converted.contains("\"rare\""), "{converted}");
-    assert_eq!(match_hits(&service, long).await[0].0, 7);
+    let text = words.join(" ");
+    for (max_terms, kept) in [
+        (0, summa_core::query::DEFAULT_TEXT_MAX_TERMS),
+        (64, summa_core::query::MAX_QUERY_TERMS),
+    ] {
+        let long = match_query("body", &text, max_terms);
+        let converted = converted_match(&registry, &long, None).await;
+        assert_eq!(converted.matches("Term(").count(), kept, "{converted}");
+        assert!(converted.contains("\"rare\""), "{converted}");
+        assert_eq!(match_hits(&service, long).await[0].0, 7);
+    }
     registry.shutdown().await.unwrap();
 }
