@@ -1212,6 +1212,49 @@ async fn proximity_rescoring_prefers_adjacent_terms() {
     }
 }
 
+/// A Boolean with more than `MAX_QUERY_TERMS` text SHOULD clauses keeps
+/// the rarest terms, not the first ones: a discriminating term listed last
+/// still matches and ranks its document first.
+#[tokio::test]
+async fn boolean_should_term_limit_keeps_the_rarest_text_terms() {
+    use crate::query::{BooleanQuery, TermQuery};
+
+    let mut schema_builder = SchemaBuilder::default();
+    let body = schema_builder.add_text_field_with_tokenizer("body", true, false, "simple");
+    let schema = schema_builder.build();
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema.clone(), config.clone())
+        .await
+        .unwrap();
+    let fillers: Vec<String> = (0..crate::query::MAX_QUERY_TERMS + 5)
+        .map(|i| format!("filler{i}"))
+        .collect();
+    for doc in 0..8 {
+        let mut words = fillers.clone();
+        if doc == 5 {
+            words.push("rare".into());
+        }
+        let mut document = Document::new();
+        document.add_text(body, words.join(" "));
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+
+    let mut query = BooleanQuery::new();
+    for filler in &fillers {
+        query = query.should(TermQuery::text(body, filler.as_str()));
+    }
+    query = query.should(TermQuery::text(body, "rare"));
+    let hits = index.search(&query, 3).await.unwrap().hits;
+    assert_eq!(
+        hits[0].address.doc_id, 5,
+        "rare term was dropped by the cap"
+    );
+    assert!(hits[0].score > hits[1].score);
+}
+
 /// Long-query cap and approximate mode: `max_terms` keeps the rarest terms
 /// (the result equals the query over those terms alone), and a heap factor
 /// above one returns a subset of the exact top-k with exact scores.

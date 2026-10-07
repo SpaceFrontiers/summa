@@ -242,6 +242,14 @@ field content: text<lex(by: languages, default: en, stop_words: true)> [indexed<
   ([common word pairs](common-word-pairs.md)). Plain (not chunked) text fields
   with token positions only; every word must be a single token of the field's
   tokenizer (stop words are not). The list is fixed when the index is created.
+- `indexed<query<max_terms: 16>>` caps long match queries on the field: a
+  match query that leaves `max_terms` unset keeps only its 16 rarest distinct
+  tokens (1..=64; default 20 when the field declares no cap). The request's
+  `MatchQuery.max_terms` overrides it. Rarity
+  is the index-wide document frequency, or the broker's cross-shard
+  frequency behind a broker, resolved once per query, so every segment and
+  shard scores the same tokens and the query keeps the text fast paths and
+  L1 decomposition. Dropped tokens neither match nor score.
 
 See `docs/dynamic-tokenizer-and-phrase.md` for the design.
 

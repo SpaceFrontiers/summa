@@ -88,6 +88,11 @@ pub struct FieldEntry {
     /// BM25 b of a text field; `None` = `BM25_B`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bm25_b: Option<f32>,
+    /// Default long-query cap of a text field (`indexed<query<max_terms: N>>`):
+    /// match queries that leave `max_terms` unset keep only the N rarest
+    /// distinct tokens. `None` = every token, up to `MAX_QUERY_TERMS`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_max_terms: Option<u32>,
     /// Common words of a text field: every adjacent pair of them is indexed
     /// as one extra term so exact two-word phrases of common words read a
     /// single posting list (`docs/common-word-pairs.md`). Fixed for the life
@@ -100,6 +105,28 @@ pub struct FieldEntry {
 pub const MAX_COMMON_GRAMS: usize = 4096;
 
 impl FieldEntry {
+    /// A default long-query cap is a text-field option bounded by the
+    /// engine's query-term limit.
+    fn validate_text_max_terms(&self) -> crate::Result<()> {
+        let Some(max_terms) = self.text_max_terms else {
+            return Ok(());
+        };
+        if self.field_type != FieldType::Text {
+            return Err(crate::Error::Schema(format!(
+                "field '{}': `query<max_terms>` requires a text field, got {:?}",
+                self.name, self.field_type
+            )));
+        }
+        if max_terms == 0 || max_terms as usize > crate::query::MAX_QUERY_TERMS {
+            return Err(crate::Error::Schema(format!(
+                "field '{}': `query<max_terms>` must be between 1 and {}, got {max_terms}",
+                self.name,
+                crate::query::MAX_QUERY_TERMS
+            )));
+        }
+        Ok(())
+    }
+
     /// Common word pairs need exact phrase positions on one plain text field.
     fn validate_common_grams(&self) -> crate::Result<()> {
         if self.common_grams.is_empty() {
@@ -1175,6 +1202,7 @@ impl Schema {
                 )));
             }
             entry.validate_common_grams()?;
+            entry.validate_text_max_terms()?;
         }
         self.validate_content_hash()
     }
@@ -1331,6 +1359,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            text_max_terms: None,
             common_grams: Vec::new(),
         });
         field
@@ -1388,6 +1417,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            text_max_terms: None,
             common_grams: Vec::new(),
         });
         field
@@ -1440,6 +1470,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            text_max_terms: None,
             common_grams: Vec::new(),
         });
         field
@@ -1494,6 +1525,7 @@ impl SchemaBuilder {
             chunked: false,
             bm25_k1: None,
             bm25_b: None,
+            text_max_terms: None,
             common_grams: Vec::new(),
         });
         field
@@ -1557,6 +1589,13 @@ impl SchemaBuilder {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.bm25_k1 = k1;
             entry.bm25_b = b;
+        }
+    }
+
+    /// Set the default long-query cap of a text field (`None` = no cap).
+    pub fn set_text_max_terms(&mut self, field: Field, max_terms: Option<u32>) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.text_max_terms = max_terms;
         }
     }
 

@@ -437,8 +437,10 @@ export interface MatchQuery {
    */
   heapFactor: number;
   /**
-   * Long queries: keep only the `max_terms` rarest (highest idf) tokens for
-   * scoring; 0 = all tokens. Approximate.
+   * Long queries: keep only the `max_terms` rarest distinct tokens (lowest
+   * index-wide, or broker cross-shard, document frequency); dropped tokens
+   * neither match nor score. 0 = the field's `query<max_terms>`, else 20.
+   * At most 64. Approximate.
    */
   maxTerms: number;
 }
