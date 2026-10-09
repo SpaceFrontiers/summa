@@ -63,8 +63,9 @@ orthogonality term is what pays.
   `logical..=2 × logical`.
 - The schema must match the payload: readers and merges reject spilled
   payloads for fields without `soar`, and unspilled payloads for fields with it.
-  Changing `soar` through ALTER rebuilds payloads from retained exact codes
-  without retraining the quantizer.
+  Changing `soar` through ALTER retrains the field's quantizer from a sample
+  of the retained exact codes and rewrites the field in every segment,
+  published atomically.
 - Build and generation rebuilds compute secondary leaves with the global
   quantizer's own routing for candidates, so cost is one extra routed probe per
   vector. Byte-copy merges, coalescing merges, reorder and deletion compaction
