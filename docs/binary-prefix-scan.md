@@ -116,8 +116,9 @@ Format and compatibility:
   readers reject payloads whose width differs from the schema.
 - Schema: `prefix_bits` must be a positive multiple of 8 below `dim` and
   requires `ivf`; `prefix_rerank` (default 1,000) requires `prefix_bits` and is
-  query-time only. Changing `prefix_bits` through ALTER rebuilds payloads;
-  changing `prefix_rerank` does not.
+  query-time only. Changing `prefix_bits` through ALTER retrains the field's
+  quantizer and rewrites the field in every segment; changing `prefix_rerank`
+  does not.
 
 ## Query algorithm
 
