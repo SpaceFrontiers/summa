@@ -1,6 +1,7 @@
 //! Row visibility publication uses the segment manager's existing transaction.
 use super::*;
 use crate::query::DocBitset;
+use futures::{StreamExt, TryStreamExt};
 
 impl<D: DirectoryWriter + 'static> SegmentManager<D> {
     pub(crate) async fn commit_with_deletes(
@@ -19,90 +20,53 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         for (id, count) in new_segments {
             self.validate_completed_segment(id, *count).await?;
         }
+        let lock_start = std::time::Instant::now();
         let mut st = Arc::clone(&self.state).lock_owned().await;
+        let lock_wait = lock_start.elapsed();
         let manager = Arc::clone(self);
         let new_segments = new_segments.to_vec();
         self.run_lifecycle_transaction(async move {
-            let keys: Arc<HashSet<String>> = Arc::new(keys.into_iter().collect());
+            let scan_start = std::time::Instant::now();
+            // Probe dictionaries in key order: consecutive lookups then hit
+            // the same or adjacent term blocks instead of random pages.
+            let mut keys = keys;
+            keys.sort_unstable();
+            keys.dedup();
+            let keys = Arc::new(keys);
+            let sources: Vec<_> = if keys.is_empty() {
+                Vec::new()
+            } else {
+                st.metadata
+                    .segment_metas
+                    .iter()
+                    .map(|(id, info)| (id.clone(), info.num_docs, info.deletions.clone()))
+                    .collect()
+            };
+            let scanned = sources.len();
+            // Segments are independent, so their I/O-bound probes and scans
+            // overlap under a fixed bound instead of serializing across the
+            // whole index while the state lock is held.
+            let mut changed: Vec<(String, DocBitset)> = futures::stream::iter(
+                sources
+                    .into_iter()
+                    .map(|(segment_id, num_docs, deletions)| {
+                        manager.deletion_targets(segment_id, num_docs, deletions, field, Arc::clone(&keys))
+                    }),
+            )
+            .buffer_unordered(DELETE_SCAN_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
+            changed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             let mut next = st.metadata.clone();
             let mut retired = Vec::new();
             let mut outputs = Vec::new();
             // Only committed rows are targets. The same transaction's replacement
             // insertions must survive the deletion of their old primary keys.
-            for (segment_id, info) in st
-                .metadata
-                .segment_metas
-                .iter()
-                .filter(|_| !keys.is_empty())
-            {
-                let sid = SegmentId::from_hex(segment_id)
-                    .ok_or_else(|| Error::Corruption("invalid deletion source".into()))?;
-                let mut fields = crate::segment::reader::loader::load_fast_fields_file(
-                    manager.directory.as_ref(),
-                    &SegmentFiles::new(sid.0),
-                    &manager.schema,
-                )
-                .await?;
-                let ff = fields
-                    .remove(&field.0)
-                    .ok_or_else(|| Error::Corruption("primary-key column is missing".into()))?;
-                // Bounded by the admitted deletion-key set, independent of
-                // the source dictionary/row count. Decode global ordinals in
-                // batches instead of looking up and hashing each row's text.
-                let cancellation = manager.active_operations.cancellation_flag();
-                let lookup_cancellation = Arc::clone(&cancellation);
-                let keys = Arc::clone(&keys);
-                let num_docs = info.num_docs;
-                // Publication holds the state lock. Run its bounded serial scan
-                // directly on Tokio's blocking executor, never behind bulk BP.
-                let (ff, ordinals) = tokio::task::spawn_blocking(move || {
-                    let ordinals = crate::segment::deletion::target_ordinals(
-                        &ff,
-                        num_docs,
-                        keys.iter().map(String::as_str),
-                        || {
-                            if lookup_cancellation.load(Ordering::Acquire) {
-                                Err(Error::IndexClosed)
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    )?;
-                    Ok::<_, Error>((ff, ordinals))
-                })
-                .await
-                .map_err(|error| {
-                    Error::Internal(format!("deletion key lookup failed: {error}"))
-                })??;
-                if ordinals.is_empty() {
-                    continue;
-                }
-                let mut alive = match &info.deletions {
-                    Some(meta) => {
-                        (*meta.load(manager.directory.as_ref(), info.num_docs).await?).clone()
-                    }
-                    None => DocBitset::all(info.num_docs),
-                };
-                let (alive, changed) = tokio::task::spawn_blocking(move || {
-                    let changed = crate::segment::deletion::clear_target_rows(
-                        &ff,
-                        &ordinals,
-                        &mut alive,
-                        || {
-                            if cancellation.load(Ordering::Acquire) {
-                                Err(Error::IndexClosed)
-                            } else {
-                                Ok(())
-                            }
-                        },
-                    )?;
-                    Ok::<_, Error>((alive, changed))
-                })
-                .await
-                .map_err(|error| Error::Internal(format!("deletion worker failed: {error}")))??;
-                if !changed {
-                    continue;
-                }
+            for (segment_id, alive) in changed {
+                let info = &st.metadata.segment_metas[&segment_id];
                 let id = SegmentId::new();
                 let claim = manager.protect_new_segment(id.to_hex())?;
                 let cleanup = manager.output_cleanup_guard(id);
@@ -118,7 +82,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                 if let Some(old) = &info.deletions {
                     retired.push(old.id.clone());
                 }
-                next.segment_metas.get_mut(segment_id).unwrap().deletions = Some(deletion);
+                next.segment_metas.get_mut(&segment_id).unwrap().deletions = Some(deletion);
             }
             for (id, count) in &new_segments {
                 if !next.has_segment(id) {
@@ -152,6 +116,20 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
                     .await?,
                 );
             }
+            log::log!(
+                if scan_start.elapsed() >= std::time::Duration::from_secs(1) {
+                    log::Level::Info
+                } else {
+                    log::Level::Debug
+                },
+                "[row_mutation] index={} applied {} delete key(s) to {} segment(s): {} visibility mask(s) rewritten in {:.3}s (state lock wait {:.3}s)",
+                manager.schema.index_label(),
+                keys.len(),
+                scanned,
+                outputs.len(),
+                scan_start.elapsed().as_secs_f64(),
+                lock_wait.as_secs_f64(),
+            );
             next.publication_generation = next
                 .publication_generation
                 .checked_add(1)
@@ -179,6 +157,81 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             Ok(())
         })
         .await
+    }
+}
+
+/// Concurrent segment probes during commit visibility publication. Each one
+/// holds a decoded primary-key column handle and one visibility bitset.
+const DELETE_SCAN_CONCURRENCY: usize = 8;
+
+impl<D: DirectoryWriter + 'static> SegmentManager<D> {
+    /// Rows of one committed segment whose primary key is in `keys`; `None`
+    /// when no live row matches. Pure read: the caller publishes masks.
+    async fn deletion_targets(
+        self: &Arc<Self>,
+        segment_id: String,
+        num_docs: u32,
+        deletions: Option<crate::segment::DeletionMeta>,
+        field: crate::dsl::Field,
+        keys: Arc<Vec<String>>,
+    ) -> Result<Option<(String, DocBitset)>> {
+        let sid = SegmentId::from_hex(&segment_id)
+            .ok_or_else(|| Error::Corruption("invalid deletion source".into()))?;
+        let mut fields = crate::segment::reader::loader::load_fast_fields_file(
+            self.directory.as_ref(),
+            &SegmentFiles::new(sid.0),
+            &self.schema,
+        )
+        .await?;
+        let ff = fields
+            .remove(&field.0)
+            .ok_or_else(|| Error::Corruption("primary-key column is missing".into()))?;
+        // Bounded by the admitted deletion-key set, independent of the source
+        // dictionary/row count. Decode global ordinals in batches instead of
+        // looking up and hashing each row's text. The shutdown commit stops
+        // maintenance, not this scan: only closing admission cancels it.
+        let cancellation = self.active_operations.shutdown_flag();
+        let lookup_cancellation = Arc::clone(&cancellation);
+        // Publication holds the state lock. Run its bounded scans directly on
+        // Tokio's blocking executor, never behind bulk BP.
+        let (ff, ordinals) = tokio::task::spawn_blocking(move || {
+            let ordinals = crate::segment::deletion::target_ordinals(
+                &ff,
+                num_docs,
+                keys.iter().map(String::as_str),
+                || {
+                    if lookup_cancellation.load(Ordering::Acquire) {
+                        Err(Error::IndexClosed)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            Ok::<_, Error>((ff, ordinals))
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("deletion key lookup failed: {error}")))??;
+        if ordinals.is_empty() {
+            return Ok(None);
+        }
+        let mut alive = match &deletions {
+            Some(meta) => (*meta.load(self.directory.as_ref(), num_docs).await?).clone(),
+            None => DocBitset::all(num_docs),
+        };
+        let (alive, changed) = tokio::task::spawn_blocking(move || {
+            let changed =
+                crate::segment::deletion::clear_target_rows(&ff, &ordinals, &mut alive, || {
+                    if cancellation.load(Ordering::Acquire) {
+                        Err(Error::IndexClosed)
+                    } else {
+                        Ok(())
+                    }
+                })?;
+            Ok::<_, Error>((alive, changed))
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("deletion worker failed: {error}")))??;
+        Ok(changed.then_some((segment_id, alive)))
     }
 }
 
@@ -265,7 +318,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
         }
         let sid = SegmentId::from_hex(segment_id)
             .ok_or_else(|| Error::Document("invalid compaction segment ID".into()))?;
-        if !self.active_operations.is_accepting() {
+        if !self.active_operations.accepts_maintenance() {
             return Err(Error::IndexClosed);
         }
         if self.quarantined_segments.lock().contains(segment_id) {
@@ -292,7 +345,7 @@ impl<D: DirectoryWriter + 'static> SegmentManager<D> {
             let (global, local) = self.acquire_maintenance_capacity().await?;
             let reorder = tokio::select! {
                 biased;
-                () = self.active_operations.wait_for_shutdown() => return Err(Error::IndexClosed),
+                () = self.active_operations.wait_for_maintenance_stop() => return Err(Error::IndexClosed),
                 permit = self.reorder_permits.acquire(ReorderPriority::Optimizer) => permit.map_err(|_| Error::IndexClosed)?,
             };
             (global, local, reorder)

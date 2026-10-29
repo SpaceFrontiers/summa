@@ -26,6 +26,14 @@ const DENSE_SCORE_BATCH: usize = 4_096;
 const BINARY_SCORE_BATCH: usize = 8_192;
 const MAX_VECTOR_SCORE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
+/// Per-query binary search state shared by sync and async readers.
+#[derive(Default)]
+pub(crate) struct BinarySearchOptions<'a> {
+    pub retrieval: crate::query::BinaryRetrievalOptions,
+    pub eligibility: Option<Arc<crate::query::DocBitset>>,
+    pub probe_cache: Option<&'a std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
+}
+
 /// Runtime memory accounting for a single segment.
 ///
 /// Heap, file-backed address space, and pinned residency are deliberately
@@ -2223,9 +2231,12 @@ impl SegmentReader {
             sparse_pin_report: Default::default(),
         };
 
-        // Pin hot metadata per the process-wide policy (no-op when disabled)
+        // Pin hot metadata per the process-wide policy (no-op when disabled).
+        // Locking faults the sections in, so it leaves the async executor:
+        // inline, one segment's I/O stalled every concurrent open polled by
+        // the same reload stream and segment-open concurrency was moot.
         #[cfg(feature = "native")]
-        reader.apply_pin_policy(&crate::segment::pin::pin_policy().to_owned());
+        let reader = reader.pinned_off_executor().await?;
 
         // Structural ANN health from the already-parsed run directories —
         // O(runs) per field, no payload reads. This is the passive tier of
@@ -2265,6 +2276,23 @@ impl SegmentReader {
         }
     }
 
+    /// Apply the process-wide pin policy on Tokio's blocking pool when one
+    /// is available; without a runtime it runs inline.
+    #[cfg(feature = "native")]
+    async fn pinned_off_executor(mut self) -> Result<Self> {
+        let policy = crate::segment::pin::pin_policy().to_owned();
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.apply_pin_policy(&policy);
+            return Ok(self);
+        }
+        tokio::task::spawn_blocking(move || {
+            self.apply_pin_policy(&policy);
+            self
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("segment metadata pinning failed: {error}")))
+    }
+
     /// Pin per-query-mandatory metadata sections in priority order until the
     /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
     ///
@@ -2282,6 +2310,7 @@ impl SegmentReader {
         // dry run (every section is "skipped: budget exhausted") so the
         // amount of hot metadata left unpinned can be reported loudly.
         let disabled = !policy.is_enabled();
+        let started = std::time::Instant::now();
         let mut remaining = policy.budget_bytes;
         let mut dense_report = PinReport::default();
         let mut sparse_report = PinReport::default();
@@ -2348,22 +2377,24 @@ impl SegmentReader {
         }
         if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
             log::warn!(
-                "[pin] index={} segment {:016x}: pinned {}/{} (budget skipped {}, mlock failed {}) — \
+                "[pin] index={} segment {:016x}: pinned {}/{} in {:?} (budget skipped {}, mlock failed {}) — \
                  raise SUMMA_PIN_METADATA_BUDGET_MB or RLIMIT_MEMLOCK for full coverage",
                 self.schema.index_label(),
                 self.meta.id,
                 crate::format_bytes(report.pinned_bytes),
                 crate::format_bytes(report.intended_bytes),
+                started.elapsed(),
                 crate::format_bytes(report.skipped_budget_bytes),
                 crate::format_bytes(report.failed_bytes),
             );
         } else if report.pinned_bytes > 0 {
             log::info!(
-                "[pin] index={} segment {:016x}: pinned {} of hot metadata ({:?})",
+                "[pin] index={} segment {:016x}: pinned {} of hot metadata ({:?}) in {:?}",
                 self.schema.index_label(),
                 self.meta.id,
                 crate::format_bytes(report.pinned_bytes),
                 policy.mode,
+                started.elapsed(),
             );
         }
     }
@@ -3554,10 +3585,19 @@ impl SegmentReader {
         query: &[u8],
         k: usize,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: Option<&std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
+        options: BinarySearchOptions<'_>,
     ) -> Result<Vec<VectorSearchResult>> {
         let schema_dim = self.validate_binary_search_request(field, query)?;
         combiner.validate().map_err(Error::Query)?;
+        let config = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+            .ok_or_else(|| Error::Schema("binary field has no configuration".into()))?;
+        options
+            .retrieval
+            .validate_field(config)
+            .map_err(Error::Query)?;
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -3596,7 +3636,12 @@ impl SegmentReader {
                     ))
                 })?;
             let model = artifact.binary_model().map_err(Error::Io)?;
-            let clusters = binary_scann_probe_clusters(&model, query, config.nprobe, probe_cache)?;
+            let clusters = binary_scann_probe_clusters(
+                &model,
+                query,
+                options.retrieval.effective_nprobe(config),
+                options.probe_cache,
+            )?;
             let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
                 Error::Corruption(format!(
                     "binary ScaNN field {} is missing flat vectors",
@@ -3607,6 +3652,7 @@ impl SegmentReader {
                 checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
             let (documents, ordinal_scores) = lazy
                 .get()
+                .with_eligibility(options.eligibility.as_ref())
                 .search_binary_combined_documents(
                     candidate_limit,
                     query,
@@ -3644,7 +3690,7 @@ impl SegmentReader {
             return Ok(results);
         }
         if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0) {
-            let ivf = lazy.get();
+            let ivf = lazy.get().with_eligibility(options.eligibility.as_ref());
             let config = self
                 .schema
                 .get_field_entry(field)
@@ -3665,7 +3711,7 @@ impl SegmentReader {
                         field.0
                     ))
                 })?;
-            validate_binary_ann(ivf, quantizer, config, schema_dim, field)?;
+            validate_binary_ann(&ivf, quantizer, config, schema_dim, field)?;
             let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
                 Error::Corruption(format!(
                     "global binary IVF field {} is missing flat vector storage",
@@ -3676,9 +3722,9 @@ impl SegmentReader {
             let clusters = binary_probe_clusters(
                 quantizer,
                 query,
-                config.nprobe,
+                options.retrieval.effective_nprobe(config),
                 config.ivf_routing,
-                probe_cache,
+                options.probe_cache,
             )?;
             let results = if !single_valued
                 && !matches!(combiner, crate::query::MultiValueCombiner::Max)
@@ -3691,7 +3737,7 @@ impl SegmentReader {
                         query,
                         &clusters,
                         combiner,
-                        config.effective_prefix_rerank(),
+                        options.retrieval.effective_prefix_rerank(config),
                         Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                     .map_err(|error| {
@@ -3729,7 +3775,7 @@ impl SegmentReader {
                         query,
                         candidate_docs,
                         &clusters,
-                        config.effective_prefix_rerank(),
+                        options.retrieval.effective_prefix_rerank(config),
                         Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 } else {
@@ -3737,7 +3783,7 @@ impl SegmentReader {
                         query,
                         candidate_docs,
                         &clusters,
-                        config.effective_prefix_rerank(),
+                        options.retrieval.effective_prefix_rerank(config),
                         Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 }
@@ -3821,7 +3867,12 @@ impl SegmentReader {
 
             for (i, &score) in scores.iter().enumerate().take(batch_count) {
                 let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                if self.is_alive(doc_id) {
+                if self.is_alive(doc_id)
+                    && options
+                        .eligibility
+                        .as_ref()
+                        .is_none_or(|bits| bits.contains(doc_id))
+                {
                     collector.push(doc_id, ordinal, score);
                 }
             }
@@ -3846,19 +3897,25 @@ impl SegmentReader {
         k: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
-        self.search_binary_dense_vector_impl(field, query, k, combiner, None)
-            .await
+        self.search_binary_dense_vector_impl(
+            field,
+            query,
+            k,
+            combiner,
+            BinarySearchOptions::default(),
+        )
+        .await
     }
 
-    pub(crate) async fn search_binary_dense_vector_with_probe_cache(
+    pub(crate) async fn search_binary_dense_vector_with_options(
         &self,
         field: Field,
         query: &[u8],
         k: usize,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: &std::sync::Mutex<Option<crate::structures::IvfProbePlan>>,
+        options: BinarySearchOptions<'_>,
     ) -> Result<Vec<VectorSearchResult>> {
-        self.search_binary_dense_vector_impl(field, query, k, combiner, Some(probe_cache))
+        self.search_binary_dense_vector_impl(field, query, k, combiner, options)
             .await
     }
 
@@ -4257,10 +4314,19 @@ impl SegmentReader {
         query: &[u8],
         k: usize,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: Option<&std::sync::Mutex<Option<crate::structures::IvfProbePlan>>>,
+        options: BinarySearchOptions<'_>,
     ) -> Result<Vec<VectorSearchResult>> {
         let schema_dim = self.validate_binary_search_request(field, query)?;
         combiner.validate().map_err(Error::Query)?;
+        let config = self
+            .schema
+            .get_field_entry(field)
+            .and_then(|entry| entry.binary_dense_vector_config.as_ref())
+            .ok_or_else(|| Error::Schema("binary field has no configuration".into()))?;
+        options
+            .retrieval
+            .validate_field(config)
+            .map_err(Error::Query)?;
         if k == 0 {
             return Ok(Vec::new());
         }
@@ -4299,7 +4365,12 @@ impl SegmentReader {
                     ))
                 })?;
             let model = artifact.binary_model().map_err(Error::Io)?;
-            let clusters = binary_scann_probe_clusters(&model, query, config.nprobe, probe_cache)?;
+            let clusters = binary_scann_probe_clusters(
+                &model,
+                query,
+                options.retrieval.effective_nprobe(config),
+                options.probe_cache,
+            )?;
             let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
                 Error::Corruption(format!(
                     "binary ScaNN field {} is missing flat vectors",
@@ -4310,6 +4381,7 @@ impl SegmentReader {
                 checked_binary_combined_fetch_k(k)?.min(flat.num_docs_with_vectors());
             let (documents, ordinal_scores) = lazy
                 .get()
+                .with_eligibility(options.eligibility.as_ref())
                 .search_binary_combined_documents(
                     candidate_limit,
                     query,
@@ -4346,7 +4418,7 @@ impl SegmentReader {
             return Ok(results);
         }
         if let Some(VectorIndex::BinaryIvf(lazy)) = self.vector_indexes.get(&field.0) {
-            let ivf = lazy.get();
+            let ivf = lazy.get().with_eligibility(options.eligibility.as_ref());
             let config = self
                 .schema
                 .get_field_entry(field)
@@ -4367,7 +4439,7 @@ impl SegmentReader {
                         field.0
                     ))
                 })?;
-            validate_binary_ann(ivf, quantizer, config, schema_dim, field)?;
+            validate_binary_ann(&ivf, quantizer, config, schema_dim, field)?;
             let flat = self.flat_vectors.get(&field.0).ok_or_else(|| {
                 Error::Corruption(format!(
                     "global binary IVF field {} is missing flat vector storage",
@@ -4378,9 +4450,9 @@ impl SegmentReader {
             let clusters = binary_probe_clusters(
                 quantizer,
                 query,
-                config.nprobe,
+                options.retrieval.effective_nprobe(config),
                 config.ivf_routing,
-                probe_cache,
+                options.probe_cache,
             )?;
             let results = if !single_valued
                 && !matches!(combiner, crate::query::MultiValueCombiner::Max)
@@ -4393,7 +4465,7 @@ impl SegmentReader {
                         query,
                         &clusters,
                         combiner,
-                        config.effective_prefix_rerank(),
+                        options.retrieval.effective_prefix_rerank(config),
                         Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                     .map_err(|error| {
@@ -4426,7 +4498,7 @@ impl SegmentReader {
                         query,
                         candidate_docs,
                         &clusters,
-                        config.effective_prefix_rerank(),
+                        options.retrieval.effective_prefix_rerank(config),
                         Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 } else {
@@ -4434,7 +4506,7 @@ impl SegmentReader {
                         query,
                         candidate_docs,
                         &clusters,
-                        config.effective_prefix_rerank(),
+                        options.retrieval.effective_prefix_rerank(config),
                         Some(&|doc, ordinal| flat.exact_code_location(doc, ordinal)),
                     )
                 }
@@ -4514,7 +4586,12 @@ impl SegmentReader {
 
             for (i, &score) in scores.iter().enumerate().take(batch_count) {
                 let (doc_id, ordinal) = lazy_flat.get_doc_id(batch_start + i);
-                if self.is_alive(doc_id) {
+                if self.is_alive(doc_id)
+                    && options
+                        .eligibility
+                        .as_ref()
+                        .is_none_or(|bits| bits.contains(doc_id))
+                {
                     collector.push(doc_id, ordinal, score);
                 }
             }
@@ -4540,19 +4617,25 @@ impl SegmentReader {
         k: usize,
         combiner: crate::query::MultiValueCombiner,
     ) -> Result<Vec<VectorSearchResult>> {
-        self.search_binary_dense_vector_sync_impl(field, query, k, combiner, None)
+        self.search_binary_dense_vector_sync_impl(
+            field,
+            query,
+            k,
+            combiner,
+            BinarySearchOptions::default(),
+        )
     }
 
     #[cfg(feature = "sync")]
-    pub(crate) fn search_binary_dense_vector_sync_with_probe_cache(
+    pub(crate) fn search_binary_dense_vector_sync_with_options(
         &self,
         field: Field,
         query: &[u8],
         k: usize,
         combiner: crate::query::MultiValueCombiner,
-        probe_cache: &std::sync::Mutex<Option<crate::structures::IvfProbePlan>>,
+        options: BinarySearchOptions<'_>,
     ) -> Result<Vec<VectorSearchResult>> {
-        self.search_binary_dense_vector_sync_impl(field, query, k, combiner, Some(probe_cache))
+        self.search_binary_dense_vector_sync_impl(field, query, k, combiner, options)
     }
 }
 

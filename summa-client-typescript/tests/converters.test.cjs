@@ -9,7 +9,17 @@ const {
 const {
   FusionMethod,
   MultiValueCombiner,
+  Query,
 } = require("../dist/generated/summa.js");
+
+test("binary retrieval controls survive protobuf roundtrip", () => {
+  const query = buildQuery({binaryDenseVector: {
+    field: "body", vector: new Uint8Array([255]), nprobe: 256,
+    prefixRerank: 4000, maxOrdinalsPerDoc: 3,
+  }});
+  const parsed = Query.decode(Query.encode(Query.fromPartial(query)).finish()).binaryDenseVector;
+  assert.deepEqual([parsed.nprobe, parsed.prefixRerank, parsed.maxOrdinalsPerDoc], [256, 4000, 3]);
+});
 
 test("document conversion preserves repeated fields and vector shapes", () => {
   const entries = toFieldEntries({

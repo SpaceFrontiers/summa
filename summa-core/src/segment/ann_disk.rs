@@ -330,6 +330,29 @@ impl AnnHealth {
     }
 }
 
+impl AnnDiskIndex {
+    /// Request-scoped visibility, preserving the reader's deletion mask and
+    /// sharing all immutable payload/run allocations with the original index.
+    pub(crate) fn with_eligibility(
+        &self,
+        eligibility: Option<&std::sync::Arc<crate::query::DocBitset>>,
+    ) -> std::borrow::Cow<'_, Self> {
+        let Some(eligible) = eligibility else {
+            return std::borrow::Cow::Borrowed(self);
+        };
+        let mut view = self.clone();
+        view.alive_docs = Some(match &self.alive_docs {
+            None => std::sync::Arc::clone(eligible),
+            Some(alive) => {
+                let mut visible = (**eligible).clone();
+                visible.intersect_with(alive);
+                std::sync::Arc::new(visible)
+            }
+        });
+        std::borrow::Cow::Owned(view)
+    }
+}
+
 /// `largest_cluster_share` above this, on at least [`ANN_SKEW_WARN_MIN_VECTORS`]
 /// vectors, is a scan cliff worth a warning: the production incident value was
 /// 0.31, and a healthy 100k+-cluster codebook sits orders of magnitude lower.
@@ -4454,6 +4477,21 @@ mod tests {
         let mut alive = crate::query::DocBitset::all(2);
         alive.clear(0);
         changed.alive_docs = Some(Arc::new(alive));
+        let mut eligible = crate::query::DocBitset::all(2);
+        eligible.clear(1);
+        let eligible = Arc::new(eligible);
+        let filtered = changed.with_eligibility(Some(&eligible));
+        assert!(
+            filtered
+                .alive_docs
+                .as_ref()
+                .unwrap()
+                .next_set_bit(0)
+                .is_none()
+        );
+        assert!(changed.alive_docs.as_ref().unwrap().contains(1));
+        assert!(eligible.contains(0));
+        drop(filtered);
         assert!(original.alive_docs.is_none());
         assert!(Arc::ptr_eq(&original.runs, &changed.runs));
         assert!(Arc::ptr_eq(&original.heap_pins, &changed.heap_pins));

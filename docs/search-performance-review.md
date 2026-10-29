@@ -12966,3 +12966,26 @@ still applies; the transient BSR investigation is now complete.
 
 Both original x86 VMs were verified stopped after collection; the temporary ARM
 VM, cloned disk and snapshot were removed. Original data disks were preserved.
+
+
+## 2026-10-29: binary eligibility and bounded passage nomination
+
+The Azeroth sparse-removal audit exposed a binary query eligibility defect:
+common filters were applied after the flat/ANN top-k shortlist. Stronger excluded
+documents could leave an otherwise valid filtered query empty. Eligibility now
+reaches binary flat, IVF/prefix/SOAR, and ScaNN readers before selection, with an
+immutable request view intersecting the deletion mask. The regression failed
+before the change and passed afterward. This does not make partial ANN probing
+exact.
+
+The same audit motivated opt-in probe/prefix controls and a per-document ordinal
+limit. This permits evaluating MAX/weighted-top-k without unbounded passage
+nomination. See [the design and validation evidence](binary-retrieval-controls.md).
+No index format or serving default changed. The limit bounds nominations, not
+all exact-vector completion work.
+
+Remaining findings: measure production recall, latency and vector-completion
+cost on matched all-shard requests; include long documents and selected
+above-cutoff ANN misses. Historical identity retention is insufficient evidence
+for sparse removal. No quality or performance gain is claimed from the local
+functional tests, and no live rollout has occurred for these changes.

@@ -619,6 +619,82 @@ async fn test_dedup_concurrent_inserts() {
 // Reopen writer on existing index with committed keys
 // ---------------------------------------------------------------------------
 
+/// Process shutdown publishes admitted upserts exactly like a normal commit
+/// but starts no merge from its own output and closes admission. Reopening
+/// rebuilds dedup state for segments the shutdown commit did not refresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_commit_publishes_upserts_without_merging_and_closes_admission() {
+    let (schema, pk, title) = make_schema();
+    let dir = RamDirectory::new();
+    // The shutdown commit's segment is the third in its tier, so a normal
+    // commit would start a merge here.
+    let config = IndexConfig {
+        num_indexing_threads: 1,
+        merge_policy: Box::new(crate::merge::TieredMergePolicy {
+            segments_per_tier: 3,
+            max_merge_at_once: 3,
+            tier_floor: 1,
+            floor_segment_docs: 1,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut writer = IndexWriter::create(dir.clone(), schema, config)
+        .await
+        .unwrap();
+    writer.init_primary_key_dedup().await.unwrap();
+    for segment in 0..2 {
+        for row in 0..4 {
+            writer
+                .add_document(make_doc(pk, title, &format!("{segment}-{row}"), "old"))
+                .unwrap();
+        }
+        writer.commit().await.unwrap();
+    }
+    writer.wait_for_all_merges().await;
+    assert_eq!(writer.segment_manager().get_segment_ids().await.len(), 2);
+    writer
+        .upsert_document(make_doc(pk, title, "0-0", "new"))
+        .await
+        .unwrap();
+    writer
+        .upsert_document(make_doc(pk, title, "1-3", "new"))
+        .await
+        .unwrap();
+    writer
+        .add_document(make_doc(pk, title, "fresh", "new"))
+        .unwrap();
+
+    assert!(writer.commit_for_shutdown().await.unwrap());
+    writer.wait_for_all_merges().await;
+    assert_eq!(writer.segment_manager().get_segment_ids().await.len(), 3);
+    assert!(matches!(
+        writer.add_document(make_doc(pk, title, "late", "new")),
+        Err(Error::IndexClosed)
+    ));
+    writer.shutdown().await.unwrap();
+    drop(writer);
+
+    let config = IndexConfig {
+        merge_policy: Box::new(crate::merge::NoMergePolicy),
+        ..Default::default()
+    };
+    let index = crate::index::Index::open(dir.clone(), config.clone())
+        .await
+        .unwrap();
+    // 8 original rows, 2 replaced in place, 1 new key.
+    assert_eq!(index.num_docs().await.unwrap(), 9);
+    drop(index);
+    let mut reopened = IndexWriter::open(dir, config).await.unwrap();
+    reopened.init_primary_key_dedup().await.unwrap();
+    for key in ["0-0", "1-3", "fresh", "1-0"] {
+        assert!(matches!(
+            reopened.add_document(make_doc(pk, title, key, "dup")),
+            Err(Error::DuplicatePrimaryKey(_))
+        ));
+    }
+}
+
 #[tokio::test]
 async fn test_dedup_reopen_existing_index() {
     let (schema, pk, title) = make_schema();
