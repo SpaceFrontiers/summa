@@ -318,6 +318,13 @@ pub(crate) fn pin_section(
 
     match mode {
         PinMode::Mlock => {
+            // Hot sections carry the reader's MADV_RANDOM policy, which turns
+            // off readahead: mlock alone faulted cold sections in one 4 KiB
+            // read at a time (~16 MB/s, 30 s per production segment open).
+            // WILLNEED queues readahead for the whole section regardless of
+            // that policy, so the lock mostly finds resident pages.
+            #[cfg(target_os = "linux")]
+            bytes.madvise(libc::MADV_WILLNEED);
             if bytes.mlock() {
                 *remaining -= len;
                 report.pinned_bytes += len;

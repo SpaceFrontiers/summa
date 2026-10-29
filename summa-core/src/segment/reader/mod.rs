@@ -2231,9 +2231,12 @@ impl SegmentReader {
             sparse_pin_report: Default::default(),
         };
 
-        // Pin hot metadata per the process-wide policy (no-op when disabled)
+        // Pin hot metadata per the process-wide policy (no-op when disabled).
+        // Locking faults the sections in, so it leaves the async executor:
+        // inline, one segment's I/O stalled every concurrent open polled by
+        // the same reload stream and segment-open concurrency was moot.
         #[cfg(feature = "native")]
-        reader.apply_pin_policy(&crate::segment::pin::pin_policy().to_owned());
+        let reader = reader.pinned_off_executor().await?;
 
         // Structural ANN health from the already-parsed run directories —
         // O(runs) per field, no payload reads. This is the passive tier of
@@ -2283,6 +2286,23 @@ impl SegmentReader {
     /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
     /// pinned_metadata_bytes}`.
     #[cfg(feature = "native")]
+    /// Apply the process-wide pin policy on Tokio's blocking pool when one
+    /// is available; without a runtime it runs inline.
+    #[cfg(feature = "native")]
+    async fn pinned_off_executor(mut self) -> Result<Self> {
+        let policy = crate::segment::pin::pin_policy().to_owned();
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.apply_pin_policy(&policy);
+            return Ok(self);
+        }
+        tokio::task::spawn_blocking(move || {
+            self.apply_pin_policy(&policy);
+            self
+        })
+        .await
+        .map_err(|error| Error::Internal(format!("segment metadata pinning failed: {error}")))
+    }
+
     pub(crate) fn apply_pin_policy(&mut self, policy: &crate::segment::pin::PinPolicy) {
         use crate::segment::pin::PinReport;
 
@@ -2290,6 +2310,7 @@ impl SegmentReader {
         // dry run (every section is "skipped: budget exhausted") so the
         // amount of hot metadata left unpinned can be reported loudly.
         let disabled = !policy.is_enabled();
+        let started = std::time::Instant::now();
         let mut remaining = policy.budget_bytes;
         let mut dense_report = PinReport::default();
         let mut sparse_report = PinReport::default();
@@ -2356,22 +2377,24 @@ impl SegmentReader {
         }
         if report.skipped_budget_bytes > 0 || report.failed_bytes > 0 {
             log::warn!(
-                "[pin] index={} segment {:016x}: pinned {}/{} (budget skipped {}, mlock failed {}) — \
+                "[pin] index={} segment {:016x}: pinned {}/{} in {:?} (budget skipped {}, mlock failed {}) — \
                  raise SUMMA_PIN_METADATA_BUDGET_MB or RLIMIT_MEMLOCK for full coverage",
                 self.schema.index_label(),
                 self.meta.id,
                 crate::format_bytes(report.pinned_bytes),
                 crate::format_bytes(report.intended_bytes),
+                started.elapsed(),
                 crate::format_bytes(report.skipped_budget_bytes),
                 crate::format_bytes(report.failed_bytes),
             );
         } else if report.pinned_bytes > 0 {
             log::info!(
-                "[pin] index={} segment {:016x}: pinned {} of hot metadata ({:?})",
+                "[pin] index={} segment {:016x}: pinned {} of hot metadata ({:?}) in {:?}",
                 self.schema.index_label(),
                 self.meta.id,
                 crate::format_bytes(report.pinned_bytes),
                 policy.mode,
+                started.elapsed(),
             );
         }
     }
