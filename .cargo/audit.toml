@@ -1,0 +1,13 @@
+# Advisories for lockfile-only packages. Cargo.lock records burn-dispatch's
+# optional `tch` backend (burn-tch -> tch/torch-sys -> zip 0.6 -> zstd 0.11),
+# but no workspace feature enables it: `cargo tree --workspace --all-features
+# --target all -e all -i zip@0.6.6` finds nothing, so none of these crates is
+# compiled into any artifact. Upstream torch-sys still requires zip ^0.6.
+# Remove an entry once the lockfile no longer contains the package.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0367", # zip 0.6.6: SUID/SGID bits preserved on extraction
+    "RUSTSEC-2026-0368", # zip 0.6.6: symlink targets on extraction
+    "RUSTSEC-2026-0369", # zip 0.6.6: Unix permissions on extraction
+    "RUSTSEC-2026-0403", # zstd-safe 5.0.2 (via zip 0.6.6): legacy streaming decompression
+]

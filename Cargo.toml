@@ -54,7 +54,7 @@ prost = "0.14"
 prost-types = "0.14"
 
 # Compression
-zstd = { version = "0.13", default-features = false, features = ["zdict_builder"] }
+zstd = { version = "0.14", default-features = false, features = ["zdict_builder"] }
 rust-openzl = "0.1"
 
 # Text processing
