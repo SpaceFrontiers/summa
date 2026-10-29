@@ -2276,16 +2276,6 @@ impl SegmentReader {
         }
     }
 
-    /// Pin per-query-mandatory metadata sections in priority order until the
-    /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
-    ///
-    /// Priority: ANN run directories → BMP offsets + Seismic term directories → sparse skip
-    /// sections → doc-id maps → BMP E offsets + coarse H. Bulk data (ANN codes,
-    /// D/E grid payloads, Seismic summaries, block data, raw vectors) is never pinned. Fail-loud: budget
-    /// exhaustion and mlock failures are
-    /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
-    /// pinned_metadata_bytes}`.
-    #[cfg(feature = "native")]
     /// Apply the process-wide pin policy on Tokio's blocking pool when one
     /// is available; without a runtime it runs inline.
     #[cfg(feature = "native")]
@@ -2303,6 +2293,16 @@ impl SegmentReader {
         .map_err(|error| Error::Internal(format!("segment metadata pinning failed: {error}")))
     }
 
+    /// Pin per-query-mandatory metadata sections in priority order until the
+    /// budget is exhausted (see `segment::pin` and docs/hot-metadata-pinning.md).
+    ///
+    /// Priority: ANN run directories → BMP offsets + Seismic term directories → sparse skip
+    /// sections → doc-id maps → BMP E offsets + coarse H. Bulk data (ANN codes,
+    /// D/E grid payloads, Seismic summaries, block data, raw vectors) is never pinned. Fail-loud: budget
+    /// exhaustion and mlock failures are
+    /// logged and visible via `SegmentMemoryStats::{pin_intended_bytes,
+    /// pinned_metadata_bytes}`.
+    #[cfg(feature = "native")]
     pub(crate) fn apply_pin_policy(&mut self, policy: &crate::segment::pin::PinPolicy) {
         use crate::segment::pin::PinReport;
 
