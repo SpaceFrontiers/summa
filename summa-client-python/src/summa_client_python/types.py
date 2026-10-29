@@ -90,6 +90,9 @@ class BinaryDenseVectorQuery(TypedDict, total=False):
     combiner_temperature: float
     combiner_top_k: int
     combiner_decay: float
+    nprobe: int
+    prefix_rerank: int
+    max_ordinals_per_doc: int
 
 
 class RangeQuery(TypedDict, total=False):
@@ -287,6 +290,7 @@ class IndexInfo:
     num_deleted_docs: int = 0
     deleted_ratio: float = 0.0
     candidate_scoring_version: int = 0
+    binary_retrieval_version: int = 0
     unprepared_candidate_fields: list[str] = field(default_factory=list)
 
 

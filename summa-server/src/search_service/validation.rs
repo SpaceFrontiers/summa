@@ -356,6 +356,13 @@ fn validate_query_shape<'a>(
                 budget.add_text(prefix.prefix.len())?;
             }
             query::Query::BinaryDenseVector(binary) => {
+                summa_core::query::BinaryRetrievalOptions {
+                    nprobe: binary.nprobe as usize,
+                    prefix_rerank: binary.prefix_rerank as usize,
+                    max_ordinals_per_doc: binary.max_ordinals_per_doc as usize,
+                }
+                .validate()
+                .map_err(Status::invalid_argument)?;
                 budget.add_field_name(&binary.field, "BinaryDenseVectorQuery.field")?;
                 budget.add_vector(
                     "BinaryDenseVectorQuery.vector",

@@ -13,6 +13,28 @@ from summa_client_python.client import (
 from summa_client_python.summa_pb2 import FieldValue, FieldValueList
 
 
+def test_binary_retrieval_controls_survive_protobuf_roundtrip():
+    from summa_client_python.summa_pb2 import Query
+
+    query = _build_query(
+        {
+            "binary_dense_vector": {
+                "field": "body",
+                "vector": b"\xff",
+                "nprobe": 256,
+                "prefix_rerank": 4000,
+                "max_ordinals_per_doc": 3,
+            }
+        }
+    )
+    parsed = Query.FromString(query.SerializeToString()).binary_dense_vector
+    assert (parsed.nprobe, parsed.prefix_rerank, parsed.max_ordinals_per_doc) == (
+        256,
+        4000,
+        3,
+    )
+
+
 def test_runtime_version_comes_from_distribution_metadata():
     assert __version__ == version("summa-client-python")
 

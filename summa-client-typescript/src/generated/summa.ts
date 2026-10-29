@@ -368,6 +368,15 @@ export interface BinaryDenseVectorQuery {
   combinerTemperature: number;
   combinerTopK: number;
   combinerDecay: number;
+  /** 0: schema default; explicit maximum 65536. */
+  nprobe: number;
+  /** 0: schema default; requires prefix IVF; maximum 65536. */
+  prefixRerank: number;
+  /**
+   * Highest-scoring ordinals nominated per document, ties by ordinal.
+   * 0: all ordinals; maximum 64. Document scores still combine all values.
+   */
+  maxOrdinalsPerDoc: number;
 }
 
 export interface TermQuery {
@@ -842,6 +851,11 @@ export interface GetIndexInfoResponse {
   numDeletedDocs: number;
   /** num_deleted_docs / physical_num_docs; zero for an empty index. */
   deletedRatio: number;
+  /**
+   * 1: binary filters precede nomination; binary query controls are supported.
+   * Check every partition's support before sending nondefault controls.
+   */
+  binaryRetrievalVersion: number;
 }
 
 /** Tokenization facts of one text field. */
@@ -2502,6 +2516,9 @@ function createBaseBinaryDenseVectorQuery(): BinaryDenseVectorQuery {
     combinerTemperature: 0,
     combinerTopK: 0,
     combinerDecay: 0,
+    nprobe: 0,
+    prefixRerank: 0,
+    maxOrdinalsPerDoc: 0,
   };
 }
 
@@ -2524,6 +2541,15 @@ export const BinaryDenseVectorQuery: MessageFns<BinaryDenseVectorQuery> = {
     }
     if (message.combinerDecay !== 0) {
       writer.uint32(53).float(message.combinerDecay);
+    }
+    if (message.nprobe !== 0) {
+      writer.uint32(56).uint32(message.nprobe);
+    }
+    if (message.prefixRerank !== 0) {
+      writer.uint32(64).uint32(message.prefixRerank);
+    }
+    if (message.maxOrdinalsPerDoc !== 0) {
+      writer.uint32(72).uint32(message.maxOrdinalsPerDoc);
     }
     return writer;
   },
@@ -2583,6 +2609,30 @@ export const BinaryDenseVectorQuery: MessageFns<BinaryDenseVectorQuery> = {
           message.combinerDecay = reader.float();
           continue;
         }
+        case 7: {
+          if (tag !== 56) {
+            break;
+          }
+
+          message.nprobe = reader.uint32();
+          continue;
+        }
+        case 8: {
+          if (tag !== 64) {
+            break;
+          }
+
+          message.prefixRerank = reader.uint32();
+          continue;
+        }
+        case 9: {
+          if (tag !== 72) {
+            break;
+          }
+
+          message.maxOrdinalsPerDoc = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -2612,6 +2662,17 @@ export const BinaryDenseVectorQuery: MessageFns<BinaryDenseVectorQuery> = {
         : isSet(object.combiner_decay)
         ? globalThis.Number(object.combiner_decay)
         : 0,
+      nprobe: isSet(object.nprobe) ? globalThis.Number(object.nprobe) : 0,
+      prefixRerank: isSet(object.prefixRerank)
+        ? globalThis.Number(object.prefixRerank)
+        : isSet(object.prefix_rerank)
+        ? globalThis.Number(object.prefix_rerank)
+        : 0,
+      maxOrdinalsPerDoc: isSet(object.maxOrdinalsPerDoc)
+        ? globalThis.Number(object.maxOrdinalsPerDoc)
+        : isSet(object.max_ordinals_per_doc)
+        ? globalThis.Number(object.max_ordinals_per_doc)
+        : 0,
     };
   },
 
@@ -2635,6 +2696,15 @@ export const BinaryDenseVectorQuery: MessageFns<BinaryDenseVectorQuery> = {
     if (message.combinerDecay !== 0) {
       obj.combinerDecay = message.combinerDecay;
     }
+    if (message.nprobe !== 0) {
+      obj.nprobe = Math.round(message.nprobe);
+    }
+    if (message.prefixRerank !== 0) {
+      obj.prefixRerank = Math.round(message.prefixRerank);
+    }
+    if (message.maxOrdinalsPerDoc !== 0) {
+      obj.maxOrdinalsPerDoc = Math.round(message.maxOrdinalsPerDoc);
+    }
     return obj;
   },
 
@@ -2649,6 +2719,9 @@ export const BinaryDenseVectorQuery: MessageFns<BinaryDenseVectorQuery> = {
     message.combinerTemperature = object.combinerTemperature ?? 0;
     message.combinerTopK = object.combinerTopK ?? 0;
     message.combinerDecay = object.combinerDecay ?? 0;
+    message.nprobe = object.nprobe ?? 0;
+    message.prefixRerank = object.prefixRerank ?? 0;
+    message.maxOrdinalsPerDoc = object.maxOrdinalsPerDoc ?? 0;
     return message;
   },
 };
@@ -7273,6 +7346,7 @@ function createBaseGetIndexInfoResponse(): GetIndexInfoResponse {
     physicalNumDocs: 0,
     numDeletedDocs: 0,
     deletedRatio: 0,
+    binaryRetrievalVersion: 0,
   };
 }
 
@@ -7313,6 +7387,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     }
     if (message.deletedRatio !== 0) {
       writer.uint32(97).double(message.deletedRatio);
+    }
+    if (message.binaryRetrievalVersion !== 0) {
+      writer.uint32(104).uint32(message.binaryRetrievalVersion);
     }
     return writer;
   },
@@ -7420,6 +7497,14 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
           message.deletedRatio = reader.double();
           continue;
         }
+        case 13: {
+          if (tag !== 104) {
+            break;
+          }
+
+          message.binaryRetrievalVersion = reader.uint32();
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -7487,6 +7572,11 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
         : isSet(object.deleted_ratio)
         ? globalThis.Number(object.deleted_ratio)
         : 0,
+      binaryRetrievalVersion: isSet(object.binaryRetrievalVersion)
+        ? globalThis.Number(object.binaryRetrievalVersion)
+        : isSet(object.binary_retrieval_version)
+        ? globalThis.Number(object.binary_retrieval_version)
+        : 0,
     };
   },
 
@@ -7528,6 +7618,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     if (message.deletedRatio !== 0) {
       obj.deletedRatio = message.deletedRatio;
     }
+    if (message.binaryRetrievalVersion !== 0) {
+      obj.binaryRetrievalVersion = Math.round(message.binaryRetrievalVersion);
+    }
     return obj;
   },
 
@@ -7550,6 +7643,7 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     message.physicalNumDocs = object.physicalNumDocs ?? 0;
     message.numDeletedDocs = object.numDeletedDocs ?? 0;
     message.deletedRatio = object.deletedRatio ?? 0;
+    message.binaryRetrievalVersion = object.binaryRetrievalVersion ?? 0;
     return message;
   },
 };

@@ -2809,7 +2809,7 @@ async fn binary_single_copy_preserves_alter_retrain_compaction_and_all_combiners
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_binary_prefix_scan_end_to_end() {
     use crate::dsl::{BinaryDenseVectorConfig, VectorIndexAlter};
-    use crate::query::BinaryDenseVectorQuery;
+    use crate::query::{BinaryDenseVectorQuery, Query};
     use rand::{Rng, SeedableRng};
 
     let dim_bits = 128;
@@ -2939,6 +2939,36 @@ async fn test_binary_prefix_scan_end_to_end() {
     for query in &queries {
         let hits = search(&dir, &cfg, field, query).await;
         assert!(!hits.is_empty() && hits.len() <= 10);
+        let index = Index::open(dir.clone(), cfg.clone()).await.unwrap();
+        let readers = index.segment_readers().await.unwrap();
+        let mut controlled = BinaryDenseVectorQuery::new(field, query.clone())
+            .with_retrieval_options(crate::query::BinaryRetrievalOptions {
+                nprobe: 1,
+                prefix_rerank: 1,
+                max_ordinals_per_doc: 1,
+            });
+        // Reuse the same query's routing cache across changed effort controls.
+        controlled.scorer(&readers[0], 10).await.unwrap();
+        controlled.retrieval.nprobe = 8;
+        controlled.retrieval.prefix_rerank = codes.len();
+        let expected = search(&plain_dir, &plain_cfg, plain_field, query).await;
+        let mut expected_scores: Vec<_> = expected.iter().map(|entry| entry.1).collect();
+        expected_scores.sort_by(|a, b| b.total_cmp(a));
+        let check = |mut scorer: Box<dyn crate::query::Scorer + '_>| {
+            let mut scores = Vec::new();
+            while scorer.doc() != crate::TERMINATED {
+                scores.push(scorer.score());
+                scorer.advance();
+            }
+            scores.sort_by(|a, b| b.total_cmp(a));
+            assert_eq!(
+                scores, expected_scores,
+                "explicit covering probes/prefix must match exact search"
+            );
+        };
+        check(controlled.scorer(&readers[0], 10).await.unwrap());
+        #[cfg(feature = "sync")]
+        check(controlled.scorer_sync(&readers[0], 10).unwrap());
     }
 
     // Dropping the prefix rebuilds payloads without it.
