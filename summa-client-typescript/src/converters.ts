@@ -123,6 +123,9 @@ export function buildQuery(q: Query): PbQuery {
         combinerTemperature: bv.combinerTemperature ?? 0,
         combinerTopK: bv.combinerTopK ?? 0,
         combinerDecay: bv.combinerDecay ?? 0,
+        nprobe: bv.nprobe ?? 0,
+        prefixRerank: bv.prefixRerank ?? 0,
+        maxOrdinalsPerDoc: bv.maxOrdinalsPerDoc ?? 0,
       },
     };
   }

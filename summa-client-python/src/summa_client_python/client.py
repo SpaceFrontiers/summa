@@ -231,6 +231,7 @@ class SummaClient:
             num_deleted_docs=response.num_deleted_docs,
             deleted_ratio=response.deleted_ratio,
             candidate_scoring_version=response.candidate_scoring_version,
+            binary_retrieval_version=response.binary_retrieval_version,
             unprepared_candidate_fields=list(response.unprepared_candidate_fields),
             vector_stats=vector_stats,
         )
@@ -1027,6 +1028,9 @@ def _build_query(q: dict[str, Any]) -> pb.Query:
                 combiner_temperature=bv.get("combiner_temperature", 0),
                 combiner_top_k=bv.get("combiner_top_k", 0),
                 combiner_decay=bv.get("combiner_decay", 0),
+                nprobe=bv.get("nprobe", 0),
+                prefix_rerank=bv.get("prefix_rerank", 0),
+                max_ordinals_per_doc=bv.get("max_ordinals_per_doc", 0),
             )
         )
 

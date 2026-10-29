@@ -28,6 +28,130 @@ index e2e {
 }
 "#;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the summa-server binary; see module docs"]
+async fn partitioned_binary_filters_and_passage_bounds_survive_real_rpc() {
+    let servers = [spawn_server(), spawn_server()];
+    for server in &servers {
+        wait_server_ready(&server.addr).await;
+    }
+    let broker = spawn_broker(
+        &[
+            format!("id=a,addr={},shard=0", servers[0].addr),
+            format!("id=b,addr={},shard=1", servers[1].addr),
+        ],
+        &["--placement", "docs*=0,1"],
+    );
+    wait_for_backends(&broker, Duration::from_secs(10)).await;
+    let name = "docs_binary_bounds";
+    broker_index_client(&broker).await.create_index(CreateIndexRequest {
+        index_name: name.into(),
+        schema: format!("index {name} {{ field id: text<raw> [primary, indexed, stored] field type: text<raw> [indexed] field binary: binary_dense_vector<128> [indexed<ivf, num_clusters: 4, nprobe: 4, prefix_bits: 32, prefix_rerank: 4>, stored<multi>] }}"),
+    }).await.unwrap();
+    wait_for_indexes(&broker, &[name], Duration::from_secs(10)).await;
+    for (shard, server) in servers.iter().enumerate() {
+        let mut index = direct_index_client(&server.addr).await;
+        let documents = [("blocked", 255), ("allowed", 127)]
+            .into_iter()
+            .map(|(kind, byte)| {
+                let mut fields = vec![
+                    FieldEntry {
+                        name: "id".into(),
+                        value: Some(FieldValue {
+                            value: Some(field_value::Value::Text(format!("{shard}-{kind}"))),
+                        }),
+                    },
+                    FieldEntry {
+                        name: "type".into(),
+                        value: Some(FieldValue {
+                            value: Some(field_value::Value::Text(kind.into())),
+                        }),
+                    },
+                ];
+                fields.extend((0..16).map(|_| FieldEntry {
+                    name: "binary".into(),
+                    value: Some(FieldValue {
+                        value: Some(field_value::Value::BinaryDenseVector(vec![byte; 16])),
+                    }),
+                }));
+                NamedDocument { fields }
+            })
+            .collect();
+        index
+            .batch_index_documents(BatchIndexDocumentsRequest {
+                index_name: name.into(),
+                documents,
+            })
+            .await
+            .unwrap();
+        index
+            .commit(CommitRequest {
+                index_name: name.into(),
+            })
+            .await
+            .unwrap();
+    }
+    let mut search = broker_search_client(&broker).await;
+    let info = search
+        .get_index_info(GetIndexInfoRequest {
+            index_name: name.into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.binary_retrieval_version, 1);
+    let result = search
+        .search(SearchRequest {
+            index_name: name.into(),
+            limit: 2,
+            tracing: true,
+            query: Some(Query {
+                query: Some(query::Query::Fusion(FusionQuery {
+                    method: FusionMethod::FusionCandidates as i32,
+                    candidate_depth: 1,
+                    queries: vec![WeightedQuery {
+                        name: "body_binary".into(),
+                        scope: ScoreScope::Chunk as i32,
+                        query: Some(Query {
+                            query: Some(query::Query::BinaryDenseVector(BinaryDenseVectorQuery {
+                                field: "binary".into(),
+                                vector: vec![255; 16],
+                                combiner: MultiValueCombiner::CombinerMax as i32,
+                                nprobe: 4,
+                                prefix_rerank: 64,
+                                max_ordinals_per_doc: 3,
+                                ..Default::default()
+                            })),
+                        }),
+                        ..Default::default()
+                    }],
+                    filters: vec![Query {
+                        query: Some(query::Query::Term(TermQuery {
+                            field: "type".into(),
+                            term: "allowed".into(),
+                            ..Default::default()
+                        })),
+                    }],
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(result.hits.len(), 2);
+    let trace = result.trace.unwrap();
+    assert_eq!(trace.shards.len(), 2);
+    for shard in trace.shards {
+        assert!(!shard.truncated);
+        assert_eq!(shard.queries[0].candidates.len(), 1);
+        let hit = &shard.queries[0].candidates[0];
+        assert_eq!(hit.score, 0.875);
+        assert_eq!(hit.ordinal_scores.len(), 3);
+    }
+}
+
 fn summa_server_bin() -> PathBuf {
     if let Ok(path) = std::env::var("SUMMA_SERVER_BIN") {
         return PathBuf::from(path);
