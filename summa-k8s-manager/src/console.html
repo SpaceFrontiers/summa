@@ -1,0 +1,451 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>summa-k8s-manager</title>
+<link rel="icon" href="data:,">
+<style>
+  [hidden] { display: none !important; }
+  :root {
+    --fg: #1c1f23; --muted: #646b75; --line: #dde1e6; --bg: #fff; --panel: #f6f7f9;
+    --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --accent: #0b5cad;
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--fg); background: var(--bg);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6e8eb; --muted: #9aa2ad; --line: #30363d; --bg: #0f1216; --panel: #161b22;
+            --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff; }
+  }
+  body { margin: 0; padding: 0 24px 96px; max-width: 1280px; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 16px 0 8px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; }
+  header .spacer { flex: 1; }
+  h2 { font-size: 14px; margin: 28px 0 8px; display: flex; gap: 8px; align-items: baseline; }
+  h2 .hint { font-weight: normal; color: var(--muted); font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .dot::before { content: "●"; margin-right: 4px; font-size: 10px; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); background: var(--panel);
+           color: var(--fg); border-radius: 4px; cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .5; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.link { border: 0; background: none; color: var(--accent); padding: 0 4px; }
+  input, select, textarea { font: inherit; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px;
+                            background: var(--bg); color: var(--fg); }
+  input.wide { width: 100%; box-sizing: border-box; }
+  textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .banner { margin: 12px 0; padding: 8px 12px; border: 1px solid var(--bad); border-radius: 4px; }
+  .form { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px 12px; padding: 12px;
+          background: var(--panel); border: 1px solid var(--line); border-radius: 4px; margin-top: 8px; }
+  .form label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--muted); }
+  .form .span2 { grid-column: span 2; } .form .span4 { grid-column: span 4; }
+  .form .actions { grid-column: span 4; display: flex; gap: 8px; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 24px; background: var(--panel);
+         border-top: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  .bar .spacer { flex: 1; }
+  .review { border: 1px solid var(--line); border-radius: 4px; padding: 12px; margin-top: 12px; }
+  .diff { white-space: pre; max-height: 360px; overflow: auto; background: var(--panel); padding: 8px; border-radius: 4px; margin: 8px 0 0; }
+  .diff .add { color: var(--ok); } .diff .del { color: var(--bad); }
+  .share { display: inline-block; min-width: 120px; }
+  details summary { cursor: pointer; color: var(--muted); margin-top: 28px; }
+  .changed td { background: color-mix(in srgb, var(--warn) 8%, transparent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>summa-k8s-manager</h1>
+  <span id="title" class="muted"></span>
+  <span class="spacer"></span>
+  <span id="readiness"></span>
+  <button id="reload">Reload</button>
+  <button id="refresh" title="Ask the broker to re-poll every backend now">Refresh broker</button>
+</header>
+<div id="errors"></div>
+
+<h2>Conditions</h2>
+<table id="conditions"></table>
+
+<h2>Shards <span class="hint">one Deployment per replica, pinned to a node and its host directories</span></h2>
+<table id="shards"></table>
+<div id="shard-form"></div>
+
+<h2>Broker</h2>
+<table id="broker"></table>
+
+<h2>Indexes <span class="hint">live from the broker; share = rows held vs. partition weight</span></h2>
+<table id="indexes"></table>
+
+<h2>Placement <span class="hint">first matching rule wins; rule order is partition order</span></h2>
+<table id="placement"></table>
+<div style="margin-top:8px; display:flex; gap:8px; align-items:center">
+  <button id="add-rule">Add rule</button>
+  <label class="muted">Unmatched CreateIndex
+    <select id="placement-default"><option value="single">goes to the emptiest shard</option><option value="reject">is refused</option></select>
+  </label>
+</div>
+
+<details id="raw">
+  <summary>Edit the spec as JSON</summary>
+  <textarea id="raw-spec" rows="24" spellcheck="false"></textarea>
+  <div style="margin-top:8px"><button id="raw-apply">Use as draft</button> <span id="raw-error" class="bad"></span></div>
+</details>
+
+<div id="review"></div>
+<div class="bar" id="bar" hidden>
+  <span id="bar-text"></span><span class="spacer"></span>
+  <button id="discard">Discard</button>
+  <button id="review-btn" class="primary">Review changes</button>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const clone = (v) => JSON.parse(JSON.stringify(v));
+// Key-sorted JSON: the server returns sorted keys, objects built here do not.
+const canonical = (v) => Array.isArray(v) ? v.map(canonical)
+  : v && typeof v === "object" ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canonical(v[k])])) : v;
+const pretty = (v) => JSON.stringify(canonical(v), null, 2);
+const fmt = (n) => Number(n).toLocaleString("en-US");
+
+let data = null;        // GET /api/cluster
+let saved = null;       // spec as loaded
+let draft = null;       // spec being edited
+let editing = null;     // index of the shard in the form, or "new"
+let report = null;      // last check report
+
+async function api(method, path, body) {
+  const response = await fetch(path, {
+    method, headers: body ? { "content-type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch { json = { error: text }; }
+  return { status: response.status, ok: response.ok, json };
+}
+
+async function load() {
+  const result = await api("GET", "/api/cluster");
+  if (!result.ok) { showErrors([result.json?.error ?? `HTTP ${result.status}`]); return; }
+  data = result.json;
+  saved = clone(data.cluster.spec);
+  draft = clone(saved);
+  editing = null; report = null;
+  render();
+}
+
+function showErrors(errors) {
+  $("errors").innerHTML = errors.map((e) => `<div class="banner">${esc(e)}</div>`).join("");
+}
+
+const replicaName = (shard, replica) => replica.name || `${data.cluster.name}-shard-${shard.id}`;
+const brokerName = (spec) => spec.broker?.name || `${data.cluster.name}-broker`;
+const condition = (type) => (data.cluster.status?.conditions ?? []).find((c) => c.type === type);
+
+// Coalesce renders: replacing a focused input fires its change handler
+// synchronously, which must not re-enter an innerHTML update in progress.
+let renderQueued = false;
+function render() {
+  if (renderQueued) return;
+  renderQueued = true;
+  queueMicrotask(() => { renderQueued = false; renderNow(); });
+}
+
+function renderNow() {
+  showErrors(data.errors ?? []);
+  $("title").textContent = `${data.cluster.name} · namespace ${data.namespace} · generation ${data.cluster.generation ?? "?"}` +
+    ` · observed ${data.cluster.status?.observedGeneration ?? "never"}`;
+  const ready = condition("Ready");
+  $("readiness").innerHTML = ready
+    ? `<span class="dot ${ready.status === "True" ? "ok" : "bad"}">${esc(ready.status === "True" ? "Ready" : ready.reason)}</span>`
+    : `<span class="dot warn">not reconciled yet</span>`;
+  renderConditions(); renderShards(); renderShardForm(); renderBroker(); renderIndexes(); renderPlacement();
+  $("raw-spec").value = pretty(draft);
+  renderBar(); renderReview();
+}
+
+function renderConditions() {
+  const conditions = data.cluster.status?.conditions ?? [];
+  $("conditions").innerHTML = conditions.length === 0
+    ? `<tr><td class="muted">The operator has not reported status yet.</td></tr>`
+    : `<tr><th>Type</th><th>Status</th><th>Reason</th><th>Message</th><th>Since</th></tr>` + conditions.map((c) =>
+      `<tr><td>${esc(c.type)}</td><td class="${c.status === "True" ? "ok" : "bad"}">${esc(c.status)}</td>` +
+      `<td>${esc(c.reason)}</td><td>${esc(c.message)}</td><td class="muted">${esc(c.lastTransitionTime)}</td></tr>`).join("");
+}
+
+function backendsOf(shardId) {
+  return (data.broker.backends ?? []).filter((b) => b.shardId === shardId);
+}
+
+function replicaStatus(name) {
+  for (const shard of data.cluster.status?.shards ?? []) {
+    const found = shard.replicas.find((r) => r.name === name);
+    if (found) return found;
+  }
+  return null;
+}
+
+function renderShards() {
+  const savedIds = new Set(saved.shards.map((s) => s.id));
+  const rows = draft.shards.map((shard, i) => {
+    const before = saved.shards.find((s) => s.id === shard.id);
+    const changed = !before || pretty(before) !== pretty(shard);
+    const backends = backendsOf(shard.id);
+    const backendCell = backends.length === 0
+      ? `<span class="muted">not discovered</span>`
+      : backends.map((b) => `<div><span class="dot ${b.health === "healthy" && b.ready ? "ok" : "bad"}">${esc(b.health)}${b.ready ? "" : ", not ready"}</span>` +
+          (b.consecutiveFailures ? ` <span class="muted">${b.consecutiveFailures} failures</span>` : "") + `</div>`).join("");
+    const indexes = [...new Set(backends.flatMap((b) => b.indexes))];
+    return shard.replicas.map((replica, j) => {
+      const name = replicaName(shard, replica);
+      const status = replicaStatus(name);
+      const pod = !savedIds.has(shard.id) || changed
+        ? `<span class="warn">pending apply</span>`
+        : status ? `<span class="dot ${status.ready ? "ok" : "bad"}">${status.ready ? "ready" : "not ready"}</span>` +
+            (status.message ? `<div class="muted">${esc(status.message)}</div>` : "")
+          : `<span class="muted">unknown</span>`;
+      return `<tr class="${changed ? "changed" : ""}">` +
+        (j === 0 ? `<td rowspan="${shard.replicas.length}"><b>${esc(shard.id)}</b></td>` : "") +
+        `<td class="mono">${esc(name)}</td><td>${esc(replica.node)}</td>` +
+        `<td class="mono">${esc(replica.dataPath)}<br><span class="muted">${esc(replica.cachePath)}</span></td>` +
+        `<td>${pod}</td><td>${backendCell}</td>` +
+        `<td>${indexes.length ? indexes.map(esc).join("<br>") : `<span class="muted">none</span>`}</td>` +
+        (j === 0 ? `<td rowspan="${shard.replicas.length}" style="white-space:nowrap">` +
+          `<button class="link" data-edit="${i}">Edit</button><button class="link" data-remove="${i}">Remove</button></td>` : "") +
+        `</tr>`;
+    }).join("");
+  }).join("");
+  $("shards").innerHTML = `<tr><th>Shard</th><th>Deployment</th><th>Node</th><th>Data / cache</th><th>Pod</th><th>Backend</th><th>Indexes</th><th></th></tr>` +
+    (rows || `<tr><td colspan="8" class="muted">No shards.</td></tr>`) +
+    `<tr><td colspan="8"><button id="add-shard">Add shard</button></td></tr>`;
+  $("add-shard").onclick = () => { editing = "new"; renderShardForm(); };
+  document.querySelectorAll("[data-edit]").forEach((b) => b.onclick = () => { editing = Number(b.dataset.edit); renderShardForm(); });
+  document.querySelectorAll("[data-remove]").forEach((b) => b.onclick = () => {
+    const shard = draft.shards[Number(b.dataset.remove)];
+    const used = draft.placement.rules.filter((r) => r.partitions.some((p) => p.shard === shard.id));
+    if (used.length && !confirm(`Placement rules ${used.map((r) => r.pattern).join(", ")} use shard ${shard.id}. Remove the shard anyway? The review will refuse it until the rules change.`)) return;
+    draft.shards.splice(Number(b.dataset.remove), 1);
+    editing = null; render();
+  });
+}
+
+function renderShardForm() {
+  if (editing === null) { $("shard-form").innerHTML = ""; return; }
+  const shard = editing === "new"
+    ? { id: nextShardId(), args: [], replicas: [{ node: "", dataPath: "", cachePath: "" }] }
+    : draft.shards[editing];
+  const replica = shard.replicas[0] ?? { node: "", dataPath: "", cachePath: "" };
+  const nodes = data.nodes ?? [];
+  const nodeOptions = [`<option value="">choose a node</option>`].concat(nodes.map((n) =>
+    `<option value="${esc(n.name)}" ${n.name === replica.node ? "selected" : ""}>${esc(n.name)}` +
+    ` (${n.ready ? "ready" : "not ready"}${n.schedulable ? "" : ", cordoned"}, ${esc(n.cpu ?? "?")} CPU, ${esc(n.memory ?? "?")})</option>`));
+  if (replica.node && !nodes.some((n) => n.name === replica.node)) nodeOptions.push(`<option selected>${esc(replica.node)}</option>`);
+  const memory = shard.resources?.requests?.memory ?? "";
+  $("shard-form").innerHTML = `<div class="form">
+    <label>Shard id<input id="f-id" value="${esc(shard.id)}" ${editing === "new" ? "" : "readonly"}></label>
+    <label>Deployment name<input id="f-name" value="${esc(replica.name ?? "")}" placeholder="${esc(data.cluster.name)}-shard-${esc(shard.id)}"></label>
+    <label class="span2">Node<select id="f-node">${nodeOptions.join("")}</select></label>
+    <label class="span2">Data directory (must exist on the node)<input id="f-data" class="wide" value="${esc(replica.dataPath)}" placeholder="/data/summa-server"></label>
+    <label class="span2">Cache directory (must exist on the node)<input id="f-cache" class="wide" value="${esc(replica.cachePath)}" placeholder="/data/summa-cache"></label>
+    <label class="span2">Shard arguments, one per line (added to spec.server.args)<textarea id="f-args" rows="6">${esc((shard.args ?? []).join("\n"))}</textarea></label>
+    <label>Memory request<input id="f-memory" value="${esc(memory)}" placeholder="from spec.server"></label>
+    <div></div>
+    <div class="actions"><button class="primary" id="f-save">${editing === "new" ? "Add to draft" : "Update draft"}</button><button id="f-cancel">Cancel</button>
+      <span class="muted">Moving a shard to another node or directory opens whatever that directory holds: copy the data first.</span></div>
+  </div>`;
+  $("f-cancel").onclick = () => { editing = null; renderShardForm(); };
+  $("f-save").onclick = () => {
+    const updated = clone(shard);
+    updated.id = $("f-id").value.trim();
+    const name = $("f-name").value.trim();
+    updated.replicas = [{ ...(name ? { name } : {}), node: $("f-node").value, dataPath: $("f-data").value.trim(), cachePath: $("f-cache").value.trim() }];
+    updated.args = $("f-args").value.split("\n").map((a) => a.trim()).filter(Boolean);
+    const mem = $("f-memory").value.trim();
+    if (mem) { updated.resources = { ...(updated.resources ?? {}), requests: { ...(updated.resources?.requests ?? {}), memory: mem } }; }
+    else if (updated.resources?.requests) { delete updated.resources.requests.memory; }
+    // Omit empty fields, as the server does, so the draft diff shows only real changes.
+    if (!updated.args.length) delete updated.args;
+    if (updated.resources?.requests && !Object.keys(updated.resources.requests).length) delete updated.resources.requests;
+    if (updated.resources && !Object.keys(updated.resources).length) delete updated.resources;
+    if (editing === "new") draft.shards.push(updated); else draft.shards[editing] = updated;
+    editing = null; render();
+  };
+}
+
+function nextShardId() {
+  const numbers = draft.shards.map((s) => Number(s.id)).filter(Number.isInteger);
+  return String(numbers.length ? Math.max(...numbers) + 1 : 1);
+}
+
+function renderBroker() {
+  const status = data.cluster.status?.broker;
+  const b = draft.broker;
+  const perBroker = Math.max(1, Math.floor(b.backendMaxSearches / Math.max(1, b.replicas)));
+  $("broker").innerHTML = `<tr><th>Deployment</th><th>Address</th><th>Replicas</th><th>Ready</th><th>Searches per backend</th><th>Per broker</th></tr>
+    <tr><td class="mono">${esc(brokerName(draft))}</td><td class="mono">${esc(data.broker.address)}</td>
+    <td><input id="b-replicas" type="number" min="1" value="${esc(b.replicas)}" style="width:64px"></td>
+    <td>${status ? `<span class="${status.readyReplicas >= status.replicas ? "ok" : "bad"}">${status.readyReplicas}/${status.replicas}</span>` : `<span class="muted">unknown</span>`}</td>
+    <td><input id="b-searches" type="number" min="1" value="${esc(b.backendMaxSearches)}" style="width:64px"></td>
+    <td class="num">${perBroker}</td></tr>`;
+  $("b-replicas").onchange = (e) => { draft.broker.replicas = Number(e.target.value); render(); };
+  $("b-searches").onchange = (e) => { draft.broker.backendMaxSearches = Number(e.target.value); render(); };
+}
+
+function globMatch(pattern, name) {
+  const re = new RegExp("^" + pattern.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+  return re.test(name);
+}
+
+function renderIndexes() {
+  const topology = data.broker.topology;
+  if (!topology) { $("indexes").innerHTML = `<tr><td class="muted">Broker topology unavailable.</td></tr>`; return; }
+  const rules = data.cluster.status?.placement ?? [];
+  const rows = topology.slice().sort((a, b) => a.indexName.localeCompare(b.indexName)).map((index) => {
+    const docs = index.partitions.map((p) => p.replicas.reduce((max, r) => Math.max(max, r.numDocs), 0));
+    const total = docs.reduce((a, b) => a + b, 0);
+    const weights = index.partitions.map((p) => p.weight);
+    const weightTotal = weights.reduce((a, b) => a + b, 0);
+    const partitioned = index.mergePolicy !== "passthrough";
+    const parts = index.partitions.map((p, i) => {
+      const health = p.replicas.every((r) => r.health === "healthy") ? "ok" : "bad";
+      let share = "";
+      if (partitioned && total > 0) {
+        const actual = (100 * docs[i] / total).toFixed(1);
+        const expected = weightTotal ? (100 * weights[i] / weightTotal).toFixed(1) : "?";
+        const skew = Math.abs(actual - expected) > 2 ? "warn" : "muted";
+        share = ` <span class="share ${skew}">${actual}% of rows, weight ${expected}%</span>`;
+      }
+      return `<div><span class="dot ${health}">shard ${esc(p.shardId)}</span> <span class="mono">${fmt(docs[i])}</span> docs${share}</div>`;
+    }).join("");
+    const rule = rules.find((r) => globMatch(r.slice(0, r.lastIndexOf("=")), index.indexName));
+    const segments = index.partitions.reduce((sum, p) => sum + p.replicas.reduce((m, r) => Math.max(m, r.numSegments), 0), 0);
+    return `<tr><td class="mono">${esc(index.indexName)}</td>` +
+      `<td>${partitioned ? "partitioned" : "single shard"}${index.ambiguous ? ` <span class="bad">ambiguous: on several shards without a rule</span>` : ""}</td>` +
+      `<td>${parts}</td><td class="num">${fmt(total)}</td><td class="num">${fmt(segments)}</td>` +
+      `<td class="mono">${rule ? esc(rule) : `<span class="muted">no rule</span>`}</td></tr>`;
+  }).join("");
+  $("indexes").innerHTML = `<tr><th>Index</th><th>Mode</th><th>Partitions</th><th class="num">Documents</th><th class="num">Segments</th><th>Running rule</th></tr>` +
+    (rows || `<tr><td colspan="6" class="muted">No indexes.</td></tr>`);
+}
+
+const partitionsText = (rule) => rule.partitions.map((p) => p.weight ? `${p.shard}:${p.weight}` : p.shard).join(",");
+function parsePartitions(text) {
+  return text.split(",").map((s) => s.trim()).filter(Boolean).map((entry) => {
+    const [shard, weight] = entry.split(":").map((s) => s.trim());
+    return weight === undefined ? { shard } : { shard, weight: Number(weight) };
+  });
+}
+
+function renderPlacement() {
+  const rules = draft.placement.rules;
+  const live = (data.broker.topology ?? []).map((t) => t.indexName);
+  $("placement").innerHTML = `<tr><th>#</th><th>Pattern</th><th>Partitions <span class="muted">shard[:weight],…</span></th><th>Matches live indexes</th><th></th></tr>` +
+    rules.map((rule, i) => {
+      const earlier = rules.slice(0, i);
+      const matches = live.filter((name) => globMatch(rule.pattern, name) && !earlier.some((r) => globMatch(r.pattern, name)));
+      return `<tr><td class="muted">${i + 1}</td>
+        <td><input class="wide mono" data-pattern="${i}" value="${esc(rule.pattern)}"></td>
+        <td><input class="wide mono" data-partitions="${i}" value="${esc(partitionsText(rule))}"></td>
+        <td class="mono">${matches.length ? matches.map(esc).join("<br>") : `<span class="muted">none</span>`}</td>
+        <td style="white-space:nowrap"><button class="link" data-up="${i}" ${i === 0 ? "disabled" : ""}>Up</button>` +
+        `<button class="link" data-down="${i}" ${i === rules.length - 1 ? "disabled" : ""}>Down</button>` +
+        `<button class="link" data-drop="${i}">Remove</button></td></tr>`;
+    }).join("");
+  $("placement-default").value = draft.placement.default ?? "single";
+  document.querySelectorAll("[data-pattern]").forEach((el) => el.onchange = () => { rules[el.dataset.pattern].pattern = el.value.trim(); render(); });
+  document.querySelectorAll("[data-partitions]").forEach((el) => el.onchange = () => { rules[el.dataset.partitions].partitions = parsePartitions(el.value); render(); });
+  const move = (i, j) => { [rules[i], rules[j]] = [rules[j], rules[i]]; render(); };
+  document.querySelectorAll("[data-up]").forEach((el) => el.onclick = () => move(Number(el.dataset.up), Number(el.dataset.up) - 1));
+  document.querySelectorAll("[data-down]").forEach((el) => el.onclick = () => move(Number(el.dataset.down), Number(el.dataset.down) + 1));
+  document.querySelectorAll("[data-drop]").forEach((el) => el.onclick = () => { rules.splice(Number(el.dataset.drop), 1); render(); });
+}
+
+function dirty() { return pretty(saved) !== pretty(draft); }
+
+function renderBar() {
+  $("bar").hidden = !dirty();
+  $("bar-text").textContent = "The draft differs from the saved SearchCluster.";
+}
+
+function diffLines(a, b) {
+  const x = a.split("\n"), y = b.split("\n");
+  const m = x.length, n = y.length;
+  const lcs = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
+  for (let i = m - 1; i >= 0; i--) for (let j = n - 1; j >= 0; j--)
+    lcs[i][j] = x[i] === y[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+  const out = [];
+  let i = 0, j = 0;
+  while (i < m || j < n) {
+    if (i < m && j < n && x[i] === y[j]) { out.push(["  ", x[i]]); i++; j++; }
+    else if (j < n && (i === m || lcs[i][j + 1] >= lcs[i + 1][j])) { out.push(["+ ", y[j++]]); }
+    else { out.push(["- ", x[i++]]); }
+  }
+  // Keep three lines of context around each change.
+  const keep = out.map((_, k) => out.slice(Math.max(0, k - 3), k + 4).some((l) => l[0] !== "  "));
+  return out.map((l, k) => keep[k] ? `<div class="${l[0] === "+ " ? "add" : l[0] === "- " ? "del" : ""}">${esc(l[0] + l[1])}</div>` : (keep[k - 1] ? `<div class="muted">…</div>` : "")).join("");
+}
+
+function renderReview() {
+  if (!report) { $("review").innerHTML = ""; return; }
+  const errors = report.errors.map((e) => `<li><code>${esc(e.field)}</code>: ${esc(e.message)}</li>`);
+  const live = report.liveErrors.map((e) => `<li>${esc(e)}</li>`);
+  const placement = report.placement.map((c) =>
+    `<tr><td class="mono">${esc(c.index)}</td><td class="mono">${esc(c.current ?? "no rule")}</td><td class="mono">${esc(c.proposed ?? "no rule")}</td>` +
+    `<td class="${c.blocked ? "bad" : "muted"}">${esc(c.blocked ?? c.note ?? "")}</td></tr>`);
+  const removed = report.removedShards.map((r) =>
+    `<tr><td>${esc(r.shard)}</td><td class="${r.blocked ? "bad" : "ok"}">${esc(r.blocked ?? "empty: its Deployment will be deleted; the node directories stay")}</td></tr>`);
+  $("review").innerHTML = `<div class="review">
+    <h2 style="margin-top:0">Review <span class="hint">${report.ok ? "checks passed" : "the operator would refuse this change"}</span></h2>
+    ${errors.length ? `<p class="bad">Invalid spec</p><ul>${errors.join("")}</ul>` : ""}
+    ${live.length ? `<p class="bad">Live checks could not run</p><ul>${live.join("")}</ul>` : ""}
+    ${placement.length ? `<p>Live indexes whose routing changes</p><table><tr><th>Index</th><th>Running</th><th>Proposed</th><th></th></tr>${placement.join("")}</table>` : ""}
+    ${removed.length ? `<p>Removed shards</p><table><tr><th>Shard</th><th></th></tr>${removed.join("")}</table>` : ""}
+    <div class="diff mono">${diffLines(pretty(saved), pretty(draft))}</div>
+    <div style="margin-top:12px; display:flex; gap:8px">
+      <button class="primary" id="apply" ${report.ok ? "" : "disabled"}>Apply to the SearchCluster</button>
+      <button id="close-review">Close</button>
+    </div></div>`;
+  $("close-review").onclick = () => { report = null; renderReview(); };
+  $("apply").onclick = applyDraft;
+  $("review").scrollIntoView({ behavior: "smooth" });
+}
+
+async function reviewDraft() {
+  const result = await api("POST", "/api/cluster/check", { spec: draft });
+  if (!result.ok) { showErrors([result.json?.error ?? `HTTP ${result.status}`]); return; }
+  report = result.json; renderReview();
+}
+
+async function applyDraft() {
+  const result = await api("PUT", "/api/cluster", { resourceVersion: data.cluster.resourceVersion, spec: draft });
+  if (result.status === 422) { report = result.json; renderReview(); return; }
+  if (!result.ok) { showErrors([result.json?.error ?? `HTTP ${result.status}`]); return; }
+  await load();
+}
+
+$("reload").onclick = load;
+$("refresh").onclick = async () => {
+  const result = await api("POST", "/api/broker/refresh");
+  if (!result.ok) showErrors([result.json?.error ?? `HTTP ${result.status}`]);
+  setTimeout(load, 1500);
+};
+$("discard").onclick = () => { draft = clone(saved); editing = null; report = null; render(); };
+$("review-btn").onclick = reviewDraft;
+$("add-rule").onclick = () => { draft.placement.rules.push({ pattern: "", partitions: [] }); render(); };
+$("placement-default").onchange = (e) => { draft.placement.default = e.target.value; render(); };
+$("raw-apply").onclick = () => {
+  try { draft = JSON.parse($("raw-spec").value); $("raw-error").textContent = ""; report = null; render(); }
+  catch (e) { $("raw-error").textContent = e.message; }
+};
+load();
+</script>
+</body>
+</html>

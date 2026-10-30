@@ -6,6 +6,8 @@
 //! is partitioned across shards (phase 2), which makes the ordering an
 //! immutable routing contract — reorder rules only together with a rebuild.
 
+use summa_broker::placement_rules::{self, glob_match};
+
 use crate::partition::PartitionWeights;
 use crate::topology::ShardId;
 
@@ -65,118 +67,24 @@ impl PlacementRules {
     }
 }
 
-/// Parse one `--placement "pattern=shard"` argument. The shard id follows the
-/// last `=` so patterns themselves may not contain `=` (index names cannot
-/// either, per summa-server's index-name validation).
-/// `pattern=shard` or `pattern=shardA,shardB,...` (partitions in order).
-/// A partition may carry a positive integer weight, `pattern=a:5,b:5,c:4`:
-/// partitions receive rows in proportion to their weights (default 1).
+/// Parse one `--placement` argument (syntax in [`placement_rules::parse`]).
 pub fn parse_placement(s: &str) -> anyhow::Result<PlacementRule> {
-    let (pattern, shards) = s.rsplit_once('=').ok_or_else(|| {
-        anyhow::anyhow!("invalid --placement '{s}': expected 'pattern=shard[:weight][,shard...]'")
-    })?;
-    if pattern.is_empty() || shards.is_empty() {
-        anyhow::bail!("invalid --placement '{s}': empty pattern or shard");
-    }
-    let mut parsed: Vec<ShardId> = Vec::new();
-    let mut weights = Vec::new();
-    let mut weighted = false;
-    for entry in shards.split(',') {
-        let (shard, weight) = match entry.split_once(':') {
-            Some((shard, weight)) => {
-                weighted = true;
-                (
-                    shard.trim(),
-                    parse_weight(weight.trim()).map_err(|e| {
-                        anyhow::anyhow!(
-                            "invalid --placement '{s}': weight of shard '{}': {e}",
-                            shard.trim()
-                        )
-                    })?,
-                )
-            }
-            None => (entry.trim(), 1),
-        };
-        if shard.is_empty() {
-            anyhow::bail!("invalid --placement '{s}': empty shard id");
-        }
-        if parsed.iter().any(|p| p.0 == shard) {
-            anyhow::bail!("invalid --placement '{s}': shard '{shard}' listed twice");
-        }
-        parsed.push(ShardId(shard.to_string()));
-        weights.push(weight);
-    }
-    if weighted && parsed.len() == 1 {
-        anyhow::bail!(
-            "invalid --placement '{s}': a weight only applies to a partition of a multi-shard rule"
-        );
-    }
+    let rule = placement_rules::parse(s)?;
+    let weights = rule.weights();
     Ok(PlacementRule {
-        pattern: pattern.to_string(),
-        shards: parsed,
+        pattern: rule.pattern,
+        shards: rule
+            .partitions
+            .into_iter()
+            .map(|p| ShardId(p.shard))
+            .collect(),
         weights: PartitionWeights::new(weights),
     })
-}
-
-/// A positive integer weight. Decimal fractions are refused: weights decide
-/// where every key is routed, so they are compared exactly.
-fn parse_weight(weight: &str) -> anyhow::Result<u32> {
-    if weight.is_empty() || !weight.bytes().all(|b| b.is_ascii_digit()) {
-        anyhow::bail!("'{weight}' is not a positive integer such as 4");
-    }
-    match weight.parse::<u32>() {
-        Ok(0) => anyhow::bail!("'{weight}' must be greater than 0"),
-        Ok(weight) => Ok(weight),
-        Err(_) => anyhow::bail!("'{weight}' is larger than {}", u32::MAX),
-    }
-}
-
-/// Glob match supporting `*` (any run of characters, including empty).
-/// Iterative backtracking matcher — no recursion, O(pattern × name).
-pub fn glob_match(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let n: Vec<char> = name.chars().collect();
-    let (mut pi, mut ni) = (0usize, 0usize);
-    let mut star: Option<(usize, usize)> = None; // (pattern idx after '*', name idx it consumed to)
-    while ni < n.len() {
-        if pi < p.len() && (p[pi] == n[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some((pi + 1, ni));
-            pi += 1;
-        } else if let Some((star_pi, star_ni)) = star {
-            // Let the last '*' swallow one more character and retry.
-            pi = star_pi;
-            ni = star_ni + 1;
-            star = Some((star_pi, star_ni + 1));
-        } else {
-            return false;
-        }
-    }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
-    }
-    pi == p.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn glob_matches() {
-        assert!(glob_match("documents*", "documents"));
-        assert!(glob_match("documents*", "documents_20260724"));
-        assert!(glob_match("*", "anything"));
-        assert!(glob_match("a*b*c", "aXXbYYc"));
-        assert!(glob_match("a*b*c", "abc"));
-        assert!(!glob_match("documents*", "social"));
-        assert!(!glob_match("documents", "documents_20260724"));
-        assert!(!glob_match("a*b", "aXc"));
-        assert!(glob_match("", ""));
-        assert!(!glob_match("", "x"));
-    }
 
     #[test]
     fn placement_first_match_wins() {

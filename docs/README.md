@@ -21,6 +21,7 @@
 - [Summa 2 migration](summa-2-migration.md)
 - [Index compatibility (2.1)](compatibility.md)
 - [Server](../summa-server/README.md) and [broker](broker.md)
+- [Kubernetes operator and console (summa-k8s-manager)](summa-k8s-manager.md)
 - [Segment lifecycle and recovery](segment-lifecycle.md)
 - [Deletion, upserts, and compaction](row-deletion.md)
 - [Content-hash deduplication](content-deduplication.md)

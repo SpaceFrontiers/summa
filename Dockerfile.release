@@ -21,6 +21,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY summa-broker ./summa-broker
 COPY summa-core ./summa-core
+COPY summa-k8s-manager ./summa-k8s-manager
 COPY summa-llm ./summa-llm
 COPY summa-mal ./summa-mal
 COPY summa-mal-python ./summa-mal-python
