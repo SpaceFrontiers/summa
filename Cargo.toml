@@ -3,6 +3,7 @@ members = [
     "summa-broker",
     "summa-core",
     "summa-llm",
+    "summa-k8s-manager",
     "summa-mal",
     "summa-mal-python",
     "summa-proto",

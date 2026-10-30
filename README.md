@@ -48,6 +48,7 @@ Connect with the [Python](summa-client-python/README.md) or
 | [summa-tool](summa-tool/README.md)                     | Index CLI and JSONL processing            |
 | [summa-server](summa-server/README.md)                 | gRPC search and indexing                  |
 | [summa-broker](summa-broker/README.md)                 | Shard routing and distributed search      |
+| [summa-k8s-manager](summa-k8s-manager/README.md)       | Kubernetes operator and cluster console   |
 | [summa-proto](summa-proto/README.md)                   | Shared gRPC contract                      |
 | [Python client](summa-client-python/README.md)         | Async gRPC client                         |
 | [TypeScript client](summa-client-typescript/README.md) | Node.js gRPC client                       |
