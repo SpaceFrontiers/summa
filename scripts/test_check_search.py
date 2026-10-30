@@ -28,6 +28,7 @@ class SearchHarnessTests(unittest.TestCase):
             "summa-proto",
             "summa-server",
             "summa-broker",
+            "summa-k8s-manager",
             "summa-tool",
             "summa-wasm",
         ):
