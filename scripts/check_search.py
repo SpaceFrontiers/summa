@@ -36,8 +36,8 @@ def contracts(root=ROOT):
         "summa-core": set(),
         "summa-server": {"summa-core", "summa-proto"},
         "summa-broker": {"summa-core", "summa-proto"},
-        # The manager shares the broker's placement rule syntax.
-        "summa-k8s-manager": {"summa-broker", "summa-proto"},
+        # The manager shares the broker's placement rules and protocol bindings.
+        "summa-k8s-manager": {"summa-broker"},
         "summa-proto": set(),
         "summa-tool": {"summa-core"},
         "summa-wasm": {"summa-core"},

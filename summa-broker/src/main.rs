@@ -16,7 +16,6 @@ mod metrics;
 mod partition;
 mod placement;
 mod poller;
-mod proto;
 mod ranking;
 mod routes;
 mod search_service;
@@ -38,10 +37,10 @@ use tonic::transport::Server;
 use crate::client::ClientPool;
 use crate::context::BrokerContext;
 use crate::placement::{PlacementDefault, PlacementRules};
-use crate::proto::broker::broker_service_server::BrokerServiceServer;
-use crate::proto::summa::index_service_server::IndexServiceServer;
-use crate::proto::summa::search_service_server::SearchServiceServer;
 use crate::topology::TopologySnapshot;
+use summa_broker::proto::broker::broker_service_server::BrokerServiceServer;
+use summa_broker::proto::summa::index_service_server::IndexServiceServer;
+use summa_broker::proto::summa::search_service_server::SearchServiceServer;
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum DiscoveryMode {
@@ -74,6 +73,12 @@ struct Args {
     /// Pod label carrying the shard id; its presence selects the pods to watch
     #[arg(long, default_value = "summa.spacefrontiers.org/shard-id")]
     shard_label: String,
+
+    /// Label selector narrowing the watched pods (kubernetes discovery), e.g.
+    /// "summa.spacefrontiers.org/cluster=social" for a broker that serves one
+    /// cluster among several in the namespace
+    #[arg(long)]
+    pod_selector: Option<String>,
 
     /// Pod label carrying the replica role (master|follower); a shard's sole
     /// unlabeled member is the implicit master
@@ -376,6 +381,11 @@ async fn async_main(args: Args) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let discovery_handle = match args.discovery {
         DiscoveryMode::Static => {
+            if args.pod_selector.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--pod-selector is only valid with --discovery kubernetes"
+                ));
+            }
             if args.backends.is_empty() {
                 return Err(anyhow::anyhow!(
                     "--discovery static requires at least one --backend"
@@ -409,6 +419,7 @@ async fn async_main(args: Args) -> Result<()> {
             let cfg = kube_discovery::KubeDiscoveryConfig {
                 namespace: args.namespace.clone(),
                 shard_label: args.shard_label.clone(),
+                pod_selector: args.pod_selector.clone(),
                 role_label: args.role_label.clone(),
                 port_annotation: args.port_annotation.clone(),
                 default_port: args.backend_port,
@@ -497,8 +508,8 @@ async fn async_main(args: Args) -> Result<()> {
     // summa.proto surface behind it) without local .proto files — the
     // migration runbook's verification steps depend on this.
     let reflection_service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(proto::SUMMA_DESCRIPTOR)
-        .register_encoded_file_descriptor_set(proto::BROKER_DESCRIPTOR)
+        .register_encoded_file_descriptor_set(summa_broker::proto::SUMMA_DESCRIPTOR)
+        .register_encoded_file_descriptor_set(summa_broker::proto::BROKER_DESCRIPTOR)
         .build_v1()
         .map_err(|e| anyhow::anyhow!("failed to build reflection service: {e}"))?;
 

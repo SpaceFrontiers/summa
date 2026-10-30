@@ -1,7 +1,7 @@
-//! `SearchCluster` custom resource: the desired shards, broker and placement
-//! of one Summa cluster. See `docs/summa-k8s-manager.md`.
+//! `SearchCluster` custom resource: one Summa index with its shards and
+//! broker. See `docs/summa-k8s-manager.md`.
 
-use k8s_openapi::api::core::v1::{EnvVar, ResourceRequirements};
+use k8s_openapi::api::core::v1::{EnvVar, ResourceRequirements, Toleration};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::CustomResource;
 use schemars::JsonSchema;
@@ -14,32 +14,42 @@ use serde::{Deserialize, Serialize};
     kind = "SearchCluster",
     namespaced,
     status = "SearchClusterStatus",
+    printcolumn = r#"{"name":"Routing","type":"string","jsonPath":".status.routing"}"#,
+    printcolumn = r#"{"name":"Shard","type":"string","priority":1,"jsonPath":".spec.shard.image"}"#,
+    printcolumn = r#"{"name":"Broker","type":"string","priority":1,"jsonPath":".spec.broker.image"}"#,
     printcolumn = r#"{"name":"Ready","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].status"}"#,
     printcolumn = r#"{"name":"Reason","type":"string","jsonPath":".status.conditions[?(@.type==\"Ready\")].reason"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct SearchClusterSpec {
-    /// summa-server image; the broker runs the `summa-broker` binary of the
-    /// same image.
+    /// Index schema (SDL). The operator creates the index from it once every
+    /// shard serves; omit it for an index that already exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    /// Settings shared by every shard.
+    pub shard: ShardTemplate,
+    /// Shards in routing order. Count, order and weights are fixed once
+    /// the index exists.
+    pub shards: Vec<ShardSpec>,
+    pub broker: BrokerSpec,
+}
+
+/// Image of a workload and how the kubelet pulls it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageSpec {
     pub image: String,
-    /// `Always`, `IfNotPresent` or `Never`; omitted uses the Kubernetes
-    /// default for the tag.
+    /// `Always`, `IfNotPresent` or `Never`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_pull_policy: Option<String>,
-    /// Defaults for every shard replica.
-    #[serde(default)]
-    pub server: ServerSpec,
-    #[serde(default)]
-    pub shards: Vec<ShardSpec>,
-    #[serde(default)]
-    pub broker: BrokerSpec,
-    #[serde(default)]
-    pub placement: PlacementSpec,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct ServerSpec {
+pub struct ShardTemplate {
+    /// summa-server image of every shard.
+    #[serde(flatten)]
+    pub image: ImageSpec,
     /// summa-server arguments after the operator's `--addr`, `--data-dir`
     /// and `--cache-dir`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -49,60 +59,54 @@ pub struct ServerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirements>,
     /// Add CAP_IPC_LOCK, needed by `--pin-mode mlock`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ipc_lock: bool,
     /// Default 600: a shard commits admitted documents before it stops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_grace_period_seconds: Option<i64>,
+    /// Tolerations of shard pods, e.g. for dedicated data nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<Toleration>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ShardSpec {
-    /// Value of the `summa.spacefrontiers.org/shard-id` pod label.
-    pub id: String,
-    /// Appended to `server.args`; must not repeat a flag set there.
+    /// Node (`kubernetes.io/hostname`) the shard runs on.
+    pub node: String,
+    /// Host directory holding the shard's index; created if missing.
+    pub data_path: String,
+    /// Host cache directory; default `<dataPath>-cache`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
+    /// Share of rows (default 1); only for clusters with several shards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<u32>,
+    /// Appended to `shard.args`; must not repeat a flag set there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    /// Replaces `server.resources` for this shard.
+    /// Replaces `shard.resources` for this shard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirements>,
-    /// Exactly one until summa-server supports follower replication.
-    #[serde(default)]
-    pub replicas: Vec<ReplicaSpec>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplicaSpec {
-    /// Deployment name; default `<cluster>-shard-<id>`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Node (`kubernetes.io/hostname`) the replica runs on.
-    pub node: String,
-    /// Existing host directory holding the shard's indexes.
-    pub data_path: String,
-    /// Existing host directory for the shard's cache.
-    pub cache_path: String,
+    /// Scale the shard to zero for maintenance, keeping its routing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub suspended: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerSpec {
-    /// Deployment and Service name; default `<cluster>-broker`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// Broker image; default `spec.image`. Lets the broker upgrade without
-    /// restarting the shards.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
+    /// summa-broker image.
+    #[serde(flatten)]
+    pub image: ImageSpec,
     #[serde(default = "default_broker_replicas")]
     pub replicas: i32,
     /// Needs get/list/watch on pods in the namespace.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_account_name: Option<String>,
-    /// In-flight searches admitted per backend across all broker replicas;
-    /// each broker gets `backendMaxSearches / replicas`.
+    #[serde(default = "default_service_account")]
+    pub service_account_name: String,
+    /// In-flight searches admitted per shard: every shard runs with
+    /// `--max-concurrent-searches` set to it, and each broker replica admits
+    /// `backendMaxSearches / replicas`.
     #[serde(default = "default_backend_max_searches")]
     pub backend_max_searches: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -111,22 +115,18 @@ pub struct BrokerSpec {
     pub env: Vec<EnvVar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ResourceRequirements>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub termination_grace_period_seconds: Option<i64>,
 }
 
 impl Default for BrokerSpec {
     fn default() -> Self {
         Self {
-            name: None,
-            image: None,
+            image: ImageSpec::default(),
             replicas: default_broker_replicas(),
-            service_account_name: None,
+            service_account_name: default_service_account(),
             backend_max_searches: default_backend_max_searches(),
             args: Vec::new(),
             env: Vec::new(),
             resources: None,
-            termination_grace_period_seconds: None,
         }
     }
 }
@@ -135,47 +135,12 @@ fn default_broker_replicas() -> i32 {
     1
 }
 
+fn default_service_account() -> String {
+    "summa-broker".into()
+}
+
 fn default_backend_max_searches() -> u32 {
     16
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PlacementSpec {
-    #[serde(default)]
-    pub default: PlacementDefault,
-    /// First match wins; rule order is partition order.
-    #[serde(default)]
-    pub rules: Vec<PlacementRuleSpec>,
-}
-
-/// Where `CreateIndex` lands when no rule matches.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PlacementDefault {
-    /// The shard hosting the fewest indexes.
-    #[default]
-    Single,
-    /// Refuse the CreateIndex.
-    Reject,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PlacementRuleSpec {
-    /// Index-name glob (`*` matches any run of characters).
-    pub pattern: String,
-    /// One shard pins the index; several partition it in this order.
-    pub partitions: Vec<PartitionRef>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct PartitionRef {
-    pub shard: String,
-    /// Share of rows (default 1); only for rules with several partitions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub weight: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -183,13 +148,13 @@ pub struct PartitionRef {
 pub struct SearchClusterStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
+    /// Placement rule of the index, fixed once the index exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<String>,
     #[serde(default)]
     pub shards: Vec<ShardStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broker: Option<BrokerStatus>,
-    /// `--placement` arguments of the running broker Deployment.
-    #[serde(default)]
-    pub placement: Vec<String>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
 }
@@ -197,18 +162,8 @@ pub struct SearchClusterStatus {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ShardStatus {
-    pub id: String,
-    #[serde(default)]
-    pub replicas: Vec<ReplicaStatus>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ReplicaStatus {
-    pub name: String,
-    pub node: String,
     pub ready: bool,
-    /// Why the replica is not running its current spec, if known.
+    /// Why the shard is not running its current spec, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
 }
@@ -216,7 +171,39 @@ pub struct ReplicaStatus {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerStatus {
-    pub name: String,
-    pub replicas: i32,
     pub ready_replicas: i32,
+}
+
+#[cfg(test)]
+mod tests {
+    use kube::CustomResourceExt;
+
+    use super::SearchCluster;
+
+    #[test]
+    fn crd_requires_both_images_and_the_shard_placement() {
+        let crd = serde_json::to_value(SearchCluster::crd()).unwrap();
+        let spec = &crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        assert_eq!(
+            spec["required"],
+            serde_json::json!(["broker", "shard", "shards"])
+        );
+        assert_eq!(
+            spec["properties"]["shard"]["required"],
+            serde_json::json!(["image"])
+        );
+        assert_eq!(
+            spec["properties"]["broker"]["required"],
+            serde_json::json!(["image"])
+        );
+        assert_eq!(
+            spec["properties"]["shards"]["items"]["required"],
+            serde_json::json!(["dataPath", "node"])
+        );
+        // Broker defaults are applied by the API server at admission.
+        let broker = &spec["properties"]["broker"]["properties"];
+        assert_eq!(broker["replicas"]["default"], 1);
+        assert_eq!(broker["backendMaxSearches"]["default"], 16);
+        assert_eq!(broker["serviceAccountName"]["default"], "summa-broker");
+    }
 }

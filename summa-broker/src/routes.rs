@@ -10,7 +10,7 @@ use crate::client::BackendChannels;
 use crate::context::{BrokerContext, code_label};
 use crate::metrics as m;
 use crate::partition::{self, PartitionWeights};
-use crate::proto::summa::GetIndexInfoRequest;
+use summa_broker::proto::summa::GetIndexInfoRequest;
 
 /// One backend a request goes to.
 #[derive(Clone)]

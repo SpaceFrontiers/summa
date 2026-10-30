@@ -1,185 +1,88 @@
-//! Client of the broker's `summa.broker.BrokerService`: live topology and
-//! backends for safety checks and the console.
+//! Client of a cluster's broker: live topology of its index and index
+//! creation.
 
 use std::time::Duration;
 
 use anyhow::Context as _;
 use serde::Serialize;
-use tonic::transport::Endpoint;
+use tonic::transport::{Channel, Endpoint};
 
-pub mod proto {
-    tonic::include_proto!("summa.broker");
-}
-
-use proto::broker_service_client::BrokerServiceClient;
+use summa_broker::proto;
+use summa_broker::proto::broker::broker_service_client::BrokerServiceClient;
+use summa_broker::proto::summa::index_service_client::IndexServiceClient;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// `GetTopology` asks every replica for `GetIndexInfo` with a 3 s deadline.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// `GetTopology` asks every shard for `GetIndexInfo` with a 3 s deadline.
+const TOPOLOGY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Creating an index opens it on every shard.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// One shard of the index as the broker sees it.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Backend {
-    pub backend_id: String,
-    pub address: String,
-    pub shard_id: String,
-    pub role: String,
-    pub health: String,
-    pub indexes: Vec<String>,
-    pub index_map_age_ms: u64,
-    pub consecutive_failures: u64,
-    pub ready: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IndexTopology {
-    pub index_name: String,
-    pub partitions: Vec<Partition>,
-    pub merge_policy: String,
-    pub primary_key_field: String,
-    pub ambiguous: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Partition {
-    pub shard_id: String,
-    pub weight: u32,
-    pub replicas: Vec<Replica>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Replica {
-    pub backend_id: String,
-    pub role: String,
+pub struct ShardStats {
+    pub shard: String,
     pub health: String,
     pub num_docs: u32,
     pub num_segments: u32,
 }
 
-/// What the safety checks need to know about a live index.
-#[derive(Debug, Clone)]
-pub struct LiveIndex {
-    pub name: String,
-    pub partitioned: bool,
-    /// Shards hosting a copy or a partition.
-    pub hosts: Vec<String>,
+/// Endpoint of a cluster's broker, from a template with `{cluster}` and
+/// `{namespace}`.
+pub fn endpoint(template: &str, cluster: &str, namespace: &str) -> String {
+    template
+        .replace("{cluster}", cluster)
+        .replace("{namespace}", namespace)
 }
 
-impl From<&IndexTopology> for LiveIndex {
-    fn from(index: &IndexTopology) -> Self {
-        Self {
-            name: index.index_name.clone(),
-            partitioned: index.merge_policy != "passthrough",
-            hosts: index
-                .partitions
-                .iter()
-                .map(|p| p.shard_id.clone())
-                .collect(),
-        }
-    }
+async fn channel(address: &str, timeout: Duration) -> anyhow::Result<Channel> {
+    Endpoint::from_shared(format!("http://{address}"))
+        .with_context(|| format!("invalid broker address '{address}'"))?
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .connect()
+        .await
+        .with_context(|| format!("cannot connect to broker {address}"))
 }
 
-#[derive(Clone)]
-pub struct BrokerClient {
-    address: String,
+/// Shards hosting `index`, with their statistics. Empty when no shard has
+/// the index.
+pub async fn index_shards(address: &str, index: &str) -> anyhow::Result<Vec<ShardStats>> {
+    let response = BrokerServiceClient::new(channel(address, TOPOLOGY_TIMEOUT).await?)
+        .get_topology(proto::broker::GetTopologyRequest {
+            index_name: index.to_string(),
+        })
+        .await
+        .with_context(|| format!("GetTopology on broker {address}"))?;
+    Ok(response
+        .into_inner()
+        .indexes
+        .into_iter()
+        .filter(|topology| topology.index_name == index)
+        .flat_map(|topology| topology.partitions)
+        .map(|partition| {
+            // One replica per shard; report the healthiest view.
+            let replica = partition.replicas.into_iter().max_by_key(|r| r.num_docs);
+            ShardStats {
+                shard: partition.shard_id,
+                health: replica
+                    .as_ref()
+                    .map_or("missing".into(), |r| r.health.clone()),
+                num_docs: replica.as_ref().map_or(0, |r| r.num_docs),
+                num_segments: replica.as_ref().map_or(0, |r| r.num_segments),
+            }
+        })
+        .collect())
 }
 
-impl BrokerClient {
-    pub fn new(address: impl Into<String>) -> Self {
-        Self {
-            address: address.into(),
-        }
-    }
-
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-
-    async fn client(&self) -> anyhow::Result<BrokerServiceClient<tonic::transport::Channel>> {
-        let channel = Endpoint::from_shared(format!("http://{}", self.address))
-            .with_context(|| format!("invalid broker address '{}'", self.address))?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
-            .connect()
-            .await
-            .with_context(|| format!("cannot connect to broker {}", self.address))?;
-        Ok(BrokerServiceClient::new(channel))
-    }
-
-    pub async fn topology(&self) -> anyhow::Result<Vec<IndexTopology>> {
-        let response = self
-            .client()
-            .await?
-            .get_topology(proto::GetTopologyRequest::default())
-            .await
-            .with_context(|| format!("GetTopology on broker {}", self.address))?;
-        Ok(response
-            .into_inner()
-            .indexes
-            .into_iter()
-            .map(|index| IndexTopology {
-                index_name: index.index_name,
-                merge_policy: index.merge_policy,
-                primary_key_field: index.primary_key_field,
-                ambiguous: index.ambiguous,
-                partitions: index
-                    .partitions
-                    .into_iter()
-                    .map(|partition| Partition {
-                        shard_id: partition.shard_id,
-                        weight: partition.weight,
-                        replicas: partition
-                            .replicas
-                            .into_iter()
-                            .map(|replica| Replica {
-                                backend_id: replica.backend_id,
-                                role: replica.role,
-                                health: replica.health,
-                                num_docs: replica.num_docs,
-                                num_segments: replica.num_segments,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            })
-            .collect())
-    }
-
-    pub async fn backends(&self) -> anyhow::Result<Vec<Backend>> {
-        let response = self
-            .client()
-            .await?
-            .get_backends(proto::GetBackendsRequest {})
-            .await
-            .with_context(|| format!("GetBackends on broker {}", self.address))?;
-        Ok(response
-            .into_inner()
-            .backends
-            .into_iter()
-            .map(|backend| Backend {
-                backend_id: backend.backend_id,
-                address: backend.address,
-                shard_id: backend.shard_id,
-                role: backend.role,
-                health: backend.health,
-                indexes: backend.indexes,
-                index_map_age_ms: backend.index_map_age_ms,
-                consecutive_failures: backend.consecutive_failures,
-                ready: backend.ready,
-            })
-            .collect())
-    }
-
-    pub async fn refresh(&self) -> anyhow::Result<u32> {
-        let response = self
-            .client()
-            .await?
-            .refresh_topology(proto::RefreshTopologyRequest {})
-            .await
-            .with_context(|| format!("RefreshTopology on broker {}", self.address))?;
-        Ok(response.into_inner().backends_polled)
-    }
+/// Create `index` on every shard of the broker's placement rule.
+pub async fn create_index(address: &str, index: &str, schema: &str) -> anyhow::Result<()> {
+    IndexServiceClient::new(channel(address, CREATE_TIMEOUT).await?)
+        .create_index(proto::summa::CreateIndexRequest {
+            index_name: index.to_string(),
+            schema: schema.to_string(),
+        })
+        .await
+        .with_context(|| format!("CreateIndex {index} on broker {address}"))?;
+    Ok(())
 }

@@ -28,19 +28,9 @@ kube = { version = "1", default-features = false, features = ["client", "runtime
 log = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false, features = ["http-listener"] }
-prost = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 schemars = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "signal", "time"] }
 tonic = { workspace = true }
-tonic-prost = "0.14"
-
-[build-dependencies]
-summa-proto = { workspace = true }
-tonic-prost-build = "0.14"
-
-[package.metadata.cargo-machete]
-# prost/tonic-prost are used by tonic::include_proto! generated code
-ignored = ["prost", "tonic-prost"]
