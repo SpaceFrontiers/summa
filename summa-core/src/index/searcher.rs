@@ -124,6 +124,29 @@ pub struct Searcher<D: Directory + 'static> {
     sparse_io_concurrency: usize,
 }
 
+/// A spawned task that is aborted when its handle is dropped.
+#[cfg(feature = "native")]
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+#[cfg(feature = "native")]
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(feature = "native")]
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
 impl<D: Directory + 'static> Searcher<D> {
     /// Create a Searcher directly from segment IDs
     ///
@@ -357,6 +380,57 @@ impl<D: Directory + 'static> Searcher<D> {
         ))
     }
 
+    /// Open one segment reader (or refresh an existing reader's visibility
+    /// view) from owned inputs, so the open can run as an independent task.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_segment(
+        directory: Arc<D>,
+        schema: Arc<Schema>,
+        sid: SegmentId,
+        existing: Option<Arc<SegmentReader>>,
+        deletion: Option<(u32, crate::segment::DeletionMeta)>,
+        term_cache: TermCachePolicy,
+        cache_directory_namespace: usize,
+        store_cache: Arc<crate::segment::SharedStoreCache>,
+        trained_vectors: Arc<TrainedVectorStructures>,
+    ) -> Result<Arc<SegmentReader>> {
+        let mut reader = match existing {
+            Some(existing) => {
+                existing
+                    .with_deletions(directory.as_ref(), deletion.map(|(_, meta)| meta))
+                    .await?
+            }
+            None => {
+                let mut reader = SegmentReader::open_with_shared_caches(
+                    directory.as_ref(),
+                    sid,
+                    schema,
+                    term_cache,
+                    cache_directory_namespace,
+                    store_cache,
+                )
+                .await
+                .map_err(|error| {
+                    crate::Error::Internal(format!(
+                        "Failed to open segment {:016x}: {:?}",
+                        sid.0, error
+                    ))
+                })?;
+                if let Some((num_docs, meta)) = deletion {
+                    if num_docs != reader.num_docs() {
+                        return Err(crate::Error::Corruption(
+                            "deletion metadata row count mismatch".into(),
+                        ));
+                    }
+                    reader.load_deletions(directory.as_ref(), meta).await?;
+                }
+                reader
+            }
+        };
+        reader.set_trained_vectors(trained_vectors);
+        Ok(Arc::new(reader))
+    }
+
     /// Load segment readers with bounded opening concurrency.
     /// Reuses existing segment readers for unchanged segments when `existing_segments`
     /// is non-empty — avoids re-opening mmaps, fast fields, sparse indexes, etc.
@@ -434,50 +508,34 @@ impl<D: Directory + 'static> Searcher<D> {
         let cache_directory_namespace = Arc::as_ptr(directory) as usize;
         let results: Vec<_> =
             futures::stream::iter(to_load.into_iter().map(|(idx, sid, existing)| {
-                let store_cache = Arc::clone(&store_cache);
-                async move {
-                    let deletion = deletions.get(&sid.to_hex());
-                    let mut reader = match existing {
-                        Some(existing) => {
-                            existing
-                                .with_deletions(
-                                    directory.as_ref(),
-                                    deletion.map(|(_, meta)| meta.clone()),
-                                )
-                                .await?
-                        }
-                        None => {
-                            let mut reader = SegmentReader::open_with_shared_caches(
-                                directory.as_ref(),
-                                sid,
-                                Arc::clone(schema),
-                                term_cache.clone(),
-                                cache_directory_namespace,
-                                store_cache,
-                            )
-                            .await
-                            .map_err(|error| {
-                                crate::Error::Internal(format!(
-                                    "Failed to open segment {:016x}: {:?}",
-                                    sid.0, error
-                                ))
-                            })?;
-                            if let Some((num_docs, meta)) = deletion {
-                                if *num_docs != reader.num_docs() {
-                                    return Err(crate::Error::Corruption(
-                                        "deletion metadata row count mismatch".into(),
-                                    ));
-                                }
-                                reader
-                                    .load_deletions(directory.as_ref(), meta.clone())
-                                    .await?;
-                            }
-                            reader
-                        }
-                    };
-                    reader.set_trained_vectors(Arc::clone(trained_vectors));
-                    Ok((idx, Arc::new(reader)))
-                }
+                let open = Self::open_segment(
+                    Arc::clone(directory),
+                    Arc::clone(schema),
+                    sid,
+                    existing,
+                    deletions.get(&sid.to_hex()).cloned(),
+                    term_cache.clone(),
+                    cache_directory_namespace,
+                    Arc::clone(&store_cache),
+                    Arc::clone(trained_vectors),
+                );
+                // Opening parses and validates segment structures on the CPU.
+                // Polled inside this one stream task, every open shared a single
+                // worker thread and segment-open concurrency never overlapped:
+                // a 75-segment social shard used 0.7 core for 30 minutes. Each
+                // open is its own task so the configured width uses real cores.
+                // Abort-on-drop keeps cancellation: a dropped reload stops its
+                // in-flight opens instead of leaving detached tasks running.
+                #[cfg(feature = "native")]
+                let open = {
+                    let task = AbortOnDrop(tokio::spawn(open));
+                    async move {
+                        task.await.map_err(|error| {
+                            crate::Error::Internal(format!("segment open task failed: {error}"))
+                        })?
+                    }
+                };
+                async move { Ok::<_, crate::Error>((idx, open.await?)) }
             }))
             .buffer_unordered(open_concurrency.max(1))
             .try_collect()
@@ -2346,6 +2404,14 @@ mod load_segments_tests {
         )
         .await;
         assert!(result.is_err());
+        // Opens run as tasks aborted on drop; the runtime drops them on its
+        // next pass rather than inside the cancelled call.
+        for _ in 0..100 {
+            if directory.active.load(SeqCst) == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert_eq!(
             directory.active.load(SeqCst),
             0,
