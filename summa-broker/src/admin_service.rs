@@ -11,13 +11,13 @@ use std::time::{Duration, Instant};
 use tonic::{Request, Response, Status};
 
 use crate::context::BrokerContext;
-use crate::proto::broker::broker_service_server::BrokerService;
-use crate::proto::broker::{
+use crate::topology::{Backend, Role, TopologySnapshot};
+use summa_broker::proto::broker::broker_service_server::BrokerService;
+use summa_broker::proto::broker::{
     BackendState, GetBackendsRequest, GetBackendsResponse, GetTopologyRequest, GetTopologyResponse,
     IndexTopology, Partition, RefreshTopologyRequest, RefreshTopologyResponse, ReplicaState,
 };
-use crate::proto::summa::GetIndexInfoRequest;
-use crate::topology::{Backend, Role, TopologySnapshot};
+use summa_broker::proto::summa::GetIndexInfoRequest;
 
 /// Deadline for each live GetIndexInfo call made on behalf of GetTopology.
 const INFO_TIMEOUT: Duration = Duration::from_secs(3);

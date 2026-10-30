@@ -24,8 +24,9 @@ use crate::client::forward_timeout;
 use crate::context::BrokerContext;
 use crate::metrics as m;
 use crate::partition;
-use crate::proto::summa::index_service_server::IndexService;
-use crate::proto::summa::{
+use crate::routes::{Route, Target, record_backend};
+use summa_broker::proto::summa::index_service_server::IndexService;
+use summa_broker::proto::summa::{
     AlterVectorIndexRequest, AlterVectorIndexResponse, BatchIndexDocumentsRequest,
     BatchIndexDocumentsResponse, CommitRequest, CommitResponse, CreateIndexRequest,
     CreateIndexResponse, DeleteDocumentsRequest, DeleteIndexRequest, DeleteIndexResponse,
@@ -33,7 +34,6 @@ use crate::proto::summa::{
     IndexDocumentsResponse, ListIndexesRequest, ListIndexesResponse, NamedDocument, ReorderRequest,
     ReorderResponse, RetrainVectorIndexRequest, RetrainVectorIndexResponse, UpsertDocumentsRequest,
 };
-use crate::routes::{Route, Target, record_backend};
 
 mod mutations;
 
@@ -299,7 +299,7 @@ impl IndexService for BrokerIndexService {
             budget: Option<Duration>,
             started: Instant,
             indexed_count: &mut u32,
-            errors: &mut Vec<crate::proto::summa::DocumentError>,
+            errors: &mut Vec<summa_broker::proto::summa::DocumentError>,
         ) -> Result<(), Status> {
             if documents.is_empty() {
                 return Ok(());

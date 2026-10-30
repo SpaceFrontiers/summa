@@ -16,8 +16,8 @@ use tonic::codec::CompressionEncoding;
 use tonic::metadata::MetadataMap;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::proto::summa::index_service_client::IndexServiceClient;
-use crate::proto::summa::search_service_client::SearchServiceClient;
+use summa_broker::proto::summa::index_service_client::IndexServiceClient;
+use summa_broker::proto::summa::search_service_client::SearchServiceClient;
 
 /// Shaved off a propagated client deadline to cover broker overhead, so the
 /// backend gives up slightly before the client does and the client sees the

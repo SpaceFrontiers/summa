@@ -1,22 +1,22 @@
 # summa-k8s-manager
 
-Kubernetes operator and web console for a Summa cluster described by one
-`SearchCluster` resource: the shards and the node and host directories of each
-replica, the broker replicas, and the placement rules.
+Kubernetes operator, API and console for Summa indexes. Each index is a
+`SearchCluster`: its shards (one Deployment each, pinned to a node and host
+directory), its broker and the broker Service clients reach it at. Creating a
+cluster creates the index; deleting it removes the workloads.
 
-- The operator reconciles the resource into one Deployment per shard replica,
-  the broker Deployment and the broker Service. It adopts existing
-  hand-written Deployments of the same names without restarting them.
-- Before rolling a placement change into the broker, it checks the broker's
-  live topology and refuses changes that would reroute a live index. It keeps
-  a removed shard's Deployment while the broker shows the shard hosts indexes.
-- The console (`kubectl port-forward deploy/summa-k8s-manager 8080`) shows shards,
-  broker health, indexes and partition balance, and edits the resource after
-  the same checks.
+- The operator waits for a replaced shard's pod to release its directories,
+  creates the index once every shard and the broker serve, and keeps the
+  routing (shard count, order and weights) fixed once the index may exist.
+- The API (`/api/clusters`) and console list clusters with live document
+  counts and create, edit and delete them after the same validation. The
+  console listens on loopback for `kubectl port-forward
+deploy/summa-k8s-manager 8080`; in-cluster clients use the API listener
+  with the bearer token from `--api-token-file`.
 
 ```bash
-summa-k8s-manager crd | kubectl apply -f -          # install the CRD
-summa-k8s-manager run --namespace summa             # operator + console
+summa-k8s-manager crd | kubectl apply -f -   # install the CRD
+summa-k8s-manager run --namespace summa      # operator, API and console
 ```
 
-Design and safety rules: [docs/summa-k8s-manager.md](../docs/summa-k8s-manager.md).
+Design: [docs/summa-k8s-manager.md](../docs/summa-k8s-manager.md).

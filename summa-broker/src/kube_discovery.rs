@@ -21,6 +21,9 @@ use crate::topology::{BackendId, DiscoveredEndpoint, Role, ShardId};
 pub struct KubeDiscoveryConfig {
     pub namespace: String,
     pub shard_label: String,
+    /// Extra label selector narrowing the watched pods to one cluster, e.g.
+    /// `summa.spacefrontiers.org/cluster=social`.
+    pub pod_selector: Option<String>,
     pub role_label: String,
     pub port_annotation: String,
     pub default_port: u16,
@@ -86,6 +89,15 @@ pub fn pods_to_endpoints(
     endpoints
 }
 
+/// Label selector of the watched pods: the shard label, narrowed by
+/// `--pod-selector` when set.
+fn watch_selector(cfg: &KubeDiscoveryConfig) -> String {
+    match &cfg.pod_selector {
+        Some(selector) => format!("{},{selector}", cfg.shard_label),
+        None => cfg.shard_label.clone(),
+    }
+}
+
 /// Long-running pod watch; publishes the full endpoint set on every change.
 /// Only exits on shutdown. Watch errors are logged and the stream recovers
 /// (kube's watcher re-lists automatically after an error).
@@ -98,10 +110,11 @@ pub async fn run(
         anyhow::anyhow!("kubernetes discovery requires in-cluster or kubeconfig access: {e}")
     })?;
     let api: Api<Pod> = Api::namespaced(client, &cfg.namespace);
-    let watcher_config = watcher::Config::default().labels(&cfg.shard_label);
+    let selector = watch_selector(&cfg);
+    let watcher_config = watcher::Config::default().labels(&selector);
     info!(
-        "watching pods in namespace '{}' with label '{}'",
-        cfg.namespace, cfg.shard_label
+        "watching pods in namespace '{}' with selector '{selector}'",
+        cfg.namespace
     );
 
     let mut store: BTreeMap<String, Pod> = BTreeMap::new();
@@ -171,10 +184,22 @@ mod tests {
         KubeDiscoveryConfig {
             namespace: "summa".into(),
             shard_label: "summa.spacefrontiers.org/shard-id".into(),
+            pod_selector: None,
             role_label: "summa.spacefrontiers.org/role".into(),
             port_annotation: "summa.spacefrontiers.org/grpc-port".into(),
             default_port: 50051,
         }
+    }
+
+    #[test]
+    fn pod_selector_narrows_the_watch_to_one_cluster() {
+        let mut cfg = cfg();
+        assert_eq!(watch_selector(&cfg), "summa.spacefrontiers.org/shard-id");
+        cfg.pod_selector = Some("summa.spacefrontiers.org/cluster=social".into());
+        assert_eq!(
+            watch_selector(&cfg),
+            "summa.spacefrontiers.org/shard-id,summa.spacefrontiers.org/cluster=social"
+        );
     }
 
     fn pod(

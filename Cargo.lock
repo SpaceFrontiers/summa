@@ -7380,17 +7380,13 @@ dependencies = [
  "log",
  "metrics",
  "metrics-exporter-prometheus",
- "prost",
  "rustls",
  "schemars",
  "serde",
  "serde_json",
  "summa-broker",
- "summa-proto",
  "tokio",
  "tonic",
- "tonic-prost",
- "tonic-prost-build",
 ]
 
 [[package]]
