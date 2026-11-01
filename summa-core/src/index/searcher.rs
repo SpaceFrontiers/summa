@@ -30,6 +30,7 @@ pub(crate) struct SearcherResources {
     pub(crate) sparse_io_gate: Arc<super::SparseIoGate>,
     pub(crate) sparse_io_concurrency: usize,
     pub(crate) segment_open_concurrency: usize,
+    pub(crate) binary_prefix_cache: Arc<crate::segment::PrefixCacheBudget>,
     #[cfg(feature = "sync")]
     pub(crate) search_pool: Arc<rayon::ThreadPool>,
 }
@@ -50,6 +51,8 @@ impl SearcherResources {
             config.sparse_io_concurrency,
         )?;
         resources.segment_open_concurrency = config.segment_open_concurrency;
+        resources.binary_prefix_cache =
+            crate::segment::PrefixCacheBudget::new(config.binary_prefix_cache_budget_bytes);
         Ok(resources)
     }
 
@@ -82,6 +85,7 @@ impl SearcherResources {
             sparse_io_gate: super::shared_sparse_io_gate(sparse_io_concurrency),
             sparse_io_concurrency,
             segment_open_concurrency: super::DEFAULT_SEGMENT_OPEN_CONCURRENCY,
+            binary_prefix_cache: crate::segment::PrefixCacheBudget::new(0),
             #[cfg(feature = "sync")]
             search_pool,
         })
@@ -197,6 +201,7 @@ impl<D: Directory + 'static> Searcher<D> {
             resources.segment_open_concurrency,
         )
         .await?;
+        Self::prepare_prefix_caches(&segments, &resources.binary_prefix_cache).await?;
 
         Ok(Self {
             _snapshot: snapshot,
@@ -240,6 +245,7 @@ impl<D: Directory + 'static> Searcher<D> {
             resources.segment_open_concurrency,
         )
         .await?;
+        Self::prepare_prefix_caches(&segments, &resources.binary_prefix_cache).await?;
 
         Ok(Self {
             _snapshot: snapshot,
@@ -257,6 +263,20 @@ impl<D: Directory + 'static> Searcher<D> {
             sparse_io_gate: resources.sparse_io_gate,
             sparse_io_concurrency: resources.sparse_io_concurrency,
         })
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) async fn prepare_prefix_caches(
+        segments: &[Arc<SegmentReader>],
+        budget: &Arc<crate::segment::PrefixCacheBudget>,
+    ) -> Result<()> {
+        if !budget.enabled() {
+            return Ok(());
+        }
+        for segment in segments {
+            segment.prepare_prefix_cache(budget).await?;
+        }
+        Ok(())
     }
 
     /// Internal create method

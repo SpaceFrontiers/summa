@@ -11,6 +11,8 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::io;
 #[cfg(feature = "native")]
+pub(crate) mod prefix_cache;
+#[cfg(feature = "native")]
 use std::io::Write;
 use std::ops::Range;
 
@@ -265,6 +267,8 @@ pub(crate) struct AnnDiskIndex {
     // Drop locks before the directory allocation they reference.
     #[cfg(feature = "native")]
     heap_pins: std::sync::Arc<crate::segment::pin::HeapPinSet>,
+    #[cfg(feature = "native")]
+    prefix_cache: std::sync::Arc<std::sync::OnceLock<prefix_cache::ResidentBinaryPrefixes>>,
     raw: OwnedBytes,
     header: AnnDiskHeader,
     runs: std::sync::Arc<Vec<AnnRun>>,
@@ -275,6 +279,8 @@ pub(crate) struct AnnDiskIndex {
     /// The payload holds prefix-only SOAR runs, so every query uses the
     /// prefix stage and rescoring may need the exact-vector lookup.
     has_prefix_only_runs: bool,
+    #[cfg(all(test, feature = "native"))]
+    full_prefetch_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Cheap structural health of one ANN payload, computed from the in-memory
@@ -714,6 +720,10 @@ impl AnnDiskIndex {
                 Vec::new()
             }),
             has_prefix_only_runs: runs.iter().any(|run| run.prefix_only),
+            #[cfg(feature = "native")]
+            prefix_cache: Default::default(),
+            #[cfg(all(test, feature = "native"))]
+            full_prefetch_calls: Default::default(),
             raw,
             header,
             runs: std::sync::Arc::new(runs),
@@ -947,7 +957,11 @@ impl AnnDiskIndex {
     }
 
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.runs.capacity() * std::mem::size_of::<AnnRun>()
+        #[cfg(feature = "native")]
+        let cached = self.resident_prefix_bytes();
+        #[cfg(not(feature = "native"))]
+        let cached = 0;
+        std::mem::size_of::<Self>() + self.runs.capacity() * std::mem::size_of::<AnnRun>() + cached
     }
 
     #[cfg(feature = "native")]
@@ -1031,6 +1045,9 @@ impl AnnDiskIndex {
     /// unrelated clusters.
     #[cfg(feature = "native")]
     fn prefetch_cluster_runs(&self, cluster_ids: &[u32]) {
+        #[cfg(test)]
+        self.full_prefetch_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if cluster_ids.is_empty() || !self.raw.is_mmap() {
             return;
         }
@@ -1541,9 +1558,6 @@ impl AnnDiskIndex {
         if k == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
-        #[cfg(feature = "native")]
-        self.prefetch_cluster_runs(cluster_ids);
-
         let bytes = self.raw.as_slice();
         let posting_count = probed_posting_count(self, cluster_ids)?;
         if let Some(candidates) = self.binary_prefix_candidates(
@@ -1561,6 +1575,8 @@ impl AnnDiskIndex {
                 combiner,
             ));
         }
+        #[cfg(feature = "native")]
+        self.prefetch_cluster_runs(cluster_ids);
         #[cfg(feature = "native")]
         if rayon::current_num_threads() > 1 && posting_count >= parallel_min_postings {
             use rayon::prelude::*;
@@ -2152,6 +2168,8 @@ impl AnnDiskIndex {
                         bytes,
                         query_prefix,
                         prefix_bytes,
+                        #[cfg(feature = "native")]
+                        self.prefix_cache.get(),
                         self.header.code_size,
                         *task,
                         rerank,
@@ -2176,6 +2194,8 @@ impl AnnDiskIndex {
                     bytes,
                     query_prefix,
                     prefix_bytes,
+                    #[cfg(feature = "native")]
+                    self.prefix_cache.get(),
                     self.header.code_size,
                     BinaryScanTask {
                         run,
@@ -2217,38 +2237,96 @@ impl AnnDiskIndex {
         let suffix_len = self.header.code_size - prefix;
         let query_suffix = &query[prefix..];
         let inv_dim = 1.0 / self.header.dim as f32;
-        for candidate in candidates {
-            let suffix_at = if candidate.prefix_only {
-                let virtual_offset = locator.ok_or_else(|| {
-                    invalid_data("prefix-only SOAR candidates need the exact-vector lookup")
-                })?(candidate.doc_id, candidate.ordinal)
-                .ok_or_else(|| invalid_data("SOAR candidate has no exact-vector location"))?;
-                let virtual_offset = usize::try_from(virtual_offset)
-                    .map_err(|_| invalid_data("vector location exceeds address space"))?;
-                self.split_code_parts(virtual_offset)
-                    .ok_or_else(|| invalid_data("SOAR candidate location is not a code row"))?
-                    .1
-            } else {
-                candidate.suffix_offset
-            };
-            let suffix = bytes
-                .get(suffix_at..suffix_at + suffix_len)
-                .ok_or_else(|| invalid_data("vector suffix outside ANN payload"))?;
-            let distance = candidate.distance + kernel.distance(query_suffix, suffix);
-            sink.insert_score(
-                candidate.doc_id,
-                candidate.ordinal,
-                1.0 - distance as f32 * inv_dim,
-            );
+        #[cfg(feature = "native")]
+        let prefetch = self.prefix_cache.get().is_some() && self.raw.is_mmap() && suffix_len > 0;
+        #[cfg(not(feature = "native"))]
+        let prefetch = false;
+        let mut offsets = [0usize; SUFFIX_PREFETCH_BATCH];
+        for batch in candidates.chunks(SUFFIX_PREFETCH_BATCH) {
+            if prefetch {
+                for (offset, candidate) in offsets.iter_mut().zip(batch) {
+                    *offset = self.prefix_candidate_suffix_at(candidate, locator)?;
+                    let end = offset
+                        .checked_add(suffix_len)
+                        .ok_or_else(|| invalid_data("vector suffix offset overflow"))?;
+                    if bytes.get(*offset..end).is_none() {
+                        return Err(invalid_data("vector suffix outside ANN payload"));
+                    }
+                }
+                #[cfg(feature = "native")]
+                self.prefetch_suffix_batch(&offsets[..batch.len()], suffix_len);
+            }
+            // Advice order never changes the candidate/reduction order.
+            for (index, candidate) in batch.iter().enumerate() {
+                let suffix_at = if prefetch {
+                    offsets[index]
+                } else {
+                    self.prefix_candidate_suffix_at(candidate, locator)?
+                };
+                let suffix = bytes
+                    .get(suffix_at..suffix_at + suffix_len)
+                    .ok_or_else(|| invalid_data("vector suffix outside ANN payload"))?;
+                let distance = candidate.distance + kernel.distance(query_suffix, suffix);
+                sink.insert_score(
+                    candidate.doc_id,
+                    candidate.ordinal,
+                    1.0 - distance as f32 * inv_dim,
+                );
+            }
         }
         Ok(())
+    }
+
+    fn prefix_candidate_suffix_at(
+        &self,
+        candidate: &PrefixCandidate,
+        locator: Option<ExactCodeLocator<'_>>,
+    ) -> io::Result<usize> {
+        if !candidate.prefix_only {
+            return Ok(candidate.suffix_offset);
+        }
+        let virtual_offset = locator.ok_or_else(|| {
+            invalid_data("prefix-only SOAR candidates need the exact-vector lookup")
+        })?(candidate.doc_id, candidate.ordinal)
+        .ok_or_else(|| invalid_data("SOAR candidate has no exact-vector location"))?;
+        let virtual_offset = usize::try_from(virtual_offset)
+            .map_err(|_| invalid_data("vector location exceeds address space"))?;
+        self.split_code_parts(virtual_offset)
+            .map(|(_, suffix)| suffix)
+            .ok_or_else(|| invalid_data("SOAR candidate location is not a code row"))
+    }
+
+    #[cfg(feature = "native")]
+    fn prefetch_suffix_batch(&self, offsets: &[usize], suffix_len: usize) {
+        let samples = [
+            offsets[0],
+            offsets[offsets.len() / 2],
+            offsets[offsets.len() - 1],
+        ];
+        if samples
+            .iter()
+            .all(|&offset| self.raw.range_resident(offset..offset + suffix_len))
+        {
+            return;
+        }
+        let page_size = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+            .ok()
+            .filter(|size| size.is_power_of_two())
+            .unwrap_or(4096);
+        for_each_suffix_prefetch_range(
+            offsets,
+            suffix_len,
+            self.raw.as_slice().as_ptr() as usize,
+            page_size,
+            |range| self.raw.madvise_range(range, libc::MADV_WILLNEED),
+        );
     }
 
     /// Prefetch labels and prefix rows of the probed leaves, not suffixes;
     /// the full-code stage reads its few candidates on demand.
     #[cfg(feature = "native")]
     fn prefetch_prefix_runs(&self, cluster_ids: &[u32]) {
-        if cluster_ids.is_empty() || !self.raw.is_mmap() {
+        if self.prefix_cache.get().is_some() || cluster_ids.is_empty() || !self.raw.is_mmap() {
             return;
         }
         let mut ranges = Vec::with_capacity(cluster_ids.len());
@@ -2279,6 +2357,44 @@ struct PrefixCandidate {
     suffix_offset: usize,
 }
 
+const SUFFIX_PREFETCH_BATCH: usize = 64;
+
+/// Combine only requested physical pages. Offsets may refer to a sliced mapping,
+/// so page boundaries include the backing address rather than assuming offset 0
+/// is page aligned. One suffix wider than the cap remains one required range.
+#[cfg(feature = "native")]
+fn for_each_suffix_prefetch_range(
+    offsets: &[usize],
+    suffix_len: usize,
+    address: usize,
+    page_size: usize,
+    mut visit: impl FnMut(Range<usize>),
+) {
+    debug_assert!(!offsets.is_empty() && offsets.len() <= SUFFIX_PREFETCH_BATCH);
+    debug_assert!(suffix_len > 0);
+    let mut sorted = [0usize; SUFFIX_PREFETCH_BATCH];
+    sorted[..offsets.len()].copy_from_slice(offsets);
+    let sorted = &mut sorted[..offsets.len()];
+    sorted.sort_unstable();
+    let mut range = sorted[0]..sorted[0] + suffix_len;
+    for &offset in &sorted[1..] {
+        let end = offset + suffix_len;
+        let first_page = (address + range.start) / page_size;
+        let previous_last_page = (address + range.end - 1) / page_size;
+        let next_first_page = (address + offset) / page_size;
+        let next_last_page = (address + end - 1) / page_size;
+        if next_first_page <= previous_last_page + 1
+            && (next_last_page - first_page + 1) * page_size <= 64 * 1024
+        {
+            range.end = range.end.max(end);
+        } else {
+            visit(range);
+            range = offset..end;
+        }
+    }
+    visit(range);
+}
+
 /// Keep the `limit` smallest candidates in a max-heap.
 #[inline]
 fn push_prefix_candidate(
@@ -2301,6 +2417,7 @@ fn scan_prefix_task(
     bytes: &[u8],
     query_prefix: &[u8],
     prefix_bytes: usize,
+    #[cfg(feature = "native")] resident: Option<&prefix_cache::ResidentBinaryPrefixes>,
     code_size: usize,
     task: BinaryScanTask<'_>,
     limit: usize,
@@ -2311,15 +2428,32 @@ fn scan_prefix_task(
     let suffix_len = code_size - prefix_bytes;
     let mut distances = [0u32; BLOCK];
     let end = task.first_index + task.count;
-    for block_start in (task.first_index..end).step_by(BLOCK) {
-        let rows = BLOCK.min(end - block_start);
+    #[cfg(feature = "native")]
+    let mut scratch = resident
+        .filter(|_| run.prefix_only)
+        .map(|_| [0u8; prefix_cache::GATHER_BYTES]);
+    #[cfg(feature = "native")]
+    let cache_base = resident.map(|cache| cache.base(run));
+    #[cfg(feature = "native")]
+    let block = if resident.is_some() && run.prefix_only {
+        BLOCK.min(prefix_cache::GATHER_BYTES / prefix_bytes)
+    } else {
+        BLOCK
+    };
+    #[cfg(not(feature = "native"))]
+    let block = BLOCK;
+    for block_start in (task.first_index..end).step_by(block) {
+        let rows = block.min(end - block_start);
         let start = run.prefix.start + block_start * prefix_bytes;
-        kernel.distances(
-            query_prefix,
-            &bytes[start..start + rows * prefix_bytes],
-            prefix_bytes,
-            &mut distances[..rows],
-        );
+        #[cfg(feature = "native")]
+        let codes = if let (Some(cache), Some(base)) = (resident, cache_base) {
+            cache.block(run, base, block_start, rows, prefix_bytes, scratch.as_mut())
+        } else {
+            &bytes[start..start + rows * prefix_bytes]
+        };
+        #[cfg(not(feature = "native"))]
+        let codes = &bytes[start..start + rows * prefix_bytes];
+        kernel.distances(query_prefix, codes, prefix_bytes, &mut distances[..rows]);
         // Only distances that can enter the heap touch the label columns.
         let worst = if heap.len() < limit {
             u32::MAX
@@ -2331,16 +2465,31 @@ fn scan_prefix_task(
                 continue;
             }
             let index = block_start + lane;
+            #[cfg(feature = "native")]
+            let labels = resident
+                .zip(cache_base)
+                .map(|(cache, base)| cache.labels(run, base, index));
+            #[cfg(feature = "native")]
+            let doc_id =
+                labels.map_or_else(|| run_doc_id_validated(bytes, run, index), |(doc, _)| doc);
+            #[cfg(not(feature = "native"))]
             let doc_id = run_doc_id_validated(bytes, run, index);
             if visibility.is_some_and(|bits| !bits.contains(doc_id)) {
                 continue;
             }
+            #[cfg(feature = "native")]
+            let ordinal = labels.map_or_else(
+                || read_u16(bytes, run.ordinals.start + index * 2),
+                |(_, ordinal)| ordinal,
+            );
+            #[cfg(not(feature = "native"))]
+            let ordinal = read_u16(bytes, run.ordinals.start + index * 2);
             push_prefix_candidate(
                 heap,
                 PrefixCandidate {
                     distance,
                     doc_id,
-                    ordinal: read_u16(bytes, run.ordinals.start + index * 2),
+                    ordinal,
                     prefix_only: run.prefix_only,
                     suffix_offset: if run.prefix_only {
                         0
@@ -4455,6 +4604,97 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
 #[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn suffix_prefetch_never_fills_page_gaps_and_bounds_combined_ranges() {
+        use std::collections::BTreeSet;
+        for page_size in [4096, 16384] {
+            for address in [page_size, page_size + 137] {
+                let cases = [
+                    vec![0, 192, 3900, 4000, 8192, 20000, 4000, 100000],
+                    (0..SUFFIX_PREFETCH_BATCH)
+                        .rev()
+                        .map(|row| row * page_size)
+                        .collect(),
+                ];
+                for offsets in cases {
+                    let pages = |range: Range<usize>| {
+                        (address + range.start) / page_size..=(address + range.end - 1) / page_size
+                    };
+                    let expected: BTreeSet<_> = offsets
+                        .iter()
+                        .flat_map(|&offset| pages(offset..offset + 192))
+                        .collect();
+                    let mut actual = BTreeSet::new();
+                    for_each_suffix_prefetch_range(&offsets, 192, address, page_size, |range| {
+                        let requested = pages(range);
+                        assert!(requested.clone().count() * page_size <= 64 * 1024);
+                        actual.extend(requested);
+                    });
+                    assert_eq!(actual, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combined_prefix_search_does_not_prefetch_full_leaves() {
+        let mut header = binary_header(2);
+        header.dim = 32;
+        header.code_size = 4;
+        header.prefix_bytes = 2;
+        let mut bytes = Vec::new();
+        write_built_runs(
+            header,
+            &[BuildRun {
+                cluster_id: 0,
+                doc_ids: &[0, 1],
+                ordinals: &[0, 0],
+                codes: &[0, 0, 255, 255, 255, 255, 0, 0],
+                prefix_only: false,
+            }],
+            &mut bytes,
+            None,
+        )
+        .unwrap();
+        let disk = AnnDiskIndex::open(OwnedBytes::new(bytes), AnnKind::BinaryIvf, 2).unwrap();
+        let prefix_results = disk
+            .search_binary_combined_documents(
+                1,
+                &[0; 4],
+                &[0],
+                crate::query::MultiValueCombiner::Sum,
+                1,
+                None,
+            )
+            .unwrap();
+        assert_eq!(prefix_results.0[0].doc_id, 0);
+        assert_eq!(prefix_results.0[0].score, 0.5);
+        assert_eq!(prefix_results.1, vec![(0, 0, 0.5)]);
+        assert_eq!(
+            disk.full_prefetch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "prefix selection must not advise suffixes for every leaf posting"
+        );
+        let full_results = disk
+            .search_binary_combined_documents(
+                1,
+                &[0; 4],
+                &[0],
+                crate::query::MultiValueCombiner::Sum,
+                0,
+                None,
+            )
+            .unwrap();
+        assert_eq!(prefix_results, full_results);
+        assert_eq!(
+            disk.full_prefetch_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
 
     #[test]
     fn ann_visibility_clones_share_run_allocations_and_pin_lifetime() {

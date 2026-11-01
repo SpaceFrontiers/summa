@@ -97,6 +97,9 @@ References: [posting codecs](posting-codecs.md), [cold I/O](cold-io.md),
   does not scan them, and summary views do not revalidate their format, lengths
   or decoded IDs. Writer/codec tests own those guarantees. Index-envelope
   compatibility and directory ownership remain separate from payload decoding.
+- The optional [binary prefix cache](binary-prefix-cache.md) is an explicitly
+  budgeted derived tier, disabled by default. Its index-wide reservations survive
+  retained readers; all other compressed and exact payloads remain evictable.
 - Keep Seismic nomination payloads, compressed ANN runs, and exact vectors evictable.
   Prefetch only selected bounded ranges; a deliberate flat scan is an explicit
   query plan, not a reason to make every payload resident.

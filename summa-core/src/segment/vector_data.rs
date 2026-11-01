@@ -793,9 +793,20 @@ impl LazyFlatVectorData {
     pub(crate) fn exact_code_location(&self, doc_id: u32, ordinal: u16) -> Option<u64> {
         self.locations.as_ref()?;
         let (start, count) = self.flat_indexes_for_doc_range(doc_id);
-        (start..start + count)
-            .find(|&index| self.get_doc_id(index) == (doc_id, ordinal))
-            .map(|index| self.code_offset(index))
+        // The validated lookup is strictly sorted by (doc, ordinal). Avoid a
+        // linear passage walk for every SOAR reference in a cache build.
+        let mut low = start;
+        let mut high = start + count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.get_doc_id(middle).1 < ordinal {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        (low < start + count && self.get_doc_id(low) == (doc_id, ordinal))
+            .then(|| self.code_offset(low))
     }
 
     /// Whether exact codes are shared with the ANN payload.

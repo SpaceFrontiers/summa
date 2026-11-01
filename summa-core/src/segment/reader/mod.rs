@@ -5,6 +5,8 @@ pub(crate) mod candidate_lookup;
 pub(crate) mod loader;
 mod term_expansion;
 pub(crate) use term_expansion::{ExpandedPosting, TermDictionaryLookup};
+#[cfg(feature = "native")]
+mod prefix_cache;
 mod types;
 
 pub use bmp::{BmpDimStats, BmpIndex};
