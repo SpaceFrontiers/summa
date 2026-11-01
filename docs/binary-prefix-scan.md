@@ -140,6 +140,12 @@ When the probed leaves hold more postings than `prefix_rerank`:
 
 With fewer probed postings than `M` the full scan runs instead.
 
+Combined multi-value searches choose the prefix path before issuing full-leaf
+prefetch hints. Only the full-scan fallback advises complete leaves. This keeps
+the prefix path from requesting every suffix before nomination; it changes no
+candidate budgets, scores, execution backend or file format. Physical read and
+latency savings still require measurement on a matching storage fixture.
+
 Cold storage: stage 2 is `M` random reads. On warm pages they are cheap; on
 cold NVMe they are about `M` 4-KiB page reads per query, which must be
 measured against the saved sequential bytes before choosing `M`.

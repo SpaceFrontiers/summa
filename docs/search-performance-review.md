@@ -12989,3 +12989,63 @@ cost on matched all-shard requests; include long documents and selected
 above-cutoff ANN misses. Historical identity retention is insufficient evidence
 for sparse removal. No quality or performance gain is claimed from the local
 functional tests, and no live rollout has occurred for these changes.
+
+## Binary read prototype withdrawn (October 31, 2026)
+
+The private binary suffix/completion pool and io_uring prototype is removed.
+Optimizing core/server to level 3 did not remove its local warm-data penalty:
+on the same four-segment, 32,768-document synthetic fixture, warm full-code
+search medians were 0.377/2.305/2.213 ms for mmap/pool/ring; prefix medians were
+0.706/21.692/24.164 ms. Each cell has 48 samples. All result identities matched,
+and warm process/device read bytes were zero. A separate regression reproduced
+serialized segment CPU work when the prototype selected the async executor.
+The benchmark also includes submission, copying and scheduling costs; it does
+not isolate io_uring or establish slow-disk performance. Dependencies remained
+in the development profile, so this is not a fully optimized release comparison.
+
+The only retained engine change defers full-leaf prefetch until after the
+[prefix scan](binary-prefix-scan.md#query-algorithm) decision for combined
+multi-value searches. Its regression checks that prefix selection requests no
+full-leaf hints and that full-scan fallback retains them. This is a prefetch
+policy correction, without a measured production IOPS or latency claim. It
+does not help the existing social generation, which has no prefix layout.
+Serving settings, query budgets and on-disk formats remain unchanged. The
+prototype patch, probe and raw results are retained under `.context/` only.
+
+## November 1, 2026: resident nomination and bounded suffix advice
+
+The optional [native prefix cache](binary-prefix-cache.md) now retains one u32
+document ID and u16 ordinal per primary vector, with SOAR secondary labels using
+the existing primary-row references. Nomination no longer touches persisted
+prefixes or labels, including remapped merge document IDs. Loading and retained
+reader reservations charge all six additional bytes per primary row. Persisted
+formats, query budgets and the default cache budget of zero do not change.
+
+Fully resident nomination alone cut private complete-query bytes 44.6–46.9%,
+but worsened paired cold latency 11.5–15.6%. Removing broad nomination prefetch
+increased demand faults. The continuation resolves at most 64 suffix locations,
+coalesces only overlapping/adjacent requested pages into at most 64-KiB ranges,
+and issues advice before the same scorer consumes the original candidate order.
+Three residency samples skip hints for apparently warm batches. This is mmap
+prefetch, not an io_uring backend or a changed candidate-selection policy.
+
+On the same 8,192-document / 39,305-original-code, four-segment SOAR fixture,
+1,536 rotated cold/warm native queries pass exact ordered-ID/score-bit checks.
+Versus contemporaneous mapped controls, Max/softmax paired cold medians improve
+35.42%/34.66%, process read bytes fall 44.58%/46.89%, and observed whole-sandbox
+device operations/query fall 44.18%/46.56%. Against labels alone, batching keeps
+identical read bytes while improving paired cold medians 43.33%/44.72%.
+Warm ratios against mapped are 0.989/1.034; query-cluster bootstrap intervals
+include 1. This is a positive private cold gate, not proof of zero warm cost.
+
+All 1,925 enabled core tests, 56 async cache-filtered tests, strict core Clippy,
+portable compilation, formatting and contracts pass. Native partial/full merge,
+deletion, compaction, retained-reader and budget retry checks pass 2,048 complete
+query comparisons plus 1,536 historical rechecks. Full server/RPC, WASM runtime,
+ARM, pressure/concurrency and comparable cold cache-loading costs remain untested.
+The fixture fits CPU caches much better than a roughly 150-GiB projected live
+nomination tier. Device deltas include background writes and are not attributed
+production IOPS. Keep the feature disabled by default pending a larger private
+workload. Detailed source provenance, patch, counters and previous negative
+results are preserved in the Azeroth task artifacts under
+`.context/summa-native-label-cache-20261101/`.

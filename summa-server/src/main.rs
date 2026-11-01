@@ -98,6 +98,12 @@ struct Args {
     #[arg(long, default_value = "2048")]
     store_cache_budget_mb: usize,
 
+    /// Optional binary-IVF prefix heap cache budget (MiB) per opened index,
+    /// shared across its segments and retained reader generations. Zero disables.
+    /// Does not mlock pages; multiply by the number of independently opened indexes.
+    #[arg(long, default_value_t = 0)]
+    binary_prefix_cache_budget_mb: usize,
+
     /// Process-wide budget (MB) for decompressed term-dictionary blocks read
     /// by searches, shared by every index and segment. Broad wildcard, regex
     /// and prefix scans reuse retained blocks instead of decompressing them
@@ -674,6 +680,8 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         .store_cache_budget_mb
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow::anyhow!("--store-cache-budget-mb is too large"))?;
+    let binary_prefix_cache_budget_bytes =
+        prefix_cache_budget_from_mb(args.binary_prefix_cache_budget_mb)?;
     let term_cache_process_bytes = args
         .term_cache_budget_mb
         .checked_mul(1024 * 1024)
@@ -769,6 +777,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
         sparse_io_concurrency: args.sparse_io_concurrency,
         segment_open_concurrency: args.segment_open_concurrency,
         store_cache_budget_bytes,
+        binary_prefix_cache_budget_bytes,
         term_cache_process_bytes,
         max_indexing_memory_bytes,
         vector_training_max_samples: args.vector_training_max_samples,
@@ -854,6 +863,10 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     info!("Starting Summa server on {}", addr);
     info!("Data directory: {:?}", args.data_dir);
     info!("Max indexing memory: {} MB", args.max_indexing_memory_mb);
+    info!(
+        "Binary prefix cache budget per index: {} MiB (heap, not mlock)",
+        args.binary_prefix_cache_budget_mb
+    );
     info!(
         "Shared document-store cache budget: {} MB",
         args.store_cache_budget_mb
@@ -1098,6 +1111,12 @@ async fn shutdown_signal() {
     }
 }
 
+fn prefix_cache_budget_from_mb(megabytes: usize) -> anyhow::Result<usize> {
+    megabytes
+        .checked_mul(1024 * 1024)
+        .ok_or_else(|| anyhow::anyhow!("--binary-prefix-cache-budget-mb is too large"))
+}
+
 fn merge_bp_time_budget(seconds: u64) -> Option<Duration> {
     (seconds != 0).then(|| Duration::from_secs(seconds))
 }
@@ -1105,6 +1124,26 @@ fn merge_bp_time_budget(seconds: u64) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_prefix_cache_budget_is_opt_in_and_rejects_overflow() {
+        let defaults = Args::try_parse_from(["summa-server"]).unwrap();
+        assert_eq!(defaults.binary_prefix_cache_budget_mb, 0);
+        let enabled =
+            Args::try_parse_from(["summa-server", "--binary-prefix-cache-budget-mb", "64"])
+                .unwrap();
+        assert_eq!(
+            prefix_cache_budget_from_mb(enabled.binary_prefix_cache_budget_mb).unwrap(),
+            64 * 1024 * 1024
+        );
+        assert_eq!(prefix_cache_budget_from_mb(0).unwrap(), 0);
+        assert!(
+            prefix_cache_budget_from_mb(usize::MAX)
+                .unwrap_err()
+                .to_string()
+                .contains("--binary-prefix-cache-budget-mb")
+        );
+    }
 
     async fn health_status(reporter: &tonic_health::server::HealthReporter) -> i32 {
         use tonic_health::pb::health_server::Health;
