@@ -867,7 +867,9 @@ mod tests {
         // Window 1: the implicit bound is 2, an explicit depth may reach the floor.
         let floor = summa_core::query::MIN_EXPLICIT_CANDIDATE_DEPTH as u32;
         assert!(with_depth(floor).is_ok());
-        let error = with_depth(floor + 1).unwrap_err();
+        let Err(error) = with_depth(floor + 1) else {
+            panic!("depth above the floor must be rejected");
+        };
         assert!(error.message().contains("nomination budget"), "{error:?}");
         assert!(with_depth(0).is_ok());
     }
