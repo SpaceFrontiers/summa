@@ -96,6 +96,8 @@ pub struct FieldDef {
     pub common_grams: Vec<String>,
     /// Default long-query cap of a text field (`indexed<query<max_terms: N>>`)
     pub text_max_terms: Option<u32>,
+    /// Query encoder of a vector field (`indexed<query<encoder: "...">>`)
+    pub query_encoder: Option<String>,
 }
 
 /// Parsed index definition
@@ -197,6 +199,7 @@ impl IndexDef {
                 builder.set_bm25_params(f, field.bm25_k1, field.bm25_b);
             }
             builder.set_text_max_terms(f, field.text_max_terms);
+            builder.set_query_encoder(f, field.query_encoder.clone());
             // Set positions: explicit > auto (ordinal for multi vectors)
             let positions = field.positions.or({
                 // Auto-set ordinal positions for multi-valued vector fields
@@ -346,6 +349,8 @@ struct IndexConfig {
     bm25_b: Option<f32>,
     // Default long-query cap of a text field (`query<max_terms: N>`)
     query_max_terms: Option<u32>,
+    // Query encoder of a vector field (`query<encoder: "...">`)
+    query_encoder: Option<String>,
 }
 
 /// Parsed attributes from SDL field definition
@@ -774,6 +779,14 @@ fn parse_query_config_block(config: &mut IndexConfig, pair: pest::iterators::Pai
                                         }));
                                 }
                             }
+                            Rule::query_encoder_kwarg => {
+                                // query_encoder_kwarg = { "encoder" ~ ":" ~ tokenizer_path }
+                                if let Some(path) = p.into_inner().next()
+                                    && let Some(inner) = path.into_inner().next()
+                                {
+                                    config.query_encoder = Some(inner.as_str().to_string());
+                                }
+                            }
                             Rule::query_max_terms_kwarg => {
                                 if let Some(t) = p.into_inner().next() {
                                     // An unparsable value fails admission
@@ -967,6 +980,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
     let mut bm25_k1 = None;
     let mut bm25_b = None;
     let mut text_max_terms = None;
+    let mut query_encoder = None;
     if let Some(idx_cfg) = index_config {
         positions = idx_cfg.positions;
         chunked = idx_cfg.chunked;
@@ -979,6 +993,8 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         }
         // Schema admission validates the field type and range.
         text_max_terms = idx_cfg.query_max_terms;
+        // Schema admission validates the field type and name.
+        query_encoder = idx_cfg.query_encoder.clone();
         bm25_k1 = idx_cfg.bm25_k1;
         bm25_b = idx_cfg.bm25_b;
         if (bm25_k1.is_some() || bm25_b.is_some()) && field_type != FieldType::Text {
@@ -1043,6 +1059,7 @@ fn parse_field_def(pair: pest::iterators::Pair<Rule>) -> Result<FieldDef> {
         bm25_k1,
         bm25_b,
         text_max_terms,
+        query_encoder,
     })
 }
 
@@ -3178,6 +3195,53 @@ mod tests {
         assert_eq!(entry.field_type, FieldType::Json);
         assert!(!entry.indexed); // JSON fields are never indexed
         assert!(entry.stored);
+    }
+
+    #[test]
+    fn query_encoder_names_the_model_of_vector_field_queries() {
+        let schema = parse_single_index(
+            r#"index docs {
+                field sparse: sparse_vector<u32> [indexed<format: bmp, dims: 128256, query<encoder: "akin_embed_v1", seismic_cut: 10>>]
+                field binary: binary_dense_vector<256> [indexed<query<encoder: "pplx_embed_v1_4b">>]
+                field dense: dense_vector<8> [indexed<flat, query<encoder: "org/model:v2">>]
+                field plain: sparse_vector<u32> [indexed<format: bmp>]
+            }"#,
+        )
+        .unwrap()
+        .to_schema();
+        let encoder = |name: &str| {
+            schema
+                .get_field_entry(schema.get_field(name).unwrap())
+                .unwrap()
+                .query_encoder
+                .clone()
+        };
+        assert_eq!(encoder("sparse").as_deref(), Some("akin_embed_v1"));
+        assert_eq!(encoder("binary").as_deref(), Some("pplx_embed_v1_4b"));
+        assert_eq!(encoder("dense").as_deref(), Some("org/model:v2"));
+        assert_eq!(encoder("plain"), None);
+
+        for (sdl, message) in [
+            (
+                r#"index docs { field body: text<simple> [indexed<query<encoder: "m">>] }"#,
+                "requires a vector field",
+            ),
+            (
+                r#"index docs { field v: sparse_vector<u32> [indexed<format: bmp, query<tokenizer: "t", encoder: "m">>] }"#,
+                "conflicts with `query<tokenizer>`",
+            ),
+            (
+                r#"index docs { field v: binary_dense_vector<256> [indexed<query<encoder: "">>] }"#,
+                "must be 1..=128 characters",
+            ),
+            (
+                r#"index docs { field v: binary_dense_vector<256> [indexed<query<encoder: "a b">>] }"#,
+                "must be 1..=128 characters",
+            ),
+        ] {
+            let error = parse_single_index(sdl).unwrap_err().to_string();
+            assert!(error.contains(message), "{sdl}: {error}");
+        }
     }
 
     #[test]

@@ -856,6 +856,20 @@ export interface GetIndexInfoResponse {
    * Check every partition's support before sending nondefault controls.
    */
   binaryRetrievalVersion: number;
+  /**
+   * Vector fields whose queries the client encodes with a named model
+   * (`indexed<query<encoder: "...">>`, docs/query-encoders.md).
+   */
+  queryEncoders: QueryEncoderInfo[];
+}
+
+/**
+ * The model a vector field's queries are encoded with. Sparse fields that
+ * declare one accept explicit indices/values only, never text.
+ */
+export interface QueryEncoderInfo {
+  field: string;
+  encoder: string;
 }
 
 /** Tokenization facts of one text field. */
@@ -7347,6 +7361,7 @@ function createBaseGetIndexInfoResponse(): GetIndexInfoResponse {
     numDeletedDocs: 0,
     deletedRatio: 0,
     binaryRetrievalVersion: 0,
+    queryEncoders: [],
   };
 }
 
@@ -7390,6 +7405,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     }
     if (message.binaryRetrievalVersion !== 0) {
       writer.uint32(104).uint32(message.binaryRetrievalVersion);
+    }
+    for (const v of message.queryEncoders) {
+      QueryEncoderInfo.encode(v!, writer.uint32(114).fork()).join();
     }
     return writer;
   },
@@ -7505,6 +7523,14 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
           message.binaryRetrievalVersion = reader.uint32();
           continue;
         }
+        case 14: {
+          if (tag !== 114) {
+            break;
+          }
+
+          message.queryEncoders.push(QueryEncoderInfo.decode(reader, reader.uint32()));
+          continue;
+        }
       }
       if ((tag & 7) === 4 || tag === 0) {
         break;
@@ -7577,6 +7603,11 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
         : isSet(object.binary_retrieval_version)
         ? globalThis.Number(object.binary_retrieval_version)
         : 0,
+      queryEncoders: globalThis.Array.isArray(object?.queryEncoders)
+        ? object.queryEncoders.map((e: any) => QueryEncoderInfo.fromJSON(e))
+        : globalThis.Array.isArray(object?.query_encoders)
+        ? object.query_encoders.map((e: any) => QueryEncoderInfo.fromJSON(e))
+        : [],
     };
   },
 
@@ -7621,6 +7652,9 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     if (message.binaryRetrievalVersion !== 0) {
       obj.binaryRetrievalVersion = Math.round(message.binaryRetrievalVersion);
     }
+    if (message.queryEncoders?.length) {
+      obj.queryEncoders = message.queryEncoders.map((e) => QueryEncoderInfo.toJSON(e));
+    }
     return obj;
   },
 
@@ -7644,6 +7678,83 @@ export const GetIndexInfoResponse: MessageFns<GetIndexInfoResponse> = {
     message.numDeletedDocs = object.numDeletedDocs ?? 0;
     message.deletedRatio = object.deletedRatio ?? 0;
     message.binaryRetrievalVersion = object.binaryRetrievalVersion ?? 0;
+    message.queryEncoders = object.queryEncoders?.map((e) => QueryEncoderInfo.fromPartial(e)) || [];
+    return message;
+  },
+};
+
+function createBaseQueryEncoderInfo(): QueryEncoderInfo {
+  return { field: "", encoder: "" };
+}
+
+export const QueryEncoderInfo: MessageFns<QueryEncoderInfo> = {
+  encode(message: QueryEncoderInfo, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.field !== "") {
+      writer.uint32(10).string(message.field);
+    }
+    if (message.encoder !== "") {
+      writer.uint32(18).string(message.encoder);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): QueryEncoderInfo {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const end = length === undefined ? reader.len : reader.pos + length;
+    const message = createBaseQueryEncoderInfo();
+    while (reader.pos < end) {
+      const tag = reader.uint32();
+      switch (tag >>> 3) {
+        case 1: {
+          if (tag !== 10) {
+            break;
+          }
+
+          message.field = reader.string();
+          continue;
+        }
+        case 2: {
+          if (tag !== 18) {
+            break;
+          }
+
+          message.encoder = reader.string();
+          continue;
+        }
+      }
+      if ((tag & 7) === 4 || tag === 0) {
+        break;
+      }
+      reader.skip(tag & 7);
+    }
+    return message;
+  },
+
+  fromJSON(object: any): QueryEncoderInfo {
+    return {
+      field: isSet(object.field) ? globalThis.String(object.field) : "",
+      encoder: isSet(object.encoder) ? globalThis.String(object.encoder) : "",
+    };
+  },
+
+  toJSON(message: QueryEncoderInfo): unknown {
+    const obj: any = {};
+    if (message.field !== "") {
+      obj.field = message.field;
+    }
+    if (message.encoder !== "") {
+      obj.encoder = message.encoder;
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<QueryEncoderInfo>): QueryEncoderInfo {
+    return QueryEncoderInfo.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<QueryEncoderInfo>): QueryEncoderInfo {
+    const message = createBaseQueryEncoderInfo();
+    message.field = object.field ?? "";
+    message.encoder = object.encoder ?? "";
     return message;
   },
 };

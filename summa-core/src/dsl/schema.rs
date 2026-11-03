@@ -93,6 +93,13 @@ pub struct FieldEntry {
     /// distinct tokens. `None` = every token, up to `MAX_QUERY_TERMS`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_max_terms: Option<u32>,
+    /// Query encoder of a vector field (`indexed<query<encoder: "...">>`):
+    /// the model clients must encode this field's queries with before
+    /// sending explicit vectors (`docs/query-encoders.md`). The engine never
+    /// calls it; it exposes the name in `GetIndexInfo` and refuses text
+    /// sparse queries on the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_encoder: Option<String>,
     /// Common words of a text field: every adjacent pair of them is indexed
     /// as one extra term so exact two-word phrases of common words read a
     /// single posting list (`docs/common-word-pairs.md`). Fixed for the life
@@ -103,6 +110,9 @@ pub struct FieldEntry {
 
 /// Most common words one field may pair (`docs/common-word-pairs.md`).
 pub const MAX_COMMON_GRAMS: usize = 4096;
+
+/// Longest query encoder name (`docs/query-encoders.md`).
+pub const MAX_QUERY_ENCODER_LEN: usize = 128;
 
 impl FieldEntry {
     /// A default long-query cap is a text-field option bounded by the
@@ -123,6 +133,51 @@ impl FieldEntry {
                 self.name,
                 crate::query::MAX_QUERY_TERMS
             )));
+        }
+        Ok(())
+    }
+
+    /// A query encoder names the model of a vector field's queries; a sparse
+    /// field cannot also tokenize text queries in the engine.
+    fn validate_query_encoder(&self) -> crate::Result<()> {
+        let Some(encoder) = self.query_encoder.as_deref() else {
+            return Ok(());
+        };
+        let reject = |reason: String| {
+            Err(crate::Error::Schema(format!(
+                "field '{}': `query<encoder>` {reason}",
+                self.name
+            )))
+        };
+        if !matches!(
+            self.field_type,
+            FieldType::SparseVector | FieldType::DenseVector | FieldType::BinaryDenseVector
+        ) {
+            return reject(format!(
+                "requires a vector field, got {:?}",
+                self.field_type
+            ));
+        }
+        if encoder.is_empty()
+            || encoder.len() > MAX_QUERY_ENCODER_LEN
+            || !encoder
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-:/".contains(&b))
+        {
+            return reject(format!(
+                "must be 1..={MAX_QUERY_ENCODER_LEN} characters of [A-Za-z0-9._-:/], got {encoder:?}"
+            ));
+        }
+        if self
+            .sparse_vector_config
+            .as_ref()
+            .and_then(|config| config.query_config.as_ref())
+            .is_some_and(|query| query.tokenizer.is_some())
+        {
+            return reject(
+                "conflicts with `query<tokenizer>`: encoded fields take explicit vectors only"
+                    .to_string(),
+            );
         }
         Ok(())
     }
@@ -1190,6 +1245,7 @@ impl Schema {
             }
             entry.validate_common_grams()?;
             entry.validate_text_max_terms()?;
+            entry.validate_query_encoder()?;
         }
         self.validate_content_hash()
     }
@@ -1347,6 +1403,7 @@ impl SchemaBuilder {
             bm25_k1: None,
             bm25_b: None,
             text_max_terms: None,
+            query_encoder: None,
             common_grams: Vec::new(),
         });
         field
@@ -1405,6 +1462,7 @@ impl SchemaBuilder {
             bm25_k1: None,
             bm25_b: None,
             text_max_terms: None,
+            query_encoder: None,
             common_grams: Vec::new(),
         });
         field
@@ -1458,6 +1516,7 @@ impl SchemaBuilder {
             bm25_k1: None,
             bm25_b: None,
             text_max_terms: None,
+            query_encoder: None,
             common_grams: Vec::new(),
         });
         field
@@ -1513,6 +1572,7 @@ impl SchemaBuilder {
             bm25_k1: None,
             bm25_b: None,
             text_max_terms: None,
+            query_encoder: None,
             common_grams: Vec::new(),
         });
         field
@@ -1576,6 +1636,13 @@ impl SchemaBuilder {
         if let Some(entry) = self.fields.get_mut(field.0 as usize) {
             entry.bm25_k1 = k1;
             entry.bm25_b = b;
+        }
+    }
+
+    /// Set the query encoder of a vector field (`None` = none declared).
+    pub fn set_query_encoder(&mut self, field: Field, encoder: Option<String>) {
+        if let Some(entry) = self.fields.get_mut(field.0 as usize) {
+            entry.query_encoder = encoder;
         }
     }
 
