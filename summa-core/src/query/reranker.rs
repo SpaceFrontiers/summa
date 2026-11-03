@@ -1069,6 +1069,10 @@ pub(super) async fn score_vector_candidates<D: crate::directories::Directory + '
     let mut runs = Vec::new();
     let mut scores = vec![0.0; targets.len()];
     for (batch, out) in targets.chunks(batch_len).zip(scores.chunks_mut(batch_len)) {
+        // Candidates arrive sorted by flat row; advise the whole batch at once
+        // so its page faults overlap instead of serialising run by run.
+        #[cfg(feature = "native")]
+        flat.prefetch_vectors(batch.iter().map(|&target| target as usize));
         plan_flat_read_runs(batch.iter().map(|&target| target as usize), &mut runs);
         let raw = &mut raw[..batch.len() * vbs];
         read_flat_vector_runs(flat, &runs, raw).await?;
