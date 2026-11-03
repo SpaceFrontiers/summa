@@ -41,6 +41,23 @@ pub const fn max_candidate_limit(result_window: usize) -> usize {
     result_window.saturating_mul(MAX_CANDIDATE_OVERSUBSCRIPTION)
 }
 
+/// Smallest ceiling for an explicit L1 `FusionQuery.candidate_depth`,
+/// whatever the result window. Sparse-only nomination rescored by score-only
+/// vector branches needs hundreds of candidates for a page of ten
+/// (`docs/candidate-rescoring.md`); only callers that ask for the depth pay for it.
+pub const MIN_EXPLICIT_CANDIDATE_DEPTH: usize = 1024;
+
+/// Bound of an explicit L1 nomination depth for `result_window`: the
+/// oversubscribed window, raised to [`MIN_EXPLICIT_CANDIDATE_DEPTH`].
+pub const fn max_explicit_candidate_depth(result_window: usize) -> usize {
+    let scaled = max_candidate_limit(result_window);
+    if scaled > MIN_EXPLICIT_CANDIDATE_DEPTH {
+        scaled
+    } else {
+        MIN_EXPLICIT_CANDIDATE_DEPTH
+    }
+}
+
 mod all;
 mod bm25;
 pub(crate) mod bmp;
