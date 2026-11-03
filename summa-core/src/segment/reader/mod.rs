@@ -650,6 +650,19 @@ fn ann_candidate_document_ranges_from_ids(
 /// ANN/flat consistency checks the rerank path provided: every candidate must
 /// name the field's sole stored ordinal. Deduplicate by document as well so a
 /// malformed ANN payload cannot surface the same document more than once.
+/// A stored-only vector field has no index: it rescores candidates in L1
+/// score-only branches and never nominates. Refuse a search over it instead
+/// of brute-forcing every stored vector.
+fn reject_stored_only_nomination(entry: &crate::dsl::FieldEntry) -> Result<()> {
+    if entry.indexed {
+        return Ok(());
+    }
+    Err(Error::Query(format!(
+        "vector field '{}' is stored for score-only rescoring; it cannot nominate candidates",
+        entry.name
+    )))
+}
+
 fn validate_binary_single_value_ann_results(
     ann_results: Vec<RawVectorCandidate>,
     flat: &LazyFlatVectorData,
@@ -3074,6 +3087,7 @@ impl SegmentReader {
                 got: format!("{:?}", entry.field_type),
             });
         }
+        reject_stored_only_nomination(entry)?;
         let config = entry.dense_vector_config.as_ref().ok_or_else(|| {
             Error::Schema(format!(
                 "dense vector field '{}' has no dense vector configuration",
@@ -3142,6 +3156,7 @@ impl SegmentReader {
                 got: format!("{:?}", entry.field_type),
             });
         }
+        reject_stored_only_nomination(entry)?;
         let config = entry.binary_dense_vector_config.as_ref().ok_or_else(|| {
             Error::Schema(format!(
                 "binary dense vector field '{}' has no configuration",

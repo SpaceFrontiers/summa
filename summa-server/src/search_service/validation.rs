@@ -727,14 +727,20 @@ pub(super) fn validate_search_budget(
             }
         }
 
-        let depth = if fusion.candidate_depth == 0 {
-            candidate_limit
+        let (depth, max_depth) = if fusion.candidate_depth == 0 {
+            (candidate_limit, max_candidate_limit)
         } else {
-            fusion.candidate_depth as usize
+            // An explicit (L1) depth may exceed the oversubscribed window up
+            // to the explicit-depth floor; the default stays the candidate limit.
+            (
+                fusion.candidate_depth as usize,
+                summa_core::query::max_explicit_candidate_depth(search_limit)
+                    .min(limits.max_candidate_limit),
+            )
         };
-        if depth > max_candidate_limit {
+        if depth > max_depth {
             return Err(Status::invalid_argument(format!(
-                "fusion candidate_depth exceeds {max_candidate_limit}"
+                "fusion candidate_depth exceeds {max_depth}"
             )));
         }
         let candidate_slots = depth

@@ -9,5 +9,6 @@ ignore = [
     "RUSTSEC-2026-0367", # zip 0.6.6: SUID/SGID bits preserved on extraction
     "RUSTSEC-2026-0368", # zip 0.6.6: symlink targets on extraction
     "RUSTSEC-2026-0369", # zip 0.6.6: Unix permissions on extraction
+    "RUSTSEC-2026-0429", # zip 0.6.6: extract aborts on a large symlink entry
     "RUSTSEC-2026-0403", # zstd-safe 5.0.2 (via zip 0.6.6): legacy streaming decompression
 ]
