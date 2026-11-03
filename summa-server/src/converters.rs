@@ -475,6 +475,12 @@ pub fn convert_query_with_rarity(
             }
 
             let vector: Vec<(u32, f32)> = if !sv_query.text.is_empty() {
+                if let Some(encoder) = &field_entry.query_encoder {
+                    return Err(format!(
+                        "Field '{}' takes queries encoded by '{encoder}': send explicit indices/values, not text",
+                        sv_query.field
+                    ));
+                }
                 // Text provided - tokenize server-side
                 let sparse_config = field_entry.sparse_vector_config.as_ref().ok_or_else(|| {
                     format!("Field '{}' is not a sparse vector field", sv_query.field)
@@ -1041,6 +1047,8 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
             if let Some(max_terms) = entry.text_max_terms {
                 idx_params.push(format!("query<max_terms: {max_terms}>"));
             }
+            // Query encoder: inside a sparse field's query block, else its own.
+            let mut encoder_rendered = false;
 
             // Positions (for text/sparse)
             if let Some(pos) = entry.positions {
@@ -1183,6 +1191,10 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                     if let Some(ref t) = qc.tokenizer {
                         qparams.push(format!("tokenizer: \"{}\"", t));
                     }
+                    if let Some(ref encoder) = entry.query_encoder {
+                        qparams.push(format!("encoder: \"{encoder}\""));
+                        encoder_rendered = true;
+                    }
                     if qc.weighting != summa_core::structures::QueryWeighting::One {
                         let w = match qc.weighting {
                             summa_core::structures::QueryWeighting::Idf => "idf",
@@ -1214,6 +1226,11 @@ pub fn schema_to_sdl(schema: &Schema) -> String {
                         idx_params.push(format!("query<{}>", qparams.join(", ")));
                     }
                 }
+            }
+            if let Some(ref encoder) = entry.query_encoder
+                && !encoder_rendered
+            {
+                idx_params.push(format!("query<encoder: \"{encoder}\">"));
             }
 
             if idx_params.is_empty() {
@@ -2563,6 +2580,59 @@ mod tests {
         assert!(rendered.contains("query<max_terms: 12>"), "{rendered}");
         let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
         assert_eq!(max_terms(&reparsed), Some(12));
+    }
+
+    #[test]
+    fn query_encoders_round_trip_sdl_reach_index_info_and_refuse_text_queries() {
+        let input = r#"
+            index documents {
+                field sparse_vectors: sparse_vector<u32> [indexed<format: bmp, dims: 128256, query<encoder: "akin_embed_v1">>]
+                field profile: sparse_vector<u32> [indexed<format: bmp, dims: 128256, query<encoder: "akin_embed_v1", seismic_cut: 7>>]
+                field binary_embeddings: binary_dense_vector<256> [indexed<query<encoder: "pplx_embed_v1_4b">>]
+            }
+        "#;
+        let schema = summa_core::dsl::sdl::parse_sdl(input).unwrap()[0].to_schema();
+        let encoders = |schema: &Schema| {
+            crate::search_service::query_encoder_infos(schema)
+                .into_iter()
+                .map(|info| (info.field, info.encoder))
+                .collect::<Vec<_>>()
+        };
+        let expected = vec![
+            ("sparse_vectors".to_string(), "akin_embed_v1".to_string()),
+            ("profile".to_string(), "akin_embed_v1".to_string()),
+            (
+                "binary_embeddings".to_string(),
+                "pplx_embed_v1_4b".to_string(),
+            ),
+        ];
+        assert_eq!(encoders(&schema), expected);
+        // GetIndexInfo renders the schema back; the declaration survives.
+        let rendered = schema_to_sdl(&schema);
+        assert!(
+            rendered.contains(r#"query<encoder: "pplx_embed_v1_4b">"#),
+            "{rendered}"
+        );
+        let reparsed = summa_core::dsl::sdl::parse_sdl(&rendered).unwrap()[0].to_schema();
+        assert_eq!(encoders(&reparsed), expected);
+
+        let sparse = |text: &str, indices: Vec<u32>| proto::Query {
+            query: Some(ProtoQueryType::SparseVector(proto::SparseVectorQuery {
+                field: "sparse_vectors".into(),
+                text: text.into(),
+                values: vec![1.0; indices.len()],
+                indices,
+                ..Default::default()
+            })),
+        };
+        let error = convert_query(&sparse("quantum", vec![]), &schema, None, None, &shape())
+            .err()
+            .expect("text on an encoded field is refused");
+        assert!(
+            error.contains("takes queries encoded by 'akin_embed_v1'"),
+            "{error}"
+        );
+        assert!(convert_query(&sparse("", vec![3, 9]), &schema, None, None, &shape()).is_ok());
     }
 
     #[test]

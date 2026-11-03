@@ -561,6 +561,16 @@ message GetIndexInfoResponse {
   // 1: binary filters precede nomination; binary query controls are supported.
   // Check every partition's support before sending nondefault controls.
   uint32 binary_retrieval_version = 13;
+  // Vector fields whose queries the client encodes with a named model
+  // (`indexed<query<encoder: "...">>`, docs/query-encoders.md).
+  repeated QueryEncoderInfo query_encoders = 14;
+}
+
+// The model a vector field's queries are encoded with. Sparse fields that
+// declare one accept explicit indices/values only, never text.
+message QueryEncoderInfo {
+  string field = 1;
+  string encoder = 2;
 }
 
 // Tokenization facts of one text field.

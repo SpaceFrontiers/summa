@@ -962,10 +962,22 @@ mod tests {
                 avg_terms_per_vector: 2.0,
             }],
             text_fields: vec![],
-
+            query_encoders: vec![summa_broker::proto::summa::QueryEncoderInfo {
+                field: "v".to_string(),
+                encoder: "akin_embed_v1".to_string(),
+            }],
             ..Default::default()
         };
         let merged = merge_index_info(vec![info(5, 2), info(7, 3)]);
+        // Partitions share one schema: its query encoders pass through once.
+        assert_eq!(
+            merged
+                .query_encoders
+                .iter()
+                .map(|info| (info.field.as_str(), info.encoder.as_str()))
+                .collect::<Vec<_>>(),
+            [("v", "akin_embed_v1")]
+        );
         assert_eq!(merged.num_docs, 12);
         assert_eq!(merged.num_segments, 5);
         assert_eq!(merged.memory_stats.unwrap().total_bytes, 20);
