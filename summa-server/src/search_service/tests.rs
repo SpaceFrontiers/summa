@@ -204,6 +204,65 @@ async fn text_stats_shares_search_admission_and_releases_permits_on_error() {
     assert_eq!(service.search_permits.available_permits(), 1);
 }
 
+#[tokio::test]
+async fn test_rejected_searches_are_not_progress_but_answered_ones_are() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SearchServiceImpl::new(
+        Arc::new(IndexRegistry::new(temp.path().into(), Default::default())),
+        1,
+        SearchLimits::default(),
+    );
+    let monitor = service.stall_monitor();
+    let stall_after = std::time::Duration::from_millis(50);
+    let request = || {
+        Request::new(SearchRequest {
+            index_name: "absent".into(),
+            query: Some(all_query()),
+            limit: 1,
+            ..Default::default()
+        })
+    };
+
+    // Wedged pool work holds the only permit: searches are rejected and the
+    // stall persists, naming the held search.
+    let wedged = service.progress.admit(
+        try_acquire_search_permit(&service.search_permits).unwrap(),
+        "social",
+    );
+    assert!(
+        monitor.check(stall_after).is_none(),
+        "starts the exhaustion clock"
+    );
+    tokio::time::sleep(stall_after * 2).await;
+    assert_eq!(
+        service.search(request()).await.unwrap_err().code(),
+        Code::ResourceExhausted
+    );
+    let report = monitor
+        .check(stall_after)
+        .expect("exhausted admission without progress");
+    assert_eq!(report.in_flight.len(), 1);
+    assert_eq!(report.in_flight[0].index, "social");
+
+    // An admitted search that answers (here: the index is absent) is progress.
+    drop(wedged);
+    assert_eq!(
+        service.search(request()).await.unwrap_err().code(),
+        Code::NotFound
+    );
+    assert_eq!(service.search_permits.available_permits(), 1);
+    let _held = service.progress.admit(
+        try_acquire_search_permit(&service.search_permits).unwrap(),
+        "social",
+    );
+    assert!(monitor.check(stall_after).is_none());
+    tokio::time::sleep(stall_after / 2).await;
+    assert!(
+        monitor.check(stall_after).is_none(),
+        "a search completed within the stall interval"
+    );
+}
+
 fn all_query() -> Query {
     Query {
         query: Some(query::Query::All(AllQuery::default())),

@@ -737,17 +737,30 @@ impl<D: Directory + 'static> Searcher<D> {
         &self.segment_map
     }
 
+    /// `ThreadPool::install` on the shared search pool. A caller outside the
+    /// pool blocks until the work returns; it is counted in
+    /// [`super::SearchRuntimeState::pool_install_waiters`] meanwhile.
+    #[cfg(feature = "sync")]
+    fn pool_install<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
+        let _waiter = self
+            .search_pool
+            .current_thread_index()
+            .is_none()
+            .then(super::runtime_state::InstallWaiter::new);
+        self.search_pool.install(operation)
+    }
+
     /// Run a bounded piece of CPU work inside this index's shared search pool.
     #[cfg(feature = "sync")]
     pub(crate) fn install_search_cpu<R: Send>(&self, operation: impl FnOnce() -> R + Send) -> R {
         #[cfg(not(feature = "query-diagnostics"))]
         {
-            self.search_pool.install(operation)
+            self.pool_install(operation)
         }
         #[cfg(feature = "query-diagnostics")]
         {
             let submitted = std::time::Instant::now();
-            let (result, queued, finished) = self.search_pool.install(|| {
+            let (result, queued, finished) = self.pool_install(|| {
                 let queued = submitted.elapsed();
                 let result = operation();
                 (result, queued, std::time::Instant::now())
@@ -779,7 +792,9 @@ impl<D: Directory + 'static> Searcher<D> {
         work: impl FnOnce() -> R + Send + 'static,
     ) -> Result<R> {
         let (sender, receiver) = futures::channel::oneshot::channel();
+        let queued = super::runtime_state::QueuedPoolJob::new();
         self.search_pool.spawn(move || {
+            let _running = queued.start();
             let _ = sender.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)));
         });
         match receiver.await {
@@ -1151,7 +1166,7 @@ impl<D: Directory + 'static> Searcher<D> {
         #[cfg(feature = "sync")]
         let coarse_bounds: Vec<Option<Vec<f32>>> = if parallel {
             use rayon::prelude::*;
-            self.search_pool.install(|| {
+            self.pool_install(|| {
                 self.segments
                     .par_iter()
                     .map(prepare)
@@ -1583,14 +1598,14 @@ impl<D: Directory + 'static> Searcher<D> {
         let mut merge_scratch = Vec::new();
         let mut total_seen = 0u32;
         if let Some((&pilot, rest)) = order.split_first() {
-            let (pilot_results, pilot_seen) = self.search_pool.install(|| run_segment(&pilot))?;
+            let (pilot_results, pilot_seen) = self.pool_install(|| run_segment(&pilot))?;
             merge_ranked_reuse(&mut merged, pilot_results, fetch_limit, &mut merge_scratch);
             total_seen = total_seen.saturating_add(pilot_seen);
 
             for wave in rest.chunks(self.bmp_wave_width()) {
-                let batches = self
-                    .search_pool
-                    .install(|| wave.par_iter().map(run_segment).collect::<Result<Vec<_>>>())?;
+                let batches = self.pool_install(|| {
+                    wave.par_iter().map(run_segment).collect::<Result<Vec<_>>>()
+                })?;
                 for (results, seen) in batches {
                     merge_ranked_reuse(&mut merged, results, fetch_limit, &mut merge_scratch);
                     total_seen = total_seen.saturating_add(seen);

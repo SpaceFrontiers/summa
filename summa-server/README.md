@@ -25,8 +25,21 @@ work. Default: detected CPUs / 4, minimum 1.
 
 `--max-concurrent-searches` bounds admitted search pipelines. Default: CPUs / 8,
 clamped to 1–8. Overload fails immediately with `RESOURCE_EXHAUSTED`; retry with
-bounded backoff. Completion/cancellation releases admission. Document lookup and
-metadata RPCs do not consume search permits.
+bounded backoff. Completion releases admission. Cancellation releases it only
+once search-pool work started for the request also finishes: that work cannot
+be interrupted, so it keeps the permit. Document lookup and metadata RPCs do not
+consume search permits.
+
+`--search-stall-restart-secs` (default `300`, `0` disables) restarts the server
+when every search permit has been held that long and no search has completed.
+That state otherwise rejects every search until an operator restarts the
+process. The server logs a `[search_stall]` report, then shuts down gracefully
+(indexes commit) and exits non-zero for its supervisor to restart it. If
+shutdown has not finished after 120 s, it exits with status 70. The report lists
+each admitted search's index, age, phase (`opening`, `retrieving`, `reranking`,
+`loading`), query and whether its caller is gone. It also gives the search-pool
+job counts and the sparse I/O gates' active and waiting scorers. Keep the
+interval well above the longest legitimate search.
 
 Request limits:
 
