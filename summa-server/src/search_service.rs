@@ -16,11 +16,14 @@ use crate::proto::*;
 use crate::registry::IndexRegistry;
 
 mod candidate_scoring;
+mod progress;
 mod response;
 #[cfg(test)]
 mod tests;
 mod validation;
 
+use progress::{SearchPhase, SearchProgress};
+pub use progress::{StallMonitor, StallReport};
 use response::{
     SearchResponseBudget, resolve_requested_fields, retained_field_entry_bytes,
     retained_field_value_bytes, retained_hit_base_bytes,
@@ -38,6 +41,8 @@ fn canonical_metric_index_label(schema: &summa_core::Schema) -> &str {
 pub struct SearchServiceImpl {
     pub registry: Arc<IndexRegistry>,
     search_permits: Arc<Semaphore>,
+    max_concurrent_searches: usize,
+    progress: Arc<SearchProgress>,
     limits: SearchLimits,
 }
 
@@ -54,8 +59,19 @@ impl SearchServiceImpl {
         Self {
             registry,
             search_permits: Arc::new(Semaphore::new(max_concurrent_searches)),
+            max_concurrent_searches,
+            progress: SearchProgress::new(),
             limits,
         }
+    }
+
+    /// Detector for exhausted admission without completed searches.
+    pub fn stall_monitor(&self) -> StallMonitor {
+        StallMonitor::new(
+            Arc::clone(&self.search_permits),
+            self.max_concurrent_searches,
+            Arc::clone(&self.progress),
+        )
     }
 
     fn acquire_search_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
@@ -77,6 +93,7 @@ impl SearchService for SearchServiceImpl {
     ) -> Result<Response<SearchResponse>, Status> {
         let req = request.into_inner();
         let metric_index = std::sync::OnceLock::new();
+        let admitted = std::sync::OnceLock::new();
         let t = std::time::Instant::now();
         let result = async {
         let budget = validate_search_budget(&req, &self.limits)?;
@@ -85,7 +102,11 @@ impl SearchService for SearchServiceImpl {
         // unbounded waiter queue retaining decoded requests under overload.
         // The search-pool job shares the permit: it outlives a cancelled
         // request, so admission is released when both have finished.
-        let search_permit = Arc::new(self.acquire_search_permit()?);
+        let search_permit = self
+            .progress
+            .admit(self.acquire_search_permit()?, &req.index_name);
+        let _request = search_permit.request_scope();
+        let _ = admitted.set(());
 
         let index = self.registry.get_or_open_index(&req.index_name).await?;
         let _ = metric_index.set(canonical_metric_index_label(&index.schema()).to_owned());
@@ -131,6 +152,7 @@ impl SearchService for SearchServiceImpl {
             .transpose()?;
 
         // ── Phase 1: L1 search ──────────────────────────────────────────────
+        search_permit.set_phase(SearchPhase::Retrieving);
         let start = Instant::now();
         let t_search = Instant::now();
         let query_desc;
@@ -162,6 +184,7 @@ impl SearchService for SearchServiceImpl {
                 let nominations: Vec<_> = fusion.queries.iter().zip(&queries).filter(|(branch, _)| !branch.score_only)
                     .map(|(_, query)| candidate_scoring::with_filters(query.clone(), &filters)).collect();
                 let depth = if fusion.candidate_depth == 0 { candidate_limit } else { fusion.candidate_depth as usize };
+                search_permit.describe(&format!("scoring {} branches, nominating {} at depth {}", queries.len(), nominations.len(), depth));
                 let lists = searcher.search_candidate_lists(&nominations, depth, Some(stats.clone())).await.map_err(crate::error::summa_error_to_status)?;
                 let seen = lists.iter().fold(0u32, |sum, (_, seen)| sum.saturating_add(*seen));
                 let candidates = searcher.merge_candidate_lists(lists.iter().map(|(list, _)| list.as_slice())).map_err(crate::error::summa_error_to_status)?;
@@ -170,6 +193,7 @@ impl SearchService for SearchServiceImpl {
                 if req.l1.is_none() && candidates.len() > limit {
                     return Err(Status::invalid_argument(format!("feature export needs limit >= complete candidate union ({} documents)", candidates.len())));
                 }
+                search_permit.describe(&format!("scoring {} branches over {} candidates", queries.len(), candidates.len()));
                 let t_scoring = Instant::now();
                 let needs_rrf = plan.model.as_ref().is_some_and(summa_core::query::RankingModel::needs_rrf);
                 let rrf = needs_rrf.then(|| candidate_scoring::rrf_scores(&searcher, &req, fusion, &lists, &candidates)).transpose()?;
@@ -188,6 +212,7 @@ impl SearchService for SearchServiceImpl {
                 if req.include_rrf_scores || req.tracing { nomination_lists = lists; }
                 ranking_method = if req.l1.is_some() { "formula_v1" } else { "feature_export_v2" }.into();
                 query_desc = format!("{}: {} branches, depth {}, union {}", ranking_method, queries.len(), depth, candidates.len());
+                search_permit.describe(&query_desc);
                 (results, seen, rerank_setup.map(|config| (config, limit)))
             } else if let Some(crate::proto::query::Query::Fusion(fusion)) = &query.query {
                 // Fusion: run each sub-query independently and fuse the ranked
@@ -232,6 +257,7 @@ impl SearchService for SearchServiceImpl {
                     }
                     ranking_method = "fusion_candidates_v1".into();
                     query_desc = format!("candidate export of {} branches, depth {}", sub_queries.len(), depth);
+                    search_permit.describe(&query_desc);
                     (candidates, seen, None)
                 } else {
                 let method = match fusion.method() {
@@ -270,6 +296,7 @@ impl SearchService for SearchServiceImpl {
                     method,
                     candidate_limit
                 );
+                search_permit.describe(&query_desc);
                 log::info!(
                     "search: index={}, limit={}, candidates={}, query={}",
                     req.index_name,
@@ -315,6 +342,7 @@ impl SearchService for SearchServiceImpl {
                 .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
 
                 query_desc = core_query.to_string();
+                search_permit.describe(&query_desc);
                 log::info!(
                     "search: index={}, limit={}, candidates={}, query={}",
                     req.index_name,
@@ -347,6 +375,7 @@ impl SearchService for SearchServiceImpl {
         } else { None };
 
         // ── Phase 2: L2 reranking (optional) ────────────────────────────────
+        search_permit.set_phase(SearchPhase::Reranking);
         let t_rerank = Instant::now();
         let results = if let Some((config, final_limit)) = rerank_config {
             summa_core::query::rerank(&searcher, &results, &config, final_limit)
@@ -417,6 +446,7 @@ impl SearchService for SearchServiceImpl {
             }
         }
 
+        search_permit.set_phase(SearchPhase::Loading);
         let mut hits = Vec::with_capacity(results.len());
         let prepare_reads = !requested_fields.is_empty() && searcher.has_lazy_document_reads();
         let mut prepared = None;
@@ -552,6 +582,11 @@ impl SearchService for SearchServiceImpl {
         Ok(Response::new(response))
             }
         .await;
+        // Only an admitted search that ran to a response or error is progress;
+        // a cancelled request never reaches this point.
+        if admitted.get().is_some() {
+            self.progress.record_completion();
+        }
         let status = if result.is_ok() { "ok" } else { "error" };
         let metric_index = metric_index
             .get()
@@ -619,39 +654,48 @@ impl SearchService for SearchServiceImpl {
     ) -> Result<Response<GetTextStatsResponse>, Status> {
         let req = request.into_inner();
         validate_text_stats_request(&req, &self.limits.shape)?;
-        let _search_permit = self.acquire_search_permit()?;
-        let query = req
-            .query
-            .ok_or_else(|| Status::invalid_argument("query is required"))?;
-        let index = self.registry.get_or_open_index(&req.index_name).await?;
-        let reader = index
-            .reader()
-            .await
-            .map_err(crate::error::summa_error_to_status)?;
-        let searcher = reader
-            .searcher()
-            .await
-            .map_err(crate::error::summa_error_to_status)?;
-        // Collect every token: the broker merges frequencies for the
-        // complete query before shards choose which capped tokens to keep.
-        let core_query = convert_query_with_rarity(
-            &query,
-            searcher.schema(),
-            Some(searcher.global_stats()),
-            TermRarity::Uncapped,
-            Some(index.directory().root()),
-            &self.limits.shape,
-        )
-        .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
-        let mut terms = Vec::new();
-        core_query.text_terms(&mut terms);
-        terms.sort_unstable_by(|a, b| (a.0.0, &a.1).cmp(&(b.0.0, &b.1)));
-        terms.dedup_by(|a, b| a.0.0 == b.0.0 && a.1 == b.1);
-        let stats = searcher.global_stats().text_stats_for(&terms);
-        Ok(Response::new(GetTextStatsResponse {
-            stats: Some(text_stats_to_proto(&stats, searcher.schema())),
-            missing_partitions: 0,
-        }))
+        let admission = self
+            .progress
+            .admit(self.acquire_search_permit()?, &req.index_name);
+        admission.describe("text stats");
+        let result = async {
+            let query = req
+                .query
+                .ok_or_else(|| Status::invalid_argument("query is required"))?;
+            let index = self.registry.get_or_open_index(&req.index_name).await?;
+            let reader = index
+                .reader()
+                .await
+                .map_err(crate::error::summa_error_to_status)?;
+            let searcher = reader
+                .searcher()
+                .await
+                .map_err(crate::error::summa_error_to_status)?;
+            // Collect every token: the broker merges frequencies for the
+            // complete query before shards choose which capped tokens to keep.
+            let core_query = convert_query_with_rarity(
+                &query,
+                searcher.schema(),
+                Some(searcher.global_stats()),
+                TermRarity::Uncapped,
+                Some(index.directory().root()),
+                &self.limits.shape,
+            )
+            .map_err(|e| Status::invalid_argument(format!("Invalid query: {}", e)))?;
+            let mut terms = Vec::new();
+            core_query.text_terms(&mut terms);
+            terms.sort_unstable_by(|a, b| (a.0.0, &a.1).cmp(&(b.0.0, &b.1)));
+            terms.dedup_by(|a, b| a.0.0 == b.0.0 && a.1 == b.1);
+            let stats = searcher.global_stats().text_stats_for(&terms);
+            Ok(Response::new(GetTextStatsResponse {
+                stats: Some(text_stats_to_proto(&stats, searcher.schema())),
+                missing_partitions: 0,
+            }))
+        }
+        .await;
+        self.progress.record_completion();
+        drop(admission);
+        result
     }
 
     async fn get_index_info(

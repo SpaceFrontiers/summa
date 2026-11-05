@@ -29,6 +29,8 @@ mod content_hash;
 mod primary_key;
 #[cfg(feature = "native")]
 mod reader;
+#[cfg(feature = "native")]
+mod runtime_state;
 #[cfg(any(feature = "native", feature = "wasm"))]
 pub(crate) mod staged_row;
 #[cfg(feature = "native")]
@@ -41,6 +43,8 @@ mod writer;
 pub use primary_key::PrimaryKeyIndex;
 #[cfg(feature = "native")]
 pub use reader::IndexReader;
+#[cfg(feature = "native")]
+pub use runtime_state::{SearchRuntimeState, SparseIoGateState, search_runtime_state};
 #[cfg(feature = "native")]
 pub use vector_builder::{AlterVectorIndexOutcome, AlterVectorIndexState};
 #[cfg(all(feature = "wasm", not(feature = "native")))]
@@ -119,6 +123,8 @@ pub(crate) struct SparseIoGate {
     active: parking_lot::Mutex<usize>,
     available: parking_lot::Condvar,
     async_available: tokio::sync::Notify,
+    /// Scorers waiting for a permit (diagnostics only).
+    waiting: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(feature = "native")]
@@ -129,20 +135,35 @@ impl SparseIoGate {
             active: parking_lot::Mutex::new(0),
             available: parking_lot::Condvar::new(),
             async_available: tokio::sync::Notify::new(),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn state(&self) -> SparseIoGateState {
+        SparseIoGateState {
+            limit: self.limit,
+            active: *self.active.lock(),
+            waiting: self.waiting.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
 
     #[cfg(feature = "sync")]
     fn acquire(&self) -> SparseIoPermit<'_> {
+        use std::sync::atomic::Ordering;
         let mut active = self.active.lock();
-        while *active >= self.limit {
-            self.available.wait(&mut active);
+        if *active >= self.limit {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
+            while *active >= self.limit {
+                self.available.wait(&mut active);
+            }
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
         }
         *active += 1;
         SparseIoPermit { gate: self }
     }
 
     async fn acquire_async(&self) -> SparseIoPermit<'_> {
+        let mut waiting = None;
         loop {
             // Register before checking the counter, so a release between the
             // check and await cannot be lost.
@@ -154,8 +175,28 @@ impl SparseIoGate {
                     return SparseIoPermit { gate: self };
                 }
             }
+            waiting.get_or_insert_with(|| GateWaiter::new(&self.waiting));
             notified.await;
         }
+    }
+}
+
+/// Counts a parked async waiter; dropping a cancelled acquisition releases it.
+#[cfg(feature = "native")]
+struct GateWaiter<'a>(&'a std::sync::atomic::AtomicUsize);
+
+#[cfg(feature = "native")]
+impl<'a> GateWaiter<'a> {
+    fn new(waiting: &'a std::sync::atomic::AtomicUsize) -> Self {
+        waiting.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(waiting)
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for GateWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -524,6 +565,22 @@ pub(crate) fn shared_sparse_io_gate(limit: usize) -> Arc<SparseIoGate> {
         "[sparse] process-wide random-I/O concurrency={limit}"
     );
     gate
+}
+
+/// States of every live sparse I/O gate, ordered by limit.
+#[cfg(feature = "native")]
+pub(crate) fn sparse_io_gate_states() -> Vec<SparseIoGateState> {
+    let Some(gates) = SPARSE_IO_GATES.get() else {
+        return Vec::new();
+    };
+    let mut states: Vec<_> = gates
+        .lock()
+        .values()
+        .filter_map(Weak::upgrade)
+        .map(|gate| gate.state())
+        .collect();
+    states.sort_unstable_by_key(|state| state.limit);
+    states
 }
 
 #[cfg(feature = "native")]
