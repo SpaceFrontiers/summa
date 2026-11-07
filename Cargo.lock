@@ -3278,9 +3278,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -7526,6 +7528,7 @@ dependencies = [
  "exmex",
  "fst",
  "futures",
+ "getrandom 0.3.4",
  "getrandom 0.4.3",
  "half",
  "hashbrown 0.17.1",
@@ -7758,6 +7761,7 @@ dependencies = [
  "console_error_panic_hook",
  "console_log",
  "futures-channel",
+ "getrandom 0.3.4",
  "getrandom 0.4.3",
  "js-sys",
  "log",
