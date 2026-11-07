@@ -15,7 +15,6 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Pod, Service};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
-use k8s_openapi::chrono::Utc;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
@@ -548,7 +547,7 @@ fn set_condition(
         .conditions
         .iter()
         .find(|c| c.type_ == type_ && c.status == value)
-        .map_or_else(|| Time(Utc::now()), |c| c.last_transition_time.clone());
+        .map_or_else(|| Time(k8s_openapi::jiff::Timestamp::now()), |c| c.last_transition_time.clone());
     let condition = Condition {
         type_: type_.to_string(),
         status: value.to_string(),

@@ -1156,7 +1156,7 @@ fn read_pinned_checkpoint_bytes_after_open(
             "pinned checkpoint publication changed while it was read"
         );
     }
-    let observed = format!("sha256:{:x}", Sha256::digest(&bytes));
+    let observed = format!("sha256:{}", summa_train::artifact_io::lower_hex(Sha256::digest(&bytes)));
     ensure!(
         observed == expected_sha256,
         "pinned checkpoint hash mismatch: expected {expected_sha256}, observed {observed}"
@@ -1185,7 +1185,7 @@ fn token_cache_path(root: &Path, data: &str, source: &Path, tokenizer: &str) -> 
         source,
         tokenizer,
     })?;
-    Ok(root.join(format!("{:x}.tokens", Sha256::digest(identity))))
+    Ok(root.join(format!("{}.tokens", summa_train::artifact_io::lower_hex(Sha256::digest(identity)))))
 }
 
 fn shuffle_seed(seed: u64, phase: usize, epoch: usize) -> u64 {
@@ -1364,7 +1364,7 @@ fn run_signature(
         gpu_metrics_interval_ms: args.gpu_metrics_interval_ms,
         gpu_physical_device: &args.gpu_physical_device,
     })?;
-    Ok(format!("sha256:{:x}", Sha256::digest(encoded)))
+    Ok(format!("sha256:{}", summa_train::artifact_io::lower_hex(Sha256::digest(encoded))))
 }
 
 fn bind_phase_data(
@@ -1901,7 +1901,7 @@ fn run_workflow_dispatch_identity(
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part);
     }
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", summa_train::artifact_io::lower_hex(hasher.finalize())))
 }
 
 fn run_workflow_command(args: RunWorkflowArgs) -> Result<()> {
@@ -2870,7 +2870,7 @@ mod tests {
                 gpu_physical_device: &args.gpu_physical_device,
             })
             .unwrap();
-            format!("sha256:{:x}", Sha256::digest(encoded))
+            format!("sha256:{}", summa_train::artifact_io::lower_hex(Sha256::digest(encoded)))
         };
         let baseline = valid_train_args();
         let mut interval = valid_train_args();

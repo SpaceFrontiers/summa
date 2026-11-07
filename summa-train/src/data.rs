@@ -376,7 +376,7 @@ fn hash_stable_phase_file(
         path.display()
     );
     file.rewind()?;
-    Ok(format!("sha256:{:x}", hasher.finalize()))
+    Ok(format!("sha256:{}", crate::artifact_io::lower_hex(hasher.finalize())))
 }
 
 fn with_decoded_reader<T, R: Read>(

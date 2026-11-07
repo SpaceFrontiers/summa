@@ -373,7 +373,7 @@ fn prospective_update_hash_inner(
         hash.update(before);
         hash.update(after);
     }
-    Ok(format!("sha256:{:x}", hash.finalize()))
+    Ok(format!("sha256:{}", crate::artifact_io::lower_hex(hash.finalize())))
 }
 
 /// Bind the exact sender tier's base plus currently active reserve slots.
@@ -2974,7 +2974,7 @@ pub(crate) fn model_parameter_hash(model: &Transformer) -> Result<String> {
     if let Some(error) = visitor.failure {
         bail!("reading Transformer parameters for candidate verification: {error}");
     }
-    Ok(format!("sha256:{:x}", visitor.hash.finalize()))
+    Ok(format!("sha256:{}", crate::artifact_io::lower_hex(visitor.hash.finalize())))
 }
 
 /// Operations allowed to mutate an owned trial model or generation-policy
@@ -3202,7 +3202,7 @@ fn model_probe_hash(
     for value in values {
         hash.update(value.to_bits().to_le_bytes());
     }
-    Ok(format!("sha256:{:x}", hash.finalize()))
+    Ok(format!("sha256:{}", crate::artifact_io::lower_hex(hash.finalize())))
 }
 
 #[cfg(test)]
