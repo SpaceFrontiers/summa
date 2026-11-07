@@ -558,6 +558,27 @@ export interface SearchRequest {
    * does not rerun subqueries or change retrieval/ranking budgets.
    */
   tracing: boolean;
+  /**
+   * Return the listed multi-value stored fields only near each hit's best
+   * ordinals instead of every value (see OrdinalWindow). Unset = whole fields.
+   */
+  ordinalWindow: OrdinalWindow | undefined;
+}
+
+/**
+ * Bounds multi-value stored fields (for example per-chunk spans) to the
+ * ordinals a caller can use: the `top` highest-scoring ordinals of each hit
+ * (ties: lower ordinal first), each widened by `radius` ordinals on both sides.
+ * Windowed values carry their ordinals in FieldValueList.ordinals; a hit
+ * without ordinal scores returns no values for these fields.
+ */
+export interface OrdinalWindow {
+  /** Fields to window; each must also be listed in fields_to_load. */
+  fields: string[];
+  /** 1..=64 ordinals kept per hit. */
+  top: number;
+  /** 0..=16 neighbours kept on each side of a kept ordinal. */
+  radius: number;
 }
 
 export interface GetTextStatsRequest {
@@ -676,6 +697,11 @@ export interface PassageScores_ScoresEntry {
 /** List of field values — supports multi-value fields (e.g. multiple URIs per document) */
 export interface FieldValueList {
   values: FieldValue[];
+  /**
+   * Set only for fields windowed by SearchRequest.ordinal_window: the ordinal
+   * of each value, ascending and parallel to `values`.
+   */
+  ordinals: number[];
 }
 
 /** Score contribution from a specific ordinal in a multi-valued field */
@@ -4034,6 +4060,7 @@ function createBaseSearchRequest(): SearchRequest {
     scoreExport: undefined,
     includeRrfScores: false,
     tracing: false,
+    ordinalWindow: undefined,
   };
 }
 
@@ -4077,6 +4104,9 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     }
     if (message.tracing !== false) {
       writer.uint32(104).bool(message.tracing);
+    }
+    if (message.ordinalWindow !== undefined) {
+      OrdinalWindow.encode(message.ordinalWindow, writer.uint32(114).fork()).join();
     }
     return writer;
   },
@@ -4198,6 +4228,14 @@ export const SearchRequest: MessageFns<SearchRequest> = {
             message.tracing = reader.bool();
             continue;
           }
+          case 14: {
+            if (tag !== 114) {
+              break;
+            }
+
+            message.ordinalWindow = OrdinalWindow.decode(reader, reader.uint32());
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -4253,6 +4291,11 @@ export const SearchRequest: MessageFns<SearchRequest> = {
         ? globalThis.Boolean(object.include_rrf_scores)
         : false,
       tracing: isSet(object.tracing) ? globalThis.Boolean(object.tracing) : false,
+      ordinalWindow: isSet(object.ordinalWindow)
+        ? OrdinalWindow.fromJSON(object.ordinalWindow)
+        : isSet(object.ordinal_window)
+        ? OrdinalWindow.fromJSON(object.ordinal_window)
+        : undefined,
     };
   },
 
@@ -4297,6 +4340,9 @@ export const SearchRequest: MessageFns<SearchRequest> = {
     if (message.tracing !== false) {
       obj.tracing = message.tracing;
     }
+    if (message.ordinalWindow !== undefined) {
+      obj.ordinalWindow = OrdinalWindow.toJSON(message.ordinalWindow);
+    }
     return obj;
   },
 
@@ -4324,6 +4370,110 @@ export const SearchRequest: MessageFns<SearchRequest> = {
       : undefined;
     message.includeRrfScores = object.includeRrfScores ?? false;
     message.tracing = object.tracing ?? false;
+    message.ordinalWindow = (object.ordinalWindow !== undefined && object.ordinalWindow !== null)
+      ? OrdinalWindow.fromPartial(object.ordinalWindow)
+      : undefined;
+    return message;
+  },
+};
+
+function createBaseOrdinalWindow(): OrdinalWindow {
+  return { fields: [], top: 0, radius: 0 };
+}
+
+export const OrdinalWindow: MessageFns<OrdinalWindow> = {
+  encode(message: OrdinalWindow, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    for (const v of message.fields) {
+      writer.uint32(10).string(v!);
+    }
+    if (message.top !== 0) {
+      writer.uint32(16).uint32(message.top);
+    }
+    if (message.radius !== 0) {
+      writer.uint32(24).uint32(message.radius);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): OrdinalWindow {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseOrdinalWindow();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 10) {
+              break;
+            }
+
+            message.fields.push(reader.string());
+            continue;
+          }
+          case 2: {
+            if (tag !== 16) {
+              break;
+            }
+
+            message.top = reader.uint32();
+            continue;
+          }
+          case 3: {
+            if (tag !== 24) {
+              break;
+            }
+
+            message.radius = reader.uint32();
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): OrdinalWindow {
+    return {
+      fields: globalThis.Array.isArray(object?.fields) ? object.fields.map((e: any) => globalThis.String(e)) : [],
+      top: isSet(object.top) ? globalThis.Number(object.top) : 0,
+      radius: isSet(object.radius) ? globalThis.Number(object.radius) : 0,
+    };
+  },
+
+  toJSON(message: OrdinalWindow): unknown {
+    const obj: any = {};
+    if (message.fields?.length) {
+      obj.fields = message.fields;
+    }
+    if (message.top !== 0) {
+      obj.top = Math.round(message.top);
+    }
+    if (message.radius !== 0) {
+      obj.radius = Math.round(message.radius);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<OrdinalWindow>): OrdinalWindow {
+    return OrdinalWindow.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<OrdinalWindow>): OrdinalWindow {
+    const message = createBaseOrdinalWindow();
+    message.fields = object.fields?.map((e) => e) || [];
+    message.top = object.top ?? 0;
+    message.radius = object.radius ?? 0;
     return message;
   },
 };
@@ -5798,13 +5948,20 @@ export const PassageScores_ScoresEntry: MessageFns<PassageScores_ScoresEntry> = 
 };
 
 function createBaseFieldValueList(): FieldValueList {
-  return { values: [] };
+  return { values: [], ordinals: [] };
 }
 
 export const FieldValueList: MessageFns<FieldValueList> = {
   encode(message: FieldValueList, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     for (const v of message.values) {
       FieldValue.encode(v!, writer.uint32(10).fork()).join();
+    }
+    if (message.ordinals.length !== 0) {
+      writer.uint32(18).fork();
+      for (const v of message.ordinals) {
+        writer.uint32(v);
+      }
+      writer.join();
     }
     return writer;
   },
@@ -5830,6 +5987,24 @@ export const FieldValueList: MessageFns<FieldValueList> = {
             message.values.push(FieldValue.decode(reader, reader.uint32()));
             continue;
           }
+          case 2: {
+            if (tag === 16) {
+              message.ordinals.push(reader.uint32());
+
+              continue;
+            }
+
+            if (tag === 18) {
+              const end2 = reader.uint32() + reader.pos;
+              while (reader.pos < end2) {
+                message.ordinals.push(reader.uint32());
+              }
+
+              continue;
+            }
+
+            break;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -5845,6 +6020,7 @@ export const FieldValueList: MessageFns<FieldValueList> = {
   fromJSON(object: any): FieldValueList {
     return {
       values: globalThis.Array.isArray(object?.values) ? object.values.map((e: any) => FieldValue.fromJSON(e)) : [],
+      ordinals: globalThis.Array.isArray(object?.ordinals) ? object.ordinals.map((e: any) => globalThis.Number(e)) : [],
     };
   },
 
@@ -5852,6 +6028,9 @@ export const FieldValueList: MessageFns<FieldValueList> = {
     const obj: any = {};
     if (message.values?.length) {
       obj.values = message.values.map((e) => FieldValue.toJSON(e));
+    }
+    if (message.ordinals?.length) {
+      obj.ordinals = message.ordinals.map((e) => Math.round(e));
     }
     return obj;
   },
@@ -5862,6 +6041,7 @@ export const FieldValueList: MessageFns<FieldValueList> = {
   fromPartial(object: DeepPartial<FieldValueList>): FieldValueList {
     const message = createBaseFieldValueList();
     message.values = object.values?.map((e) => FieldValue.fromPartial(e)) || [];
+    message.ordinals = object.ordinals?.map((e) => e) || [];
     return message;
   },
 };

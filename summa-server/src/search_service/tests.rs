@@ -1940,7 +1940,10 @@ async fn ordinal_window_shape_is_validated_before_index_open() {
     };
     for (window, expected) in [
         (window(&[], 5, 1), "must name at least one field"),
-        (window(&["uris"], 5, 1), "'uris' must also be in fields_to_load"),
+        (
+            window(&["uris"], 5, 1),
+            "'uris' must also be in fields_to_load",
+        ),
         (window(&["span"], 0, 1), "top must be 1..=64"),
         (window(&["span"], 65, 1), "top must be 1..=64"),
         (window(&["span"], 5, 17), "radius must be at most 16"),

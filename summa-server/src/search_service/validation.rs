@@ -426,11 +426,20 @@ pub(super) const MAX_ORDINAL_WINDOW_TOP: u32 = 64;
 /// Most neighbours an ordinal window adds on each side.
 pub(super) const MAX_ORDINAL_WINDOW_RADIUS: u32 = 16;
 
-fn validate_ordinal_window(window: &OrdinalWindow, fields_to_load: &[String]) -> Result<(), Status> {
+fn validate_ordinal_window(
+    window: &OrdinalWindow,
+    fields_to_load: &[String],
+) -> Result<(), Status> {
     if window.fields.is_empty() {
-        return Err(Status::invalid_argument("SearchRequest.ordinal_window.fields must name at least one field"));
+        return Err(Status::invalid_argument(
+            "SearchRequest.ordinal_window.fields must name at least one field",
+        ));
     }
-    if let Some(field) = window.fields.iter().find(|field| !fields_to_load.contains(field)) {
+    if let Some(field) = window
+        .fields
+        .iter()
+        .find(|field| !fields_to_load.contains(field))
+    {
         return Err(Status::invalid_argument(format!(
             "SearchRequest.ordinal_window.fields entry '{field}' must also be in fields_to_load"
         )));

@@ -950,7 +950,10 @@ mod ordinal_window_tests {
     #[test]
     fn keeps_the_best_ordinals_and_their_neighbours() {
         let rows = scores(&[(40, 0.9), (3, 0.2), (0, 0.5), (41, 0.1), (900, 0.8)]);
-        assert_eq!(window_ordinals(&rows, 2, 1), vec![39, 40, 41, 899, 900, 901]);
+        assert_eq!(
+            window_ordinals(&rows, 2, 1),
+            vec![39, 40, 41, 899, 900, 901]
+        );
         assert_eq!(window_ordinals(&rows, 3, 0), vec![0, 40, 900]);
     }
 
