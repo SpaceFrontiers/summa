@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::ops::Range;
 
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use super::quantized_dot::QuantizedDotKernel;
 use super::{

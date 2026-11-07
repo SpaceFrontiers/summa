@@ -1,13 +1,12 @@
 //! Unified output formatting with comfy_table
 
-use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
+use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 
 /// Create a styled table with standard formatting
 pub fn create_table(headers: Vec<&str>) -> Table {
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(headers.iter().map(|h| Cell::new(*h).fg(Color::Cyan)));
     table
 }

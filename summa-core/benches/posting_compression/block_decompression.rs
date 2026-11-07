@@ -181,7 +181,7 @@ pub fn bench_raw_throughput(_c: &mut Criterion) {
 
     // Build table with comfy-table
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
+    table.load_style(UTF8_FULL);
     table.set_header(vec![
         Cell::new("Bits"),
         Cell::new("Unpack Only\n(bitpacking)"),
@@ -295,7 +295,7 @@ pub fn bench_rounded_bitpacking(_c: &mut Criterion) {
 
     // Build table
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
+    table.load_style(UTF8_FULL);
     table.set_header(vec![
         Cell::new("Exact\nBits"),
         Cell::new("Rounded\nBits"),
@@ -396,7 +396,7 @@ pub fn bench_rounded_fused_delta(_c: &mut Criterion) {
 
     // Build table
     let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
+    table.load_style(UTF8_FULL);
     table.set_header(vec![
         Cell::new("Rounded\nBits"),
         Cell::new("Unpack Only\n(Gints/s)"),

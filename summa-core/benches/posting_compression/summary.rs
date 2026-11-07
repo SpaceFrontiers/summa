@@ -1,6 +1,6 @@
 //! Summary table benchmarks with formatted output
 
-use comfy_table::{Cell, Color, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
+use comfy_table::{Cell, Color, Table, presets::UTF8_FULL};
 use criterion::Criterion;
 
 use super::access_patterns::{AccessPattern, measure_access_pattern};
@@ -32,8 +32,7 @@ pub fn bench_all_formats_compression_summary(_c: &mut Criterion) {
     // ═══════════════════════════════════════════════════════════════════════════════
     let mut compression_table = Table::new();
     compression_table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             "Distribution",
             "Size",
@@ -119,8 +118,7 @@ pub fn bench_all_formats_compression_summary(_c: &mut Criterion) {
     // ═══════════════════════════════════════════════════════════════════════════════
     let mut encoding_table = Table::new();
     encoding_table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             "Distribution",
             "Size",
@@ -201,8 +199,7 @@ pub fn bench_all_formats_compression_summary(_c: &mut Criterion) {
     // ═══════════════════════════════════════════════════════════════════════════════
     let mut decoding_table = Table::new();
     decoding_table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             "Distribution",
             "Size",
@@ -283,8 +280,7 @@ pub fn bench_all_formats_compression_summary(_c: &mut Criterion) {
     // ═══════════════════════════════════════════════════════════════════════════════
     let mut access_table = Table::new();
     access_table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
+        .load_style(UTF8_FULL.with_rounded_corners())
         .set_header(vec![
             "Pattern", "HorizBP", "VertBP", "EF", "PEF", "Roaring", "OptP4D", "Best",
         ]);

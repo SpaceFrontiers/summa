@@ -62,7 +62,10 @@ fn binary() -> &'static str {
 }
 
 fn sha256(bytes: &[u8]) -> String {
-    format!("sha256:{:x}", Sha256::digest(bytes))
+    format!(
+        "sha256:{}",
+        summa_train::artifact_io::lower_hex(Sha256::digest(bytes))
+    )
 }
 
 fn run_train(

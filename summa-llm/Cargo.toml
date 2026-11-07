@@ -53,7 +53,7 @@ rand = { workspace = true }
 
 # Local model-lab server (feature-gated so summa-train does not pull it in)
 axum = { version = "0.8", optional = true, default-features = false, features = ["http1", "json", "tokio"] }
-tower-http = { version = "0.6", optional = true, default-features = false, features = ["fs"] }
+tower-http = { version = "0.7", optional = true, default-features = false, features = ["fs"] }
 
 # Remote artifact loading (s3://, gs://, http(s)://). The pinned upstream
 # 0.14.1 revision includes the quick-xml security update not in crates.io 0.14.0.
@@ -61,7 +61,7 @@ tower-http = { version = "0.6", optional = true, default-features = false, featu
 object_store = { version = "0.14", git = "https://github.com/apache/arrow-rs-object-store.git", rev = "c7316d29face118e7409eead0cda098f38589428", default-features = false, features = ["aws", "gcp", "http"], optional = true }
 tokio = { version = "1", default-features = false, features = ["fs", "macros", "net", "rt", "rt-multi-thread", "signal", "sync"], optional = true }
 url = { version = "2", optional = true }
-dirs = { version = "6", optional = true }
+dirs = { version = "7", optional = true }
 
 [features]
 default = ["remote", "lab"]

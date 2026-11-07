@@ -1092,8 +1092,8 @@ pub fn metric_log_digests(
     .with_context(|| format!("validate metric log {} for digest", path.display()))?;
     ensure!(visited.reached_eof, "complete metric digest stopped early");
     Ok(MetricLogDigests {
-        raw_sha256: format!("{:x}", raw.finalize()),
-        semantic_progress_sha256: format!("{:x}", semantic.finalize()),
+        raw_sha256: crate::artifact_io::lower_hex(raw.finalize()),
+        semantic_progress_sha256: crate::artifact_io::lower_hex(semantic.finalize()),
         records: visited.state.records,
         last_global_step: visited.state.last_global_step,
     })
@@ -1120,7 +1120,7 @@ pub(crate) fn metric_log_digests_from_bytes(
     })?;
     Ok(MetricLogDigests {
         raw_sha256: sha256_hex(bytes),
-        semantic_progress_sha256: format!("{:x}", semantic.finalize()),
+        semantic_progress_sha256: crate::artifact_io::lower_hex(semantic.finalize()),
         records: state.records,
         last_global_step: state.last_global_step,
     })

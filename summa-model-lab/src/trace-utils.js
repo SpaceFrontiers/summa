@@ -124,7 +124,7 @@ export function parseTraceJson(text) {
   try {
     parsed = JSON.parse(text)
   } catch (error) {
-    throw new Error(`Trace is not valid JSON: ${error.message}`)
+    throw new Error(`Trace is not valid JSON: ${error.message}`, { cause: error })
   }
   return validateTrace(parsed)
 }

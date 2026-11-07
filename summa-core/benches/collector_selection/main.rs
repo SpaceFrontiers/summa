@@ -11,7 +11,7 @@ use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
 };
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use summa_core::query::{Bm25Params, HeapEntry, ScoreCollector};
 
 const BLOCK: usize = 128;
