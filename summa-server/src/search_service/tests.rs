@@ -1924,3 +1924,109 @@ async fn long_match_queries_keep_the_rarest_tokens_by_default_and_up_to_the_engi
     }
     registry.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn ordinal_window_shape_is_validated_before_index_open() {
+    let temp = tempfile::tempdir().unwrap();
+    let service = SearchServiceImpl::new(
+        Arc::new(IndexRegistry::new(temp.path().into(), Default::default())),
+        1,
+        limits(),
+    );
+    let window = |fields: &[&str], top, radius| OrdinalWindow {
+        fields: fields.iter().map(|field| field.to_string()).collect(),
+        top,
+        radius,
+    };
+    for (window, expected) in [
+        (window(&[], 5, 1), "must name at least one field"),
+        (window(&["uris"], 5, 1), "'uris' must also be in fields_to_load"),
+        (window(&["span"], 0, 1), "top must be 1..=64"),
+        (window(&["span"], 65, 1), "top must be 1..=64"),
+        (window(&["span"], 5, 17), "radius must be at most 16"),
+    ] {
+        let error = service
+            .search(Request::new(SearchRequest {
+                index_name: "absent".into(),
+                query: Some(all_query()),
+                fields_to_load: vec!["span".into()],
+                ordinal_window: Some(window),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains(expected), "{error}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinal_window_returns_only_values_near_the_best_ordinals() {
+    let temp = tempfile::tempdir().unwrap();
+    let registry = Arc::new(IndexRegistry::new(temp.path().into(), Default::default()));
+    let mut schema = summa_core::Schema::builder();
+    let binary = schema.add_binary_dense_vector_field("binary", 8, true, true);
+    schema.set_multi(binary, true);
+    registry
+        .create_index("window-test", schema.build())
+        .await
+        .unwrap();
+    let writer = registry.get_writer("window-test").await.unwrap();
+    {
+        let mut writer = writer.write().await;
+        let mut document = summa_core::Document::new();
+        for ordinal in 0..2000 {
+            document.add_binary_dense_vector(binary, vec![if ordinal == 1000 { 255 } else { 0 }]);
+        }
+        writer.add_document(document).unwrap();
+        writer.commit().await.unwrap();
+    }
+    let index = registry.get_or_open_index("window-test").await.unwrap();
+    index.reader().await.unwrap().reload().await.unwrap();
+    let service = SearchServiceImpl::new(registry.clone(), 1, limits());
+    let search = |ordinal_window: Option<OrdinalWindow>| {
+        let service = &service;
+        async move {
+            service
+                .search(Request::new(SearchRequest {
+                    index_name: "window-test".into(),
+                    limit: 1,
+                    query: Some(Query {
+                        query: Some(query::Query::BinaryDenseVector(
+                            crate::proto::BinaryDenseVectorQuery {
+                                field: "binary".into(),
+                                vector: vec![255],
+                                combiner: crate::proto::MultiValueCombiner::CombinerMax as i32,
+                                max_ordinals_per_doc: 3,
+                                ..Default::default()
+                            },
+                        )),
+                    }),
+                    fields_to_load: vec!["binary".into()],
+                    ordinal_window,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+        }
+    };
+
+    let whole = search(None).await;
+    let field = &whole.hits[0].fields["binary"];
+    assert_eq!(field.values.len(), 2000);
+    assert!(field.ordinals.is_empty());
+
+    let windowed = search(Some(OrdinalWindow {
+        fields: vec!["binary".into()],
+        top: 1,
+        radius: 1,
+    }))
+    .await;
+    let hit = &windowed.hits[0];
+    assert!(hit.ordinal_scores.iter().any(|row| row.ordinal == 1000));
+    let field = &hit.fields["binary"];
+    assert_eq!(field.ordinals, vec![999, 1000, 1001]);
+    assert_eq!(field.values.len(), 3);
+    registry.shutdown().await.unwrap();
+}

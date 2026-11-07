@@ -521,6 +521,7 @@ pub fn rich_search_response() -> SearchResponse {
             values: vec![FieldValue {
                 value: Some(field_value::Value::Text("doc-1".to_string())),
             }],
+            ordinals: Vec::new(),
         },
     );
     fields.insert(
@@ -534,6 +535,7 @@ pub fn rich_search_response() -> SearchResponse {
                     value: Some(field_value::Value::U64(17)),
                 },
             ],
+            ordinals: Vec::new(),
         },
     );
     fields.insert(
@@ -542,6 +544,7 @@ pub fn rich_search_response() -> SearchResponse {
             values: vec![FieldValue {
                 value: Some(field_value::Value::BinaryDenseVector(vec![0xAB, 0xCD])),
             }],
+            ordinals: Vec::new(),
         },
     );
     SearchResponse {

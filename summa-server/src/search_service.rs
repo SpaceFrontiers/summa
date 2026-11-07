@@ -483,6 +483,10 @@ impl SearchService for SearchServiceImpl {
                 ordinal_scores.dedup_by_key(|row| row.ordinal);
             }
             response_budget.reserve_retained(retained_hit_base_bytes(ordinal_scores.len())?)?;
+            let kept_ordinals = req
+                .ordinal_window
+                .as_ref()
+                .map(|window| window_ordinals(&ordinal_scores, window.top, window.radius));
 
             // Allocate map buckets only for fields that actually have values.
             // Pre-sizing every hit from raw request count was an OOM multiplier.
@@ -499,8 +503,21 @@ impl SearchService for SearchServiceImpl {
 
                 if let Some(doc) = doc {
                     for requested in &requested_fields {
+                        let kept = kept_ordinals.as_deref().filter(|_| {
+                            req.ordinal_window
+                                .as_ref()
+                                .is_some_and(|window| window.fields.contains(&requested.name))
+                        });
                         let mut values = Vec::new();
-                        for value in doc.get_all(requested.id) {
+                        let mut ordinals = Vec::new();
+                        for (ordinal, value) in doc.get_all(requested.id).enumerate() {
+                            if let Some(kept) = kept {
+                                let ordinal = u32::try_from(ordinal).unwrap_or(u32::MAX);
+                                if kept.binary_search(&ordinal).is_err() {
+                                    continue;
+                                }
+                                ordinals.push(ordinal);
+                            }
                             // Charge retained payload before cloning it into
                             // the response, so a single oversized value fails
                             // without first doubling its memory footprint.
@@ -514,7 +531,7 @@ impl SearchService for SearchServiceImpl {
                             ))?;
                             fields.insert(
                                 requested.name.clone(),
-                                FieldValueList { values },
+                                FieldValueList { values, ordinals },
                             );
                         }
                     }
@@ -639,7 +656,7 @@ impl SearchService for SearchServiceImpl {
             if let Some(entry) = index.schema().get_field_entry(*field) {
                 fields
                     .entry(entry.name.clone())
-                    .or_insert_with(|| FieldValueList { values: Vec::new() })
+                    .or_insert_with(FieldValueList::default)
                     .values
                     .push(convert_field_value(value));
             }
@@ -896,4 +913,57 @@ pub fn text_field_infos(schema: &summa_core::Schema) -> Vec<TextFieldInfo> {
             }
         })
         .collect()
+}
+
+/// Ordinals an [`OrdinalWindow`] keeps for one hit, ascending: the `top`
+/// best-scoring distinct ordinals (ties: lower ordinal first), each widened by
+/// `radius` on both sides.
+fn window_ordinals(scores: &[OrdinalScore], top: u32, radius: u32) -> Vec<u32> {
+    let mut best: rustc_hash::FxHashMap<u32, f32> = rustc_hash::FxHashMap::default();
+    for row in scores {
+        best.entry(row.ordinal)
+            .and_modify(|score| *score = score.max(row.score))
+            .or_insert(row.score);
+    }
+    let mut ranked: Vec<(u32, f32)> = best.into_iter().collect();
+    ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut kept: Vec<u32> = ranked
+        .into_iter()
+        .take(top as usize)
+        .flat_map(|(ordinal, _)| ordinal.saturating_sub(radius)..=ordinal.saturating_add(radius))
+        .collect();
+    kept.sort_unstable();
+    kept.dedup();
+    kept
+}
+
+#[cfg(test)]
+mod ordinal_window_tests {
+    use super::*;
+
+    fn scores(rows: &[(u32, f32)]) -> Vec<OrdinalScore> {
+        rows.iter()
+            .map(|&(ordinal, score)| OrdinalScore { ordinal, score })
+            .collect()
+    }
+
+    #[test]
+    fn keeps_the_best_ordinals_and_their_neighbours() {
+        let rows = scores(&[(40, 0.9), (3, 0.2), (0, 0.5), (41, 0.1), (900, 0.8)]);
+        assert_eq!(window_ordinals(&rows, 2, 1), vec![39, 40, 41, 899, 900, 901]);
+        assert_eq!(window_ordinals(&rows, 3, 0), vec![0, 40, 900]);
+    }
+
+    #[test]
+    fn counts_each_ordinal_once_at_its_best_score() {
+        // Branches report the same ordinal separately; it must not take two
+        // of the `top` slots or lose to a weaker ordinal.
+        let rows = scores(&[(7, 0.1), (5, 0.6), (7, 0.9), (2, 0.6)]);
+        assert_eq!(window_ordinals(&rows, 2, 0), vec![2, 7]);
+    }
+
+    #[test]
+    fn no_scores_keep_nothing() {
+        assert!(window_ordinals(&[], 5, 2).is_empty());
+    }
 }

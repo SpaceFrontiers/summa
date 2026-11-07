@@ -340,6 +340,23 @@ message SearchRequest {
   // Preserve bounded per-shard nomination and selection traces. Default false;
   // does not rerun subqueries or change retrieval/ranking budgets.
   bool tracing = 13;
+  // Return the listed multi-value stored fields only near each hit's best
+  // ordinals instead of every value (see OrdinalWindow). Unset = whole fields.
+  OrdinalWindow ordinal_window = 14;
+}
+
+// Bounds multi-value stored fields (for example per-chunk spans) to the
+// ordinals a caller can use: the `top` highest-scoring ordinals of each hit
+// (ties: lower ordinal first), each widened by `radius` ordinals on both sides.
+// Windowed values carry their ordinals in FieldValueList.ordinals; a hit
+// without ordinal scores returns no values for these fields.
+message OrdinalWindow {
+  // Fields to window; each must also be listed in fields_to_load.
+  repeated string fields = 1;
+  // 1..=64 ordinals kept per hit.
+  uint32 top = 2;
+  // 0..=16 neighbours kept on each side of a kept ordinal.
+  uint32 radius = 3;
 }
 
 message GetTextStatsRequest {
@@ -422,6 +439,9 @@ message PassageScores {
 // List of field values — supports multi-value fields (e.g. multiple URIs per document)
 message FieldValueList {
   repeated FieldValue values = 1;
+  // Set only for fields windowed by SearchRequest.ordinal_window: the ordinal
+  // of each value, ascending and parallel to `values`.
+  repeated uint32 ordinals = 2;
 }
 
 // Score contribution from a specific ordinal in a multi-valued field
