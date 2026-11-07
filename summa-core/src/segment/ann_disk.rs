@@ -5656,7 +5656,7 @@ mod tests {
     /// Deterministic multi-cluster binary payload with 64-bit codes and an
     /// optional 16-bit prefix column.
     fn prefixed_binary_payload(prefix_bytes: usize, seed: u64) -> (Vec<u8>, usize) {
-        use rand::{Rng, SeedableRng};
+        use rand::{RngExt, SeedableRng};
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let clusters = 4u32;
         let per = 40usize;

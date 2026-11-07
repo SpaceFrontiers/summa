@@ -21,7 +21,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use anyhow::{Context, Result, ensure};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use sha2::{Digest, Sha256};
 use summa_llm::Tokenizer;
 use summa_train::corpus::AuthenticatedCorpus;
