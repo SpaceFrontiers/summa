@@ -32,7 +32,7 @@ num_cpus = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
 thiserror = { workspace = true }
 log = "0.4"
-lru = "0.12"
+lru = "0.19"
 rust-stemmers = { workspace = true }
 unicode-segmentation = { workspace = true }
 unicode-normalization = { workspace = true }
@@ -75,7 +75,7 @@ optional = true
 
 # getrandom needs wasm_js backend for WASM (pulled transitively by tokenizers, rand, etc.)
 [target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
-version = "0.3"
+version = "0.4"
 features = ["wasm_js"]
 
 [dev-dependencies]
@@ -84,7 +84,7 @@ metrics-util = "0.20"
 tempfile = { workspace = true }
 rand = { workspace = true }
 criterion = { workspace = true }
-comfy-table = "7"
+comfy-table = "8"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
