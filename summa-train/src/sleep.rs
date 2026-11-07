@@ -2174,7 +2174,8 @@ impl SleepState {
         hash.update(self.completed_chain_hash.as_bytes());
         hash.update(encoded_len.to_le_bytes());
         hash.update(encoded);
-        let completed_chain_hash = format!("sha256:{}", crate::artifact_io::lower_hex(hash.finalize()));
+        let completed_chain_hash =
+            format!("sha256:{}", crate::artifact_io::lower_hex(hash.finalize()));
         let mut completed_transactions = self.completed_transactions.clone();
         completed_transactions
             .try_reserve(1)

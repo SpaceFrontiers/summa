@@ -260,7 +260,10 @@ impl NativeWorkflowAdapters {
         ] {
             hash_part(&mut hasher, identity.unwrap_or("none").as_bytes());
         }
-        Ok(format!("sha256:{}", crate::artifact_io::lower_hex(hasher.finalize())))
+        Ok(format!(
+            "sha256:{}",
+            crate::artifact_io::lower_hex(hasher.finalize())
+        ))
     }
 
     fn into_runtime(
@@ -554,7 +557,10 @@ mod tests {
     use crate::workflow::load_workflow;
 
     fn identity(label: &str) -> String {
-        format!("sha256:{}", crate::artifact_io::lower_hex(Sha256::digest(label.as_bytes())))
+        format!(
+            "sha256:{}",
+            crate::artifact_io::lower_hex(Sha256::digest(label.as_bytes()))
+        )
     }
 
     struct UnusedPostTrainingFactory {

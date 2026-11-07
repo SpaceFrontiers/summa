@@ -1885,7 +1885,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("retention.json");
         fs::write(&path, b"sealed-retention-v1").unwrap();
-        let digest = format!("sha256:{}", crate::artifact_io::lower_hex(Sha256::digest(b"sealed-retention-v1")));
+        let digest = format!(
+            "sha256:{}",
+            crate::artifact_io::lower_hex(Sha256::digest(b"sealed-retention-v1"))
+        );
         (directory, digest)
     }
 

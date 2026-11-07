@@ -135,7 +135,10 @@ impl ExternalPhaseExecutor {
                 hash_execution_part(&mut hasher, text.as_bytes());
             }
         }
-        format!("sha256:{}", crate::artifact_io::lower_hex(hasher.finalize()))
+        format!(
+            "sha256:{}",
+            crate::artifact_io::lower_hex(hasher.finalize())
+        )
     }
 
     #[cfg(unix)]

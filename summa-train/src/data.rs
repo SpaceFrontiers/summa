@@ -376,7 +376,13 @@ fn hash_stable_phase_file(
         path.display()
     );
     file.rewind()?;
-    Ok(format!("sha256:{}", crate::artifact_io::lower_hex(hasher.finalize())))
+    // Also compiled into the binary crate, so no `crate::artifact_io` path here.
+    let digest: String = hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(format!("sha256:{digest}"))
 }
 
 fn with_decoded_reader<T, R: Read>(

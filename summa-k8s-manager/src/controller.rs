@@ -547,7 +547,10 @@ fn set_condition(
         .conditions
         .iter()
         .find(|c| c.type_ == type_ && c.status == value)
-        .map_or_else(|| Time(k8s_openapi::jiff::Timestamp::now()), |c| c.last_transition_time.clone());
+        .map_or_else(
+            || Time(k8s_openapi::jiff::Timestamp::now()),
+            |c| c.last_transition_time.clone(),
+        );
     let condition = Condition {
         type_: type_.to_string(),
         status: value.to_string(),
