@@ -28,6 +28,7 @@ console_error_panic_hook = { workspace = true }
 log = "0.4"
 console_log = "1.0"
 getrandom = { workspace = true }
+getrandom_03 = { workspace = true }
 parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 futures-channel = "0.3"
@@ -36,6 +37,6 @@ futures-channel = "0.3"
 wasm-opt = ["-O4", "--enable-bulk-memory"]
 
 [package.metadata.cargo-machete]
-# getrandom is a feature-activation dep: enables the wasm_js backend for
-# transitive getrandom users (uuid, rand) on wasm32
-ignored = ["getrandom"]
+# getrandom (0.4 and 0.3) are feature-activation deps: they enable the
+# wasm_js backend for transitive getrandom users on wasm32
+ignored = ["getrandom", "getrandom_03"]
