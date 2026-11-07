@@ -656,7 +656,7 @@ impl SearchService for SearchServiceImpl {
             if let Some(entry) = index.schema().get_field_entry(*field) {
                 fields
                     .entry(entry.name.clone())
-                    .or_insert_with(FieldValueList::default)
+                    .or_default()
                     .values
                     .push(convert_field_value(value));
             }
