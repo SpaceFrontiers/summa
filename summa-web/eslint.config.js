@@ -41,6 +41,14 @@ export default [
     }
   },
   {
+    // ESLint's core rule cannot see <script setup> bindings used only by the
+    // template, so it reports every template-only binding as unused.
+    files: ['**/*.vue'],
+    rules: {
+      'no-useless-assignment': 'off'
+    }
+  },
+  {
     ignores: ['dist/**', 'node_modules/**', '*.config.js']
   }
 ]

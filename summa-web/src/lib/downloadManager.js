@@ -226,7 +226,7 @@ export function createDownloadManager(appConfig) {
         }
 
         if (attempt >= MAX_RETRIES) {
-          throw new Error(`Download failed after ${MAX_RETRIES} attempts: ${e.message}`)
+          throw new Error(`Download failed after ${MAX_RETRIES} attempts: ${e.message}`, { cause: e })
         }
 
         const delay = RETRY_DELAY * Math.min(attempt, 5)
