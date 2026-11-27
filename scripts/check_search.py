@@ -13,8 +13,9 @@ import signal
 import subprocess
 import sys
 import time
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGES = ("summa-core", "summa-server", "summa-broker", "summa-tool")
