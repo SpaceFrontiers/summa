@@ -1260,33 +1260,20 @@ impl CompressedGrid {
         })
     }
 
-    /// Byte range containing one group's checkpoint and width selector.
+    /// Byte range of one row's checkpoint and width-selector records.
     ///
-    /// Unlike `group()`, this needs no row payload metadata and can therefore
-    /// be advised far enough ahead to hide a cold header-page fault.
+    /// Resolving any group of the row reads only this header before the
+    /// group's payload, so it can be advised ahead of the first window.
     #[cfg(feature = "native")]
-    pub(crate) fn group_metadata_range(
-        &self,
-        dimension: usize,
-        group: usize,
-    ) -> crate::Result<Range<usize>> {
-        if group >= self.layout.groups() {
-            return Err(crate::Error::Corruption(format!(
-                "BMP compressed-grid group {group} exceeds {}",
-                self.layout.groups()
-            )));
-        }
+    pub(crate) fn row_header_range(&self, dimension: usize) -> crate::Result<Range<usize>> {
         let (row_start, row_end) = self.row_range(dimension)?;
-        let chunk = group / META_GROUPS;
-        let selectors = META_GROUPS.min(self.layout.groups() - chunk * META_GROUPS);
-        let start = row_start + chunk * META_RECORD_BYTES;
-        let end = start + std::mem::size_of::<u32>() + selector_bytes(selectors);
+        let end = row_start + self.layout.row_header_bytes();
         if end > row_end {
             return Err(crate::Error::Corruption(
                 "BMP compressed-grid metadata extends beyond row".into(),
             ));
         }
-        Ok(start..end)
+        Ok(row_start..end)
     }
 
     /// True when the row payload is heap/RAM-backed (a RAM directory or a

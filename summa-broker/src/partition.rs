@@ -193,34 +193,45 @@ pub fn route_documents(
 /// partitioned hybrid search still needs corpus-wide BM25 statistics, so the
 /// broker sends only its term/match/phrase leaves for statistics while the
 /// original fusion remains unchanged for the actual search.
+///
+/// Returns `None`, and the search skips the statistics round, when no leaf
+/// can score: the query has no text leaf, or only exact terms under fusion
+/// filters and MUST_NOT clauses.
 pub fn text_stats_query(query: &Query) -> Option<Query> {
-    fn collect(query: &Query, leaves: &mut Vec<Query>) {
+    /// `scores` is false below eligibility clauses (fusion filters and
+    /// MUST_NOT), whose matches never contribute a BM25 score.
+    fn collect(query: &Query, scores: bool, leaves: &mut Vec<Query>, required: &mut bool) {
         match &query.query {
-            Some(query::Query::Term(_))
-            | Some(query::Query::Match(_))
-            | Some(query::Query::Phrase(_)) => leaves.push(query.clone()),
+            Some(query::Query::Term(_)) => {
+                *required |= scores;
+                leaves.push(query.clone());
+            }
+            // A capped match keeps its rarest tokens, so even a filter needs
+            // the shared frequencies to keep the same tokens on every shard.
+            Some(query::Query::Match(_)) | Some(query::Query::Phrase(_)) => {
+                *required = true;
+                leaves.push(query.clone());
+            }
             Some(query::Query::Boolean(boolean)) => {
-                for clause in boolean
-                    .must
-                    .iter()
-                    .chain(&boolean.should)
-                    .chain(&boolean.must_not)
-                {
-                    collect(clause, leaves);
+                for clause in boolean.must.iter().chain(&boolean.should) {
+                    collect(clause, scores, leaves, required);
+                }
+                for clause in &boolean.must_not {
+                    collect(clause, false, leaves, required);
                 }
             }
             Some(query::Query::Boost(boost)) => {
                 if let Some(inner) = boost.query.as_deref() {
-                    collect(inner, leaves);
+                    collect(inner, scores, leaves, required);
                 }
             }
             Some(query::Query::Fusion(fusion)) => {
                 for filter in &fusion.filters {
-                    collect(filter, leaves);
+                    collect(filter, false, leaves, required);
                 }
                 for weighted in &fusion.queries {
                     if let Some(inner) = weighted.query.as_ref() {
-                        collect(inner, leaves);
+                        collect(inner, scores, leaves, required);
                     }
                 }
             }
@@ -229,7 +240,13 @@ pub fn text_stats_query(query: &Query) -> Option<Query> {
     }
 
     let mut leaves = Vec::new();
-    collect(query, &mut leaves);
+    let mut required = false;
+    collect(query, true, &mut leaves, &mut required);
+    // Exact terms that only restrict eligibility match identically under each
+    // shard's own statistics; the extra round trip would change nothing.
+    if !required {
+        return None;
+    }
     match leaves.len() {
         0 => None,
         1 => leaves.pop(),
@@ -757,6 +774,61 @@ mod tests {
             ..Default::default()
         }));
         assert!(text_stats_query(&vector_only).is_none());
+    }
+
+    #[test]
+    fn text_statistics_are_requested_only_when_a_text_leaf_can_score() {
+        use summa_broker::proto::summa::TermQuery;
+        let text_query = |kind| Query { query: Some(kind) };
+        let term = |field: &str| {
+            text_query(query::Query::Term(TermQuery {
+                field: field.to_string(),
+                term: "message".to_string(),
+                ..Default::default()
+            }))
+        };
+        let sparse = || {
+            text_query(query::Query::SparseVector(SparseVectorQuery {
+                field: "sparse_vectors".to_string(),
+                ..Default::default()
+            }))
+        };
+        let capped_match = text_query(query::Query::Match(MatchQuery {
+            field: "content".to_string(),
+            text: "quantum field".to_string(),
+            ..Default::default()
+        }));
+        let fusion = |filters: Vec<Query>, branch: Query| {
+            text_query(query::Query::Fusion(FusionQuery {
+                filters,
+                queries: vec![WeightedQuery {
+                    query: Some(branch),
+                    weight: 1.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))
+        };
+        let boolean = |must: Vec<Query>, should: Vec<Query>, must_not: Vec<Query>| {
+            text_query(query::Query::Boolean(BooleanQuery {
+                must,
+                should,
+                must_not,
+            }))
+        };
+
+        // Exact-term eligibility needs no shared statistics.
+        assert!(text_stats_query(&fusion(vec![term("type")], sparse())).is_none());
+        assert!(text_stats_query(&boolean(vec![], vec![sparse()], vec![term("type")])).is_none());
+        // A scoring term, or a filter that selects tokens by rarity, does; the
+        // statistics then cover every leaf, as before.
+        let scored = text_stats_query(&fusion(vec![term("type")], term("uris"))).unwrap();
+        let Some(query::Query::Boolean(leaves)) = scored.query else {
+            panic!("two text leaves should become a boolean query");
+        };
+        assert_eq!(leaves.should.len(), 2);
+        assert!(text_stats_query(&boolean(vec![term("type")], vec![sparse()], vec![])).is_some());
+        assert!(text_stats_query(&fusion(vec![capped_match], sparse())).is_some());
     }
 
     #[test]

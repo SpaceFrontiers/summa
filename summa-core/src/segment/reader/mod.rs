@@ -2866,6 +2866,7 @@ impl SegmentReader {
         self.doc_with_reads(
             local_doc_id,
             fields,
+            None,
             &super::store::PreparedStoreReads::default(),
         )
         .await
@@ -2892,6 +2893,7 @@ impl SegmentReader {
         &self,
         local_doc_id: DocId,
         fields: Option<&rustc_hash::FxHashSet<u32>>,
+        window: Option<super::store::StoredValueWindow<'_>>,
         reads: &super::store::PreparedStoreReads,
     ) -> Result<Option<Document>> {
         if !self.is_alive(local_doc_id) {
@@ -2900,7 +2902,13 @@ impl SegmentReader {
         let field_ids = fields.map(|set| set.iter().copied().collect::<Vec<_>>());
         let Some(mut doc) = self
             .store
-            .get_with_reads(local_doc_id, &self.schema, field_ids.as_deref(), reads)
+            .get_with_reads(
+                local_doc_id,
+                &self.schema,
+                field_ids.as_deref(),
+                window,
+                reads,
+            )
             .await?
         else {
             return Ok(None);

@@ -108,8 +108,6 @@ struct BmpScratch {
     /// laid out `[weight_index * window_groups.len() + group_slot]`.
     resolved_groups: Vec<ResolvedGridGroup>,
     #[cfg(feature = "native")]
-    next_window_groups: Vec<usize>,
-    #[cfg(feature = "native")]
     grid_prefetch_ranges: Vec<std::ops::Range<usize>>,
     #[cfg(feature = "native")]
     block_prefetch_ranges: Vec<std::ops::Range<u64>>,
@@ -135,8 +133,6 @@ impl Default for BmpScratch {
             window_groups: Vec::with_capacity(BMP_PREFETCH_SUPERBLOCKS),
             window_group_slot: [0; BMP_PREFETCH_SUPERBLOCKS],
             resolved_groups: Vec::new(),
-            #[cfg(feature = "native")]
-            next_window_groups: Vec::with_capacity(BMP_PREFETCH_SUPERBLOCKS),
             #[cfg(feature = "native")]
             grid_prefetch_ranges: Vec::new(),
             #[cfg(feature = "native")]
@@ -811,19 +807,16 @@ fn execute_bmp_inner(
         let mut threshold_units = ThresholdUnits::new(dequant, alpha);
         let mut cursor = 0usize;
 
-        // Stage one of the first window's D-grid pipeline: only deterministic
-        // selector/checkpoint ranges are needed, so no cold row metadata is
-        // dereferenced here.
+        // Stage one of the D-grid pipeline: every window resolves its groups
+        // through the query rows' selector/checkpoint headers (a few KiB per
+        // dimension), so advise each header once here. Hinting the next
+        // window's records instead repeated the same pages on every window.
         #[cfg(feature = "native")]
-        {
+        if cursor < superblock_visit_limit {
             let prefetch_start = crate::observe::Timer::start();
-            let (bytes, calls) = prefetch_grid_metadata_window(
+            let (bytes, calls) = prefetch_grid_row_headers(
                 index.block_grid(),
                 candidate_grid_weights,
-                sb_order,
-                cursor,
-                superblock_visit_limit,
-                &mut scratch.next_window_groups,
                 &mut scratch.grid_prefetch_ranges,
             )?;
             phases.prefetch_secs += prefetch_start.secs();
@@ -955,18 +948,6 @@ fn execute_bmp_inner(
             #[cfg(feature = "native")]
             {
                 let prefetch_start = crate::observe::Timer::start();
-                // Advise the next D selector window now; current payload
-                // scoring supplies the actual I/O lead time.
-                let (grid_bytes, grid_calls) = prefetch_grid_metadata_window(
-                    index.block_grid(),
-                    candidate_grid_weights,
-                    sb_order,
-                    cursor,
-                    superblock_visit_limit,
-                    &mut scratch.next_window_groups,
-                    &mut scratch.grid_prefetch_ranges,
-                )?;
-
                 let block_action = if index.block_data_resident() {
                     crate::segment::prefetch_gate::PrefetchAction::Skip
                 } else {
@@ -999,14 +980,8 @@ fn execute_bmp_inner(
                     index.prefetch_block_data_ranges(&mut scratch.block_prefetch_ranges, block_action)
                 };
                 phases.prefetch_secs += prefetch_start.secs();
-                phases.prefetched_bytes = phases
-                    .prefetched_bytes
-                    .saturating_add(grid_bytes)
-                    .saturating_add(block_bytes);
-                phases.prefetch_ranges = phases
-                    .prefetch_ranges
-                    .saturating_add(grid_calls)
-                    .saturating_add(block_calls);
+                phases.prefetched_bytes = phases.prefetched_bytes.saturating_add(block_bytes);
+                phases.prefetch_ranges = phases.prefetch_ranges.saturating_add(block_calls);
             }
 
             let (prepared_superblocks, acc) = (
@@ -1693,43 +1668,25 @@ fn two_phase_upper_bound_units(
 // ============================================================================
 // Helpers
 // ============================================================================
+/// Advise the selector/checkpoint header of every candidate dimension's row.
 #[cfg(feature = "native")]
-fn collect_grid_group_ids(sb_order: &[u32], start: usize, limit: usize, groups: &mut Vec<usize>) {
-    groups.clear();
-    let end = (start + BMP_PREFETCH_SUPERBLOCKS).min(limit);
-    for &superblock in &sb_order[start..end] {
-        let block = superblock as usize * BMP_SUPERBLOCK_SIZE as usize;
-        groups.push(block / GRID_GROUP_CELLS);
-    }
-    groups.sort_unstable();
-    groups.dedup();
-}
-
-#[cfg(feature = "native")]
-fn prefetch_grid_metadata_window(
+fn prefetch_grid_row_headers(
     grid: &CompressedGrid,
     weights: &[BmpGridWeight],
-    sb_order: &[u32],
-    start: usize,
-    limit: usize,
-    groups: &mut Vec<usize>,
     ranges: &mut Vec<std::ops::Range<usize>>,
 ) -> crate::Result<(usize, usize)> {
     // Heap/RAM-backed rows (RAM directory, heap pin copy) are always
     // resident; madvise would be a no-op, so skip the range bookkeeping.
-    if start >= limit || grid.rows_resident() {
+    if grid.rows_resident() {
         return Ok((0, 0));
     }
     let action = grid.prefetch_gate().action();
     if action == crate::segment::prefetch_gate::PrefetchAction::Skip {
         return Ok((0, 0));
     }
-    collect_grid_group_ids(sb_order, start, limit, groups);
     ranges.clear();
     for weight in weights {
-        for &group in groups.iter() {
-            ranges.push(grid.group_metadata_range(weight.dimension, group)?);
-        }
+        ranges.push(grid.row_header_range(weight.dimension)?);
     }
     Ok(grid.prefetch_ranges(ranges, action))
 }
@@ -2060,7 +2017,6 @@ impl CandidateBmpPreparation {
         terms: &[(u32, f32)],
         targets: &[u32],
     ) -> crate::Result<Vec<f32>> {
-        use crate::segment::bmp_adaptive::AdaptivePostings;
         let mut scores = vec![0.0; targets.len()];
         if self
             .prepared
@@ -2072,78 +2028,164 @@ impl CandidateBmpPreparation {
         let Some(prepared) = self.prepared.as_ref().and_then(|(_, query)| query.as_ref()) else {
             return Ok(scores);
         };
-        let dequant = prepared.dequant_for(index)?;
-        if let Some(forward) = index.forward() {
-            for (score, &target) in scores.iter_mut().zip(targets) {
-                let vector = forward.vector_for_scoring(target)?;
-                let units = score_forward_units(vector, &prepared.query_by_dim_u16)?;
-                *score = units as f32 * dequant;
-            }
-            return Ok(scores);
+        score_prepared_candidates(index, prepared, targets, &mut scores)?;
+        Ok(scores)
+    }
+}
+
+/// Score sorted forward rows or real physical slots with an already prepared
+/// query. `scores` has one zero-initialized entry per target.
+fn score_prepared_candidates(
+    index: &BmpIndex,
+    prepared: &PreparedBmpQuery,
+    targets: &[u32],
+    scores: &mut [f32],
+) -> crate::Result<()> {
+    use crate::segment::bmp_adaptive::AdaptivePostings;
+    let dequant = prepared.dequant_for(index)?;
+    if let Some(forward) = index.forward() {
+        for (score, &target) in scores.iter_mut().zip(targets) {
+            let vector = forward.vector_for_scoring(target)?;
+            let units = score_forward_units(vector, &prepared.query_by_dim_u16)?;
+            *score = units as f32 * dequant;
         }
-        let mut start = 0;
-        while start < targets.len() {
-            let block_id = targets[start] / index.bmp_block_size;
-            let mut end = start + 1;
-            while end < targets.len() && targets[end] / index.bmp_block_size == block_id {
-                end += 1;
-            }
-            // Missing/empty blocks contain no nonzero terms. Real-slot identity is
-            // validated by the reader before this call.
-            let (byte_start, byte_end) = index.block_data_range(block_id);
-            if byte_start == byte_end {
-                start = end;
+        return Ok(());
+    }
+    let mut start = 0;
+    while start < targets.len() {
+        let block_id = targets[start] / index.bmp_block_size;
+        let mut end = start + 1;
+        while end < targets.len() && targets[end] / index.bmp_block_size == block_id {
+            end += 1;
+        }
+        // Missing/empty blocks contain no nonzero terms. Real-slot identity is
+        // validated by the reader before this call.
+        let (byte_start, byte_end) = index.block_data_range(block_id);
+        if byte_start == byte_end {
+            start = end;
+            continue;
+        }
+        let block = index.parse_block(block_id).ok_or_else(|| {
+            crate::Error::Corruption(format!("cannot decode candidate BMP block {block_id}"))
+        })?;
+        let mut units = [0u32; 256];
+        for &(dimension, weight) in &prepared.query_by_dim_u16 {
+            let Some(term) = block.find_dimension(dimension) else {
                 continue;
-            }
-            let block = index.parse_block(block_id).ok_or_else(|| {
-                crate::Error::Corruption(format!("cannot decode candidate BMP block {block_id}"))
+            };
+            let postings = block.postings(term).ok_or_else(|| {
+                crate::Error::Corruption(format!(
+                    "cannot decode candidate BMP dimension {dimension}"
+                ))
             })?;
-            let mut units = [0u32; 256];
-            for &(dimension, weight) in &prepared.query_by_dim_u16 {
-                let Some(term) = block.find_dimension(dimension) else {
-                    continue;
-                };
-                let postings = block.postings(term).ok_or_else(|| {
-                    crate::Error::Corruption(format!(
-                        "cannot decode candidate BMP dimension {dimension}"
-                    ))
-                })?;
-                match postings {
-                    AdaptivePostings::Dense(impacts) => {
-                        for &target in &targets[start..end] {
-                            let slot = (target % index.bmp_block_size) as usize;
-                            units[slot] = units[slot]
-                                .checked_add(u32::from(impacts[slot]) * u32::from(weight))
+            match postings {
+                AdaptivePostings::Dense(impacts) => {
+                    for &target in &targets[start..end] {
+                        let slot = (target % index.bmp_block_size) as usize;
+                        units[slot] = units[slot]
+                            .checked_add(u32::from(impacts[slot]) * u32::from(weight))
+                            .ok_or_else(|| {
+                                crate::Error::Query("BMP candidate score overflow".into())
+                            })?;
+                    }
+                }
+                AdaptivePostings::Sparse(postings) => {
+                    for &target in &targets[start..end] {
+                        let slot = (target % index.bmp_block_size) as u8;
+                        let start = postings.partition_point(|p| p.local_slot < slot);
+                        for posting in postings[start..]
+                            .iter()
+                            .take_while(|p| p.local_slot == slot)
+                        {
+                            units[slot as usize] = units[slot as usize]
+                                .checked_add(u32::from(posting.impact) * u32::from(weight))
                                 .ok_or_else(|| {
                                     crate::Error::Query("BMP candidate score overflow".into())
                                 })?;
                         }
                     }
-                    AdaptivePostings::Sparse(postings) => {
-                        for &target in &targets[start..end] {
-                            let slot = (target % index.bmp_block_size) as u8;
-                            let start = postings.partition_point(|p| p.local_slot < slot);
-                            for posting in postings[start..]
-                                .iter()
-                                .take_while(|p| p.local_slot == slot)
-                            {
-                                units[slot as usize] = units[slot as usize]
-                                    .checked_add(u32::from(posting.impact) * u32::from(weight))
-                                    .ok_or_else(|| {
-                                        crate::Error::Query("BMP candidate score overflow".into())
-                                    })?;
-                            }
-                        }
-                    }
                 }
             }
-            for i in start..end {
-                scores[i] = units[(targets[i] % index.bmp_block_size) as usize] as f32 * dequant;
-            }
-            start = end;
         }
-        Ok(scores)
+        for i in start..end {
+            scores[i] = units[(targets[i] % index.bmp_block_size) as usize] as f32 * dequant;
+        }
+        start = end;
     }
+    Ok(())
+}
+
+/// Largest eligible document set scored exactly instead of traversed.
+///
+/// A filter this selective rejects nearly every slot the block-max traversal
+/// scores, so the heap never fills, no bound prunes, and a capped traversal
+/// can end before reaching the few eligible documents. Scoring those
+/// documents' own rows is both bounded and complete.
+const EXACT_FILTER_MAX_DOCS: u32 = 4096;
+/// The exact pass replaces the traversal only when the eligible documents are
+/// at most one in this many of the segment's. A wider filter (or the alive
+/// documents of a small segment) fills the traversal's heap quickly, and the
+/// traversal then prunes with bounds the exact pass does not have.
+const EXACT_FILTER_MIN_SELECTIVITY: u32 = 64;
+
+/// Whether `eligible` documents of a `segment_docs` segment are few enough,
+/// in number and in share, to score exactly instead of traversing.
+pub(crate) fn exact_filter_applies(eligible: u32, segment_docs: u32) -> bool {
+    eligible <= EXACT_FILTER_MAX_DOCS
+        && eligible.saturating_mul(EXACT_FILTER_MIN_SELECTIVITY) <= segment_docs
+}
+/// Stored values (chunks) resolved for one exact pass. Long documents can hold
+/// thousands of values each; past this the traversal stays the bounded plan.
+const EXACT_FILTER_MAX_ROWS: usize = 65_536;
+
+/// Score every stored value of `eligible` (ascending document ids) and keep
+/// the best `k`, using retrieval's integer quantization so scores equal the
+/// traversal's. Returns `None` when this segment cannot address documents
+/// (reordered without forward values) or the expansion exceeds its row cap;
+/// the caller then runs the ordinary traversal.
+pub(crate) fn score_bmp_eligible_exact(
+    index: &BmpIndex,
+    prepared: &PreparedBmpQuery,
+    eligible: impl Iterator<Item = crate::DocId>,
+    k: usize,
+) -> crate::Result<Option<Vec<ScoredDoc>>> {
+    if k == 0 || index.num_blocks == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let forward = index.forward();
+    if forward.is_none() && !index.logically_ordered() {
+        return Ok(None);
+    }
+    let mut keys: Vec<(crate::DocId, u16)> = Vec::new();
+    let mut targets: Vec<u32> = Vec::new();
+    for doc in eligible {
+        let before = targets.len();
+        if let Some(forward) = forward {
+            for (ordinal, physical) in forward.for_document(doc) {
+                keys.push((doc, ordinal));
+                targets.push(physical);
+            }
+        } else {
+            for (ordinal, physical) in index.ordered_slots_for_document(doc) {
+                keys.push((doc, ordinal));
+                targets.push(physical);
+            }
+        }
+        if targets.len() > EXACT_FILTER_MAX_ROWS {
+            return Ok(None);
+        }
+        debug_assert!(targets[before..].windows(2).all(|pair| pair[0] < pair[1]));
+    }
+    let mut scores = vec![0.0f32; targets.len()];
+    score_prepared_candidates(index, prepared, &targets, &mut scores)?;
+    let mut collector = ScoreCollector::new(k);
+    for (&(doc, ordinal), &score) in keys.iter().zip(&scores) {
+        // The traversal never reports a value without a matching dimension.
+        if score > 0.0 {
+            collector.insert_with_ordinal(doc, score, ordinal);
+        }
+    }
+    Ok(Some(collector_to_results(collector)))
 }
 
 #[cfg(test)]

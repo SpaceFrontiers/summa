@@ -360,6 +360,10 @@ pub struct SharedThreshold {
     deadline: Option<std::time::Instant>,
     /// Set by any executor that stopped early because of `deadline`.
     truncated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Opt-in: executors ranking the values of multi-valued documents may
+    /// prune values below this document floor (see
+    /// `IndexConfig::sparse_document_floor`).
+    floors_values: bool,
 }
 
 impl Default for SharedThreshold {
@@ -388,7 +392,19 @@ impl SharedThreshold {
             k,
             deadline: None,
             truncated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            floors_values: false,
         }
+    }
+
+    /// Let value-level executors of multi-valued fields consume this floor.
+    pub(crate) fn with_value_floor(mut self, enabled: bool) -> Self {
+        self.floors_values = enabled;
+        self
+    }
+
+    /// Whether value-level executors may prune below this document floor.
+    pub(crate) fn floors_values(&self) -> bool {
+        self.floors_values
     }
 
     /// Attach a wall-clock budget (`None` = unbounded).
@@ -409,6 +425,7 @@ impl SharedThreshold {
             k: usize::MAX,
             deadline: self.deadline,
             truncated: self.truncated.clone(),
+            floors_values: false,
         }
     }
 

@@ -427,6 +427,16 @@ candidates by binary search and score their query-term postings in selected
 blocks. BP-reordered BMP maps need this setting enabled and explicit
 reorder/rebuild to regain backfill capability. Disabling storage does not affect
 full-text or sparse MaxScore backfill. See [optional forward storage](bmp-forward-index.md#configuration-and-scoring).
+Document lookups in the flat doc-id map and the BMP forward directory use
+`first_position_of_document`: a secant estimate guarded by bisection (at most
+`2 * log2(len)` probes) instead of a plain bisection. Positions are roughly
+proportional to document ids, so a lookup in a directory larger than memory
+reads two or three cold pages where bisection reads one per upper level. The
+result is identical; the pin budget still decides whether those directories are
+resident at all. The server reports each phase of a search, including candidate
+scoring, as `summa_search_phase_duration_seconds` and in the slow-query line.
+Segment-parallel backfill remains unmeasured and unbuilt.
+
 `GetIndexInfo.unprepared_candidate_fields`
 reports these fields and ANN fields without stored flat vectors. Disabling
 backfill, or supplying every needed organic cell, requires no address probes

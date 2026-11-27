@@ -339,6 +339,85 @@ async fn test_bmp_multi_value_threshold_is_combiner_scoped() {
     assert_eq!(sum_results.len(), 5);
 }
 
+/// The opt-in document floor lets an averaging combiner skip superblocks whose
+/// values are all below the floor other segments established. Documents that
+/// can still reach the window keep their place; without the opt-in the floor
+/// is stripped and the segment fills its own heap, as before.
+#[tokio::test]
+async fn test_bmp_document_floor_prunes_multi_value_segments_only_when_enabled() {
+    use crate::query::{MultiValueCombiner, SharedThreshold, search_segment_shared};
+
+    let (schema, _title, sparse) = bmp_schema_with_config(SparseVectorConfig {
+        format: SparseFormat::Bmp,
+        weight_quantization: WeightQuantization::UInt8,
+        bmp_block_size: 32,
+        dims: Some(1),
+        max_weight: Some(5.0),
+        ..SparseVectorConfig::default()
+    });
+    let dir = RamDirectory::new();
+    let config = IndexConfig::default();
+    let mut writer = IndexWriter::create(dir.clone(), schema, config.clone())
+        .await
+        .unwrap();
+    // 256 weak documents fill two superblocks of their own; 16 strong
+    // documents follow. Every document holds two values.
+    for doc_id in 0..272 {
+        let (first, second) = if doc_id < 256 { (0.1, 0.1) } else { (4.0, 3.0) };
+        let mut document = Document::new();
+        document.add_sparse_vector(sparse, vec![(0, first)]);
+        document.add_sparse_vector(sparse, vec![(0, second)]);
+        writer.add_document(document).unwrap();
+    }
+    writer.commit().await.unwrap();
+    let index = Index::open(dir, config).await.unwrap();
+    let segment = index.segment_readers().await.unwrap().pop().unwrap();
+
+    for combiner in [
+        MultiValueCombiner::default(),
+        MultiValueCombiner::Avg,
+        MultiValueCombiner::Sum,
+    ] {
+        let query = SparseVectorQuery::new(sparse, vec![(0, 1.0)])
+            .with_combiner(combiner)
+            .with_heap_factor(1.0)
+            .with_lsp_gamma(0);
+        let run = |value_floor: bool| {
+            let shared = SharedThreshold::for_limit(100).with_value_floor(value_floor);
+            // Another segment already holds 100 documents scoring at least 1.0.
+            shared.raise(1.0);
+            search_segment_shared(segment.as_ref(), &query, 100, false, shared)
+        };
+        let (default, _) = run(false).await.unwrap();
+        assert_eq!(
+            default.len(),
+            100,
+            "{combiner:?}: the floor must be stripped"
+        );
+        let strong = |results: &[crate::query::SearchResult]| {
+            let mut docs: Vec<_> = results
+                .iter()
+                .filter(|hit| hit.doc_id >= 256)
+                .map(|hit| (hit.doc_id, hit.score))
+                .collect();
+            docs.sort_unstable_by_key(|hit| hit.0);
+            docs
+        };
+        assert_eq!(strong(&default).len(), 16);
+
+        let (floored, _) = run(true).await.unwrap();
+        if combiner.bounded_by_max() {
+            // Only documents holding a value at or above the floor remain,
+            // with the scores the unfloored segment gives them.
+            assert_eq!(floored.len(), 16, "{combiner:?}");
+            assert_eq!(strong(&floored), strong(&default), "{combiner:?}");
+        } else {
+            // Sub-floor values can sum above the floor: Sum never consumes it.
+            assert_eq!(floored.len(), 100, "{combiner:?}");
+        }
+    }
+}
+
 /// BMP multi-segment merge: build two segments, merge, verify query correctness.
 #[tokio::test]
 async fn test_bmp_merge() {
@@ -4058,5 +4137,125 @@ async fn test_bmp_forward_storage_stays_disabled_through_merge_and_standalone_bp
                 .len(),
             146
         );
+    }
+}
+
+/// A filter that leaves a handful of documents must return them even when the
+/// capped traversal never reaches their superblock (or the global plan selects
+/// nothing in their segment). The capped plan used to score the competitive
+/// superblock, reject every slot through the filter and return nothing.
+#[tokio::test]
+async fn test_bmp_selective_filter_scores_eligible_documents_beyond_the_gamma_cap() {
+    use crate::query::{BooleanQuery, FilteredQuery, Query, RangeQuery};
+    use std::sync::Arc;
+
+    for (multi, split_segments) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut sb = SchemaBuilder::default();
+        let allowed = sb.add_u64_field("allowed", true, false);
+        sb.set_fast(allowed, true);
+        let sparse = sb.add_sparse_vector_field_with_config(
+            "sparse",
+            true,
+            true,
+            SparseVectorConfig {
+                format: SparseFormat::Bmp,
+                weight_quantization: WeightQuantization::UInt8,
+                bmp_block_size: 32,
+                dims: Some(2),
+                max_weight: Some(5.0),
+                ..SparseVectorConfig::default()
+            },
+        );
+        sb.set_multi(sparse, multi);
+        let dir = RamDirectory::new();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..IndexConfig::default()
+        };
+        let mut writer = IndexWriter::create(dir.clone(), sb.build(), config.clone())
+            .await
+            .unwrap();
+        // Eligible documents 3 and 7 are weak; every strong document is
+        // ineligible. Weak rows fill whole superblocks of their own, so the
+        // single superblock a gamma of one may visit holds only strong rows.
+        let rows_per_doc = if multi { 2 } else { 1 };
+        let weak_docs = 512 / rows_per_doc;
+        for doc_id in 0..weak_docs + 64 {
+            if split_segments && doc_id == weak_docs {
+                writer.commit().await.unwrap();
+            }
+            let strong = doc_id >= weak_docs;
+            let mut document = Document::new();
+            document.add_u64(allowed, u64::from(doc_id == 3 || doc_id == 7));
+            let weight = if strong {
+                5.0
+            } else if doc_id == 7 {
+                0.2
+            } else {
+                0.1
+            };
+            for _ in 0..rows_per_doc {
+                document.add_sparse_vector(sparse, vec![(0, weight)]);
+            }
+            writer.add_document(document).unwrap();
+        }
+        writer.commit().await.unwrap();
+
+        let index = Index::open(dir, config).await.unwrap();
+        let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+        assert_eq!(
+            searcher.segment_readers().len(),
+            if split_segments { 2 } else { 1 }
+        );
+        // Independent oracle: the unfiltered exhaustive traversal's scores.
+        let all = searcher
+            .search(
+                &SparseVectorQuery::new(sparse, vec![(0, 1.0)]).with_lsp_gamma(0),
+                weak_docs + 64,
+            )
+            .await
+            .unwrap();
+        // Document ids are segment-local: the eligible pair lives in the
+        // (larger) segment that holds the weak documents.
+        let weak_segment = searcher
+            .segment_readers()
+            .iter()
+            .max_by_key(|segment| segment.num_docs())
+            .unwrap()
+            .meta()
+            .id;
+        let expected: Vec<_> = all
+            .iter()
+            .filter(|hit| hit.segment_id == weak_segment && (hit.doc_id == 3 || hit.doc_id == 7))
+            .map(|hit| (hit.doc_id, hit.score))
+            .collect();
+        assert_eq!(
+            expected.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+            [7, 3],
+            "exhaustive oracle (multi={multi}, split={split_segments})"
+        );
+        let range = || RangeQuery::u64(allowed, Some(1), Some(1));
+        let capped = || SparseVectorQuery::new(sparse, vec![(0, 1.0)]).with_lsp_gamma(1);
+        let queries: [(&str, Box<dyn Query>); 2] = [
+            (
+                "common filter",
+                Box::new(FilteredQuery::new(
+                    Arc::new(capped()),
+                    vec![Arc::new(range())],
+                )),
+            ),
+            (
+                "boolean must",
+                Box::new(BooleanQuery::new().must(range()).should(capped())),
+            ),
+        ];
+        for (name, query) in &queries {
+            let actual = searcher.search(query.as_ref(), 10).await.unwrap();
+            let actual: Vec<_> = actual.iter().map(|hit| (hit.doc_id, hit.score)).collect();
+            assert_eq!(
+                actual, expected,
+                "{name}: capped plan (multi={multi}, split={split_segments})"
+            );
+        }
     }
 }

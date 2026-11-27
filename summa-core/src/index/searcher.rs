@@ -29,6 +29,7 @@ pub(crate) struct SearcherResources {
     pub(crate) store_cache: Arc<crate::segment::SharedStoreCache>,
     pub(crate) sparse_io_gate: Arc<super::SparseIoGate>,
     pub(crate) sparse_io_concurrency: usize,
+    pub(crate) sparse_document_floor: bool,
     pub(crate) segment_open_concurrency: usize,
     pub(crate) binary_prefix_cache: Arc<crate::segment::PrefixCacheBudget>,
     #[cfg(feature = "sync")]
@@ -51,6 +52,7 @@ impl SearcherResources {
             config.sparse_io_concurrency,
         )?;
         resources.segment_open_concurrency = config.segment_open_concurrency;
+        resources.sparse_document_floor = config.sparse_document_floor;
         resources.binary_prefix_cache =
             crate::segment::PrefixCacheBudget::new(config.binary_prefix_cache_budget_bytes);
         Ok(resources)
@@ -84,6 +86,7 @@ impl SearcherResources {
             store_cache: super::shared_store_cache(store_cache_budget_bytes),
             sparse_io_gate: super::shared_sparse_io_gate(sparse_io_concurrency),
             sparse_io_concurrency,
+            sparse_document_floor: false,
             segment_open_concurrency: super::DEFAULT_SEGMENT_OPEN_CONCURRENCY,
             binary_prefix_cache: crate::segment::PrefixCacheBudget::new(0),
             #[cfg(feature = "sync")]
@@ -126,6 +129,8 @@ pub struct Searcher<D: Directory + 'static> {
     sparse_io_gate: Arc<super::SparseIoGate>,
     #[cfg(feature = "native")]
     sparse_io_concurrency: usize,
+    /// `IndexConfig::sparse_document_floor` of the owning index.
+    sparse_document_floor: bool,
 }
 
 /// A spawned task that is aborted when its handle is dropped.
@@ -218,6 +223,7 @@ impl<D: Directory + 'static> Searcher<D> {
             search_pool: resources.search_pool,
             sparse_io_gate: resources.sparse_io_gate,
             sparse_io_concurrency: resources.sparse_io_concurrency,
+            sparse_document_floor: resources.sparse_document_floor,
         })
     }
 
@@ -262,6 +268,7 @@ impl<D: Directory + 'static> Searcher<D> {
             search_pool: resources.search_pool,
             sparse_io_gate: resources.sparse_io_gate,
             sparse_io_concurrency: resources.sparse_io_concurrency,
+            sparse_document_floor: resources.sparse_document_floor,
         })
     }
 
@@ -354,6 +361,7 @@ impl<D: Directory + 'static> Searcher<D> {
             sparse_io_gate,
             #[cfg(feature = "native")]
             sparse_io_concurrency,
+            sparse_document_floor: false,
         })
     }
 
@@ -1379,7 +1387,9 @@ impl<D: Directory + 'static> Searcher<D> {
         // segments share it via an atomic; ordering is best-effort. The floor
         // carries the query window so executors with clamped heaps (segments
         // smaller than the window) can never publish an invalid floor.
-        let shared = crate::query::SharedThreshold::for_limit(fetch_limit).with_deadline(deadline);
+        let shared = crate::query::SharedThreshold::for_limit(fetch_limit)
+            .with_deadline(deadline)
+            .with_value_floor(self.sparse_document_floor);
         let lsp_plans = self.prepare_global_lsp(query, fetch_limit, false)?;
         let mut total_seen: u32 = 0;
         let mut merged = Vec::new();
@@ -1400,7 +1410,9 @@ impl<D: Directory + 'static> Searcher<D> {
             #[cfg(feature = "native")]
             let sparse_io_gate = Arc::clone(&sparse_io_gate);
             async move {
-                if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
+                if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work())
+                    && !query.restricts_documents()
+                {
                     return Ok((Vec::new(), 0u32));
                 }
                 #[cfg(feature = "native")]
@@ -1543,7 +1555,9 @@ impl<D: Directory + 'static> Searcher<D> {
         use rayon::prelude::*;
 
         let lsp_plans = self.prepare_global_lsp(query, fetch_limit, true)?;
-        let shared = crate::query::SharedThreshold::for_limit(fetch_limit).with_deadline(deadline);
+        let shared = crate::query::SharedThreshold::for_limit(fetch_limit)
+            .with_deadline(deadline)
+            .with_value_floor(self.sparse_document_floor);
         #[cfg(feature = "query-diagnostics")]
         let diagnostic_context = crate::search_diagnostics::WorkContext::current();
         let run_segment = |segment_index: &usize| {
@@ -1551,7 +1565,9 @@ impl<D: Directory + 'static> Searcher<D> {
             let _diagnostic_scope = diagnostic_context.as_ref().map(|context| context.enter());
             let segment = &self.segments[*segment_index];
             let lsp_plan = lsp_plans[*segment_index].clone();
-            if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work()) {
+            if lsp_plan.as_ref().is_some_and(|plan| !plan.has_work())
+                && !query.restricts_documents()
+            {
                 return Ok((Vec::new(), 0u32));
             }
             let _io_permit = lsp_plan.as_ref().map(|_| self.sparse_io_gate.acquire());
@@ -2056,6 +2072,31 @@ impl<D: Directory + 'static> Searcher<D> {
         }
 
         Ok(None)
+    }
+
+    /// [`Self::get_document_with_fields`] that decodes only `window`'s
+    /// positions of its multi-valued stored fields; see
+    /// [`crate::segment::StoredValueWindow`] for the placeholder contract.
+    pub async fn get_document_windowed(
+        &self,
+        address: &crate::query::DocAddress,
+        fields: Option<&rustc_hash::FxHashSet<u32>>,
+        window: Option<crate::segment::StoredValueWindow<'_>>,
+    ) -> Result<Option<crate::dsl::Document>> {
+        let segment_id = address.segment_id_u128().ok_or_else(|| {
+            crate::error::Error::Query(format!("Invalid segment ID: {}", address.segment_id()))
+        })?;
+        let Some(&idx) = self.segment_map.get(&segment_id) else {
+            return Ok(None);
+        };
+        self.segments[idx]
+            .doc_with_reads(
+                address.doc_id,
+                fields,
+                window,
+                &crate::segment::PreparedStoreReads::default(),
+            )
+            .await
     }
 }
 

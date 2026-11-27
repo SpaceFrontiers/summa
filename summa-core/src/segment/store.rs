@@ -1127,7 +1127,7 @@ impl AsyncStoreReader {
 
     /// Get a document by doc_id (async - may load block).
     pub async fn get(&self, doc_id: DocId, schema: &Schema) -> io::Result<Option<Document>> {
-        self.get_with_reads(doc_id, schema, None, &PreparedStoreReads::default())
+        self.get_with_reads(doc_id, schema, None, None, &PreparedStoreReads::default())
             .await
     }
 
@@ -1138,8 +1138,14 @@ impl AsyncStoreReader {
         schema: &Schema,
         fields: &[u32],
     ) -> io::Result<Option<Document>> {
-        self.get_with_reads(doc_id, schema, Some(fields), &PreparedStoreReads::default())
-            .await
+        self.get_with_reads(
+            doc_id,
+            schema,
+            Some(fields),
+            None,
+            &PreparedStoreReads::default(),
+        )
+        .await
     }
 
     pub(crate) async fn get_with_reads(
@@ -1147,6 +1153,7 @@ impl AsyncStoreReader {
         doc_id: DocId,
         schema: &Schema,
         fields: Option<&[u32]>,
+        window: Option<StoredValueWindow<'_>>,
         reads: &PreparedStoreReads,
     ) -> io::Result<Option<Document>> {
         if doc_id >= self.num_docs {
@@ -1161,11 +1168,7 @@ impl AsyncStoreReader {
             .map(|(_, bytes)| bytes.clone());
         let block = self.load_block(entry, compressed).await?;
         let doc_bytes = block.doc_bytes(doc_id - entry.first_doc_id)?;
-        let result = match fields {
-            Some(fields) => deserialize_document_fields(doc_bytes, schema, fields),
-            None => deserialize_document(doc_bytes, schema),
-        }
-        .map(Some);
+        let result = deserialize_document_inner(doc_bytes, schema, fields, window).map(Some);
         crate::observe::store_get(schema.index_label(), t.secs());
         result
     }
@@ -1303,14 +1306,30 @@ pub fn deserialize_document_fields(
     schema: &Schema,
     field_ids: &[u32],
 ) -> io::Result<Document> {
-    deserialize_document_inner(data, schema, Some(field_ids))
+    deserialize_document_inner(data, schema, Some(field_ids), None)
 }
 
 /// Deserialize all fields from document bytes.
 ///
 /// Delegates to the shared field-parsing core with no field filter.
 pub fn deserialize_document(data: &[u8], schema: &Schema) -> io::Result<Document> {
-    deserialize_document_inner(data, schema, None)
+    deserialize_document_inner(data, schema, None, None)
+}
+
+/// The values a caller will read from multi-valued stored fields.
+///
+/// A long document stores one value per chunk (thousands of spans), while a
+/// search hit reads the few around its best passages. Values of `fields`
+/// whose position is not in `ordinals` keep their position in the returned
+/// document but are left as empty placeholders (empty text or bytes, JSON
+/// null) instead of being validated, parsed and allocated. The caller must
+/// read only the ordinals it asked for.
+#[derive(Clone, Copy, Debug)]
+pub struct StoredValueWindow<'a> {
+    /// Stored field ids the window applies to.
+    pub fields: &'a [u32],
+    /// Value positions to decode, ascending.
+    pub ordinals: &'a [u32],
 }
 
 /// Shared deserialization core. `field_filter = None` means all fields wanted.
@@ -1318,25 +1337,47 @@ fn deserialize_document_inner(
     data: &[u8],
     _schema: &Schema,
     field_filter: Option<&[u32]>,
+    window: Option<StoredValueWindow<'_>>,
 ) -> io::Result<Document> {
     use crate::dsl::Field;
 
     let mut reader = data;
     let num_fields = reader.read_u32::<LittleEndian>()? as usize;
     let mut doc = Document::new();
+    // Next value position of each windowed field seen so far.
+    let mut positions: Vec<(u16, u32)> = Vec::new();
 
     for _ in 0..num_fields {
         let field_id = reader.read_u16::<LittleEndian>()?;
         let type_tag = reader.read_u8()?;
 
         let wanted = field_filter.is_none_or(|ids| ids.contains(&(field_id as u32)));
+        let mut placeholder = false;
+        if wanted
+            && let Some(window) = window
+            && window.fields.contains(&(field_id as u32))
+        {
+            let position = match positions.iter_mut().find(|(id, _)| *id == field_id) {
+                Some((_, next)) => {
+                    *next += 1;
+                    *next - 1
+                }
+                None => {
+                    positions.push((field_id, 1));
+                    0
+                }
+            };
+            placeholder = window.ordinals.binary_search(&position).is_err();
+        }
 
         match type_tag {
             0 => {
                 // Text
                 let len = reader.read_u32::<LittleEndian>()? as usize;
                 let bytes = take_document_bytes(&mut reader, len, "text field")?;
-                if wanted {
+                if placeholder {
+                    doc.add_text(Field(field_id as u32), "");
+                } else if wanted {
                     let s = std::str::from_utf8(bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     doc.add_text(Field(field_id as u32), s);
@@ -1367,7 +1408,9 @@ fn deserialize_document_inner(
                 // Bytes
                 let len = reader.read_u32::<LittleEndian>()? as usize;
                 let bytes = take_document_bytes(&mut reader, len, "byte field")?;
-                if wanted {
+                if placeholder {
+                    doc.add_bytes(Field(field_id as u32), Vec::new());
+                } else if wanted {
                     doc.add_bytes(Field(field_id as u32), bytes.to_vec());
                 }
             }
@@ -1415,7 +1458,9 @@ fn deserialize_document_inner(
                 // Json
                 let len = reader.read_u32::<LittleEndian>()? as usize;
                 let bytes = take_document_bytes(&mut reader, len, "JSON field")?;
-                if wanted {
+                if placeholder {
+                    doc.add_json(Field(field_id as u32), serde_json::Value::Null);
+                } else if wanted {
                     let v: serde_json::Value = serde_json::from_slice(bytes)
                         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                     doc.add_json(Field(field_id as u32), v);
@@ -1790,6 +1835,77 @@ impl AsyncStoreReader {
 mod tests {
     use super::*;
 
+    /// A value window keeps every value's position, decodes the requested
+    /// positions of its fields exactly, and leaves the rest of those fields
+    /// as placeholders. Fields outside the window are untouched.
+    #[test]
+    fn stored_value_window_decodes_only_requested_positions() {
+        use crate::dsl::{Field, FieldValue};
+        let mut builder = Schema::builder();
+        let title = builder.add_text_field("title", false, true);
+        let span = builder.add_json_field("span", true);
+        let note = builder.add_text_field("note", false, true);
+        let schema = builder.build();
+        let mut document = Document::new();
+        document.add_text(title, "kept title");
+        for chunk in 0..6u32 {
+            // Interleave the fields: positions count per field, not per row.
+            document.add_json(
+                span,
+                serde_json::json!({"start": chunk * 10, "end": chunk * 10 + 9}),
+            );
+            document.add_text(note, format!("note {chunk}"));
+        }
+        let bytes = serialize_document(&document, &schema).unwrap();
+
+        let all = deserialize_document_inner(&bytes, &schema, None, None).unwrap();
+        let windowed = deserialize_document_inner(
+            &bytes,
+            &schema,
+            None,
+            Some(StoredValueWindow {
+                fields: &[span.0, note.0],
+                ordinals: &[1, 4],
+            }),
+        )
+        .unwrap();
+        let values = |doc: &Document, field: Field| doc.get_all(field).cloned().collect::<Vec<_>>();
+        assert_eq!(values(&windowed, title), values(&all, title));
+        for field in [span, note] {
+            let (full, kept) = (values(&all, field), values(&windowed, field));
+            assert_eq!(kept.len(), full.len());
+            for (position, (full, kept)) in full.iter().zip(&kept).enumerate() {
+                if position == 1 || position == 4 {
+                    assert_eq!(kept, full, "position {position}");
+                } else {
+                    assert!(
+                        matches!(kept, FieldValue::Json(serde_json::Value::Null))
+                            || matches!(kept, FieldValue::Text(text) if text.is_empty()),
+                        "position {position}: {kept:?}"
+                    );
+                }
+            }
+        }
+        // A field filter still applies, and the window only narrows it.
+        let filtered = deserialize_document_inner(
+            &bytes,
+            &schema,
+            Some(&[span.0]),
+            Some(StoredValueWindow {
+                fields: &[span.0],
+                ordinals: &[5],
+            }),
+        )
+        .unwrap();
+        assert_eq!(values(&filtered, title).len(), 0);
+        assert_eq!(values(&filtered, note).len(), 0);
+        assert_eq!(values(&filtered, span)[5], values(&all, span)[5]);
+        assert!(matches!(
+            values(&filtered, span)[0],
+            FieldValue::Json(serde_json::Value::Null)
+        ));
+    }
+
     #[cfg(feature = "native")]
     fn raw_store_bytes(
         num_threads: usize,
@@ -1896,7 +2012,7 @@ mod tests {
             let prepared_calls = calls.load(Ordering::SeqCst);
             for &id in &ids {
                 let actual = reader
-                    .get_with_reads(id, &schema, Some(&[title.0]), &reads)
+                    .get_with_reads(id, &schema, Some(&[title.0]), None, &reads)
                     .await
                     .unwrap();
                 if id == 16 {
@@ -1918,7 +2034,7 @@ mod tests {
             let none = prepare_store_reads(&reader, &ids, &mut 0).await.unwrap();
             assert!(none.blocks.is_empty());
             let actual = reader
-                .get_with_reads(15, &schema, None, &none)
+                .get_with_reads(15, &schema, None, None, &none)
                 .await
                 .unwrap()
                 .unwrap();

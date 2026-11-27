@@ -232,6 +232,9 @@ impl Query for FilteredQuery {
     fn sparse_decomposition(&self) -> super::QueryDecomposition {
         self.query.sparse_decomposition()
     }
+    fn restricts_documents(&self) -> bool {
+        !self.filters.is_empty() || self.query.restricts_documents()
+    }
     fn text_terms(&self, out: &mut Vec<(crate::Field, Vec<u8>)>) {
         self.query.text_terms(out);
         for filter in &self.filters {

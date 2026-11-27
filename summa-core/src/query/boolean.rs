@@ -7,11 +7,11 @@ use crate::structures::TERMINATED;
 use crate::{DocId, Score};
 
 use super::planner::{
-    build_combined_bitset, build_sparse_bmp_results, build_sparse_bmp_results_filtered,
-    build_sparse_maxscore_executor, build_sparse_results, build_sparse_results_filtered, cap_terms,
-    chain_predicates, combine_sparse_results, compute_idf, extract_all_sparse_infos,
-    finish_chunked_text_maxscore, finish_text_maxscore, prepare_per_field_grouping,
-    prepare_text_maxscore, sparse_result_scorer, text_maxscore_allowed,
+    build_combined_bitset, build_sparse_bmp_results, build_sparse_bmp_results_bitset,
+    build_sparse_bmp_results_filtered, build_sparse_maxscore_executor, build_sparse_results,
+    build_sparse_results_filtered, cap_terms, chain_predicates, combine_sparse_results,
+    compute_idf, extract_all_sparse_infos, finish_chunked_text_maxscore, finish_text_maxscore,
+    prepare_per_field_grouping, prepare_text_maxscore, sparse_result_scorer, text_maxscore_allowed,
 };
 use super::{CountFuture, EmptyScorer, GlobalStats, Query, Scorer, ScorerFuture};
 
@@ -866,8 +866,8 @@ macro_rules! boolean_plan {
                             return Ok(sparse_result_scorer(raw, info.field));
                         }
                         if let Some((raw, info)) =
-                            build_sparse_bmp_results_filtered(
-                                &infos, reader, limit, &bitset_pred, &scorer_options
+                            build_sparse_bmp_results_bitset(
+                                &infos, reader, limit, bitset, &scorer_options
                             )?
                         {
                             log::debug!(
@@ -1340,6 +1340,10 @@ impl Query for BooleanQuery {
         extract_all_sparse_infos(&self.should)
             .map(super::QueryDecomposition::SparseTerms)
             .unwrap_or(super::QueryDecomposition::Opaque)
+    }
+
+    fn restricts_documents(&self) -> bool {
+        !self.must.is_empty() || !self.must_not.is_empty()
     }
 
     fn should_children(&self) -> Option<&[Arc<dyn Query>]> {

@@ -396,6 +396,13 @@ pub struct IndexConfig {
     /// `num_threads`; this separate cap protects the page cache and storage
     /// queue from segment/query fan-out.
     pub sparse_io_concurrency: usize,
+    /// Let later segments of a multi-valued BMP query skip values scoring
+    /// below the document floor earlier segments established (averaging
+    /// combiners only). This removes most per-segment heap fills, but a
+    /// returned document's combined score then omits its values below the
+    /// floor, so ranking can differ from the default. Off by default; enable
+    /// after measuring retrieval quality.
+    pub sparse_document_floor: bool,
     /// Segment readers opened concurrently when a searcher loads or reloads
     /// (each open validates and pins its hot metadata). Every concurrent open
     /// holds its own validation scratch, so raise this only with memory to
@@ -702,6 +709,7 @@ impl Default for IndexConfig {
         Self {
             num_threads: search_threads,
             sparse_io_concurrency: 4,
+            sparse_document_floor: false,
             segment_open_concurrency: DEFAULT_SEGMENT_OPEN_CONCURRENCY,
             #[cfg(feature = "native")]
             binary_prefix_cache_budget_bytes: 0,

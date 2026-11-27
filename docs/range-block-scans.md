@@ -203,3 +203,28 @@ avoid regression; their small gains are not attributed to lazy scorer batching.
 The final x86 RSS pairs peak at 36.21–36.34 MiB before and 36.39–36.51 MiB after.
 CPU 2 records zero steal ticks across all measured processes. The remote archive
 was downloaded and SHA256-verified before deleting the machine and boot disk.
+
+## Signed bounds and learned block extremes (2.2.7)
+
+Signed ranges used only exact constant bounds, so an `i64` timestamp filter
+scanned every copied block of every segment. Two changes remove that:
+
+- **Zigzag-aware header bounds.** Zigzag interleaves the signs: even raw values
+  are the non-negative numbers in ascending order and odd raw values the
+  negative numbers in descending order. A raw interval therefore decodes to at
+  most one interval per sign, and `CompiledRange::may_match` tests the query
+  against both. For a dense raw interval this is exact.
+- **Learned extremes.** `BlockwiseLinear`, which near-sorted timestamps select,
+  has no cheap header bound, and bitpacked bounds are loose. The first scan that
+  decodes a whole copied block records the exact raw and signed extremes of its
+  present values in the block (`ColumnBlock::learned_bounds`, 40 bytes per
+  copied block, never persisted). Later range scans reject the block without
+  reading it. A block whose values are all missing is rejected outright.
+
+Blocks are immutable and readers are reused across reloads, so the extremes stay
+valid for a segment's lifetime. Text-ordinal columns still skip pruning.
+Membership is unchanged: `learned_block_bounds_prune_signed_ranges_without_changing_matches`
+compares both passes with a per-document oracle, and
+`signed_block_bounds_follow_zigzag_parity_without_false_rejections` checks the
+header test exhaustively on small intervals. Not measured: scan time on a
+production column; the saving is one skipped block per disjoint copied block.

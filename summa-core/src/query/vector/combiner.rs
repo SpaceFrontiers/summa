@@ -84,6 +84,14 @@ impl MultiValueCombiner {
         Self::WeightedTopK { k, decay }
     }
 
+    /// Whether a combined document score can never exceed the document's
+    /// best value score. Every averaging combiner qualifies; `Sum` does not.
+    /// A document-level score floor is then also a floor for the values a
+    /// competitive document must hold.
+    pub fn bounded_by_max(&self) -> bool {
+        !matches!(self, Self::Sum)
+    }
+
     /// Combine multiple scores into a single score
     pub fn combine(&self, scores: &[(u32, f32)]) -> f32 {
         if scores.is_empty() {
