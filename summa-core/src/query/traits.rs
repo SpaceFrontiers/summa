@@ -509,6 +509,15 @@ macro_rules! define_query_traits {
                 false
             }
 
+            /// True if eligibility clauses (filters, MUST or MUST_NOT) can
+            /// remove documents this query's scoring clauses would return. A
+            /// query-global sparse plan may select nothing in a segment whose
+            /// few eligible documents still have to be scored exactly, so the
+            /// searcher keeps such segments.
+            fn restricts_documents(&self) -> bool {
+                false
+            }
+
             /// For filter queries: return a cheap per-doc predicate against a segment.
             /// The predicate does O(1) work per doc (e.g., fast-field lookup).
             fn as_doc_predicate<'a>(
@@ -820,6 +829,10 @@ impl Query for Box<dyn Query> {
 
     fn is_filter(&self) -> bool {
         (**self).is_filter()
+    }
+
+    fn restricts_documents(&self) -> bool {
+        (**self).restricts_documents()
     }
 
     fn as_doc_predicate<'a>(&self, reader: &'a SegmentReader) -> Option<DocPredicate<'a>> {

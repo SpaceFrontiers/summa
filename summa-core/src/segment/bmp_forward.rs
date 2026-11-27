@@ -120,8 +120,19 @@ impl BmpForward {
     }
 
     fn lower_bound(&self, target: LogicalUnit) -> u32 {
-        let mut low = 0;
-        let mut high = self.len();
+        // Locate the document by interpolation; its values follow in strictly
+        // ascending ordinal order, so ordinal `n` is at most `n` rows further.
+        let first = super::logical_address::first_position_of_document(
+            self.len() as usize,
+            target.doc,
+            |index| self.key(index as u32).doc,
+        ) as u32;
+        let mut low = first;
+        let mut high = self.len().min(
+            first
+                .saturating_add(u32::from(target.ordinal))
+                .saturating_add(1),
+        );
         while low < high {
             let mid = low + (high - low) / 2;
             if self.key(mid) < target {

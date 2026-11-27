@@ -143,6 +143,22 @@ immutable contract: repartitioning or reordering = full rebuild). Every
 partition must host the index; by default a partition without a routable
 copy fails the request instead of serving a partial view.
 
+### Statistics round
+
+A partitioned search scores BM25 with statistics summed over every partition,
+so the broker calls `GetTextStats` on each partition before the search fan-out.
+The round is skipped when no text leaf can score: the query has no
+term/match/phrase leaf, or its only text leaves are exact terms under fusion
+`filters` or Boolean `must_not`. Such terms match identically under each
+partition's own statistics. A match or phrase filter still triggers the round,
+because a capped match keeps its rarest tokens and every partition must keep
+the same ones. When any leaf scores, the statistics cover every leaf, as before.
+
+A broker-side cache of merged statistics was considered and not built:
+production shard logs showed no identical query repeated within 60 seconds
+(point lookups by distinct identifiers dominate), so a query-keyed cache would
+not hit.
+
 ### Partition weights
 
 A partition may carry a positive integer weight, `shard:weight` (default 1):

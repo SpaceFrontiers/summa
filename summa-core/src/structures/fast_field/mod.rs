@@ -720,6 +720,43 @@ pub struct ColumnBlock {
     pub dict: Option<TextDictReader>,
     /// Raw dictionary bytes for this block (for merge: memcpy).
     pub raw_dict: OwnedBytes,
+    /// Exact extremes learned by the first complete single-value scan.
+    pub(crate) learned_bounds: std::sync::OnceLock<Option<LearnedBounds>>,
+}
+
+/// Exact extremes of one block's present values in the encoded domain (before
+/// any text-ordinal remapping) and, for zigzag columns, the signed domain.
+///
+/// Headers bound only some codecs, and only loosely. A block is immutable, so
+/// the first scan that decodes all of it records what it saw (40 bytes per
+/// copied block) and later range scans reject the block without reading it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LearnedBounds {
+    pub raw: (u64, u64),
+    pub signed: (i64, i64),
+}
+
+impl LearnedBounds {
+    const EMPTY: Self = Self {
+        raw: (u64::MAX, 0),
+        signed: (i64::MAX, i64::MIN),
+    };
+
+    #[inline]
+    fn include(&mut self, values: &[u64]) {
+        for &value in values {
+            if value != FAST_FIELD_MISSING {
+                let signed = zigzag_decode(value);
+                self.raw = (self.raw.0.min(value), self.raw.1.max(value));
+                self.signed = (self.signed.0.min(signed), self.signed.1.max(signed));
+            }
+        }
+    }
+
+    /// `None` when every value was missing.
+    fn finish(self) -> Option<Self> {
+        (self.raw.0 <= self.raw.1).then_some(self)
+    }
 }
 
 mod checkpoints;
@@ -728,6 +765,12 @@ impl ColumnBlock {
     /// Bounds in the encoded domain, before any text-ordinal remapping.
     pub(crate) fn value_bounds(&self) -> Option<(u64, u64)> {
         codec::value_bounds(self.data.as_slice())
+    }
+
+    /// Exact bounds once a complete scan has recorded them. The inner `None`
+    /// is a block without any present value.
+    pub(crate) fn learned_bounds(&self) -> Option<Option<LearnedBounds>> {
+        self.learned_bounds.get().copied()
     }
 }
 
@@ -1071,6 +1114,7 @@ impl FastFieldReader {
                 value_data,
                 dict,
                 raw_dict,
+                learned_bounds: std::sync::OnceLock::new(),
             });
 
             cumulative = cumulative.checked_add(entry.num_docs).ok_or_else(|| {
@@ -1404,6 +1448,11 @@ impl FastFieldReader {
 
             let map = ordinal_maps.map(|maps| &maps[block_idx]);
             let has_map = map.is_some_and(|m| !m.is_empty());
+            let mut learned = block
+                .learned_bounds
+                .get()
+                .is_none()
+                .then_some(LearnedBounds::EMPTY);
 
             while pos < n {
                 let chunk = (n - pos).min(BATCH);
@@ -1413,12 +1462,19 @@ impl FastFieldReader {
                     &mut buf[..chunk],
                     &mut cursor,
                 );
+                if let Some(learned) = &mut learned {
+                    learned.include(&buf[..chunk]);
+                }
 
                 if has_map {
                     remap_batch(map.unwrap(), &mut buf[..chunk]);
                 }
                 f(block.cumulative_docs + pos as u32, &buf[..chunk])?;
                 pos += chunk;
+            }
+            // Only a scan that decoded the whole block may publish its extremes.
+            if let Some(learned) = learned {
+                let _ = block.learned_bounds.set(learned.finish());
             }
         }
         Ok(())

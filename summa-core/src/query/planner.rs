@@ -461,6 +461,22 @@ fn bmp_threshold<'a>(
     heap_covers_limit: bool,
 ) -> super::bmp::BmpThreshold<'a> {
     if !single_valued && combiner != MultiValueCombiner::Max {
+        // Opt-in: an averaging combiner never scores a document above its
+        // best value, so a document whose every value is below the query's
+        // document floor cannot enter the result window. Values below the
+        // floor are then skipped even for documents that stay, which is why
+        // this is not the default: their combined scores see fewer values.
+        // The raw heap holds values, not documents, so it never publishes.
+        if let Some(shared) = options.shared_threshold.as_ref()
+            && shared.floors_values()
+            && combiner.bounded_by_max()
+        {
+            return super::bmp::BmpThreshold {
+                initial: 0.0,
+                shared: Some(shared),
+                publish: false,
+            };
+        }
         return super::bmp::BmpThreshold::default();
     }
     super::bmp::BmpThreshold {
@@ -539,10 +555,63 @@ pub(crate) fn build_sparse_bmp_results(
             reader,
             limit,
             Some(&|doc| filter.contains(doc)),
+            Some(EligibleDocs {
+                primary: filter,
+                also: None,
+            }),
             options,
         )
     } else {
-        build_sparse_bmp_results_inner(infos, reader, limit, None, options)
+        build_sparse_bmp_results_inner(infos, reader, limit, None, None, options)
+    }
+}
+
+/// Build sparse BMP results restricted to a materialized filter bitset.
+///
+/// Unlike an opaque predicate, a bitset has a known cardinality: a filter that
+/// leaves only a few thousand documents is scored exactly over those documents
+/// instead of traversed (see [`super::bmp::exact_filter_applies`]).
+pub(crate) fn build_sparse_bmp_results_bitset(
+    infos: &[SparseTermQueryInfo],
+    reader: &SegmentReader,
+    limit: usize,
+    bitset: &super::DocBitset,
+    options: &super::ScorerOptions,
+) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
+    let outer = options.eligibility.as_deref();
+    build_sparse_bmp_results_inner(
+        infos,
+        reader,
+        limit,
+        Some(&|doc| bitset.contains(doc) && outer.is_none_or(|outer| outer.contains(doc))),
+        Some(EligibleDocs {
+            primary: bitset,
+            also: outer,
+        }),
+        options,
+    )
+}
+
+/// The complete set of documents a filtered sparse query may return.
+#[derive(Clone, Copy)]
+struct EligibleDocs<'a> {
+    primary: &'a super::DocBitset,
+    also: Option<&'a super::DocBitset>,
+}
+
+impl EligibleDocs<'_> {
+    /// Upper bound on the eligible documents, without intersecting.
+    fn at_most(&self) -> u32 {
+        let primary = self.primary.count();
+        self.also.map_or(primary, |also| primary.min(also.count()))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = crate::DocId> + '_ {
+        std::iter::successors(self.primary.next_set_bit(0), |&doc| {
+            doc.checked_add(1)
+                .and_then(|next| self.primary.next_set_bit(next))
+        })
+        .filter(|&doc| self.also.is_none_or(|also| also.contains(doc)))
     }
 }
 
@@ -563,10 +632,11 @@ pub(crate) fn build_sparse_bmp_results_filtered(
             reader,
             limit,
             Some(&|doc| filter.contains(doc) && predicate(doc)),
+            None,
             options,
         )
     } else {
-        build_sparse_bmp_results_inner(infos, reader, limit, Some(predicate), options)
+        build_sparse_bmp_results_inner(infos, reader, limit, Some(predicate), None, options)
     }
 }
 
@@ -575,6 +645,7 @@ fn build_sparse_bmp_results_inner(
     reader: &SegmentReader,
     limit: usize,
     predicate: Option<&dyn Fn(crate::DocId) -> bool>,
+    eligible: Option<EligibleDocs<'_>>,
     options: &super::ScorerOptions,
 ) -> crate::Result<Option<(Vec<ScoredDoc>, SparseTermQueryInfo)>> {
     let infos = options
@@ -609,6 +680,45 @@ fn build_sparse_bmp_results_inner(
         (candidate_terms, scoring_terms)
     };
     let executor_limit = bmp_executor_limit(limit, info.over_fetch_factor, bmp);
+    if let Some(eligible) = eligible
+        && super::bmp::exact_filter_applies(eligible.at_most(), bmp.num_real_docs())
+    {
+        let local_query;
+        let prepared = if let Some(plan) = options.lsp_plan.as_ref() {
+            Some(plan.prepared_query.as_ref())
+        } else {
+            local_query =
+                super::bmp::prepare_bmp_query(bmp.dims(), &candidate_terms, &scoring_terms)?;
+            local_query.as_ref()
+        };
+        let Some(prepared) = prepared else {
+            return Ok(Some((Vec::new(), info)));
+        };
+        if let Some(results) =
+            super::bmp::score_bmp_eligible_exact(bmp, prepared, eligible.iter(), executor_limit)?
+        {
+            log::debug!(
+                "[planner] exact filtered sparse BMP: field={}, at most {} eligible docs, {} hits",
+                reader.schema().get_field_name(field).unwrap_or("?"),
+                eligible.at_most(),
+                results.len()
+            );
+            crate::observe::bmp_exact_filter(
+                reader.schema().index_label(),
+                reader.schema().get_field_name(field).unwrap_or("?"),
+            );
+            return Ok(Some((results, info)));
+        }
+    }
+    // A filtered query reaches segments the global plan selected nothing in
+    // only for the exact pass above; a wider filter keeps the plan's verdict.
+    if options
+        .lsp_plan
+        .as_ref()
+        .is_some_and(|plan| !plan.has_work())
+    {
+        return Ok(Some((Vec::new(), info)));
+    }
     let lsp_gamma = if info.exhaustive {
         0
     } else {

@@ -43,6 +43,19 @@ enum CompiledRange {
 }
 
 impl CompiledRange {
+    /// Exact once a complete scan has recorded the block's extremes; until
+    /// then the codec header's conservative interval decides.
+    fn may_match_block(self, block: &crate::structures::fast_field::ColumnBlock) -> bool {
+        match block.learned_bounds() {
+            None => self.may_match(block.value_bounds()),
+            Some(None) => false,
+            Some(Some(bounds)) => match self {
+                Self::Raw { lo, hi } => lo <= bounds.raw.1 && hi >= bounds.raw.0,
+                Self::Signed { lo, hi } => lo <= bounds.signed.1 && hi >= bounds.signed.0,
+            },
+        }
+    }
+
     fn may_match(self, bounds: Option<(u64, u64)>) -> bool {
         let Some((min, max)) = bounds else {
             return true;
@@ -50,11 +63,31 @@ impl CompiledRange {
         if min == max {
             return self.contains(min);
         }
+        let max = max.min(FAST_FIELD_MISSING - 1);
         match self {
-            Self::Raw { lo, hi } => lo <= hi && lo <= max.min(FAST_FIELD_MISSING - 1) && hi >= min,
-            // Zigzag does not preserve order. Only exact constants above can
-            // reject signed blocks using a raw-domain interval.
-            Self::Signed { .. } => true,
+            Self::Raw { lo, hi } => lo <= hi && lo <= max && hi >= min,
+            // Zigzag interleaves the signs: even raw values are the
+            // non-negative numbers in ascending order and odd raw values the
+            // negative numbers in descending order. A raw interval therefore
+            // decodes to at most one interval per sign, each bounded by the
+            // interval's outermost value of that parity.
+            Self::Signed { lo, hi } => {
+                if lo > hi || min > max {
+                    return false;
+                }
+                let (first_even, last_even) = (min + (min & 1), max - (max & 1));
+                let non_negative = first_even <= last_even
+                    && lo <= zigzag_decode(last_even)
+                    && hi >= zigzag_decode(first_even);
+                let first_odd = min | 1;
+                // `max` is below the all-ones sentinel, so the largest odd
+                // value at or below it never underflows past an odd `min`.
+                let negative = max >= first_odd && {
+                    let last_odd = max - (1 - (max & 1));
+                    lo <= zigzag_decode(first_odd) && hi >= zigzag_decode(last_odd)
+                };
+                non_negative || negative
+            }
         }
     }
 
@@ -211,7 +244,7 @@ impl Query for RangeQuery {
             .try_scan_single_value_batches_where(
                 |block| {
                     fast_field.column_type == FastFieldColumnType::TextOrdinal
-                        || bound.may_match(block.value_bounds())
+                        || bound.may_match_block(block)
                 },
                 |start, values| {
                     match bound {
@@ -487,5 +520,146 @@ mod tests {
 
         let q = RangeQuery::f64(Field(2), Some(0.5), Some(9.5));
         assert!(matches!(q.bound, RangeBound::F64 { .. }));
+    }
+    /// The signed block test may never reject an interval holding a match.
+    /// Dense raw intervals also make it exact, which the pruning relies on to
+    /// skip columns of positive timestamps.
+    #[test]
+    fn signed_block_bounds_follow_zigzag_parity_without_false_rejections() {
+        for min in 0u64..24 {
+            for max in min + 1..24 {
+                for lo in -14i64..14 {
+                    for hi in lo..14 {
+                        let expected = (min..=max).any(|raw| {
+                            let value = zigzag_decode(raw);
+                            value >= lo && value <= hi
+                        });
+                        assert_eq!(
+                            CompiledRange::Signed { lo, hi }.may_match(Some((min, max))),
+                            expected,
+                            "raw [{min}, {max}] against [{lo}, {hi}]"
+                        );
+                    }
+                }
+            }
+        }
+        let day = CompiledRange::Signed {
+            lo: 1_795_665_600,
+            hi: 1_795_752_000,
+        };
+        let raw = |value: i64| crate::structures::fast_field::zigzag_encode(value);
+        assert!(!day.may_match(Some((raw(1_700_000_000), raw(1_795_000_000)))));
+        assert!(day.may_match(Some((raw(1_795_000_000), raw(1_795_700_000)))));
+        // A block holding the missing sentinel still bounds its present values.
+        assert!(!day.may_match(Some((raw(1_800_000_000), FAST_FIELD_MISSING))));
+        assert!(
+            CompiledRange::Signed {
+                lo: i64::MIN,
+                hi: -1
+            }
+            .may_match(Some((0, FAST_FIELD_MISSING)))
+        );
+    }
+
+    /// A complete scan records each copied block's exact extremes; later range
+    /// scans then reject blocks whose codec header carries no usable bound.
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn learned_block_bounds_prune_signed_ranges_without_changing_matches() {
+        use crate::{Document, Index, IndexConfig, IndexWriter, RamDirectory, Schema};
+
+        let mut schema = Schema::builder();
+        let issued = schema.add_i64_field("issued_at", false, false);
+        schema.set_fast(issued, true);
+        let directory = RamDirectory::new();
+        let config = IndexConfig {
+            merge_policy: Box::new(crate::merge::NoMergePolicy),
+            ..Default::default()
+        };
+        let mut writer = IndexWriter::create(directory.clone(), schema.build(), config.clone())
+            .await
+            .unwrap();
+        // One block per commit: historical negatives, two noisy timestamp
+        // days, and a block where most documents have no value.
+        let blocks: [Box<dyn Fn(i64) -> Option<i64>>; 4] = [
+            Box::new(|i| Some(-2_000_000_000 + i * 7919 % 100_003)),
+            Box::new(|i| Some(1_795_000_000 + (i * 7919) % 86_400)),
+            Box::new(|i| Some(1_795_665_600 + (i * 104_729) % 86_400)),
+            Box::new(|i| (i % 5 == 0).then_some(1_900_000_000 + i)),
+        ];
+        let mut expected_values = Vec::new();
+        for block in &blocks {
+            for i in 0..700 {
+                let mut document = Document::new();
+                let value = block(i);
+                if let Some(value) = value {
+                    document.add_i64(issued, value);
+                }
+                expected_values.push(value);
+                writer.add_document(document).unwrap();
+            }
+            writer.commit().await.unwrap();
+        }
+        writer.force_merge().await.unwrap();
+        let index = Index::open(directory, config).await.unwrap();
+        let searcher = index.reader().await.unwrap().searcher().await.unwrap();
+        assert_eq!(searcher.segment_readers().len(), 1);
+        let reader = &searcher.segment_readers()[0];
+        let column = reader.fast_field(issued.0).unwrap();
+        assert_eq!(column.blocks().len(), blocks.len());
+        assert_eq!(reader.num_docs() as usize, expected_values.len());
+        // Merging keeps commit order, so the oracle indexes by document id.
+        for (doc, value) in expected_values.iter().enumerate() {
+            assert_eq!(
+                column
+                    .has_value(doc as u32)
+                    .then(|| column.get_i64(doc as u32)),
+                *value
+            );
+        }
+
+        let ranges = [
+            (Some(1_795_665_600), Some(1_795_752_000)),
+            (Some(-2_000_000_000), Some(-1_999_950_000)),
+            (None, Some(0)),
+            (Some(1_900_000_000), None),
+            (Some(5), Some(4)),
+            (None, None),
+        ];
+        // The first pass decides from headers and learns; the second decides
+        // from the learned extremes. Both must equal the per-document oracle.
+        for pass in 0..2 {
+            for &(min, max) in &ranges {
+                let query = RangeQuery::i64(issued, min, max);
+                let bits = query.as_doc_bitset(reader).unwrap();
+                for (doc, value) in expected_values.iter().enumerate() {
+                    let expected = value.is_some_and(|value| {
+                        min.is_none_or(|min| value >= min) && max.is_none_or(|max| value <= max)
+                    });
+                    assert_eq!(
+                        bits.contains(doc as u32),
+                        expected,
+                        "pass {pass}, doc {doc}, range {min:?}..{max:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            column
+                .blocks()
+                .iter()
+                .all(|block| block.learned_bounds().is_some())
+        );
+        let day = RangeBound::I64 {
+            min: Some(1_795_665_600),
+            max: Some(1_795_752_000),
+        }
+        .compile();
+        let scanned: Vec<bool> = column
+            .blocks()
+            .iter()
+            .map(|block| day.may_match_block(block))
+            .collect();
+        assert_eq!(scanned, [false, false, true, false]);
     }
 }

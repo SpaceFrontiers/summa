@@ -56,6 +56,7 @@
 - [Binary IVF SOAR spill](binary-ivf-soar.md)
 - [Binary eligibility, ANN controls, and bounded passage nomination](binary-retrieval-controls.md)
 - [BMP grid compression](bmp-grid-compression.md) and [forward storage](bmp-forward-index.md)
+- [Filtered and floored BMP scoring](filtered-sparse-scoring.md)
 - [Seismic](seismic-sparse-index.md), [compact summaries](seismic-compact-summaries.md), and [forward compression](seismic-forward-compression.md)
 - [Algebraic float reductions](algebraic-float-reductions.md)
 

@@ -162,6 +162,14 @@ struct Args {
     #[arg(long, default_value = "4")]
     sparse_io_concurrency: usize,
 
+    /// Let later segments of a multi-valued BMP sparse query skip values
+    /// below the document floor earlier segments established. Fewer blocks
+    /// are scored, but a returned document's combined score omits its values
+    /// below the floor, so ranking can differ. Measure retrieval quality
+    /// before enabling.
+    #[arg(long)]
+    sparse_document_floor: bool,
+
     /// Restart the server when every search admission permit has been held
     /// this many seconds without a completed search; 0 disables. Request
     /// cancellation cannot release a permit held by running search-pool
@@ -784,6 +792,7 @@ async fn async_main(args: Args, worker_threads: usize) -> Result<()> {
     let config = IndexConfig {
         num_threads: search_threads,
         sparse_io_concurrency: args.sparse_io_concurrency,
+        sparse_document_floor: args.sparse_document_floor,
         segment_open_concurrency: args.segment_open_concurrency,
         store_cache_budget_bytes,
         binary_prefix_cache_budget_bytes,

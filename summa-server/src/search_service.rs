@@ -446,6 +446,14 @@ impl SearchService for SearchServiceImpl {
             }
         }
 
+        let windowed_field_ids: Vec<u32> = req.ordinal_window.as_ref().map_or_else(Vec::new, |window| {
+            requested_fields
+                .iter()
+                .filter(|requested| window.fields.contains(&requested.name))
+                .map(|requested| requested.id.0)
+                .collect()
+        });
+
         search_permit.set_phase(SearchPhase::Loading);
         let mut hits = Vec::with_capacity(results.len());
         let prepare_reads = !requested_fields.is_empty() && searcher.has_lazy_document_reads();
@@ -493,11 +501,21 @@ impl SearchService for SearchServiceImpl {
             let mut fields: HashMap<String, FieldValueList> = HashMap::new();
 
             if !requested_fields.is_empty() {
+                // Decode only the windowed fields' kept values: a long
+                // document stores thousands of them and the loop below skips
+                // every other ordinal anyway.
+                let window = kept_ordinals.as_deref().map(|ordinals| {
+                    summa_core::segment::StoredValueWindow {
+                        fields: &windowed_field_ids,
+                        ordinals,
+                    }
+                });
                 let doc = match &prepared {
-                    Some(batch) => batch.get(batch_position, requested_field_ids.as_ref()).await,
-                    None => searcher.get_document_with_fields(
+                    Some(batch) => batch.get_windowed(batch_position, requested_field_ids.as_ref(), window).await,
+                    None => searcher.get_document_windowed(
                         &summa_core::query::DocAddress::new(result.segment_id, result.doc_id),
                         requested_field_ids.as_ref(),
+                        window,
                     ).await,
                 }.map_err(crate::error::summa_error_to_status)?;
 
@@ -559,13 +577,29 @@ impl SearchService for SearchServiceImpl {
 
         let total_us = start.elapsed().as_micros() as u64;
         let took_ms = total_us / 1000;
+        if let Some(index) = metric_index.get() {
+            for (phase, micros) in [
+                ("search", search_us),
+                ("candidate_scoring", candidate_scoring_us),
+                ("rerank", rerank_us),
+                ("load", load_us),
+            ] {
+                metrics::histogram!(
+                    "summa_search_phase_duration_seconds",
+                    "index" => index.clone(),
+                    "phase" => phase,
+                )
+                .record(micros as f64 / 1e6);
+            }
+        }
 
         if took_ms > 1000 {
             log::warn!(
-                "slow query: index={}, took={}ms (search={}us, rerank={}us, load={}us), hits={}, total_seen={}, query={}",
+                "slow query: index={}, took={}ms (search={}us, scoring={}us, rerank={}us, load={}us), hits={}, total_seen={}, query={}",
                 req.index_name,
                 took_ms,
                 search_us,
+                candidate_scoring_us,
                 rerank_us,
                 load_us,
                 hits.len(),

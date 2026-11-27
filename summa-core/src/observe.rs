@@ -134,6 +134,13 @@ mod imp {
             .record(docmap_lookups as f64);
     }
 
+    /// A selective filter was scored exactly over its eligible documents
+    /// instead of traversed, on one segment/field.
+    pub fn bmp_exact_filter(index: &str, field: &str) {
+        metrics::counter!("summa_bmp_exact_filter_segments_total", "index" => shared_label(index), "field" => shared_label(field))
+            .increment(1);
+    }
+
     /// Query-global LSP planning, which runs outside every segment executor.
     #[allow(clippy::too_many_arguments)]
     pub fn bmp_lsp(
@@ -395,6 +402,8 @@ mod imp {
         _: usize,
     ) {
     }
+    #[inline(always)]
+    pub fn bmp_exact_filter(_: &str, _: &str) {}
     #[inline(always)]
     pub fn seismic_query(_: &str, _: &str, _: f64, _: usize, _: usize, _: bool) {}
     #[inline(always)]

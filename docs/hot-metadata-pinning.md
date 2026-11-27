@@ -61,6 +61,10 @@ sampled miss reopens the gate immediately, so cold and partially resident
 segments keep prefetching (`summa_bmp_prefetch_gated_total` counts withheld
 stages). The sizes above are dense four-bit upper bounds; the
 row-local variable-width codec is smaller whenever groups need fewer bits.
+Each query dimension's D row header (checkpoints and width selectors, a few KiB)
+is advised once per segment execution. Advising the next window's records
+instead re-advised the same header pages on every eight-superblock window:
+about one syscall per query dimension per window.
 
 ### Fast-field header checkpoints
 

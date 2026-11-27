@@ -4,7 +4,7 @@ use super::Searcher;
 use crate::directories::{Directory, FileHandle};
 use crate::dsl::Document;
 use crate::query::DocAddress;
-use crate::segment::PreparedStoreReads;
+use crate::segment::{PreparedStoreReads, StoredValueWindow};
 use crate::{Error, Result};
 use rustc_hash::FxHashSet;
 
@@ -88,6 +88,17 @@ impl<D: Directory + 'static> DocumentReadBatch<'_, D> {
         position: usize,
         fields: Option<&FxHashSet<u32>>,
     ) -> Result<Option<Document>> {
+        self.get_windowed(position, fields, None).await
+    }
+
+    /// [`Self::get`] that decodes only `window`'s positions of its fields; see
+    /// [`StoredValueWindow`] for the placeholder contract.
+    pub async fn get_windowed(
+        &self,
+        position: usize,
+        fields: Option<&FxHashSet<u32>>,
+        window: Option<StoredValueWindow<'_>>,
+    ) -> Result<Option<Document>> {
         let address = self
             .addresses
             .get(position)
@@ -106,7 +117,7 @@ impl<D: Directory + 'static> DocumentReadBatch<'_, D> {
             .expect("prepared segment")
             .1;
         self.searcher.segments[segment]
-            .doc_with_reads(address.doc_id, fields, reads)
+            .doc_with_reads(address.doc_id, fields, window, reads)
             .await
     }
 }

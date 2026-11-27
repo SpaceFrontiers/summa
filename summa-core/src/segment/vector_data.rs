@@ -1293,19 +1293,9 @@ impl LazyFlatVectorData {
     /// More efficient than `flat_indexes_for_doc` as it avoids Vec allocation.
     pub fn flat_indexes_for_doc_range(&self, doc_id: u32) -> (usize, usize) {
         let n = self.num_vectors;
-        let start = {
-            let mut lo = 0usize;
-            let mut hi = n;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if self.doc_id_at(mid) < doc_id {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        };
+        let start = super::logical_address::first_position_of_document(n, doc_id, |index| {
+            self.doc_id_at(index)
+        });
         let mut count = 0;
         let mut i = start;
         while i < n && self.doc_id_at(i) == doc_id {
@@ -1323,20 +1313,9 @@ impl LazyFlatVectorData {
     /// Returns `(start_index, entries)` where start_index is the flat vector index.
     pub fn flat_indexes_for_doc(&self, doc_id: u32) -> (usize, Vec<(u32, u16)>) {
         let n = self.num_vectors;
-        // Binary search: find first entry where doc_id >= target
-        let start = {
-            let mut lo = 0usize;
-            let mut hi = n;
-            while lo < hi {
-                let mid = lo + (hi - lo) / 2;
-                if self.doc_id_at(mid) < doc_id {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo
-        };
+        let start = super::logical_address::first_position_of_document(n, doc_id, |index| {
+            self.doc_id_at(index)
+        });
         // Collect entries with matching doc_id
         let mut entries = Vec::new();
         let mut i = start;
